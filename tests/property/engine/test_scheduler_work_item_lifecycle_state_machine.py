@@ -377,6 +377,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         item = self.repo.mark_blocked(
             member_token=member_token_for(self.engine, worker_id=model.lease_owner, run_id=RUN_ID),
             work_item_id=model.work_item_id,
+            row_payload_json=self.payload,
             queue_key=None,
             barrier_key=barrier_key,
             expected_lease_owner=model.lease_owner,

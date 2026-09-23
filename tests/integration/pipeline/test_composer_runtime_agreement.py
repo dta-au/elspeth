@@ -568,6 +568,18 @@ where the architectural fix landed:
   guided accept path catch it. Recorded as ``abstains`` in the parity baseline.
   Ten sites remain ``unmirrored`` under the gate's ratchet
   (elspeth-96e2dd023f).
+* Shape 29 — a batch-aware plugin placed in a node kind it cannot run in
+  (elspeth-5887fb7928 AC-R4, measured in the lane's engine-seams §8 repros
+  ``perrow`` / ``collreport``). A batch-only plugin under ``transforms:`` was
+  validate-RED in the composer (``batch_transform_misplaced``) but green in
+  ``elspeth validate`` and aborted every row at run time; ``report_assemble``
+  as a collector was green on BOTH surfaces and aborted every group. Closed
+  for NodeSpec-constructed state and for runtime YAML: ``runtime_factory``
+  refuses both from the plugin class declarations before construction (it is
+  outside the raise-site parity scan, like its sibling aggregation/collector
+  kind checks), and the collector arm of ``_batch_aware_placement_error``
+  mirrors the second one on every mutation boundary. Pinned by
+  ``TestComposerRuntimeBatchPlacementAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -603,7 +615,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -2216,7 +2228,9 @@ class TestComposerRuntimeRouteTargetAgreement:
     Empirical scope of the original gap (post-investigation):
 
     * Aggregation ``on_error`` -> unknown sink: composer was silent (the
-      original reproducer). Now caught at ``route_target_resolution``.
+      original reproducer), then caught at ``route_target_resolution``. Since
+      elspeth-d2e3f29d10 wired the aggregation error edge, the DAG builder
+      also refuses it, so it is now defense-in-depth like the transform axis.
     * Source ``on_validation_failure`` -> unknown sink: composer was silent.
       Now caught at ``route_target_resolution``.
     * Transform ``on_error`` -> unknown sink: was already caught at
@@ -2226,8 +2240,8 @@ class TestComposerRuntimeRouteTargetAgreement:
       ``graph_structure`` (``builder.py:859``). The new check is
       defense-in-depth.
 
-    Each gap-closing test (aggregation/source) exercises both paths from
-    independent inputs and asserts the error messages are byte-identical.
+    Each gap-closing test (source) exercises both paths from independent
+    inputs and asserts the error messages are byte-identical.
     Each defense-in-depth test asserts both layers reject and the dangling
     target name is present in both messages.
     """
@@ -2301,7 +2315,13 @@ class TestComposerRuntimeRouteTargetAgreement:
 
     def test_both_reject_aggregation_on_error_dangling_sink(self, tmp_path: Path) -> None:
         """Original reproducer (S2 v1 from docs/composer/evidence/composer-llm-eval-2026-05-01.md):
-        aggregation ``on_error: aggregation_errors`` with no sink of that name."""
+        aggregation ``on_error: aggregation_errors`` with no sink of that name.
+
+        Defense-in-depth since elspeth-d2e3f29d10: the DAG builder wires the
+        aggregation's ``__error_<name>__`` DIVERT edge and refuses an unknown
+        sink while doing so, exactly as it does for a transform. Both walls
+        reject: composer ``/validate`` and runtime graph construction, and
+        the dangling name appears in both messages."""
         csv_path = self._csv_input(tmp_path)
         output_path = self._csv_output(tmp_path)
 
@@ -2348,7 +2368,15 @@ class TestComposerRuntimeRouteTargetAgreement:
             metadata=PipelineMetadata(),
             version=1,
         )
-        composer_detail = self._composer_route_target_failure(state, tmp_path)
+        composer_result = validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+        assert composer_result.is_valid is False
+        composer_messages = " | ".join(err.message for err in composer_result.errors)
+        assert "aggregation_errors" in composer_messages
 
         # Runtime: equivalent ElspethSettings.
         config = ElspethSettings(
@@ -2378,11 +2406,18 @@ class TestComposerRuntimeRouteTargetAgreement:
                 ),
             },
         )
-        runtime_msg = self._runtime_route_target_failure(config)
-
-        assert "aggregation_errors" in composer_detail
-        assert "aggregation_errors" in runtime_msg
-        assert composer_detail == runtime_msg, "Composer and runtime must surface identical RouteValidationError"
+        plugins = instantiate_plugins_from_config(config)
+        with pytest.raises(GraphValidationError) as runtime_exc:
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(config.gates),
+                coalesce_settings=list(config.coalesce) if config.coalesce else None,
+            )
+        assert "Aggregation 'agg1' on_error 'aggregation_errors' references unknown sink." in str(runtime_exc.value)
 
     def test_both_reject_transform_on_error_dangling_sink(self, tmp_path: Path) -> None:
         """Defense-in-depth axis: the DAG builder (``graph.validate()`` via
@@ -7313,3 +7348,157 @@ class TestCsvBindGuaranteeRuntimeAgreement:
             graph.validate_edge_compatibility()
         assert "colour" in str(exc_info.value)
         assert exc_info.value.from_component_type == "source"
+
+
+class TestComposerRuntimeBatchPlacementAgreement:
+    """Shape 29 — a batch-aware plugin in a node kind it cannot run in (elspeth-5887fb7928 AC-R4).
+
+    Two placements used to pass ``elspeth validate`` (exit 0) and abort the run
+    on every row or group: a batch-only plugin under ``transforms:`` (handed
+    one row, it iterated the field names: ``AttributeError``), and
+    ``report_assemble`` as a collector (no aggregation flush window on
+    ``ctx.aggregation_batch``: ``RuntimeError``). ``runtime_factory`` now
+    refuses both from the plugin CLASS declarations
+    (``is_batch_aware`` / ``supports_row_mode_when_batch_aware`` /
+    ``requires_aggregation_batch_context``) before construction, and the
+    composer's ``_batch_aware_placement_error`` refuses the same two from the
+    same declarations. The runtime arm here is the composer's own generated
+    YAML loaded and instantiated exactly as ``elspeth validate`` does, so it
+    does not lean on Stage 1. Each rejection has a control that differs only in
+    the node kind and is accepted by both.
+
+    Bug verification protocol: reverting the transform-loop check in
+    ``runtime_factory.instantiate_plugins_from_config`` makes
+    ``test_both_reject_batch_plugin_as_row_transform`` fail at its
+    ``pytest.raises(ValueError)`` (DID NOT RAISE); reverting the collector
+    ``requires_aggregation_batch_context`` check does the same to
+    ``test_both_reject_report_assemble_as_collector``; dropping the collector
+    arm of ``_batch_aware_placement_error`` fails the composer assertion of the
+    collector test (``batch_transform_misplaced`` absent).
+    """
+
+    @staticmethod
+    def _json_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "docs.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"doc": "d1", "items": [{"t": "a", "v": 1}]}\n', encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _output(tmp_path: Path) -> OutputSpec:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return OutputSpec(
+            name="main",
+            plugin="json",
+            options={"path": str(out_dir / "out.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    @staticmethod
+    def _node(node_id: str, node_type: str, plugin: str, input_name: str, on_success: str, **extra: Any) -> NodeSpec:
+        fields: dict[str, Any] = {
+            "id": node_id,
+            "node_type": node_type,
+            "plugin": plugin,
+            "input": input_name,
+            "on_success": on_success,
+            "on_error": "discard" if node_type != "collector" else None,
+            "options": {"schema": {"mode": "observed"}},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        fields.update(extra)
+        return NodeSpec(**fields)
+
+    def _state(self, tmp_path: Path, *nodes: NodeSpec) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="json",
+                on_success="rows",
+                options={"path": str(self._json_input(tmp_path)), "format": "jsonl", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=nodes,
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="batch-placement"),
+            version=1,
+        )
+
+    def _batch_stats(self, node_type: str, **extra: Any) -> NodeSpec:
+        node = self._node("stats", node_type, "batch_stats", "rows", "main", **extra)
+        return replace(node, options={"schema": {"mode": "observed"}, "value_field": "v"})
+
+    def _explode_then(self, tmp_path: Path, closer_plugin: str, closer_options: dict[str, Any]) -> CompositionState:
+        explode = self._node("explode", "transform", "json_explode", "rows", "items")
+        explode = replace(explode, options={"schema": {"mode": "observed"}, "array_field": "items", "output_field": "item"})
+        lift = self._node("lift", "transform", "value_transform", "items", "pages")
+        lift = replace(
+            lift,
+            options={
+                "schema": {"mode": "observed"},
+                "operations": [{"target": "t", "expression": "row['item']['t']"}, {"target": "v", "expression": "row['item']['v']"}],
+            },
+        )
+        collector = self._node(
+            "stitch",
+            "collector",
+            closer_plugin,
+            "pages",
+            "main",
+            scope_name="document_pages",
+            scope_opener="explode",
+            scope_policy="require_all",
+        )
+        return self._state(tmp_path, explode, lift, replace(collector, options=closer_options))
+
+    @staticmethod
+    def _runtime_instantiate(state: CompositionState) -> None:
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        instantiate_plugins_from_config(load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state)), preflight_mode=True)
+
+    def test_both_reject_batch_plugin_as_row_transform(self, tmp_path: Path) -> None:
+        state = self._state(tmp_path, self._batch_stats("transform"))
+
+        composer = state.validate()
+        assert not composer.is_valid
+        assert any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        with pytest.raises(ValueError, match=r"Transform 'stats' uses transform 'batch_stats' which is batch-aware"):
+            self._runtime_instantiate(state)
+
+    def test_both_accept_batch_plugin_as_aggregation(self, tmp_path: Path) -> None:
+        """Control: the same plugin and options under the aggregation kind."""
+        state = self._state(tmp_path, self._batch_stats("aggregation", trigger={"count": 10}, output_mode="transform"))
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        assert composer.is_valid, composer.errors
+        self._runtime_instantiate(state)
+
+    def test_both_reject_report_assemble_as_collector(self, tmp_path: Path) -> None:
+        state = self._explode_then(tmp_path, "report_assemble", {"schema": {"mode": "observed"}, "text_field": "t"})
+
+        composer = state.validate()
+        assert not composer.is_valid
+        misplaced = [e for e in composer.errors if e.error_code == "batch_transform_misplaced"]
+        assert misplaced, composer.errors
+        assert "aggregation flush window" in misplaced[0].message
+        with pytest.raises(
+            ValueError, match=r"Collector 'stitch' uses transform 'report_assemble' which requires an aggregation flush window"
+        ):
+            self._runtime_instantiate(state)
+
+    def test_both_accept_a_windowless_batch_plugin_as_collector(self, tmp_path: Path) -> None:
+        """Control: the same collector topology closed by batch_stats, which reads no flush window."""
+        state = self._explode_then(tmp_path, "batch_stats", {"schema": {"mode": "observed"}, "value_field": "v"})
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        assert composer.is_valid, composer.errors
+        self._runtime_instantiate(state)

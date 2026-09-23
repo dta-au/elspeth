@@ -332,7 +332,7 @@ class TestChromaSinkOnStart:
         config = {
             "collection": "test-collection",
             "mode": "client",
-            "host": "169.254.169.254",
+            "host": "chroma.example.com",
             "port": 8000,
             "ssl": True,
             "field_mapping": {
@@ -349,7 +349,10 @@ class TestChromaSinkOnStart:
             sink = inject_write_failure(ChromaSink(config))
         ctx = _make_lifecycle_ctx()
 
-        with patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb:
+        with (
+            patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("169.254.169.254", 0))]),
+            patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb,
+        ):
             with pytest.raises(ValueError, match=r"(?i)ssrf"):
                 sink.on_start(ctx)
 

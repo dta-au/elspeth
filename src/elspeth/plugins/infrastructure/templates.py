@@ -3,25 +3,325 @@
 Provides a sandboxed Jinja2 environment factory and the TemplateError exception.
 Used by both LLM prompt templates and RAG query templates.
 
-The sandbox prevents attribute access, method calls, and module imports.
-It does NOT limit CPU or memory consumption from template loops — templates
-are authored by pipeline architects (trusted config), not end users.
+The sandbox prevents unsafe access. Constant folding of authored expressions
+is disabled during bounded-size compilation; rendering runs in a child process
+with CPU, memory, input and output ceilings.
 """
 
 from __future__ import annotations
 
+import math
+import multiprocessing
+import os
+import pickle
+import resource
+import sys
+import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, cast
 
-from jinja2 import StrictUndefined, nodes
+from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
+from jinja2.compiler import CodeGenerator
+from jinja2.exceptions import SecurityError, TemplateRuntimeError, UndefinedError
 from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.templates import validate_jinja_source
 
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
+
+
+_MAX_RENDER_BYTES = 4 * 1024 * 1024
+_MAX_CONTEXT_BYTES = 8 * 1024 * 1024
+_MAX_PARENT_PACK_BYTES = 32 * 1024 * 1024
+_MAX_CONTEXT_NODES = 65536
+# RLIMIT_AS is virtual address space, including the interpreter's existing
+# mappings. Cap growth from the spawned worker's own baseline, not an absolute
+# address size that depends on which web/test modules Python imported.
+_MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
+_WORKER_TIMEOUT_SECONDS = 5.0
+# The two workers bound CPU and memory use. Ordinary concurrent rows may queue
+# behind one another, so their bounded admission wait is longer than a single
+# worker's execution deadline.
+_WORKER_QUEUE_TIMEOUT_SECONDS = 30.0
+_WORKER_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _charge_row_export(value: Any, budget: list[int], *, depth: int = 0) -> None:
+    """Bound expanded row work before PipelineRow.to_dict makes a deep copy."""
+    if depth > 64:
+        raise TemplateError("Template context nesting exceeds 64 levels")
+    budget[0] += 1
+    budget[1] += sys.getsizeof(value)
+    if budget[0] > _MAX_CONTEXT_NODES or budget[1] > _MAX_PARENT_PACK_BYTES:
+        raise TemplateError("Template context exceeds the parent packing limit")
+    if isinstance(value, (dict, MappingProxyType)):
+        for key, item in value.items():
+            _charge_row_export(key, budget, depth=depth + 1)
+            _charge_row_export(item, budget, depth=depth + 1)
+    elif isinstance(value, (list, tuple, frozenset)):
+        for item in value:
+            _charge_row_export(item, budget, depth=depth + 1)
+
+
+class _NoFoldCodeGenerator(CodeGenerator):
+    """Never evaluate an authored expression while compiling a template."""
+
+    def _output_child_to_const(self, node: nodes.Expr, frame: Any, finalize: Any) -> str:
+        if type(node) is nodes.TemplateData:
+            return super()._output_child_to_const(node, frame, finalize)
+        raise nodes.Impossible()
+
+
+class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
+    code_generator_class = _NoFoldCodeGenerator
+
+
+@dataclass(frozen=True)
+class _RowTransport:
+    data: bytes
+    contract: bytes
+
+
+def _pack_context_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    memo: dict[int, Any] | None = None,
+    active: set[int] | None = None,
+    budget: list[int] | None = None,
+) -> Any:
+    """Detach frozen carriers with alias preservation and a parent work cap."""
+    from elspeth.contracts.freeze import FrozenJsonArray
+    from elspeth.contracts.schema_contract import PipelineRow
+
+    if depth > 64:
+        raise TemplateError("Template context nesting exceeds 64 levels")
+    if memo is None:
+        memo = {}
+    if active is None:
+        active = set()
+    if budget is None:
+        budget = [0, 0]
+    identity = id(value)
+    if identity in active:
+        raise TemplateError("Template context contains a cyclic container")
+    if identity in memo:
+        return memo[identity]
+    budget[0] += 1
+    if type(value) is MappingProxyType:
+        estimated_bytes = 64 + 72 * len(value)
+    elif type(value) in (dict, list, tuple, FrozenJsonArray, str, bytes, int, float, bool):
+        estimated_bytes = sys.getsizeof(value)
+    else:
+        estimated_bytes = 128
+    budget[1] += estimated_bytes
+    if budget[0] > _MAX_CONTEXT_NODES or budget[1] > _MAX_PARENT_PACK_BYTES:
+        raise TemplateError("Template context exceeds the parent packing limit")
+    active.add(identity)
+    try:
+        if type(value) is PipelineRow:
+            _charge_row_export(value._data, budget, depth=depth + 1)
+            data = pickle.dumps(value.to_dict(), protocol=5)
+            contract = pickle.dumps(value.contract.to_checkpoint_format(), protocol=5)
+            budget[1] += len(data) + len(contract)
+            if budget[1] > _MAX_PARENT_PACK_BYTES:
+                raise TemplateError("Template context exceeds the parent packing limit")
+            packed: Any = _RowTransport(data, contract)
+        elif type(value) in (dict, MappingProxyType):
+            packed = {}
+            for key, item in value.items():
+                _charge_row_export(key, budget, depth=depth + 1)
+                if budget[1] > _MAX_CONTEXT_BYTES:
+                    raise TemplateError("Template context exceeds the parent packing limit")
+                packed[key] = _pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget)
+        elif type(value) is list:
+            packed = [_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value]
+        elif type(value) is FrozenJsonArray:
+            packed = FrozenJsonArray(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
+        elif type(value) is tuple:
+            packed = tuple(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
+        elif isinstance(value, (tuple, frozenset)):
+            # deep_freeze preserves these carriers when children are already
+            # frozen; charge their expanded payload before pickle sees them.
+            _charge_row_export(value, budget, depth=depth)
+            if budget[1] > _MAX_CONTEXT_BYTES:
+                raise TemplateError("Template context exceeds the parent packing limit")
+            packed = value
+        else:
+            packed = value
+    finally:
+        active.remove(identity)
+    memo[identity] = packed
+    return packed
+
+
+def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) -> Any:
+    from elspeth.contracts.freeze import FrozenJsonArray
+
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if type(value) is _RowTransport:
+        from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+
+        restored: Any = PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
+    elif type(value) is dict:
+        restored = {key: _restore_context_value(item, memo=memo) for key, item in value.items()}
+    elif type(value) is list:
+        restored = [_restore_context_value(item, memo=memo) for item in value]
+    elif type(value) is FrozenJsonArray:
+        restored = FrozenJsonArray(_restore_context_value(item, memo=memo) for item in value)
+    elif type(value) is tuple:
+        restored = tuple(_restore_context_value(item, memo=memo) for item in value)
+    else:
+        restored = value
+    memo[identity] = restored
+    return restored
+
+
+def _check_template_source(source: str) -> None:
+    try:
+        validate_jinja_source(source)
+    except ValueError as exc:
+        raise TemplateError(str(exc)) from exc
+
+
+def _template_worker(connection: Any, source: str, payload: bytes) -> None:
+    """Render in a process with an OS memory/CPU ceiling."""
+    try:
+        baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
+        max_address_space = baseline_pages * os.sysconf("SC_PAGE_SIZE") + _MAX_WORKER_ADDRESS_GROWTH
+        resource.setrlimit(resource.RLIMIT_AS, (max_address_space, max_address_space))
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+        context = pickle.loads(payload)
+        if type(context) is not dict or any(type(key) is not str for key in context):
+            raise TemplateError("Template worker received an invalid context")
+        context = _restore_context_value(context)
+        environment = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
+        template = environment.from_string(source)
+        pieces: list[str] = []
+        size = 0
+        for piece in template.generate(**context):
+            size += len(piece.encode("utf-8"))
+            if size > _MAX_RENDER_BYTES:
+                raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
+            pieces.append(piece)
+        connection.send(("ok", "".join(pieces)))
+    except (
+        TemplateError,
+        TemplateSyntaxError,
+        TemplateRuntimeError,
+        UndefinedError,
+        SecurityError,
+        MemoryError,
+        ArithmeticError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        # Keep the protocol bounded and do not pickle a third-party exception.
+        connection.send((type(exc).__name__, str(exc)[:1024]))
+        raise SystemExit(1) from exc
+    finally:
+        connection.close()
+
+
+def _run_template_worker(source: str, payload: bytes) -> str:
+    if len(payload) > _MAX_CONTEXT_BYTES:
+        raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
+    process_context = multiprocessing.get_context("spawn")
+    parent, child = process_context.Pipe(duplex=False)
+    process: Any = None
+    try:
+        process = cast("Any", process_context).Process(target=_template_worker, args=(child, source, payload))
+        process.start()
+        child.close()
+        if not parent.poll(_WORKER_TIMEOUT_SECONDS):
+            raise TemplateError("Template exceeded the execution time limit")
+        try:
+            status, value = parent.recv()
+        except EOFError as exc:
+            raise TemplateError("Template worker stopped before completing") from exc
+        if status == "ok":
+            if type(value) is not str:
+                raise TemplateError("Template worker returned a non-string result")
+            return value
+        if status == "TemplateSyntaxError":
+            raise TemplateSyntaxError(value, 1)
+        if status == "UndefinedError":
+            raise UndefinedError(value)
+        if status == "SecurityError":
+            raise SecurityError(value)
+        if status == "TemplateError":
+            raise TemplateError(value)
+        if status == "MemoryError":
+            raise TemplateError("Template worker exceeded the memory limit")
+        raise TemplateRuntimeError(value)
+    finally:
+        parent.close()
+        child.close()
+        if process is not None and process.is_alive():
+            process.kill()
+        if process is not None and process.pid is not None:
+            process.join()
+
+
+class _BoundedTemplate:
+    def __init__(self, source: str) -> None:
+        self._source = source
+
+    def render(self, **context: Any) -> str:
+        _check_template_source(self._source)
+        if not _WORKER_SLOTS.acquire(timeout=_WORKER_QUEUE_TIMEOUT_SECONDS):
+            raise TemplateError("Too many concurrent template workers")
+        try:
+            transport = _pack_context_value(context)
+            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
+        finally:
+            _WORKER_SLOTS.release()
+
+
+class _BoundedEnvironment(_LocalSandboxedEnvironment):
+    def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
+        _check_template_source(source)
+        return super().parse(source, name=name, filename=filename)
+
+    def from_string(
+        self,
+        source: str | nodes.Template,
+        globals: object = None,
+        template_class: type[Template] | None = None,
+    ) -> Template:
+        if globals is not None or template_class is not None:
+            raise TemplateError("Custom template globals and classes are unsupported")
+        if type(source) is not str:
+            raise TemplateError("Pre-parsed Jinja templates are unsupported")
+        _check_template_source(source)
+        ast = super().parse(source)
+        if sum(1 for _ in ast.find_all(nodes.Node)) > 2048:
+            raise TemplateError("Template AST exceeds 2048 nodes")
+        if next(ast.find_all(nodes.Pow), None) is not None:
+            raise TemplateError("Power expressions are not supported in pipeline templates")
+        # Jinja's stock compiler folds authored constants here. This
+        # environment disables that path, so syntax validation is bounded by
+        # the source/AST limits and does not wait for a child on the web loop.
+        compiled = super().from_string(ast)
+        # Static text has a fixed output no larger than its bounded source.
+        # Keep it in-process so ordinary blob paths need no worker startup.
+        if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):
+            return compiled
+        return cast("Template", _BoundedTemplate(source))
 
 
 def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
@@ -32,10 +332,12 @@ def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
         - Raises on undefined variables (StrictUndefined)
         - Blocks attribute access and method calls (ImmutableSandboxedEnvironment)
         - Does not HTML-escape output (autoescape=False)
+        - Bounds compile input, render time, worker memory, and output size
     """
-    return ImmutableSandboxedEnvironment(
+    return _BoundedEnvironment(
         undefined=StrictUndefined,
         autoescape=False,
+        optimized=False,
     )
 
 

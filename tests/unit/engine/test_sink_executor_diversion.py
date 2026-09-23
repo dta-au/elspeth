@@ -10,13 +10,15 @@ compatibility-path tests were removed with that production path.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from elspeth.contracts import PendingOutcome, PluginSchema
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import OrchestrationInvariantError, PluginContractViolation
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.plugin_protocols import SinkProtocol
 from elspeth.engine.executors.sink import SinkExecutor
 
 
@@ -185,6 +187,7 @@ def test_write_primary_effect_ownership_and_buffered_outcome_guards(
             sink_name="legacy",
             sink_node_id="node-legacy",
             join_group_id_by_token={},
+            ctx=PluginContext(run_id="run-1", config={}),
         )
 
 
@@ -206,3 +209,27 @@ def test_validate_sink_input_rows_contracts_desync_is_orchestration_bug() -> Non
             skip_schema=True,
             contracts=[],
         )
+
+
+class _StrictCountSchema(PluginSchema):
+    """A sink input contract the sentinel row cannot meet."""
+
+    count: int
+
+
+class _StrictCountSink(_ForbiddenLegacySink):
+    input_schema = _StrictCountSchema
+
+
+def test_sink_input_validation_message_never_echoes_the_row_value() -> None:
+    """The boundary violation's message reaches the FAILED sink node_states and the
+    boundary-failure outcomes, so it names the field and error type, never the value."""
+    sentinel = "SENTINEL-value-7f3a91"
+
+    with pytest.raises(PluginContractViolation) as excinfo:
+        SinkExecutor._validate_sink_input(cast(SinkProtocol, _StrictCountSink()), [{"count": sentinel}])
+
+    message = str(excinfo.value)
+    assert message.startswith("Sink 'legacy' input validation failed: 1 validation error: count: ")
+    assert "[int_parsing]" in message
+    assert sentinel not in message

@@ -246,6 +246,7 @@ def test_n1_self_blocked_still_raises_and_backstop_counts_blocked() -> None:
     scheduler.mark_blocked(
         member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         work_item_id=work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key="barrier-1",
         expected_lease_owner=LEADER_OWNER,

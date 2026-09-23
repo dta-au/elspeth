@@ -142,6 +142,7 @@ def test_fires_for_blocked_work() -> None:
     blocked = scheduler.mark_blocked(
         member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         work_item_id=claimed.work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key="barrier-1",
         expected_lease_owner=LEASE_OWNER,

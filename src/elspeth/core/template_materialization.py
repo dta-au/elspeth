@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 import yaml
 
+from elspeth.contracts.enums import RunMode
+
 PluginCollectionName = Literal["transforms", "aggregations"]
 ContentKind = Literal["text", "yaml"]
 
@@ -113,16 +115,40 @@ class TemplateOptionMaterializer:
     def __init__(self, settings_path: Path) -> None:
         self._settings_path = settings_path
 
-    def materialize_config(self, raw_config: Mapping[str, Any]) -> dict[str, Any]:
+    def materialize_config(
+        self,
+        raw_config: Mapping[str, Any],
+        *,
+        run_mode: RunMode = RunMode.LIVE,
+        source_settings: object | None = None,
+    ) -> dict[str, Any]:
         config = dict(raw_config)
         for collection_name in PLUGIN_OPTION_COLLECTIONS:
-            collection = config.get(collection_name)
-            if not isinstance(collection, list):
+            if collection_name not in config or type(config[collection_name]) is not list:
                 continue
-            config[collection_name] = [self._materialize_plugin_config(plugin_config) for plugin_config in collection]
+            collection = config[collection_name]
+            source_collection = (
+                source_settings[collection_name] if type(source_settings) is dict and collection_name in source_settings else None
+            )
+            config[collection_name] = [
+                self._materialize_plugin_config(
+                    plugin_config,
+                    run_mode=run_mode,
+                    source_plugin=(
+                        source_collection[index] if type(source_collection) is list and index < len(source_collection) else None
+                    ),
+                )
+                for index, plugin_config in enumerate(collection)
+            ]
         return config
 
-    def materialize_options(self, options: Mapping[str, Any]) -> dict[str, Any]:
+    def materialize_options(
+        self,
+        options: Mapping[str, Any],
+        *,
+        run_mode: RunMode = RunMode.LIVE,
+        source_options: object | None = None,
+    ) -> dict[str, Any]:
         result = dict(options)
         for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY:
             if rule.file_key not in result:
@@ -130,8 +156,28 @@ class TemplateOptionMaterializer:
             if rule.content_key in result:
                 raise TemplateFileError(f"Cannot specify both '{rule.content_key}' and '{rule.file_key}'")
             file_ref = result.pop(rule.file_key)
-            file_path = _resolve_template_path(file_ref, self._settings_path, rule.label)
-            result[rule.content_key] = self._load_content(rule, file_path)
+            archived_content: Any = None
+            if run_mode is not RunMode.LIVE:
+                if (
+                    type(source_options) is not dict
+                    or rule.source_key not in source_options
+                    or source_options[rule.source_key] != file_ref
+                    or rule.content_key not in source_options
+                ):
+                    raise TemplateFileError(
+                        f"{rule.label} has no matching materialized content in the source run; replay/verify cannot read an unbound file"
+                    )
+                archived_content = source_options[rule.content_key]
+                if rule.content_kind == "text" and type(archived_content) is not str:
+                    raise TemplateFileError(f"{rule.label} source-run content is not retained as text")
+            if run_mode is RunMode.REPLAY:
+                result[rule.content_key] = archived_content
+            else:
+                file_path = _resolve_template_path(file_ref, self._settings_path, rule.label)
+                live_content = self._load_content(rule, file_path)
+                if run_mode is RunMode.VERIFY and live_content != archived_content:
+                    raise TemplateFileError(f"{rule.label} differs from source-run materialized content")
+                result[rule.content_key] = live_content
             result[rule.source_key] = file_ref
         return result
 
@@ -162,13 +208,28 @@ class TemplateOptionMaterializer:
                     f"configs, or inline {inline_instead} before web validation/execution."
                 )
 
-    def _materialize_plugin_config(self, plugin_config: Any) -> Any:
-        if not isinstance(plugin_config, dict):
+    def _materialize_plugin_config(
+        self,
+        plugin_config: Any,
+        *,
+        run_mode: RunMode,
+        source_plugin: Any,
+    ) -> Any:
+        if type(plugin_config) is not dict:
             return plugin_config
         plugin = dict(plugin_config)
-        options = plugin.get("options")
-        if isinstance(options, dict):
-            plugin["options"] = self.materialize_options(options)
+        options = plugin["options"] if "options" in plugin else None
+        if type(options) is dict:
+            source_options = None
+            if (
+                type(source_plugin) is dict
+                and (source_plugin["plugin"] if "plugin" in source_plugin else None) == (plugin["plugin"] if "plugin" in plugin else None)
+                and (source_plugin["name"] if "name" in source_plugin else None) == (plugin["name"] if "name" in plugin else None)
+            ):
+                candidate = source_plugin["options"] if "options" in source_plugin else None
+                if type(candidate) is dict:
+                    source_options = candidate
+            plugin["options"] = self.materialize_options(options, run_mode=run_mode, source_options=source_options)
         return plugin
 
     def _load_content(self, rule: FileBackedTemplateOption, file_path: Path) -> Any:

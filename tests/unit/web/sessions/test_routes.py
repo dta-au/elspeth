@@ -8197,6 +8197,76 @@ class TestYamlEndpoint:
     """Tests for GET /api/sessions/{id}/state/yaml."""
 
     @pytest.mark.asyncio
+    async def test_yaml_template_validation_offloads_while_health_responds(self, tmp_path: Path, monkeypatch) -> None:
+        import elspeth.web.sessions.routes.composer.state as state_routes
+
+        app, service = _make_app(tmp_path)
+        session = await service.create_session("alice", "Jinja bound", "local")
+
+        @app.get("/api/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
+
+        entered = threading.Event()
+        release = threading.Event()
+        original = state_routes.run_sync_in_worker
+
+        async def traced_worker(function, *args, **kwargs):
+            if function.__name__ == "unsurfaceable_pending_interpretation_review_sites":
+
+                def check_in_worker():
+                    entered.set()
+                    release.wait(timeout=3)
+                    return function(*args, **kwargs)
+
+                return await original(check_in_worker)
+            return await original(function, *args, **kwargs)
+
+        monkeypatch.setattr(state_routes, "run_sync_in_worker", traced_worker)
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: '{{ (3**(3**15)) % 7 }}'
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            import_task = asyncio.create_task(client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text}))
+            try:
+                for _ in range(200):
+                    if entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                assert entered.is_set()
+                assert not import_task.done()
+                started = asyncio.get_running_loop().time()
+                response = await client.get("/api/health")
+                assert asyncio.get_running_loop().time() - started < 0.5
+                assert response.json() == {"status": "ok"}
+            finally:
+                release.set()
+            imported = await import_task
+        assert imported.status_code < 500
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("compartment_id", ["alpha", None])
     async def test_yaml_download_marks_configured_compartment(self, tmp_path: Path, compartment_id: str | None) -> None:
         app, service = _make_app(tmp_path)

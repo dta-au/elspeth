@@ -15,6 +15,7 @@ import pytest
 from pydantic import SecretBytes
 
 from elspeth.config_loading import load_settings_from_yaml_string
+from elspeth.contracts.enums import RunMode
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
@@ -368,6 +369,8 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
 
     class _Context:
         def __init__(self) -> None:
+            self.run_mode = RunMode.LIVE
+            self.call_mode_session = None
             self.calls: list[dict[str, object]] = []
             self.validation_errors: list[dict[str, object]] = []
 

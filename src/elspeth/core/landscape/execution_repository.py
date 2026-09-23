@@ -56,6 +56,7 @@ from elspeth.contracts import (
     TerminalPath,
     TriggerType,
 )
+from elspeth.contracts.audit import CallVerification, TokenRef
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
@@ -67,6 +68,7 @@ from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids_on
+from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.execution import (
@@ -610,6 +612,7 @@ class ExecutionRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call for a node state."""
         return self.calls.record_call(
@@ -627,6 +630,7 @@ class ExecutionRepository:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
 
     # === Operations (Source/Sink I/O) ===
@@ -689,6 +693,7 @@ class ExecutionRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call made during an operation."""
         return self.calls.record_operation_call(
@@ -705,7 +710,76 @@ class ExecutionRepository:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
+
+    def record_verification_decision(
+        self,
+        *,
+        current_run_id: str,
+        current_call_id: str,
+        source_run_id: str,
+        source_call_id: str | None,
+        is_match: bool | None,
+        differences_json: str,
+        coordination_token: CoordinationToken,
+    ) -> CallVerification:
+        return self.calls.record_verification_decision(
+            current_run_id=current_run_id,
+            current_call_id=current_call_id,
+            source_run_id=source_run_id,
+            source_call_id=source_call_id,
+            is_match=is_match,
+            differences_json=differences_json,
+            coordination_token=coordination_token,
+        )
+
+    def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
+        return self.calls.get_verification_decision(current_call_id)
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        return self.calls.get_verification_decisions_for_run(current_run_id)
+
+    def get_all_calls_for_run(self, run_id: str) -> list[Call]:
+        """Return both state-parented and operation-parented calls for finalization."""
+        return self.calls.get_all_calls_for_run(run_id)
+
+    def find_call_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        request_hash: str | None,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> Call | None:
+        return self.calls.find_call_for_current_parent(
+            source_run_id=source_run_id,
+            call_type=call_type,
+            request_hash=request_hash,
+            current_state_id=current_state_id,
+            current_operation_id=current_operation_id,
+            current_call_index=current_call_index,
+        )
+
+    def list_source_calls_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> list[Call]:
+        return self.calls.list_source_calls_for_current_parent(
+            source_run_id=source_run_id,
+            call_type=call_type,
+            current_state_id=current_state_id,
+            current_operation_id=current_operation_id,
+        )
+
+    def get_call_request_data(self, call_id: str) -> CallDataResult:
+        return self.calls.get_call_request_data(call_id)
 
     def get_operation(self, operation_id: str) -> Operation | None:
         """Get an operation by ID."""
@@ -1053,40 +1127,15 @@ class ExecutionRepository:
                         or batch.expansion_group_id is not None
                     ):
                         raise AuditIntegrityError("aggregation result receipt requires an OPEN state and unclaimed EXECUTING batch")
-                    # The members' live BUFFERED acceptances keep the ORIGINAL
-                    # batch_id across crash-retry (retry batches copy members
-                    # but never rewrite immutable acceptance history), so the
-                    # liveness proof binds against the durable retry lineage.
-                    lineage_batch_ids = batch_retry_lineage_ids_on(
+                    self._require_live_unterminated_members_on(
                         conn,
-                        batch_id=batch_id,
                         run_id=run_id,
+                        batch_id=batch_id,
                         aggregation_node_id=aggregation_node_id,
                         retry_of_batch_id=batch.retry_of_batch_id,
+                        member_token_ids=member_token_ids,
+                        subject="aggregation result receipt",
                     )
-                    live_rows = conn.execute(
-                        select(token_outcomes_table.c.token_id)
-                        .where(token_outcomes_table.c.run_id == run_id)
-                        .where(token_outcomes_table.c.token_id.in_(member_token_ids))
-                        .where(token_outcomes_table.c.completed == 0)
-                        .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
-                        .where(token_outcomes_table.c.batch_id.in_(lineage_batch_ids))
-                    ).all()
-                    if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(member_token_ids)):
-                        raise AuditIntegrityError(
-                            "aggregation result receipt requires one live BUFFERED outcome for every member within the batch retry lineage"
-                        )
-                    terminal_rows = conn.execute(
-                        select(token_outcomes_table.c.token_id)
-                        .where(token_outcomes_table.c.run_id == run_id)
-                        .where(token_outcomes_table.c.token_id.in_(member_token_ids))
-                        .where(token_outcomes_table.c.completed == 1)
-                    ).all()
-                    if terminal_rows:
-                        terminal_token_ids = sorted(str(row.token_id) for row in terminal_rows)
-                        raise AuditIntegrityError(
-                            f"aggregation result receipt members already have terminal outcomes: {terminal_token_ids!r}"
-                        )
 
                     self.node_states.complete_node_state_on(
                         run_id=coordination_token.run_id,
@@ -1189,6 +1238,308 @@ class ExecutionRepository:
             raise LandscapePostCommitError(f"aggregation result receipt {batch_id!r} failed exact post-commit readback") from exc
         return receipt
 
+    @staticmethod
+    def _require_live_unterminated_members_on(
+        conn: Connection,
+        *,
+        run_id: str,
+        batch_id: str,
+        aggregation_node_id: str,
+        retry_of_batch_id: str | None,
+        member_token_ids: Sequence[str],
+        subject: str,
+    ) -> None:
+        """Refuse to complete a flush unless every member is still live in this batch's lineage.
+
+        Shared by the two flush verdicts (``complete_aggregation_result`` and
+        ``complete_aggregation_failure``). The members' live BUFFERED
+        acceptances keep the ORIGINAL batch_id across crash-retry (retry
+        batches copy members but never rewrite immutable acceptance history),
+        so the liveness proof binds against the durable retry lineage; a member
+        that already has a terminal outcome cannot be completed a second time.
+        """
+        lineage_batch_ids = batch_retry_lineage_ids_on(
+            conn,
+            batch_id=batch_id,
+            run_id=run_id,
+            aggregation_node_id=aggregation_node_id,
+            retry_of_batch_id=retry_of_batch_id,
+        )
+        live_rows = conn.execute(
+            select(token_outcomes_table.c.token_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id.in_(member_token_ids))
+            .where(token_outcomes_table.c.completed == 0)
+            .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
+            .where(token_outcomes_table.c.batch_id.in_(lineage_batch_ids))
+        ).all()
+        if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(member_token_ids)):
+            raise AuditIntegrityError(f"{subject} requires one live BUFFERED outcome for every member within the batch retry lineage")
+        terminal_rows = conn.execute(
+            select(token_outcomes_table.c.token_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id.in_(member_token_ids))
+            .where(token_outcomes_table.c.completed == 1)
+        ).all()
+        if terminal_rows:
+            terminal_token_ids = sorted(str(row.token_id) for row in terminal_rows)
+            raise AuditIntegrityError(f"{subject} members already have terminal outcomes: {terminal_token_ids!r}")
+
+    @staticmethod
+    def _validate_verdict_members(member_refs: Sequence[TokenRef], *, run_id: str, subject: str) -> tuple[str, ...]:
+        """The ordered member token ids of a failure verdict, refused when empty, repeated or cross-run.
+
+        Shared by the two group failure verdicts (``complete_aggregation_failure``
+        and ``complete_collector_failure``).
+        """
+        member_token_ids = tuple(ref.token_id for ref in member_refs)
+        if not member_token_ids:
+            raise AuditIntegrityError(f"{subject} requires ordered members")
+        if any(ref.run_id != run_id for ref in member_refs):
+            raise AuditIntegrityError(f"{subject} members cross run identity")
+        if len(set(member_token_ids)) != len(member_token_ids):
+            raise AuditIntegrityError(f"{subject} contains duplicate members")
+        return member_token_ids
+
+    @staticmethod
+    def _lock_verdict_members_on(conn: Connection, *, run_id: str, member_token_ids: Sequence[str], subject: str) -> None:
+        """Lock a failure verdict's member tokens, refusing a missing or foreign one."""
+        token_rows = conn.execute(
+            select(tokens_table.c.token_id, tokens_table.c.run_id)
+            .where(tokens_table.c.token_id.in_(member_token_ids))
+            .order_by(tokens_table.c.token_id)
+            .with_for_update(of=tokens_table)
+        ).all()
+        if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
+            raise AuditIntegrityError(f"{subject} references a missing or foreign member token")
+
+    @staticmethod
+    def _lock_verdict_state_on(conn: Connection, *, run_id: str, state_id: str, node_id: str, subject: str) -> tuple[str, str]:
+        """Lock one node_state a failure verdict completes; return its (status, token_id).
+
+        Refuses a state that is missing, belongs to another run, or sits at
+        another node.
+        """
+        state = conn.execute(
+            select(node_states_table.c.run_id, node_states_table.c.node_id, node_states_table.c.status, node_states_table.c.token_id)
+            .where(node_states_table.c.state_id == state_id)
+            .with_for_update(of=node_states_table)
+        ).one_or_none()
+        if state is None or state.run_id != run_id or state.node_id != node_id:
+            raise AuditIntegrityError(f"{subject} references a missing, foreign, or wrong-node state")
+        return str(state.status), str(state.token_id)
+
+    def complete_collector_failure(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        collector_node_id: str,
+        flush_state_id: str | None,
+        flush_error: ExecutionError | None,
+        flush_duration_ms: float | None,
+        member_holds: Sequence[tuple[TokenRef, str, float]],
+        hold_error: ExecutionError,
+    ) -> None:
+        """Record a collector group's FAILED verdict atomically: the group's one durable failure.
+
+        A collector group fails as a whole (``CollectorExecutor._fail_group``):
+        a ``require_all`` roster closed with lost members, the plugin returned
+        ``TransformResult.error``, or a Tier-2 contract violation. The verdict
+        is ONE leader-fenced transaction:
+
+        - the flush's opener-anchored node_state FAILED with ``flush_error``
+          (absent for the lost-members arm, which never opens a flush);
+        - every arrived member's accept-time hold FAILED with ``hold_error``,
+          the group-level ``CollectorGroupFailure`` each survivor carries.
+
+        So the holds ARE the verdict's witness. OPEN holds mean no verdict:
+        a flush that died before this commits is re-run on resume. FAILED
+        ``CollectorGroupFailure`` holds on members the journal still holds
+        BLOCKED mean a recorded verdict, and resume completes its disposition
+        without the plugin (the aggregation twin is
+        ``complete_aggregation_failure``, operator ruling 2026-09-23). Before
+        this verb each hold completed in its own transaction, so a crash
+        after the first left a group restore treated as closed while its
+        members stayed BLOCKED forever.
+
+        ``member_holds`` is ``(member, hold state_id, hold duration_ms)`` in
+        member order.
+
+        Raises:
+            AuditIntegrityError: The members are empty, repeated or cross the
+                run; a flush state is named without its error or vice versa;
+                a state is missing, foreign, at another node, not OPEN, or a
+                hold does not belong to its member.
+        """
+        subject = "collector failure verdict"
+        run_id = coordination_token.run_id
+        member_token_ids = self._validate_verdict_members(
+            [ref for ref, _state_id, _duration in member_holds], run_id=run_id, subject=subject
+        )
+        if (flush_state_id is None) != (flush_error is None) or (flush_state_id is None) != (flush_duration_ms is None):
+            raise AuditIntegrityError(f"{subject} names a flush state, its error and its duration together or not at all")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_collector_failure",
+        ) as conn:
+            self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject=subject)
+            if flush_state_id is not None:
+                flush_status, _opener = self._lock_verdict_state_on(
+                    conn, run_id=run_id, state_id=flush_state_id, node_id=collector_node_id, subject=subject
+                )
+                if flush_status != NodeStateStatus.OPEN.value:
+                    raise AuditIntegrityError(f"{subject} requires an OPEN flush state")
+            for ref, hold_state_id, _duration in member_holds:
+                hold_status, hold_token_id = self._lock_verdict_state_on(
+                    conn, run_id=run_id, state_id=hold_state_id, node_id=collector_node_id, subject=subject
+                )
+                if hold_status != NodeStateStatus.OPEN.value or hold_token_id != ref.token_id:
+                    raise AuditIntegrityError(f"{subject} requires every member's own OPEN accept-time hold")
+            failed_states: list[tuple[str, float, ExecutionError]] = [
+                (hold_state_id, hold_duration_ms, hold_error) for _ref, hold_state_id, hold_duration_ms in member_holds
+            ]
+            if flush_state_id is not None and flush_error is not None and flush_duration_ms is not None:
+                failed_states.insert(0, (flush_state_id, flush_duration_ms, flush_error))
+            self.node_states.complete_node_states_failed_many(failed_states, conn=conn)
+
+    def complete_aggregation_failure(
+        self,
+        *,
+        batch_id: str,
+        coordination_token: CoordinationToken,
+        aggregation_node_id: str,
+        state_id: str,
+        trigger_type: TriggerType,
+        members: Sequence[tuple[TokenRef, PipelineRow]],
+        reason: TransformErrorReason,
+        destination: str,
+        divert_edge_id: str | None,
+        duration_ms: float,
+    ) -> None:
+        """Record a batch transform's FAILED verdict atomically: the batch's one durable failure.
+
+        A batch transform that returns ``TransformResult.error`` fails the
+        whole batch. Its verdict is recorded in ONE leader-fenced transaction:
+
+        - one ``transform_errors`` row per member, in member order, with the
+          (already scrubbed) ``reason`` and ``destination`` = the aggregation's
+          ``on_error`` (a sink name or ``"discard"``) — operator ruling B5;
+        - for a named sink, the flush state's ONE DIVERT ``routing_event``
+          along ``divert_edge_id``;
+        - the flush node_state FAILED with ``error_json`` = the reason;
+        - the batch FAILED, bound to that state.
+
+        So a verdict either exists whole or not at all. A flush that dies
+        before this commits recorded no verdict and is re-run on resume; once
+        it commits, the verdict is final — resume completes its disposition
+        from these rows and never re-invokes the plugin (operator ruling,
+        2026-09-23). ``BatchRepository.recorded_failure_verdict`` is the one
+        reader of that fact.
+
+        Raises:
+            AuditIntegrityError: The members are empty, repeated or cross the
+                run; the reason category is unknown; a named destination has no
+                DIVERT edge (or ``"discard"`` has one); the state is not this
+                node's OPEN flush state; the batch is not this node's EXECUTING
+                batch; the members are not the batch's exact ordered
+                membership; or a member is not live in the batch lineage.
+        """
+        run_id = coordination_token.run_id
+        subject = "aggregation failure verdict"
+        member_token_ids = self._validate_verdict_members([ref for ref, _row in members], run_id=run_id, subject=subject)
+        if (destination == "discard") != (divert_edge_id is None):
+            raise AuditIntegrityError(
+                f"aggregation failure verdict destination {destination!r} disagrees with its DIVERT edge {divert_edge_id!r}: "
+                "a named on_error sink routes along exactly one DIVERT edge, and discard along none"
+            )
+        divert_event = (
+            self.node_states.prepare_routing_event(
+                state_id,
+                divert_edge_id,
+                RoutingMode.DIVERT,
+                reason,
+                owner="complete_aggregation_failure",
+            )
+            if divert_edge_id is not None
+            else None
+        )
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_aggregation_failure",
+        ) as conn:
+            self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject=subject)
+            state_status, _state_token_id = self._lock_verdict_state_on(
+                conn, run_id=run_id, state_id=state_id, node_id=aggregation_node_id, subject=subject
+            )
+            batch = conn.execute(
+                select(
+                    batches_table.c.run_id,
+                    batches_table.c.aggregation_node_id,
+                    batches_table.c.status,
+                    batches_table.c.aggregation_state_id,
+                    batches_table.c.retry_of_batch_id,
+                )
+                .where(batches_table.c.batch_id == batch_id)
+                .with_for_update(of=batches_table)
+            ).one_or_none()
+            if batch is None or batch.run_id != run_id or batch.aggregation_node_id != aggregation_node_id:
+                raise AuditIntegrityError("aggregation failure verdict references a missing, foreign, or wrong-node batch")
+            if (
+                state_status != NodeStateStatus.OPEN.value
+                or batch.status != BatchStatus.EXECUTING.value
+                or batch.aggregation_state_id not in (None, state_id)
+            ):
+                raise AuditIntegrityError("aggregation failure verdict requires an OPEN state and an EXECUTING batch")
+            batch_member_rows = conn.execute(
+                select(batch_members_table.c.token_id)
+                .where(batch_members_table.c.batch_id == batch_id)
+                .where(batch_members_table.c.run_id == run_id)
+                .order_by(batch_members_table.c.ordinal)
+            ).all()
+            if tuple(str(row.token_id) for row in batch_member_rows) != member_token_ids:
+                raise AuditIntegrityError("aggregation failure verdict members do not match exact ordered batch membership")
+            self._require_live_unterminated_members_on(
+                conn,
+                run_id=run_id,
+                batch_id=batch_id,
+                aggregation_node_id=aggregation_node_id,
+                retry_of_batch_id=batch.retry_of_batch_id,
+                member_token_ids=member_token_ids,
+                subject="aggregation failure verdict",
+            )
+            insert_batch_transform_errors_on(
+                conn,
+                run_id=coordination_token.run_id,
+                members=members,
+                transform_id=aggregation_node_id,
+                error_details=reason,
+                destination=destination,
+            )
+            if divert_event is not None:
+                self.node_states.record_routing_event_on(
+                    divert_event, conn=conn, run_id=coordination_token.run_id, owner="complete_aggregation_failure"
+                )
+            self.node_states.complete_node_state_on(
+                run_id=coordination_token.run_id,
+                state_id=state_id,
+                status=NodeStateStatus.FAILED,
+                duration_ms=duration_ms,
+                error=reason,
+                conn=conn,
+            )
+            self.batches.complete_batch_on(
+                run_id=coordination_token.run_id,
+                batch_id=batch_id,
+                status=BatchStatus.FAILED,
+                trigger_type=trigger_type,
+                state_id=state_id,
+                conn=conn,
+            )
+
     def get_batch(self, batch_id: str) -> Batch | None:
         """Get a batch by ID."""
         return self.batches.get_batch(batch_id)
@@ -1204,7 +1555,7 @@ class ExecutionRepository:
         return self.batches.get_batches(run_id, status=status, node_id=node_id)
 
     def get_incomplete_batches(self, run_id: str) -> list[Batch]:
-        """Get batches that need recovery (draft, executing, or failed)."""
+        """Get batches whose flush recovery must (re-)run; a recorded FAILED verdict is final and excluded."""
         return self.batches.get_incomplete_batches(run_id)
 
     def get_batch_members(self, batch_id: str) -> list[BatchMember]:

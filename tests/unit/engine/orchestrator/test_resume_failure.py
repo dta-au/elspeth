@@ -23,7 +23,7 @@ from elspeth.contracts import Checkpoint, NodeID, PluginSchema, ResumedRow, Resu
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenOutcome
 from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken
-from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import NodeType, RunMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunSummary
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError, PayloadStore
@@ -585,7 +585,7 @@ class TestResumeFinalizesAsFailed:
         config = MagicMock(spec=PipelineConfig)
         graph = MagicMock(spec=ExecutionGraph)
         payload_store = MagicMock(spec=PayloadStore)
-        settings = MagicMock(spec=ElspethSettings)
+        settings = MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None)
 
         # Mock factory to capture finalize_run calls
         mock_factory = MagicMock(spec=RecorderFactory)
@@ -781,7 +781,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1080,7 +1080,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1141,7 +1141,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -1203,7 +1203,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -1270,7 +1270,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id),
+            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id, run_mode=RunMode.LIVE),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -1329,7 +1329,7 @@ class TestResumeFinalizesAsFailed:
         )
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id),
+            ctx=MagicMock(spec=PluginContext, run_id=processor.run_id, run_mode=RunMode.LIVE),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -1421,7 +1421,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1507,7 +1507,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"refunds_sink": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1575,7 +1575,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1706,7 +1706,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1788,7 +1788,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"refunds_sink": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1866,7 +1866,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"refunds_sink": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext, contract=orders_contract),
+            ctx=MagicMock(spec=PluginContext, contract=orders_contract, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -1915,7 +1915,7 @@ class TestResumeFinalizesAsFailed:
         processor.summarize_unresolved_scheduler_work.return_value = ("READY count=1 node=transform-normalize",)
         run_ctx = SimpleNamespace(
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             agg_transform_lookup={},
             coalesce_executor=None,
             coalesce_node_map={},
@@ -2547,9 +2547,9 @@ class TestBuildProcessorCallsCleanupOnFailure:
 
         graph = MagicMock(spec=ExecutionGraph)
         graph.get_route_resolution_map.return_value = {}
-        settings = MagicMock(spec=ElspethSettings)
+        settings = MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None)
         payload_store = MagicMock(spec=PayloadStore)
-        mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory = MagicMock(spec=RecorderFactory, audited_sources=None)
 
         artifacts = GraphArtifacts(
             edge_map={},
@@ -2630,11 +2630,11 @@ class TestBuildProcessorCallsCleanupOnFailure:
             pytest.raises(RuntimeError, match="transform startup failed"),
         ):
             orch._context_factory.initialize_run_context(
-                MagicMock(spec=RecorderFactory),
+                MagicMock(spec=RecorderFactory, audited_sources=None),
                 "test-run",
                 config,
                 graph,
-                MagicMock(spec=ElspethSettings),
+                MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None),
                 artifacts,
                 MagicMock(spec=PayloadStore),
                 include_source_on_start=True,
@@ -2686,11 +2686,11 @@ class TestBuildProcessorCallsCleanupOnFailure:
             pytest.raises(RuntimeError, match="source startup failed"),
         ):
             orch._context_factory.initialize_run_context(
-                MagicMock(spec=RecorderFactory),
+                MagicMock(spec=RecorderFactory, audited_sources=None),
                 "test-run",
                 config,
                 graph,
-                MagicMock(spec=ElspethSettings),
+                MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None),
                 artifacts,
                 MagicMock(spec=PayloadStore),
                 include_source_on_start=True,
@@ -2742,11 +2742,11 @@ class TestBuildProcessorCallsCleanupOnFailure:
             pytest.raises(RuntimeError, match="sink startup failed"),
         ):
             orch._context_factory.initialize_run_context(
-                MagicMock(spec=RecorderFactory),
+                MagicMock(spec=RecorderFactory, audited_sources=None),
                 "test-run",
                 config,
                 graph,
-                MagicMock(spec=ElspethSettings),
+                MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None),
                 artifacts,
                 MagicMock(spec=PayloadStore),
                 include_source_on_start=True,
@@ -2799,11 +2799,11 @@ class TestBuildProcessorCallsCleanupOnFailure:
 
         with patch.object(orch._processor_factory, "build_processor", return_value=(processor, {}, None)):
             run_ctx = orch._context_factory.initialize_run_context(
-                MagicMock(spec=RecorderFactory),
+                MagicMock(spec=RecorderFactory, audited_sources=None),
                 "test-run",
                 config,
                 graph,
-                MagicMock(spec=ElspethSettings),
+                MagicMock(spec=ElspethSettings, run_mode=RunMode.LIVE, replay_from=None),
                 artifacts,
                 MagicMock(spec=PayloadStore),
                 include_source_on_start=True,
@@ -2997,7 +2997,7 @@ class TestResumeLoopCoordinationLatch:
             counters=ExecutionCounters(),
             pending_tokens={sink_name: []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -3145,7 +3145,7 @@ class TestResumeLoopCoordinationLatch:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,

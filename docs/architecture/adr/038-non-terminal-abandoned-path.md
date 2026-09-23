@@ -28,6 +28,14 @@ lifecycle state. The tokens are pending forever, and the audit trail
 contains a contradiction: a finished run that claims its work is still in
 flight.
 
+> **Note 2026-09-23 (elspeth-5887fb7928, operator ruling B2).** The
+> reproduction's vehicle no longer raises: a Tier-2 `PluginContractViolation`
+> from the flush's input-schema validation now fails the batch and follows the
+> aggregation's `on_error`, so its tokens are decided. The two pinned tests keep
+> their ids and now crash the flush with a batch plugin that raises
+> `RuntimeError`, which is still "a raised flush". Everything below about a
+> raised flush is unchanged.
+
 Two constraints make the obvious fixes wrong, both verified against source:
 
 1. **The executor must not terminalize.** Writing `(FAILURE, UNROUTED)` at

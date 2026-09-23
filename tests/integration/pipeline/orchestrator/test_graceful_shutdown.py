@@ -1007,6 +1007,7 @@ class TestInterruptAndResume:
         scheduler.mark_blocked(
             member_token=setup.coordination_token.membership,
             work_item_id=work_item.work_item_id,
+            row_payload_json=work_item.row_payload_json,
             queue_key=None,
             barrier_key="merge_paths",
             expected_lease_owner=leader_worker_id,

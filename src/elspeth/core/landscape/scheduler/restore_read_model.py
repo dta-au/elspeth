@@ -22,6 +22,7 @@ than re-deriving the join independently.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -37,16 +38,18 @@ from elspeth.contracts import (
     CommittedAggregationResidual,
     CommittedCoalesceResidual,
     NodeStateStatus,
+    RecordedAggregationFailure,
+    RoutingMode,
     TokenOutcome,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import BatchStatus, FrameKind, OutputMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
-from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
+from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids, recorded_failure_verdict_condition
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
@@ -59,11 +62,13 @@ from elspeth.core.landscape.schema import (
     group_losses_table,
     group_records_table,
     node_states_table,
+    routing_events_table,
     token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     token_work_items_table,
     tokens_table,
+    transform_errors_table,
 )
 
 _TOKEN_ID_CHUNK_SIZE = 500
@@ -81,6 +86,50 @@ class GroupRecordRow:
     # META-38's written release fact: non-NULL only for a collector RELEASE
     # group, whose "opener" is a group member, never a declared scope opener.
     closes_group_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCollectorGroupFailureHold:
+    """One member's hold that records its collector group's FAILED verdict."""
+
+    node_id: str
+    failure_reason: str
+
+
+_COLLECTOR_GROUP_FAILURE_TYPE = "CollectorGroupFailure"
+_SCOPE_GROUP_FAILED = GroupSettlementReason.SCOPE_GROUP_FAILED.value
+
+
+def _collector_group_failure_hold(token_id: str, node_id: str, error_json: str | None) -> RecordedCollectorGroupFailureHold | None:
+    """Parse one FAILED hold's ``error_json``: the group verdict it records, or None for any other failure.
+
+    The shape is the ``ExecutionError`` ``CollectorExecutor._fail_group``
+    writes: ``{"type": "CollectorGroupFailure", "context": {"failure_reason":
+    <str>, "member_disposition": "scope_group_failed", ...}, ...}``. A
+    group-failure hold that deviates from it is audit corruption, not a
+    shape to tolerate.
+    """
+    if error_json is None:
+        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has no error_json")
+    error = json.loads(error_json)
+    if type(error) is not dict or "type" not in error:
+        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has a malformed error_json")
+    if error["type"] != _COLLECTOR_GROUP_FAILURE_TYPE:
+        return None
+    context = error["context"] if "context" in error else None
+    if (
+        type(context) is not dict
+        or "failure_reason" not in context
+        or type(context["failure_reason"]) is not str
+        or not context["failure_reason"]
+        or "member_disposition" not in context
+        or context["member_disposition"] != _SCOPE_GROUP_FAILED
+    ):
+        raise AuditIntegrityError(
+            f"Collector group-failure hold of token {token_id!r} at {node_id!r} does not carry the verdict's failure_reason "
+            "and scope_group_failed disposition"
+        )
+    return RecordedCollectorGroupFailureHold(node_id=node_id, failure_reason=context["failure_reason"])
 
 
 def collector_scoped_completion_conflict(
@@ -298,6 +347,49 @@ class BarrierRestoreReadModel:
             )
             for row in self._ops.execute_fetchall(query):
                 result[row.token_id] = row.state_id
+        return result
+
+    def get_recorded_collector_group_failures(
+        self,
+        run_id: str,
+        *,
+        node_ids: Sequence[str],
+        token_ids: Sequence[str],
+    ) -> dict[str, RecordedCollectorGroupFailureHold]:
+        """Members whose accept-time hold records their collector group's FAILED verdict.
+
+        ``complete_collector_failure`` completes every arrived member's hold
+        FAILED with one ``CollectorGroupFailure`` error, in the verdict's own
+        transaction. Such a hold on a member the journal still holds BLOCKED
+        is a recorded verdict whose disposition the crashed process never
+        finished. Returns ``token_id -> (node_id, failure_reason)`` for those
+        holds at ``node_ids``. A FAILED hold of any other kind (a quarantined
+        member of a successful flush) is not a group verdict and is not
+        returned.
+
+        Raises:
+            AuditIntegrityError: A group-failure hold whose ``error_json`` is
+                not the shape the verdict writes (our own Tier-1 data).
+        """
+        if not node_ids:
+            return {}
+        result: dict[str, RecordedCollectorGroupFailureHold] = {}
+        for i in range(0, len(token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = list(token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            query = (
+                select(node_states_table.c.token_id, node_states_table.c.node_id, node_states_table.c.error_json)
+                .where(node_states_table.c.run_id == run_id)
+                .where(node_states_table.c.node_id.in_(list(node_ids)))
+                .where(node_states_table.c.token_id.in_(chunk))
+                .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
+            )
+            for row in self._ops.execute_fetchall(query):
+                hold = _collector_group_failure_hold(str(row.token_id), str(row.node_id), row.error_json)
+                if hold is None:
+                    continue
+                if row.token_id in result:
+                    raise AuditIntegrityError(f"Token {row.token_id!r} holds more than one collector group-failure verdict")
+                result[str(row.token_id)] = hold
         return result
 
     def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecordRow | None:
@@ -707,9 +799,13 @@ class BarrierRestoreReadModel:
     def find_failed_unrouted_terminal_token_ids(self, run_id: str, token_ids: Sequence[str]) -> frozenset[str]:
         """Token ids holding terminal ``(FAILURE, UNROUTED)`` outcomes.
 
-        This is the ADR-030 aggregation restore reconcile signature for a crash
-        after failed-flush terminal writes but before BLOCKED scheduler rows are
-        released.
+        This is the ADR-030 §E.3a restore reconcile signature for a crash after
+        terminal writes but before BLOCKED scheduler rows are released: an
+        aggregation flush's Tier-1 cross-check violation
+        (``RowProcessor._record_flush_violation``), a late row_union arrival,
+        and a row_union failed closure. A failed flush's discard terminals
+        commit inside ``complete_barrier`` with the release (operator ruling
+        B3), so ``(FAILURE, QUARANTINED_AT_SOURCE)`` is deliberately not read.
         """
         if not token_ids:
             return frozenset()
@@ -1316,6 +1412,154 @@ class BarrierRestoreReadModel:
             )
             claimed_member_ids.update(member_ids)
         return tuple(receipts)
+
+    def list_recorded_aggregation_failures(
+        self,
+        run_id: str,
+        *,
+        aggregation_node_id: str,
+        blocked_token_ids: Sequence[str],
+    ) -> tuple[RecordedAggregationFailure, ...]:
+        """Return recorded FAILED batch verdicts whose members are still BLOCKED.
+
+        A batch transform that returned an error records its verdict in one
+        transaction (``ExecutionRepository.complete_aggregation_failure``); a
+        crash after that commit but before the members' journal disposition
+        leaves the members BLOCKED behind a final verdict. Selection is the one
+        verdict predicate (``recorded_failure_verdict_condition``); every
+        selected verdict is then proved whole before it is returned, since
+        resume dispositions from it without re-invoking the plugin.
+
+        Raises:
+            AuditIntegrityError: A verdict's members are not all BLOCKED (a
+                barrier completion is atomic, so it released all or none), its
+                membership is malformed or overlaps another verdict, a member
+                lacks exactly one ``transform_errors`` row at the node, the
+                rows disagree with each other or with the FAILED flush
+                node_state's reason, or the DIVERT routing does not match the
+                recorded destination.
+        """
+        if not blocked_token_ids:
+            return ()
+        candidate_batch_ids: set[str] = set()
+        for i in range(0, len(blocked_token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = tuple(blocked_token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            rows = self._ops.execute_fetchall(
+                select(batches_table.c.batch_id)
+                .select_from(
+                    batches_table.join(
+                        batch_members_table,
+                        and_(
+                            batches_table.c.batch_id == batch_members_table.c.batch_id,
+                            batches_table.c.run_id == batch_members_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(batches_table.c.run_id == run_id)
+                .where(batches_table.c.aggregation_node_id == aggregation_node_id)
+                .where(batch_members_table.c.token_id.in_(chunk))
+                .where(recorded_failure_verdict_condition())
+                .distinct()
+            )
+            candidate_batch_ids.update(str(row.batch_id) for row in rows)
+
+        blocked_set = frozenset(blocked_token_ids)
+        verdicts: list[RecordedAggregationFailure] = []
+        claimed_member_ids: set[str] = set()
+        for batch_id in sorted(candidate_batch_ids):
+            header = self._ops.execute_fetchone(
+                select(
+                    batches_table.c.aggregation_state_id,
+                    node_states_table.c.node_id.label("state_node_id"),
+                    node_states_table.c.status.label("state_status"),
+                    node_states_table.c.error_json,
+                )
+                .select_from(
+                    batches_table.join(
+                        node_states_table,
+                        and_(
+                            batches_table.c.aggregation_state_id == node_states_table.c.state_id,
+                            batches_table.c.run_id == node_states_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(batches_table.c.batch_id == batch_id)
+                .where(batches_table.c.run_id == run_id)
+            )
+            if (
+                header is None
+                or header.state_node_id != aggregation_node_id
+                or header.state_status != NodeStateStatus.FAILED.value
+                or header.error_json is None
+            ):
+                raise AuditIntegrityError(f"Recorded FAILED verdict of batch {batch_id!r} lacks its FAILED flush node_state and reason")
+            state_id = str(header.aggregation_state_id)
+
+            member_rows = self._ops.execute_fetchall(
+                select(batch_members_table.c.token_id, batch_members_table.c.ordinal)
+                .where(batch_members_table.c.batch_id == batch_id)
+                .where(batch_members_table.c.run_id == run_id)
+                .order_by(batch_members_table.c.ordinal)
+            )
+            member_ids = tuple(str(row.token_id) for row in member_rows)
+            if not member_ids or tuple(int(row.ordinal) for row in member_rows) != tuple(range(len(member_rows))):
+                raise AuditIntegrityError(f"Recorded FAILED verdict of batch {batch_id!r} has invalid batch membership")
+            if not frozenset(member_ids).issubset(blocked_set) or claimed_member_ids.intersection(member_ids):
+                raise AuditIntegrityError(
+                    f"Recorded FAILED verdict of batch {batch_id!r} lacks an exact non-overlapping BLOCKED member set"
+                )
+
+            error_rows = self._ops.execute_fetchall(
+                select(
+                    transform_errors_table.c.token_id,
+                    transform_errors_table.c.error_details_json,
+                    transform_errors_table.c.destination,
+                )
+                .where(transform_errors_table.c.run_id == run_id)
+                .where(transform_errors_table.c.transform_id == aggregation_node_id)
+                .where(transform_errors_table.c.token_id.in_(member_ids))
+            )
+            if sorted(str(row.token_id) for row in error_rows) != sorted(member_ids):
+                raise AuditIntegrityError(
+                    f"Recorded FAILED verdict of batch {batch_id!r} needs exactly one transform_errors row per member at "
+                    f"node {aggregation_node_id!r}; found {len(error_rows)} for {len(member_ids)} members"
+                )
+            recorded = {(row.error_details_json, row.destination) for row in error_rows}
+            if len(recorded) != 1:
+                raise AuditIntegrityError(
+                    f"Recorded FAILED verdict of batch {batch_id!r} has members with divergent reasons or destinations"
+                )
+            ((recorded_reason_json, recorded_destination),) = recorded
+            if recorded_reason_json != header.error_json:
+                raise AuditIntegrityError(
+                    f"Recorded FAILED verdict of batch {batch_id!r}: the transform_errors reason disagrees with the flush node_state's"
+                )
+            reason_json, destination = str(header.error_json), str(recorded_destination)
+
+            route_modes = [
+                str(row.mode)
+                for row in self._ops.execute_fetchall(
+                    select(routing_events_table.c.mode).where(routing_events_table.c.state_id == state_id)
+                )
+            ]
+            expected_modes = [] if destination == "discard" else [RoutingMode.DIVERT.value]
+            if route_modes != expected_modes:
+                raise AuditIntegrityError(
+                    f"Recorded FAILED verdict of batch {batch_id!r} (destination {destination!r}) has flush routing "
+                    f"{route_modes!r}; expected {expected_modes!r}"
+                )
+            verdicts.append(
+                RecordedAggregationFailure(
+                    batch_id=batch_id,
+                    aggregation_node_id=aggregation_node_id,
+                    aggregation_state_id=state_id,
+                    member_token_ids=member_ids,
+                    reason_json=reason_json,
+                    destination=destination,
+                )
+            )
+            claimed_member_ids.update(member_ids)
+        return tuple(verdicts)
 
     def find_released_node_state_token_ids(
         self,

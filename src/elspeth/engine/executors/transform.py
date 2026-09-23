@@ -2,7 +2,7 @@
 
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -41,7 +41,8 @@ from elspeth.contracts.errors import (
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -52,6 +53,7 @@ from elspeth.engine.executors.declaration_dispatch import (
     run_post_emission_checks,
     run_pre_emission_checks,
 )
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.spans import SpanFactory
 
@@ -59,14 +61,6 @@ if TYPE_CHECKING:
     from elspeth.contracts import TransformErrorReason
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.engine.batch_adapter import SharedBatchAdapter
-
-
-def _scrub_transform_error_details(error_details: "TransformErrorReason") -> "TransformErrorReason":
-    """Scrub freeform transform error payload while preserving category fields."""
-    scrubbed = scrub_payload_for_audit(error_details)
-    if scrubbed == error_details:
-        return error_details
-    return cast("TransformErrorReason", scrubbed)
 
 
 class TransformResultError(Exception):
@@ -102,7 +96,7 @@ def record_transform_error_with_routing(
     if node_id is None:
         raise OrchestrationInvariantError(f"Transform '{transform.name}' executed without node_id - orchestrator bug")
 
-    scrubbed_error_details = _scrub_transform_error_details(error_details)
+    scrubbed_error_details = scrub_transform_error_reason(error_details)
 
     # Validate the complete DIVERT envelope before writing either half. A
     # transform_error without its required routing_event is contradictory
@@ -454,7 +448,8 @@ class TransformExecutor:
             transform.input_schema.model_validate(input_dict, strict=True)
         except ValidationError as e:
             input_violation = PluginContractViolation(
-                f"Transform '{transform.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                f"Transform '{transform.name}' input validation failed: {safe_validation_error_text(e)}. "
+                "This indicates an upstream transform/source schema bug."
             )
             raise input_violation from e
 
@@ -585,7 +580,7 @@ class TransformExecutor:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
                 output_violation = PluginContractViolation(
-                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {e}. "
+                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {safe_validation_error_text(e)}. "
                     "This indicates a transform schema bug."
                 )
                 raise output_violation from e
@@ -621,12 +616,12 @@ class TransformExecutor:
             else:
                 result.output_hash = None
         except (TypeError, ValueError) as e:
-            canonicalization_violation = PluginContractViolation(
-                f"Transform '{transform.name}' emitted non-canonical data: {e}. "
-                f"Ensure output contains only JSON-serializable types. "
-                f"Use None instead of NaN for missing values."
-            )
-            raise canonicalization_violation from e
+            raise non_canonical_output_violation(
+                producer=f"Transform '{transform.name}'",
+                output_schema=transform.output_schema,
+                result=result,
+                exc=e,
+            ) from e
         result.duration_ms = duration_ms
 
     def _prepare_success_completion(
@@ -944,7 +939,7 @@ class TransformExecutor:
                             f"Transform '{transform.name}' returned error but reason is None. "
                             'Use TransformResult.error({{"reason": "...", ...}}) to create error results.'
                         )
-                    sanitized_reason = _scrub_transform_error_details(result.reason)
+                    sanitized_reason = scrub_transform_error_reason(result.reason)
                     result.reason = sanitized_reason
 
                     # Record transform_error + DIVERT routing_event BEFORE terminal

@@ -169,6 +169,7 @@ class _PeerSimulatingSource(_TestSourceBase):
         if self._peer_completes_into_barrier:
             repo.mark_blocked(
                 work_item_id=claimed.work_item_id,
+                row_payload_json=claimed.row_payload_json,
                 queue_key=None,
                 barrier_key=str(sample["barrier_key"]),
                 expected_lease_owner=PEER_OWNER,
@@ -245,6 +246,7 @@ class TestEofFlushQuiescenceGating:
         with pytest.raises(RunMembershipLostError):
             repo.mark_blocked(
                 work_item_id=str(peer_row["work_item_id"]),
+                row_payload_json=str(peer_row["row_payload_json"]),
                 queue_key=None,
                 barrier_key=str(blocked[0]["barrier_key"]),
                 expected_lease_owner=PEER_OWNER,

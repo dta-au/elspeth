@@ -621,6 +621,7 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
     blocked = repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key="queue-a",
         barrier_key=None,
         expected_lease_owner="worker-a",
@@ -823,7 +824,9 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
     assert work_item["lease_expires_at"] is None
 
     if expected_status is TokenWorkStatus.BLOCKED:
-        assert work_item["row_payload_json"] == payload
+        # The hold records the token as held, as a PENDING_SINK park does: a
+        # claim may have run transforms since the READY enqueue.
+        assert work_item["row_payload_json"] == replacement_payload
         assert work_item["queue_key"] == "queue-a"
         assert work_item["barrier_key"] is None
         assert work_item["barrier_blocked_at"] == work_item["updated_at"]
@@ -1029,6 +1032,7 @@ def test_mark_blocked_refuses_missing_release_key_without_mutation() -> None:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key=None,
             expected_lease_owner="worker-b",
@@ -1768,6 +1772,7 @@ def test_blocked_barrier_terminalization_records_transition_event() -> None:
     blocked = repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="join:1",
         expected_lease_owner="worker-a",
@@ -1816,6 +1821,7 @@ def test_blocked_barrier_pending_sink_handoff_records_state_and_event() -> None:
     repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="agg-1",
         expected_lease_owner="worker-a",
@@ -2139,6 +2145,7 @@ def _invoke_normal_disposition(
         return repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id="run-1", worker_id=expected_lease_owner),
             work_item_id=work_item_id,
+            row_payload_json=payload,
             queue_key="queue-a",
             barrier_key=None,
             expected_lease_owner=expected_lease_owner,

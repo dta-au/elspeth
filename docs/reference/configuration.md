@@ -93,8 +93,19 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | Mode | Behavior |
 |------|----------|
 | `live` | Execute normally, make real external calls |
-| `replay` | Use recorded responses from a previous run |
-| `verify` | Compare new results against a previous run |
+| `replay` | Reconstruct audited source rows and external responses from `replay_from`; execute the pipeline without contacting those providers or publishing configured sinks |
+| `verify` | Read current sources and call providers, compare complete source and call evidence with `replay_from`, and publish no configured sinks |
+
+Replay and verify require a completed, compatible source run with retained
+payloads and call evidence. The runtime rejects missing or ambiguous evidence,
+changed graph or plugin implementations, and capabilities it cannot safely
+run in the selected mode. Both modes write a new Landscape audit run. They
+compare canonical rows at each sink boundary, including node, role, ingest
+sequence, disposition, and payload hash; this does not compare serialized sink
+bytes or external artifacts. A mismatch makes verify fail. Concurrency must
+be one worker. Dependency runs, collection probes, commencement gates, audit
+export, remote telemetry, and remote Key Vault secrets are refused in these
+modes until they have an explicit replay or verify contract.
 
 ---
 
@@ -1856,7 +1867,7 @@ aggregations:
     plugin: batch_stats
     input: enriched
     on_success: output
-    on_error: discard           # Sink name for batch errors, or 'discard'
+    on_error: discard           # Sink for every row of a failed batch, or 'discard'
     trigger:
       count: 100              # Fire after 100 rows
       timeout_seconds: 3600   # Or after 1 hour
@@ -1876,8 +1887,8 @@ aggregations:
 | `plugin` | string | **Yes** | Aggregation plugin name |
 | `input` | string | **Yes** | Connection name to receive data from |
 | `on_success` | string | No | Where successful output rows go (sink name or connection name) |
-| `on_error` | string | **Yes** | Sink name for rows that fail batch processing, or `discard` |
-| `trigger` | object | **Yes** | When to flush the batch |
+| `on_error` | string | **Yes** | Where the rows of a FAILED batch go. A batch fails as a whole: when the batch transform returns an error, EVERY buffered row is written to this sink with its original values (each recorded `on_error_routed` with the batch reason), or with `discard` each row is recorded quarantined without being written. A plugin contract violation raised before the flush records anything (for example a buffered row that fails the aggregation's typed `schema`) fails the batch the same way; any other exception the batch transform raises still aborts the run. |
+| `trigger` | object | No | When to flush the batch early; omit for end-of-source only |
 | `output_mode` | string | No | `passthrough` or `transform` (default: `transform`) |
 | `expected_output_count` | int | No | For `transform` mode: validate output row count |
 | `options` | object | No | Plugin-specific configuration |
@@ -1905,9 +1916,17 @@ aggregations:
 
 Omit `trigger` to emit a single report covering all source rows at end-of-source.
 
+`report_assemble` is aggregation-only. Its pagination fields come from the
+aggregation flush window, and a collector's end-of-group flush has no window, so
+`elspeth validate` refuses it under `collectors:`. It also refuses any
+batch-aware plugin under `transforms:`, because a batch plugin processes a list
+of rows and cannot run one row at a time.
+
 ### Trigger Configuration
 
-At least one trigger type is required:
+Every trigger type is optional. Configure any combination for early flushes, or
+omit `trigger` (or use `{}`) to flush only at end of source, which is always
+checked:
 
 | Trigger | Type | Description |
 |---------|------|-------------|
@@ -2177,7 +2196,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 43
+### Landscape schema epoch 44
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2232,16 +2251,19 @@ approved prompt artifact anchor, paired with session epoch 57. Epoch 42 requires
 admission evidence v2 with token quota usage and limits; its decoder rejects
 stored v1 evidence, requiring recreation even with an unchanged table layout.
 Epoch 43 gives every digest column a shape CHECK, paired with session epoch 63;
-SQLite ignores a declared `VARCHAR` width, so the width alone admitted any text. See the
+SQLite ignores a declared `VARCHAR` width, so the width alone admitted any text.
+Epoch 44 records run mode and source-run lineage, links replayed calls to their
+source calls, stores verification decisions, and assigns fenced occurrence
+indices to operations created under the run leader. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-42, either automatically at startup or through an operator migration command.
+44, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-43 database.
+an older epoch must not be rolled back over an epoch-44 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

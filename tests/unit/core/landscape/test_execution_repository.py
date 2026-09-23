@@ -2957,6 +2957,48 @@ class TestDelegationSignatureAlignment:
         ),
         pytest.param("record_call", lambda execution: execution.record_call, ExecutionRepository.record_call, id="record_call"),
         pytest.param(
+            "record_verification_decision",
+            lambda execution: execution.record_verification_decision,
+            ExecutionRepository.record_verification_decision,
+            id="record_verification_decision",
+        ),
+        pytest.param(
+            "get_verification_decision",
+            lambda execution: execution.get_verification_decision,
+            ExecutionRepository.get_verification_decision,
+            id="get_verification_decision",
+        ),
+        pytest.param(
+            "get_verification_decisions_for_run",
+            lambda execution: execution.get_verification_decisions_for_run,
+            ExecutionRepository.get_verification_decisions_for_run,
+            id="get_verification_decisions_for_run",
+        ),
+        pytest.param(
+            "get_all_calls_for_run",
+            lambda execution: execution.get_all_calls_for_run,
+            ExecutionRepository.get_all_calls_for_run,
+            id="get_all_calls_for_run",
+        ),
+        pytest.param(
+            "find_call_for_current_parent",
+            lambda execution: execution.find_call_for_current_parent,
+            ExecutionRepository.find_call_for_current_parent,
+            id="find_call_for_current_parent",
+        ),
+        pytest.param(
+            "list_source_calls_for_current_parent",
+            lambda execution: execution.list_source_calls_for_current_parent,
+            ExecutionRepository.list_source_calls_for_current_parent,
+            id="list_source_calls_for_current_parent",
+        ),
+        pytest.param(
+            "get_call_request_data",
+            lambda execution: execution.get_call_request_data,
+            ExecutionRepository.get_call_request_data,
+            id="get_call_request_data",
+        ),
+        pytest.param(
             "begin_operation", lambda execution: execution.begin_operation, ExecutionRepository.begin_operation, id="begin_operation"
         ),
         pytest.param(
@@ -3049,6 +3091,18 @@ class TestDelegationSignatureAlignment:
             lambda execution: execution.complete_aggregation_result,
             ExecutionRepository.complete_aggregation_result,
             id="complete_aggregation_result",
+        ),
+        pytest.param(
+            "complete_aggregation_failure",
+            lambda execution: execution.complete_aggregation_failure,
+            ExecutionRepository.complete_aggregation_failure,
+            id="complete_aggregation_failure",
+        ),
+        pytest.param(
+            "complete_collector_failure",
+            lambda execution: execution.complete_collector_failure,
+            ExecutionRepository.complete_collector_failure,
+            id="complete_collector_failure",
         ),
         pytest.param(
             "get_max_node_state_attempts",

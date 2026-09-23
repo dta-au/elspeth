@@ -14,14 +14,20 @@ hierarchy) still crashes the run, so the executor still records FAILURE/UNROUTED
 itself. Sink-boundary violations are a separate surface and keep the crashing
 shape. The tests below are split along exactly that line.
 
-SCOPE BOUNDARY, learned the hard way: this applies to ROW-LEVEL violations,
-whose fate is decided where they raise. It does NOT extend to the aggregation
-flush sites, which look identical but must never terminalize — see
-``test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens``.
-The aggregation half is instead decided at run finalization (ADR-038): a
-FAILED/INTERRUPTED stamp on a non-resumable run records ``(NULL, ABANDONED)``
-for every undecided token — see
-``test_aggregation_count_flush_violation_abandons_tokens_at_finalization``.
+At the aggregation flush the same Tier-2 violation now fails the whole batch
+and each buffered token is terminalized ONCE by the aggregation's ``on_error``
+(operator ruling 2026-09-23, elspeth-5887fb7928 B2) — see
+``test_aggregation_flush_input_violation_decides_every_token_once``.
+
+SCOPE BOUNDARY, learned the hard way: a flush that RAISES (a plugin crash, not
+a routed violation) must never terminalize where it raises — see
+``test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens``. That
+half is instead decided at run finalization (ADR-038): a FAILED/INTERRUPTED
+stamp on a non-resumable run records ``(NULL, ABANDONED)`` for every undecided
+token — see ``test_aggregation_count_flush_violation_abandons_tokens_at_finalization``.
+These two used the input-validation violation as their crash until B2 made it
+route; a raising plugin is the crash that remains. Their ids are kept because
+ADR-038 and the barrier-scopes spec cite them.
 """
 
 from __future__ import annotations
@@ -169,6 +175,26 @@ class _BatchInputValidationFailer(BaseTransform):
         )
 
 
+class _BatchProcessCrasher(BaseTransform):
+    """Batch transform whose process() raises a plain plugin crash (not a routed violation)."""
+
+    name = "batch-process-crasher"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = None
+    input_schema = _TestSchema
+    output_schema = _TestSchema
+    is_batch_aware = True
+    on_success = "output"
+    on_error = "discard"
+
+    def __init__(self) -> None:
+        super().__init__({"schema": {"mode": "observed"}})
+
+    def process(self, rows: list[PipelineRow], ctx: Any) -> TransformResult:  # type: ignore[override]
+        raise RuntimeError("injected batch flush crash")
+
+
 def _build_failing_aggregation(
     transform: BaseTransform,
     *,
@@ -223,17 +249,17 @@ def _source_lifecycle_states(db: LandscapeDB, run_id: str) -> dict[str, str]:
 def _run_failing_aggregation(
     db: LandscapeDB, tmp_path: Path, *, trigger_count: int
 ) -> tuple[str, RecoveryManager, ExecutionGraph, CheckpointManager]:
-    """Crash a 3-row aggregation on an input-validation violation, checkpointed."""
+    """Crash a 3-row aggregation on a raising batch plugin, checkpointed."""
     checkpoint_mgr = CheckpointManager(db)
     checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
     config, graph, output_sink = _build_failing_aggregation(
-        _BatchInputValidationFailer(),
+        _BatchProcessCrasher(),
         source_data=[{"value": 1}, {"value": 2}, {"value": 3}],
         trigger_count=trigger_count,
     )
     orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
-    with pytest.raises(PluginContractViolation, match="input validation failed"):
+    with pytest.raises(RuntimeError, match="injected batch flush crash"):
         orchestrator.run(config, graph=graph, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
 
     assert output_sink.results == []
@@ -271,6 +297,39 @@ def _assert_all_tokens_abandoned(db: LandscapeDB, run_id: str) -> None:
     for row in abandoned_rows:
         assert row.outcome is None
         assert row.completed == 0
+
+
+def test_aggregation_flush_input_violation_decides_every_token_once(tmp_path: Path) -> None:
+    """A buffered row failing the aggregation's declared input schema fails the batch.
+
+    Tier-2 at the flush as at the transform seam (B2): the run finishes, and
+    ``on_error: discard`` records every buffered token once as
+    ``(FAILURE, QUARANTINED_AT_SOURCE)`` — no pending, no abandoned, closure
+    ``closed``. Before B2 this raised and left all three undecided.
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    config, graph, output_sink = _build_failing_aggregation(
+        _BatchInputValidationFailer(),
+        source_data=[{"value": 1}, {"value": 2}, {"value": 3}],
+        trigger_count=3,
+    )
+
+    result = Orchestrator(db).run(config, graph=graph, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
+    assert output_sink.results == []
+    accounting = load_run_accounting_from_db(db, landscape_run_id=result.run_id)
+    assert accounting.tokens.emitted == 3
+    assert accounting.tokens.pending == 0
+    assert accounting.tokens.abandoned == 0
+    assert accounting.integrity.missing_terminal_outcomes == 0
+    assert accounting.integrity.closure == "closed"
+    with db.connection() as conn:
+        outcomes = conn.execute(
+            select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id).where(token_outcomes_table.c.completed == 1)
+        ).fetchall()
+    assert len(outcomes) == 3
+    assert {(row.outcome, row.path) for row in outcomes} == {(TerminalOutcome.FAILURE.value, TerminalPath.QUARANTINED_AT_SOURCE.value)}
 
 
 def test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens(tmp_path: Path) -> None:
@@ -350,7 +409,7 @@ def test_aggregation_count_flush_violation_abandons_tokens_at_finalization(tmp_p
         Orchestrator(db, checkpoint_manager=checkpoint_mgr).resume(
             resume_point=resume_point,
             config=_build_failing_aggregation(
-                _BatchInputValidationFailer(),
+                _BatchProcessCrasher(),
                 source_data=[{"value": 1}, {"value": 2}, {"value": 3}],
                 trigger_count=3,
             )[0],

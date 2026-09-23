@@ -18,20 +18,28 @@ Dependencies held by the factory:
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import (
     TransformProtocol,
 )
 from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.call_mode import CallModeSession
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
+from elspeth.core.replay_payload_store import SourceBoundPayloadStore, collect_source_payload_refs
+from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins, plugin_node_scope
 from elspeth.engine.orchestrator.graph_wiring import assign_plugin_node_ids
+from elspeth.engine.orchestrator.run_modes import RuntimeRunMode, resolve_runtime_run_mode
 from elspeth.engine.orchestrator.run_state import (
     AggNodeEntry,
     RunContext,
 )
+from elspeth.engine.orchestrator.source_compatibility import admit_registered_graph
+from elspeth.engine.orchestrator.source_replay import AuditedSource, prepare_verified_sources
 
 if TYPE_CHECKING:
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
@@ -87,12 +95,14 @@ class RunContextFactory:
         concurrency_config: RuntimeConcurrencyConfig | None,
         processor_factory: ProcessorFactory,
         llm_call_governance: LLMCallGovernance | None = None,
+        call_mode_session_factory: Callable[[RecorderFactory, RuntimeRunMode, str], CallModeSession] | None = None,
     ) -> None:
         self._ceremony = ceremony
         self._rate_limit_registry = rate_limit_registry
         self._concurrency_config = concurrency_config
         self._processor_factory = processor_factory
         self._llm_call_governance = llm_call_governance
+        self._call_mode_session_factory = call_mode_session_factory
 
     def initialize_run_context(
         self,
@@ -146,17 +156,66 @@ class RunContextFactory:
         )
 
         # Create context with the PluginAuditWriter
+        runtime_mode = resolve_runtime_run_mode(config, settings)
+        call_mode_session: CallModeSession | None = None
+        plugin_payload_store = payload_store
+        if runtime_mode.mode is not RunMode.LIVE:
+            source_run_id = runtime_mode.replay_from
+            if source_run_id is None:
+                raise RuntimeError("Replay/verify source run ID is missing")
+            if factory.audited_sources is None:
+                raise RuntimeError("Replay/verify source snapshot was not admitted before plugin startup")
+            admit_registered_graph(factory, source_run_id=source_run_id, current_run_id=run_id)
+            blob_ref_fields: set[str] = set()
+            for transform in config.transforms:
+                if transform.name not in {"blob_csv_expand", "blob_json_expand", "blob_text_expand", "pdf_rasterize"}:
+                    continue
+                if transform.name == "blob_csv_expand" and "source" in transform.config and transform.config["source"] == "field":
+                    continue
+                field_name = transform.config["blob_ref_field"] if "blob_ref_field" in transform.config else "blob_ref"
+                if type(field_name) is not str or not field_name:
+                    raise RuntimeError(f"Invalid blob_ref_field for {transform.name}")
+                blob_ref_fields.add(field_name)
+            refs = collect_source_payload_refs(
+                factory,
+                source_run_id,
+                source_store=payload_store,
+                blob_ref_fields=blob_ref_fields,
+            )
+            plugin_payload_store = SourceBoundPayloadStore(
+                mode=runtime_mode.mode,
+                source_store=payload_store,
+                current_store=payload_store,
+                source_refs=refs.input_refs,
+                output_refs=refs.output_refs,
+            )
+            if self._call_mode_session_factory is None:
+                if coordination_token is None:
+                    raise RuntimeError("Replay/verify requires a current leader token before call comparison")
+                call_mode_session = AuditedCallModeSession(
+                    factory,
+                    current_run_id=run_id,
+                    source_run_id=source_run_id,
+                    mode=runtime_mode.mode,
+                    coordination_token=coordination_token,
+                )
+            else:
+                call_mode_session = self._call_mode_session_factory(factory, runtime_mode, run_id)
         ctx = PluginContext(
             llm_call_governance=self._llm_call_governance,
             run_id=run_id,
             config=config.config,
             landscape=factory.plugin_audit_writer(),
-            payload_store=payload_store,
+            payload_store=plugin_payload_store,
             rate_limit_registry=self._rate_limit_registry,
             concurrency_config=self._concurrency_config,
             telemetry_emit=self._ceremony.emit_telemetry,
             shutdown_event=shutdown_event,
             coordination_token=coordination_token,
+            run_mode=runtime_mode.mode,
+            replay_from=runtime_mode.replay_from,
+            call_mode_session=call_mode_session,
+            audited_sources=factory.audited_sources,
         )
 
         # Set node_id on context for source validation error attribution
@@ -168,20 +227,32 @@ class RunContextFactory:
         started_transforms: list[TransformProtocol] = []
         started_sinks: dict[str, SinkProtocol] = {}
         try:
-            if include_source_on_start:
+            if include_source_on_start and runtime_mode.mode is not RunMode.REPLAY:
                 for source_name, source in config.sources.items():
                     with plugin_node_scope(ctx, source.node_id):
                         source.on_start(ctx)
                     started_sources[source_name] = source
                 ctx.node_id = source_id
+            if runtime_mode.mode is RunMode.VERIFY:
+                if coordination_token is None or factory.audited_sources is None:
+                    raise RuntimeError("Verify source preflight lacks coordination or audited source evidence")
+                ctx.verified_sources = prepare_verified_sources(
+                    factory,
+                    run_id,
+                    cast("Mapping[str, AuditedSource]", factory.audited_sources),
+                    config.sources,
+                    ctx,
+                    coordination_token,
+                )
             for transform in config.transforms:
                 with plugin_node_scope(ctx, transform.node_id):
                     transform.on_start(ctx)
                 started_transforms.append(transform)
-            for sink_name, sink in config.sinks.items():
-                with plugin_node_scope(ctx, sink.node_id):
-                    sink.on_start(ctx)
-                started_sinks[sink_name] = sink
+            if runtime_mode.mode is RunMode.LIVE:
+                for sink_name, sink in config.sinks.items():
+                    with plugin_node_scope(ctx, sink.node_id):
+                        sink.on_start(ctx)
+                    started_sinks[sink_name] = sink
 
             processor, coalesce_node_map, coalesce_executor = self._processor_factory.build_processor(
                 graph=graph,

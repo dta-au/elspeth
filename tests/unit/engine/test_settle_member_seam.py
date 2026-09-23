@@ -157,7 +157,6 @@ def aggregation_flush_processor():
             settings=settings,
             buffered_tokens=tokens,
             batch_id="batch-1",
-            error_msg="batch flush failed",
             expand_parent_token=tokens[0],
             triggering_token=None,
             coalesce_node_id=None,

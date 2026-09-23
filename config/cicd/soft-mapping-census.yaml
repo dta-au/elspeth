@@ -37,7 +37,9 @@ files:
     dict[str, Any]: 7
   src/elspeth/contracts/call_data.py:
     Mapping[str, Any]: 8
-    dict[str, Any]: 12
+    dict[str, Any]: 15
+  src/elspeth/contracts/call_mode.py:
+    Mapping[str, Any]: 15
   src/elspeth/contracts/chat_parts.py:
     dict[str, Any]: 7
   src/elspeth/contracts/checkpoint.py:
@@ -83,7 +85,7 @@ files:
     Mapping[str, object]: 2
   src/elspeth/contracts/plugin_context.py:
     Mapping[str, Any]: 4
-    Mapping[str, object]: 1
+    Mapping[str, object]: 3
     dict[str, Any]: 4
   src/elspeth/contracts/plugin_protocols.py:
     Mapping[str, object]: 2
@@ -166,7 +168,7 @@ files:
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/node_states.py:
     Mapping[str, object]: 14
-    dict[str, object]: 5
+    dict[str, object]: 4
   src/elspeth/core/landscape/execution/operations.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/execution/sink_effect_attempt_results.py:
@@ -188,6 +190,8 @@ files:
     Mapping[str, object]: 20
   src/elspeth/core/landscape/exporter.py:
     dict[str, Any]: 5
+  src/elspeth/core/landscape/factory.py:
+    Mapping[str, object]: 1
   src/elspeth/core/landscape/formatters.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
@@ -268,14 +272,22 @@ files:
     dict[str, Any]: 5
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
+  src/elspeth/engine/orchestrator/call_mode_session.py:
+    Mapping[str, Any]: 15
+    dict[str, Any]: 1
+    dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
     Mapping[str, object]: 2
+  src/elspeth/engine/orchestrator/run_lifecycle.py:
+    Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/run_status.py:
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/runtime_preflight.py:
     dict[str, object]: 2
   src/elspeth/engine/orchestrator/schema_reconstruction.py:
     Mapping[str, object]: 5
+    dict[str, Any]: 1
+  src/elspeth/engine/orchestrator/source_compatibility.py:
     dict[str, Any]: 1
   src/elspeth/engine/orchestrator/types.py:
     Mapping[str, Any]: 1
@@ -315,7 +327,7 @@ files:
   src/elspeth/plugins/infrastructure/clients/dataverse.py:
     dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/http.py:
-    Mapping[str, Any]: 13
+    Mapping[str, Any]: 16
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/clients/json_utils.py:
     dict[str, Any]: 2
@@ -442,6 +454,8 @@ files:
   src/elspeth/plugins/transforms/aws/guardrails_client.py:
     Mapping[str, object]: 1
     dict[str, object]: 1
+  src/elspeth/plugins/transforms/aws/replay_sdk.py:
+    Mapping[str, Any]: 1
   src/elspeth/plugins/transforms/aws/textract_bucket_region.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 1
@@ -1056,10 +1070,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 895
-  Mapping[str, object]: 306
+  Mapping[str, Any]: 929
+  Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 66
-  dict[str, Any]: 1175
+  dict[str, Any]: 1180
   dict[str, object]: 409
-  soft: 2798
+  soft: 2841

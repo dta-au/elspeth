@@ -30,6 +30,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from ipaddress import IPv4Network, IPv6Network
 
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+
 
 class SSRFBlockedError(Exception):
     """URL validation failed due to security policy (SSRF prevention)."""
@@ -458,5 +460,58 @@ def validate_url_for_ssrf(
         port=port,
         path=path,
         scheme=scheme_lower,
+        bare_hostname=hostname,
+    )
+
+
+def validate_archived_ssrf_request(
+    url: str,
+    archived: ReplaySSRFRequest,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> SSRFSafeRequest:
+    """Revalidate an archived DNS pin without resolving the hostname again.
+
+    Replay may use only the address recorded for the exact original URL. This
+    checks every URL component and applies the *current* IP policy to the
+    archived address, so a forged or newly forbidden pin cannot bypass SSRF
+    admission. No resolver or network client is invoked here.
+    """
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    if not hostname:
+        raise SSRFBlockedError("URL has no hostname")
+    explicit_port = _validated_url_port(url, parsed)
+    if explicit_port == 0:
+        raise SSRFBlockedError("Port 0 is not allowed")
+    port = explicit_port if explicit_port is not None else (443 if parsed.scheme.lower() == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if parsed.fragment:
+        path = f"{path}#{parsed.fragment}"
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80
+    host_for_header = f"[{hostname}]" if ":" in hostname else hostname
+    host_header = f"{host_for_header}:{port}" if port != default_port else host_for_header
+
+    if (
+        archived.original_url != url
+        or archived.host_header != host_header
+        or archived.port != port
+        or archived.path != path
+        or archived.scheme != scheme
+        or archived.bare_hostname != hostname
+    ):
+        raise SSRFBlockedError("Archived SSRF request does not match the current URL")
+    _validate_ip_address(archived.resolved_ip, allowed_ranges=allowed_ranges)
+    return SSRFSafeRequest(
+        original_url=url,
+        resolved_ip=archived.resolved_ip,
+        host_header=host_header,
+        port=port,
+        path=path,
+        scheme=scheme,
         bare_hostname=hostname,
     )

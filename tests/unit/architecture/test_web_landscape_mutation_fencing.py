@@ -238,6 +238,8 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "update_batch_status",
             "complete_batch",
             "complete_aggregation_result",
+            "complete_aggregation_failure",
+            "complete_collector_failure",
             "retry_batch",
         ),
     ),
@@ -307,7 +309,11 @@ _EXPECTED_API_CATEGORY_COUNTS = {
     "run-lifecycle": 14,
     "run-start-admission": 2,
     "data-flow": 17,
-    "execution": 19,
+    # C4 (recorded FAILED verdict, operator ruling 2026-09-23): 19 -> 20,
+    # ExecutionRepository.complete_aggregation_failure, the batch's one verdict write.
+    # CODEX-R2 (elspeth-5887fb7928 R4): 20 -> 21,
+    # ExecutionRepository.complete_collector_failure, a collector group's one verdict write.
+    "execution": 21,
     "scheduler": 23,
     "sink-effect": 11,
     "checkpoint": 2,
@@ -614,7 +620,12 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # already took an UPDATE through depart_worker and evict_worker, so this is a
 # new construction of an existing write shape, not a new shape. Re-derived from
 # this file's own printed output on the rebased tree, applied and run.
-_EXPECTED_DML_COUNT = 158
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10, operator ruling B5): 158 -> 159, +1 identity —
+# ErrorAuditRepository.record_batch_transform_errors_leader's ONE executemany INSERT
+# into transform_errors (one row per member of a FAILED aggregation batch), inside its
+# own fenced_leader_transaction. Write set UNCHANGED (transform_errors/insert already
+# existed via record_transform_error). Measured by scripts/fencing_inventory.py.
+_EXPECTED_DML_COUNT = 160
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -693,7 +704,34 @@ _EXPECTED_DML_COUNT = 158
 # GraphAuditRepository.register_node's insert fingerprint (and its one
 # subordinate edge below); scripts/fencing_inventory.py against the base tree
 # classifies exactly that one identity as departed/arrived, write shapes 70/70.
-_EXPECTED_DML_INVENTORY_SHA256 = "f586b74e6d325e9e57bb8f56e3f562dac10b96f353228a178ffe7af8033c1568"
+# AGG-ERROR-EDGE: f586b74e… -> 14b71a75… for the one identity above.
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): 14b71a75… -> the value
+# below. Count 159 and write shapes 70/70 unchanged; the transform_errors INSERT
+# (fingerprint 6c23ee1f5d6bfd77, unchanged) moved from the deleted verb
+# ErrorAuditRepository.record_batch_transform_errors_leader to the connection
+# helper insert_batch_transform_errors_on, which ExecutionRepository.
+# complete_aggregation_failure calls inside the verdict's ONE transaction. Measured
+# by scripts/fencing_inventory.py against a clean export of 5e25798db and the tree.
+# R4 (elspeth-5887fb7928 AC-R4, a BLOCKED hold records the token as held): 2b5bca9a… ->
+# the value below. Count 159 and write shapes 70/70 unchanged; the one identity
+# SchedulerDispositionRepository._transition_on update token_work_items changed
+# fingerprint a3c95c278555df16 -> 9bea65003336f796 because the BLOCKED image now
+# writes row_payload_json. Measured by scripts/fencing_inventory.py --json against a
+# clean export of c5ea22fa7 and the tree.
+# K056 adds the owned call_verifications INSERT and its source-run lineage.
+# Combined K063/K056 inventory adds the verification identity and its new
+# table/operation shape after the aggregation batch identity above.
+# Verification writes derive their current run from the fenced token and
+# their source run from the checked persisted run row in that transaction.
+# CODEX-R2 (elspeth-5887fb7928 R4, a collector group's FAILED verdict is one
+# transaction): the K063 donor's count 159 and write shapes 70/70 stayed fixed;
+# the one node_states bulk UPDATE moved from
+# NodeStateRepository.complete_node_states_completed_many (fp 36ac590bf615c1f6) to
+# the status-parameterised _complete_node_states_many (fp 27ab1839b7ac242c), which
+# the COMPLETED wrapper and the new FAILED wrapper share. Measured by
+# scripts/fencing_inventory.py --json against a clean export of 2a1d93652 and the tree.
+# Re-derived on the combined K063/K056 tree with scripts/fencing_inventory.py.
+_EXPECTED_DML_INVENTORY_SHA256 = "cde69a415209183985430961899a093d07f971b6a9ad3ce1c9f957f462181ecd"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -708,6 +746,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("batches", "update"),
         ("calls", "insert"),
         ("calls", "update"),
+        ("call_verifications", "insert"),
         ("checkpoints", "delete"),
         ("checkpoints", "insert"),
         ("coalesce_effect_members", "insert"),
@@ -780,12 +819,58 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle.complete_run#1
 #   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
 #   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
-_EXPECTED_CALL_COUNT = 280
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10): 280 -> 281, +1 caller —
+# AggregationExecutor._complete_error_flush -> self._execution.record_routing_event,
+# the ONE DIVERT routing_event of a batch routed to its aggregation's on_error sink.
+# AGG-DISCARD (operator ruling B3): 281 -> 279, -2 callers — RowProcessor._handle_flush_error
+# (per-member record_token_outcome_leader) and _mark_buffered_scheduler_work_terminal (the
+# separate BLOCKED-row release) are DELETED: a discarded failed batch's terminals now ride
+# complete_barrier's terminal_outcomes, the same transaction as the release.
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): 279 -> 278. Departed:
+# AggregationExecutor._complete_error_flush -> self._execution.record_routing_event#1
+# and -> self._execution.complete_batch#1 (the verdict's separate writes). Arrived:
+# NodeStateGuard.complete_aggregation_failure -> self._execution.complete_aggregation_failure#1,
+# the ONE verdict write (complete_aggregation_failure is listed in _MUTATION_APIS).
+# R4 (elspeth-5887fb7928 AC-R4): 278 -> 279. Arrived:
+# SchedulerDrainCoordinator._mark_claimed_scheduler_work_blocked -> self._scheduler.mark_blocked#2.
+# The barrier arm (#1) writes the recorded arrival's barrier_key and held row; the
+# queue arm (#2) keeps the claimed row. Nothing departed.
+# K056 adds seven live call sites across replay verification, readiness,
+# provider lineage, and PDF call auditing. The typed PluginContext PDF
+# record_row_call forwarder adds one more; five existing PluginContext calls
+# also moved line.
+# CODEX-R2 (elspeth-5887fb7928 R4): 279 -> 280. Departed:
+# CollectorExecutor._fail_group -> self._execution.complete_node_state#1 (each member
+# hold in its own transaction). Arrived: CollectorExecutor._fail_group ->
+# self._execution.complete_collector_failure#1 (the lost-members arm's verdict) and
+# NodeStateGuard.complete_collector_failure -> self._execution.complete_collector_failure#1
+# (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
+_EXPECTED_CALL_COUNT = 288
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "0b7a93820401e5a6878e38c28827b557e51f712ba865facd26ade2dd92fd3fc4"
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 138
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d3b83b4cef4ce6ceae28d98c48ad49b0162b26ef96b7a7e7551e3ab4be89d26f"
+# AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
+# AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
+# C4: 70bb43aa… -> 6c2ff337…, the caller exchange above.
+# R4: 6c2ff337… -> 0478b37d…, the one caller added above.
+# CODEX-R2: 0478b37d… -> 9e7698c9… on the donor, the caller exchange above.
+# Re-derived for the combined K063/K056 tree after the caller exchange.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "f7a7a51f1c07dbf941e97c40571436b092e633adf6aa755c7799e90f2295885d"
+# C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
+# ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
+# -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
+# -> BatchRepository.complete_batch_on (the verdict's four writes on its one fenced
+# connection), and NodeStateRepository.record_routing_event_on ->
+# _insert_or_load_routing_decision. NodeStateRepository.record_routing_event ->
+# _insert_or_load_routing_decision stays, its call fingerprint moved (1b40f529… ->
+# 751cf56f…) because the event is now built by prepare_routing_event.
+# CODEX-R2 (elspeth-5887fb7928 R4): 143 -> 146, 4bdcff84… -> the value below. Arrived:
+# ExecutionRepository.complete_collector_failure -> NodeStateRepository.complete_node_states_failed_many
+# (the verdict's one write on its fenced connection), and both
+# complete_node_states_completed_many and complete_node_states_failed_many ->
+# NodeStateRepository._complete_node_states_many (the shared bulk UPDATE, fed owned
+# _BulkStateCompletion rows).
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 146
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d86b459406b192b8421605f22d7e967e4504f1c99685be646de7bb95752303d2"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -7722,7 +7807,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # attachment and precedes schema initialization/return on both dialects.
     # Approved prompt artifact rename changes the required column/index names;
     # database construction and deadline guard installation are unchanged.
-    "src/elspeth/core/landscape/database.py": "4430861bca6a169282ba94364224571b8c29bc6991200403ac6d22b3031c76b8",
+    # K056 adds schema checks for run lineage, call verification, and
+    # operation occurrence without changing the deadline issuance path.
+    "src/elspeth/core/landscape/database.py": "ab066128381ea24d2799479e20e80985190da4bf8847bbe093985d59c6ae54f4",
 }
 
 
@@ -9120,21 +9207,27 @@ def _coordination_repo(self) -> RunCoordinationRepository:
     return self._run_coordination
 """,
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
-def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None) -> Run:
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
     if status == RunStatus.COMPLETED:
         raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
+    if type(run_mode) is not RunMode:
+        raise AuditIntegrityError('run_mode must be a RunMode')
+    if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
+        raise AuditIntegrityError('live runs have no replay source; replay/verify runs require one')
     validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
     _validate_openrouter_catalog_snapshot(sha256=openrouter_catalog_sha256, source=openrouter_catalog_source)
     if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
         raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
     run_id = run_id or generate_id()
+    if replay_from_run_id == run_id:
+        raise AuditIntegrityError('a replay/verify run cannot cite itself as its source')
     if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
         raise AuditIntegrityError('Run start permit must bind the exact run UUID')
     settings_json = canonical_json(config)
     config_hash = stable_hash(config)
     timestamp = now()
     runtime_val_manifest_json = _frozen_runtime_val_manifest_json()
-    run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, reproducibility_grade=reproducibility_grade)
+    run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, run_mode=run_mode, replay_from_run_id=replay_from_run_id, reproducibility_grade=reproducibility_grade)
     worker_id = leader_worker_id or mint_worker_id(run.run_id)
     coordination = self._coordination_repo
     try:
@@ -9143,7 +9236,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
                 if existing is not None:
                     return existing
-            conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
+            conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, run_mode=run.run_mode.value, replay_from_run_id=run.replay_from_run_id, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
             if run_start_permit is not None:
                 conn.execute(run_start_admissions_table.insert().values(run_id=run_id, permit_id=run_start_permit.permit_id, permit_epoch=run_start_permit.permit_epoch, subject_hash=run_start_permit.subject_hash, state='prepared'))
             if initiated_by_user_id is not None and auth_provider_type is not None:
@@ -9252,6 +9345,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): {
         "Run": "elspeth.contracts.Run",
         "RunStatus": "elspeth.contracts.RunStatus",
+        "RunMode": "elspeth.contracts.enums.RunMode",
         "validate_run_attribution": "elspeth.core.landscape.run_lifecycle_repository.validate_run_attribution",
         "_validate_openrouter_catalog_snapshot": "elspeth.core.landscape.run_lifecycle_repository._validate_openrouter_catalog_snapshot",
         "canonical_json": "elspeth.core.canonical.canonical_json",
@@ -16700,7 +16794,8 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
 
 def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_one() -> None:
     units = _production_units()
-    assert len(_MUTATION_APIS) == 91
+    # CODEX-R2 (elspeth-5887fb7928 R4): 92 -> 93, ExecutionRepository.complete_collector_failure.
+    assert len(_MUTATION_APIS) == 93
     assert Counter(api.category for api in _MUTATION_APIS) == Counter(_EXPECTED_API_CATEGORY_COUNTS)
     assert len({(api.path, api.symbol) for api in _MUTATION_APIS}) == len(_MUTATION_APIS)
 

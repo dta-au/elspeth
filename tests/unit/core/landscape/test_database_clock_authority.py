@@ -156,7 +156,22 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "e41b6c7f0c6ce3321053df8a51817b6488f321cb5d4e0283895c244d6d8233ac"
+# AGG-ERROR-EDGE (elspeth-d2e3f29d10, operator ruling B5): e41b6c7f… → the value
+# below, +1 identity: ErrorAuditRepository.record_batch_transform_errors_leader opens
+# its own fenced_leader_transaction (one transform_errors row per member of a FAILED
+# aggregation batch), so it reads the Landscape clock to verify-and-extend the seat.
+# Re-derived by RUNNING the gate on the changed tree.
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): f130aec7… → the value
+# below, one identity exchanged: ErrorAuditRepository.record_batch_transform_errors_leader
+# (deleted; its INSERT is now a connection helper) leaves, and
+# ExecutionRepository.complete_aggregation_failure arrives — it opens the ONE
+# fenced_leader_transaction that records the whole verdict. Re-derived by RUNNING the gate.
+# CODEX-R2 (elspeth-5887fb7928 R4, a collector group's FAILED verdict is one
+# transaction): 3adddc41… → the value below, +1 identity:
+# ExecutionRepository.complete_collector_failure opens the ONE
+# fenced_leader_transaction that fails the flush state and every member hold.
+# Re-derived by RUNNING the gate on the changed tree.
+_CLOCK_BOUNDARY_DIGEST = "585abca879f8dd46e76df361df075a6594d44d0193f70f5b7b95c75744f48902"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -274,7 +289,9 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.takeover_expired"),
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
+        ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_failure"),
         ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_result"),
+        ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_collector_failure"),
         ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),

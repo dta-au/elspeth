@@ -175,15 +175,15 @@ class TestCoalesceTriggerEquivalence:
         assert handled is node_should_handle
 
         # Slice 3 re-pin (ADR-030 §E.2): acceptance is journal-first — the
-        # in-claim accept is gone for every arm. A handled token stashes its
-        # live barrier hold for the next drain iteration's intake instead.
-        # For the no-executor (follower) arm, the live_barrier_holds stash is
-        # SKIPPED — followers return early before the stash; mark_blocked is
-        # the only durable signal.
+        # in-claim accept is gone for every arm. A handled token records its
+        # arrival for the drain, leader and follower alike (elspeth-5887fb7928
+        # AC-R4): the drain persists the BLOCKED row's barrier_key and held row
+        # from it, and the leader's next intake consumes it.
         coalesce_executor.accept.assert_not_called()
         assert result is None
-        if node_should_handle_with_executor:
+        if node_should_handle:
             hold = processor._live_barrier_holds["token-1"]
             assert hold.barrier_key == "merge"
+            assert hold.token is token
         else:
             assert "token-1" not in processor._live_barrier_holds

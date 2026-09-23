@@ -66,6 +66,12 @@ class _ExecutionFake:
             )
         )
 
+    def get_node_state(self, state_id: str) -> SimpleNamespace:
+        """The durable read-back: completed if a completion was recorded, else still OPEN."""
+        if self.completion_calls:
+            return SimpleNamespace(state_id=state_id, status=self.completion_calls[-1].status)
+        return SimpleNamespace(state_id=state_id, status=NodeStateStatus.OPEN)
+
     def assert_completed_once(self) -> _CompletionCall:
         assert len(self.completion_calls) == 1
         return self.completion_calls[0]

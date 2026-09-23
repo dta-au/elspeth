@@ -371,6 +371,19 @@ aggregations:
   expected_output_count: 1   # Assert N inputs → 1 output
 ```
 
+**Declare every column `process()` reads.** A real batch transform validates its
+config, calls `self._initialize_declared_input_fields(cfg)`, and folds each
+configured input column into `schema.required_fields` on the `SchemaConfig` it
+stores as `self._schema_config` (`batch_threshold_summary.py` is the pattern).
+Before `process()` runs, the engine checks every buffered row for those fields
+(`schema_required_input_fields()`); a row that omits one fails the whole batch
+through the aggregation's `on_error`, or fails the collector's group, with a
+reason naming the field and the batch row index. A column you read without
+declaring it reaches `row[...]` as a `KeyError` that ends the run.
+`tests/invariants/test_batch_transforms_read_only_declared_fields.py` holds every
+built-in batch transform to this. A column you read only when present
+(`if field in row`) is optional and is not declared.
+
 </details>
 
 <details>

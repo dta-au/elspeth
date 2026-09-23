@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunStatus
+from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunMode, RunStatus
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
@@ -74,6 +74,7 @@ from elspeth.core.landscape.run_lifecycle_repository import _IMMUTABLE_SUCCESS_R
 from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
 from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
@@ -1464,6 +1465,15 @@ class ResumeCoordinator:
                     coordination_token=coordination_token,
                 )
 
+                if not interrupted and loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.assert_complete()
+
                 # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b
                 # postconditions only after resume sink writes finish.
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
@@ -1497,18 +1507,27 @@ def handle_incomplete_batches(
     """Find and handle incomplete batches for recovery.
 
     - EXECUTING batches: Mark as failed (crash interrupted), then retry
-    - FAILED batches: Retry with incremented attempt
+    - FAILED batches without a recorded verdict (the flush died before
+      recording one): Retry with incremented attempt
     - DRAFT batches: Leave as-is (collection continues)
+
+    A FAILED batch whose verdict was recorded
+    (``ExecutionRepository.complete_aggregation_failure``) never reaches
+    here: ``get_incomplete_batches`` excludes it because the verdict is
+    final, and the journal restore completes its disposition instead.
 
     Args:
         execution: ExecutionRepository for database operations
         coordination_token: Acquired leadership of the run being recovered
 
     Returns:
-        Mapping of old_batch_id to new_batch_id for retried batches.
-        Callers must use this to rebind batch_ids in restored checkpoint
-        state so that resumed execution references the retry batches,
-        not the dead originals.
+        Mapping of old_batch_id to new_batch_id for retried batches: one
+        retry hop per entry. ``retry_batch`` is idempotent, so a batch that
+        an earlier resume already retried maps to that same retry; when the
+        retry itself failed, it has its own entry and the edges chain
+        (``{A: B, B: C}``). The journal restore reads the chain through
+        ``barrier_coordination.resolve_retry_chain`` to reach the batch the
+        buffered members must flush in — never with a single lookup.
     """
     from elspeth.contracts.enums import BatchStatus
 

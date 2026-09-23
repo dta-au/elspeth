@@ -269,6 +269,8 @@ class GateExecutor:
         token: TokenInfo,
         ctx: PluginContext,
         token_manager: "TokenManager | None" = None,
+        *,
+        attempt_offset: int = 0,
     ) -> GateOutcome:
         """Execute a config-driven gate using ExpressionParser.
 
@@ -289,6 +291,7 @@ class GateExecutor:
             token: Current token with row data
             ctx: Plugin context
             token_manager: TokenManager for fork operations (required for fork destinations)
+            attempt_offset: Starting audit attempt offset for a reclaimed scheduler work item
 
         Returns:
             GateOutcome with result, updated token, and routing info
@@ -326,6 +329,8 @@ class GateExecutor:
                 member_token=ctx.require_member_token(),
                 step_index=step,
                 input_data=input_dict,
+                attempt=token.resume_attempt_offset + attempt_offset,
+                resume_checkpoint_id=token.resume_checkpoint_id,
                 auto_fail_phase="gate_evaluation_routing",
             ) as guard,
         ):

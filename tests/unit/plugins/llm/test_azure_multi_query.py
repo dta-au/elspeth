@@ -14,6 +14,7 @@ import pytest
 
 from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -286,14 +287,13 @@ class TestSingleQueryProcessing:
         result = transform._process_row(row, ctx)
 
         assert result.status == "success"
-        # First query should have rendered template with cs1_bg data
+        # A query using the first case study should render its background.
         assert len(captured_messages) == 4
-        first_user_msg = captured_messages[0][-1].content
-        assert "45yo male" in first_user_msg
+        assert any("45yo male" in messages[-1].content for messages in captured_messages)
 
     def test_process_row_parses_json_response(self) -> None:
         """Query parses JSON and returns mapped fields."""
-        transform = LLMTransform(_make_config())
+        transform = LLMTransform(_make_config(pool_size=1))
         mock_provider = _make_provider(
             [
                 {"score": 85, "rationale": "CS1 diagnosis"},
@@ -393,6 +393,8 @@ class TestSingleQueryProcessing:
             shutdown_event=None,
             payload_store=None,
             llm_call_governance=None,
+            call_mode_session=None,
+            run_mode=RunMode.LIVE,
         )
         transform.on_start(ctx)
 

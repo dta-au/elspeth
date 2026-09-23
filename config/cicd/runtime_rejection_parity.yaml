@@ -154,6 +154,19 @@ sites:
   - node_id_invalid
   note: state.py:157 emits "Aggregation name must not be empty" for an empty node id; probed. Counterpart
     is WORKING-TREE-ONLY, absent from HEAD — see header.
+- key: 094b4cb3a610c996
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_on_error
+  exception: ValueError
+  message: on_error must be a sink name or 'discard'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+  note: elspeth-d2e3f29d10 added this validator (TransformSettings.validate_on_error twin) because aggregation
+    on_error became a live __error_<name>__ DIVERT edge target. Stage 1's label mirror (state.py _routing_label_errors,
+    aggregation arm) emits the same message for a blank on_error; pinned by test_state.py::test_aggregation_on_error_follows_runtime_label_rules[blank].
+    A None on_error is aggregation_missing_on_error.
 - key: e25b99c40322cf26
   path: src/elspeth/core/config.py
   qualname: AggregationSettings.validate_on_success
@@ -2354,6 +2367,18 @@ sites:
     prefix, and the edit only changed text AFTER the truncation point, so the skeleton (hence the key)
     is byte-identical. The PREDICATE this site/twin pair covers is unchanged (transform-mode-only); only
     the remedy sentence changed.'
+- key: f876fc25500623d7
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Aggregation ''{}'' on_error ''{}'' references unknown sink.{} Available sinks: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_on_error_unknown_sink
+  note: elspeth-d2e3f29d10 aggregation error-edge loop. state.py _validate_runtime_route_destinations
+    aggregation arm rejects on_error not 'discard' and not a declared sink, with no closer relax on either
+    side (rule 6 keeps aggregations out of bound regions). Both walls pinned by test_composer_runtime_agreement.py::test_both_reject_aggregation_on_error_dangling_sink.
 - key: ad2b76e2461e9fbc
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph

@@ -1420,9 +1420,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
         "Every aggregation must declare where failed rows go.",
-        "Set the aggregation's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
-        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
-        "quarantine sink name instead when failed rows must stay inspectable.",
+        "Set the aggregation's on_error explicitly. 'discard' costs the failed batch's rows' CONTENT, not the record of "
+        "them — the audit trail keeps each row's terminal outcome and failure reason, but nothing reaches a sink to "
+        "inspect later. Route to a declared quarantine sink name instead when failed rows must stay inspectable.",
     ),
     (
         r"aggregation_output_mode_invalid",
@@ -1743,6 +1743,16 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The source on_validation_failure names an output that is not declared.",
         "Declare the intended quarantine output and reference its name in on_validation_failure, "
         "or choose 'discard' only if discarding invalid source rows is intended.",
+    ),
+    # elspeth-d2e3f29d10: the aggregation error edge is wired, so a ghost
+    # aggregation on_error sink is refused by the DAG builder too.
+    DirectValidationGuidance(
+        "aggregation_on_error_unknown_sink",
+        "An aggregation's on_error names where every input row of a FAILED batch goes, and may only be 'discard' or "
+        "an existing sink name. The rejection's 'connectivity' facts carry the offending value as 'dangling_on_error' "
+        "and the candidate's sink names as 'declared_sinks'.",
+        "Set the aggregation's on_error='discard', or copy one of the connectivity facts' declared_sinks exactly. It "
+        "cannot name a coalesce, row_union or collector: an aggregation never sits inside a bound region.",
     ),
     DirectValidationGuidance(
         "aggregation_expected_output_count_mode_invalid",

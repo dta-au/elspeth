@@ -12,6 +12,8 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+from elspeth.contracts.enums import RunMode
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -217,6 +219,55 @@ def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -
     assert result.reason is not None
     assert result.reason["reason"] == "validation_failed"
     assert result.reason["error_type"] == "SSRFBlockedError"
+
+
+def test_blob_fetch_replay_uses_archived_pin_without_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    url = "https://example.test/file.pdf"
+    captured: list[SSRFSafeRequest] = []
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            safe = _safe_request_for(url, resolved_ip="93.184.216.34")
+            return ReplaySSRFRequest(
+                safe.original_url,
+                safe.resolved_ip,
+                safe.host_header,
+                safe.port,
+                safe.path,
+                safe.scheme,
+                safe.bare_hostname,
+            )
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> SSRFSafeRequest:
+        raise AssertionError("DNS validation called during replay")
+
+    monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _dns_forbidden)
+    transform = BlobFetch(_config())
+    response = httpx.Response(
+        200,
+        content=b"%PDF-1.7",
+        headers={"content-type": "application/pdf"},
+        request=httpx.Request("GET", "https://93.184.216.34/file.pdf"),
+    )
+
+    def _fetch(safe: SSRFSafeRequest, _ctx: Any) -> tuple[httpx.Response, str, Call]:
+        captured.append(safe)
+        return response, url, _call()
+
+    monkeypatch.setattr(transform, "_fetch_url", _fetch)
+    ctx = make_context()
+    ctx.call_mode_session = _ReplaySession()
+    ctx.run_mode = RunMode.REPLAY
+    ctx.replay_from = "source-run"
+    result = transform.process(make_pipeline_row({"url": url}), ctx)
+
+    assert result.status == "error"
+    assert captured[0].resolved_ip == "93.184.216.34"
 
 
 def test_blob_fetch_rejects_unapproved_content_type(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -24,11 +24,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
-from elspeth.contracts import Call, CallStatus, CallType
+from elspeth.contracts import Call, CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -160,10 +162,33 @@ class LLMAuditParent:
         latency_ms: float | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        call_mode_session: CallModeSession | None = None,
     ) -> Call:
         """Record a semantic call under this validated parent."""
+        source_call_id: str | None = None
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY:
+            evidence = call_mode_session.replay_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+            )
+            actual_response = None if response_data is None else response_data.to_dict()
+            actual_error = None if error is None else error.to_dict()
+            if evidence.status is not status or evidence.response_data != actual_response or evidence.error_data != actual_error:
+                raise AuditIntegrityError("Replayed semantic LLM response differs from its source call")
+            source_call_id = evidence.source_call_id
+        if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            call_mode_session.admit_verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+            )
         if self.operation_id is not None:
-            return recorder.record_operation_call(
+            call = recorder.record_operation_call(
                 coordination_token=self._require_coordination_token(),
                 operation_id=self.operation_id,
                 call_index=call_index,
@@ -175,23 +200,39 @@ class LLMAuditParent:
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
+                source_call_id=source_call_id,
             )
-        if self.state_id is None:
-            raise RuntimeError("validated row parent lost state_id")
-        return recorder.record_call(
-            member_token=self._require_member_token(),
-            work_item=self._require_work_item(),
-            state_id=self.state_id,
-            call_index=call_index,
-            call_type=call_type,
-            status=status,
-            request_data=request_data,
-            response_data=response_data,
-            error=error,
-            latency_ms=latency_ms,
-            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
-            token_usage=token_usage,
-        )
+        else:
+            if self.state_id is None:
+                raise RuntimeError("validated row parent lost state_id")
+            call = recorder.record_call(
+                member_token=self._require_member_token(),
+                work_item=self._require_work_item(),
+                state_id=self.state_id,
+                call_index=call_index,
+                call_type=call_type,
+                status=status,
+                request_data=request_data,
+                response_data=response_data,
+                error=error,
+                latency_ms=latency_ms,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                token_usage=token_usage,
+                source_call_id=source_call_id,
+            )
+        if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            call_mode_session.verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=None if response_data is None else response_data.to_dict(),
+                live_error_data=None if error is None else error.to_dict(),
+            )
+        return call
 
 
 class FinishReason(StrEnum):

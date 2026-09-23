@@ -1926,6 +1926,20 @@ class TestStateCallRecords:
         assert c["operation_id"] is None  # State calls don't have operation_id
         assert c["call_type"] == "llm"
 
+    def test_call_summary_exports_payload_reference_without_provider_response(self) -> None:
+        """Opaque SDK pagination tokens stay in the protected call payload."""
+        exporter = _make_exporter(
+            rows=[_ROW],
+            tokens=[_TOKEN],
+            node_states=[_NODE_STATE_COMPLETED],
+            state_calls=[_STATE_CALL],
+        )
+        calls = [record for record in exporter.export_run("run-1") if record["record_type"] == "call"]
+        assert len(calls) == 1
+        assert calls[0]["response_ref"] == "resp-ref-2"
+        assert "response_data" not in calls[0]
+        assert "next_token" not in calls[0]
+
 
 # ===========================================================================
 # Batch records

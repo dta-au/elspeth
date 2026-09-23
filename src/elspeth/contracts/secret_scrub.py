@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Set
-from typing import Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, urlparse
 
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
+
+if TYPE_CHECKING:
+    from elspeth.contracts.errors import TransformErrorReason
 
 # Public so consumers that must NOT treat two scrubbed strings as the same
 # fact (failure-attribution correlation) can recognise the constant instead of
@@ -146,6 +149,23 @@ def scrub_text_for_audit(text: str) -> str:
     persisted exception messages do not bypass the audit scrubber.
     """
     return cast(str, _scrub_value(text, parent_key=None))
+
+
+def scrub_transform_error_reason(reason: TransformErrorReason) -> TransformErrorReason:
+    """Return ``reason`` with secret-bearing keys and values redacted.
+
+    The one scrub every returned transform error passes through before it is
+    persisted anywhere — the transform_errors row, the DIVERT routing_event,
+    the FAILED node_state, and the pending_error_message a routed token carries
+    to its sink. The per-row transform seam and the aggregation flush seam
+    both call it so the two cannot drift. Category fields survive unchanged;
+    the scrub removes secrets, not row values (value discipline is the
+    plugin's, see ``BatchRowTypeError.as_reason``).
+    """
+    scrubbed = scrub_payload_for_audit(reason)
+    if scrubbed == reason:
+        return reason
+    return cast("TransformErrorReason", scrubbed)
 
 
 @trust_boundary(

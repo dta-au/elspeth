@@ -169,6 +169,7 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
     repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key=barrier_key,
         expected_lease_owner=WORKER,
@@ -226,6 +227,7 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
     repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key=collector_barrier_key(collector_name, "g-1"),
         expected_lease_owner=WORKER,

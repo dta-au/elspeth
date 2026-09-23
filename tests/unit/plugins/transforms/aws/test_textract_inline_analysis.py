@@ -10,7 +10,7 @@ import pytest
 from tests.fixtures.factories import make_context
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
-from elspeth.contracts import AuditCharacteristic, Determinism
+from elspeth.contracts import AuditCharacteristic, Determinism, RunMode
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
@@ -20,6 +20,7 @@ from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_client import (
     InlineAnalysisResult,
     TextractResponseError,
@@ -714,6 +715,7 @@ def test_on_start_requires_landscape() -> None:
         rate_limit_registry=None,
         shutdown_event=None,
         payload_store=FakePayloadStore(),
+        run_mode=RunMode.LIVE,
     )
 
     with pytest.raises(FrameworkBugError, match="Landscape"):
@@ -757,6 +759,7 @@ def test_on_start_builds_sdk_with_resolved_secrets_and_close_closes_once(monkeyp
         rate_limit_registry=registry,
         shutdown_event=None,
         payload_store=store,
+        run_mode=RunMode.LIVE,
     )
 
     transform.on_start(ctx)
@@ -773,6 +776,48 @@ def test_on_start_builds_sdk_with_resolved_secrets_and_close_closes_once(monkeyp
     transform.close()
     transform.close()
     assert sdk.close_count == 1
+
+
+def test_replay_start_constructs_no_textract_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed in replay")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_inline_analysis.build_textract_sync_sdk_client", forbidden_build)
+    transform = AWSTextractInlineAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        payload_store=FakePayloadStore(),
+        run_mode=RunMode.REPLAY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, ReplayOnlySDK)
+    transform.close()
+
+
+def test_verify_start_defers_textract_client_until_admitted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_inline_analysis.build_textract_sync_sdk_client", forbidden_build)
+    transform = AWSTextractInlineAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        payload_store=FakePayloadStore(),
+        run_mode=RunMode.VERIFY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, DeferredAWSClient)
+    transform.close()
 
 
 def test_missing_payload_store_is_a_framework_bug_at_row_time() -> None:

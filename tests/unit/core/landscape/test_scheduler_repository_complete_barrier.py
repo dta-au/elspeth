@@ -251,6 +251,7 @@ def _enqueue_and_block(
     repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w1"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key=barrier_key,
         expected_lease_owner="w1",

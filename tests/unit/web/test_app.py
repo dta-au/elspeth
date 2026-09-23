@@ -44,6 +44,8 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.web import aws_rds_trust as aws_rds_trust_module
 from elspeth.web.app import (
     _BodySizeLimitMiddleware,
@@ -52,6 +54,7 @@ from elspeth.web.app import (
     create_app,
     lifespan,
 )
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
@@ -549,6 +552,31 @@ class TestHealthEndpoint:
         client = TestClient(app)
         response = client.get("/api/health")
         assert response.json() == {"status": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_health_responds_during_malicious_jinja_render(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        attempted = threading.Event()
+
+        def render_nested_loops() -> None:
+            attempted.set()
+            PromptTemplate("{% for a in range(100000) %}{% for b in range(100000) %}{% set x = a + b %}{% endfor %}{% endfor %}").render({})
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # State validation and review debt on the YAML route use this same
+            # bounded pool; the synchronous child-process wait runs off-loop.
+            task = asyncio.create_task(run_sync_in_worker(render_nested_loops))
+            await asyncio.sleep(0.3)
+            assert attempted.is_set()
+            assert not task.done()
+            started = asyncio.get_running_loop().time()
+            health = await client.get("/api/health")
+            assert asyncio.get_running_loop().time() - started < 0.5
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            with pytest.raises(TemplateError):
+                await task
 
     def test_health_stays_shallow_when_readiness_is_not_ready(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))

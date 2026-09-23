@@ -76,6 +76,7 @@ class PluginAuditWriterAdapter:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         return self._execution.record_call(
             state_id,
@@ -92,6 +93,7 @@ class PluginAuditWriterAdapter:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
 
     def record_operation_call(
@@ -110,6 +112,7 @@ class PluginAuditWriterAdapter:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         return self._execution.record_operation_call(
             operation_id,
@@ -125,6 +128,7 @@ class PluginAuditWriterAdapter:
             response_ref=response_ref,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
 
     def get_node_state(self, state_id: str) -> NodeState | None:

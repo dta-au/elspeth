@@ -57,7 +57,9 @@ class _RecordingExecution:
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> _RecordedCall:
+        assert source_call_id is None
         kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -71,6 +73,8 @@ class _RecordingExecution:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
         }
+        if source_call_id is not None:
+            kwargs["source_call_id"] = source_call_id
         self.record_call_calls.append(kwargs)
         if isinstance(self.record_call_effect, Exception):
             raise self.record_call_effect
@@ -94,7 +98,9 @@ class _RecordingExecution:
         approved_prompt_artifact_hash: str | None = None,
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> _RecordedCall:
+        assert source_call_id is None
         return _RecordedCall()
 
 

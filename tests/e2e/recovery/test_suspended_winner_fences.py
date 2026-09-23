@@ -351,6 +351,7 @@ class TestSuspendedWinnerFences:
         token_id, _row_id, work_item_id = _seed_journal_row(crashed, ingest_sequence=3)
         crashed.repo.mark_blocked(
             work_item_id=work_item_id,
+            row_payload_json=str(_work_item(crashed.db, token_id)["row_payload_json"]),
             queue_key=None,
             barrier_key="barrier-1",
             expected_lease_owner=WORKER_OLD,
@@ -405,6 +406,7 @@ class TestSuspendedWinnerFences:
         token_id, _row_id, work_item_id = _seed_journal_row(crashed, ingest_sequence=3)
         crashed.repo.mark_blocked(
             work_item_id=work_item_id,
+            row_payload_json=str(_work_item(crashed.db, token_id)["row_payload_json"]),
             queue_key=None,
             barrier_key="agg-1",
             expected_lease_owner=WORKER_OLD,

@@ -197,7 +197,7 @@ class RunSummary:
 
     Routing breakdown:
     - routed_success: Rows routed via gate route_to_sink (intentional MOVE — success-side routing)
-    - routed_failure: Rows routed via transform on_error (DIVERT — failure-side routing)
+    - routed_failure: Rows routed via transform/config-gate/aggregation on_error (DIVERT — failure-side routing)
     - routed_destinations: Count per destination sink {sink_name: count}; the per-sink
       breakdown is not split by routing intent — see ADR-004 for rationale.
     """
@@ -211,7 +211,7 @@ class RunSummary:
     duration_seconds: float
     exit_code: int  # 0=success, 1=partial failure, 2=total failure
     routed_success: int = 0  # Rows routed via gate route_to_sink (intentional MOVE)
-    routed_failure: int = 0  # Rows routed via transform on_error (DIVERT)
+    routed_failure: int = 0  # Rows routed via transform/config-gate/aggregation on_error (DIVERT)
     routed_destinations: tuple[tuple[str, int], ...] = ()  # (sink_name, count) pairs
 
     def __post_init__(self) -> None:

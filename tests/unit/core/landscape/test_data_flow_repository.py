@@ -37,7 +37,7 @@ from elspeth.contracts.audit import (
 )
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import BatchStatus, NodeStateStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, TransformErrorReason
 from elspeth.contracts.hashing import repr_hash
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
@@ -45,6 +45,7 @@ from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.model_loaders import (
@@ -61,7 +62,9 @@ from elspeth.core.landscape.schema import (
     token_outcomes_table,
     token_parents_table,
     tokens_table,
+    transform_errors_table,
 )
+from elspeth.testing import make_pipeline_row
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
@@ -1242,6 +1245,90 @@ class TestRecordTransformErrorDirect:
                 member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-2").run_id).membership,
                 work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-2")),
             )
+
+
+class TestInsertBatchTransformErrorsOn:
+    """The batch twin of record_transform_error: one row per member of a FAILED batch.
+
+    A connection-level helper: ``ExecutionRepository.complete_aggregation_failure``
+    calls it inside the verdict's one transaction. Its three Tier-1 write guards
+    each need a test of their own: a regression that dropped one would
+    otherwise let an unknown category, a foreign run's reference or an empty
+    batch reach ``transform_errors`` (which has no CHECK constraint for the
+    category) with nothing going red.
+    """
+
+    @staticmethod
+    def _transform_error_rows(db: LandscapeDB) -> list[Any]:
+        with db.read_only_connection() as conn:
+            return list(conn.execute(select(transform_errors_table)).all())
+
+    def test_writes_one_row_per_member_in_order(self) -> None:
+        db, repo, _fac, _row, tok = _make_repo_with_token()
+        second = repo.create_token("row-1", token_id="tok-2", coordination_token=_test_leader(repo, "run-1"))
+        reason: TransformErrorReason = {"reason": "batch_failed", "error": "flush failed"}
+
+        with db.write_connection() as conn:
+            error_ids = insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[
+                    (TokenRef(token_id=tok, run_id="run-1"), make_pipeline_row({"name": "a"})),
+                    (TokenRef(token_id=second.token_id, run_id="run-1"), make_pipeline_row({"name": "b"})),
+                ],
+                transform_id="transform-1",
+                error_details=reason,
+                destination="quarantine",
+            )
+
+        rows = {row.error_id: row for row in self._transform_error_rows(db)}
+        assert [rows[error_id].token_id for error_id in error_ids] == [tok, second.token_id]
+        assert {json.loads(rows[error_id].error_details_json)["reason"] for error_id in error_ids} == {"batch_failed"}
+        assert {rows[error_id].destination for error_id in error_ids} == {"quarantine"}
+
+    def test_invalid_error_reason_crashes_at_tier1_boundary(self) -> None:
+        db, _repo, _fac, _row, tok = _make_repo_with_token()
+        with pytest.raises(AuditIntegrityError, match="Invalid TransformErrorCategory 'banana_error'"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[(TokenRef(token_id=tok, run_id="run-1"), make_pipeline_row({"name": "test"}))],
+                transform_id="transform-1",
+                error_details=cast(TransformErrorReason, {"reason": "banana_error", "error": "not a real category"}),
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
+
+    def test_a_reference_outside_the_authority_run_is_refused(self) -> None:
+        """Checked against the verdict's run before anything is written.
+
+        The reference names run-2 while the writing authority is run-1's.
+        """
+        db, _repo, fac, _row, tok = _make_repo_with_token(run_id="run-1")
+        fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
+        with pytest.raises(AuditIntegrityError, match="does not belong to the authority's run"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[(TokenRef(token_id=tok, run_id="run-2"), make_pipeline_row({"name": "test"}))],
+                transform_id="transform-1",
+                error_details={"reason": "batch_failed", "error": "flush failed"},
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
+
+    def test_an_empty_member_set_is_refused(self) -> None:
+        db, _repo, _fac, _row, _tok = _make_repo_with_token()
+        with pytest.raises(AuditIntegrityError, match="a failed batch has at least one member"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[],
+                transform_id="transform-1",
+                error_details={"reason": "batch_failed", "error": "flush failed"},
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
 
 
 # ===========================================================================

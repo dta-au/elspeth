@@ -8,6 +8,7 @@ and routing-event recording with store-first reason materialization.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import bindparam, func, or_, select
@@ -78,6 +79,17 @@ def _validate_transform_success_reason(success_reason: object) -> None:
     action = success_reason.get("action")
     if not isinstance(action, str):
         raise ValueError("success_reason['action'] must be a str")
+
+
+@dataclass(frozen=True, slots=True)
+class _BulkStateCompletion:
+    """One row of a bulk node-state completion: the terminal image one OPEN state takes."""
+
+    state_id: str
+    output_hash: str | None
+    duration_ms: float
+    error_json: str | None
+    context_after_json: str | None
 
 
 class NodeStateRepository:
@@ -606,24 +618,8 @@ class NodeStateRepository:
         The method preserves the single-row immutability and post-write loader
         validation contract from ``complete_node_state`` while avoiding one
         transaction per sink token in high-volume writes.
-
-        PostgreSQL prelocks the unique state set in ascending
-        ``_STATE_ID_CHUNK_SIZE`` chunks: chunk N's ids all sort before chunk
-        N+1's, so overlapping bulk callers keep one global acquisition order
-        while every statement stays under dialect bound-parameter ceilings.
-        Non-PostgreSQL dialects skip the prelock entirely — SQLite ignores
-        ``FOR UPDATE`` because ``BEGIN IMMEDIATE`` already owns the file's
-        write slot for the complete boundary.
         """
-        if not completions:
-            return
-
-        timestamp = now()
-        terminal_values = [status.value for status in _TERMINAL_NODE_STATE_STATUSES]
-        state_ids = [state_id for state_id, _output_data, _duration_ms in completions]
-        lock_state_ids = sorted(set(state_ids))
-
-        params: list[dict[str, object]] = []
+        rows: list[_BulkStateCompletion] = []
         for state_id, output_data, duration_ms in completions:
             context_after = context_after_by_state[state_id] if context_after_by_state is not None else None
             validate_node_state_completion_fields(
@@ -633,16 +629,82 @@ class NodeStateRepository:
                 error_present=False,
                 success_reason_present=False,
             )
-            params.append(
-                {
-                    "batch_state_id": state_id,
-                    "batch_status": NodeStateStatus.COMPLETED.value,
-                    "batch_output_hash": stable_hash(output_data),
-                    "batch_duration_ms": duration_ms,
-                    "batch_completed_at": timestamp,
-                    "batch_context_after_json": canonical_json(context_after.to_dict()) if context_after is not None else None,
-                }
+            rows.append(
+                _BulkStateCompletion(
+                    state_id=state_id,
+                    output_hash=stable_hash(output_data),
+                    duration_ms=duration_ms,
+                    error_json=None,
+                    context_after_json=canonical_json(context_after.to_dict()) if context_after is not None else None,
+                )
             )
+        self._complete_node_states_many(rows, status=NodeStateStatus.COMPLETED, conn=conn)
+
+    def complete_node_states_failed_many(
+        self,
+        failures: Sequence[tuple[str, float, ExecutionError]],
+        *,
+        conn: Connection,
+    ) -> None:
+        """Complete many node states as FAILED in one audit transaction.
+
+        ``failures`` is ``(state_id, duration_ms, error)``. The FAILED twin of
+        :meth:`complete_node_states_completed_many`: a verdict that fails
+        several states at once (``ExecutionRepository.complete_collector_failure``)
+        writes them all or none, with the same immutability and read-back
+        contract as ``complete_node_state``.
+        """
+        rows: list[_BulkStateCompletion] = []
+        for state_id, duration_ms, error in failures:
+            validate_node_state_completion_fields(
+                NodeStateStatus.FAILED,
+                output_data_present=False,
+                duration_ms=duration_ms,
+                error_present=True,
+                success_reason_present=False,
+            )
+            rows.append(
+                _BulkStateCompletion(
+                    state_id=state_id,
+                    output_hash=None,
+                    duration_ms=duration_ms,
+                    error_json=canonical_json(error.to_dict()),
+                    context_after_json=None,
+                )
+            )
+        self._complete_node_states_many(rows, status=NodeStateStatus.FAILED, conn=conn)
+
+    def _complete_node_states_many(self, rows: Sequence[_BulkStateCompletion], *, status: NodeStateStatus, conn: Connection) -> None:
+        """Write one terminal status to many OPEN node states in the caller's transaction.
+
+        PostgreSQL prelocks the unique state set in ascending
+        ``_STATE_ID_CHUNK_SIZE`` chunks: chunk N's ids all sort before chunk
+        N+1's, so overlapping bulk callers keep one global acquisition order
+        while every statement stays under dialect bound-parameter ceilings.
+        Non-PostgreSQL dialects skip the prelock entirely — SQLite ignores
+        ``FOR UPDATE`` because ``BEGIN IMMEDIATE`` already owns the file's
+        write slot for the complete boundary.
+        """
+        if not rows:
+            return
+
+        timestamp = now()
+        verb = f"complete_node_states_{status.value}_many"
+        bind_rows = [
+            {
+                "batch_state_id": row.state_id,
+                "batch_status": status.value,
+                "batch_output_hash": row.output_hash,
+                "batch_duration_ms": row.duration_ms,
+                "batch_error_json": row.error_json,
+                "batch_completed_at": timestamp,
+                "batch_context_after_json": row.context_after_json,
+            }
+            for row in rows
+        ]
+        terminal_values = [terminal.value for terminal in _TERMINAL_NODE_STATE_STATUSES]
+        state_ids = [row.state_id for row in rows]
+        lock_state_ids = sorted(set(state_ids))
 
         stmt = (
             node_states_table.update()
@@ -653,7 +715,7 @@ class NodeStateRepository:
                 status=bindparam("batch_status"),
                 output_hash=bindparam("batch_output_hash"),
                 duration_ms=bindparam("batch_duration_ms"),
-                error_json=None,
+                error_json=bindparam("batch_error_json"),
                 success_reason_json=None,
                 context_after_json=bindparam("batch_context_after_json"),
                 completed_at=bindparam("batch_completed_at"),
@@ -682,9 +744,7 @@ class NodeStateRepository:
             before_by_id = {row.state_id: row.status for row in before_rows}
             missing = [state_id for state_id in state_ids if state_id not in before_by_id]
             if missing:
-                raise LandscapeRecordError(
-                    f"complete_node_states_completed_many: target rows do not exist (state_ids={missing!r}) — audit data corruption"
-                )
+                raise LandscapeRecordError(f"{verb}: target rows do not exist (state_ids={missing!r}) — audit data corruption")
             terminal = [(state_id, before_by_id[state_id]) for state_id in state_ids if before_by_id[state_id] in terminal_values]
             if terminal:
                 first_state_id, first_status = terminal[0]
@@ -693,35 +753,30 @@ class NodeStateRepository:
                     "Terminal node states are immutable."
                 )
 
-            result = conn.execute(stmt, params)
-            if result.rowcount not in (-1, len(params)):
+            result = conn.execute(stmt, bind_rows)
+            if result.rowcount not in (-1, len(rows)):
                 raise LandscapeRecordError(
-                    f"complete_node_states_completed_many affected {result.rowcount} rows for {len(params)} states; "
-                    "expected one audit update per token."
+                    f"{verb} affected {result.rowcount} rows for {len(rows)} states; expected one audit update per token."
                 )
             after_rows: list[Any] = []
             for i in range(0, len(state_ids), _STATE_ID_CHUNK_SIZE):
                 chunk = state_ids[i : i + _STATE_ID_CHUNK_SIZE]
                 after_rows.extend(conn.execute(select(node_states_table).where(node_states_table.c.state_id.in_(chunk))).fetchall())
-            after_rows = after_rows
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"complete_node_states_completed_many failed for {len(params)} states — database rejected audit update: "
-                f"{type(exc).__name__}: {exc}"
+                f"{verb} failed for {len(rows)} states — database rejected audit update: {type(exc).__name__}: {exc}"
             ) from exc
 
-        if len(after_rows) != len(params):
-            raise LandscapePostCommitError(
-                f"complete_node_states_completed_many loaded {len(after_rows)} states after update; expected {len(params)}."
-            )
+        if len(after_rows) != len(rows):
+            raise LandscapePostCommitError(f"{verb} loaded {len(after_rows)} states after update; expected {len(rows)}.")
         for row in after_rows:
             try:
                 loaded = self._node_state_loader.load(row)
             except AuditIntegrityError as exc:
                 raise LandscapePostCommitError(f"NodeState {row.state_id} became unreadable immediately after completion: {exc}") from exc
-            if loaded.status is not NodeStateStatus.COMPLETED:
+            if loaded.status is not status:
                 raise LandscapePostCommitError(
-                    f"NodeState {row.state_id} should be COMPLETED after batch completion but has status {loaded.status}"
+                    f"NodeState {row.state_id} should be {status.name} after batch completion but has status {loaded.status}"
                 )
 
     def complete_coalesce_node_states_on(
@@ -878,21 +933,59 @@ class NodeStateRepository:
         Returns:
             RoutingEvent model
         """
-        event_id_was_supplied = event_id is not None
-        routing_group_id_was_supplied = routing_group_id is not None
+        event = self.prepare_routing_event(
+            state_id,
+            edge_id,
+            mode,
+            reason,
+            owner="record_routing_event",
+            event_id=event_id,
+            routing_group_id=routing_group_id,
+            ordinal=ordinal,
+            reason_ref=reason_ref,
+        )
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="record_routing_event") as conn:
+            return self._insert_or_load_routing_decision(
+                [event],
+                conn=conn,
+                run_id=member_token.run_id,
+                owner="record_routing_event",
+                enforce_event_ids=event_id is not None,
+                enforce_group_id=routing_group_id is not None,
+            )[0]
+
+    def prepare_routing_event(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason | None = None,
+        *,
+        owner: str,
+        event_id: str | None = None,
+        routing_group_id: str | None = None,
+        ordinal: int = 0,
+        reason_ref: str | None = None,
+    ) -> RoutingEvent:
+        """Build one route of a state's decision, its reason bytes already durable.
+
+        The pre-transaction half of :meth:`record_routing_event`: identities
+        default to the state's stable decision identity, and a reason is
+        materialized in the payload store BEFORE any transaction that inserts
+        the event (so a crash can never leave an event whose ``reason_ref``
+        points at nothing). :meth:`record_routing_event_on` inserts it.
+        """
         routing_group_id = routing_group_id or self._default_routing_group_id(state_id)
         event_id = event_id or self._default_routing_event_id(routing_group_id, ordinal)
         reason_hash = stable_hash(reason) if reason is not None else None
         if reason is not None and self._payload_store is not None:
-            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner="record_routing_event")
+            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner=owner)
         materialized_reason_ref = self._materialize_routing_reason_before_insert(
             reason=reason,
             reason_hash=reason_hash,
             supplied_reason_ref=reason_ref,
         )
-        timestamp = now()
-
-        event = RoutingEvent(
+        return RoutingEvent(
             event_id=event_id,
             state_id=state_id,
             edge_id=edge_id,
@@ -901,18 +994,24 @@ class NodeStateRepository:
             mode=mode,
             reason_hash=reason_hash,
             reason_ref=materialized_reason_ref,
-            created_at=timestamp,
+            created_at=now(),
         )
 
-        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="record_routing_event") as conn:
-            return self._insert_or_load_routing_decision(
-                [event],
-                conn=conn,
-                run_id=member_token.run_id,
-                owner="record_routing_event",
-                enforce_event_ids=event_id_was_supplied,
-                enforce_group_id=routing_group_id_was_supplied,
-            )[0]
+    def record_routing_event_on(self, event: RoutingEvent, *, conn: Connection, run_id: str, owner: str) -> RoutingEvent:
+        """Insert one :meth:`prepare_routing_event` route as the state's whole decision, on ``conn``.
+
+        For a caller that must record the decision in the same transaction as
+        other writes (a failed aggregation batch's verdict). The state owns
+        exactly one decision; a retry of the identical decision loads it.
+        """
+        return self._insert_or_load_routing_decision(
+            [event],
+            conn=conn,
+            run_id=run_id,
+            owner=owner,
+            enforce_event_ids=False,
+            enforce_group_id=False,
+        )[0]
 
     def record_routing_events(
         self,

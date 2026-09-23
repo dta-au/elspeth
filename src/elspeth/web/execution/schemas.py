@@ -751,8 +751,10 @@ class DiscardSummary(_StrictResponse):
     """Counts routed to the virtual ``discard`` sink.
 
     The backing records live in four audit surfaces:
-    ``validation_errors.destination='discard'``,
-    ``transform_errors.destination='discard'``, terminal
+    ``validation_errors.destination='discard'``, tokens whose terminal
+    outcome is a transform-error failure decided by a
+    ``transform_errors.destination='discard'`` row (one per token, at the
+    deciding node, never a failed attempt a resumed retry superseded), terminal
     ``token_outcomes.path='gate_error_discarded'`` rows attributed to their
     failed gate node states, and terminal
     ``token_outcomes.sink_name='__discard__'`` rows for sink-write
@@ -1115,7 +1117,7 @@ class RunDiagnosticDiscard(_StrictResponse):
     ``tokens``.
 
     ``error`` is already boundary-scrubbed at the recording site
-    (``plugins/sources/_safe_validation_errors.py``, elspeth-a300402c58):
+    (``contracts/safe_validation_errors.py``, elspeth-a300402c58):
     loc/msg/type only, input echo dropped — so it is projected verbatim with
     no second scrubber.  ``row_data_json`` is audit material and is never
     projected (module rule, ``web/execution/diagnostics.py``).  The structured

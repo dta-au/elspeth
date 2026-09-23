@@ -483,7 +483,9 @@ class TestRowAtomicity:
 
         # Pin a low retry budget so the persistently-failing rows divert quickly
         # (B3.7 bounded local retry would otherwise nap toward the 3600s default).
-        config = _make_config(max_capacity_retry_seconds=1)
+        # This load case measures batch atomicity, so keep template rendering
+        # outside the measurement made with the provider double.
+        config = _make_config(max_capacity_retry_seconds=1, prompt_template="Evaluate")
 
         transform = LLMTransform(config)
         init_ctx = make_context()
@@ -690,7 +692,8 @@ class TestRowAtomicity:
         from elspeth.plugins.infrastructure.clients.llm import RateLimitError
         from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 
-        config = _make_config()
+        # Keep this stress case focused on row settlement under provider errors.
+        config = _make_config(prompt_template="Evaluate")
 
         transform = LLMTransform(config)
         init_ctx = make_context()
@@ -849,7 +852,8 @@ class TestProfilingInstrumentation:
             _call_count,
             _mock_azure_class,
         ):
-            config = _make_config()
+            # Exclude template worker startup from the batch overhead measure.
+            config = _make_config(prompt_template="Evaluate")
 
             transform = LLMTransform(config)
             init_ctx = make_context()

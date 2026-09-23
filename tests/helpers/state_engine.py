@@ -28,6 +28,7 @@ from elspeth.core.landscape.schema import (
     audit_export_snapshots_table,
     batch_outputs_table,
     batches_table,
+    call_verifications_table,
     calls_table,
     metadata,
     node_states_table,
@@ -63,6 +64,7 @@ STATE_ENGINE_TABLES: tuple[str, ...] = (
     "batch_members",
     "batch_outputs",
     "batches",
+    "call_verifications",
     "calls",
     "checkpoints",
     "coalesce_effect_members",
@@ -202,6 +204,8 @@ class StateEngineImage:
 
 def _run_predicate(table_name: str, run_id: str) -> ColumnElement[bool]:
     table = metadata.tables[table_name]
+    if table_name == "call_verifications":
+        return call_verifications_table.c.current_run_id == run_id
     if table_name == "audit_export_snapshots":
         return audit_export_snapshots_table.c.source_run_id == run_id
     if table_name == "audit_export_snapshot_chunks":

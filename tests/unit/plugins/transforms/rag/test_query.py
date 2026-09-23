@@ -154,6 +154,12 @@ class TestTemplateMode:
         assert result.error is not None
         assert result.error["reason"] == "template_rendering_failed"
 
+    def test_resource_bounded_render_returns_row_error(self):
+        builder = QueryBuilder(query_field="topic", query_template="{{ query * 300000000 }}")
+        result = builder.build({"topic": "x"})
+        assert result.error is not None
+        assert result.error["reason"] == "template_rendering_failed"
+
 
 # =============================================================================
 # Regex mode

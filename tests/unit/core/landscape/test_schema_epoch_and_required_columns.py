@@ -49,7 +49,7 @@ def test_epoch_is_forty() -> None:
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
-    assert SQLITE_SCHEMA_EPOCH == 43
+    assert SQLITE_SCHEMA_EPOCH == 44
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

@@ -51,7 +51,7 @@ from elspeth.contracts.chargeable_admission import (
     ChargeableAdmissionRefused,
     QuotaDisposition,
 )
-from elspeth.contracts.enums import CreationModality, RunStatus
+from elspeth.contracts.enums import CreationModality, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -11531,6 +11531,15 @@ class TestFailureSampleClientEgress:
                     "error_type": f"BadGzipFile: {_EGRESS_CANARY_PROVIDER}",
                 },
                 destination="discard",
+            )
+            # The row's terminal discard: the failure summary counts tokens
+            # whose terminal outcome a transform error decided.
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(factory, run.run_id),
+                ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="a" * 16,
             )
         return run.run_id
 

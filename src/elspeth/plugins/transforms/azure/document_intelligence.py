@@ -294,7 +294,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:54b0ec728b7c5519"
+    source_file_hash: str | None = "sha256:2f84a868669a4ab1"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -448,6 +448,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
                     limiter=self._limiter,
                     token_id=token_id,
                     max_response_body_bytes=self._max_response_body_bytes,
+                    call_mode_session=ctx.call_mode_session,
                 )
             return self._http_clients[state_id]
 

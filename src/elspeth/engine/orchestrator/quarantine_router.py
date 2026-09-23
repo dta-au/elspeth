@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 # Backstop cap for plugin-authored quarantine error text (elspeth-a300402c58).
 # Source plugins own producing input-free error strings
-# (plugins/sources/_safe_validation_errors.py); this bound stops an
+# (contracts/safe_validation_errors.py); this bound stops an
 # unbounded or input-echoing plugin string from flooding every audit
 # surface the text lands on (node_states.error_json, the DIVERT routing
 # reason, exports). Genuine validation messages are far shorter.

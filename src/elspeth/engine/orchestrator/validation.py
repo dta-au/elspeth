@@ -230,10 +230,12 @@ def validate_aggregation_error_sinks(
 ) -> None:
     """Validate aggregation on_error destinations reference existing sinks.
 
-    AggregationSettings.on_error is required ("sink name or 'discard'"), but a
-    ghost sink was only discovered when the first batch actually failed —
-    mid-run, after rows were consumed. Mirror the transform/gate checks and
-    fail at pipeline initialization instead (elspeth-eb4127fb49).
+    The DAG builder is the first wall: it refuses an unknown aggregation
+    on_error sink while it wires the ``__error_<name>__`` DIVERT edge
+    (elspeth-d2e3f29d10). This is the second wall at pipeline initialization,
+    for a PipelineConfig whose aggregation settings reach the orchestrator
+    without that graph — mirroring the transform/gate checks
+    (elspeth-eb4127fb49).
     """
     for settings in aggregation_settings.values():
         on_error = settings.on_error

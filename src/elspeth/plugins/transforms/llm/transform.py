@@ -27,7 +27,7 @@ import structlog
 from pydantic import BaseModel, TypeAdapter
 from pydantic import Field as PydanticField
 
-from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
+from elspeth.contracts import Determinism, RunMode, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
@@ -89,6 +89,7 @@ from elspeth.plugins.transforms.llm.validation import (
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
@@ -1206,7 +1207,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a81bfd6827329531"
+    source_file_hash: str | None = "sha256:0e4ac5f1088d3fcf"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1633,6 +1634,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._limiter: Any = None
         self._shutdown_event: threading.Event | None = None
         self._payload_store: PayloadStore | None = None
+        self._call_mode_session: CallModeSession | None = None
 
         # Batch processing state
         self._batch_initialized = False
@@ -1725,12 +1727,24 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Capture recorder/telemetry and create provider instance."""
+        if ctx.call_mode_session is None:
+            if ctx.run_mode is not RunMode.LIVE:
+                raise RuntimeError("LLM replay/verify requires a matching call-mode session")
+        elif ctx.call_mode_session.mode is not ctx.run_mode:
+            raise RuntimeError("LLM run mode and call-mode session disagree")
+        if (
+            ctx.run_mode in (RunMode.REPLAY, RunMode.VERIFY)
+            and self._tracing_config is not None
+            and self._tracing_config.provider != "none"
+        ):
+            raise RuntimeError("LLM tracing is not supported in replay or verify mode")
         super().on_start(ctx)
         self._recorder = ctx.landscape
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
         self._shutdown_event = ctx.shutdown_event
         self._payload_store = ctx.payload_store
+        self._call_mode_session = ctx.call_mode_session
         limiter_name = (
             "azure_openai"
             if isinstance(self._config, AzureOpenAIConfig)
@@ -1790,6 +1804,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
                 llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, OpenRouterConfig):
             return OpenRouterLLMProvider(
@@ -1803,6 +1818,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
                 llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
@@ -1815,6 +1831,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
                 llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, GatewayConfig):
             # GatewayConfig.api_key already carries the resolved bearer value
@@ -1838,6 +1855,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 limiter=self._limiter,
                 approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
                 llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")

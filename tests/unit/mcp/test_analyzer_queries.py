@@ -24,6 +24,7 @@ import json
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import (
     CallStatus,
@@ -43,6 +44,7 @@ from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
 from elspeth.core.landscape.lineage import explain
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import transform_errors_table
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.analyzers.diagnostics import get_failure_context
 from elspeth.mcp.analyzers.queries import (
@@ -1288,6 +1290,16 @@ class TestGetRunSummary:
         assert result["errors"]["transform"] == 1
         assert result["errors"]["total"] == 2
 
+    def test_summary_counts_a_token_once_when_a_resumed_attempt_rewrote_its_error(self) -> None:
+        """Two attempts' rows for N tokens count N transform errors, not 2N."""
+        db, factory = _record_two_attempts_per_token("two-attempt-summary-run", tokens=3)
+
+        result = get_run_summary(db, factory, "two-attempt-summary-run")
+
+        assert "error" not in result
+        assert result["errors"]["transform"] == 3
+        assert result["errors"]["total"] == 3
+
     def test_list_rows_exposes_source_local_and_ingest_identity(self) -> None:
         setup = make_recorder_with_run(run_id="multi-source-rows", source_node_id="orders")
         db = setup.db
@@ -1646,8 +1658,106 @@ class TestErrorAnalysisCorruptionGuard:
 
         _delete_node(db, "corrupt-ea", "xform")
 
-        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption.*transform_errors"):
+        # The guard's count is COUNT(DISTINCT token_id), so it names tokens, not rows.
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
             get_error_analysis(db, factory, "corrupt-ea")
+
+    def test_missing_node_raises_even_when_its_token_did_not_fail(self) -> None:
+        """The guard reads EVERY transform_errors row, not only the ones the count keeps.
+
+        The counts keep only the error that decided a terminally failed token.
+        An orphaned row whose token was delivered after a resumed retry is
+        still Tier-1 corruption, and gating the guard on the count would let it
+        vanish silently.
+        """
+        setup = make_recorder_with_run(run_id="corrupt-delivered", source_node_id="src")
+        db, factory = setup.db, setup.factory
+        register_test_node(factory.data_flow, "corrupt-delivered", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "corrupt-delivered"),
+        )
+        error_reason: TransformErrorReason = {"reason": "test_error"}
+        error_member = leader_member_token(factory, "corrupt-delivered")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
+        factory.data_flow.record_transform_error(
+            ref=TokenRef(token_id=token.token_id, run_id="corrupt-delivered"),
+            transform_id="xform",
+            row_data={"x": 1},
+            error_details=error_reason,
+            destination="discard",
+            member_token=error_member,
+            work_item=error_item,
+        )
+        factory.data_flow.record_token_outcome_leader(
+            ref=TokenRef(token_id=token.token_id, run_id="corrupt-delivered"),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="output",
+            coordination_token=leader_coordination_token(factory, "corrupt-delivered"),
+        )
+        control = get_error_analysis(db, factory, "corrupt-delivered")
+        assert "error" not in control
+        assert control["transform_errors"]["total"] == 0, "control: the delivered token is not a failure"
+
+        _delete_node(db, "corrupt-delivered", "xform")
+
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
+            get_error_analysis(db, factory, "corrupt-delivered")
+
+    def test_an_orphan_in_another_run_does_not_fail_this_runs_analysis(self) -> None:
+        """The guard scans the analysed run's transform_errors only.
+
+        One audit database holds many runs. An orphaned row in one run is that
+        run's corruption. It must not make every other run's error analysis
+        raise.
+        """
+        corrupt = make_recorder_with_run(run_id="orphan-run", source_node_id="src")
+        clean = make_recorder_with_run(run_id="clean-neighbour-run", source_node_id="src", db=corrupt.db)
+        for setup in (corrupt, clean):
+            run_id, factory = setup.run_id, setup.factory
+            register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+            _row, token = factory.data_flow.create_row_with_token(
+                "src",
+                row_index=0,
+                data={"x": 1},
+                source_row_index=0,
+                ingest_sequence=0,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+            error_reason: TransformErrorReason = {"reason": "test_error"}
+            error_member = leader_member_token(factory, run_id)
+            error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                transform_id="xform",
+                row_data={"x": 1},
+                error_details=error_reason,
+                destination="discard",
+                member_token=error_member,
+                work_item=error_item,
+            )
+            factory.data_flow.record_token_outcome_leader(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="a" * 16,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+
+        _delete_node(corrupt.db, "orphan-run", "xform")
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
+            get_error_analysis(corrupt.db, corrupt.factory, "orphan-run")
+
+        result = get_error_analysis(clean.db, clean.factory, "clean-neighbour-run")
+
+        assert "error" not in result
+        assert result["transform_errors"]["total"] == 1
+        assert result["transform_errors"]["by_transform"] == [{"transform_plugin": "mapper", "count": 1}]
 
     def test_clean_error_analysis_still_works(self) -> None:
         """Corruption guard doesn't break normal error analysis."""
@@ -1693,6 +1803,64 @@ class TestErrorAnalysisCorruptionGuard:
         assert "error" not in result
         assert result["transform_errors"]["total"] == 1
         assert result["transform_errors"]["by_transform"][0]["transform_plugin"] == "mapper"
+
+    def test_error_analysis_counts_a_token_once_when_a_resumed_attempt_rewrote_its_error(self) -> None:
+        """Two attempts' rows for N tokens count N per transform and in the total, not 2N."""
+        db, factory = _record_two_attempts_per_token("two-attempt-ea-run", tokens=3)
+
+        result = get_error_analysis(db, factory, "two-attempt-ea-run")
+
+        assert "error" not in result
+        assert result["transform_errors"]["total"] == 3
+        assert result["transform_errors"]["by_transform"] == [{"transform_plugin": "mapper", "count": 3}]
+
+
+def _record_two_attempts_per_token(run_id: str, *, tokens: int) -> tuple[Any, Any]:
+    """A run whose ``tokens`` tokens each own TWO transform_errors rows at one node.
+
+    That is what a crash after the error write followed by a resumed attempt
+    leaves (elspeth-5887fb7928 E8): ``transform_errors`` has no
+    ``(token_id, transform_id)`` uniqueness.
+    """
+    setup = make_recorder_with_run(run_id=run_id, source_node_id="src")
+    db, factory = setup.db, setup.factory
+    register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+    member = leader_member_token(factory, run_id)
+    error_reason: TransformErrorReason = {"reason": "api_error"}
+    for index in range(tokens):
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=index,
+            data={"x": index},
+            source_row_index=index,
+            ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+        work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id="xform")
+        for _attempt in range(2):
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                transform_id="xform",
+                row_data={"x": index},
+                error_details=error_reason,
+                destination="quarantine",
+                member_token=member,
+                work_item=work_item,
+            )
+        # The second attempt failed too and routed the token to its on_error sink.
+        factory.data_flow.record_token_outcome_leader(
+            ref=TokenRef(token_id=token.token_id, run_id=run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.ON_ERROR_ROUTED,
+            sink_name="quarantine",
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+    factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
+    with db.connection() as conn:
+        rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+    assert len(rows) == 2 * tokens, "control: both attempts' rows are in the audit trail"
+    return db, factory
 
 
 class TestExplainTokenErrorHandling:

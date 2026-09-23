@@ -194,7 +194,7 @@ def test_replicate_guidance_distinguishes_missing_wrong_type_and_unsafe_integer_
     prose = f"{plugin_cls.usage_when_to_use} {plugin_cls.usage_when_not_to_use}".casefold()
 
     assert "missing copies_field uses default_copies" in prose
-    assert "a present non-integer count raises typeerror" in prose
+    assert "a present non-integer count (including null) fails the whole batch" in prose
     assert "only integer counts outside 1..max_copies are quarantined" in prose
 
 

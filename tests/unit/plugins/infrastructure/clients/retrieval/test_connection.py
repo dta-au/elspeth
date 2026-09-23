@@ -124,23 +124,27 @@ class TestChromaConnectionConfig:
                 ssl=True,
             )
 
-    def test_ssrf_check_is_deferred_in_preflight_mode(self) -> None:
-        """SSRF resolves DNS, so it must not run during no-network preflight.
-
-        Preflight validates config purely; the SSRF block is enforced at real
-        runtime, before the Chroma SDK connects. An internal host therefore
-        constructs cleanly under preflight and is only rejected at runtime.
-        """
+    def test_named_host_dns_is_deferred_in_every_config_mode(self) -> None:
+        """Config parsing stays local; live SDK construction pins DNS later."""
         from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 
-        with plugin_preflight_mode(True):
+        with patch("socket.getaddrinfo", side_effect=AssertionError("config resolved DNS")):
             config = ChromaConnectionConfig(
                 collection="test",
                 mode="client",
-                host="169.254.169.254",
+                host="chroma.example.com",
                 ssl=True,
             )
-        assert config.host == "169.254.169.254"
+        assert config.host == "chroma.example.com"
+
+        with plugin_preflight_mode(True), patch("socket.getaddrinfo", side_effect=AssertionError("preflight resolved DNS")):
+            config = ChromaConnectionConfig(
+                collection="test",
+                mode="client",
+                host="chroma.example.com",
+                ssl=True,
+            )
+        assert config.host == "chroma.example.com"
 
     def test_persistent_mode_valid(self) -> None:
         config = ChromaConnectionConfig(

@@ -80,6 +80,15 @@ gateway_adapter_fingerprint = "REPLACE_WITH_64_HEX_ADAPTER_PACKAGE_FINGERPRINT"
 # here, never baked into the module.
 gateway_upstream_origin = "https://REPLACE_WITH_AGENCY_UPSTREAM_ORIGIN"
 gateway_oauth_token_url = "https://REPLACE_WITH_TOKEN_ENDPOINT/oauth2/token"
+gateway_oauth_auth_method = "client_secret_basic"
+
+# Positive request bounds required by the gateway. Review these against the
+# agency upstream's limits and the workload before deploying.
+gateway_max_messages     = 50
+gateway_max_tools        = 10
+gateway_max_string_chars = 10000
+gateway_max_schema_bytes = 65536
+gateway_max_schema_depth = 10
 
 # alias => adapter-defined mapping object; must cover both composer models.
 gateway_model_mappings_json = <<JSON

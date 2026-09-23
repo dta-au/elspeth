@@ -70,8 +70,8 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.1, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=65` and
-`SQLITE_SCHEMA_EPOCH=43`. Session epoch 29 introduced durable guided
+contract. The release expects `SESSION_SCHEMA_EPOCH=66` and
+`SQLITE_SCHEMA_EPOCH=44`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -119,7 +119,7 @@ It also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-A Landscape store below epoch 43 is stale and must be recreated. When
+A Landscape store below epoch 44 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this
