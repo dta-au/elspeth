@@ -30,6 +30,7 @@ from elspeth.web.composer.tools._dispatch import (
     get_tool_definitions,
     require_schema_valid_arguments,
 )
+from tests.helpers.tree_gate import iter_gate_files
 
 from .conftest import (
     _fake_llm_response,
@@ -262,7 +263,7 @@ def _pydantic_wraps_without_category(source: str) -> list[int]:
 
 
 def _scanned_files() -> list[Path]:
-    return [path for root in _SCANNED_ROOTS for path in sorted(root.rglob("*.py")) if "guided" not in path.relative_to(root).parts]
+    return [path for root in _SCANNED_ROOTS for path in iter_gate_files(root) if "guided" not in path.relative_to(root).parts]
 
 
 class TestPydanticWrapCensus:
@@ -503,6 +504,9 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
     """The unreachable no-session branch must not claim a tool-list filter exists."""
     from unittest.mock import MagicMock
 
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+    from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
     from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
@@ -512,14 +516,14 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
             tool_call_id="call_1",
             arguments={},
             state=_empty_state(),
-            audit=MagicMock(),
-            recorder=MagicMock(),
+            audit=MagicMock(spec=DispatchAudit),
+            recorder=MagicMock(spec=BufferingRecorder),
             session_id=None,
             current_state_id=None,
             composer_model_version="m",
             llm_messages=[],
-            anti_anchor=MagicMock(),
-            policy_catalog=MagicMock(),
+            anti_anchor=MagicMock(spec=AntiAnchorTracker),
+            policy_catalog=MagicMock(spec=PolicyCatalogView),
         )
     message = str(caught.value)
     assert "composer_loop_tool_definitions" not in message

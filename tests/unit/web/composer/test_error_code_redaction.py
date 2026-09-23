@@ -24,6 +24,7 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools.generation import _VALIDATION_GUIDANCE_BY_CODE
 from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
+from tests.helpers.tree_gate import iter_gate_files
 
 _SRC = Path(__file__).resolve().parents[4] / "src" / "elspeth"
 _WEB = _SRC / "web"
@@ -237,7 +238,7 @@ def _is_excluded(relative: Path) -> bool:
 
 def _live_code_sites() -> list[_CodeSite]:
     sites: list[_CodeSite] = []
-    for path in sorted(_WEB.rglob("*.py")):
+    for path in iter_gate_files(_WEB):
         relative = path.relative_to(_WEB)
         if _is_excluded(relative):
             continue

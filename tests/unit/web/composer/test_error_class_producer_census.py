@@ -34,6 +34,7 @@ import pytest
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.redaction import _SAFE_ARG_ERROR_CLASSES
+from tests.helpers.tree_gate import iter_gate_files
 
 _COMPOSER = Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web" / "composer"
 
@@ -237,7 +238,7 @@ def _error_class_labels(relative_path: str, source: str) -> list[_Label]:
 
 def _live_labels() -> list[_Label]:
     labels: list[_Label] = []
-    for path in sorted(_COMPOSER.rglob("*.py")):
+    for path in iter_gate_files(_COMPOSER):
         relative = path.relative_to(_COMPOSER)
         if "guided" in relative.parts:
             continue

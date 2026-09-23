@@ -750,8 +750,8 @@ where this differs from the bullets above, this paragraph is the current state.
 
 **S0 review fixes (second review round): corrections, decisions and what is still owed.** Recorded after the S0
 correctness and gates reviews; where this differs from the two paragraphs above, this paragraph is the current state.
-Code in `0be896c48`. Evidence is in the lane under `s0-fix/`. After the fixes the trust-tier corpus is unchanged
-against `8ca98eaaf` (2290 findings, 0 added, 0 removed), the soft-mapping census and masquerade baseline are
+Code in `04b46a6d7`. Evidence is in the lane under `s0-fix/`. After the fixes the trust-tier corpus is unchanged
+against `109c8597a` (2290 findings, 0 added, 0 removed), the soft-mapping census and masquerade baseline are
 unchanged, and the affected test set (`tests/unit/web/composer`, `tests/unit/composer_mcp`, `tests/unit/web/test_app.py`
 and 4 more files) has one failure, `test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion`,
 which fails identically at `release/0.8.1`.
@@ -806,7 +806,7 @@ which fails identically at `release/0.8.1`.
   `other_failure:cancelled` / `other_failure:plugin_crash` (`appendix-a-fixture.log`). Negative control: an
   unregistered code in the rejection row gives `rejected:<redacted-response-text>` and the check fails
   (`appendix-a-fixture-negative.log`). The script is `s0-fix/appendix_a_fixture.py` in the lane.
-- **Codex review (gpt-6-astra, medium, read-only) of `4574ee7c9`.** It confirmed the planner tool lists are
+- **Codex review (gpt-6-astra, medium, read-only) of `03255b0e0`.** It confirmed the planner tool lists are
   byte-identical to `release/0.8.1` (42 loop tools, 63,872 bytes, same SHA-256; the lead measured 96,240 bytes for
   the loop and planner lists together) and found no production defect. Two findings were confirmed and fixed:
   (1) the census missed `type(X).__name__` writers, so a builtin exception built only to be named passed. The rule
@@ -815,7 +815,13 @@ which fails identically at `release/0.8.1`.
   `TypeError` is flagged; the unmutated tree is clean. (2) The boot-probe copy test mutated only the top level of
   `kwargs`, which `**kwargs` already copies; it now mutates nested messages and tools against a deep snapshot, and a
   shared-object `to_litellm_kwargs` fails it on the assertion.
-- **Still owed before merge:** the full-suite gate (`--stages ruff,mypy,contracts,lints,pytest`), and acceptance 2
+- **Full-suite gate (rebased on `780ef0f56`), run at `eae09efc8`.** The tree stayed frozen; ruff, mypy and contracts
+  passed; lints held at 2290 findings, the known +4 below. Pytest: 11 failed, 56,285 passed. Nine also fail on a clean
+  `780ef0f56` export: the session-epoch-66 doc and runbook pins, the session-DB authority pins, the website get-started
+  pin and the P5 advisor test. The other two were caused by this branch and are fixed in the commit that records this entry. Four
+  `MagicMock()`s had no `spec`. Three censuses called `rglob("*.py")` instead of `tests/helpers/tree_gate.iter_gate_files`,
+  which lists the same 110/360/4 files in the same order.
+- **Still owed after merge:** acceptance 2
   (a dev session persisting `plugin_options_invalid` / `prompt_template_parts_required`), 4 (a dev-deployment boot
   with the logged total probe time, which is also the only measurement of `planner_tools` latency at candidate
   effort) and 5 (the baseline). All three need a dev deployment. The testcontainer selection is not run: no DDL and
