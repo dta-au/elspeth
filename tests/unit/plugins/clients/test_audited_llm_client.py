@@ -23,14 +23,33 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     ContentPolicyError,
+    ContextLengthError,
     LLMClientError,
     LLMResponse,
     NetworkError,
     RateLimitError,
+    ServerError,
+    public_llm_error_category,
 )
 from tests.fixtures.mock_audit import mock_audit_authority
 
 _DEFAULT_USAGE = object()
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "retryable"),
+    [
+        (RateLimitError("limit"), "rate_limit", True),
+        (NetworkError("network"), "network", True),
+        (ServerError("server"), "server", True),
+        (ContentPolicyError("policy"), "content_policy", False),
+        (ContextLengthError("context"), "context_length", False),
+        (LLMClientError("client"), "client", False),
+    ],
+)
+def test_public_llm_error_category_tracks_owned_retry_semantics(error: LLMClientError, category: str, retryable: bool) -> None:
+    assert public_llm_error_category(error) == category
+    assert error.retryable is retryable
 
 
 def test_replay_llm_call_returns_recorded_typed_response_without_sdk_dispatch() -> None:

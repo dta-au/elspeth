@@ -84,6 +84,8 @@ class LLMClientError(PluginRetryableError):
         retryable: Whether the error is likely transient and retryable
     """
 
+    category: LLMErrorCategory = "client"
+
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message, retryable=retryable)
 
@@ -95,6 +97,8 @@ class RateLimitError(LLMClientError):
     Always marked as retryable since rate limits are transient.
     """
 
+    category: LLMErrorCategory = "rate_limit"
+
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=True)
 
@@ -105,6 +109,8 @@ class NetworkError(LLMClientError):
     Raised for transient network issues like timeouts, connection refused,
     DNS failures, etc. These errors are typically transient and should be retried.
     """
+
+    category: LLMErrorCategory = "network"
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=True)
@@ -124,6 +130,8 @@ class ServerError(LLMClientError):
     resolve on retry.
     """
 
+    category: LLMErrorCategory = "server"
+
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=True)
 
@@ -134,6 +142,8 @@ class ContentPolicyError(LLMClientError):
     Raised when the LLM provider rejects the request due to content
     policy violations. Retrying with the same prompt will always fail.
     """
+
+    category: LLMErrorCategory = "content_policy"
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=False)
@@ -146,23 +156,15 @@ class ContextLengthError(LLMClientError):
     Retrying with the same prompt will always fail.
     """
 
+    category: LLMErrorCategory = "context_length"
+
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=False)
 
 
 def public_llm_error_category(error: LLMClientError) -> LLMErrorCategory:
     """Name the public exception behavior retained in an LLM audit error."""
-    if isinstance(error, RateLimitError):
-        return "rate_limit"
-    if isinstance(error, ContentPolicyError):
-        return "content_policy"
-    if isinstance(error, ContextLengthError):
-        return "context_length"
-    if isinstance(error, ServerError):
-        return "server"
-    if isinstance(error, NetworkError):
-        return "network"
-    return "client"
+    return error.category
 
 
 _RATE_LIMIT_PATTERNS = (
@@ -436,14 +438,14 @@ class AuditedLLMClient(AuditedClientBase):
                 raise ValueError("Recorded LLM error has no error payload")
             if evidence.response_data is not None:
                 raise ValueError("Recorded LLM response-processing error cannot be reproduced exactly")
-            retryable = error.get("retryable")
-            error_type = error.get("type")
-            error_message = error.get("message")
-            pricing_model = error.get("pricing_model")
-            if type(retryable) is not bool or type(error_type) is not str or type(error_message) is not str:
-                raise ValueError("Recorded LLM error has invalid fields")
             if set(error) != {"type", "message", "retryable", "pricing_model", "provider_cost", "provider_cost_source", "category"}:
                 raise ValueError("Recorded LLM error lacks a complete public classification")
+            retryable = error["retryable"]
+            error_type = error["type"]
+            error_message = error["message"]
+            pricing_model = error["pricing_model"]
+            if type(retryable) is not bool or type(error_type) is not str or type(error_message) is not str:
+                raise ValueError("Recorded LLM error has invalid fields")
             raw_cost_source = error["provider_cost_source"]
             if raw_cost_source not in get_args(ComposerLLMProviderCostSource):
                 raise ValueError("Recorded LLM error has invalid provider cost source")
@@ -458,7 +460,7 @@ class AuditedLLMClient(AuditedClientBase):
                 message=error_message,
                 retryable=retryable,
                 pricing_model=pricing_model,
-                provider_cost=error.get("provider_cost"),
+                provider_cost=error["provider_cost"],
                 provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
                 category=category,
             )
@@ -509,8 +511,6 @@ class AuditedLLMClient(AuditedClientBase):
         if set(response_data) != required_fields:
             raise ValueError("Recorded LLM response has incomplete fields")
         usage_data = response_data["usage"]
-        if not isinstance(usage_data, Mapping):
-            raise ValueError("Recorded LLM usage is not a mapping")
         usage = TokenUsage.from_dict(usage_data)
         if usage.to_dict() != usage_data:
             raise ValueError("Recorded LLM usage is malformed")
