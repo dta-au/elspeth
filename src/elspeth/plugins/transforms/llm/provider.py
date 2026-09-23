@@ -165,7 +165,7 @@ class LLMAuditParent:
         call_mode_session: CallModeSession | None = None,
     ) -> Call:
         """Record a semantic call under this validated parent."""
-        source_identity: dict[str, str] = {}
+        source_call_id: str | None = None
         if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY:
             evidence = call_mode_session.replay_call(
                 call_type=call_type,
@@ -178,7 +178,7 @@ class LLMAuditParent:
             actual_error = None if error is None else error.to_dict()
             if evidence.status is not status or evidence.response_data != actual_response or evidence.error_data != actual_error:
                 raise AuditIntegrityError("Replayed semantic LLM response differs from its source call")
-            source_identity["source_call_id"] = evidence.source_call_id
+            source_call_id = evidence.source_call_id
         if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
             call_mode_session.admit_verify_call(
                 call_type=call_type,
@@ -200,7 +200,7 @@ class LLMAuditParent:
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
-                **source_identity,
+                source_call_id=source_call_id,
             )
         else:
             if self.state_id is None:
@@ -218,7 +218,7 @@ class LLMAuditParent:
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
-                **source_identity,
+                source_call_id=source_call_id,
             )
         if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
             call_mode_session.verify_call(

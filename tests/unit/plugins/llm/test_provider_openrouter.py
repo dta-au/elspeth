@@ -94,6 +94,39 @@ def test_replay_semantic_llm_record_binds_source_call() -> None:
     assert recorder.operation_calls[0]["source_call_id"] == "original-semantic-call"
 
 
+def test_replay_semantic_llm_row_record_keeps_claim_authority() -> None:
+    response = RawCallPayload({"content": "answer"})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["current_state_id"] == "state-1"
+            return SimpleNamespace(
+                source_call_id="original-row-call",
+                status=CallStatus.SUCCESS,
+                response_data=response.to_dict(),
+                error_data=None,
+            )
+
+    recorder = FakeAuditRecorder()
+    parent = LLMAuditParent.for_row(state_id="state-1", token_id="token-1", member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM)
+    parent.record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    recorded = recorder.calls[0]
+    assert recorded["source_call_id"] == "original-row-call"
+    assert recorded["member_token"] is _MEMBER_TOKEN
+    assert recorded["work_item"] is _WORK_ITEM
+
+
 def test_verify_semantic_llm_record_is_admitted_before_audit_and_compared_after() -> None:
     recorder = FakeAuditRecorder()
     request = RawCallPayload({"model": "gpt-4"})
