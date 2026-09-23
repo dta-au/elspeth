@@ -507,6 +507,104 @@ def test_ssrf_http_verify_refuses_unmatched_request_before_network(mock_executio
     assert mock_execution.record_call.call_count == 0
 
 
+@respx.mock
+def test_ssrf_managed_identity_verify_admits_current_fingerprint_before_dispatch(mock_execution, mock_telemetry_emit, monkeypatch):
+    admissions: list[dict[str, Any]] = []
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-managed-identity-verify")
+    monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "false")
+
+    class _VerifySession:
+        mode = RunMode.VERIFY
+
+        def admit_verify_http_managed_identity(self, **kwargs: Any) -> str:
+            assert route.call_count == 0
+            admissions.append(kwargs)
+            return "source-call"
+
+        def verify_call(self, **_kwargs: Any) -> VerificationDecision:
+            return VerificationDecision("call-1", "source-call", True)
+
+    route = respx.get("https://93.184.216.34/raw").mock(return_value=httpx.Response(200, content=b"current response"))
+    safe_request = SSRFSafeRequest(
+        original_url="https://api.example.com/raw",
+        resolved_ip="93.184.216.34",
+        host_header="api.example.com",
+        port=443,
+        path="/raw",
+        scheme="https",
+        bare_hostname="api.example.com",
+    )
+    client = AuditedHTTPClient(
+        **mock_audit_authority(),
+        execution=mock_execution,
+        state_id="test-state-001",
+        run_id="verify-run",
+        telemetry_emit=mock_telemetry_emit,
+        call_mode_session=_VerifySession(),
+        semantic_managed_identity_verify=True,
+    )
+
+    response, _final_url, _call = client.request_ssrf_safe(
+        "GET", safe_request, headers={"Authorization": "Bearer current-token"}, verify_source_call_id="source-call"
+    )
+
+    assert response.content == b"current response"
+    assert route.call_count == 1
+    assert admissions[0]["source_call_id"] == "source-call"
+    current_fingerprint = admissions[0]["request_data"]["headers"]["Authorization"]
+    assert current_fingerprint.startswith("<fingerprint:")
+    assert "current-token" not in str(admissions)
+    assert mock_execution.record_call.call_args[1]["request_data"].to_dict()["headers"]["Authorization"] == current_fingerprint
+
+
+def test_ssrf_managed_identity_verify_rejects_missing_or_divergent_preflight_before_network(
+    mock_execution, mock_telemetry_emit, monkeypatch
+):
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-managed-identity-verify")
+    monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "false")
+
+    class _VerifySession:
+        mode = RunMode.VERIFY
+
+        def admit_verify_http_managed_identity(self, **_kwargs: Any) -> str:
+            raise AuditIntegrityError("Current managed identity request differs from source")
+
+    safe_request = SSRFSafeRequest(
+        original_url="https://api.example.com/raw",
+        resolved_ip="93.184.216.34",
+        host_header="api.example.com",
+        port=443,
+        path="/raw",
+        scheme="https",
+        bare_hostname="api.example.com",
+    )
+    client = AuditedHTTPClient(
+        **mock_audit_authority(),
+        execution=mock_execution,
+        state_id="test-state-001",
+        run_id="verify-run",
+        telemetry_emit=mock_telemetry_emit,
+        call_mode_session=_VerifySession(),
+        semantic_managed_identity_verify=True,
+    )
+
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")),
+        pytest.raises(AuditIntegrityError, match="requires a preflight source call"),
+    ):
+        client.request_ssrf_safe("GET", safe_request, headers={"Authorization": "Bearer current-token"})
+
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")),
+        pytest.raises(AuditIntegrityError, match="differs from source"),
+    ):
+        client.request_ssrf_safe(
+            "GET", safe_request, headers={"Authorization": "Bearer current-token"}, verify_source_call_id="source-call"
+        )
+
+    assert mock_execution.record_call.call_count == 0
+
+
 def test_ssrf_replay_uses_archived_managed_identity_fingerprint_with_explicit_origin(mock_execution, mock_telemetry_emit):
     source_request = {
         "method": "GET",

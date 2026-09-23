@@ -150,6 +150,7 @@ class AuditedHTTPClient(AuditedClientBase):
         max_response_body_bytes: int | None = None,
         call_mode_session: CallModeSession | None = None,
         archived_auth_for_replay: bool = False,
+        semantic_managed_identity_verify: bool = False,
     ) -> None:
         """Initialize audited HTTP client.
 
@@ -172,6 +173,8 @@ class AuditedHTTPClient(AuditedClientBase):
             raise ValueError("max_response_body_bytes must be > 0 when configured")
         if archived_auth_for_replay and (call_mode_session is None or call_mode_session.mode is not RunMode.REPLAY):
             raise ValueError("archived_auth_for_replay requires a replay call-mode session")
+        if semantic_managed_identity_verify and (call_mode_session is None or call_mode_session.mode is not RunMode.VERIFY):
+            raise ValueError("semantic_managed_identity_verify requires a verify call-mode session")
         super().__init__(
             execution,
             state_id,
@@ -190,6 +193,7 @@ class AuditedHTTPClient(AuditedClientBase):
         self._max_response_body_bytes = max_response_body_bytes
         self._call_mode_session = call_mode_session
         self._archived_auth_for_replay = archived_auth_for_replay
+        self._semantic_managed_identity_verify = semantic_managed_identity_verify
         # Shared httpx.Client for connection pooling and TCP reuse.
         # httpx.Client is thread-safe; the internal pool handles concurrency.
         # Per-request timeouts override the default via timeout= kwarg.
@@ -917,6 +921,8 @@ class AuditedHTTPClient(AuditedClientBase):
         Raises:
             httpx.HTTPError: For network/HTTP errors
         """
+        if self._semantic_managed_identity_verify:
+            raise AuditIntegrityError("Managed identity verify requires the SSRF-safe request path")
         if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
             self._acquire_rate_limit()
         call_index = self._next_call_index()
@@ -1131,6 +1137,7 @@ class AuditedHTTPClient(AuditedClientBase):
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        verify_source_call_id: str | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """HTTP request with SSRF-safe IP pinning and redirect validation.
 
@@ -1150,6 +1157,8 @@ class AuditedHTTPClient(AuditedClientBase):
                 blocklist when validating redirect targets. This must match
                 the ranges used to create the initial SSRFSafeRequest so every
                 redirect hop preserves the same caller-approved boundary.
+            verify_source_call_id: Source HTTP call admitted before managed
+                identity token acquisition in verify mode.
 
         Returns:
             Tuple of (httpx.Response, final hostname URL as string, Call).
@@ -1165,6 +1174,13 @@ class AuditedHTTPClient(AuditedClientBase):
             SSRFBlockedError: If redirect target resolves to blocked IP
         """
         method_upper = method.upper()
+        if self._semantic_managed_identity_verify:
+            if not verify_source_call_id:
+                raise AuditIntegrityError("Managed identity verify requires a preflight source call")
+            if follow_redirects:
+                raise AuditIntegrityError("Managed identity verify does not support redirect following")
+        elif verify_source_call_id is not None:
+            raise AuditIntegrityError("Verify source call identity requires managed identity verify mode")
         if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
             self._acquire_rate_limit()
 
@@ -1208,7 +1224,21 @@ class AuditedHTTPClient(AuditedClientBase):
                 max_redirects=max_redirects,
             )
 
-        self._admit_verify_call(call_type=CallType.HTTP, request_data=request_data, call_index=call_index)
+        if self._semantic_managed_identity_verify:
+            session = self._call_mode_session
+            if session is None or verify_source_call_id is None:
+                raise AuditIntegrityError("Managed identity verify session or source call is missing")
+            admitted_source_call_id = session.admit_verify_http_managed_identity(
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                source_call_id=verify_source_call_id,
+            )
+            if admitted_source_call_id != verify_source_call_id:
+                raise AuditIntegrityError("Managed identity verify admitted a different source call")
+        else:
+            self._admit_verify_call(call_type=CallType.HTTP, request_data=request_data, call_index=call_index)
 
         start = time.perf_counter()
         response: httpx.Response | None = None
@@ -1373,6 +1403,7 @@ class AuditedHTTPClient(AuditedClientBase):
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        verify_source_call_id: str | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """GET with SSRF-safe IP pinning and redirect validation.
 
@@ -1386,6 +1417,7 @@ class AuditedHTTPClient(AuditedClientBase):
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             allowed_ranges=allowed_ranges,
+            verify_source_call_id=verify_source_call_id,
         )
 
     def _follow_redirects_safe(
