@@ -203,6 +203,26 @@ def test_programmatic_bootstrap_uses_same_early_admission(tmp_path: Path) -> Non
     loader.assert_not_called()
 
 
+def test_missing_source_run_refused_before_json_client_package_import(tmp_path: Path) -> None:
+    import builtins
+
+    from elspeth.cli import _admit_raw_cli_nonlive_run
+
+    settings_path = _settings_path(tmp_path, mode="replay")
+    original_import = builtins.__import__
+
+    def guarded_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "elspeth.plugins.infrastructure.clients.json_utils":
+            raise AssertionError("client package imported before source-run admission")
+        return original_import(name, *args, **kwargs)
+
+    with (
+        patch("builtins.__import__", side_effect=guarded_import),
+        pytest.raises(OrchestrationInvariantError, match="does not exist"),
+    ):
+        _admit_raw_cli_nonlive_run(settings_path)
+
+
 @pytest.mark.parametrize("mode", ["replay", "verify"])
 def test_supported_mode_reaches_constructor_only_after_cli_admission(tmp_path: Path, mode: str) -> None:
     settings_path = _settings_path(tmp_path, mode=mode)

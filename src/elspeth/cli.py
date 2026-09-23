@@ -517,7 +517,6 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine.orchestrator.run_modes import admit_source_run
-    from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
     from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
 
     raw_config = _load_raw_yaml(settings_path)
@@ -585,6 +584,8 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     )
     try:
         admit_source_run(db, RuntimeRunMode(mode, replay_from))
+        from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+
         source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
         if source is None:
             raise ValueError(f"Replay/verify source run {replay_from!r} disappeared during admission")
