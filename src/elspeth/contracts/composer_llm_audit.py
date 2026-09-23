@@ -69,6 +69,21 @@ class ComposerLLMCallStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ToolContractDialect(StrEnum):
+    """The shape of the tool list a composer model call was sent.
+
+    ``NONE`` is the flat registry schema (plus the web set_pipeline
+    envelope) with no ``strict`` key: today's bytes. ``OPENAI_STRICT`` makes
+    every optional property of a strict-capable tool required and nullable,
+    and stamps every tool with an explicit ``strict`` flag. The web wire
+    projection builds one tool list per dialect; the LLM-call audit record
+    reads the dialect, so the type lives here rather than under ``web/``.
+    """
+
+    OPENAI_STRICT = "openai_strict"
+    NONE = "none"
+
+
 def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:
     if optional and value is None:
         return

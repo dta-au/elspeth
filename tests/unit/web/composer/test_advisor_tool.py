@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
@@ -226,7 +227,7 @@ def test_advisor_tool_exposed() -> None:
     """Advisor is mandatory, so composer_loop_tool_definitions() always includes
     request_advisor_hint in the LiteLLM function format.
     """
-    tools = composer_loop_tool_definitions()
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")

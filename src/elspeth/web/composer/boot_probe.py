@@ -28,6 +28,7 @@ from typing import Any, Final, Literal
 
 import httpx
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_response
 from elspeth.web.composer.advisor_request import build_advisor_request_options
@@ -143,7 +144,7 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
     # The compose loop applies Anthropic cache markers (history-tail marker
     # included) before ``_call_llm`` builds the request; mirror it.
     loop_messages: list[dict[str, Any]] = [{"role": "user", "content": _PLANNER_PROBE_PROMPT}]
-    loop_tools = composer_loop_tool_definitions()
+    loop_tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     if supports_anthropic_prompt_cache_markers(model):
         loop_messages, marked_loop_tools = apply_anthropic_cache_markers(loop_messages, loop_tools, mark_history_tail=True)
         assert marked_loop_tools is not None

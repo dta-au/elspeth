@@ -99,6 +99,7 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.sessions.models import sessions_table
@@ -257,7 +258,7 @@ async def test_set_pipeline_invalid_provider_envelope_is_closed_arg_error_before
 def test_provider_discovery_explains_how_to_wrap_round_trip_pipeline_arguments(
     fake_composer_service: ComposerServiceImpl,
 ) -> None:
-    tools = composer_loop_tool_definitions()
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     discovery = next(tool["function"] for tool in tools if tool["function"]["name"] == "get_pipeline_state")
     mutation = next(tool["function"] for tool in tools if tool["function"]["name"] == "set_pipeline")
 
@@ -277,7 +278,7 @@ async def test_advisor_tool_always_present(
     """The ``request_advisor_hint`` tool is ALWAYS exposed to the composer
     LLM. There is no enable flag any more — advisor is mandatory, so the
     tool is unconditionally part of ``composer_loop_tool_definitions()``."""
-    tools = composer_loop_tool_definitions()
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
 

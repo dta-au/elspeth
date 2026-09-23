@@ -19,6 +19,7 @@ import pytest
 from litellm.exceptions import InternalServerError
 
 import elspeth.web.composer.boot_probe as bp
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
 from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
@@ -73,7 +74,7 @@ def test_requests_cover_every_surface_in_send_order(settings_factory: Any) -> No
 def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: Any) -> None:
     request = _request(settings_factory(composer_model="gpt-5.5"), "loop_tools")
 
-    assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions()
+    assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.NONE)
     assert request.to_litellm_kwargs()["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
     assert request.tool_count == 42
     assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 42)
@@ -174,7 +175,7 @@ def test_anthropic_routes_mirror_the_production_cache_markers(settings_factory: 
     loop = _request(settings, "loop_tools")
     planner = _request(settings, "planner_tools")
     loop_messages, loop_tools = apply_anthropic_cache_markers(
-        [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(), mark_history_tail=True
+        [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(ToolContractDialect.NONE), mark_history_tail=True
     )
     planner_messages, planner_tools = apply_anthropic_cache_markers(
         [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions()

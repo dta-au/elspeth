@@ -55,6 +55,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind, Interp
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
+    ToolContractDialect,
 )
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -226,13 +227,13 @@ from elspeth.web.composer.tools import (
     ToolResult,
     _sync_list_blobs,
     compute_proof_diagnostics,
-    get_tool_definitions,
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
+from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -861,46 +862,23 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_key"] = api_key
 
 
-def composer_loop_tool_definitions() -> list[dict[str, Any]]:
+def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
     """Return the tool list the freeform compose loop sends, in LiteLLM function format.
 
     The compose loop and the boot probe both call this, so the probe sends
-    exactly the list production sends.
+    exactly the list production sends. The list is the static wire
+    projection W of the registry for ``dialect``
+    (:func:`elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
+    which also owns the web ``set_pipeline`` envelope;
+    :mod:`elspeth.web.composer.tool_batch` unwraps that envelope before
+    custody, audit, redaction, or dispatch.
 
     Advisor is mandatory, so ``request_advisor_hint`` is always present
     in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
     affected; advisor is web-composer only by design (the tool is not
     registered in the CLI dispatch tables).
-
-    The web-visible ``set_pipeline`` arguments alone carry a required
-    ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
-    unions nested below a property but discard root-level ``oneOf``. The
-    registry and every internal/MCP consumer remain on the flat semantic
-    argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
-    provider envelope before custody, audit, redaction, or dispatch.
     """
-    definitions = get_tool_definitions()
-    tools: list[dict[str, Any]] = []
-    for defn in definitions:
-        parameters = defn["parameters"]
-        if defn["name"] == "set_pipeline":
-            parameters = {
-                "type": "object",
-                "properties": {"pipeline": parameters},
-                "required": ["pipeline"],
-                "additionalProperties": False,
-            }
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": defn["name"],
-                    "description": defn["description"],
-                    "parameters": parameters,
-                },
-            }
-        )
-    return tools
+    return wire_tool_definitions(dialect)
 
 
 def build_composer_loop_request_kwargs(
@@ -7158,7 +7136,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
-        tools = composer_loop_tool_definitions()
+        tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -7970,7 +7948,7 @@ class ComposerServiceImpl:
         method itself does not need to change shape.
         """
         if session_id is None:
-            # Compose-loop invariant. ``composer_loop_tool_definitions()`` filters
+            # Compose-loop invariant. ``composer_loop_tool_definitions`` filters
             # nothing: every compose turn advertises the session-aware
             # tools. What guarantees a session here is ``compose()``'s
             # admission, which refuses a turn without COMPOSE session
