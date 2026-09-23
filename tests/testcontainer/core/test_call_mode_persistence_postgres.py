@@ -89,6 +89,7 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
             source_call_id=source_call.call_id,
             is_match=True,
             differences_json="{}",
+            coordination_token=leader_coordination_token(factory, "current"),
         )
         with pytest.raises(AuditIntegrityError, match="source call"):
             factory.execution.record_verification_decision(
@@ -98,6 +99,7 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
                 source_call_id=current_call.call_id,
                 is_match=True,
                 differences_json="{}",
+                coordination_token=leader_coordination_token(factory, "current"),
             )
         with db.engine.connect() as conn:
             run = conn.execute(select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == "current")).one()
