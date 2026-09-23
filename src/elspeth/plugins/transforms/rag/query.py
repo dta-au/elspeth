@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from jinja2 import Template
 
 from jinja2 import TemplateSyntaxError, UndefinedError
-from jinja2.exceptions import SecurityError
+from jinja2.exceptions import SecurityError, TemplateRuntimeError
 
 from elspeth.contracts.errors import TransformErrorReason
 from elspeth.core.regex_worker import run_regex_worker
@@ -125,7 +125,17 @@ class QueryBuilder:
         assert self._compiled_template is not None  # guaranteed by build() guard
         try:
             query = self._compiled_template.render(query=extracted, row=row_data)
-        except (UndefinedError, SecurityError, OverflowError, ZeroDivisionError, ArithmeticError, TypeError, ValueError) as e:
+        except (
+            TemplateError,
+            TemplateRuntimeError,
+            UndefinedError,
+            SecurityError,
+            OverflowError,
+            ZeroDivisionError,
+            ArithmeticError,
+            TypeError,
+            ValueError,
+        ) as e:
             return QueryResult(
                 error=TransformErrorReason(
                     reason="template_rendering_failed",

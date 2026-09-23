@@ -3,25 +3,203 @@
 Provides a sandboxed Jinja2 environment factory and the TemplateError exception.
 Used by both LLM prompt templates and RAG query templates.
 
-The sandbox prevents attribute access, method calls, and module imports.
-It does NOT limit CPU or memory consumption from template loops — templates
-are authored by pipeline architects (trusted config), not end users.
+The sandbox prevents unsafe access. Constant folding of authored expressions
+is disabled during bounded-size compilation; rendering runs in a child process
+with CPU, memory, input and output ceilings.
 """
 
 from __future__ import annotations
 
+import math
+import multiprocessing
+import os
+import pickle
+import resource
+import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
 
-from jinja2 import StrictUndefined, nodes
+from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
+from jinja2.compiler import CodeGenerator
+from jinja2.exceptions import SecurityError, TemplateRuntimeError, UndefinedError
 from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.templates import validate_jinja_source
 
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
+
+
+_MAX_RENDER_BYTES = 4 * 1024 * 1024
+_MAX_CONTEXT_BYTES = 8 * 1024 * 1024
+# RLIMIT_AS is virtual address space, including the interpreter's existing
+# mappings. Cap growth from the spawned worker's own baseline, not an absolute
+# address size that depends on which web/test modules Python imported.
+_MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
+_WORKER_TIMEOUT_SECONDS = 5.0
+_WORKER_SLOTS = threading.BoundedSemaphore(2)
+
+
+class _NoFoldCodeGenerator(CodeGenerator):
+    """Never evaluate an authored expression while compiling a template."""
+
+    def _output_child_to_const(self, node: nodes.Expr, frame: Any, finalize: Any) -> str:
+        if isinstance(node, nodes.TemplateData):
+            return super()._output_child_to_const(node, frame, finalize)
+        raise nodes.Impossible()
+
+
+class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
+    code_generator_class = _NoFoldCodeGenerator
+
+
+@dataclass(frozen=True)
+class _RowTransport:
+    data: bytes
+    contract: bytes
+
+
+def _check_template_source(source: str) -> None:
+    try:
+        validate_jinja_source(source)
+    except ValueError as exc:
+        raise TemplateError(str(exc)) from exc
+
+
+def _template_worker(connection: Any, source: str, payload: bytes) -> None:
+    """Render in a process with an OS memory/CPU ceiling."""
+    try:
+        baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
+        max_address_space = baseline_pages * os.sysconf("SC_PAGE_SIZE") + _MAX_WORKER_ADDRESS_GROWTH
+        resource.setrlimit(resource.RLIMIT_AS, (max_address_space, max_address_space))
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+        context = pickle.loads(payload)
+        if type(context) is not dict or any(not isinstance(key, str) for key in context):
+            raise TemplateError("Template worker received an invalid context")
+        if any(isinstance(value, _RowTransport) for value in context.values()):
+            from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+
+            context = {
+                key: PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
+                if isinstance(value, _RowTransport)
+                else value
+                for key, value in context.items()
+            }
+        environment = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
+        template = environment.from_string(source)
+        pieces: list[str] = []
+        size = 0
+        for piece in template.generate(**context):
+            size += len(piece.encode("utf-8"))
+            if size > _MAX_RENDER_BYTES:
+                raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
+            pieces.append(piece)
+        connection.send(("ok", "".join(pieces)))
+    except BaseException as exc:
+        # Keep the protocol bounded and do not pickle a third-party exception.
+        connection.send((type(exc).__name__, str(exc)[:1024]))
+    finally:
+        connection.close()
+
+
+def _run_template_worker(source: str, payload: bytes) -> str:
+    _check_template_source(source)
+    if len(payload) > _MAX_CONTEXT_BYTES:
+        raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
+    if not _WORKER_SLOTS.acquire(timeout=_WORKER_TIMEOUT_SECONDS):
+        raise TemplateError("Too many concurrent template workers")
+    process_context = multiprocessing.get_context("spawn")
+    parent, child = process_context.Pipe(duplex=False)
+    process: Any = None
+    try:
+        process = cast("Any", process_context).Process(target=_template_worker, args=(child, source, payload))
+        process.start()
+        child.close()
+        if not parent.poll(_WORKER_TIMEOUT_SECONDS):
+            raise TemplateError("Template exceeded the execution time limit")
+        try:
+            status, value = parent.recv()
+        except EOFError as exc:
+            raise TemplateError("Template worker stopped before completing") from exc
+        if status == "ok":
+            if not isinstance(value, str):
+                raise TemplateError("Template worker returned a non-string result")
+            return value
+        if status == "TemplateSyntaxError":
+            raise TemplateSyntaxError(value, 1)
+        if status == "UndefinedError":
+            raise UndefinedError(value)
+        if status == "SecurityError":
+            raise SecurityError(value)
+        if status == "TemplateError":
+            raise TemplateError(value)
+        if status == "MemoryError":
+            raise TemplateError("Template worker exceeded the memory limit")
+        raise TemplateRuntimeError(value)
+    finally:
+        parent.close()
+        child.close()
+        if process is not None and process.is_alive():
+            process.kill()
+        if process is not None and process.pid is not None:
+            process.join()
+        _WORKER_SLOTS.release()
+
+
+class _BoundedTemplate:
+    def __init__(self, source: str) -> None:
+        self._source = source
+
+    def render(self, **context: Any) -> str:
+        from elspeth.contracts.schema_contract import PipelineRow
+
+        transport = {
+            key: _RowTransport(pickle.dumps(value.to_dict(), protocol=5), pickle.dumps(value.contract.to_checkpoint_format(), protocol=5))
+            if isinstance(value, PipelineRow)
+            else value
+            for key, value in context.items()
+        }
+        return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
+
+
+class _BoundedEnvironment(_LocalSandboxedEnvironment):
+    def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
+        _check_template_source(source)
+        return super().parse(source, name=name, filename=filename)
+
+    def from_string(
+        self,
+        source: str | nodes.Template,
+        globals: object = None,
+        template_class: type[Template] | None = None,
+    ) -> Template:
+        if globals is not None or template_class is not None:
+            raise TemplateError("Custom template globals and classes are unsupported")
+        if not isinstance(source, str):
+            raise TemplateError("Pre-parsed Jinja templates are unsupported")
+        _check_template_source(source)
+        ast = super().parse(source)
+        if sum(1 for _ in ast.find_all(nodes.Node)) > 2048:
+            raise TemplateError("Template AST exceeds 2048 nodes")
+        if next(ast.find_all(nodes.Pow), None) is not None:
+            raise TemplateError("Power expressions are not supported in pipeline templates")
+        # Jinja's stock compiler folds authored constants here. This
+        # environment disables that path, so syntax validation is bounded by
+        # the source/AST limits and does not wait for a child on the web loop.
+        compiled = super().from_string(ast)
+        # Static text has a fixed output no larger than its bounded source.
+        # Keep it in-process so ordinary blob paths need no worker startup.
+        if all(isinstance(node, nodes.Output) and all(isinstance(child, nodes.TemplateData) for child in node.nodes) for node in ast.body):
+            return compiled
+        return cast("Template", _BoundedTemplate(source))
 
 
 def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
@@ -32,10 +210,12 @@ def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
         - Raises on undefined variables (StrictUndefined)
         - Blocks attribute access and method calls (ImmutableSandboxedEnvironment)
         - Does not HTML-escape output (autoescape=False)
+        - Bounds compile input, render time, worker memory, and output size
     """
-    return ImmutableSandboxedEnvironment(
+    return _BoundedEnvironment(
         undefined=StrictUndefined,
         autoescape=False,
+        optimized=False,
     )
 
 
