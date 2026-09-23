@@ -52,10 +52,12 @@ _TRANSFORM_CLASSES = {
     "keyword_filter": ("elspeth.plugins.transforms.keyword_filter", "KeywordFilter"),
     "line_explode": ("elspeth.plugins.transforms.line_explode", "LineExplode"),
     "passthrough": ("elspeth.plugins.transforms.passthrough", "PassThrough"),
+    "reference_join": ("elspeth.plugins.transforms.reference_join", "ReferenceJoin"),
     "report_assemble": ("elspeth.plugins.transforms.report_assemble", "ReportAssemble"),
     "truncate": ("elspeth.plugins.transforms.truncate", "Truncate"),
     "type_coerce": ("elspeth.plugins.transforms.type_coerce", "TypeCoerce"),
     "value_transform": ("elspeth.plugins.transforms.value_transform", "ValueTransform"),
+    "web_scrape": ("elspeth.plugins.transforms.web_scrape", "WebScrapeTransform"),
 }
 
 _SINK_CLASSES = {

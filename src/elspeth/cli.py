@@ -41,6 +41,7 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
+from elspeth.core.template_materialization import TemplateFileError
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 
 if TYPE_CHECKING:
@@ -508,13 +509,15 @@ def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
     admit_nonlive_plugin_classes(config)
 
 
-def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str]]:
+def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str], object | None]:
     """Check source-run authority before secrets, file templates, or plugins."""
     from elspeth.cli_helpers import resolve_audit_passphrase
     from elspeth.contracts.call_mode import RuntimeRunMode
     from elspeth.core.config import ConcurrencySettings, LandscapeSettings, TelemetrySettings
     from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine.orchestrator.run_modes import admit_source_run
+    from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
     from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
 
     raw_config = _load_raw_yaml(settings_path)
@@ -527,7 +530,7 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     if env_mode is not None and env_mode != mode.value:
         raise ValueError("run_mode environment override must match the literal YAML value before execution")
     if mode is RunMode.LIVE:
-        return mode, frozenset()
+        return mode, frozenset(), None
 
     # Dynaconf can change invocation authority via environment overrides.
     # Require these fields in YAML so source-run admission uses the same DB and
@@ -549,8 +552,8 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     if any(name == prefix or name.startswith(f"{prefix}__") for name in os.environ for prefix in forbidden_env_prefixes):
         raise ValueError("Replay/verify admission fields must be literal YAML settings")
     secrets_config = _parse_raw_secrets_config(raw_config)
-    if mode is RunMode.REPLAY and secrets_config.source == "keyvault":
-        raise ValueError("Replay cannot fetch Key Vault secrets")
+    if secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
     requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
     replay_from = raw_config.get("replay_from")
     if not isinstance(replay_from, str) or not replay_from.strip():
@@ -582,9 +585,15 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     )
     try:
         admit_source_run(db, RuntimeRunMode(mode, replay_from))
+        source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
+        if source is None:
+            raise ValueError(f"Replay/verify source run {replay_from!r} disappeared during admission")
+        source_settings, parse_error = parse_json_strict(source.settings_json)
+        if parse_error is not None or type(source_settings) is not dict:
+            raise ValueError(f"Replay/verify source run {replay_from!r} has invalid settings_json")
     finally:
         db.close()
-    return mode, requested_plugins
+    return mode, requested_plugins, source_settings
 
 
 def _install_nonlive_plugin_scope(mode: RunMode, requested_plugins: frozenset[str]) -> None:
@@ -741,6 +750,8 @@ def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
 
 def _load_settings_with_secrets(
     settings_path: Path,
+    *,
+    source_settings: object | None = None,
 ) -> tuple[ElspethSettings, list[SecretResolutionInput]]:
     """Load settings with Key Vault secret resolution.
 
@@ -775,7 +786,7 @@ def _load_settings_with_secrets(
     # Extract and validate secrets config
     secrets_config = _parse_raw_secrets_config(raw_config)
 
-    # A replay run must never contact Key Vault before mode admission. The
+    # A non-live run must never contact Key Vault before mode admission. The
     # raw mode is literal here: secret expansion has not happened yet, and an
     # unknown value cannot safely be treated as live for this early boundary.
     raw_mode = raw_config.get("run_mode", RunMode.LIVE)
@@ -783,8 +794,8 @@ def _load_settings_with_secrets(
         run_mode = RunMode(raw_mode)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
-    if run_mode is RunMode.REPLAY and secrets_config.source == "keyvault":
-        raise ValueError("Replay cannot fetch Key Vault secrets")
+    if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
 
     # Phase 2: Load secrets from Key Vault if configured
     # Returns resolution records for later audit recording
@@ -792,7 +803,7 @@ def _load_settings_with_secrets(
 
     # Phase 3: Full config loading with Dynaconf (resolves ${VAR})
     # Now that secrets are in os.environ, Dynaconf can resolve them
-    config = load_settings(settings_path)
+    config = load_settings(settings_path, source_settings=source_settings)
 
     return config, secret_resolutions
 
@@ -953,10 +964,12 @@ def run(
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
-            mode, requested_plugins = _admit_raw_cli_nonlive_run(settings_path)
+            mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
             _install_nonlive_plugin_scope(mode, requested_plugins)
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-        config, secret_resolutions = _load_settings_with_secrets(settings_path)
+        else:
+            source_settings = None
+        config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
         _require_marked_export(config)
     except FileNotFoundError:
         typer.echo(f"Error: Settings file not found: {settings}", err=True)
@@ -976,7 +989,7 @@ def run(
     except SinkEffectCapabilityError as e:
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
-    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
+    except (ValueError, TemplateFileError, contract_errors.OrchestrationInvariantError) as e:
         typer.echo(f"Configuration error: {e}", err=True)
         raise typer.Exit(1) from None
     except SecretLoadError as e:
@@ -1790,14 +1803,14 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
     from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
 
-    mode, requested_plugins = _admit_raw_cli_nonlive_run(settings_path)
+    mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
     if mode is RunMode.LIVE:
         return _bootstrap_and_run_impl(settings_path)
     with scoped_plugin_manager(build_nonlive_plugin_manager(requested_plugins)):
-        return _bootstrap_and_run_impl(settings_path)
+        return _bootstrap_and_run_impl(settings_path, source_settings=source_settings)
 
 
-def _bootstrap_and_run_impl(settings_path: Path) -> RunResult:
+def _bootstrap_and_run_impl(settings_path: Path, *, source_settings: object | None = None) -> RunResult:
     """Load config, instantiate plugins, build graph, and run a sub-pipeline.
 
     This is the programmatic equivalent of ``elspeth run --execute`` used by
@@ -1813,7 +1826,7 @@ def _bootstrap_and_run_impl(settings_path: Path) -> RunResult:
     from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
 
     _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-    config, secret_resolutions = _load_settings_with_secrets(settings_path)
+    config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
     _require_marked_export(config)
     _admit_cli_nonlive_run(config)
 

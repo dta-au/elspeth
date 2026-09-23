@@ -16,6 +16,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.infrastructure.run_mode_capabilities import (
     admit_nonlive_plugin_classes,
+    build_nonlive_plugin_manager,
     precheck_nonlive_plugin_names,
     precheck_nonlive_plugin_names_from_raw,
 )
@@ -96,9 +97,89 @@ def test_keyvault_refused_before_any_secret_or_plugin_work(tmp_path: Path, mode:
         result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
 
     assert result.exit_code == 1, result.output
-    assert ("cannot fetch Key Vault" if mode == "replay" else "does not exist") in result.output
+    assert "cannot fetch Key Vault" in result.output
     secrets.assert_not_called()
     loader.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_valid_source_keyvault_refused_before_remote_secret_or_constructor(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode, keyvault=True)
+    raw = yaml.safe_load(settings_path.read_text())
+    raw["replay_from"] = "source-run"
+    settings_path.write_text(yaml.safe_dump(raw))
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        lifecycle = RecorderFactory(db).run_lifecycle
+        lifecycle.begin_run(config={}, canonical_version="v1", run_id="source-run")
+        lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), "source-run"))
+    finally:
+        db.close()
+    with (
+        patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("settings loaded")) as loader,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    assert "cannot fetch Key Vault" in result.output
+    secrets.assert_not_called()
+    loader.assert_not_called()
+    construct.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_cli_file_backed_settings_use_admitted_source_content(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode)
+    raw = yaml.safe_load(settings_path.read_text())
+    raw["replay_from"] = "source-run"
+    raw["transforms"] = [
+        {
+            "name": "join",
+            "plugin": "reference_join",
+            "input": "primary",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {
+                "reference_file": "reference.csv",
+                "reference_format": "csv",
+                "key_field": "id",
+                "reference_key_name": "id",
+                "output": {"description": "ref['description']"},
+                "schema": {"mode": "observed"},
+            },
+        }
+    ]
+    settings_path.write_text(yaml.safe_dump(raw))
+    source_settings = {
+        "transforms": [
+            {
+                "name": "join",
+                "plugin": "reference_join",
+                "options": {"reference_source": "reference.csv", "reference_content": "id,description\n1,archived\n"},
+            }
+        ]
+    }
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        lifecycle = RecorderFactory(db).run_lifecycle
+        lifecycle.begin_run(config=source_settings, canonical_version="v1", run_id="source-run")
+        lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), "source-run"))
+    finally:
+        db.close()
+    reference_path = tmp_path / "reference.csv"
+    if mode == "verify":
+        reference_path.write_text("id,description\n1,changed\n")
+    with patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_FILE_ADMISSION")) as construct:
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    if mode == "replay":
+        assert "AFTER_FILE_ADMISSION" in result.output
+        construct.assert_called_once()
+        assert not reference_path.exists()
+    else:
+        assert "differs from source-run" in result.output
+        construct.assert_not_called()
 
 
 def test_unsupported_plugin_name_refused_before_registry_import(tmp_path: Path) -> None:
@@ -252,3 +333,13 @@ def test_capability_inventory_positive_and_negative_controls(monkeypatch: pytest
     monkeypatch.setattr(manager, "get_source_by_name", lambda _name: Impostor)
     with pytest.raises(OrchestrationInvariantError, match="not the reviewed built-in class"):
         admit_nonlive_plugin_classes(settings)
+
+
+def test_file_and_http_transform_capabilities_resolve_exact_builtin_classes() -> None:
+    from elspeth.plugins.transforms.reference_join import ReferenceJoin
+    from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+    requested = precheck_nonlive_plugin_names_from_raw({"transforms": [{"plugin": "reference_join"}, {"plugin": "web_scrape"}]})
+    manager = build_nonlive_plugin_manager(requested)
+    assert manager.get_transform_by_name("reference_join") is ReferenceJoin
+    assert manager.get_transform_by_name("web_scrape") is WebScrapeTransform
