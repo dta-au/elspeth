@@ -88,6 +88,12 @@ variables {
   gateway_adapter_fingerprint            = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   gateway_upstream_origin                = "https://agency.example.invalid"
   gateway_oauth_token_url                = "https://auth.example.invalid/oauth2/token"
+  gateway_oauth_auth_method              = "client_secret_basic"
+  gateway_max_messages                   = 50
+  gateway_max_tools                      = 10
+  gateway_max_string_chars               = 10000
+  gateway_max_schema_bytes               = 65536
+  gateway_max_schema_depth               = 10
   gateway_model_mappings_json = jsonencode({
     agency-primary = { upstream_model = "primary-upstream" }
     agency-advisor = { upstream_model = "advisor-upstream" }
