@@ -10,7 +10,6 @@ would never see it).
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
@@ -231,10 +231,18 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         assert durable.tool_calls == (
             {
                 "_kind": "composer_control_message",
-                "schema": "composer.control-message.v1",
+                "schema": "composer.control-message.v2",
                 "origin": "anti_anchor",
                 "provider_role": "user",
-                "content_hash": hashlib.sha256(durable.content.encode("utf-8")).hexdigest(),
+                "content_hash": stable_hash(
+                    {
+                        "_kind": "composer_control_message",
+                        "schema": "composer.control-message.v2",
+                        "origin": "anti_anchor",
+                        "provider_role": "user",
+                        "content": durable.content,
+                    }
+                ),
             },
         )
 
@@ -301,11 +309,6 @@ def test_anti_anchor_control_replay_fails_closed_on_provenance_tamper(tamper: st
     elif tamper == "provider_role":
         envelope["provider_role"] = "system"
     else:
-        # Measured 2026-09-22: the content hash binds the content alone, so
-        # swapping in another REGISTERED user-role origin (there is one:
-        # ``advisor_signoff_withheld``) replays successfully — the provider
-        # message is identical either way. Only an unregistered origin fails
-        # closed; that is the case pinned here.
         envelope["origin"] = "not_a_registered_origin"
 
     with pytest.raises(AuditIntegrityError):

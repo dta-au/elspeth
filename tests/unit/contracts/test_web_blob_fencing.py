@@ -3199,7 +3199,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
-    assert SESSION_SCHEMA_EPOCH == 65
+    # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
+    assert SESSION_SCHEMA_EPOCH == 66
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

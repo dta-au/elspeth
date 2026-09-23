@@ -7,14 +7,14 @@ records the provider role needed to reconstruct the exact outbound message.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 
 COMPOSER_CONTROL_MESSAGE_KIND = "composer_control_message"
-COMPOSER_CONTROL_MESSAGE_SCHEMA = "composer.control-message.v1"
+COMPOSER_CONTROL_MESSAGE_SCHEMA = "composer.control-message.v2"
 _ANTI_ANCHOR_ORIGIN = "anti_anchor"
 _ADVISOR_SIGNOFF_WITHHELD_ORIGIN = "advisor_signoff_withheld"
 # Closed origin vocabulary: every registered origin pins the exact provider
@@ -29,8 +29,21 @@ _ANTI_ANCHOR_PROVIDER_ROLE = _CONTROL_ORIGIN_PROVIDER_ROLES[_ANTI_ANCHOR_ORIGIN]
 _CONTROL_ENVELOPE_KEYS = frozenset({"_kind", "schema", "origin", "provider_role", "content_hash"})
 
 
-def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+def _control_hash(origin: str, content: str) -> str:
+    """Bind exact content to its closed provenance contract.
+
+    The v2 ``content_hash`` includes the envelope metadata: registered origins
+    can share a provider role but must not share a checksum for the same text.
+    """
+    return stable_hash(
+        {
+            "_kind": COMPOSER_CONTROL_MESSAGE_KIND,
+            "schema": COMPOSER_CONTROL_MESSAGE_SCHEMA,
+            "origin": origin,
+            "provider_role": _CONTROL_ORIGIN_PROVIDER_ROLES[origin],
+            "content": content,
+        }
+    )
 
 
 def _control_envelope(origin: str, content: str) -> dict[str, str]:
@@ -41,7 +54,7 @@ def _control_envelope(origin: str, content: str) -> dict[str, str]:
         "schema": COMPOSER_CONTROL_MESSAGE_SCHEMA,
         "origin": origin,
         "provider_role": _CONTROL_ORIGIN_PROVIDER_ROLES[origin],
-        "content_hash": _content_hash(content),
+        "content_hash": _control_hash(origin, content),
     }
 
 
@@ -101,6 +114,6 @@ def replay_composer_control_message(
     expected_role = _CONTROL_ORIGIN_PROVIDER_ROLES[envelope["origin"]]
     if envelope["provider_role"] != expected_role:
         raise AuditIntegrityError("composer control audit envelope has an unsupported origin or provider role")
-    if envelope["content_hash"] != _content_hash(content):
-        raise AuditIntegrityError("composer control audit content hash does not match stored content")
+    if envelope["content_hash"] != _control_hash(envelope["origin"], content):
+        raise AuditIntegrityError("composer control audit hash does not match stored content and provenance")
     return {"role": expected_role, "content": content}
