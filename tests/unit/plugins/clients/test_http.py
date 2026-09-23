@@ -428,16 +428,20 @@ def test_http_verify_submits_live_transport_and_call_identity(mock_execution, mo
     respx.get("https://api.example.com/raw").mock(
         return_value=httpx.Response(200, content=b"raw\n", headers={"content-type": "text/plain"})
     )
-    client = AuditedHTTPClient(
-        **mock_audit_authority(),
-        execution=mock_execution,
-        state_id="test-state-001",
-        run_id="verify-run",
-        telemetry_emit=mock_telemetry_emit,
-        call_mode_session=_VerifySession(),
-    )
-
-    response = client.get("https://api.example.com/raw")
+    real_httpx_client = httpx.Client
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", wraps=real_httpx_client) as client_factory:
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="verify-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_VerifySession(),
+        )
+        assert client_factory.call_count == 0
+        response = client.get("https://api.example.com/raw")
+        assert client_factory.call_count == 1
+        client.close()
 
     assert response.content == b"raw\n"
     assert len(decisions) == 2
@@ -457,16 +461,20 @@ def test_http_verify_refuses_unmatched_request_before_network(mock_execution, mo
         def admit_verify_call(self, **_kwargs: Any) -> str:
             raise AuditIntegrityError("No source call matches the intended HTTP request")
 
-    client = AuditedHTTPClient(
-        **mock_audit_authority(),
-        execution=mock_execution,
-        state_id="test-state-001",
-        run_id="verify-run",
-        telemetry_emit=mock_telemetry_emit,
-        call_mode_session=_VerifySession(),
-    )
-
-    with pytest.raises(AuditIntegrityError, match="No source call"):
+    with (
+        patch(
+            "elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("client constructed before admission")
+        ),
+        pytest.raises(AuditIntegrityError, match="No source call"),
+    ):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="verify-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_VerifySession(),
+        )
         client.get("https://api.example.com/raw")
 
     assert route.call_count == 0
@@ -489,19 +497,18 @@ def test_ssrf_http_verify_refuses_unmatched_request_before_network(mock_executio
         scheme="https",
         bare_hostname="api.example.com",
     )
-    client = AuditedHTTPClient(
-        **mock_audit_authority(),
-        execution=mock_execution,
-        state_id="test-state-001",
-        run_id="verify-run",
-        telemetry_emit=mock_telemetry_emit,
-        call_mode_session=_VerifySession(),
-    )
-
     with (
         patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")),
         pytest.raises(AuditIntegrityError, match="No source call"),
     ):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="verify-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_VerifySession(),
+        )
         client.request_ssrf_safe("GET", safe_request)
 
     assert mock_execution.record_call.call_count == 0

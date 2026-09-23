@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Network, IPv6Network
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -198,9 +199,11 @@ class AuditedHTTPClient(AuditedClientBase):
         # httpx.Client is thread-safe; the internal pool handles concurrency.
         # Per-request timeouts override the default via timeout= kwarg.
         # follow_redirects=False: SSRF-safe methods manage redirects manually.
+        # VERIFY waits until the first request has passed source-call admission.
+        self._client_init_lock = Lock()
         self._client = (
             None
-            if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY
+            if call_mode_session is not None and call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY)
             else httpx.Client(timeout=self._timeout, follow_redirects=False)
         )
 
@@ -962,10 +965,17 @@ class AuditedHTTPClient(AuditedClientBase):
 
         try:
             if self._client is None:
-                raise AuditIntegrityError("HTTP client absent outside replay mode")
+                with self._client_init_lock:
+                    if self._client is None:
+                        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.VERIFY:
+                            raise AuditIntegrityError("HTTP client absent outside admitted verify mode")
+                        self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
+            client = self._client
+            if client is None:
+                raise AuditIntegrityError("HTTP client absent after verify admission")
             # Dispatch to the correct httpx method
             response = self._request_with_optional_body_cap(
-                self._client,
+                client,
                 method,
                 full_url,
                 json=json,
