@@ -20,7 +20,53 @@ verbatim in `tracker-rows.json` alongside this file — nothing was summarised a
 
 ## Status
 
-MEASURED STATE (2026-09-13): Phase 2 auth core 6/6 and Phase 1 5/6 are done; Phase 3 frontend 2/3. **Phase 4 governance backend 1/9, Phase 5 frontend 0/3, cutover pending.** Approval, review, library, quotas, compartment marking and the admin UI are NOT built.
+**Re-measured 2026-09-23: the programme is essentially delivered — 9 of 12 deliverables done.**
+The three that remain are read-surface and labelling work, not enforcement. Full evidence:
+`docs/reviews/2026-09-23-identity-sso-completion.md`.
+
+| Deliverable | State |
+|---|---|
+| Pluggable SSO, identity substrate | Done |
+| Send for approval, send for review | Done |
+| Shared library | Done |
+| Per-person quotas — tokens/day and storage bytes | Done |
+| Compartment marking | Done |
+| Admin interface | Done |
+| Operator cutover runbook and compatibility record | Done — `docs/runbooks/identity-workflow-cutover.md` |
+| Approver audit view | **Partial** — the route is registered and tested, no interface reads it |
+| Composer completion-bar affordances | **Partial** — reachable, but see the placement question below |
+| `Save for review` → `Share inspect link` rename | **Not done** — the old label is still in the served bundle |
+
+### One thing to understand before reading "done"
+
+**`workflow_governance` defaults to `"off"`** (`src/elspeth/web/config.py`). With it off, the run
+admission gate admits runs with no approval — that is deliberate and tested, not a gap. Turning
+it on is refused unless a `compartment_id` is set and registration is not open
+(`src/elspeth/web/readiness.py`), because one person can hold many local identities under open
+registration and every author-is-not-approver rule would be defeatable. So the machinery is
+built and the enforcement is real; a deployment that has not turned it on is not governed.
+
+### A question this raises, not an answer
+
+Send-for-approval and send-for-review are reached through the Pipeline → Checks sub-tab
+(`ApprovalReadinessRow` → `AuditReadinessPanel` → `ChecksView`). A pending approval is a
+blocking state, and the standing placement ruling for this project is that a blocking state and
+its fix affordance belong at the top level rather than in a sub-tab. Whether that ruling governs
+this surface is a decision, not something to infer.
+
+### Why the previous status was wrong, and what it said
+
+This section previously recorded, from **2026-09-13**: Phase 4 governance backend 1/9, Phase 5
+frontend 0/3, cutover pending, and "approval, review, library, quotas, compartment marking and
+the admin UI are NOT built". That was accurate when written. It was overtaken by
+`44cf55a65` (2026-09-20, 218 files, +21,344 lines), which landed Phase 4, Phase 5 and the cutover
+runbook in one commit, and it is retained here rather than deleted so that anyone who meets those
+figures elsewhere can see they were re-measured rather than quietly dropped.
+
+Two rows in `tracker-rows.json` — per-person quotas and the cutover runbook — were closed as
+`skipped` on 2026-09-22 by the migration to GitHub Issues, not because they were abandoned.
+**Both are in fact done.** That status is an artefact of how the row was closed; read the table
+above, not the row.
 
 This is product governance — approvals and quotas for the people using ELSPETH. It is not the internal signing/tier-model ceremony that the 2026-09-23 ruling kept out of the GitHub migration.
 
