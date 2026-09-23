@@ -5646,7 +5646,7 @@ def test_planner_rejects_over_budget_tool_json_as_malformed_response(raw_argumen
     )
 
     with pytest.raises(PipelinePlannerError) as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5659,7 +5659,7 @@ def test_planner_rejects_excessive_tool_call_container_before_argument_parsing()
     )
 
     with pytest.raises(PipelinePlannerError, match="tool call") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     # The cap is the per-turn tool-call budget, not a malformed response
     # (see test_pipeline_planner_protocol_rejections.py for the loop path).
@@ -5683,7 +5683,7 @@ def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
     )
 
     with pytest.raises(PipelinePlannerError, match="duplicate") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5699,7 +5699,7 @@ def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
     response = _response_with_call_id(call_id, "list_sources", {})
 
     with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5721,7 +5721,7 @@ def test_planner_preserves_valid_distinct_provider_tool_call_order() -> None:
         usage=_planner_usage(),
     )
 
-    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3)
+    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert len(signed_call_id) > 256
     assert [call.call_id for call in calls] == [signed_call_id, "second"]

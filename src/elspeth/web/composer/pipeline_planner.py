@@ -1727,8 +1727,8 @@ def _parse_response_tool_calls(
     max_tool_calls: int,
     allow_text: bool = False,
     text_marker: str | None = None,
-    dialect: ToolContractDialect = ToolContractDialect.NONE,
-    sent_tool_names: frozenset[str] = frozenset(),
+    dialect: ToolContractDialect,
+    sent_tool_names: frozenset[str],
 ) -> tuple[Any, tuple[_ParsedToolCall, ...]]:
     """Parse one planner response into its tool calls.
 
@@ -1739,8 +1739,8 @@ def _parse_response_tool_calls(
     (information keys, the cycle guard, schema bookkeeping) and dispatch see
     the semantic form. Any other name keeps its arguments unchanged with no
     wire facts (D17): the palette is not enforced at dispatch, so decode
-    must not touch a W that was never sent. The defaults decode nothing;
-    the planner loop passes both.
+    must not touch a W that was never sent. Both keywords are required
+    (D10): a defaulted form would be a second path that decodes nothing.
     """
     choices = _provider_field(response, "choices")
     if type(choices) not in {list, tuple} or len(choices) != 1:

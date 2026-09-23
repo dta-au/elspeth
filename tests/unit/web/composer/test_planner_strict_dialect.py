@@ -38,6 +38,7 @@ from elspeth.web.composer.pipeline_planner import (
     PLANNER_DISCOVERY_TOOL_NAMES,
     PlannerDiscoveryPolicy,
     PlannerTerminalContract,
+    _parse_response_tool_calls,
     _ParsedToolCall,
     planner_terminal_tool_definition,
     planner_tool_definitions,
@@ -226,6 +227,28 @@ async def test_get_pipeline_state_outside_the_freeform_palette_is_not_decoded(
         assert deep_thaw(call.arguments) == {"component": None}
         assert (call.strict_sent, call.wire_conformant) == (None, None)
     assert len(recorder.invocations) == 0
+
+
+def test_the_parser_requires_the_dialect_and_the_sent_tool_names() -> None:
+    """D10: no defaulted form, so no caller can get a parse that silently decodes nothing.
+
+    A defaulted ``dialect`` / ``sent_tool_names`` would leave a strict W's
+    ``null`` at a promoted position unstripped for any caller that omits
+    them, and S would reject it (§1.6). Omitting either keyword is refused
+    at the call. Control: give either keyword a default and this test goes
+    red.
+    """
+    response = _response(("list_models", {"provider": None, "limit": None}))
+    without_either: dict[str, Any] = {"max_tool_calls": 3}
+    without_names: dict[str, Any] = {"max_tool_calls": 3, "dialect": _STRICT}
+    without_dialect: dict[str, Any] = {"max_tool_calls": 3, "sent_tool_names": frozenset({"list_models"})}
+
+    with pytest.raises(TypeError, match="'dialect' and 'sent_tool_names'"):
+        _parse_response_tool_calls(response, **without_either)
+    with pytest.raises(TypeError, match="'sent_tool_names'"):
+        _parse_response_tool_calls(response, **without_names)
+    with pytest.raises(TypeError, match="'dialect'"):
+        _parse_response_tool_calls(response, **without_dialect)
 
 
 def _palette_without(name: str) -> PlannerDiscoveryPolicy:

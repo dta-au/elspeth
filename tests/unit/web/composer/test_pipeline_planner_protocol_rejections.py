@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
     ComposerPlannerAttemptOutcome,
@@ -60,7 +60,7 @@ def test_parser_classifies_over_cap_batch_as_tool_calls_exhausted() -> None:
     response = _four_discovery_calls()
 
     with pytest.raises(PipelinePlannerError, match="per-turn tool call limit") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "TOOL_CALLS_EXHAUSTED"
 
