@@ -4744,7 +4744,7 @@ def health(
 def web(
     port: int = typer.Option(8451, help="Port to listen on"),
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
-    auth: str = typer.Option("local", help="Auth provider: local, oidc, entra, vanguard, google"),
+    auth: str | None = typer.Option(None, help="Auth provider: local, oidc, entra, vanguard, google"),
     reload: bool = typer.Option(False, help="Enable auto-reload for development"),
 ) -> None:
     """Start the ELSPETH web application."""
@@ -4776,9 +4776,12 @@ def web(
     # exists.
     from elspeth.web.auth.providers import registered_provider_names
 
+    # An explicit CLI choice takes precedence; otherwise preserve the provider
+    # supplied to the app factory through its normal environment settings.
+    selected_auth = auth if auth is not None else os.environ.get("ELSPETH_WEB__AUTH_PROVIDER", "local")
     selectable = registered_provider_names()
-    if auth not in selectable:
-        typer.echo(f"Error: unknown auth provider {auth!r}. Choose one of: {', '.join(selectable)}", err=True)
+    if selected_auth not in selectable:
+        typer.echo(f"Error: unknown auth provider {selected_auth!r}. Choose one of: {', '.join(selectable)}", err=True)
         raise typer.Exit(1)
 
     # Bridge CLI args to create_app() via environment variables.
@@ -4786,7 +4789,7 @@ def web(
     # so we set ELSPETH_WEB__* env vars that settings_from_env() reads.
     os.environ["ELSPETH_WEB__HOST"] = host
     os.environ["ELSPETH_WEB__PORT"] = str(port)
-    os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = auth
+    os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
 
     uvicorn.run(
         "elspeth.web.app:create_app",
