@@ -248,7 +248,12 @@ Phase 4: Structural Validation (called externally by orchestrator)
 - Stores trigger config, output_mode, options
 - Links via `continue` edge to the aggregation transform
 - `on_error` is NOT part of the aggregation node config, so it never moves a
-  node id; a named `on_error` sink is recorded by its DIVERT edge (Phase 2)
+  node id; a named `on_error` sink is recorded by its DIVERT edge (Phase 2).
+  That edge is part of the full topology hash, so naming an `on_error` sink
+  (even the aggregation's own success sink, which built before the edge
+  existed) changes the hash, and a checkpoint taken without the edge is
+  refused by the topology-mismatch check on resume. `discard` adds no edge
+  and leaves the hash unchanged.
 
 **Config-driven gates** (after aggregations):
 - Created from `GateSettings` config

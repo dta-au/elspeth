@@ -1543,7 +1543,9 @@ def build_execution_graph(
     # (validate_no_aggregations_in_regions) bans aggregations inside every
     # bound region, so a closer-named on_error falls through to the
     # unknown-sink error. on_error is NOT part of the aggregation node config
-    # (node identity): the edges row is the audit record of the route.
+    # (node identity): the edges row is the audit record of the route. The
+    # edge IS hashed into the full topology hash, so a named route changes it
+    # (and a checkpoint taken without the edge is refused); discard does not.
     for agg_name, (_agg_transform, agg_settings) in aggregations.items():
         agg_on_error = agg_settings.on_error
         if agg_on_error == "discard":

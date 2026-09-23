@@ -253,14 +253,59 @@ def test_aggregation_node_id_does_not_depend_on_on_error() -> None:
     """on_error is not part of the aggregation node identity.
 
     The route is recorded by the DIVERT ``edges`` row. Folding on_error into
-    the node config would re-hash every aggregation node_id and every
-    checkpoint's topology hash for no audit gain.
+    the node config would re-hash every aggregation node_id, and with it the
+    topology hash of every aggregation pipeline, discard ones included, for no
+    audit gain. A NAMED route still moves the topology hash through its own
+    edge; that is pinned by the next test.
     """
     from elspeth.contracts.types import AggregationName
 
     discard_id = _aggregation_graph("discard").get_aggregation_id_map()[AggregationName("stats")]
     routed_id = _aggregation_graph("quarantine").get_aggregation_id_map()[AggregationName("stats")]
     assert discard_id == routed_id
+
+
+def test_a_named_aggregation_on_error_keeps_node_ids_but_moves_the_topology_hash() -> None:
+    """The DIVERT edge is hashed, so a checkpoint without it is refused.
+
+    ``on_error: output`` (the aggregation's own success sink) was buildable
+    before the error edge existed, and its node ids are unchanged. The new
+    edge is part of ``compute_full_topology_hash`` — truthfully: the route is
+    part of the configuration — so a checkpoint taken before the upgrade,
+    whose hash is the edge-less one, is refused by the existing
+    topology-mismatch check. A discard pipeline's hash does not move.
+    """
+    from datetime import UTC, datetime
+
+    from elspeth.contracts import Checkpoint, RoutingMode
+    from elspeth.contracts.checkpoint import ResumeRefusalCause
+    from elspeth.core.canonical import compute_full_topology_hash
+    from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+
+    discard = _aggregation_graph("discard", extra_sinks=())
+    named = _aggregation_graph("output", extra_sinks=())
+    named.validate()
+
+    assert sorted(node.node_id for node in named.get_nodes()) == sorted(node.node_id for node in discard.get_nodes())
+    discard_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in discard.get_edges()}
+    named_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in named.get_edges()}
+    [added] = named_edges - discard_edges
+    assert added[3] is RoutingMode.DIVERT
+    assert discard_edges <= named_edges
+    assert compute_full_topology_hash(named) != compute_full_topology_hash(discard)
+
+    pre_upgrade = Checkpoint(
+        checkpoint_id="cp-pre-upgrade",
+        run_id="run-pre-upgrade",
+        sequence_number=1,
+        created_at=datetime.now(UTC),
+        upstream_topology_hash=compute_full_topology_hash(discard),
+        format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+    )
+    refused = CheckpointCompatibilityValidator().validate(pre_upgrade, named)
+    assert refused.can_resume is False
+    assert refused.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
+    assert CheckpointCompatibilityValidator().validate(pre_upgrade, discard).can_resume is True
 
 
 def test_aggregation_on_error_rejects_unknown_sink_with_suggestion() -> None:
