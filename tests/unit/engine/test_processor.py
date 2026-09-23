@@ -1425,19 +1425,27 @@ class TestConstructorErrorEdgeMap:
         assert [t.token_id for t in node.tokens] == ["t1", "t2"]
         assert node.accepted_count_total == 2
 
-    def test_resume_restore_rejects_a_retry_chain_ending_at_a_terminal_batch(self) -> None:
+    @pytest.mark.parametrize("tip_status", [BatchStatus.FAILED, BatchStatus.COMPLETED], ids=["failed", "completed"])
+    def test_resume_restore_rejects_a_retry_chain_ending_at_a_terminal_batch(self, tip_status: BatchStatus) -> None:
         """BLOCKED rows whose chain ends at a finished attempt have nowhere to flush.
 
         The refusal happens at restore and names the whole chain, instead of
-        the flush dying later on the immutable-terminal transition.
+        the flush dying later on the immutable-terminal transition. Both
+        terminal statuses are refused: without the COMPLETED arm the restore
+        would silently adopt the still-BLOCKED members into a batch that has
+        already produced its output.
         """
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        chain = self._seed_failed_retry_chain(factory, agg_node, attempts=3)
+        chain = self._seed_failed_retry_chain(factory, agg_node, attempts=2)
+        leader = leader_coordination_token(factory, "test-run")
+        tip = factory.execution.retry_batch(chain[-1], coordination_token=leader)
+        factory.execution.complete_batch(tip.batch_id, tip_status, coordination_token=leader)
+        chain.append(tip.batch_id)
         remap = dict(itertools.pairwise(chain))
 
-        with pytest.raises(AuditIntegrityError, match="terminal status 'failed'") as excinfo:
+        with pytest.raises(AuditIntegrityError, match=f"terminal status '{tip_status.value}'") as excinfo:
             _make_processor(
                 factory,
                 aggregation_settings=self._agg_settings(agg_node),
