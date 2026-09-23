@@ -15,6 +15,7 @@ from litellm.types.utils import ModelResponse
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
@@ -28,6 +29,96 @@ from elspeth.plugins.infrastructure.clients.llm import (
 from tests.fixtures.mock_audit import mock_audit_authority
 
 _DEFAULT_USAGE = object()
+
+
+def test_replay_llm_call_returns_recorded_typed_response_without_sdk_dispatch() -> None:
+    """Replay must intercept the SDK, preserve response fields, and audit lineage."""
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "gpt-4"
+            return SimpleNamespace(
+                source_call_id="source-call-1",
+                status=CallStatus.SUCCESS,
+                response_data={
+                    "content": "recorded answer",
+                    "model": "recorded-model",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "raw_response": {"choices": [{"finish_reason": "stop"}]},
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                },
+                error_data=None,
+                latency_ms=12.5,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    emitted: list[ExternalCallCompleted] = []
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay",
+        telemetry_emit=emitted.append,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert response.content == "recorded answer"
+    assert response.model == "recorded-model"
+    assert response.usage == TokenUsage.known(10, 5)
+    assert response.latency_ms == 12.5
+    assert response.raw_response is not None
+    assert response.raw_response["choices"][0]["finish_reason"] == "stop"
+    assert execution.last_record_call_kwargs["source_call_id"] == "source-call-1"
+    assert execution.last_record_call_kwargs["status"] is CallStatus.SUCCESS
+    assert len(emitted) == 1
+    assert emitted[0].status is CallStatus.SUCCESS
+
+
+def test_verify_llm_call_submits_audited_response_for_persisted_comparison() -> None:
+    """Verify consumes the exact audited semantic response after live dispatch."""
+
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def __init__(self) -> None:
+            self.comparisons: list[dict[str, Any]] = []
+
+        def verify_call(self, **kwargs: Any) -> SimpleNamespace:
+            self.comparisons.append(kwargs)
+            return SimpleNamespace(is_match=False)
+
+    session = VerifySession()
+    execution = FakeExecutionRepository()
+    sdk = FakeOpenAIClient(response=provider_response())
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_verify",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=session,
+    )
+
+    client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert len(sdk.create_calls) == 1
+    assert len(session.comparisons) == 1
+    comparison = session.comparisons[0]
+    assert comparison["call_type"] is CallType.LLM
+    assert comparison["current_call_id"] == "call-1"
+    assert comparison["live_status"] is CallStatus.SUCCESS
+    assert comparison["live_response_data"] == execution.last_record_call_kwargs["response_data"].to_dict()
 
 
 @pytest.mark.parametrize("content", ["answer", None])

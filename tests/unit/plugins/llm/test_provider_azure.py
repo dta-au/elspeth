@@ -16,6 +16,7 @@ import pytest
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -36,6 +37,25 @@ from elspeth.plugins.transforms.llm.provider import (
     UnrecognizedFinishReason,
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
+
+
+def test_replay_client_does_not_construct_azure_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com/",
+        api_key="test-key",
+        api_version="2024-10-21",
+        deployment_name="gpt-4o",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=SimpleNamespace(mode=RunMode.REPLAY),
+    )
+    monkeypatch.setattr(provider, "_get_underlying_client", lambda: pytest.fail("Azure SDK constructed during replay"))
+
+    client = provider._get_llm_client(LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN))
+
+    assert client._client is None
+
 
 # Mock-only authority: these providers use FakeAuditRecorder, never a database.
 _LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)

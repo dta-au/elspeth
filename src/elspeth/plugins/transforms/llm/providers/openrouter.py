@@ -26,7 +26,7 @@ import httpx
 import structlog
 from pydantic import Field, field_validator
 
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.call_governance import LLMCallGovernance
@@ -69,6 +69,7 @@ from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = [
@@ -307,6 +308,7 @@ class OpenRouterLLMProvider:
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         # Pre-build auth headers — avoids storing the raw API key as a named attribute
         self._request_headers = {
@@ -330,6 +332,7 @@ class OpenRouterLLMProvider:
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
         self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client cache with reference counting for parallel multi-query safety.
         # Multiple parallel queries share the same row parent, so _get_http_client()
@@ -381,7 +384,8 @@ class OpenRouterLLMProvider:
         )
         logical_start = time.perf_counter()
 
-        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None else None
+        replaying = self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None and not replaying else None
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
         observed_usage = TokenUsage.unknown()
@@ -547,8 +551,11 @@ class OpenRouterLLMProvider:
             token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
-        if self._llm_call_governance is not None:
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
             if attempt_id is None:
                 raise RuntimeError("Governed LLM call has no admission attempt")
             self._llm_call_governance.after_call(attempt_id, call.call_id)
@@ -584,8 +591,11 @@ class OpenRouterLLMProvider:
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
             approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
-        if self._llm_call_governance is not None:
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
             if attempt_id is None:
                 raise RuntimeError("Governed LLM call has no admission attempt")
             self._llm_call_governance.after_call(attempt_id, call.call_id)
@@ -618,6 +628,7 @@ class OpenRouterLLMProvider:
                     base_url=self._base_url,
                     headers=self._request_headers,
                     limiter=self._limiter,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
                 self._http_client_refs[cache_key] = 0

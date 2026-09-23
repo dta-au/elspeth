@@ -14,6 +14,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -49,6 +50,7 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = ["BedrockConfig", "BedrockCredentials", "BedrockLLMProvider"]
@@ -231,6 +233,7 @@ class BedrockLLMProvider:
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._region_name = region_name
         self._credentials = credentials
@@ -241,6 +244,7 @@ class BedrockLLMProvider:
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
         self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
         self._llm_clients: dict[str, AuditedLLMClient] = {}
         self._llm_clients_lock = Lock()
         self._underlying_client: _LiteLLMSDKAdapter | None = None
@@ -306,11 +310,14 @@ class BedrockLLMProvider:
             coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
-            underlying_client=self._get_underlying_client(),
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
             provider="bedrock",
             pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
+            call_mode_session=self._call_mode_session,
         )
         redacted_error: LLMClientError | None = None
         try:
@@ -342,11 +349,14 @@ class BedrockLLMProvider:
                     execution=self._recorder,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
-                    underlying_client=self._get_underlying_client(),
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
                     provider="bedrock",
                     pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

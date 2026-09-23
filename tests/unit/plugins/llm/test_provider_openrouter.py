@@ -16,9 +16,11 @@ import httpx
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -45,6 +47,50 @@ if TYPE_CHECKING:
 _LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
 _MEMBER_TOKEN = _LEADER_TOKEN.membership
 _WORK_ITEM = Mock(spec=TokenWorkItem)
+
+
+def test_replay_mode_reaches_openrouter_http_transport() -> None:
+    session = SimpleNamespace(mode=RunMode.REPLAY)
+    provider = OpenRouterLLMProvider(
+        api_key="test-key",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=session,
+    )
+    with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient") as transport:
+        provider._get_http_client(LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN))
+    assert transport.call_args.kwargs["call_mode_session"] is session
+
+
+def test_replay_semantic_llm_record_binds_source_call() -> None:
+    response = RawCallPayload({"content": "answer"})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["call_type"] is CallType.LLM
+            return SimpleNamespace(
+                source_call_id="original-semantic-call",
+                status=CallStatus.SUCCESS,
+                response_data=response.to_dict(),
+                error_data=None,
+            )
+
+    recorder = FakeAuditRecorder()
+    parent = LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN)
+    parent.record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    assert recorder.operation_calls[0]["source_call_id"] == "original-semantic-call"
 
 
 @dataclass

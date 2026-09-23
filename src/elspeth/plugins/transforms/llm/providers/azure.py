@@ -23,6 +23,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.llm.config_validation import (
@@ -36,6 +37,7 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 logger = structlog.get_logger(__name__)
@@ -154,6 +156,7 @@ class AzureLLMProvider:
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key: str | None = api_key
@@ -169,6 +172,7 @@ class AzureLLMProvider:
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
         self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
         # (always acquire _llm_clients_lock first to prevent deadlock)
@@ -260,12 +264,15 @@ class AzureLLMProvider:
             coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
-            underlying_client=self._get_underlying_client(),
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
             provider="azure",
             pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
             max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            call_mode_session=self._call_mode_session,
         )
         try:
             response = client.chat_completion(
@@ -310,12 +317,15 @@ class AzureLLMProvider:
                     execution=self._recorder,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
-                    underlying_client=self._get_underlying_client(),
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
                     provider="azure",
                     pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
                     max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

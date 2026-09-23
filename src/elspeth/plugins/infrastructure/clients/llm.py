@@ -9,12 +9,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 import structlog
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
@@ -24,14 +24,16 @@ from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.llm_pricing import provider_cost_from_captured_usage
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
 if TYPE_CHECKING:
+    from elspeth.contracts import Call
     from elspeth.contracts.audit_protocols import CallRecorder
+    from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
     from elspeth.contracts.contexts import LimiterProtocol
 
 logger = structlog.get_logger(__name__)
@@ -335,6 +337,7 @@ class AuditedLLMClient(AuditedClientBase):
         work_item: TokenWorkItem | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         """Initialize audited LLM client.
 
@@ -370,6 +373,171 @@ class AuditedLLMClient(AuditedClientBase):
         self._provider = provider
         self._pricing_model = pricing_model
         self._max_tokens_param = max_tokens_param
+        self._call_mode_session = call_mode_session
+
+    def _replay_completion(
+        self,
+        *,
+        request_dto: LLMCallRequest,
+        call_index: int,
+        approved_prompt_artifact_hash: str | None,
+    ) -> LLMResponse:
+        """Rebuild the exact audited response before any provider dispatch."""
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise RuntimeError("LLM replay requested without a replay session")
+        evidence: ReplayCallEvidence = session.replay_call(
+            call_type=CallType.LLM,
+            request_data=request_dto.to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        if evidence.status is CallStatus.ERROR:
+            error = evidence.error_data
+            if error is None or evidence.response_data is not None:
+                raise ValueError("Recorded LLM error has incomplete or contradictory payload")
+            retryable = error.get("retryable")
+            error_type = error.get("type")
+            error_message = error.get("message")
+            pricing_model = error.get("pricing_model")
+            if type(retryable) is not bool or type(error_type) is not str or type(error_message) is not str:
+                raise ValueError("Recorded LLM error has invalid fields")
+            if set(error) != {"type", "message", "retryable", "pricing_model", "provider_cost", "provider_cost_source"}:
+                raise ValueError("Recorded LLM error has incomplete fields")
+            raw_cost_source = error["provider_cost_source"]
+            if raw_cost_source not in get_args(ComposerLLMProviderCostSource):
+                raise ValueError("Recorded LLM error has invalid provider cost source")
+            error_dto = LLMCallError(
+                type=error_type,
+                message=error_message,
+                retryable=retryable,
+                pricing_model=pricing_model,
+                provider_cost=error.get("provider_cost"),
+                provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
+            )
+            self._record_call(
+                call_index=call_index,
+                call_type=CallType.LLM,
+                status=CallStatus.ERROR,
+                request_data=request_dto,
+                error=error_dto,
+                latency_ms=evidence.latency_ms,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                source_call_id=evidence.source_call_id,
+            )
+            self._emit_telemetry_after_audit(
+                call_status=CallStatus.ERROR,
+                latency_ms=0.0 if evidence.latency_ms is None else evidence.latency_ms,
+                request_data=request_dto.to_dict(),
+                request_payload=request_dto,
+                response_data=None,
+                response_payload=None,
+                token_usage=None,
+            )
+            raise LLMClientError(error_dto.message, retryable=error_dto.retryable)
+        if evidence.status is not CallStatus.SUCCESS or evidence.error_data is not None:
+            raise ValueError("Recorded LLM call has an unsupported status or error payload")
+        response_data = evidence.response_data
+        if response_data is None:
+            raise ValueError("Recorded LLM success has no response payload")
+        required_fields = {
+            "content",
+            "model",
+            "usage",
+            "raw_response",
+            "pricing_model",
+            "provider_cost",
+            "provider_cost_source",
+        }
+        if set(response_data) != required_fields:
+            raise ValueError("Recorded LLM response has incomplete fields")
+        usage_data = response_data["usage"]
+        if not isinstance(usage_data, Mapping):
+            raise ValueError("Recorded LLM usage is not a mapping")
+        usage = TokenUsage.from_dict(usage_data)
+        if usage.to_dict() != usage_data:
+            raise ValueError("Recorded LLM usage is malformed")
+        response_dto = LLMCallResponse(
+            content=response_data["content"],
+            model=response_data["model"],
+            usage=usage,
+            raw_response=response_data["raw_response"],
+            pricing_model=response_data["pricing_model"],
+            provider_cost=response_data["provider_cost"],
+            provider_cost_source=response_data["provider_cost_source"],
+        )
+        response = LLMResponse(
+            content=response_dto.content,
+            model=response_dto.model,
+            usage=usage,
+            latency_ms=0.0 if evidence.latency_ms is None else evidence.latency_ms,
+            raw_response=response_dto.raw_response,
+        )
+        self._record_call(
+            call_index=call_index,
+            call_type=CallType.LLM,
+            status=CallStatus.SUCCESS,
+            request_data=request_dto,
+            response_data=response_dto,
+            latency_ms=evidence.latency_ms,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=usage,
+            source_call_id=evidence.source_call_id,
+        )
+        self._emit_telemetry_after_audit(
+            call_status=CallStatus.SUCCESS,
+            latency_ms=response.latency_ms,
+            request_data=request_dto.to_dict(),
+            request_payload=request_dto,
+            response_data=response_dto.to_dict(),
+            response_payload=response_dto,
+            token_usage=usage if usage.has_data else None,
+        )
+        return response
+
+    def _record_call(
+        self,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        llm_call_attempt: str | None = None,
+        source_call_id: str | None = None,
+    ) -> Call:
+        call = super()._record_call(
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_data=request_data,
+            response_data=response_data,
+            error=error,
+            latency_ms=latency_ms,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
+            llm_call_attempt=llm_call_attempt,
+            source_call_id=source_call_id,
+        )
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=None if response_data is None else response_data.to_dict(),
+                live_error_data=None if error is None else error.to_dict(),
+            )
+        return call
 
     def _emit_telemetry_after_audit(
         self,
@@ -471,9 +639,6 @@ class AuditedLLMClient(AuditedClientBase):
             RateLimitError: If rate limited (retryable)
             LLMClientError: For other errors (check retryable flag)
         """
-        # Acquire rate limit permission before making external call
-        self._acquire_rate_limit()
-
         call_index = self._next_call_index()
 
         # Build request DTO - frozen dataclass ensures construction-time type safety;
@@ -489,6 +654,16 @@ class AuditedLLMClient(AuditedClientBase):
             extra_kwargs=kwargs,
         )
         request_data = request_dto.to_dict()
+
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_completion(
+                request_dto=request_dto,
+                call_index=call_index,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            )
+
+        # A rate limiter is part of live dispatch and must not run during replay.
+        self._acquire_rate_limit()
 
         # Build SDK call kwargs - omit temperature and max_tokens when None to
         # avoid serializing as JSON null (which can trigger provider validation errors)
