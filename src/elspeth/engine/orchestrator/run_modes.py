@@ -43,9 +43,11 @@ def resolve_runtime_run_mode(config: PipelineConfig, settings: ElspethSettings |
         if settings is None:
             raise OrchestrationInvariantError("Replay/verify requires full ElspethSettings for admission")
         admit_nonlive_settings(settings)
-        if config.nonlive_plugin_validator is None:
-            raise OrchestrationInvariantError("Replay/verify requires a runtime plugin admission validator")
-        config.nonlive_plugin_validator(config, settings)
+        # Public programmatic callers cannot supply their own admission rule.
+        # A no-op callback would let an unreviewed plugin reach startup hooks.
+        from elspeth.plugins.infrastructure.run_mode_capabilities import admit_nonlive_runtime_plugin_instances
+
+        admit_nonlive_runtime_plugin_instances(config, settings)
 
     return RuntimeRunMode(mode=mode, replay_from=replay_from)
 
