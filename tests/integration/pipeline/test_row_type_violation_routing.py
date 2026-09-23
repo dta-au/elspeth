@@ -1182,6 +1182,8 @@ def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_t
     failed_pages = [o for o in outcomes if (o.outcome, o.path) == (TerminalOutcome.FAILURE.value, TerminalPath.UNROUTED.value)]
     assert len(failed_pages) == 2
 
+    # Positive control for the scan: it finds the reason it must find.
+    assert ("node_states", "error_json") in _audit_cells_containing(db, "required input field(s) ['score']")
     assert _audit_cells_containing(db, _MISSING_FIELD_SENTINEL) == []
 
 
