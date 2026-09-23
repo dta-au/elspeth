@@ -9,8 +9,10 @@ Every case runs the four counting readers over one audit state built with the
 real recorder writers: the web discard summary, the web failure categories,
 and the MCP run summary and error analysis. The end-to-end batch cases
 (fail-then-succeed on resume, a genuine discard, a routed batch) live in
-``tests/integration/pipeline/test_batch_flush_recovery_and_redaction.py``.
-The per-row twins are here: a per-row crash cannot be resumed end to end,
+``tests/integration/pipeline/test_batch_flush_recovery_and_redaction.py``,
+and the ordinary per-row run (one row fails a transform the others complete)
+in ``tests/integration/pipeline/test_transform_failure_counts.py``. The
+per-row resume twins are here: a per-row crash cannot be resumed end to end,
 because the source is still ``loading`` when a row fails.
 """
 
@@ -31,7 +33,7 @@ from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import TransformErrorCategory, TransformErrorReason
 from elspeth.core.landscape.data_flow import errors as data_flow_errors
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import transform_errors_table
+from elspeth.core.landscape.schema import node_states_table, transform_errors_table
 from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
@@ -224,6 +226,51 @@ def test_a_per_row_discard_counts_as_discarded_and_a_routed_row_as_failed_only()
     )
 
 
+@pytest.mark.parametrize(
+    ("destination", "path", "sink_name", "discarded"),
+    [
+        ("discard", TerminalPath.QUARANTINED_AT_SOURCE, None, {"xform": 1}),
+        ("quarantine", TerminalPath.ON_ERROR_ROUTED, "quarantine", {}),
+    ],
+    ids=["discard", "routed"],
+)
+def test_a_failed_token_still_counts_when_other_tokens_completed_the_node(
+    destination: str, path: TerminalPath, sink_name: str | None, discarded: dict[str | None, int]
+) -> None:
+    """The ordinary run: two rows pass X and one row fails there.
+
+    The completed-state exclusion is about THIS token getting past X. Another
+    token's completed state at X says nothing about the failed one, so the
+    failed token counts once on both on_error arms.
+    """
+    setup = _setup(f"mixed-node-{destination}")
+    passed_first, failed, passed_last = _token(setup, 0), _token(setup, 1), _token(setup, 2)
+    for passed in (passed_first, passed_last):
+        _completed_state(setup, passed, "xform")
+        _terminal(setup, passed, TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="output")
+    _error(setup, failed, "xform", reason="api_error", destination=destination)
+    _terminal(setup, failed, TerminalOutcome.FAILURE, path, sink_name=sink_name)
+    with setup.db.connection() as conn:
+        completed_at_x = (
+            conn.execute(
+                select(node_states_table.c.token_id)
+                .where(node_states_table.c.node_id == "xform")
+                .where(node_states_table.c.status == NodeStateStatus.COMPLETED)
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(completed_at_x) == sorted([passed_first, passed_last]), "control: two other tokens COMPLETED the failing node"
+
+    assert _counts(setup) == _Counts(
+        discarded=discarded,
+        categories=[("xform", "api_error", 1)],
+        run_summary_transform=1,
+        analysis_total=1,
+        analysis_by_plugin={"mapper": 1},
+    )
+
+
 def test_a_token_that_completed_the_node_did_not_fail_there() -> None:
     """A resumed attempt completed X, and a path that writes no transform error then quarantined the token.
 
@@ -241,12 +288,25 @@ def test_a_token_that_completed_the_node_did_not_fail_there() -> None:
     assert _counts(setup) == _NOTHING_FAILED
 
 
-def test_a_failure_a_transform_error_did_not_decide_is_not_counted() -> None:
-    """A recorded, superseded transform error, then a sink discard: the token failed at the sink, not at X."""
-    setup = _setup("sink-discarded")
+@pytest.mark.parametrize(
+    ("path", "sink_name"),
+    [
+        (TerminalPath.SINK_DISCARDED, DISCARD_SINK_NAME),
+        (TerminalPath.UNROUTED, None),
+        (TerminalPath.GATE_ERROR_DISCARDED, None),
+    ],
+    ids=["sink-discarded", "unrouted", "gate-error-discarded"],
+)
+def test_a_failure_a_transform_error_did_not_decide_is_not_counted(path: TerminalPath, sink_name: str | None) -> None:
+    """A recorded, superseded transform error, then a FAILURE decided elsewhere.
+
+    A sink discard, an unrouted crash and a gate error each fail the token
+    somewhere other than X, so none of them is a transform failure at X.
+    """
+    setup = _setup(f"decided-elsewhere-{path.value}")
     token = _token(setup, 0)
     _error(setup, token, "xform", reason="api_error", destination="discard")
-    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.SINK_DISCARDED, sink_name=DISCARD_SINK_NAME)
+    _terminal(setup, token, TerminalOutcome.FAILURE, path, sink_name=sink_name)
 
     counts = _counts(setup)
 

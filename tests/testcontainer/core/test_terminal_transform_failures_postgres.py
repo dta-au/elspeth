@@ -5,7 +5,8 @@ with a ``row_number()`` window and keeps the latest. The SQLite cases in
 ``tests/unit/core/landscape/test_terminal_transform_failures.py`` prove the
 semantics. The batch pipeline in ``test_aggregation_error_route_postgres.py``
 sends the query to PostgreSQL, but every token there has one attempt, so the
-ranking never has to choose. These cases give it two attempts per token.
+ranking never has to choose. These cases give it two attempts per token, and
+one failed token beside tokens that completed the same node.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from sqlalchemy import select
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.core.landscape.test_terminal_transform_failures import (
     _NOTHING_FAILED,
+    _completed_state,
     _Counts,
     _counts,
     _error,
@@ -27,10 +29,11 @@ from tests.unit.core.landscape.test_terminal_transform_failures import (
     _token,
 )
 
+from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.data_flow import errors as data_flow_errors
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import transform_errors_table
+from elspeth.core.landscape.schema import node_states_table, transform_errors_table
 
 pytestmark = pytest.mark.testcontainer
 
@@ -70,6 +73,37 @@ def test_the_latest_attempt_decides_the_count_on_postgres(postgres_db: Landscape
     _terminal(delivered, retried, TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="output")
 
     assert _counts(delivered) == _NOTHING_FAILED
+
+
+def test_a_failed_token_counts_beside_tokens_that_completed_the_node_on_postgres(postgres_db: LandscapeDB) -> None:
+    """Two tokens COMPLETED X and one failed there: the completed-state exclusion is per token."""
+    setup = _setup("pg-mixed-node", db=postgres_db)
+    passed_first, failed, passed_last = _token(setup, 0), _token(setup, 1), _token(setup, 2)
+    for passed in (passed_first, passed_last):
+        _completed_state(setup, passed, "xform")
+        _terminal(setup, passed, TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="output")
+    _error(setup, failed, "xform", reason="api_error", destination="discard")
+    _terminal(setup, failed, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    with setup.db.connection() as conn:
+        completed_at_x = (
+            conn.execute(
+                select(node_states_table.c.token_id)
+                .where(node_states_table.c.run_id == setup.run_id)
+                .where(node_states_table.c.node_id == "xform")
+                .where(node_states_table.c.status == NodeStateStatus.COMPLETED)
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(completed_at_x) == sorted([passed_first, passed_last]), "control: two other tokens COMPLETED the failing node"
+
+    assert _counts(setup) == _Counts(
+        discarded={"xform": 1},
+        categories=[("xform", "api_error", 1)],
+        run_summary_transform=1,
+        analysis_total=1,
+        analysis_by_plugin={"mapper": 1},
+    )
 
 
 def test_a_created_at_tie_counts_the_token_once_on_postgres(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
