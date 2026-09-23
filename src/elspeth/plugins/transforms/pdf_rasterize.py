@@ -381,7 +381,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3b046df8f868e5dc"
+    source_file_hash: str | None = "sha256:7140a13f10275faa"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -585,11 +585,7 @@ class PDFRasterize(BaseTransform):
         request_data = self._render_request(blob_ref)
         call_index: int | None = None
         if ctx.landscape is not None and ctx.state_id is not None:
-            call_index = ctx.landscape.allocate_call_index(
-                ctx.state_id,
-                member_token=ctx.require_member_token(),
-                work_item=ctx.require_work_item(),
-            )
+            call_index = ctx.allocate_call_index()
         if ctx.run_mode is RunMode.REPLAY:
             if call_index is None or ctx.call_mode_session is None:
                 raise AuditIntegrityError("PDF replay requires a node-state call parent and source-run session")

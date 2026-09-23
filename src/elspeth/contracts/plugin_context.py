@@ -323,6 +323,16 @@ class PluginContext:
             raise FrameworkBugError("Row audit write requires the executor's claimed work item")
         return self.work_item
 
+    def allocate_call_index(self) -> int:
+        """Allocate a row call index using this context's exact worker claim."""
+        if self.landscape is None or self.state_id is None:
+            raise FrameworkBugError("Row call index allocation requires a node-state audit parent")
+        return self.landscape.allocate_call_index(
+            self.state_id,
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
+        )
+
     def record_readiness_check(
         self,
         *,
