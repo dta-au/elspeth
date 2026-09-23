@@ -21,6 +21,7 @@ import re
 import time
 from collections.abc import Mapping
 from itertools import pairwise
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import chromadb
@@ -525,41 +526,51 @@ class ChromaSearchProvider:
         response = evidence.response_data
         if evidence.status is not CallStatus.SUCCESS or response is None:
             raise RetrievalError("Chroma replay source call did not succeed or has no retained response", retryable=False)
-        raw_chunks = response.get("chunks")
-        raw_skips = response.get("skipped_items")
-        count = response.get("collection_count")
-        if not isinstance(raw_chunks, (list, tuple)) or not isinstance(raw_skips, (list, tuple)) or type(count) is not int or count < 0:
+        try:
+            raw_chunks = response["chunks"]
+            raw_skips = response["skipped_items"]
+            count = response["collection_count"]
+        except KeyError as exc:
+            raise RetrievalError("Chroma replay source call lacks complete chunk, skip, or count evidence", retryable=False) from exc
+        # ReplayCallEvidence deep-freezes owned audit JSON: arrays become tuples
+        # and objects become mapping proxies. Older incomplete shapes fail closed.
+        if type(raw_chunks) is not tuple or type(raw_skips) is not tuple or type(count) is not int or count < 0:
             raise RetrievalError("Chroma replay source call lacks complete chunk, skip, or count evidence", retryable=False)
         chunks: list[RetrievalChunk] = []
         for raw_chunk in raw_chunks:
-            if not isinstance(raw_chunk, Mapping):
+            if type(raw_chunk) is not MappingProxyType:
                 raise RetrievalError("Chroma replay source call has malformed chunk evidence", retryable=False)
-            content = raw_chunk.get("content")
-            score = raw_chunk.get("score")
-            source_id = raw_chunk.get("source_id")
-            metadata = raw_chunk.get("metadata")
+            try:
+                content = raw_chunk["content"]
+                score = raw_chunk["score"]
+                source_id = raw_chunk["source_id"]
+                metadata = raw_chunk["metadata"]
+            except KeyError as exc:
+                raise RetrievalError("Chroma replay source call has incomplete chunk fields", retryable=False) from exc
             if (
                 type(content) is not str
-                or isinstance(score, bool)
-                or not isinstance(score, (int, float))
+                or type(score) not in (int, float)
                 or type(source_id) is not str
-                or not isinstance(metadata, Mapping)
+                or type(metadata) is not MappingProxyType
             ):
                 raise RetrievalError("Chroma replay source call has incomplete chunk fields", retryable=False)
             chunks.append(RetrievalChunk(content=content, score=float(score), source_id=source_id, metadata=deep_thaw(metadata)))
         skips = deep_thaw(raw_skips)
-        if not isinstance(skips, list) or any(not isinstance(item, dict) for item in skips):
+        if type(skips) is not list or any(type(item) is not dict for item in skips):
             raise RetrievalError("Chroma replay source call has malformed skip evidence", retryable=False)
-        result_count = response.get("result_count")
-        skipped_count = response.get("skipped_count")
-        top_score = response.get("top_score")
+        try:
+            result_count = response["result_count"]
+            skipped_count = response["skipped_count"]
+            top_score = response["top_score"]
+        except KeyError as exc:
+            raise RetrievalError("Chroma replay source call lacks complete summary evidence", retryable=False) from exc
         if (
             type(result_count) is not int
             or result_count != len(chunks)
             or type(skipped_count) is not int
             or skipped_count != len(skips)
             or count < len(chunks)
-            or (top_score is not None and (isinstance(top_score, bool) or not isinstance(top_score, (int, float))))
+            or (top_score is not None and type(top_score) not in (int, float))
             or (float(top_score) if top_score is not None else None) != (chunks[0].score if chunks else None)
             or any(left.score < right.score for left, right in pairwise(chunks))
         ):
@@ -780,7 +791,10 @@ class ChromaSearchProvider:
             response = evidence.response_data
             if evidence.status is not CallStatus.SUCCESS or response is None:
                 raise RetrievalError("Chroma replay readiness has no successful retained response", retryable=False)
-            count = response.get("collection_count")
+            try:
+                count = response["collection_count"]
+            except KeyError as exc:
+                raise RetrievalError("Chroma replay readiness has no valid retained collection count", retryable=False) from exc
             if type(count) is not int or count < 0:
                 raise RetrievalError("Chroma replay readiness has no valid retained collection count", retryable=False)
             self._execution.record_operation_call(

@@ -378,7 +378,7 @@ class AzureSearchProvider:
                 current_state_id=state_id,
                 current_operation_id=operation_id,
             )
-        archived_ip = evidence.request_data.get("resolved_ip")
+        archived_ip = evidence.request_data["resolved_ip"]
         if type(archived_ip) is not str:
             raise RetrievalError("Azure AI Search source request lacks an archived DNS pin", retryable=False)
         path = parsed.path or "/"
