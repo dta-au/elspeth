@@ -1700,7 +1700,7 @@ class TestGuidedTerminalProofDirectionSplit:
                 "source": SourceSpec(
                     plugin="csv",
                     on_success="out",
-                    options={"path": storage_path, "schema": {"mode": "observed"}},
+                    options={"path": storage_path, "blob_ref": self._BLOB_REF, "schema": {"mode": "observed"}},
                     on_validation_failure="discard",
                 )
             },
@@ -1734,6 +1734,30 @@ class TestGuidedTerminalProofDirectionSplit:
         state = self._guided_state(self._exited_terminal())
         assert reattach_guided_blob_refs_for_public_export(state) is state
 
+    @pytest.mark.parametrize("terminal_kind", ["live", "completed", "exited"])
+    def test_missing_live_blob_ref_cannot_reattach_sentinel_authority(self, terminal_kind: str) -> None:
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        terminal = (
+            None if terminal_kind == "live" else self._completed_terminal() if terminal_kind == "completed" else self._exited_terminal()
+        )
+        base = self._guided_state(terminal)
+        source = base.sources["source"]
+        state = replace(base, sources={"source": replace(source, options={"path": "unreviewed.csv", "schema": {"mode": "observed"}})})
+        if terminal_kind == "exited":
+            assert reattach_guided_blob_refs_for_public_export(state) is state
+            derivation = derive_guided_blob_refs_for_admission_proof(state)
+            assert derivation.custody_unavailable is True
+            assert derivation.proof_state is state
+        else:
+            with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+                reattach_guided_blob_refs_for_public_export(state)
+            with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+                derive_guided_blob_refs_for_admission_proof(state)
+
     def test_sessions_route_export_wrapper_keeps_exited_identity_return(self) -> None:
         from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
 
@@ -1752,10 +1776,10 @@ class TestGuidedTerminalProofDirectionSplit:
 
         assert reattach_guided_blob_refs_for_public_export(state) is state
         assert derivation.custody_unavailable is False
-        assert derivation.proof_state is not state
+        assert derivation.proof_state is state
         assert derivation.proof_state.sources["source"].options["blob_ref"] == self._BLOB_REF
-        # The durable state is never mutated by the admission derivation.
-        assert "blob_ref" not in state.sources["source"].options
+        # The verified materializer already retained the live custody reference.
+        assert state.sources["source"].options["blob_ref"] == self._BLOB_REF
 
     @pytest.mark.parametrize("terminal_kind", ["live", "completed"])
     def test_admission_derivation_matches_export_for_non_exited_terminals(self, terminal_kind: str) -> None:

@@ -216,8 +216,9 @@ repos:
         # load-time warning rather than hard-failing the commit. Without this,
         # the default `required` mode makes the hook raise on EVERY keyless
         # local commit that touches the allowlist. Required-mode signature
-        # enforcement that blocks merge remains CI's job (HMAC key as a GitHub
-        # Actions secret).
+        # checking in CI stays fail-closed without the operator-held key.
+        # Authoritative signature verification runs in the trusted operator
+        # context; Actions must never receive the HMAC key.
         # NO `types:` filter. pre-commit ANDs `types` with `files`; adding
         # `types: [python]` here made the intersection near-empty — allowlist
         # YAMLs under config/cicd/enforce_tier_model/ matched `files` but were

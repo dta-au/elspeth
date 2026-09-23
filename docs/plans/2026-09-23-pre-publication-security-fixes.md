@@ -1,180 +1,127 @@
-# Pre-publication security fixes — brief
+# Pre-publication security fixes
 
-Two defects are held back from the public GitHub issue tracker because this project's own
-rule (`docs/github-issues/README.md`) says an unfixed vulnerability belongs in a private
-advisory and becomes a public issue once it is fixed. Both must be fixed before
-`dta-au/elspeth` gets its next batch of issues. The rest of the migration is already
-published as `#158`–`#201`.
+Target: `release/0.8.1`; isolated worktree baseline `ee04378f8`.
 
-Context for both: ELSPETH is pre-release, so live exposure is negligible today. It is
-approaching official release with more than one developer, which is exactly the transition
-that turns both of these from theoretical into real.
+The original brief needed three material corrections: deleting workflow references
+cannot revoke a GitHub secret grant; shape-only checking cannot replace HMAC
+verification; active custody rejection differs from terminal/history degradation.
 
----
+## 1. Remove judge-key injection without weakening verification
 
-## Work item 1 — the judge HMAC key is reachable by anyone who can push to a release branch
+The three key-bearing CI steps verify trust-tier metadata, trust-boundary metadata,
+and SARIF findings; they do not sign. Remove their HMAC environment injection.
+Preserve PR shape-only mode and required HMAC verification on pushes. A keyless
+push must fail closed. Do not clear the standing trust-tier gate to obtain green CI.
 
-**Severity: highest. Fix this first.** Audit reference: `F-01` in
-`docs/reviews/2026-09-23-single-developer-assumptions.md`.
+Change the regression that currently requires unsafe injection; prove the new
+regression fails on baseline and passes on the patch. Preserve missing-key and
+CI-never-signs tests. Update `docs/judge-signature-handoff.md`, the judge workflow
+comment, and `CONTRIBUTING.md`. Authoritative merge still requires an operator to
+verify the exact reviewed candidate using trusted verifier code. Agents never
+obtain the key, sign, rekey, or repair the global signature corpus.
 
-### What is true, measured
+### External action required for F-01 closure
 
-- `.github/workflows/ci.yaml:14-15` triggers on push to `main`, `RC*` and `release/**`.
-- `ci.yaml:455`, `:472` and `:619` each inject
-  `ELSPETH_JUDGE_METADATA_HMAC_KEY` gated on `github.event_name != 'pull_request'` —
-  that is, the key is present precisely when there is **no** pull request.
-- `ci.yaml:60` sends those same non-PR runs to the self-hosted `nyx-ci trusted` runner.
-- All six `release/*` branches are `protected: false`. Only the default branch is covered,
-  by repository **ruleset** `12348893`, whose condition is `~DEFAULT_BRANCH`.
-- The stated threat model (`docs/judge-signature-handoff.md:10-13`) is that any holder of
-  the key can forge `judge_verdict: ACCEPTED` and pass every gate.
+Initial read-only GitHub metadata on 2026-09-23 confirmed the repository HMAC secret existed.
+Ruleset `12348893` applies only to `~DEFAULT_BRANCH`. Existing `copilot` and
+`github-pages` environments provide no judge-key approval boundary. Organisation
+secret enumeration returned HTTP 403 requiring `admin:org`. A subsequent
+repository-scoped `repos/dta-au/elspeth/actions/organization-secrets` query
+succeeded with `{"total_count":0,"secrets":[]}`, resolving the relevant grant
+question without broader permissions. Both environment secret lists were empty.
 
-### Why it is exploitable
+Deleting YAML injection is only a local mitigation: another pushed workflow can
+reference a repository or accessible organisation secret. Restricting `release/**`
+alone cannot prevent a writer creating a workflow on another writable ref.
 
-A workflow runs from the ref that was pushed. So anyone with push access can push an edited
-`ci.yaml` to a release branch and get arbitrary execution on the maintainer's own hardware
-with the key in the environment. The documented mitigation
-(`docs/judge-signature-handoff.md:14-18`) is accurate but narrower than it reads: it
-addresses **PR**-controlled code. This is **push**-controlled code.
+The operator explicitly approved the following deletion during execution. It
+completed successfully, and the secret-list recheck returned only
+`AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`, and `OPENROUTER_API_KEY`:
 
-### Before proposing a fix, answer these
+```bash
+GH_TOKEN="$(gh auth token -u johnm-dta)" \
+  gh secret delete ELSPETH_JUDGE_METADATA_HMAC_KEY --repo dta-au/elspeth
+GH_TOKEN="$(gh auth token -u johnm-dta)" \
+  gh api repos/dta-au/elspeth/actions/secrets
+```
 
-1. **Does CI need the key at all?** Signing never runs in CI — the operator fires it
-   locally. Establish what the three key-bearing steps actually do with it. If they perform
-   full HMAC verification, say what breaks if they run shape-only
-   (`ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`) and a
-   trusted context re-verifies before merge — which is already the treatment CI gives fork
-   PRs. **Removing the key from CI entirely may be the smallest correct fix.** Do not assume
-   it is; measure what the steps need.
-2. **What would a `release/**` ruleset cost?** The maintainer pushes directly to
-   `release/0.8.1` constantly. A ruleset that requires a pull request there would change the
-   daily workflow substantially. A ruleset that restricts *who may push* without requiring a
-   PR may achieve the security goal at far lower cost. Price both.
-3. **Is a GitHub Environment with required reviewers viable** for the key-bearing jobs? This
-   decouples key access from push access and survives a future protection misconfiguration,
-   which repository-scoped `secrets` does not.
+Measured before/after: the repository secret name disappeared; no local operator
+key material or signatures were changed. The effective organisation and environment
+inventories establish no inherited copy. The identified Actions secret-grant
+exposure is closed; runner-local key custody was not audited. Further settings,
+runner, key rotation, or public issue mutations remain separate actions.
 
-### Traps
+Options and costs:
 
-- **`gh api repos/dta-au/elspeth/branches/main/protection` returns 404 "Branch not
-  protected" even though the branch IS protected.** The protection is a *ruleset*; the
-  classic endpoint does not report rulesets. Always also read
-  `gh api repos/dta-au/elspeth/rulesets`. A 404 here under a non-admin token is a permission
-  ceiling and means nothing either way.
-- Admin is required to read or write protection. The `johnm-dta` account has
-  `admin: true`; the other account on this machine does not. Pass it inline —
-  `GH_TOKEN="$(gh auth token -u johnm-dta)" gh ...` — rather than `gh auth switch`, which
-  flips global state that concurrent sessions share.
-- Organisation-level rulesets need `admin:org` and were not readable. A stricter org policy
-  may exist. Check before concluding something is absent.
+- Restrict creation/update with an operator bypass: preserves that operator's
+  direct pushes, excludes other writers. Required PRs add review overhead.
+  Neither protects secrets/hardware from workflows on other writable refs.
+- Move the key exclusively to an environment with required reviewers and narrow
+  deployment refs: approval per key-bearing run, plus exact workflow/dependency/
+  code review before release. It does not isolate a self-hosted runner or revoke
+  duplicate grants. A verifier independent of candidate-controlled code is needed.
+- Remove the Actions key grant: smallest custody fix; CI remains fail-closed until
+  a separately approved authoritative verification design exists. Self-hosted
+  runner access and the separate OpenRouter credential remain independent risks.
 
-### Scope boundary
+References: [environment protection](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+[self-hosted runner risks](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners).
 
-**Do not change any repository or organisation setting without an explicit go-ahead.** These
-are outward-facing changes on a government-owned public repository. Produce the exact
-commands and the expected before/after, show them, and wait. Editing `ci.yaml` in the working
-tree is ordinary work and needs no special permission.
+## 2. Reject unverified sentinel custody
 
-### Documentation debt to close in the same change
+Specification: [held custody finding](../github-issues/held/sentinel-custody-projection-fails-open-when-live-source-op.md).
 
-Two tracked files claim broader coverage than the configuration delivers. Both must end up
-true:
+Root cause: `validate_guided_reviewed_sentinel_source_mapping` compares identities
+only when `blob_ref` exists. Otherwise carrier shape suffices to substitute the
+reviewed sentinel over unrelated live bytes.
 
-- `docs/judge-signature-handoff.md:14-18` — describes the PR gate as *the* CI-exposure
-  mitigation.
-- `.github/workflows/enforce-allowlist-judge-gates.yaml:41` — the comment reads "must never
-  be reachable from PR-controlled code", which states the intent more broadly than the
-  configuration achieves.
+Chosen behavior: require a canonical matching live `blob_ref`; do not infer identity
+from path syntax. This pure validator has no trusted blob storage lookup. Repair
+the verified reviewed-source materializer in `tools/sessions.py` to retain the
+server-authored `blob_ref` when resolving sentinel-only reviewed options. Prove
+that real candidate-building path remains persistable before requiring identity
+in the shared validator. Surface this behavior choice before implementation.
 
----
+Preserve consumer directions:
 
-## Work item 2 — sentinel custody projection fails open
+- Active projection, export and persistence admission reject inconsistent custody;
+  preserve `GuidedCustodyIntegrityError` and existing export error translation.
+- Terminal and explicitly tolerant history projections return `custody_unavailable`,
+  mask paths and remove authoritative review proof. Never emit an unverified sentinel.
+- Matching references still work; conflicting references still fail. Cover both path
+  carriers (`path`, `file`) and multi-carrier sources.
 
-Audit reference: the held issue at
-`docs/github-issues/held/sentinel-custody-projection-fails-open-when-live-source-op.md`.
-**Read that file first — it is the specification**, is written for someone with no prior
-context, and defines every term.
+Replace the existing terminal case-C test that blesses the bug; add missing-ref
+regressions beside the conflicting-ref test. Cover YAML export and persistence
+admission. Prove regressions fail on unchanged production code before implementing.
+Only repair positive fixtures after validating their real producer. Remove sentinel
+reattachment code made unreachable by requiring live identity.
 
-### The defect in one line
+Historical byte-stability expectations for the three missing-ref sentinel shapes
+must change to active refusal / terminal degradation. Preserve their historical
+JSON and corpus inputs. Affected pre-fix settled operations may fail replay because
+their old projection hash represented a false custody claim; start a fresh session
+or rebind the source. Do not rewrite stored hashes or relax replay verification.
 
-When a live source's options carry a file path but no `blob_ref`, custody validation passes
-without checking blob identity, and the code then stamps the **approved** blob's sentinel
-onto a source that reads a **different** blob's bytes — an affirmative, false custody claim
-on surfaces that users and the model provider can see.
+## Validation and landing
 
-### Where the work is
+Use the primary interpreter explicitly with both worktree source roots in PYTHONPATH,
+or a real local environment. Verify imports. Check judge environment variable names
+or presence only: the original `env | grep ELSPETH_JUDGE` could print the key.
 
-- `src/elspeth/web/composer/guided_blob_refs.py` —
-  `validate_guided_reviewed_sentinel_source_mapping`. Its only identity comparison is guarded
-  by `"blob_ref" in options`. Every other check is a shape check. With the key absent, the
-  guard is skipped and the mapping validates.
-- `src/elspeth/web/composer/redaction.py` — `redact_guided_snapshot_storage_paths` then
-  substitutes the reviewed sentinel on the strength of that validation.
-- `src/elspeth/web/sessions/routes/_helpers.py` — the comment beside the redaction call
-  records that the manual `set_source` commit path strips `blob_ref` *precisely because* it
-  cannot prove `path` equals the blob's `storage_path`. **The codebase produces the
-  vulnerable shape itself; this is not hypothetical.**
+Run focused CI, custody/redaction, export and session tests and relevant whole-tree
+gates. Compare baseline/candidate lint finding sets; do not hand-edit signatures.
+The shared validator reaches persistence admission, so run the full default suite
+and serial PostgreSQL testcontainer suite before merge. Coordinate host capacity;
+record completed exit codes and frozen source state.
 
-### The design decision that comes first
+Obtain independent review, resolve findings, run branch safety before commit/merge,
+and preserve unrelated primary edits. Merge locally into `release/0.8.1` when gates
+permit. Remote push, authoritative verification, external settings and live acceptance
+are separate states; report a blocking gate instead of claiming partial work complete.
 
-This is why it is not a quick change. With `blob_ref` absent there are two defensible
-behaviours and someone has to choose:
-
-1. **Establish identity another way** — for example require that the live path equals the
-   reviewed blob's `storage_path`. Keeps more sources working; narrows rather than closes.
-2. **Degrade to the custody-unavailable outcome** the fail-closed arm already produces.
-   Simpler and provably safe; refuses some sources that would have worked.
-
-State your recommendation with the reasoning, and **surface the choice before implementing
-it**. What must not remain reachable either way: stamping the reviewed sentinel onto a source
-whose identity was never checked.
-
-Note the direction of failure is what makes this worse than its neighbours on the same path.
-They fail **closed** — a 500, too late, but no false claim. This one fails **open** and emits
-a claim that is not true into the surfaces the audit trail exists to make trustworthy.
-
-### Done looks like
-
-A new test arm directly beside
-`tests/unit/web/composer/test_redact_set_source.py::test_redact_guided_snapshot_rejects_live_blob_ref_conflicting_with_reviewed_sentinel`,
-which already pins the case where `blob_ref` is **present** and disagrees. The missing arm is
-the same scenario with `blob_ref` **absent**: it must assert the output carries either a
-verified sentinel or the custody-unavailable outcome, and never the reviewed sentinel over
-unverified bytes.
-
-**Control the test before trusting it.** Confirm it fails against the current code for the
-right reason, then passes after the fix. A test that passes on both trees proves nothing.
-
----
-
-## Rules that apply to both
-
-- `AGENTS.md` is the covenant; read it. In particular: measure every claim with the command
-  shown beside it, and control any ad-hoc instrument against a known-positive and a
-  known-negative before trusting a number it produced. A grep that silently matches nothing
-  returns exactly what a correct one returns when there is nothing to find.
-- Do not resolve, re-sign or clear the trust-tier CI failure. It is a deliberate fail-closed
-  state. Fix tier-model defects you touch; never make the state worse.
-- Never hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` in an agent shell. Check
-  `env | grep ELSPETH_JUDGE` at the start and report it if present.
-- Run `scripts/branch-safety-check.sh --intent commit` before every commit, and commit by
-  pathspec — this is a shared checkout with other sessions staging into the same index.
-- Choose tests by the reach of the change. Work item 2 touches composer redaction and
-  session helpers, so run the affected suites plus any whole-tree gate whose scanned inputs
-  could change; state the scope and limits of what you ran.
-
-## When both are fixed
-
-Each becomes an ordinary public GitHub issue describing work that is done, or simply a
-changelog entry — that is the project's stated rule, and it is why they were held rather
-than published. For the sentinel custody one the file is already written to house style at
-`docs/github-issues/held/`; move it back to `docs/github-issues/issues/`, re-run
-`python3 docs/github-issues/check_issues.py`, and import it with
-`GH_TOKEN="$(gh auth token -u johnm-dta)" python3 docs/github-issues/import_issues.py --execute`
-(the importer is resumable and skips what is already in `.import-state.jsonl`).
-
-**One thing to be clear about:** the held files are already publicly readable. They are
-tracked and have been on `origin/release/0.8.1` — a public repository — since they were
-written. Holding them back withholds *amplification*, not disclosure. So do not treat "it
-has not been imported yet" as containment; if the content itself is judged too sensitive to
-sit in the tree, the tracked file has to be dealt with as well.
+Keep the held finding until closure, then update wording and run
+`python3 docs/github-issues/check_issues.py`. The original bulk importer publishes
+all pending issues and is not scoped to this task: any public import must select
+only the reviewed issue and requires approval. Held files are already public in Git;
+holding limits amplification, not disclosure.

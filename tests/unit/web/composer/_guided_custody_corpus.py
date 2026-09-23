@@ -1,12 +1,14 @@
 """Projection-input corpus for the guided custody hash-stability pin.
 
-Every shape the base tree projected without raising must project
-byte-identically after the custody fix (elspeth-201903a286 /
+Safe shapes the base tree projected without raising must project
+byte-identically after the custody fixes (elspeth-201903a286 /
 elspeth-4c442aaaa8): settled guided operations store
 ``guided_response_hash(_state_response(record))`` and replays compare
 against it (``guided_replay.py``), so any drift on a non-raising shape
-invalidates stored hashes. The corpus is the base test suite's inputs plus
-the terminal variants a persisted checkpoint carries.
+invalidates stored hashes. Missing-reference sentinel shapes recorded false
+custody, so the stability test explicitly requires their corrected rejection
+or degradation instead. These historical inputs remain unchanged. The corpus
+is the base test suite's inputs plus terminal variants of persisted checkpoints.
 """
 
 from __future__ import annotations

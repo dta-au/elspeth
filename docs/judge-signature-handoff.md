@@ -12,20 +12,32 @@ The judge-metadata signature is an **HMAC** — a symmetric MAC. Any holder of
 `judge_verdict: ACCEPTED` with a fabricated rationale over a publicly-computable
 fingerprint, sign it, and pass every gate. The whole design follows from that
 single fact (invariant elspeth-fa00de6ec1, *[O1] operator-only HMAC custody*).
-The CI-exposure corollary is mitigated in `.github/workflows/ci.yaml`: every
-step that injects `ELSPETH_JUDGE_METADATA_HMAC_KEY` gates it on
-`github.event_name != 'pull_request'`, so PR-controlled code never runs with the
-secret present.
+The maintained workflows never request `ELSPETH_JUDGE_METADATA_HMAC_KEY`.
+This applies to every event, including release-branch pushes: a contributor
+who can push workflow changes must not gain signing authority. Removing a
+workflow reference alone does not revoke an Actions secret. Completing the
+custody repair also requires removing any repository or organization secret
+accessible to these workflows and excluding the key from runner environments.
+Those external changes require operator authorization and live verification.
+
+CI retains `required` signature verification on pushes, which fails closed
+when the key is unavailable; this change does not clear the deliberately red
+trust-tier gate. PRs retain shape-only checks and the prohibition on unverified
+signed-metadata edits. A shape-only result cannot detect forged signatures.
+Authoritative signature verification remains an operator-keyed operation in a
+trusted context, separate from CI.
 
 - **An agent never holds the key.** Agents may *propose* work — survey the tree,
   stage a bundle, run a non-authoritative preview judge — but the authoritative
   verdict for a finding is only ever minted inside the operator-keyed step.
 - **Signing never runs in CI.** The key must never be reachable from
-  PR-controlled code. CI keeps *verifying* (`check-override-rate`,
+  workflow-controlled code. CI keeps policy checks (`check-override-rate`,
   `check-judge-quality`); it never signs. This is enforced as a standing
   regression guard by `tests/unit/elspeth_lints/test_meta_ci_never_signs.py`,
   which fails if any signing verb is added to a `run:` step of
   `.github/workflows/enforce-allowlist-judge-gates.yaml`.
+  `tests/unit/test_ci_workflow_xdist.py` also rejects operator-key references
+  anywhere in the parsed workflows and preserves required push verification.
 
 **Staging asserts; firing verifies.** A staged bundle carries *zero* authority.
 Everything it claims (which entries drifted, which findings are orphaned, which

@@ -19,6 +19,7 @@ disposition record, but the disposition record is a separate row.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -57,8 +58,10 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # Distinctive token planted in every scripted provider payload / error so the
-# leak assertions can prove it never reaches the HTTP body or any persisted row.
+# leak assertions distinguish deliberately withheld prose from public output
+# and value-free audit metadata.
 _PROVIDER_LEAK_SENTINEL = "PROVIDER-LEAK-SENTINEL-9f13c7"
+_WITHHELD_PROSE = f"I cannot help. {_PROVIDER_LEAK_SENTINEL}"
 
 _EMPTY_INTENT = "Build a CSV to JSONL pipeline."
 _PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
@@ -124,7 +127,7 @@ def _malformed_completion() -> Any:
 
     def _prose() -> _Response:
         return _Response(
-            choices=[_Choice(message=_Message(content=f"I cannot help. {_PROVIDER_LEAK_SENTINEL}", tool_calls=[]))],
+            choices=[_Choice(message=_Message(content=_WITHHELD_PROSE, tool_calls=[]))],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
 
@@ -313,11 +316,41 @@ def _llm_audit_rows(engine: Any) -> list[Any]:
     return [row for row in rows if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("_kind") == "llm_call_audit"]
 
 
-def _assert_no_sentinel_leak(engine: Any, response_text: str) -> None:
+def _assert_no_sentinel_leak(engine: Any, response_text: str, *, expected_withheld_replies: int) -> None:
     assert _PROVIDER_LEAK_SENTINEL not in response_text
     with engine.connect() as conn:
-        rows = conn.execute(select(chat_messages_table)).all()
-    assert not any(_PROVIDER_LEAK_SENTINEL in str(row) for row in rows)
+        rows = conn.execute(select(chat_messages_table)).mappings().all()
+    withheld_count = 0
+    for row in rows:
+        fields = dict(row)
+        calls = fields["tool_calls"]
+        if calls and calls[0].get("_kind") == "composer_withheld_reply":
+            assert fields["role"] == "audit"
+            assert fields["content"] == _WITHHELD_PROSE
+            assert calls == [
+                {
+                    "_kind": "composer_withheld_reply",
+                    "schema": "composer.withheld-reply.v1",
+                    "origin": "planner_prose_unadmitted",
+                    "content_hash": hashlib.sha256(_WITHHELD_PROSE.encode()).hexdigest(),
+                }
+            ]
+            withheld_count += 1
+            # Only this precisely verified content is intentionally retained.
+            # Check every other field without SQLAlchemy Row repr truncation.
+            del fields["content"]
+        assert _PROVIDER_LEAK_SENTINEL not in json.dumps(fields, default=str)
+    assert withheld_count == expected_withheld_replies
+
+
+def _assert_withheld_prose_is_not_visible_or_replayed(client: SyncASGITestClient, sessions: SessionServiceImpl, session_id: str) -> None:
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history
+
+    visible = client.get(f"/api/sessions/{session_id}/messages")
+    assert visible.status_code == 200, visible.text
+    assert _PROVIDER_LEAK_SENTINEL not in visible.text
+    stored = asyncio.run(sessions.get_messages(UUID(session_id)))
+    assert _PROVIDER_LEAK_SENTINEL not in json.dumps(_composer_chat_history(stored))
 
 
 def _empty_state() -> CompositionState:
@@ -513,19 +546,26 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
 
 
 @pytest.mark.parametrize(
-    ("completion_factory", "expected_status", "expected_failure_code", "expected_planner_code", "expected_llm_audit_rows"),
+    (
+        "completion_factory",
+        "expected_status",
+        "expected_failure_code",
+        "expected_planner_code",
+        "expected_llm_audit_rows",
+        "expected_withheld_replies",
+    ),
     [
         # The prose (no-tool-call) reply is nudge-retried on its own bounded
         # budget, the overrun engages the escape hatch, and the advisor's
         # malformed reply spends it — so every nudged attempt AND the hatch
         # call land as durable audit evidence alongside the terminal
         # MALFORMED_RESPONSE.
-        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2),
-        (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1),
+        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2, 3),
+        (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1, 0),
         # LiteLLM API errors are the declared retryable provider failure, so
         # every configured physical attempt must be present in the audit.
-        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3),
-        (_cost_unavailable_completion, 503, "cost_unavailable", "COST_UNAVAILABLE", 1),
+        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3, 0),
+        (_cost_unavailable_completion, 503, "cost_unavailable", "COST_UNAVAILABLE", 1, 0),
     ],
     ids=["malformed", "timeout", "provider_error", "cost_unavailable"],
 )
@@ -537,8 +577,11 @@ def test_send_message_freeform_planner_failure_is_translated(
     expected_failure_code: str,
     expected_planner_code: str,
     expected_llm_audit_rows: int,
+    expected_withheld_replies: int,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client, engine, _sessions = _build_app(tmp_path, monkeypatch, completion_factory())
+    client, engine, sessions = _build_app(tmp_path, monkeypatch, completion_factory())
     session_id = client.post("/api/sessions", json={"title": "freeform planner failure"}).json()["id"]
 
     response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
@@ -576,13 +619,31 @@ def test_send_message_freeform_planner_failure_is_translated(
     # NOT re-persisted as a duplicate) alongside the disposition record.
     assert len(_llm_audit_rows(engine)) == expected_llm_audit_rows
 
-    # (d) no raw provider content / usage / model metadata leaks anywhere.
-    _assert_no_sentinel_leak(engine, response.text)
+    # (d) refused prose is recoverable only in its dedicated audit envelope.
+    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
+    _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
+    captured = capsys.readouterr()
+    assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
+
+    # Negative control: a marker leaked to an ordinary row must still fail,
+    # even when the same database contains valid withheld-reply records.
+    asyncio.run(
+        sessions.add_message(
+            UUID(session_id),
+            "user",
+            _PROVIDER_LEAK_SENTINEL,
+            writer_principal="route_user_message",
+        )
+    )
+    with pytest.raises(AssertionError):
+        _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
 
 
 def test_recompose_freeform_planner_failure_is_translated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     client, engine, sessions = _build_app(tmp_path, monkeypatch, _malformed_completion())
     session_id = client.post("/api/sessions", json={"title": "recompose planner failure"}).json()["id"]
@@ -613,7 +674,10 @@ def test_recompose_freeform_planner_failure_is_translated(
     assert len(disposition_rows) == 1
     assert disposition_rows[0].tool_calls[0]["failure_code"] == "invalid_provider_response"
 
-    _assert_no_sentinel_leak(engine, response.text)
+    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=3)
+    _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
+    captured = capsys.readouterr()
+    assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
 
 
 # Every ``code=`` value raised by PipelinePlannerError in pipeline_planner.py.

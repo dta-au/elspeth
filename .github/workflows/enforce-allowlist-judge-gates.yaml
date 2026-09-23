@@ -39,7 +39,9 @@
 # workflow only ever *verifies*: it must never invoke a signing verb
 # (sign-bundle / rekey / justify / sign-judge-signatures / migrate-judge-scope).
 # The judge-metadata HMAC key is operator-custody and must never be reachable
-# from PR-controlled code, so minting or rotating a signature runs ONLY in an
+# from workflow-controlled code, including release-branch pushes. Workflow
+# references are forbidden; Actions secrets and runner environments must also
+# exclude the key. Minting or rotating a signature runs ONLY in an
 # operator-controlled shell, never here. Agents stage a review bundle via the
 # elspeth-judge MCP server; an operator fires `elspeth-lints sign-bundle` /
 # `rekey` in a key-bearing shell (see docs/judge-signature-handoff.md). This

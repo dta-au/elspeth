@@ -3,12 +3,14 @@
 ``guided_custody_projection_stability.json`` was captured by running the
 BASE tree's ``redact_guided_snapshot_storage_paths`` (commit 7cd2fc6db, in
 the projection order both callers used: ``redact_source_storage_path``
-first) over ``_guided_custody_corpus``. Every shape that projected there
-must project byte-identically now — settled guided operations store
+first) over ``_guided_custody_corpus``. Safe historical projections remain
+byte-identical — settled guided operations store
 ``guided_response_hash(_state_response(record))`` and replays verify
 against it (``guided_replay.py``), so drift on a non-raising shape
-invalidates stored hashes. The shapes that raised at base are the defect
-shapes; their new outcomes are pinned separately.
+invalidates stored hashes. The explicitly named missing-reference sentinel
+cases recorded false custody and intentionally change: active reads reject,
+and terminal reads mask paths and declare custody unavailable. Their captured
+bytes remain historical evidence. Originally raising shapes are pinned separately.
 """
 
 from __future__ import annotations
@@ -27,6 +29,18 @@ _FIXTURE = Path(__file__).with_name("guided_custody_projection_stability.json")
 _BASE = json.loads(_FIXTURE.read_text(encoding="utf-8"))
 _CORPUS = corpus()
 
+# These historical successes were false custody claims. Keep their captured
+# bytes as evidence while testing the intentionally incompatible correction.
+_UNVERIFIED_SENTINEL_CASES = frozenset(
+    f"{shape}[{terminal}]"
+    for shape in (
+        "sentinel_exact_name_with_implicit_decisions",
+        "plural_sentinels_path_and_file",
+        "case_c_reauthored_plain_path",
+    )
+    for terminal in ("active", "exited", "completed")
+)
+
 
 def _project_like_the_callers(sources: dict[str, Any] | None, meta: dict[str, Any] | None) -> tuple[Any, Any]:
     generic = redact_source_storage_path({"sources": sources})["sources"] if sources is not None else None
@@ -36,9 +50,14 @@ def _project_like_the_callers(sources: dict[str, Any] | None, meta: dict[str, An
 def test_fixture_covers_exactly_the_corpus() -> None:
     assert _BASE["base_commit"] == "7cd2fc6db"
     assert set(_BASE["cases"]) == set(_CORPUS)
+    assert set(_CORPUS) >= _UNVERIFIED_SENTINEL_CASES
+    assert all(_BASE["cases"][name]["outcome"] == "projected" for name in _UNVERIFIED_SENTINEL_CASES)
 
 
-@pytest.mark.parametrize("name", [name for name, case in _BASE["cases"].items() if case["outcome"] == "projected"])
+@pytest.mark.parametrize(
+    "name",
+    [name for name, case in _BASE["cases"].items() if case["outcome"] == "projected" and name not in _UNVERIFIED_SENTINEL_CASES],
+)
 def test_base_projecting_shapes_are_byte_identical(name: str) -> None:
     sources, meta = _CORPUS[name]
     expected = _BASE["cases"][name]
@@ -47,6 +66,36 @@ def test_base_projecting_shapes_are_byte_identical(name: str) -> None:
 
     assert json.dumps(projected_sources, sort_keys=True) == json.dumps(expected["sources"], sort_keys=True)
     assert json.dumps(projected_meta, sort_keys=True) == json.dumps(expected["composer_meta"], sort_keys=True)
+
+
+@pytest.mark.parametrize("name", sorted(_UNVERIFIED_SENTINEL_CASES))
+def test_unverified_historical_sentinels_fail_closed(name: str) -> None:
+    sources, meta = _CORPUS[name]
+    assert sources is not None
+    assert meta is not None
+    # Every exception to byte stability must carry the defect being corrected.
+    assert all("blob_ref" not in source["options"] for source in sources.values())
+    if name.endswith("[active]"):
+        with pytest.raises(GuidedCustodyIntegrityError, match="guided blob source mapping"):
+            _project_like_the_callers(sources, meta)
+        return
+
+    projected_sources, projected_meta = _project_like_the_callers(sources, meta)
+    assert projected_meta["guided_session"]["custody_unavailable"] is True
+    for source_name, source in sources.items():
+        for carrier in ("path", "file"):
+            if carrier in source["options"]:
+                assert projected_sources[source_name]["options"][carrier] == REDACTED_BLOB_SOURCE_PATH
+    for reviewed in projected_meta["guided_session"]["reviewed_sources"].values():
+        for carrier in ("path", "file"):
+            if carrier in reviewed["options"]:
+                assert reviewed["options"][carrier] == REDACTED_BLOB_SOURCE_PATH
+    if "implicit_decisions" in projected_meta:
+        entries = projected_meta["implicit_decisions"]["entries"]
+        assert entries[0]["value"] == REDACTED_BLOB_SOURCE_PATH
+        assert entries[1]["value"] == REDACTED_BLOB_SOURCE_PATH
+        assert entries[2]["value"] == "outputs/out.jsonl"
+    assert "blob:" not in json.dumps((projected_sources, projected_meta))
 
 
 @pytest.mark.parametrize("name", [name for name, case in _BASE["cases"].items() if case["outcome"] == "raised"])

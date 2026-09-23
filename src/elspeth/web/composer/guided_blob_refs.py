@@ -110,7 +110,9 @@ def validate_guided_reviewed_sentinel_source_mapping(
         if type(value) is not str or not value or "\x00" in value or value.startswith(BLOB_REF_PATH_PREFIX):
             raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
         live_carriers.append((key, value))
-    if "blob_ref" in options and validate_guided_reviewed_blob_ref(options["blob_ref"]) != binding.blob_ref:
+    # Carrier shape and source name cannot establish which blob the live path
+    # reads. Only a reference retained by a verified materializer can bind it.
+    if "blob_ref" not in options or validate_guided_reviewed_blob_ref(options["blob_ref"]) != binding.blob_ref:
         raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
     return tuple(live_carriers)
 

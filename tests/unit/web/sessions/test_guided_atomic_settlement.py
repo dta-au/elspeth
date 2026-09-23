@@ -1576,7 +1576,7 @@ def test_guided_replay_redacts_canonical_sentinel_in_sources_and_persisted_compo
     record = _replay_record(
         descriptor=descriptor,
         guided=guided,
-        sources={"source": {"plugin": "csv", "options": {"path": private_path}}},
+        sources={"source": {"plugin": "csv", "options": {"path": private_path, "blob_ref": blob_id}}},
     )
 
     response = replay.project_guided_response(record, payloads=())

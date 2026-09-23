@@ -10048,7 +10048,7 @@ sinks:
                 source={
                     "plugin": "csv",
                     "on_success": "out",
-                    "options": {"path": storage_path, "schema": {"mode": "observed"}},
+                    "options": {"path": storage_path, "blob_ref": str(blob_id), "schema": {"mode": "observed"}},
                     "on_validation_failure": "discard",
                 },
                 outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],

@@ -3,7 +3,10 @@ title: Sentinel custody projection fails open when live source options carry no 
 labels: [area/composer, area/audit, type/bug]
 ---
 
-When a live source's options carry a file path but no `blob_ref`, custody validation passes without checking blob identity, and the code then stamps the approved blob's placeholder onto a source that reads a different blob's bytes. The result is an affirmative, false custody claim on surfaces users and the model provider can see.
+Status: repaired in the pre-publication security patch for `release/0.8.1`.
+Public issue import remains held. See the [review and verification record](../../reviews/2026-09-23-pre-publication-security-review.md).
+
+Before the repair, when a live source's options carried a file path but no `blob_ref`, custody validation passed without checking blob identity, and the code then stamped the approved blob's placeholder onto a source that read a different blob's bytes. The result was an affirmative, false custody claim on surfaces users and the model provider could see. The sections below describe the original defect.
 
 ## What happens
 
@@ -32,11 +35,13 @@ The direction of failure is what makes this worse than neighbouring defects on t
 
 ## Fix
 
-Small to medium — one function and a test arm — but **a design decision comes first**, and it is the reason this is not a quick change. When the live options lack `blob_ref`, there are two defensible behaviours and someone has to choose:
+The validator now requires a canonical live `blob_ref` matching the reviewed identity.
+The trusted guided materializer retains that identity when resolving a reviewed
+sentinel into a private storage path. It does not infer identity from arbitrary paths.
 
-1. Establish identity another way, for example by requiring that the live path equals the reviewed blob's `storage_path`; or
-2. Degrade to the same named custody-unavailable outcome the fail-closed arm already produces.
-
-Option 1 keeps more sources working and narrows the hole; option 2 is simpler and provably safe. What must not remain reachable is stamping the reviewed sentinel onto a source whose identity was never checked.
-
-Done looks like a new test directly beside `tests/unit/web/composer/test_redact_set_source.py::test_redact_guided_snapshot_rejects_live_blob_ref_conflicting_with_reviewed_sentinel`, which already pins the case where `blob_ref` is present and disagrees. The missing arm is the same scenario with `blob_ref` absent: it must assert the output carries either a verified sentinel or the custody-unavailable outcome, and never the reviewed sentinel over unverified bytes.
+Missing identity rejects active projection, export and persistence admission.
+Terminal and explicitly tolerant history projections instead report
+`custody_unavailable` and mask the private paths. Regressions cover both carrier
+keys, conflicting and missing identities, legitimate materialization, export and
+persistence. The historical false-custody cases now require refusal or degradation;
+their original corpus and golden JSON remain unchanged.

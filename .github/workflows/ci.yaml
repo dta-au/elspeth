@@ -451,8 +451,9 @@ jobs:
 
       - name: Run trust-tier elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # Workflows must not receive the operator signing key. Push verification
+        # remains required and fails closed without it; PR checks stay keyless.
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
           ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e
@@ -469,7 +470,6 @@ jobs:
       - name: Run trust-boundary honesty-gate elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
           ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
@@ -616,7 +616,6 @@ jobs:
         if: always()
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
           ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e

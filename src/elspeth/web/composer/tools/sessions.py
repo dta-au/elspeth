@@ -1210,6 +1210,9 @@ def build_set_pipeline_candidate(
                     option_value = src_options[option_name] if option_name in src_options else None
                     if type(option_value) is str and option_value.startswith("blob:"):
                         src_options[option_name] = authority.verified_blob_paths[option_value]
+                        # Authority already verified canonical identity, ownership
+                        # and storage path. Retain that proof on the live source.
+                        src_options["blob_ref"] = option_value.removeprefix("blob:")
             # Echo tolerance (elspeth-c67fbbbd83), unreviewed sources only: a
             # reviewed binding is hash-matched verbatim above and must not be
             # rewritten. Non-matching values still reject at the gates below.

@@ -768,8 +768,10 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   a bare `check` exits 2, and a cwd root walks `.venv`. The
   `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`
   prefix lets a contributor without the operator key run it; shape-only
-  verification cannot detect forged judge metadata, so CI re-verifies with
-  the key before a merge is authoritative.
+  verification cannot detect forged judge metadata. CI never receives the
+  operator key; push verification remains required and fails closed without
+  it. An operator-controlled context must verify the exact reviewed candidate
+  with trusted verifier code before a merge is authoritative.
 - The `trust_tier.tier_model` allowlist under `config/cicd/enforce_tier_model/*.yaml`
   seals each judged suppression with an operator-held HMAC signature. A
   signed entry binds by `scope_fingerprint` of the enclosing function, not by

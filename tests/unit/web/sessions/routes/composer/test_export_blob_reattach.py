@@ -1,12 +1,10 @@
 """Unit tests for _reattach_guided_blob_refs (elspeth-b5ee205720).
 
-A guided blob-backed source has ``blob_ref`` stripped from its committed
-options (the manual set_source path can't prove ``path == storage_path``); it
-survives only in the schema-8 GuidedSession ``reviewed_sources`` snapshot. Public
-export custody verification and path omission key off
-``source.options["blob_ref"]``. This helper reconstitutes ``blob_ref`` into the
-private export working copy from the snapshot, mirroring the cross-reference in
-redact_guided_snapshot_storage_paths; the public response still omits the UUID.
+Exact reviewed storage paths can reconstitute a missing live ``blob_ref`` in
+the private export copy. Reviewed public sentinels instead require the live
+reference retained by the verified materializer; sentinel shape alone cannot
+establish identity. Public export verifies custody and omits both the storage
+path and UUID.
 """
 
 from __future__ import annotations
@@ -83,9 +81,9 @@ def test_reattaches_blob_ref_from_guided_snapshot() -> None:
     assert "blob_ref" not in state.sources["source"].options
 
 
-def test_reattaches_blob_ref_when_reviewed_snapshot_uses_public_blob_sentinel() -> None:
+def test_preserves_live_blob_ref_when_reviewed_snapshot_uses_public_blob_sentinel() -> None:
     state = _state(
-        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        source_options={"path": BLOB_PATH, "blob_ref": BLOB_REF, "schema": {"mode": "observed"}},
         guided_session=_guided_with_snapshot(blob_ref=BLOB_REF, path=f"blob:{BLOB_REF}"),
     )
 
@@ -100,12 +98,12 @@ def test_reattaches_blob_ref_when_reviewed_snapshot_uses_public_blob_sentinel() 
     assert "path" not in public_options
     assert "blob_ref" not in public_options
     assert BLOB_REF not in repr(public_options)
-    assert "blob_ref" not in state.sources["source"].options
+    assert out is state
 
 
-def test_reattaches_blob_ref_from_guided_native_sentinel_without_duplicate_identity_key() -> None:
+def test_preserves_live_blob_ref_from_guided_native_sentinel_without_duplicate_reviewed_identity_key() -> None:
     state = _state(
-        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        source_options={"path": BLOB_PATH, "blob_ref": BLOB_REF, "schema": {"mode": "observed"}},
         guided_session=_guided_with_snapshot(blob_ref=None, path=f"blob:{BLOB_REF}"),
     )
 
@@ -116,6 +114,18 @@ def test_reattaches_blob_ref_from_guided_native_sentinel_without_duplicate_ident
         "schema": {"mode": "observed"},
         "blob_ref": BLOB_REF,
     }
+    assert out is state
+
+
+@pytest.mark.parametrize("reviewed_blob_ref", [None, BLOB_REF])
+def test_rejects_reviewed_sentinel_without_live_blob_identity(reviewed_blob_ref: str | None) -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        guided_session=_guided_with_snapshot(blob_ref=reviewed_blob_ref, path=f"blob:{BLOB_REF}"),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        _reattach_guided_blob_refs(state)
 
 
 @pytest.mark.parametrize(

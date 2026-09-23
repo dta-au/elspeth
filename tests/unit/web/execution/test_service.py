@@ -693,13 +693,13 @@ def _proof_gate_state(
 
 
 def _guided_sentinel_proof_gate_state(*, source_path: Path, blob_id: UUID) -> Any:
-    """Observed CSV numeric gate whose reviewed source claims blob custody."""
+    """Observed CSV numeric gate retaining the verified materializer's blob identity."""
     from dataclasses import replace
 
     from elspeth.web.composer.guided.resolved import SourceResolved
     from elspeth.web.composer.guided.state_machine import GuidedSession
 
-    live_state = _proof_gate_state(source_path=source_path, blob_id=None)
+    live_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
     stable_id = str(uuid4())
     guided = replace(
         GuidedSession.initial(),

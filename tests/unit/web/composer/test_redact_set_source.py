@@ -286,7 +286,7 @@ def test_redact_guided_snapshot_leaves_operator_typed_source() -> None:
 def test_redact_guided_snapshot_projects_canonical_blob_sentinel_by_exact_name() -> None:
     real_path = "/internal/blobs/session/source.csv"
     sentinel = "blob:11111111-1111-4111-8111-111111111111"
-    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    sources = {"source": {"options": {"path": real_path, "blob_ref": sentinel.removeprefix("blob:"), "schema": {"mode": "observed"}}}}
     composer_meta = {
         "guided_session": {
             "reviewed_sources": {
@@ -317,8 +317,8 @@ def test_redact_guided_snapshot_projects_plural_canonical_sentinels_by_exact_car
     first_sentinel = "blob:11111111-1111-4111-8111-111111111111"
     second_sentinel = "blob:22222222-2222-4222-8222-222222222222"
     sources = {
-        "first": {"options": {"path": first_path}},
-        "second": {"options": {"file": second_path}},
+        "first": {"options": {"path": first_path, "blob_ref": first_sentinel.removeprefix("blob:")}},
+        "second": {"options": {"file": second_path, "blob_ref": second_sentinel.removeprefix("blob:")}},
     }
     composer_meta = {
         "guided_session": {
@@ -425,6 +425,46 @@ def test_redact_guided_snapshot_accepts_matching_fork_sentinel_and_blob_ref() ->
     )
     with pytest.raises(AuditIntegrityError):
         redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+
+@pytest.mark.parametrize("carriers", [("path",), ("file",), ("path", "file")])
+@pytest.mark.parametrize("surface", ["active", "persist", "exited", "completed", "history"])
+def test_redact_guided_snapshot_missing_live_blob_ref_never_claims_sentinel_custody(carriers: tuple[str, ...], surface: str) -> None:
+    from copy import deepcopy
+
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    private = "/internal/blobs/unreviewed.csv"
+    sources = {"source": {"options": dict.fromkeys(carriers, private)}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {"review": {"name": "source", "options": dict.fromkeys(carriers, sentinel)}},
+            "pending_source_intents": {},
+            "terminal": _EXITED_TERMINAL if surface == "exited" else _COMPLETED_TERMINAL if surface == "completed" else None,
+        },
+        "implicit_decisions": {
+            "schema_version": 2,
+            "entries": [{"path": "source.path", "value": private, "category": "source"}],
+        },
+    }
+    before = deepcopy((sources, composer_meta))
+    if surface == "active":
+        with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+            redact_guided_snapshot_storage_paths(sources, composer_meta)
+    elif surface == "persist":
+        with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+            assert_guided_custody_persistable(sources, composer_meta)
+    else:
+        sources_out, meta_out = redact_guided_snapshot_storage_paths(
+            sources, composer_meta, raw_sources=sources, degrade_unbindable=surface == "history"
+        )
+        assert sources_out["source"]["options"] == dict.fromkeys(carriers, REDACTED_BLOB_SOURCE_PATH)
+        assert meta_out["guided_session"]["custody_unavailable"] is True
+        assert meta_out["implicit_decisions"]["entries"][0]["value"] == REDACTED_BLOB_SOURCE_PATH
+        assert sentinel not in json.dumps(sources_out)
+        assert private not in json.dumps((sources_out, meta_out))
+    assert (sources, composer_meta) == before
 
 
 @pytest.mark.parametrize(
@@ -1151,7 +1191,7 @@ def test_redact_guided_snapshot_implicit_decision_entries_use_membership_reads()
     """
     real_path = "/internal/blobs/session/source.csv"
     sentinel = "blob:11111111-1111-4111-8111-111111111111"
-    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    sources = {"source": {"options": {"path": real_path, "blob_ref": sentinel.removeprefix("blob:"), "schema": {"mode": "observed"}}}}
     entries = [
         {"path": "source.path", "value": real_path, "category": "source"},
         {"path": "source.file", "value": "/tmp/other.csv", "category": "source"},
@@ -1170,7 +1210,7 @@ def test_redact_guided_snapshot_implicit_decision_entries_use_membership_reads()
 def test_redact_guided_snapshot_implicit_decision_report_without_entries_fails_closed() -> None:
     real_path = "/internal/blobs/session/source.csv"
     sentinel = "blob:11111111-1111-4111-8111-111111111111"
-    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    sources = {"source": {"options": {"path": real_path, "blob_ref": sentinel.removeprefix("blob:"), "schema": {"mode": "observed"}}}}
     meta = _sentinel_projection_meta(real_path, sentinel, [])
     del meta["implicit_decisions"]["entries"]
     with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed"):
@@ -1279,14 +1319,11 @@ _PRIVATE_REPOINTED = f"/srv/elspeth/data/blobs/s1/{_REPOINTED_BLOB_REF}_c.csv"
 
 
 def _two_guided_committed_sources_repointed_after_exit(terminal: object) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Two guided-committed sentinel-form reviewed sources ``a`` and ``b``; both live
-    sources carry the private path with NO blob_ref (guided set_source strips it);
-    after the terminal, freeform re-pointed ``b`` at a different blob (explicit
-    blob_ref). The strict binding fails on ``b``; ``a`` still carries its private
-    path and is masked today only by the sentinel-stamping arm that never runs
-    once the function raises (adversary Critical 1)."""
+    """Two reviewed sources retain verified live refs; after the terminal,
+    freeform re-points ``b`` at a different blob. The strict binding fails on
+    ``b``; degradation must also mask the correctly bound source ``a``."""
     sources = {
-        "a": {"plugin": "csv", "options": {"path": _PRIVATE_A}},
+        "a": {"plugin": "csv", "options": {"path": _PRIVATE_A, "blob_ref": "aaaaaaaa-0000-4000-8000-000000000001"}},
         "b": {"plugin": "csv", "options": {"path": _PRIVATE_REPOINTED, "blob_ref": _REPOINTED_BLOB_REF}},
     }
     composer_meta = {
@@ -1407,7 +1444,6 @@ def test_redact_guided_snapshot_bound_terminal_projection_is_byte_identical_to_a
     }
     for sources in (
         {},
-        {"source": {"plugin": "csv", "options": {"path": private}}},
         {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "360e1583-ae3c-4135-9240-0a26a14cf22f"}}},
     ):
         active_meta = {"guided_session": {"reviewed_sources": reviewed, "pending_source_intents": {}, "terminal": None}}
@@ -1422,14 +1458,10 @@ def test_redact_guided_snapshot_bound_terminal_projection_is_byte_identical_to_a
 
 
 @_TERMINALS
-def test_redact_guided_snapshot_case_c_is_out_of_scope_in_terminal_sessions(terminal: dict[str, Any]) -> None:
+def test_redact_guided_snapshot_reauthored_path_degrades_in_terminal_sessions(terminal: dict[str, Any]) -> None:
     """Mutation case C (elspeth-201903a286): the live source drops ``blob_ref`` and
-    re-authors a plain path under the reviewed name. Nothing raises, so the
-    sentinel is stamped over the re-authored path in active AND terminal sessions
-    — a provider-visible false custody claim tracked by elspeth-c72a3d09e5 /
-    elspeth-24bf6a047a. Narrowing it here would alter a non-raising projection
-    and drift stored guided_response_hash values, so this pins the current
-    behaviour deliberately."""
+    re-authors a plain path under the reviewed name. The retained review cannot
+    establish the new source's identity, so it must not stamp its sentinel."""
     sentinel = "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
     sources = {"source": {"plugin": "csv", "options": {"path": "data.csv"}}}
     composer_meta = {
@@ -1444,8 +1476,8 @@ def test_redact_guided_snapshot_case_c_is_out_of_scope_in_terminal_sessions(term
 
     sources_out, meta_out = _project(sources, composer_meta)
 
-    assert sources_out["source"]["options"]["path"] == sentinel
-    assert "custody_unavailable" not in meta_out["guided_session"]
+    assert sources_out["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert meta_out["guided_session"]["custody_unavailable"] is True
 
 
 def test_redact_guided_snapshot_rejects_malformed_terminal_before_degrading() -> None:
@@ -1551,7 +1583,9 @@ def test_redact_guided_snapshot_malformed_implicit_decisions_is_not_a_custody_co
     AuditIntegrityError on active AND terminal tips — never the custody type
     the 409 arms name, never the degraded projection."""
     real_path = "/internal/blobs/session/source.csv"
-    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    sources = {
+        "source": {"options": {"path": real_path, "blob_ref": "11111111-1111-4111-8111-111111111111", "schema": {"mode": "observed"}}}
+    }
     composer_meta = {
         "guided_session": {
             "reviewed_sources": {

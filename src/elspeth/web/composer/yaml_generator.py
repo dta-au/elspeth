@@ -636,14 +636,6 @@ def _reattach_guided_reviewed_blob_bindings(state: CompositionState) -> Composit
             source_name=source_name,
             live_source_options=live_source_options,
         )
-        sentinel_source = state.sources[source_name]
-        options = sentinel_source.options
-        if "blob_ref" in options:
-            continue
-        merged = dict(options)
-        merged["blob_ref"] = binding.blob_ref
-        reattached[source_name] = replace(sentinel_source, options=merged)
-        changed = True
 
     return replace(state, sources=reattached) if changed else state
 

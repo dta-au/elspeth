@@ -427,11 +427,10 @@ def test_pull_request_jobs_never_use_the_trusted_runner() -> None:
             assert "head.repo.full_name == github.repository" not in selector
 
 
-def test_static_analysis_signed_allowlist_steps_are_keyless_for_every_pr() -> None:
-    """PR code gets shape/binding checks but never receives the operator HMAC key."""
+def test_static_analysis_signed_allowlist_steps_never_receive_the_operator_key() -> None:
+    """CI never receives signing authority; pushes retain required verification."""
     workflow = _ci_workflow()
     static_analysis = workflow["jobs"]["static-analysis"]
-    expected_secret = "${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}"
 
     for step_name in (
         "Run trust-tier elspeth-lints rule",
@@ -441,10 +440,19 @@ def test_static_analysis_signed_allowlist_steps_are_keyless_for_every_pr() -> No
         step = _step(static_analysis, step_name)
         env = step.get("env")
         assert isinstance(env, dict), f"{step_name!r} must define step env"
-        assert env.get("ELSPETH_JUDGE_METADATA_HMAC_KEY") == expected_secret
+        assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" not in env
         verify_mode = env.get("ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE")
         assert isinstance(verify_mode, str), f"{step_name!r} must define signature verification mode"
         assert verify_mode == "${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}"
+
+
+def test_no_workflow_references_the_operator_hmac_key() -> None:
+    """A key injected at job/workflow scope is as reachable as a step secret."""
+    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    assert CI_WORKFLOW in workflow_paths
+    for workflow_path in workflow_paths:
+        if workflow_path.suffix in {".yml", ".yaml"}:
+            assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" not in json.dumps(_workflow(workflow_path)), workflow_path.name
 
 
 def test_static_analysis_all_prs_reject_unverified_signed_allowlist_edits() -> None:

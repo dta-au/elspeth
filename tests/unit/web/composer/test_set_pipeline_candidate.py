@@ -1227,6 +1227,14 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
     assert candidate.acceptable is True, candidate.result.to_dict()
     # The reviewed blob path resolved to the private storage path...
     assert candidate.result.updated_state.sources["source"].options["path"] == blob.storage_path
+    assert candidate.result.updated_state.sources["source"].options["blob_ref"] == str(blob.id)
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable, redact_guided_snapshot_storage_paths
+
+    sources = candidate.result.updated_state.to_dict()["sources"]
+    composer_meta = {"guided_session": guided.to_dict()}
+    assert_guided_custody_persistable(sources, composer_meta)
+    projected_sources, _ = redact_guided_snapshot_storage_paths(sources, composer_meta)
+    assert projected_sources["source"]["options"]["path"] == f"blob:{blob.id}"
     # ...and the short-form llm review canonicalised into a pending full-form row.
     llm_node = next(node for node in candidate.result.updated_state.nodes if node.plugin == "llm")
     shield = next(
