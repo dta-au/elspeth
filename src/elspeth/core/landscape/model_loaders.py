@@ -921,6 +921,7 @@ class OperationLoader:
             run_id=row.run_id,
             node_id=row.node_id,
             operation_type=row.operation_type,
+            occurrence_index=row.occurrence_index,
             started_at=row.started_at,
             completed_at=row.completed_at,
             status=row.status,

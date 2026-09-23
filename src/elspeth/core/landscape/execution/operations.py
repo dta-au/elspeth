@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from sqlalchemy import bindparam, select
+from sqlalchemy import bindparam, func, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import FrameworkBugError, Operation, OperationType
@@ -94,24 +94,32 @@ class OperationRepository:
                 input_ref = self._payload_store.store(input_bytes)
 
         timestamp = now()
-        operation = Operation(
-            operation_id=operation_id,
-            run_id=coordination_token.run_id,
-            node_id=node_id,
-            operation_type=operation_type,
-            started_at=timestamp,
-            status="open",
-            sink_effect_id=sink_effect_id,
-            input_data_ref=input_ref,
-            input_data_hash=input_hash,
-        )
-
         with fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="begin_operation",
         ) as conn:
+            previous_index = conn.execute(
+                select(func.max(operations_table.c.occurrence_index)).where(
+                    operations_table.c.run_id == coordination_token.run_id,
+                    operations_table.c.node_id == node_id,
+                    operations_table.c.operation_type == operation_type,
+                )
+            ).scalar_one()
+            occurrence_index = 0 if previous_index is None else previous_index + 1
+            operation = Operation(
+                operation_id=operation_id,
+                run_id=coordination_token.run_id,
+                node_id=node_id,
+                operation_type=operation_type,
+                occurrence_index=occurrence_index,
+                started_at=timestamp,
+                status="open",
+                sink_effect_id=sink_effect_id,
+                input_data_ref=input_ref,
+                input_data_hash=input_hash,
+            )
             self._ops.execute_insert_on(conn, operations_table.insert().values(**operation.to_dict()))
         return operation
 

@@ -42,7 +42,8 @@ Landscape digest column: SQLite ignores the declared `VARCHAR` width, so
 never-written `nodes.schema_hash` column and its always-null key in the exported
 node record.
 Landscape epoch 44 records the actual run mode and source run, links replayed
-calls to their source calls, and stores verify comparison decisions. Populated
+calls to their source calls, stores verify comparison decisions, and numbers
+source/preflight operation occurrences under the run leader. Populated
 epoch-43 Landscape stores require archive/export as needed and recreation before
 this version starts; no in-place migration is supported.
 Session epoch 63 also adds `interpretation_events.surface_origin`: review cards raised by

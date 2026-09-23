@@ -88,7 +88,9 @@ class InMemoryAuditWriter:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedAuditCall:
+        assert source_call_id is None
         call = RecordedAuditCall(
             state_id=state_id,
             operation_id=None,
@@ -123,7 +125,9 @@ class InMemoryAuditWriter:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedAuditCall:
+        assert source_call_id is None
         if call_index is None:
             call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         call = RecordedAuditCall(

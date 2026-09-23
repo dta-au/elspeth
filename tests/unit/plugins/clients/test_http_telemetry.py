@@ -57,7 +57,9 @@ class _RecordingExecution:
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> _RecordedCall:
+        assert source_call_id is None
         kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -94,7 +96,9 @@ class _RecordingExecution:
         approved_prompt_artifact_hash: str | None = None,
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> _RecordedCall:
+        assert source_call_id is None
         return _RecordedCall()
 
 

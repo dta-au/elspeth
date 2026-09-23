@@ -57,6 +57,31 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
             coordination_token=leader_coordination_token(factory, "current"),
             source_call_id=source_call.call_id,
         )
+        source_second_op = factory.execution.begin_operation(
+            "source-node", "source_load", coordination_token=leader_coordination_token(factory, "source")
+        )
+        current_second_op = factory.execution.begin_operation(
+            "source-node", "source_load", coordination_token=leader_coordination_token(factory, "current")
+        )
+        source_second_call = factory.execution.record_operation_call(
+            source_second_op.operation_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"url": "https://example.test/a"}),
+            RawCallPayload({"status": 201}),
+            coordination_token=leader_coordination_token(factory, "source"),
+        )
+        matched = factory.execution.find_call_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            request_hash=source_second_call.request_hash,
+            current_state_id=None,
+            current_operation_id=current_second_op.operation_id,
+            current_call_index=0,
+        )
+        assert matched is not None and matched.call_id == source_second_call.call_id
+        assert factory.execution.get_operation(source_second_op.operation_id).occurrence_index == 1
+        assert factory.execution.get_operation(current_second_op.operation_id).occurrence_index == 1
         factory.execution.record_verification_decision(
             current_run_id="current",
             current_call_id=current_call.call_id,
@@ -85,3 +110,7 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
         assert run == ("verify", "source")
         assert call == source_call.call_id
         assert verdict == (source_call.call_id, True)
+        assert {item.call_id for item in factory.execution.get_all_calls_for_run("source")} == {
+            source_call.call_id,
+            source_second_call.call_id,
+        }

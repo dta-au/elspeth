@@ -446,7 +446,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        16-hex error fingerprints, the 32-hex SchemaContract.version_hash
 #        values and the ``sha256:<16 hex>`` plugin source fingerprint now each
 #        have their own rule. Deploy with Sessions epoch 63; delete/recreate.
-#  44 → Calls gain source-call lineage and durable verification decisions.
+#  44 → Calls gain source-call lineage and durable verification decisions;
+#        operations gain a fenced per-node/type occurrence index for repeatable
+#        source/preflight call matching.
 #        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
 SQLITE_SCHEMA_EPOCH = 44
 
@@ -2173,6 +2175,7 @@ operations_table = Table(
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False, index=True),
     Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
     Column("operation_type", String(32), nullable=False),  # 'source_load' | 'sink_write' | 'runtime_preflight'
+    Column("occurrence_index", Integer, nullable=True),  # Transactional per-run/node/type order; NULL for legacy/raw rows
     Column("sink_effect_id", String(64), ForeignKey("sink_effects.effect_id"), nullable=True),
     Column("started_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
@@ -2193,6 +2196,16 @@ operations_table = Table(
     CheckConstraint(_OptionalLowerHex64Check("output_data_hash"), name="ck_operations_output_data_hash_hex"),
 )
 Index("uq_operations_sink_effect_id", operations_table.c.sink_effect_id, unique=True)
+Index(
+    "uq_operations_occurrence",
+    operations_table.c.run_id,
+    operations_table.c.node_id,
+    operations_table.c.operation_type,
+    operations_table.c.occurrence_index,
+    unique=True,
+    sqlite_where=operations_table.c.occurrence_index.isnot(None),
+    postgresql_where=operations_table.c.occurrence_index.isnot(None),
+)
 
 # === External Calls ===
 # Calls can be parented by either a node_state (transform processing) or an

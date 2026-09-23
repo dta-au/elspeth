@@ -1652,6 +1652,7 @@ class Operation:
     operation_type: OperationType
     started_at: datetime
     status: Literal["open", "completed", "failed", "pending"]
+    occurrence_index: int | None = None
     sink_effect_id: str | None = None
     completed_at: datetime | None = None
     input_data_ref: str | None = None
@@ -1675,6 +1676,7 @@ class Operation:
         """
         if self.operation_type not in self._ALLOWED_OPERATION_TYPES:
             raise ValueError(f"operation_type must be one of {sorted(self._ALLOWED_OPERATION_TYPES)}, got {self.operation_type!r}")
+        require_int(self.occurrence_index, "occurrence_index", optional=True, min_value=0)
 
         if self.status not in self._ALLOWED_STATUSES:
             raise ValueError(f"status must be one of {sorted(self._ALLOWED_STATUSES)}, got {self.status!r}")
@@ -1712,6 +1714,7 @@ class Operation:
             "run_id": self.run_id,
             "node_id": self.node_id,
             "operation_type": self.operation_type,
+            "occurrence_index": self.occurrence_index,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "status": self.status,

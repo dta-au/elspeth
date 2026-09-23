@@ -737,6 +737,10 @@ class ExecutionRepository:
     def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
         return self.calls.get_verification_decisions_for_run(current_run_id)
 
+    def get_all_calls_for_run(self, run_id: str) -> list[Call]:
+        """Return both state-parented and operation-parented calls for finalization."""
+        return self.calls.get_all_calls_for_run(run_id)
+
     def find_call_for_current_parent(
         self,
         *,

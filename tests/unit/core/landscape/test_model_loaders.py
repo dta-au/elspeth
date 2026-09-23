@@ -1687,6 +1687,7 @@ class TestOperationLoader:
             "run_id": "run-1",
             "node_id": "node-1",
             "operation_type": "source_load",
+            "occurrence_index": None,
             "sink_effect_id": None,
             "started_at": NOW,
             "status": "open",

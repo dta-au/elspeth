@@ -143,7 +143,9 @@ class FakeCallRecorder:
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
+        assert source_call_id is None
         call_kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -180,7 +182,9 @@ class FakeCallRecorder:
         approved_prompt_artifact_hash: str | None = None,
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
+        assert source_call_id is None
         actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call_kwargs = {
             "operation_id": operation_id,

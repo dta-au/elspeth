@@ -114,20 +114,61 @@ def test_rejects_wrong_run_source_call_and_verification_without_partial_write() 
         assert conn.execute(select(calls_table.c.call_id).where(calls_table.c.source_call_id == source_call.call_id)).all() == []
 
 
-def test_duplicate_operation_candidates_are_ambiguous_even_with_equal_timestamps() -> None:
+def test_repeated_source_loads_bind_transactional_occurrence() -> None:
     factory, source_operation, current_operation = _two_runs()
     first = _record(factory, "source", source_operation)
-    duplicate_operation = factory.execution.begin_operation(
+    second_source_operation = factory.execution.begin_operation(
         "source-node", "source_load", coordination_token=leader_coordination_token(factory, "source")
     )
-    _record(factory, "source", duplicate_operation.operation_id)
-    with pytest.raises(AuditIntegrityError, match="ambiguous"):
+    second = _record(factory, "source", second_source_operation.operation_id)
+    second_current_operation = factory.execution.begin_operation(
+        "source-node", "source_load", coordination_token=leader_coordination_token(factory, "current")
+    )
+    assert factory.execution.get_operation(source_operation).occurrence_index == 0
+    assert factory.execution.get_operation(second_source_operation.operation_id).occurrence_index == 1
+    assert (
         factory.execution.find_call_for_current_parent(
             source_run_id="source",
             call_type=CallType.HTTP,
             request_hash=first.request_hash,
             current_state_id=None,
             current_operation_id=current_operation,
+            current_call_index=0,
+        ).call_id
+        == first.call_id
+    )
+    assert (
+        factory.execution.find_call_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            request_hash=second.request_hash,
+            current_state_id=None,
+            current_operation_id=second_current_operation.operation_id,
+            current_call_index=0,
+        ).call_id
+        == second.call_id
+    )
+
+
+def test_identical_sink_write_operations_remain_ambiguous() -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    for run_id in ("source", "current"):
+        register_test_node(factory.data_flow, run_id, "sink-node", node_type=NodeType.SINK, plugin_name="sink")
+    source_operations = [
+        factory.execution.begin_operation("sink-node", "sink_write", coordination_token=leader_coordination_token(factory, "source"))
+        for _ in range(2)
+    ]
+    source_calls = [_record(factory, "source", operation.operation_id) for operation in source_operations]
+    current_operation = factory.execution.begin_operation(
+        "sink-node", "sink_write", coordination_token=leader_coordination_token(factory, "current")
+    )
+    with pytest.raises(AuditIntegrityError, match="ambiguous"):
+        factory.execution.find_call_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            request_hash=source_calls[0].request_hash,
+            current_state_id=None,
+            current_operation_id=current_operation.operation_id,
             current_call_index=0,
         )
 
@@ -156,7 +197,8 @@ def test_rejects_lineage_from_an_unconfigured_source_run() -> None:
 
 
 def test_state_lookup_binds_node_and_source_row_then_exposes_source_token() -> None:
-    factory, _source_operation, _current_operation = _two_runs()
+    factory, source_operation, _current_operation = _two_runs()
+    source_operation_call = _record(factory, "source", source_operation)
     source_state_id = "source-state"
     current_state_id = "current-state"
     for run_id, state_id, ingest_sequence in (
@@ -204,3 +246,7 @@ def test_state_lookup_binds_node_and_source_row_then_exposes_source_token() -> N
     assert source_state is not None
     assert source_state.state_id == source_state_id
     assert source_state.token_id != factory.execution.get_node_state(current_state_id).token_id
+    assert {call.call_id for call in factory.execution.get_all_calls_for_run("source")} == {
+        "state-source-call",
+        source_operation_call.call_id,
+    }

@@ -548,6 +548,7 @@ _REQUIRED_COLUMNS += (
     ("call_verifications", "is_match"),
     ("call_verifications", "differences_json"),
     ("call_verifications", "recorded_at"),
+    ("operations", "occurrence_index"),
 )
 
 # Required foreign keys for audit integrity (Tier 1 trust).
@@ -807,6 +808,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("tokens", "uq_tokens_coalesce_result_identity"),
     ("node_states", "uq_node_states_coalesce_member_identity"),
     ("operations", "uq_operations_sink_effect_id"),
+    ("operations", "uq_operations_occurrence"),
     ("sink_effect_streams", "uq_sink_effect_stream_identity"),
     ("sink_effect_members", "uq_sink_effect_member_binding"),
     ("audit_export_snapshots", "uq_audit_export_snapshots_registry_key"),

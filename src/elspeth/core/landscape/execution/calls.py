@@ -15,7 +15,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -816,6 +816,17 @@ class CallAuditRepository:
         db_rows = self._ops.execute_fetchall(query)
         return [self._call_loader.load(r) for r in db_rows]
 
+    def get_all_calls_for_run(self, run_id: str) -> list[Call]:
+        """Enumerate both state and operation calls with a stable total order."""
+        query = (
+            select(calls_table)
+            .outerjoin(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+            .outerjoin(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+            .where(or_(node_states_table.c.run_id == run_id, operations_table.c.run_id == run_id))
+            .order_by(calls_table.c.created_at, calls_table.c.call_id)
+        )
+        return [self._call_loader.load(row) for row in self._ops.execute_fetchall(query)]
+
     def record_verification_decision(
         self,
         *,
@@ -1009,9 +1020,12 @@ class CallAuditRepository:
             )
         else:
             current = self._ops.execute_fetchone(
-                select(operations_table.c.node_id, operations_table.c.operation_type).where(
-                    operations_table.c.operation_id == current_operation_id
-                )
+                select(
+                    operations_table.c.node_id,
+                    operations_table.c.operation_type,
+                    operations_table.c.input_data_hash,
+                    operations_table.c.occurrence_index,
+                ).where(operations_table.c.operation_id == current_operation_id)
             )
             if current is None:
                 raise AuditIntegrityError("current operation is missing for call replay lookup")
@@ -1022,8 +1036,11 @@ class CallAuditRepository:
                     operations_table.c.run_id == source_run_id,
                     operations_table.c.node_id == current.node_id,
                     operations_table.c.operation_type == current.operation_type,
+                    operations_table.c.input_data_hash == current.input_data_hash,
                 )
             )
+            if current.operation_type in ("source_load", "runtime_preflight") and current.occurrence_index is not None:
+                query = query.where(operations_table.c.occurrence_index == current.occurrence_index)
         candidates = self._ops.execute_fetchall(
             query.where(calls_table.c.call_type == call_type).order_by(calls_table.c.call_index, calls_table.c.call_id)
         )
