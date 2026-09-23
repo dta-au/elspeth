@@ -54,6 +54,23 @@ _WORKER_QUEUE_TIMEOUT_SECONDS = 30.0
 _WORKER_SLOTS = threading.BoundedSemaphore(2)
 
 
+def _charge_row_export(value: Any, budget: list[int], *, depth: int = 0) -> None:
+    """Bound expanded row work before PipelineRow.to_dict makes a deep copy."""
+    if depth > 64:
+        raise TemplateError("Template context nesting exceeds 64 levels")
+    budget[0] += 1
+    budget[1] += sys.getsizeof(value)
+    if budget[0] > _MAX_CONTEXT_NODES or budget[1] > _MAX_PARENT_PACK_BYTES:
+        raise TemplateError("Template context exceeds the parent packing limit")
+    if isinstance(value, (dict, MappingProxyType)):
+        for key, item in value.items():
+            _charge_row_export(key, budget, depth=depth + 1)
+            _charge_row_export(item, budget, depth=depth + 1)
+    elif isinstance(value, (list, tuple, frozenset)):
+        for item in value:
+            _charge_row_export(item, budget, depth=depth + 1)
+
+
 class _NoFoldCodeGenerator(CodeGenerator):
     """Never evaluate an authored expression while compiling a template."""
 
@@ -111,6 +128,7 @@ def _pack_context_value(
     active.add(identity)
     try:
         if type(value) is PipelineRow:
+            _charge_row_export(value._data, budget, depth=depth + 1)
             data = pickle.dumps(value.to_dict(), protocol=5)
             contract = pickle.dumps(value.contract.to_checkpoint_format(), protocol=5)
             budget[1] += len(data) + len(contract)
@@ -118,15 +136,25 @@ def _pack_context_value(
                 raise TemplateError("Template context exceeds the parent packing limit")
             packed: Any = _RowTransport(data, contract)
         elif type(value) in (dict, MappingProxyType):
-            packed = {
-                key: _pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for key, item in value.items()
-            }
+            packed = {}
+            for key, item in value.items():
+                _charge_row_export(key, budget, depth=depth + 1)
+                if budget[1] > _MAX_CONTEXT_BYTES:
+                    raise TemplateError("Template context exceeds the parent packing limit")
+                packed[key] = _pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget)
         elif type(value) is list:
             packed = [_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value]
         elif type(value) is FrozenJsonArray:
             packed = FrozenJsonArray(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
         elif type(value) is tuple:
             packed = tuple(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
+        elif isinstance(value, tuple):
+            # deep_freeze preserves tuple subclasses when children are already
+            # frozen; charge their expanded payload before pickle sees them.
+            _charge_row_export(value, budget, depth=depth)
+            if budget[1] > _MAX_CONTEXT_BYTES:
+                raise TemplateError("Template context exceeds the parent packing limit")
+            packed = value
         else:
             packed = value
     finally:
@@ -210,11 +238,8 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
 
 
 def _run_template_worker(source: str, payload: bytes) -> str:
-    _check_template_source(source)
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
-    if not _WORKER_SLOTS.acquire(timeout=_WORKER_QUEUE_TIMEOUT_SECONDS):
-        raise TemplateError("Too many concurrent template workers")
     process_context = multiprocessing.get_context("spawn")
     parent, child = process_context.Pipe(duplex=False)
     process: Any = None
@@ -250,7 +275,6 @@ def _run_template_worker(source: str, payload: bytes) -> str:
             process.kill()
         if process is not None and process.pid is not None:
             process.join()
-        _WORKER_SLOTS.release()
 
 
 class _BoundedTemplate:
@@ -258,8 +282,14 @@ class _BoundedTemplate:
         self._source = source
 
     def render(self, **context: Any) -> str:
-        transport = _pack_context_value(context)
-        return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
+        _check_template_source(self._source)
+        if not _WORKER_SLOTS.acquire(timeout=_WORKER_QUEUE_TIMEOUT_SECONDS):
+            raise TemplateError("Too many concurrent template workers")
+        try:
+            transport = _pack_context_value(context)
+            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
+        finally:
+            _WORKER_SLOTS.release()
 
 
 class _BoundedEnvironment(_LocalSandboxedEnvironment):

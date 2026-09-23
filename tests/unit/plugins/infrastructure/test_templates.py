@@ -2,6 +2,7 @@
 
 import pickle
 import threading
+from collections import namedtuple
 from types import MappingProxyType
 
 import pytest
@@ -75,8 +76,42 @@ def test_saturated_template_workers_refuse_after_bounded_queue_wait(monkeypatch:
     monkeypatch.setattr(template_infrastructure, "_WORKER_QUEUE_TIMEOUT_SECONDS", 0.01)
     template = create_sandboxed_environment().from_string("{{ row.text }}")
 
+    def packing_must_not_run(_context: object) -> object:
+        raise AssertionError("saturated render packed its context")
+
+    monkeypatch.setattr(template_infrastructure, "_pack_context_value", packing_must_not_run)
     with slot, pytest.raises(TemplateError, match="Too many concurrent template workers"):
         template.render(row={"text": "hello"})
+
+
+def test_context_transport_rejects_oversized_mapping_key_before_serialization():
+    with pytest.raises(TemplateError, match="parent packing limit"):
+        template_infrastructure._pack_context_value({"x" * (9 * 1024 * 1024): "small"})
+
+
+def test_context_transport_rejects_oversized_tuple_subclass_before_serialization():
+    named_values = namedtuple("NamedValues", "text")
+    with pytest.raises(TemplateError, match="parent packing limit"):
+        template_infrastructure._pack_context_value({"value": named_values("x" * (9 * 1024 * 1024))})
+
+
+def test_context_transport_rejects_large_row_before_deep_export(monkeypatch: pytest.MonkeyPatch):
+    from elspeth.contracts.schema_contract import PipelineRow
+
+    large_text = "x" * (33 * 1024 * 1024)
+    named_values = namedtuple("NamedValues", "text")
+    rows = [
+        make_pipeline_row({"text": FrozenJsonArray((large_text,))}),
+        make_pipeline_row({"text": named_values(large_text)}),
+    ]
+
+    def export_must_not_run() -> dict[str, object]:
+        raise AssertionError("oversized row was deep-copied")
+
+    monkeypatch.setattr(PipelineRow, "to_dict", export_must_not_run)
+    for row in rows:
+        with pytest.raises(TemplateError, match="parent packing limit"):
+            template_infrastructure._pack_context_value(row)
 
 
 def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:
