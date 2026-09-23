@@ -113,6 +113,8 @@ class RunSourceLifecycleRecord:
     source_node_id: str
     source_name: str
     lifecycle_state: str
+    source_schema_json: str | None = None
+    normalization_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1504,6 +1506,8 @@ class RunLifecycleRepository:
                 run_sources_table.c.source_node_id,
                 run_sources_table.c.source_name,
                 run_sources_table.c.lifecycle_state,
+                run_sources_table.c.schema_json,
+                run_sources_table.c.field_resolution_json,
             ).where(run_sources_table.c.run_id == run_id)
         )
         return {
@@ -1511,6 +1515,10 @@ class RunLifecycleRepository:
                 source_node_id=row.source_node_id,
                 source_name=row.source_name,
                 lifecycle_state=row.lifecycle_state,
+                source_schema_json=row.schema_json,
+                normalization_version=(
+                    json.loads(row.field_resolution_json)["normalization_version"] if row.field_resolution_json is not None else None
+                ),
             )
             for row in rows
         }

@@ -1,0 +1,198 @@
+"""Admission and source-row reconstruction for replay and verification runs.
+
+The source run is terminal and immutable.  Capture its rows before plugin
+startup so missing payloads or incomplete quarantine evidence cannot turn a
+replay request into a partly live execution.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from elspeth.contracts import SourceRow
+from elspeth.contracts.audit import NodeStateFailed
+from elspeth.contracts.enums import NodeType, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.canonical import stable_hash
+from elspeth.core.landscape.row_data import RowDataState
+from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
+from elspeth.engine.orchestrator.schema_reconstruction import reconstruct_schema_from_json
+
+if TYPE_CHECKING:
+    from elspeth.contracts import SourceProtocol
+    from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
+
+
+@dataclass(frozen=True, slots=True)
+class AuditedSource:
+    """One source's complete, validated input and metadata snapshot."""
+
+    name: str
+    source_run_node_id: str
+    rows: tuple[SourceRow, ...]
+    schema_contract: SchemaContract | None
+    source_schema_json: str
+    field_resolution: Mapping[str, str] | None
+    normalization_version: str | None
+
+
+def _quarantine_details(
+    factory: RecorderFactory | LandscapeReadRepositories, run_id: str, row_id: str, source_node_id: str
+) -> tuple[str, str] | None:
+    """Recover the source quarantine decision from its durable audit path."""
+    source_failures = [
+        state
+        for token in factory.query.get_tokens(row_id)
+        for state in factory.query.get_node_states_for_token(token.token_id)
+        if isinstance(state, NodeStateFailed) and state.node_id == source_node_id and state.step_index == 0
+    ]
+    outcomes = factory.data_flow.get_token_outcomes_for_row(run_id, row_id)
+    quarantined = [outcome for outcome in outcomes if outcome.path is TerminalPath.QUARANTINED_AT_SOURCE]
+    if not quarantined:
+        if source_failures:
+            raise AuditIntegrityError(f"Source replay row {row_id}: failed source state has no quarantine outcome")
+        return None
+    if len(quarantined) != 1 or len(outcomes) != 1:
+        raise AuditIntegrityError(f"Source replay row {row_id}: ambiguous quarantine outcomes")
+    outcome = quarantined[0]
+    if outcome.sink_name is None:
+        raise AuditIntegrityError(f"Source replay row {row_id}: quarantine destination missing")
+    if len(source_failures) != 1 or source_failures[0].error_json is None:
+        raise AuditIntegrityError(f"Source replay row {row_id}: source validation error evidence missing")
+    error_record = json.loads(source_failures[0].error_json)
+    if not isinstance(error_record, dict) or not isinstance(error_record.get("exception"), str) or not error_record["exception"]:
+        raise AuditIntegrityError(f"Source replay row {row_id}: malformed source validation error evidence")
+    return error_record["exception"], outcome.sink_name
+
+
+def prepare_audited_sources(
+    factory: RecorderFactory | LandscapeReadRepositories,
+    replay_from: str,
+    sources: Mapping[str, SourceProtocol],
+) -> Mapping[str, AuditedSource]:
+    """Validate and snapshot every audited source row before plugin effects.
+
+    The caller checks the source run's terminal status before this function.
+    The audit source names, plugin identity, config, row payload hashes and
+    quarantine decisions must all be reconstructable.  No source plugin hook
+    is called here.
+    """
+    lifecycle = factory.run_lifecycle.get_run_source_lifecycle_records(replay_from)
+    by_name = {record.source_name: record for record in lifecycle.values()}
+    if len(by_name) != len(lifecycle) or set(by_name) != set(sources):
+        raise AuditIntegrityError(
+            f"Source replay run {replay_from}: source declarations differ from audited run "
+            f"(audited={sorted(by_name)}, configured={sorted(sources)})"
+        )
+    nodes = {node.node_id: node for node in factory.data_flow.get_nodes(replay_from) if node.node_type is NodeType.SOURCE}
+    resolutions = factory.run_lifecycle.get_source_field_resolutions(replay_from)
+    rows_by_source: dict[str, list[SourceRow]] = {name: [] for name in sources}
+    schema_by_source: dict[str, type[Any]] = {}
+    contract_by_source: dict[str, SchemaContract | None] = {}
+    schema_json_by_source: dict[str, str] = {}
+
+    for name, source in sources.items():
+        record = by_name[name]
+        if record.lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} was not exhausted")
+        node = nodes.get(record.source_node_id)
+        if node is None or node.plugin_name != source.name:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} plugin identity differs")
+        audited_config = json.loads(node.config_json)
+        if not isinstance(audited_config, dict) or stable_hash(audited_config) != node.config_hash:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} audited config is corrupt")
+        audited_name = audited_config.pop("source_name", None)
+        if (
+            audited_name != name
+            or stable_hash(audited_config) != stable_hash(source.config)
+            or node.plugin_version != source.plugin_version
+            or node.source_file_hash != source.source_file_hash
+        ):
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} implementation or configuration differs")
+        _, contract = factory.data_flow.get_node_contracts(replay_from, record.source_node_id)
+        contract_by_source[name] = contract
+        if record.source_schema_json is None:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} has no stored schema")
+        try:
+            source_schema = json.loads(record.source_schema_json)
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} has malformed schema JSON") from exc
+        if not isinstance(source_schema, dict):
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} schema is not an object")
+        schema_json_by_source[name] = record.source_schema_json
+
+    if len(sources) > 1 and any(nodes[record.source_node_id].sequence_in_pipeline is None for record in by_name.values()):
+        raise AuditIntegrityError(f"Source replay run {replay_from}: source order cannot be established from audit nodes")
+
+    ordered_names = [
+        name for name, record in sorted(by_name.items(), key=lambda item: nodes[item[1].source_node_id].sequence_in_pipeline or 0)
+    ]
+    if ordered_names != list(sources):
+        raise AuditIntegrityError(
+            f"Source replay run {replay_from}: source order differs from audited run (audited={ordered_names}, configured={list(sources)})"
+        )
+    node_name = {record.source_node_id: name for name, record in by_name.items()}
+    for batch in factory.query.iter_rows_for_run(replay_from):
+        for row in batch:
+            row_source_name = node_name.get(row.source_node_id)
+            if row_source_name is None:
+                raise AuditIntegrityError(f"Source replay row {row.row_id}: undeclared source node {row.source_node_id}")
+            payload = factory.query.get_row_data(row.row_id)
+            if payload.state is not RowDataState.AVAILABLE or payload.data is None:
+                raise AuditIntegrityError(
+                    f"Source replay row {row.row_id}: payload is {payload.state.value}; exact replay requires stored data"
+                )
+            data = dict(payload.data)
+            quarantine = _quarantine_details(factory, replay_from, row.row_id, row.source_node_id)
+            if quarantine is not None:
+                if stable_hash(data) != row.source_data_hash:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: quarantine payload hash mismatch")
+                raw_data: Any = data
+                if set(data) == {"_raw"}:
+                    # Token ingestion wraps non-dict quarantined values in
+                    # {"_raw": value}; a genuine dict with that sole key has
+                    # identical stored bytes. The linked validation error is
+                    # the only evidence that distinguishes their original
+                    # shapes. Refuse if the source never recorded it.
+                    errors = factory.data_flow.get_validation_errors_for_row(replay_from, row_id=row.row_id)
+                    if len(errors) != 1 or errors[0].row_data_json is None:
+                        raise AuditIntegrityError(f"Source replay row {row.row_id}: ambiguous _raw quarantine payload")
+                    original = json.loads(errors[0].row_data_json)
+                    if original == data:
+                        raw_data = data
+                    elif original == data["_raw"]:
+                        raw_data = data["_raw"]
+                    else:
+                        raise AuditIntegrityError(f"Source replay row {row.row_id}: quarantine payload disagrees with validation evidence")
+                source_row = SourceRow.quarantined(raw_data, quarantine[0], quarantine[1], source_row_index=row.source_row_index)
+            else:
+                if row_source_name not in schema_by_source:
+                    if by_name[row_source_name].source_schema_json is None:
+                        raise AuditIntegrityError(f"Source replay run {replay_from}: source {row_source_name!r} has no schema record")
+                    schema_by_source[row_source_name] = reconstruct_schema_from_json(json.loads(schema_json_by_source[row_source_name]))
+                contract = contract_by_source[row_source_name]
+                if contract is None:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: source contract missing")
+                validated = schema_by_source[row_source_name].model_validate(data).to_row()
+                if stable_hash(validated) != row.source_data_hash:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: restored payload hash mismatch")
+                source_row = SourceRow.valid(validated, contract=contract, source_row_index=row.source_row_index)
+            rows_by_source[row_source_name].append(source_row)
+
+    result: dict[str, AuditedSource] = {}
+    for name, record in by_name.items():
+        resolution = resolutions.get(record.source_node_id)
+        result[name] = AuditedSource(
+            name=name,
+            source_run_node_id=record.source_node_id,
+            rows=tuple(rows_by_source[name]),
+            schema_contract=contract_by_source[name],
+            source_schema_json=schema_json_by_source[name],
+            field_resolution=resolution.resolution_mapping if resolution is not None else None,
+            normalization_version=record.normalization_version,
+        )
+    return result

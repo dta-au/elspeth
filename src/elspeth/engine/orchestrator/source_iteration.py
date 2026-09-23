@@ -23,15 +23,16 @@ Dependencies held by this driver:
 from __future__ import annotations
 
 import enum
+import itertools
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from elspeth.contracts import SourceRow
+from elspeth.contracts import RunMode, SourceRow
 from elspeth.contracts.cli import ProgressEvent
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import (
     PhaseAction,
     PhaseChanged,
@@ -41,6 +42,7 @@ from elspeth.contracts.events import (
 )
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.core.canonical import sanitize_for_canonical, stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import RunSourceLifecycleState
 from elspeth.core.operations import track_operation
@@ -54,9 +56,10 @@ from elspeth.engine.orchestrator.outcomes import (
     handle_coalesce_timeouts,
     handle_row_union_timeouts,
 )
-from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
+from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter, _bound_quarantine_error
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
+from elspeth.engine.orchestrator.source_replay import AuditedSource, prepare_audited_sources
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
@@ -337,6 +340,7 @@ class SourceIterationDriver:
         interrupted_by_shutdown: bool,
         flush_end_of_input: bool,
         active_source: SourceProtocol,
+        audited_source: AuditedSource | None = None,
         coordination_token: CoordinationToken,
     ) -> None:
         """Post-loop work after source iteration completes or is interrupted.
@@ -386,12 +390,13 @@ class SourceIterationDriver:
         self._lifecycle_recorder.record_field_resolution(
             factory,
             active_source=active_source,
+            audited_source=audited_source,
             previously_recorded=recorded_field_resolution,
             coordination_token=coordination_token,
         )
 
         if not schema_contract_recorded:
-            record_schema_contract(factory, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
+            self._record_source_contract(factory, source_id, ctx, active_source, audited_source, coordination_token)
 
         if source_exhausted and not interrupted_by_shutdown:
             self._lifecycle_recorder.record_run_source_lifecycle(
@@ -400,6 +405,7 @@ class SourceIterationDriver:
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.EXHAUSTED,
+                audited_source=audited_source,
                 coordination_token=coordination_token,
             )
 
@@ -436,6 +442,7 @@ class SourceIterationDriver:
         ctx: PluginContext,
         *,
         active_source: SourceProtocol,
+        source_rows: Iterator[SourceRow] | None = None,
     ) -> Iterator[SourceRow]:
         """Execute SOURCE phase: emit lifecycle events, load source, handle errors.
 
@@ -457,7 +464,7 @@ class SourceIterationDriver:
             )
 
             try:
-                source_iterator = iter(active_source.load(ctx))
+                source_iterator = iter(active_source.load(ctx)) if source_rows is None else source_rows
                 first_row = next(source_iterator, _SOURCE_ROW_EXHAUSTED)
                 if first_row is _SOURCE_ROW_EXHAUSTED:
                     self._events.emit(PhaseCompleted(phase=PipelinePhase.SOURCE, duration_seconds=time.perf_counter() - phase_start))
@@ -471,6 +478,48 @@ class SourceIterationDriver:
             yield from source_iterator
 
         return _source_iter()
+
+    @staticmethod
+    def _record_source_contract(
+        factory: RecorderFactory,
+        source_id: NodeID,
+        ctx: PluginContext,
+        active_source: SourceProtocol,
+        audited_source: AuditedSource | None,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        if audited_source is None:
+            return record_schema_contract(factory, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
+        contract = audited_source.schema_contract
+        if contract is None:
+            return False
+        factory.run_lifecycle.update_run_source_contract(
+            source_node_id=source_id, schema_contract=contract, coordination_token=coordination_token
+        )
+        factory.data_flow.update_node_output_contract(source_id, contract, member_token=coordination_token.membership)
+        ctx.contract = contract
+        return True
+
+    @staticmethod
+    def _verify_source_rows(active_source: SourceProtocol, ctx: PluginContext, audited_source: AuditedSource) -> Iterator[SourceRow]:
+        missing = object()
+        for ordinal, (live, audited) in enumerate(itertools.zip_longest(active_source.load(ctx), audited_source.rows, fillvalue=missing)):
+            if live is missing or audited is missing:
+                raise AuditIntegrityError(f"Verify source {audited_source.name!r}: row count differs at ordinal {ordinal}")
+            if not isinstance(live, SourceRow) or not isinstance(audited, SourceRow):
+                raise OrchestrationInvariantError(f"Verify source {audited_source.name!r}: source yielded a non-SourceRow value")
+            if (
+                live.source_row_index != audited.source_row_index
+                or live.is_quarantined != audited.is_quarantined
+                or stable_hash(sanitize_for_canonical(live.row) if live.is_quarantined else live.row) != stable_hash(audited.row)
+                or (_bound_quarantine_error(live.quarantine_error) if live.quarantine_error is not None else None)
+                != audited.quarantine_error
+                or live.quarantine_destination != audited.quarantine_destination
+                or (live.contract.version_hash() if live.contract is not None else None)
+                != (audited.contract.version_hash() if audited.contract is not None else None)
+            ):
+                raise AuditIntegrityError(f"Verify source {audited_source.name!r}: row {ordinal} differs from audited run")
+            yield live
 
     def run_main_processing_loop(
         self,
@@ -520,6 +569,18 @@ class SourceIterationDriver:
         agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
         row_union_executor = processor.row_union_executor
 
+        audited_source: AuditedSource | None = None
+        source_rows: Iterator[SourceRow] | None = None
+        if ctx.run_mode in (RunMode.REPLAY, RunMode.VERIFY):
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError(f"{ctx.run_mode.value} source iteration requires replay_from")
+            audited_sources = prepare_audited_sources(factory, ctx.replay_from, config.sources)
+            audited_source = audited_sources[active_source_name]
+            if ctx.run_mode is RunMode.REPLAY:
+                source_rows = iter(audited_source.rows)
+            else:
+                source_rows = self._verify_source_rows(active_source, ctx, audited_source)
+
         start_time = time.perf_counter()
         last_progress_time = start_time
 
@@ -550,10 +611,11 @@ class SourceIterationDriver:
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.LOADING,
+                audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                 coordination_token=coordination_token,
             )
 
-            source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source)
+            source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source, source_rows=source_rows)
             use_idle_polling = self._requires_idle_aggregation_polling(
                 config,
                 row_union_executor=row_union_executor,
@@ -654,7 +716,10 @@ class SourceIterationDriver:
                         if not field_resolution_recorded:
                             field_resolution_recorded = True
                             recorded_field_resolution = self._lifecycle_recorder.record_field_resolution(
-                                factory, active_source=active_source, coordination_token=coordination_token
+                                factory,
+                                active_source=active_source,
+                                audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
+                                coordination_token=coordination_token,
                             )
 
                         # Quarantine path — route directly to sink, skip normal processing
@@ -727,12 +792,13 @@ class SourceIterationDriver:
                             continue
 
                         # Record schema contract on first VALID row (quarantined rows don't populate contract)
-                        if not schema_contract_recorded and record_schema_contract(
+                        if not schema_contract_recorded and self._record_source_contract(
                             factory,
                             source_id,
                             ctx,
-                            active_source=active_source,
-                            coordination_token=coordination_token,
+                            active_source,
+                            audited_source if ctx.run_mode is RunMode.REPLAY else None,
+                            coordination_token,
                         ):
                             schema_contract_recorded = True
 
@@ -824,6 +890,7 @@ class SourceIterationDriver:
                         interrupted_by_shutdown=interrupted_by_shutdown,
                         flush_end_of_input=flush_end_of_input,
                         active_source=active_source,
+                        audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                         coordination_token=coordination_token,
                     )
                     if interrupted_by_shutdown:
@@ -833,6 +900,7 @@ class SourceIterationDriver:
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.INTERRUPTED,
+                            audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                             coordination_token=coordination_token,
                         )
                     elif not source_exhausted:
@@ -842,6 +910,7 @@ class SourceIterationDriver:
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.LOADED,
+                            audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                             coordination_token=coordination_token,
                         )
 
