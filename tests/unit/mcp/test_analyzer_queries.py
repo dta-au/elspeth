@@ -1709,6 +1709,56 @@ class TestErrorAnalysisCorruptionGuard:
         with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
             get_error_analysis(db, factory, "corrupt-delivered")
 
+    def test_an_orphan_in_another_run_does_not_fail_this_runs_analysis(self) -> None:
+        """The guard scans the analysed run's transform_errors only.
+
+        One audit database holds many runs. An orphaned row in one run is that
+        run's corruption. It must not make every other run's error analysis
+        raise.
+        """
+        corrupt = make_recorder_with_run(run_id="orphan-run", source_node_id="src")
+        clean = make_recorder_with_run(run_id="clean-neighbour-run", source_node_id="src", db=corrupt.db)
+        for setup in (corrupt, clean):
+            run_id, factory = setup.run_id, setup.factory
+            register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+            _row, token = factory.data_flow.create_row_with_token(
+                "src",
+                row_index=0,
+                data={"x": 1},
+                source_row_index=0,
+                ingest_sequence=0,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+            error_reason: TransformErrorReason = {"reason": "test_error"}
+            error_member = leader_member_token(factory, run_id)
+            error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                transform_id="xform",
+                row_data={"x": 1},
+                error_details=error_reason,
+                destination="discard",
+                member_token=error_member,
+                work_item=error_item,
+            )
+            factory.data_flow.record_token_outcome_leader(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="a" * 16,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+
+        _delete_node(corrupt.db, "orphan-run", "xform")
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
+            get_error_analysis(corrupt.db, corrupt.factory, "orphan-run")
+
+        result = get_error_analysis(clean.db, clean.factory, "clean-neighbour-run")
+
+        assert "error" not in result
+        assert result["transform_errors"]["total"] == 1
+        assert result["transform_errors"]["by_transform"] == [{"transform_plugin": "mapper", "count": 1}]
+
     def test_clean_error_analysis_still_works(self) -> None:
         """Corruption guard doesn't break normal error analysis."""
         setup = make_recorder_with_run(run_id="clean-ea", source_node_id="src")
