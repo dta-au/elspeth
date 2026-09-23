@@ -24,6 +24,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     LLMClientError,
     LLMResponse,
+    NetworkError,
     RateLimitError,
 )
 from tests.fixtures.mock_audit import mock_audit_authority
@@ -119,6 +120,117 @@ def test_verify_llm_call_submits_audited_response_for_persisted_comparison() -> 
     assert comparison["current_call_id"] == "call-1"
     assert comparison["live_status"] is CallStatus.SUCCESS
     assert comparison["live_response_data"] == execution.last_record_call_kwargs["response_data"].to_dict()
+
+
+@pytest.mark.parametrize(
+    ("category", "retryable", "error_class"),
+    [
+        ("rate_limit", True, RateLimitError),
+        ("network", True, NetworkError),
+    ],
+)
+def test_replay_llm_error_preserves_classification(category: str, retryable: bool, error_class: type[LLMClientError]) -> None:
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_call_id="source-error-call",
+                status=CallStatus.ERROR,
+                response_data=None,
+                error_data={
+                    "type": "ProviderError",
+                    "message": "LLM provider request failed",
+                    "retryable": retryable,
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                    "category": category,
+                },
+                latency_ms=7.0,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    with pytest.raises(error_class, match="LLM provider request failed"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.last_record_call_kwargs["source_call_id"] == "source-error-call"
+    assert execution.last_record_call_kwargs["error"].to_dict()["category"] == category
+
+
+def test_replay_llm_legacy_error_without_category_fails_before_sdk() -> None:
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_call_id="legacy-error-call",
+                status=CallStatus.ERROR,
+                response_data=None,
+                error_data={
+                    "type": "ProviderError",
+                    "message": "LLM provider request failed",
+                    "retryable": True,
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                },
+                latency_ms=7.0,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay_legacy_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    with pytest.raises(ValueError, match="classification"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.recorded_calls == []
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "category", "error_class"),
+    [
+        (RuntimeError("HTTP 429"), "rate_limit", RateLimitError),
+        (OSError("connection refused"), "network", NetworkError),
+    ],
+)
+def test_live_llm_error_persists_public_classification(provider_error: Exception, category: str, error_class: type[LLMClientError]) -> None:
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_live_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(exception=provider_error),
+    )
+
+    with pytest.raises(error_class):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert execution.last_record_call_kwargs["error"].to_dict()["category"] == category
 
 
 @pytest.mark.parametrize("content", ["answer", None])

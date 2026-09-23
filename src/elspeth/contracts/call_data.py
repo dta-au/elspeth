@@ -26,7 +26,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol, cast, get_args, runtime_checkable
+from typing import Any, Literal, Protocol, cast, get_args, runtime_checkable
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
@@ -254,6 +254,18 @@ class LLMCallResponse:
         }
 
 
+LLMErrorCategory = Literal[
+    "rate_limit",
+    "content_policy",
+    "context_length",
+    "server",
+    "network",
+    "client",
+    "unknown",
+    "response_processing",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class LLMCallError:
     """Audit record for an LLM API error."""
@@ -264,6 +276,7 @@ class LLMCallError:
     pricing_model: str | None = None
     provider_cost: float | None = None
     provider_cost_source: ComposerLLMProviderCostSource = "not_available"
+    category: LLMErrorCategory | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.type, "LLMCallError.type")
@@ -271,6 +284,8 @@ class LLMCallError:
         if type(self.retryable) is not bool:
             raise TypeError(f"LLMCallError.retryable must be bool, got {type(self.retryable).__name__}: {self.retryable!r}")
         _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
+        if self.category is not None and self.category not in get_args(LLMErrorCategory):
+            raise ValueError(f"LLMCallError.category is not recognized: {self.category!r}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -284,6 +299,7 @@ class LLMCallError:
             "pricing_model": self.pricing_model,
             "provider_cost": self.provider_cost,
             "provider_cost_source": self.provider_cost_source,
+            **({"category": self.category} if self.category is not None else {}),
         }
 
 

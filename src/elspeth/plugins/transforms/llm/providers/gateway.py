@@ -65,6 +65,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     NetworkError,
     RateLimitError,
     ServerError,
+    public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
 from elspeth.plugins.llm.config_validation import (
@@ -802,6 +803,7 @@ class GatewayLLMProvider:
                 type=type(exc).__name__,
                 message=message,
                 retryable=exc.retryable,
+                category=public_llm_error_category(exc),
                 pricing_model=self._pricing_model or request_payload.model,
                 provider_cost=provider_cost,
                 provider_cost_source=provider_cost_source,

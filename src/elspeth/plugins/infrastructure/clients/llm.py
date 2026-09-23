@@ -15,7 +15,7 @@ import structlog
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType, RunMode
-from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
+from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, LLMErrorCategory, RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
@@ -150,6 +150,21 @@ class ContextLengthError(LLMClientError):
         super().__init__(message, retryable=False)
 
 
+def public_llm_error_category(error: LLMClientError) -> LLMErrorCategory:
+    """Name the public exception behavior retained in an LLM audit error."""
+    if isinstance(error, RateLimitError):
+        return "rate_limit"
+    if isinstance(error, ContentPolicyError):
+        return "content_policy"
+    if isinstance(error, ContextLengthError):
+        return "context_length"
+    if isinstance(error, ServerError):
+        return "server"
+    if isinstance(error, NetworkError):
+        return "network"
+    return "client"
+
+
 _RATE_LIMIT_PATTERNS = (
     re.compile(r"\brate[\s_-]*limit(?:ed|ing)?\b"),
     re.compile(r"\brate(?:\s+has\s+been)?\s+exceeded\b"),
@@ -195,7 +210,7 @@ CONTEXT_LENGTH_PATTERNS = (
     ),
     non_raising=True,
 )
-def _classify_llm_error(exception: Exception) -> str:
+def _classify_llm_error(exception: Exception) -> LLMErrorCategory:
     """Classify an LLM error into a canonical category.
 
     Tier 3 boundary: the exception is constructed by the provider SDK, so its
@@ -395,19 +410,27 @@ class AuditedLLMClient(AuditedClientBase):
         )
         if evidence.status is CallStatus.ERROR:
             error = evidence.error_data
-            if error is None or evidence.response_data is not None:
-                raise ValueError("Recorded LLM error has incomplete or contradictory payload")
+            if error is None:
+                raise ValueError("Recorded LLM error has no error payload")
+            if evidence.response_data is not None:
+                raise ValueError("Recorded LLM response-processing error cannot be reproduced exactly")
             retryable = error.get("retryable")
             error_type = error.get("type")
             error_message = error.get("message")
             pricing_model = error.get("pricing_model")
             if type(retryable) is not bool or type(error_type) is not str or type(error_message) is not str:
                 raise ValueError("Recorded LLM error has invalid fields")
-            if set(error) != {"type", "message", "retryable", "pricing_model", "provider_cost", "provider_cost_source"}:
-                raise ValueError("Recorded LLM error has incomplete fields")
+            if set(error) != {"type", "message", "retryable", "pricing_model", "provider_cost", "provider_cost_source", "category"}:
+                raise ValueError("Recorded LLM error lacks a complete public classification")
             raw_cost_source = error["provider_cost_source"]
             if raw_cost_source not in get_args(ComposerLLMProviderCostSource):
                 raise ValueError("Recorded LLM error has invalid provider cost source")
+            raw_category = error["category"]
+            if raw_category not in get_args(LLMErrorCategory) or raw_category == "response_processing":
+                raise ValueError("Recorded LLM error has no replayable public classification")
+            category = cast(LLMErrorCategory, raw_category)
+            if retryable is not (category in {"rate_limit", "server", "network"}):
+                raise ValueError("Recorded LLM error classification disagrees with retryability")
             error_dto = LLMCallError(
                 type=error_type,
                 message=error_message,
@@ -415,6 +438,7 @@ class AuditedLLMClient(AuditedClientBase):
                 pricing_model=pricing_model,
                 provider_cost=error.get("provider_cost"),
                 provider_cost_source=cast(ComposerLLMProviderCostSource, raw_cost_source),
+                category=category,
             )
             self._record_call(
                 call_index=call_index,
@@ -435,7 +459,17 @@ class AuditedLLMClient(AuditedClientBase):
                 response_payload=None,
                 token_usage=None,
             )
-            raise LLMClientError(error_dto.message, retryable=error_dto.retryable)
+            if category == "rate_limit":
+                raise RateLimitError(error_dto.message)
+            if category == "content_policy":
+                raise ContentPolicyError(error_dto.message)
+            if category == "context_length":
+                raise ContextLengthError(error_dto.message)
+            if category == "server":
+                raise ServerError(error_dto.message)
+            if category == "network":
+                raise NetworkError(error_dto.message)
+            raise LLMClientError(error_dto.message, retryable=False)
         if evidence.status is not CallStatus.SUCCESS or evidence.error_data is not None:
             raise ValueError("Recorded LLM call has an unsupported status or error payload")
         response_data = evidence.response_data
@@ -702,6 +736,7 @@ class AuditedLLMClient(AuditedClientBase):
                     pricing_model=self._pricing_model or model,
                     message=_AUDIT_SAFE_PROVIDER_ERROR,
                     retryable=is_retryable,
+                    category=error_class,
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -779,6 +814,7 @@ class AuditedLLMClient(AuditedClientBase):
                     provider_cost_source=provider_cost_source,
                     message=f"Failed to read LLM response: {dump_exc}",
                     retryable=False,
+                    category="response_processing",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -826,6 +862,7 @@ class AuditedLLMClient(AuditedClientBase):
                     type="MalformedResponseError",
                     message=error_msg,
                     retryable=False,
+                    category="response_processing",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -871,6 +908,7 @@ class AuditedLLMClient(AuditedClientBase):
                     type="EmptyChoicesError",
                     message=error_msg,
                     retryable=False,
+                    category="response_processing",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -918,6 +956,7 @@ class AuditedLLMClient(AuditedClientBase):
                     provider_cost_source=provider_cost_source,
                     message=error_msg,
                     retryable=False,
+                    category="response_processing",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -966,6 +1005,7 @@ class AuditedLLMClient(AuditedClientBase):
                         type="UnsupportedResponseError",
                         message=error_msg,
                         retryable=False,
+                        category="response_processing",
                     ),
                     latency_ms=latency_ms,
                     approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -1013,6 +1053,7 @@ class AuditedLLMClient(AuditedClientBase):
                     type="ContentPolicyError",
                     message=error_msg,
                     retryable=False,
+                    category="content_policy",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -1057,6 +1098,7 @@ class AuditedLLMClient(AuditedClientBase):
                     provider_cost=provider_cost,
                     provider_cost_source=provider_cost_source,
                     retryable=False,
+                    category="response_processing",
                 ),
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
