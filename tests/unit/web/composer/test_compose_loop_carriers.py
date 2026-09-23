@@ -129,6 +129,7 @@ def test_tool_outcome_freezes_mapping_response() -> None:
         call={"id": "tc_x", "function": {"name": "request_advisor_hint"}},
         response=response_dict,
         error_class=None,
+        error_category=None,
         error_message=None,
         pre_version=1,
         post_version=1,

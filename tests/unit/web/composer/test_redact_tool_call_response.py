@@ -19,6 +19,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.tier_registry import _TIER_1_ERRORS_VIEW
 from elspeth.web.composer.redaction import (
@@ -46,15 +47,14 @@ _TYPE_DRIVEN_TOOL_RESULT_TOOLS = (
 )
 
 _EXTERNAL_SCALAR_CANARY = "RAW_RESPONSE_CANARY_/private/operator/path_sk-secret"
+# The classes the web ARG_ERROR producers raise, measured by the producer census
+# in test_error_class_producer_census.py (S0 trimmed the hand labels and the
+# classes no reachable input produces).
 _KNOWN_ARG_ERROR_CLASSES = (
-    "CanonicalizationError",
-    "FloatDomainError",
     "IntegerDomainError",
     "JSONDecodeError",
     "JsonBoundaryError",
-    "MissingRequiredPaths",
     "ToolArgumentError",
-    "TypeError",
     "ValidationError",
     "ValueError",
 )
@@ -103,10 +103,23 @@ def _tool_result_canary_response(*, success: bool) -> dict[str, Any]:
 def test_arg_error_projection_preserves_every_known_producer_class(error_class: str) -> None:
     result = redact_arg_error_response(
         error_class=error_class,
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
         error_message="fixed producer diagnostic",
     )
 
     assert result["error_class"] == error_class
+    assert result["error_category"] == "semantic_rule"
+
+
+@pytest.mark.parametrize("error_class", ["MissingRequiredPaths", "TypeError", "FloatDomainError", "CanonicalizationError"])
+def test_arg_error_projection_redacts_classes_no_producer_raises(error_class: str) -> None:
+    result = redact_arg_error_response(
+        error_class=error_class,
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
+        error_message="fixed producer diagnostic",
+    )
+
+    assert result["error_class"] == "<redacted-arg-error-class>"
 
 
 def test_every_type_driven_manifest_entry_declares_a_response_model() -> None:

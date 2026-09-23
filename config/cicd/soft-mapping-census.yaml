@@ -836,7 +836,7 @@ files:
     Mapping[str, Any]: 23
     Mapping[str, object]: 1
     boundary: 1
-    dict[str, Any]: 38
+    dict[str, Any]: 37
   src/elspeth/web/composer/source_demand.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 1
@@ -858,7 +858,7 @@ files:
     dict[str, Any]: 29
     dict[str, object]: 1
   src/elspeth/web/composer/tools/_dispatch.py:
-    Mapping[str, Any]: 6
+    Mapping[str, Any]: 7
     dict[str, Any]: 6
   src/elspeth/web/composer/tools/_generation_responses.py:
     dict[str, object]: 1
@@ -1046,10 +1046,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 875
+  Mapping[str, Any]: 876
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1142
+  dict[str, Any]: 1141
   dict[str, object]: 409
   soft: 2745

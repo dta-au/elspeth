@@ -36,6 +36,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttempt,
@@ -1076,6 +1077,9 @@ _PLANNER_SERVER_REJECTION_CODES: Final[frozenset[str]] = frozenset(
         "canonical_schema",
         "deferred_intent_claim",
         "validation_error",
+        # A discovery-call argument rejection is recorded by its closed
+        # category, the same vocabulary as the compose loop's ARG_ERROR rows.
+        *(category.value for category in ToolArgumentErrorCategory),
     }
 )
 _PLANNER_DECLARED_TOOL_NAMES: Final[frozenset[str]] = frozenset({*PLANNER_DISCOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME})
@@ -4712,7 +4716,7 @@ async def _plan_pipeline_inner(
                 )
                 continue
             except ToolArgumentError as exc:
-                last_rejection_codes = (exc.code or "argument_error",)
+                last_rejection_codes = (exc.category.value,)
                 if is_hatch_turn:
                     trail.finish_attempt("hatch", "arg_error", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
@@ -5028,8 +5032,8 @@ async def _plan_pipeline_inner(
                     do_dispatch=execute_discovery,
                     version_after_provider=lambda carrier: carrier.result.updated_state.version,
                     arg_error_payload_factory=lambda exc: {
-                        "error_class": "ToolArgumentError",
-                        "error_code": exc.code or "argument_error",
+                        "error_class": type(exc).__name__,
+                        "error_code": exc.category.value,
                     },
                 )
             except ToolArgumentError as exc:

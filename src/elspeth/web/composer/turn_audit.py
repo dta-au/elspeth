@@ -189,6 +189,7 @@ async def persist_turn_audit(
         if is_arg_error:
             arg_error_projection = redact_arg_error_response(
                 error_class=tool_outcome.error_class,
+                error_category=tool_outcome.error_category,
                 error_message=None,
             )
             persisted_arguments = {

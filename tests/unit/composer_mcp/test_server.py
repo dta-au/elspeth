@@ -250,6 +250,17 @@ class TestBuildToolDefs:
         ):
             assert excluded not in names, f"Blob/secret tool '{excluded}' should be excluded"
 
+    def test_session_tool_definitions_have_closed_roots(self) -> None:
+        """The hand-written MCP session tools advertise a closed root object."""
+        from elspeth.composer_mcp.server import _SESSION_TOOL_DEFS
+
+        assert len(_SESSION_TOOL_DEFS) == 6
+        for definition in _SESSION_TOOL_DEFS:
+            parameters = definition["parameters"]
+            assert parameters["type"] == "object", definition["name"]
+            assert "additionalProperties" in parameters, definition["name"]
+            assert parameters["additionalProperties"] is False, definition["name"]
+
 
 class TestDispatchTool:
     @pytest.mark.asyncio

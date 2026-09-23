@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
@@ -430,6 +431,22 @@ def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     return {"candidate_data": candidate_data}
 
 
+def _pre_dispatch_argument_error(tool_name: str, category: ToolArgumentErrorCategory) -> ToolArgumentError:
+    """Build the owned rejection a pre-dispatch argument gate records.
+
+    The wire and required-path gates in :func:`run_tool_batch` reject before
+    any handler runs and answer the planner with their own text. They record
+    the ``ToolArgumentError`` built here, so the audit ``error_class`` names a
+    class the site actually constructed, never a hand-written label.
+    """
+    return ToolArgumentError(
+        argument=f"{tool_name} arguments",
+        expected="an object conforming to the declared argument schema",
+        actual_type="invalid_schema",
+        category=category,
+    )
+
+
 def _replace_llm_tool_call_arguments(
     llm_messages: Sequence[Mapping[str, Any]],
     *,
@@ -824,6 +841,7 @@ async def run_tool_batch(
             *,
             response: Any,
             error_class: str | None,
+            error_category: ToolArgumentErrorCategory | None,
             error_message: str | None,
             post_version: int,
             _tool_outcomes: list[_ToolOutcome] = tool_outcomes,
@@ -835,6 +853,7 @@ async def run_tool_batch(
                     call=_tool_call,
                     response=response,
                     error_class=error_class,
+                    error_category=error_category,
                     error_message=error_message,
                     pre_version=_pre_version,
                     post_version=post_version,
@@ -877,10 +896,18 @@ async def run_tool_batch(
                 actor=actor,
             )
             error_payload = {"error": f"Invalid JSON in arguments: {exc}"}
+            # JsonBoundaryError is ELSPETH's own final-in-practice class (no
+            # subclasses); the other three caught classes are decode failures.
+            wire_category = (
+                ToolArgumentErrorCategory.WIRE_JSON_BOUNDS
+                if type(exc) is JsonBoundaryError
+                else ToolArgumentErrorCategory.WIRE_JSON_INVALID
+            )
             recorder.record(
                 finish_arg_error(
                     audit,
                     error_class=type(exc).__name__,
+                    error_category=wire_category,
                     error_message=type(exc).__name__,
                     error_payload=error_payload,
                 )
@@ -888,6 +915,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(exc).__name__,
+                error_category=wire_category,
                 error_message=type(exc).__name__,
                 post_version=state.version,
             )
@@ -924,19 +952,24 @@ async def run_tool_batch(
                 version_before=state.version,
                 actor=actor,
             )
+            error_category: ToolArgumentErrorCategory
             if canonicalization_failed is None:
                 err_msg = f"Tool '{tool_name}' arguments must be a JSON object, got {type(decoded_arguments).__name__}."
-                error_class = "TypeError"
+                not_object = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.WIRE_NOT_OBJECT)
+                error_class = type(not_object).__name__
+                error_category = not_object.category
                 error_message = f"non-object arguments ({type(decoded_arguments).__name__})"
             else:
                 err_msg = f"Tool '{tool_name}' arguments are not canonical JSON ({type(canonicalization_failed).__name__})."
                 error_class = type(canonicalization_failed).__name__
+                error_category = ToolArgumentErrorCategory.CANONICALIZATION
                 error_message = type(canonicalization_failed).__name__
             error_payload = {"error": err_msg}
             recorder.record(
                 finish_arg_error(
                     audit,
                     error_class=error_class,
+                    error_category=error_category,
                     error_message=error_message,
                     error_payload=error_payload,
                 )
@@ -944,6 +977,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=error_class,
+                error_category=error_category,
                 error_message=error_message,
                 post_version=state.version,
             )
@@ -962,9 +996,10 @@ async def run_tool_batch(
             pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
             if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
                 turn_has_mutation = True
+                envelope_rejection = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.WIRE_ENVELOPE)
                 audit_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                    "error_class": "TypeError",
+                    "error_class": type(envelope_rejection).__name__,
                 }
                 decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
                 _replace_llm_tool_call_arguments(
@@ -984,14 +1019,16 @@ async def run_tool_batch(
                 recorder.record(
                     finish_arg_error(
                         audit,
-                        error_class="TypeError",
+                        error_class=type(envelope_rejection).__name__,
+                        error_category=envelope_rejection.category,
                         error_message=envelope_error,
                         error_payload=error_payload,
                     )
                 )
                 _append_tool_outcome(
                     response=None,
-                    error_class="TypeError",
+                    error_class=type(envelope_rejection).__name__,
+                    error_category=envelope_rejection.category,
                     error_message=envelope_error,
                     post_version=state.version,
                 )
@@ -1044,6 +1081,7 @@ async def run_tool_batch(
                 finish_arg_error(
                     audit,
                     error_class=type(canonicalization_failed).__name__,
+                    error_category=ToolArgumentErrorCategory.CANONICALIZATION,
                     error_message=type(canonicalization_failed).__name__,
                     error_payload=error_payload,
                 )
@@ -1051,6 +1089,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(canonicalization_failed).__name__,
+                error_category=ToolArgumentErrorCategory.CANONICALIZATION,
                 error_message=type(canonicalization_failed).__name__,
                 post_version=state.version,
             )
@@ -1123,6 +1162,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=cached_outcome,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1164,17 +1204,20 @@ async def run_tool_batch(
             # safe to echo verbatim.
             err_msg = f"Tool '{tool_name}' missing required argument(s): {', '.join(missing)}"
             error_payload = {"error": err_msg}
+            missing_paths = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.MISSING_REQUIRED_PATH)
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="MissingRequiredPaths",
+                    error_class=type(missing_paths).__name__,
+                    error_category=missing_paths.category,
                     error_message=f"missing: {', '.join(missing)}",
                     error_payload=error_payload,
                 )
             )
             _append_tool_outcome(
                 response=None,
-                error_class="MissingRequiredPaths",
+                error_class=type(missing_paths).__name__,
+                error_category=missing_paths.category,
                 error_message=f"missing: {', '.join(missing)}",
                 post_version=state.version,
             )
@@ -1691,6 +1734,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=proposal_result,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1744,18 +1788,21 @@ async def run_tool_batch(
             # structural hint.
             advisor_arg_error = ctx.service._validate_advisor_arguments(arguments)
             if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):
+                advisor_rejection_payload = advisor_arg_error.to_payload()
                 recorder.record(
                     finish_arg_error(
                         audit,
-                        error_class=str(advisor_arg_error["error_class"]),
-                        error_message=str(advisor_arg_error["error"]),
-                        error_payload=advisor_arg_error,
+                        error_class=advisor_arg_error.error_class,
+                        error_category=advisor_arg_error.category,
+                        error_message=advisor_arg_error.error,
+                        error_payload=advisor_rejection_payload,
                     )
                 )
                 _append_tool_outcome(
                     response=None,
-                    error_class=str(advisor_arg_error["error_class"]),
-                    error_message=str(advisor_arg_error["error"]),
+                    error_class=advisor_arg_error.error_class,
+                    error_category=advisor_arg_error.category,
+                    error_message=advisor_arg_error.error,
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
@@ -1763,7 +1810,7 @@ async def run_tool_batch(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_arg_error),
+                        "content": json.dumps(advisor_rejection_payload),
                     }
                 )
                 turn_has_discovery = True
@@ -1792,6 +1839,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=budget_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1812,23 +1860,26 @@ async def run_tool_batch(
 
             remaining = _remaining_compose_seconds(deadline)
             if remaining <= 0:
-                timeout_payload: dict[str, Any] = {
+                # Nothing was raised here: the pre-call deadline check refused
+                # the call, so the payload names no exception class. The
+                # ``COMPOSE_TIMEOUT`` status is the discriminant.
+                pre_call_timeout_payload: dict[str, Any] = {
                     "status": "COMPOSE_TIMEOUT",
                     "error": "Advisor call exceeded the remaining compose deadline.",
-                    "error_class": "TimeoutError",
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
                 recorder.record(
                     finish_success(
                         audit,
-                        result_payload=timeout_payload,
+                        result_payload=pre_call_timeout_payload,
                         version_after=state.version,
                     )
                 )
                 _append_tool_outcome(
-                    response=timeout_payload,
+                    response=pre_call_timeout_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1852,6 +1903,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=deadline_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1897,7 +1949,7 @@ async def run_tool_batch(
                     timeout_payload = {
                         "status": "COMPOSE_TIMEOUT",
                         "error": "Advisor call exceeded the remaining compose deadline.",
-                        "error_class": "TimeoutError",
+                        "error_class": type(advisor_exc).__name__,
                         "budget_used": advisor_calls_used,
                         "budget_remaining": budget - advisor_calls_used,
                     }
@@ -1911,6 +1963,7 @@ async def run_tool_batch(
                     _append_tool_outcome(
                         response=timeout_payload,
                         error_class=None,
+                        error_category=None,
                         error_message=None,
                         post_version=state.version,
                     )
@@ -1936,6 +1989,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=advisor_error_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1972,6 +2026,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=advisor_error_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -2001,6 +2056,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=None,
                     error_class=type(first_party_exc).__name__,
+                    error_category=None,
                     error_message=type(first_party_exc).__name__,
                     post_version=state.version,
                 )
@@ -2038,6 +2094,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=success_payload,
                 error_class=None,
+                error_category=None,
                 error_message=None,
                 post_version=state.version,
             )
@@ -2108,6 +2165,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=None,
                     error_class=type(tool_exc).__name__,
+                    error_category=None,
                     error_message=type(tool_exc).__name__,
                     post_version=state.version,
                 )
@@ -2124,6 +2182,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=session_aware_outcome.result,
                 error_class=session_aware_outcome.error_class,
+                error_category=session_aware_outcome.error_category,
                 error_message=session_aware_outcome.error_message,
                 post_version=session_aware_outcome.post_version,
             )
@@ -2415,7 +2474,8 @@ async def run_tool_batch(
             arg_error_payload = _arg_error_payload(exc, tool_name)
             _append_tool_outcome(
                 response=None,
-                error_class="ToolArgumentError",
+                error_class=type(exc).__name__,
+                error_category=exc.category,
                 error_message=str(exc.args[0] if exc.args else "ToolArgumentError"),
                 post_version=state.version,
             )
@@ -2523,6 +2583,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(tool_exc).__name__,
+                error_category=None,
                 error_message=type(tool_exc).__name__,
                 post_version=state.version,
             )
@@ -2607,6 +2668,7 @@ async def run_tool_batch(
         _append_tool_outcome(
             response=admitted_result.to_tool_result() if admitted_result is not None else result,
             error_class=None,
+            error_category=None,
             error_message=None,
             post_version=state.version,
         )

@@ -57,6 +57,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.contracts.composer_llm_audit import (
     ComposerChatTurn,
@@ -790,10 +791,15 @@ def finish_arg_error(
     audit: DispatchAudit,
     *,
     error_class: str,
+    error_category: ToolArgumentErrorCategory,
     error_message: str,
     error_payload: Mapping[str, Any] | None = None,
 ) -> ComposerToolInvocation:
     """Build an ARG_ERROR invocation record.
+
+    ``error_class`` is the name of the exception class raised (or
+    constructed) at the calling site; ``error_category`` is its closed
+    :class:`ToolArgumentErrorCategory`.
 
     ``error_message`` is already-redacted at the dispatch boundary —
     callers MUST pass safe-by-construction text (``ToolArgumentError.args[0]``,
@@ -829,6 +835,7 @@ def finish_arg_error(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        error_category=error_category,
     )
 
 
@@ -1145,7 +1152,8 @@ async def dispatch_with_audit(
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="ToolArgumentError",
+                    error_class=type(arg_error_exc).__name__,
+                    error_category=arg_error_exc.category,
                     error_message=str(safe_message),
                     error_payload=arg_error_payload,
                 )

@@ -76,6 +76,59 @@ class ComposerToolStatus(StrEnum):
     PLUGIN_CRASH = "plugin_crash"
 
 
+class ToolArgumentErrorCategory(StrEnum):
+    """Closed, value-free reason an ``ARG_ERROR`` dispatch was rejected.
+
+    ``error_class`` names the exception class actually raised; this names
+    the stage and kind of the rejection, so shape errors (which a provider
+    grammar could have prevented) are distinguishable from value errors
+    (which no grammar prevents).
+
+    Wire stage — the provider's argument text never reached the semantic
+    contract:
+
+    WIRE_JSON_INVALID  — ``bounded_json_loads`` rejected the text as JSON.
+    WIRE_JSON_BOUNDS   — the JSON exceeded the bounded-decoder limits.
+    WIRE_NOT_OBJECT    — valid JSON, but not a JSON object.
+    WIRE_ENVELOPE      — the web ``set_pipeline`` ``{"pipeline": {...}}``
+                         envelope was malformed.
+
+    Semantic stage — the arguments were checked against the tool contract:
+
+    CANONICALIZATION      — the arguments are not canonical JSON.
+    MISSING_REQUIRED_PATH — a schema-required (nested) path is absent.
+    SCHEMA_SHAPE          — the flat Draft 2020-12 schema failed on a
+                            keyword a provider grammar can express.
+    SCHEMA_BOUND          — the schema failed on a keyword no provider
+                            grammar expresses (length, ``not``, ...).
+    MODEL_VALIDATION      — the pydantic arguments model rejected them.
+
+    Value stage — the arguments were well-formed but not acceptable:
+
+    PROMPT_BUDGET                      — advisor prompt-size cap.
+    DISCOVERY_ONLY                     — a mutation tool on a read-only path.
+    DUPLICATE_RESOLVED_INTERPRETATION  — interpretation already resolved.
+    RATE_CAP_PER_SESSION_DAY / RATE_CAP_PER_TERM — interpretation caps.
+    SEMANTIC_RULE                      — any other handler rule.
+    """
+
+    WIRE_JSON_INVALID = "wire_json_invalid"
+    WIRE_JSON_BOUNDS = "wire_json_bounds"
+    WIRE_NOT_OBJECT = "wire_not_object"
+    WIRE_ENVELOPE = "wire_envelope"
+    CANONICALIZATION = "canonicalization"
+    MISSING_REQUIRED_PATH = "missing_required_path"
+    SCHEMA_SHAPE = "schema_shape"
+    SCHEMA_BOUND = "schema_bound"
+    MODEL_VALIDATION = "model_validation"
+    PROMPT_BUDGET = "prompt_budget"
+    DISCOVERY_ONLY = "discovery_only"
+    DUPLICATE_RESOLVED_INTERPRETATION = "duplicate_resolved_interpretation"
+    RATE_CAP_PER_SESSION_DAY = "rate_cap_per_session_day"
+    RATE_CAP_PER_TERM = "rate_cap_per_term"
+    SEMANTIC_RULE = "semantic_rule"
+
+
 @dataclass(frozen=True, slots=True)
 class ComposerToolInvocation:
     """One composer tool dispatch as recorded for audit.
@@ -106,6 +159,8 @@ class ComposerToolInvocation:
 
     ``error_class`` / ``error_message``
         Populated on ``ARG_ERROR``, ``CANCELLED``, and ``PLUGIN_CRASH``.
+        ``error_class`` is the name of the exception class actually raised
+        (or constructed) at the recording site, never a hand-written label.
         ``error_message``
         is already-redacted at the dispatch boundary — for
         ``ToolArgumentError`` this is ``exc.args[0]``, which the structured
@@ -139,14 +194,19 @@ class ComposerToolInvocation:
         Stable string identifying who drove the dispatch.
         ``"composer-mcp:cli"`` or ``"composer-web:user-{user_id}"``.
 
-    Immutability
-    ------------
+    ``error_category``
+        The closed :class:`ToolArgumentErrorCategory` of an ``ARG_ERROR``.
+        Required on ``ARG_ERROR`` and ``None`` on every other status.
+
+    Immutability and the cross-field check
+    --------------------------------------
     Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``, so
     ``frozen=True`` alone is sufficient. Deep-freezing exists because
     ``frozen=True`` leaves container contents mutable through the attribute
-    reference; a scalar-only record has no container to reach through.
-    No ``__post_init__`` freeze guard is needed and none is defined —
-    a guard that does nothing is not worth defining.
+    reference; a scalar-only record has no container to reach through, so
+    no freeze guard is defined. ``__post_init__`` exists only for the
+    status/category cross-field check: an argument rejection must say which
+    closed category rejected it, and no other status may carry one.
     """
 
     tool_call_id: str
@@ -167,6 +227,15 @@ class ComposerToolInvocation:
     cache_hit: bool = False
     authority_arguments_canonical: str | None = None
     authority_arguments_hash: str | None = None
+    error_category: ToolArgumentErrorCategory | None = None
+
+    def __post_init__(self) -> None:
+        if self.error_category is not None and type(self.error_category) is not ToolArgumentErrorCategory:
+            raise TypeError("ComposerToolInvocation.error_category must be a ToolArgumentErrorCategory")
+        if self.status is ComposerToolStatus.ARG_ERROR and self.error_category is None:
+            raise ValueError("ComposerToolInvocation with status ARG_ERROR requires an error_category")
+        if self.status is not ComposerToolStatus.ARG_ERROR and self.error_category is not None:
+            raise ValueError(f"ComposerToolInvocation with status {self.status.value} must not carry an error_category")
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict for sidecar serialization.
@@ -182,6 +251,7 @@ class ComposerToolInvocation:
         """
         raw = asdict(self)
         raw["status"] = self.status.value
+        raw["error_category"] = self.error_category.value if self.error_category is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         if self.authority_arguments_canonical is None and self.authority_arguments_hash is None:

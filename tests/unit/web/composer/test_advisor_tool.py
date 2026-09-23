@@ -30,6 +30,7 @@ import pytest
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
@@ -260,7 +261,7 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     raw_extra_context = "RAW_EXTRA_CONTEXT: raw traceback and source excerpt"
 
-    payload = service._validate_advisor_arguments(
+    rejection = service._validate_advisor_arguments(
         {
             "trigger": "proactive_security_safety",
             "problem_summary": "stuck",
@@ -270,9 +271,13 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
         }
     )
 
-    assert payload is not None
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
-    assert payload["error_class"] == "ValueError"
+    # The closed-root S gate rejects the extra key before the pydantic model:
+    # an honest ToolArgumentError of category schema_shape (was "ValueError").
+    assert payload["error_class"] == "ToolArgumentError"
+    assert payload["error_category"] == "schema_shape"
     assert "extra keys" in payload["error"]
     assert "full_context" not in payload["error"]
     assert raw_extra_context not in payload["error"]
@@ -284,7 +289,7 @@ def test_reactive_trigger_is_retired() -> None:
     must be rejected as an unknown trigger.
     """
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    payload = service._validate_advisor_arguments(
+    rejection = service._validate_advisor_arguments(
         {
             "trigger": "reactive_validation_loop",
             "problem_summary": "stuck",
@@ -292,7 +297,8 @@ def test_reactive_trigger_is_retired() -> None:
             "attempted_actions": ["a1", "a2"],
         }
     )
-    assert payload is not None  # ARG_ERROR
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
     assert "published schema" in payload["error"]
     assert "reactive_validation_loop" not in payload["error"]

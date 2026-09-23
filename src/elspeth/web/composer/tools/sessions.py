@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
@@ -857,6 +858,7 @@ def build_set_pipeline_candidate(
             argument="set_pipeline arguments",
             expected="object conforming to SetPipelineArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     if validated.source is not None and validated.sources is not None:

@@ -24,6 +24,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import insert
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome
 from elspeth.web.composer.redaction import redact_arg_error_response, redact_failure_response
@@ -66,6 +67,7 @@ def _arg_error_outcome(call_id: str) -> _ToolOutcome:
         call=_call(call_id, "set_metadata"),
         response=None,
         error_class="ToolArgumentError",
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
         error_message=ARG_ERROR_SENTINEL,
         pre_version=1,
         post_version=1,
@@ -79,6 +81,7 @@ def _plugin_crash_outcome(call_id: str) -> _ToolOutcome:
         call=_call(call_id, "upsert_node"),
         response=None,
         error_class="RuntimeError",
+        error_category=None,
         error_message="RuntimeError",
         pre_version=1,
         post_version=1,
@@ -105,6 +108,7 @@ def _validation_rejection_outcome(call_id: str) -> _ToolOutcome:
             affected_nodes=(),
         ),
         error_class=None,
+        error_category=None,
         error_message=None,
         pre_version=1,
         post_version=1,
@@ -121,6 +125,7 @@ def _success_outcome(call_id: str) -> _ToolOutcome:
             affected_nodes=(),
         ),
         error_class=None,
+        error_category=None,
         error_message=None,
         pre_version=1,
         post_version=1,
@@ -130,7 +135,13 @@ def _success_outcome(call_id: str) -> _ToolOutcome:
 def _tool_row_content(outcome: _ToolOutcome) -> str:
     """A stand-in for the redacted chat tool row the compose loop persists."""
     if outcome.error_class == "ToolArgumentError":
-        return json.dumps(redact_arg_error_response(error_class=outcome.error_class, error_message=outcome.error_message))
+        return json.dumps(
+            redact_arg_error_response(
+                error_class=outcome.error_class,
+                error_category=outcome.error_category,
+                error_message=outcome.error_message,
+            )
+        )
     if outcome.error_class is not None:
         return json.dumps(
             redact_failure_response(status="plugin_crash", error_class=outcome.error_class, error_message=outcome.error_message)

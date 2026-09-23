@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.redaction import MANIFEST
 from elspeth.web.composer.tools._common import _validate_mutation_arguments
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools._dispatch import get_tool_definitions, require_schema_valid_arguments
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
 from elspeth.web.composer.tools.schema_contract import assert_set_pipeline_schema_compatible, assert_upsert_node_schema_compatible
 from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
@@ -274,6 +274,10 @@ def _model_for_handler(handler: FunctionType, *, input_parameter: str | None = N
                 if target is dict:
                     raise CensusError(f"{site}: unsupported input copy")
                 if target in (isinstance, len, bool, str, type, set, frozenset, sorted):
+                    continue
+                if target is require_schema_valid_arguments:
+                    # The closed-root flat-schema S gate only reads the input and
+                    # raises; it neither admits a model nor forwards the input.
                     continue
                 if target is _validate_mutation_arguments:
                     if len(call.args) != 3 or call.keywords or not _input_expression(call.args[1], parameter):
@@ -751,6 +755,10 @@ def _reads_for_handler(
                 unresolved.add(f"{site(node)}: bulk model-to-dict transformation")
                 return None
             if target in (isinstance, len, bool, str, type, set, frozenset, sorted):
+                return None
+            if target is require_schema_valid_arguments:
+                # The closed-root S gate validates the whole input against the
+                # flat schema and raises; it extracts no field for use.
                 return None
             if not isinstance(target, FunctionType) or None in kwargs:
                 unresolved.add(f"{site(node)}: unsupported callable receiving input provenance")

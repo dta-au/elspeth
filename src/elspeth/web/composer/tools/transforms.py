@@ -9,6 +9,7 @@ from typing import Annotated, Any, Final, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
@@ -1630,6 +1631,7 @@ def _execute_patch_node_options(
             argument="patch_node_options arguments",
             expected="object conforming to PatchNodeOptionsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     node_id = validated.node_id
     patch: Mapping[str, Any] = validated.patch

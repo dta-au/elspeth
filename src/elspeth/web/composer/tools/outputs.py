@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
@@ -233,6 +234,7 @@ def _execute_patch_output_options(
             argument="patch_output_options arguments",
             expected="object conforming to PatchOutputOptionsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     sink_name = validated.sink_name
     patch = validated.patch

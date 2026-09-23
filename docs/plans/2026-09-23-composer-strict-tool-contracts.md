@@ -640,6 +640,55 @@ Acceptance:
 5. Collect a baseline over the tutorial canary run and ordinary dev use until the option tools have enough calls to
    compare (see §5.3). Record the numbers in this plan.
 
+**S0a as implemented (error vocabulary, error codes, closed roots): corrections and decisions.** Recorded while
+implementing; where this differs from the bullets above, this paragraph is the current state.
+
+- **Deadline sites.** The plan said neither `:1818` nor `:1900` raised anything. Only `:1818` (pre-call deadline) raises
+  nothing: its `"error_class"` key is dropped, and `status: COMPOSE_TIMEOUT` is the discriminant. `:1900` is inside
+  `except TimeoutError as advisor_exc`, so it now records `type(advisor_exc).__name__`. Both are SUCCESS rows.
+- **Honest class where nothing was raised.** The non-object, envelope and required-path gates build a
+  `ToolArgumentError` (`tool_batch._pre_dispatch_argument_error`) and record its class and category; the text sent
+  to the planner is unchanged. The advisor prompt-budget cap does the same. The advisor validator now returns an
+  owned `AdvisorArgumentRejection` (error, class, category) instead of a `dict[str, Any]`.
+- **`wire_decode` is not defined in S0.** It has no producer until S2; adding the member then keeps S0 free of a
+  category nothing emits.
+- **`ToolArgumentError.category`.** Keyword-only. When omitted it is derived: `semantic_rule` with no code, or the
+  1:1 category of `DISCOVERY_ONLY` / `DUPLICATE_RESOLVED_INTERPRETATION` / the two rate caps. `SCHEMA_VALIDATION`
+  must name `schema_shape` or `schema_bound`. A category that disagrees with its code raises. The 14 pydantic-wrap
+  sites pass `model_validation` explicitly, and an AST census keeps new ones from defaulting to `semantic_rule`.
+- **`_SAFE_ARG_ERROR_CLASSES`.** It is pinned to the classes that the web ARG_ERROR producers raise, measured by
+  triggering each producer with input that can reach it. The result is `IntegerDomainError`, `JSONDecodeError`,
+  `JsonBoundaryError`, `ToolArgumentError`, `ValidationError` and `ValueError`. Four classes were removed:
+  `MissingRequiredPaths` (the class does not exist), `TypeError` (provider arguments are admitted as `str`, so
+  `bounded_json_loads` never sees non-text), and `FloatDomainError` and bare `CanonicalizationError` (the values
+  that raise them cannot come out of `bounded_json_loads`).
+- **Error-code registry.** The registry is `composer/error_codes.py`. It holds 200 codes: 174 literal codes, the 5
+  `ToolArgumentError` codes, every `PluginUnavailableReason` value and every category value. The census reads
+  `error_code=` keywords, the fourth positional argument of `ValidationEntry`/`_err`, and `"error_code"` dict keys.
+  Non-literal sites (30 of them: forwarders, enum reads, planner feedback projections) are pinned to a reviewed list,
+  so a new one fails until it is reviewed.
+- **Pipeline planner.** The categories join `_PLANNER_SERVER_REJECTION_CODES`. The discovery `ToolArgumentError`
+  rejection codes and both `arg_error_payload_factory` payloads (`pipeline_planner.py` and `pipeline_commit.py`)
+  now use the category and `type(exc).__name__`. The planner-facing feedback entries
+  (`_allowlisted_argument_error_entry`, `provider_discovery_response._ArgumentErrorResponse`) keep `exc.code or
+  "argument_error"`, so S0 changes nothing the planner reads there.
+- **R3 reader trace: no epoch bump.** The persisted invocation readers all read by key membership or `.get`:
+  `sessions/routes/_helpers.py` (outcomes and pipeline-dispatch recovery), `sessions/service.py`,
+  `sessions/guided_audit.py` and `PipelineDispatchAuditBinding.from_persisted_envelope`. The only exact key-set
+  reader in `web/` is `_aws_ecs_acceptance/receipt_contracts.py:665`, which is unrelated. The frontend does not
+  parse `_redaction_status`/`arg_error` content. `error_category` is additive JSON.
+- **Appendix A path.** The ARG_ERROR tool-row content carries `error_category` at the top level (`$.error_category`),
+  so the query stands as written.
+- **Carve-outs.** The advisor and interpretation-review flat schemas agree with their pydantic models on the
+  omission-only fields (`schema_excerpt` and `llm_draft` reject `null` in both; measured). The directional
+  `schema_contract` walker covers only `set_pipeline`, so these two tools have the same unproven narrower-than-model
+  risk as the other 39 S-gated tools.
+- **MCP session tools.** They now advertise `additionalProperties:false`. `server.py` validates only
+  `_COMPOSER_TOOL_NAMES` against S, so the session-tool arguments are not held to that closed root at dispatch.
+- **`service.py` session_id premise.** `_get_litellm_tools()` filters nothing. `compose()` admits a turn only with
+  COMPOSE session authority whose fence names the `session_id`. The `RuntimeError` stays as an invariant, and its
+  message and docstring now name the real guard.
+
 ### S1 — Strict on the 32 mechanical tools (no options decision needed)
 
 Purpose: the first wire change. 32 tools are sent `strict: true` on routes that forward it. The 10 option tools and

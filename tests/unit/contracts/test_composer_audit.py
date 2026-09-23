@@ -21,6 +21,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.core.canonical import canonical_json, stable_hash
 
@@ -100,6 +101,7 @@ def test_arg_error_invocation_shape() -> None:
         status=ComposerToolStatus.ARG_ERROR,
         error_class="ToolArgumentError",
         error_message="'plugin' must be a string, got int",
+        error_category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         version_after=None,
         result_canonical=None,
         result_hash=None,
@@ -109,6 +111,46 @@ def test_arg_error_invocation_shape() -> None:
     assert d["version_after"] is None
     assert d["result_canonical"] is None
     assert d["result_hash"] is None
+    # The category is persisted as its plain string value, exactly like status.
+    assert d["error_category"] == "model_validation"
+    assert type(d["error_category"]) is str
+
+
+def test_arg_error_without_category_is_rejected() -> None:
+    """An ARG_ERROR record must say which closed category rejected the call."""
+    with pytest.raises(ValueError, match="error_category"):
+        _make_invocation(
+            status=ComposerToolStatus.ARG_ERROR,
+            error_class="ToolArgumentError",
+            error_message="m",
+            version_after=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ComposerToolStatus.SUCCESS, ComposerToolStatus.CANCELLED, ComposerToolStatus.PLUGIN_CRASH],
+)
+def test_category_on_a_non_arg_error_status_is_rejected(status: ComposerToolStatus) -> None:
+    """A category describes an argument rejection; no other status may carry one."""
+    with pytest.raises(ValueError, match="error_category"):
+        _make_invocation(status=status, error_category=ToolArgumentErrorCategory.SEMANTIC_RULE)
+
+
+def test_category_must_be_the_owned_enum() -> None:
+    """A bare string with a category's value is not the owned closed type."""
+    with pytest.raises(TypeError, match="error_category"):
+        _make_invocation(
+            status=ComposerToolStatus.ARG_ERROR,
+            error_class="ToolArgumentError",
+            error_message="m",
+            version_after=None,
+            error_category="semantic_rule",
+        )
+
+
+def test_non_arg_error_to_dict_carries_null_category() -> None:
+    assert _make_invocation().to_dict()["error_category"] is None
 
 
 def test_plugin_crash_invocation_shape() -> None:

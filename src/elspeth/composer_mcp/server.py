@@ -39,6 +39,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -127,6 +128,7 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": [],
+            "additionalProperties": False,
         },
     },
     {
@@ -141,6 +143,7 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
@@ -155,12 +158,13 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "list_sessions",
         "description": "List all saved composition sessions.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     },
     {
         "name": "delete_session",
@@ -174,12 +178,13 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "generate_yaml",
         "description": "Generate ELSPETH pipeline YAML from the current composition state.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     },
 ]
 
@@ -747,6 +752,7 @@ def create_server(
         result_dict: dict[str, Any] | None = None
         status: ComposerToolStatus = ComposerToolStatus.SUCCESS
         error_class: str | None = None
+        error_category: ToolArgumentErrorCategory | None = None
         error_message: str | None = None
         # Captured for ARG_ERROR/PLUGIN_CRASH paths so result_canonical can
         # mirror what the LLM saw (Solution-architect review H4 — the LLM
@@ -756,14 +762,15 @@ def create_server(
         clear_session_after_audit = False
         checkout_refused = False
 
-        def _argument_error_result(exc: Exception) -> CallToolResult:
-            nonlocal status, error_class, error_message, error_payload_for_audit
+        def _argument_error_result(exc: BaseException, category: ToolArgumentErrorCategory) -> CallToolResult:
+            nonlocal status, error_class, error_category, error_message, error_payload_for_audit
             # Bad LLM arguments only. ToolArgumentError messages are
             # safe by construction; the canonicalization pre-dispatch
-            # ValueError path uses class-name only to avoid echoing raw
-            # argument values.
+            # path records the class canonical_json actually raised and
+            # uses class-name only to avoid echoing raw argument values.
             status = ComposerToolStatus.ARG_ERROR
             error_class = type(exc).__name__
+            error_category = category
             error_message = type(exc).__name__
             # Build a structured payload so the LLM and the audit row
             # see the same string (Solution-architect H4 symmetry fix).
@@ -789,14 +796,14 @@ def create_server(
         try:
             if canonicalization_failed is not None:
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
-                return _argument_error_result(ValueError(f"arguments not canonicalizable ({type(canonicalization_failed).__name__})"))
+                return _argument_error_result(canonicalization_failed, ToolArgumentErrorCategory.CANONICALIZATION)
 
             if name in _COMPOSER_TOOL_NAMES:
                 try:
                     argument_error = _validate_tool_arguments(name, arguments, state_ref[0], raise_on_error=True)
                     assert argument_error is None
                 except ToolArgumentError as exc:
-                    return _argument_error_result(exc)
+                    return _argument_error_result(exc, exc.category)
 
             if name == "preview_pipeline" and runtime_preflight is not None:
                 try:
@@ -839,7 +846,7 @@ def create_server(
                     session_checkout_ref=session_checkout_ref,
                 )
             except ToolArgumentError as exc:
-                return _argument_error_result(exc)
+                return _argument_error_result(exc, exc.category)
             except SessionCheckoutMismatchError as exc:
                 # Expected refusal: dispatch completed without changing state.
                 # Persist the same safe diagnostic the MCP client receives.
@@ -970,6 +977,7 @@ def create_server(
                 finished_at=finished_at,
                 latency_ms=latency_ms,
                 actor="composer-mcp:cli",
+                error_category=error_category,
             )
             try:
                 audit_recorder.record(invocation)

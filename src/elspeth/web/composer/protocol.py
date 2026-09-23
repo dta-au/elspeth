@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.sessions.protocol import GuidedOperationFence
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
@@ -785,6 +785,52 @@ _TOOL_ARGUMENT_ERROR_CODES = frozenset(
     }
 )
 
+# Closed-code value rejections carry their category 1:1. ``SCHEMA_VALIDATION``
+# is split by the failing schema keyword, so its constructor must name one of
+# the two schema categories explicitly.
+_TOOL_ARGUMENT_CATEGORY_BY_CODE: Final[Mapping[str, ToolArgumentErrorCategory]] = MappingProxyType(
+    {
+        "DISCOVERY_ONLY": ToolArgumentErrorCategory.DISCOVERY_ONLY,
+        "DUPLICATE_RESOLVED_INTERPRETATION": ToolArgumentErrorCategory.DUPLICATE_RESOLVED_INTERPRETATION,
+        "RATE_CAP_PER_SESSION_DAY": ToolArgumentErrorCategory.RATE_CAP_PER_SESSION_DAY,
+        "RATE_CAP_PER_TERM": ToolArgumentErrorCategory.RATE_CAP_PER_TERM,
+    }
+)
+_SCHEMA_VALIDATION_CATEGORIES: Final[frozenset[ToolArgumentErrorCategory]] = frozenset(
+    {ToolArgumentErrorCategory.SCHEMA_SHAPE, ToolArgumentErrorCategory.SCHEMA_BOUND}
+)
+# Categories that belong to a closed code: a rejection may only claim one of
+# these when it also carries that code.
+_CODE_OWNED_TOOL_ARGUMENT_CATEGORIES: Final[frozenset[ToolArgumentErrorCategory]] = frozenset(
+    {*_TOOL_ARGUMENT_CATEGORY_BY_CODE.values(), *_SCHEMA_VALIDATION_CATEGORIES}
+)
+
+
+def _resolve_tool_argument_category(code: str | None, category: object) -> ToolArgumentErrorCategory:
+    """Return the closed category for a ``(code, category)`` pair, or raise."""
+    requested: ToolArgumentErrorCategory | None
+    if category is None:
+        requested = None
+    elif type(category) is ToolArgumentErrorCategory:
+        requested = category
+    else:
+        raise ValueError("ToolArgumentError received an unsupported category")
+    if code == "SCHEMA_VALIDATION":
+        if requested is None or requested not in _SCHEMA_VALIDATION_CATEGORIES:
+            raise ValueError("ToolArgumentError code SCHEMA_VALIDATION requires the schema_shape or schema_bound category")
+        return requested
+    if code is not None:
+        coded = _TOOL_ARGUMENT_CATEGORY_BY_CODE[code]
+        if requested is not None and requested is not coded:
+            raise ValueError("ToolArgumentError category disagrees with its code")
+        return coded
+    if requested is None:
+        return ToolArgumentErrorCategory.SEMANTIC_RULE
+    if requested in _CODE_OWNED_TOOL_ARGUMENT_CATEGORIES:
+        raise ValueError("ToolArgumentError category requires its closed code")
+    return requested
+
+
 _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS = 4096
 
 _SAFE_TOOL_ARGUMENT_NAMES = frozenset(
@@ -1196,6 +1242,7 @@ class ToolArgumentError(Exception):
     __slots__ = (
         "_safe_actual_type",
         "_safe_argument",
+        "_safe_category",
         "_safe_code",
         "_safe_expected",
         "_tool_argument_error_sealed",
@@ -1205,12 +1252,14 @@ class ToolArgumentError(Exception):
         {
             "_safe_actual_type",
             "_safe_argument",
+            "_safe_category",
             "_safe_code",
             "_safe_expected",
             "_tool_argument_error_sealed",
             "actual_type",
             "args",
             "argument",
+            "category",
             "code",
             "expected",
             "safe_message",
@@ -1236,6 +1285,7 @@ class ToolArgumentError(Exception):
         expected: str,
         actual_type: str,
         code: str | None = None,
+        category: ToolArgumentErrorCategory | None = None,
     ) -> None:
         if type(argument) is not str or not argument:
             raise ValueError("ToolArgumentError.argument must be a non-empty identifier")
@@ -1245,6 +1295,7 @@ class ToolArgumentError(Exception):
             raise ValueError("ToolArgumentError.actual_type must be a non-empty type name")
         if code is not None and (type(code) is not str or code not in _TOOL_ARGUMENT_ERROR_CODES):
             raise ValueError("ToolArgumentError received an unsupported code")
+        safe_category = _resolve_tool_argument_category(code, category)
 
         safe_argument = _canonical_tool_argument_name(argument)
         safe_expected = _canonical_tool_argument_expectation(expected, safe_argument)
@@ -1255,6 +1306,7 @@ class ToolArgumentError(Exception):
         BaseException.__setattr__(self, "_safe_expected", safe_expected)
         BaseException.__setattr__(self, "_safe_actual_type", safe_actual_type)
         BaseException.__setattr__(self, "_safe_code", code)
+        BaseException.__setattr__(self, "_safe_category", safe_category)
         super().__init__(safe_message)
         BaseException.__setattr__(self, "_tool_argument_error_sealed", True)
 
@@ -1321,6 +1373,20 @@ class ToolArgumentError(Exception):
 
     @code.setter
     def code(self, value: object) -> None:
+        del value
+
+    @property
+    def category(self) -> ToolArgumentErrorCategory:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_category")
+        except AttributeError:
+            raise FrameworkBugError("ToolArgumentError classification category is missing") from None
+        if type(value) is ToolArgumentErrorCategory:
+            return value
+        raise FrameworkBugError("ToolArgumentError classification category is invalid")
+
+    @category.setter
+    def category(self, value: object) -> None:
         del value
 
     @property

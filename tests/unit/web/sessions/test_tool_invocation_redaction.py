@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
@@ -515,6 +515,7 @@ async def test_schema_valid_semantic_arg_error_persists_only_closed_argument_pro
         finished_at=datetime(2026, 7, 27, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
     )
     service = _CapturingSessionService()
     session_id = uuid4()
@@ -728,6 +729,7 @@ async def test_arg_error_result_for_response_model_tool_persists_without_success
         finished_at=datetime(2026, 5, 24, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
     )
     service = _CapturingSessionService()
     session_id = uuid4()

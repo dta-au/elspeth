@@ -16,7 +16,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select, text, update
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
@@ -250,6 +250,7 @@ def test_current_loop_arg_error_tool_row_scrubs_arbitrary_error_message(
     outcome = SimpleNamespace(
         call=SimpleNamespace(function=SimpleNamespace(name="set_source")),
         error_class="ToolArgumentError",
+        error_category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         error_message=canary,
     )
 
@@ -261,6 +262,7 @@ def test_current_loop_arg_error_tool_row_scrubs_arbitrary_error_message(
 
     assert payload["_redaction_status"] == "arg_error"
     assert payload["error_class"] == "ToolArgumentError"
+    assert payload["error_category"] == "model_validation"
     assert payload["error_message"] == "<redacted-arg-error-message>"
     assert canary not in serialized
 
@@ -1398,9 +1400,11 @@ async def test_current_loop_non_object_arg_error_matches_durable_projection_and_
         session_id=result_session_id,
     )
 
+    # S0: the non-object gate records the ToolArgumentError it builds (was
+    # the hand label "TypeError").
     expected_arguments = {
         "_redaction_status": "invalid_tool_arguments",
-        "error_class": "TypeError",
+        "error_class": "ToolArgumentError",
         "field_count": 1,
     }
     expected_canonical = canonical_json(expected_arguments)
@@ -1852,9 +1856,11 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
     assert len(result.persisted_assistant_tool_calls) == 1
     persisted_call = result.persisted_assistant_tool_calls[0]
     persisted_args = json.loads(persisted_call["function"]["arguments"])
+    # S0: the closed-root S gate rejects the extra key (a ToolArgumentError);
+    # the hand label "ValueError" is gone.
     assert persisted_args == {
         "_redaction_status": "invalid_tool_arguments",
-        "error_class": "ValueError",
+        "error_class": "ToolArgumentError",
         "field_count": 5,
     }
     persisted_blob = json.dumps(

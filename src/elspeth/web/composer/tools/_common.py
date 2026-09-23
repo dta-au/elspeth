@@ -33,6 +33,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -1231,6 +1232,7 @@ def _validate_mutation_arguments[ModelT: BaseModel](model: type[ModelT], argumen
             argument=argument_name,
             expected=f"object conforming to {model.__name__}",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
 

@@ -17,6 +17,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, select
 
 from elspeth.contracts.blobs import STORAGE_MIME_TYPES
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -1038,6 +1039,7 @@ def _execute_set_source(
             argument="set_source arguments",
             expected="object conforming to SetSourceArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     plugin = validated.plugin
@@ -1215,6 +1217,7 @@ def _execute_set_source_from_blob(
             argument="set_source_from_blob arguments",
             expected="object conforming to SetSourceFromBlobArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     source_name = validated.source_name
@@ -1444,6 +1447,7 @@ def _execute_set_source_from_blobs(
             argument="set_source_from_blobs arguments",
             expected="object conforming to SetSourceFromBlobsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     source_name = validated.source_name
@@ -1796,6 +1800,7 @@ def _execute_inspect_source(
             argument="inspect_source arguments",
             expected="object conforming to InspectSourceArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     blob_id = validated.blob_id
@@ -1888,6 +1893,7 @@ def _execute_patch_source_options(
             argument="patch_source_options arguments",
             expected="object conforming to PatchSourceOptionsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     source_name = validated.source_name
     if source_name not in state.sources:

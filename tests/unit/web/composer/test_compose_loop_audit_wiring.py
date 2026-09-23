@@ -298,6 +298,8 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     assert json.loads(durable_responses[1]["result_canonical"]) == {
         "_redaction_status": "arg_error",
         "error_class": "ToolArgumentError",
+        # S0: the closed category persists beside the honest class.
+        "error_category": "semantic_rule",
         "error_message": "<redacted-arg-error-message>",
     }
     assert json.loads(durable_responses[2]["result_canonical"]) == {
