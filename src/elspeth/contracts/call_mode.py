@@ -44,6 +44,19 @@ class VerificationDecision:
         object.__setattr__(self, "differences", deep_freeze(self.differences))
 
 
+@dataclass(frozen=True, slots=True)
+class ReplaySSRFRequest:
+    """Archived DNS pin for a syntax-valid URL, before network resolution."""
+
+    original_url: str
+    resolved_ip: str
+    host_header: str
+    port: int
+    path: str
+    scheme: str
+    bare_hostname: str
+
+
 class CallModeSession(Protocol):
     """Per-run call lookup and durable comparison authority.
 
@@ -69,6 +82,17 @@ class CallModeSession(Protocol):
         current_operation_id: str | None,
         current_call_index: int,
     ) -> ReplayCallEvidence: ...
+
+    def replay_ssrf_request(
+        self,
+        *,
+        original_url: str,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> ReplaySSRFRequest:
+        """Recover a recorded DNS pin without doing current DNS resolution."""
+        ...
 
     def verify_call(
         self,
