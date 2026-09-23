@@ -82,7 +82,7 @@ not survive as issue hierarchies. Each became one issue pointing at a folder:
 
 | Programme | Detail |
 |---|---|
-| Identity and workflow governance | `docs/programmes/identity-workflow-governance/` |
+| Identity and workflow governance | `docs-archive/2026-09-23-identity-workflow-governance/` |
 | State engine — completion to 1.0 | `docs/programmes/state-engine-1.0/` |
 
 Each folder holds a README with the full scope and a `tracker-rows.json` preserving the

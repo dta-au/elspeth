@@ -2,8 +2,15 @@
 
 Pluggable SSO, identity substrate, approval, review, shared library, per-person quotas and compartment marking.
 
-One GitHub issue points here. This folder is the detail: the programme's scope as it stood in
-the filigree tracker on 2026-09-23, captured verbatim before those rows were closed.
+**Archived 2026-09-23: this programme is complete.** It is kept for the record rather than as
+live planning, and the GitHub issue that pointed here has been closed. This folder is the
+detail: the programme's scope as it stood in the filigree tracker on 2026-09-23, captured
+verbatim before those rows were closed, plus the delivery status measured the day it finished.
+
+The quoted tracker rows below are **not** updated for the move. One of them cites
+`docs/plans/2026-09-19-identity-workflow-finalization.md`, which now sits beside this folder in
+`docs-archive/`. That path is left as the row wrote it: the rows are a frozen record of what the
+tracker said, and repairing a link inside a quotation would make it no longer a quotation.
 
 ## Why this is a folder and not 17 issues
 
@@ -15,14 +22,14 @@ verbatim in `tracker-rows.json` alongside this file — nothing was summarised a
 ## Documents of record
 
 - `docs/specs/2026-09-02-pluggable-sso-design.md` — the design of record
-- `docs/plans/2026-09-19-identity-workflow-finalization.md` — finalization plan
+- `docs-archive/2026-09-19-identity-workflow-finalization.md` — finalization plan (archived with this folder)
 - `docs/plans/2026-09-13-kubernetes-and-identity/` — the Kubernetes-and-identity planning set
 
 ## Status
 
-**Re-measured 2026-09-23: the programme is essentially delivered — 9 of 12 deliverables done.**
-The three that remain are read-surface and labelling work, not enforcement. Full evidence:
-`docs/reviews/2026-09-23-identity-sso-completion.md`.
+**Complete as of 2026-09-23 — 12 of 12 deliverables done.** Evidence for the first nine:
+`docs/reviews/2026-09-23-identity-sso-completion.md`. The last three were the gaps that
+review found, and all three were closed the same day.
 
 | Deliverable | State |
 |---|---|
@@ -33,9 +40,9 @@ The three that remain are read-surface and labelling work, not enforcement. Full
 | Compartment marking | Done |
 | Admin interface | Done |
 | Operator cutover runbook and compatibility record | Done — `docs/runbooks/identity-workflow-cutover.md` |
-| Approver audit view | **Partial** — the route is registered and tested, no interface reads it |
-| Composer completion-bar affordances | **Partial** — reachable, but see the placement question below |
-| `Save for review` → `Share inspect link` rename | **Not done** — the old label is still in the served bundle |
+| Approver audit view | Done — `4ae6ba8fd` gave the endpoint a read surface as a third mailbox folder |
+| Composer completion-bar affordances | Done — `af75be99a` moved them out of the Checks sub-tab |
+| `Save for review` → `Share inspect link` rename | Done — `6d8f7f729` |
 
 ### One thing to understand before reading "done"
 
@@ -46,13 +53,29 @@ it on is refused unless a `compartment_id` is set and registration is not open
 registration and every author-is-not-approver rule would be defeatable. So the machinery is
 built and the enforcement is real; a deployment that has not turned it on is not governed.
 
-### A question this raises, not an answer
+### The three gaps, and how each was closed
 
-Send-for-approval and send-for-review are reached through the Pipeline → Checks sub-tab
-(`ApprovalReadinessRow` → `AuditReadinessPanel` → `ChecksView`). A pending approval is a
-blocking state, and the standing placement ruling for this project is that a blocking state and
-its fix affordance belong at the top level rather than in a sub-tab. Whether that ruling governs
-this surface is a decision, not something to infer.
+**The approver audit view had no reader.** `/api/workflow/audit-view` had been registered and
+tested since the governance work landed, with no interface calling it. It is now a third folder
+in the mailbox, beside Inbox and Sent — the same audience, because the endpoint answers 404 to
+anyone who is not an approver. It fetches only when that folder is opened, renders a refusal as
+a message rather than as an empty table, and offers no control at all: the rows are records, and
+an affordance would imply a decision this surface deliberately cannot make.
+
+**The approval controls were behind a sub-tab.** They were reached through Pipeline → Checks
+(`ApprovalReadinessRow` → `AuditReadinessPanel` → `ChecksView`). A pending approval withholds
+execution, so it is a blocking state, and the standing ruling for this project is that a
+blocking state and the control that clears it sit at the top level. They now render in the chat
+panel beside the decision panel — *beside* rather than inside, because that panel returns
+nothing when there is nothing to decide, which is exactly when a clean composition is ready to
+be sent. Moving them changed no test result, because nothing pinned where they lived; two
+mutation-controlled pins now hold the placement from both directions.
+
+**The rename had never been executed.** `docs/plans/2026-09-13-kubernetes-and-identity/I4-reviews.md`
+step 15 specified it in full. The old name had become wrong rather than merely dated: it reads as
+a request addressed to a person, which is what this programme's own send-for-review verb now
+does, while the gesture itself mints a link anyone holding it can inspect. Only the visible name
+changed — the wire identifier, the test ids and the share-link lifecycle are untouched.
 
 ### Why the previous status was wrong, and what it said
 

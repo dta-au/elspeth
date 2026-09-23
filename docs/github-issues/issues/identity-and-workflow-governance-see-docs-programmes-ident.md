@@ -7,7 +7,7 @@ Tracking issue for the identity and workflow governance programme: who can sign 
 
 ## Where the detail lives
 
-`docs/programmes/identity-workflow-governance/` in this repository:
+`docs-archive/2026-09-23-identity-workflow-governance/` in this repository:
 
 - `README.md` — the scope, the documents of record, and all sixteen steps with their acceptance notes.
 - `tracker-rows.json` — the original work items, retained for traceability.
@@ -50,5 +50,5 @@ Two things to check before starting any of them, because the programme documents
 ## Documents of record
 
 - `docs/specs/2026-09-02-pluggable-sso-design.md`
-- `docs/plans/2026-09-19-identity-workflow-finalization.md`
+- `docs-archive/2026-09-19-identity-workflow-finalization.md`
 - `docs/plans/2026-09-13-kubernetes-and-identity/`
