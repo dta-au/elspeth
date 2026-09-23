@@ -287,7 +287,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ea3d3d1b406ad2aa"
+    source_file_hash: str | None = "sha256:87479c2516f06084"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
