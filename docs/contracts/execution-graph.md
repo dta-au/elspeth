@@ -653,8 +653,17 @@ trigger: count, condition, timeout, end of source), the WHOLE batch fails:
    the per-row discard pair, written inside that same `complete_barrier`
    transaction.
 
-A batch transform that RAISES still aborts the run; only a returned error is
-routed.
+A raised Tier-2 `PluginContractViolation` fails the batch the same way, before
+anything is recorded (`AggregationExecutor.execute_flush` converts it to a
+returned error with the violation's field-and-type reason). That covers the
+plugin's own violation, a buffered row that fails the aggregation's typed
+input `schema`, and the engine's checks on a success result: output schema
+validation, `expected_output_count`, and non-canonical output. What still
+aborts the run: the Tier-1 errors (`TIER_1_ERRORS`, including the
+`PluginContractViolation` subclass `SinkTransactionalInvariantError`), lost
+run leadership or membership, any other exception the batch transform
+raises, and the processor's declaration cross-check, which runs after the
+flush and writes each member's terminal before it raises.
 
 ### DIVERT Edge Properties
 

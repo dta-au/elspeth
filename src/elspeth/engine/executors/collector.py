@@ -842,16 +842,30 @@ class CollectorExecutor:
         failure_reason: str,
         coordination_token: CoordinationToken,
     ) -> CollectorOutcome:
-        """require_all group failure: engine-performed, plugin never invoked (spec §6.4)."""
+        """Fail the group as a whole: every arrived member is held FAILED, the engine writes the verdict.
+
+        Three arms reach it, named by ``failure_reason``:
+
+        * ``collector_missing_members`` — ``_close_group``: a ``require_all``
+          roster closed with members lost. The plugin is never invoked
+          (spec §6.4).
+        * ``collector_transform_error`` — ``_execute_flush``: the plugin ran
+          and returned ``TransformResult.error``.
+        * ``collector_contract_violation`` — ``_execute_flush``: a Tier-2
+          ``PluginContractViolation``, raised by the plugin itself or by the
+          engine's pre/postflight checks on the members or on the output it
+          returned. The flush state is already completed FAILED with the
+          violation's reason before this runs.
+        """
         group_id = key[1]
         consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
         now = self._clock.monotonic()
-        # I-2 (fix round 2): this method is BOTH the require_all-loss arm
-        # (_close_group, pending.lost always non-empty there) AND the
-        # collector_transform_error arm (_execute_flush, pending.lost is
-        # typically empty and the scope may be best_effort) — the message
-        # must not hardcode "under require_all" for a call it also serves
-        # on a different failure_reason and policy.
+        # I-2 (fix round 2): this method serves three arms (see the
+        # docstring). Only the require_all-loss arm guarantees a non-empty
+        # pending.lost; the two _execute_flush arms usually have none and the
+        # scope may be best_effort — so the message must not hardcode "under
+        # require_all" for a call it also serves on a different
+        # failure_reason and policy.
         if pending.lost:
             exception_text = f"Collector group {group_id!r} failed ({failure_reason}): lost members {sorted(pending.lost)!r}"
         else:
