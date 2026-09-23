@@ -220,6 +220,45 @@ def test_http_replay_rejects_legacy_payload_without_constructing_httpx_client(mo
         )
         with pytest.raises(AuditIntegrityError, match="lacks exact transport"):
             client.get("https://api.example.com/raw")
+
+
+@pytest.mark.parametrize(
+    ("transport", "message"),
+    [
+        ({"body_b64": "b2s=", "request_url": "https://api.example.com/raw"}, "required transport fields"),
+        ({"body_b64": "b2s=", "headers": "content-type: text/plain", "request_url": "https://api.example.com/raw"}, "ordered headers"),
+        ({"body_b64": "b2s=", "headers": [["content-type"]], "request_url": "https://api.example.com/raw"}, "invalid headers"),
+        ({"body_b64": "b2s=", "headers": [], "request_url": "https://api.example.com/other"}, "incomplete or divergent transport"),
+    ],
+)
+def test_http_replay_refuses_corrupt_transport_without_client(mock_execution, mock_telemetry_emit, transport, message):
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+        source_run_id = "source-run"
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence(
+                source_call_id="source-call",
+                status=CallStatus.SUCCESS,
+                response_data={"status_code": 200, "headers": {}, "body_size": 2, "body": "ok", "transport": transport},
+                error_data=None,
+                latency_ms=1.0,
+            )
+
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")),
+        pytest.raises(AuditIntegrityError, match=message),
+    ):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+        client.get("https://api.example.com/raw")
+    assert mock_execution.record_call.call_count == 0
     assert mock_execution.record_call.call_count == 0
 
 

@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Network, IPv6Network
 from threading import Lock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -34,6 +35,7 @@ from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipTo
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import stable_hash
@@ -62,6 +64,7 @@ from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict 
 logger = structlog.get_logger(__name__)
 
 _HTTP_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
+_FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
 
 
 def _sanitize_http_error_message(message: str) -> str:
@@ -234,7 +237,7 @@ class AuditedHTTPClient(AuditedClientBase):
         source_call_id: str | None = None,
     ) -> Call:
         """Sanitize HTTP error URLs at the shared audit persistence boundary."""
-        if isinstance(error, HTTPCallError):
+        if type(error) is HTTPCallError:
             error = HTTPCallError(
                 type=error.type,
                 message=_sanitize_http_error_message(error.message),
@@ -346,7 +349,7 @@ class AuditedHTTPClient(AuditedClientBase):
         Returns:
             Call object from Landscape recording (contains request_ref and response_ref blob hashes).
         """
-        if isinstance(error_data, HTTPCallError):
+        if type(error_data) is HTTPCallError:
             error_data = HTTPCallError(
                 type=error_data.type,
                 message=_sanitize_http_error_message(error_data.message),
@@ -398,23 +401,30 @@ class AuditedHTTPClient(AuditedClientBase):
         payload = evidence.response_data
         if payload is None:
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has no response payload")
-        status_code = payload.get("status_code")
-        body_size = payload.get("body_size")
-        transport = payload.get("transport")
+        if "status_code" not in payload:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid status")
+        if "transport" not in payload:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks exact transport")
+        status_code = payload["status_code"]
+        transport = payload["transport"]
+        body_size = payload["body_size"] if "body_size" in payload else None
         if type(status_code) is not int or not 100 <= status_code <= 999:
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid status")
-        if (body_size is not None and (type(body_size) is not int or body_size < 0)) or not isinstance(transport, Mapping):
+        if (body_size is not None and (type(body_size) is not int or body_size < 0)) or type(transport) not in (dict, MappingProxyType):
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks exact transport")
-        encoded_body = transport.get("body_b64")
-        header_pairs = transport.get("headers")
-        recorded_url = transport.get("request_url")
+        try:
+            encoded_body = transport["body_b64"]
+            header_pairs = transport["headers"]
+            recorded_url = transport["request_url"]
+        except KeyError as exc:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks required transport fields") from exc
         if type(encoded_body) is not str or type(recorded_url) is not str or (expected_url is not None and recorded_url != expected_url):
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has incomplete or divergent transport")
-        if not isinstance(header_pairs, tuple | list):
+        if type(header_pairs) not in (tuple, list):
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks ordered headers")
         headers: list[tuple[str, str]] = []
         for pair in header_pairs:
-            if not isinstance(pair, tuple | list) or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str:
+            if type(pair) not in (tuple, list) or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str:
                 raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid headers")
             name, value = pair
             if self._filter_response_headers({name: value}) != {name: value} or name.lower() == "content-encoding":
@@ -506,24 +516,27 @@ class AuditedHTTPClient(AuditedClientBase):
                 current_operation_id=self._operation_id,
                 current_call_index=call_index,
             )
-            archived_headers = archived.request_data.get("headers")
-            current_headers = request_data.get("headers")
-            if not isinstance(archived_headers, Mapping) or not isinstance(current_headers, Mapping):
+            archived_request_data = {key: deep_thaw(value) for key, value in archived.request_data.items()}
+            if "headers" not in archived_request_data or "headers" not in request_data:
+                raise AuditIntegrityError("Archived HTTP request has no headers")
+            archived_headers = archived_request_data["headers"]
+            current_headers = request_data["headers"]
+            if type(archived_headers) is not dict or type(current_headers) is not dict:
                 raise AuditIntegrityError("Archived HTTP request has invalid headers")
             archived_auth = [(key, value) for key, value in archived_headers.items() if type(key) is str and key.lower() == "authorization"]
             if len(archived_auth) != 1 or any(type(key) is str and key.lower() == "authorization" for key in current_headers):
                 raise AuditIntegrityError("Archived HTTP request has ambiguous credential identity")
             fingerprint = archived_auth[0][1]
-            if type(fingerprint) is not str or not fingerprint.startswith("<fingerprint:"):
+            if type(fingerprint) is not str or _FINGERPRINTED_AUTH.fullmatch(fingerprint) is None:
                 raise AuditIntegrityError("Archived HTTP credential has no trusted fingerprint")
-            comparable = dict(archived.request_data)
+            comparable = dict(archived_request_data)
             comparable["headers"] = {key: value for key, value in archived_headers.items() if key != archived_auth[0][0]}
             if comparable != request_data:
                 raise AuditIntegrityError("Current HTTP request differs from archived non-auth fields")
-            replay_request_data = archived.request_data
+            replay_request_data = archived_request_data
             archived_request_id = archived.source_call_id
             audit_request_data = {
-                **archived.request_data,
+                **archived_request_data,
                 "replay_credential_origin": {
                     "source_run_id": session.source_run_id,
                     "source_call_id": archived.source_call_id,
@@ -541,23 +554,27 @@ class AuditedHTTPClient(AuditedClientBase):
         if archived_request_id is not None and evidence.source_call_id != archived_request_id:
             raise AuditIntegrityError("Archived HTTP credential does not belong to the replayed source call")
         payload = evidence.response_data
-        transport = payload.get("transport") if payload is not None else None
-        if not isinstance(transport, Mapping):
+        if payload is None or "transport" not in payload:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
-        raw_hops = transport.get("redirect_hops", ())
-        redirect_count = payload.get("redirect_count", 0) if payload is not None else 0
-        if type(redirect_count) is not int or not isinstance(raw_hops, tuple | list) or redirect_count != len(raw_hops):
+        transport = payload["transport"]
+        if type(transport) not in (dict, MappingProxyType):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
+        raw_hops = transport["redirect_hops"] if "redirect_hops" in transport else ()
+        redirect_count = payload["redirect_count"] if "redirect_count" in payload else 0
+        if type(redirect_count) is not int or type(raw_hops) not in (tuple, list) or redirect_count != len(raw_hops):
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has incomplete redirects")
         if (not follow_redirects and redirect_count) or redirect_count > max_redirects:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} exceeds requested redirect policy")
         last_hop_url: str | None = None
         last_hop_transport_url: str | None = None
         for raw_hop in raw_hops:
-            if not isinstance(raw_hop, Mapping):
+            if type(raw_hop) not in (dict, MappingProxyType):
                 raise AuditIntegrityError("SSRF-safe HTTP replay has malformed redirect evidence")
-            hop_request = raw_hop.get("request")
-            hop_response = raw_hop.get("response")
-            if not isinstance(hop_request, Mapping) or not isinstance(hop_response, Mapping):
+            if "request" not in raw_hop or "response" not in raw_hop:
+                raise AuditIntegrityError("SSRF-safe HTTP replay has missing redirect payloads")
+            hop_request = raw_hop["request"]
+            hop_response = raw_hop["response"]
+            if type(hop_request) not in (dict, MappingProxyType) or type(hop_response) not in (dict, MappingProxyType):
                 raise AuditIntegrityError("SSRF-safe HTTP replay has missing redirect payloads")
             hop_index = self._next_call_index()
             hop_evidence = session.replay_call(
@@ -569,12 +586,18 @@ class AuditedHTTPClient(AuditedClientBase):
             )
             if hop_evidence.response_data != hop_response:
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} differs from parent archive")
-            hop_method = hop_request.get("method")
-            hop_transport = hop_response.get("transport")
-            hop_url = hop_transport.get("request_url") if isinstance(hop_transport, Mapping) else None
+            if "method" not in hop_request or "transport" not in hop_response:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks required fields")
+            hop_method = hop_request["method"]
+            hop_transport = hop_response["transport"]
+            if type(hop_transport) not in (dict, MappingProxyType) or "request_url" not in hop_transport:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks transport URL")
+            hop_url = hop_transport["request_url"]
             if type(hop_method) is not str or type(hop_url) is not str:
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks transport URL")
-            archived_hop_url = hop_request.get("url")
+            if "url" not in hop_request:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
+            archived_hop_url = hop_request["url"]
             if type(archived_hop_url) is not str:
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
             last_hop_url = archived_hop_url
@@ -582,11 +605,15 @@ class AuditedHTTPClient(AuditedClientBase):
             self._restore_replay_response(hop_evidence, method=hop_method, expected_url=hop_url, request_headers=request_headers)
             hop_audit_request: Mapping[str, Any] = hop_request
             if self._archived_auth_for_replay:
-                hop_headers = hop_request.get("headers")
-                if not isinstance(hop_headers, Mapping):
+                if "headers" not in hop_request:
+                    raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has no headers")
+                hop_headers = hop_request["headers"]
+                if type(hop_headers) not in (dict, MappingProxyType):
                     raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has invalid headers")
                 hop_auth = [(key, value) for key, value in hop_headers.items() if type(key) is str and key.lower() == "authorization"]
-                if len(hop_auth) > 1 or (hop_auth and (type(hop_auth[0][1]) is not str or not hop_auth[0][1].startswith("<fingerprint:"))):
+                if len(hop_auth) > 1 or (
+                    hop_auth and (type(hop_auth[0][1]) is not str or _FINGERPRINTED_AUTH.fullmatch(hop_auth[0][1]) is None)
+                ):
                     raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has invalid credential evidence")
                 if hop_auth:
                     hop_audit_request = {
@@ -607,14 +634,16 @@ class AuditedHTTPClient(AuditedClientBase):
                 latency_ms=hop_evidence.latency_ms,
                 source_call_id=hop_evidence.source_call_id,
             )
-        logical_url = transport.get("logical_url")
+        if "logical_url" not in transport or "request_url" not in transport:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks redirect URLs")
+        logical_url = transport["logical_url"]
         if type(logical_url) is not str:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks logical URL")
         if _fingerprint_url(logical_url) != logical_url:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has unsafe logical URL")
         if redirect_count == 0 and logical_url != request.original_url:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} changed URL")
-        if redirect_count and (logical_url != last_hop_url or transport.get("request_url") != last_hop_transport_url):
+        if redirect_count and (logical_url != last_hop_url or transport["request_url"] != last_hop_transport_url):
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has inconsistent final redirect")
         expected_url = str(httpx.Request(method, request.connection_url, params=params).url) if redirect_count == 0 else None
         response = self._restore_replay_response(
