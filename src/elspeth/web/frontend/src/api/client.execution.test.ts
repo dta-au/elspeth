@@ -84,6 +84,35 @@ describe("api/client execution state binding", () => {
     expect(result.readiness.blockers[0].suggestion).toBe(suggestion);
   });
 
+  it.each([null, "The merge step needs a failure route."])("preserves live blocker note %s", async (note) => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({
+      is_valid: true, checks: [], errors: [],
+      readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
+        blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
+          component_type: "pipeline", detail: "Review pending.", suggestion: null, note }] },
+    }), { status: 200 }));
+    const result = await validatePipeline("session-1");
+    expect(result.readiness.blockers[0].note).toBe(note);
+  });
+
+  it.each([
+    { label: "missing", note: undefined },
+    { label: "numeric", note: 7 },
+    { label: "array", note: ["Reviewer text"] },
+    { label: "object", note: { text: "Reviewer text" } },
+    { label: "boolean", note: true },
+  ])("rejects $label live blocker note", async ({ note }) => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify({
+      is_valid: true, checks: [], errors: [],
+      readiness: { authoring_valid: true, execution_ready: true, completion_ready: false,
+        blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline",
+          component_type: "pipeline", detail: "Review pending.", suggestion: null, note }] },
+    }), { status: 200 }));
+    await expect(validatePipeline("session-1")).rejects.toMatchObject({
+      detail: "Unexpected readiness shape from validate endpoint",
+    });
+  });
+
   it("carries the secret acknowledgement token alongside the fanout token", async () => {
     fetchSpy.mockResolvedValue({
       ok: true,

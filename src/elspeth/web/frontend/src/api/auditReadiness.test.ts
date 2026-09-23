@@ -193,6 +193,37 @@ describe("auditReadiness API client", () => {
     });
   });
 
+  it.each([null, "The merge step needs a failure route."])("preserves backend blocker note %s", async (note) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion: null, note,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    const snapshot = await fetchAuditReadiness(SESSION_ID);
+    expect(snapshot.validation_result.readiness.blockers[0].note).toBe(note);
+  });
+
+  it.each([
+    { label: "missing", note: undefined },
+    { label: "numeric", note: 7 },
+    { label: "array", note: ["Reviewer text"] },
+    { label: "object", note: { text: "Reviewer text" } },
+    { label: "boolean", note: true },
+  ])("rejects $label backend blocker note", async ({ note }) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion: null, note,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({
+      detail: "Unexpected response shape from audit-readiness endpoint",
+    });
+  });
+
   it.each([
     ["missing readiness row", (body: Record<string, unknown>) => { (body.rows as unknown[]).pop(); }],
     ["duplicate readiness row", (body: Record<string, unknown>) => { (body.rows as unknown[]).push((body.rows as unknown[])[0]); }],

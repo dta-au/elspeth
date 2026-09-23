@@ -18,7 +18,8 @@ export function isValidationReadiness(value: unknown): value is ValidationReadin
       (typeof blocker.component_id === "string" || blocker.component_id === null) &&
       (typeof blocker.component_type === "string" || blocker.component_type === null) &&
       typeof blocker.detail === "string" &&
-      (typeof blocker.suggestion === "string" || blocker.suggestion === null),
+      (typeof blocker.suggestion === "string" || blocker.suggestion === null) &&
+      (typeof blocker.note === "string" || blocker.note === null),
     )
   );
 }
