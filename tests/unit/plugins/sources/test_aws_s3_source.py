@@ -6,15 +6,18 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from elspeth.contracts import RunMode
 from elspeth.contracts.aws_s3 import (
     S3_PRIVATE_BINDING_OPTION_NAMES,
     S3ProfiledAuditIdentity,
     s3_profiled_binding_fingerprint,
 )
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
 if TYPE_CHECKING:
@@ -545,14 +548,41 @@ class _SourceContext:
     calls: list[dict[str, Any]] = field(default_factory=list)
     validation_errors: list[dict[str, Any]] = field(default_factory=list)
     call_error: BaseException | None = None
+    run_mode: RunMode = RunMode.LIVE
+    operation_id: str | None = None
+    call_mode_session: Any | None = None
 
-    def record_call(self, **kwargs: Any) -> None:
+    def record_call(self, **kwargs: Any) -> Any | None:
         if self.call_error is not None:
             raise self.call_error
         self.calls.append(kwargs)
+        if self.run_mode is RunMode.VERIFY:
+            return SimpleNamespace(call_id=f"call-{len(self.calls)}", call_index=len(self.calls) - 1)
+        return None
 
     def record_validation_error(self, **kwargs: Any) -> None:
         self.validation_errors.append(kwargs)
+
+
+@dataclass
+class _VerifySession:
+    preflight_error: Exception | None = None
+    preflights: list[dict[str, Any]] = field(default_factory=list)
+    admissions: list[dict[str, Any]] = field(default_factory=list)
+    verifications: list[dict[str, Any]] = field(default_factory=list)
+
+    def preflight_verify_request(self, **kwargs: Any) -> str:
+        self.preflights.append(kwargs)
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        return "source-call"
+
+    def admit_verify_call(self, **kwargs: Any) -> str:
+        self.admissions.append(kwargs)
+        return "source-call"
+
+    def verify_call(self, **kwargs: Any) -> None:
+        self.verifications.append(kwargs)
 
 
 @dataclass
@@ -585,6 +615,98 @@ def _source_for(data: bytes, **config_overrides: Any) -> tuple[Any, _RuntimeClie
     client = _RuntimeClient(data)
     source._s3_client = client
     return source, client, _SourceContext()
+
+
+@pytest.mark.parametrize("reason", ["missing source call", "ambiguous source call"])
+@pytest.mark.parametrize("preexisting_client", [False, True])
+def test_verify_s3_source_preflight_denies_sdk_construction_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch, reason: str, preexisting_client: bool
+) -> None:
+    from elspeth.plugins.sources import aws_s3_source
+
+    source = aws_s3_source.AWSS3Source(_config())
+    constructions: list[str] = []
+    dispatches: list[str] = []
+
+    def forbidden_build(_region: str | None, _endpoint: str | None) -> Any:
+        constructions.append("built")
+        raise AssertionError("S3 SDK constructed before verify preflight")
+
+    class NoDispatch:
+        def head_object(self, **_kwargs: Any) -> object:
+            dispatches.append("head")
+            raise AssertionError("S3 HeadObject escaped verify preflight")
+
+        def get_object(self, **_kwargs: Any) -> object:
+            dispatches.append("get")
+            raise AssertionError("S3 GetObject escaped verify preflight")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(aws_s3_source, "build_s3_client", forbidden_build)
+    if preexisting_client:
+        source._s3_client = NoDispatch()
+    session = _VerifySession(preflight_error=AuditIntegrityError(reason))
+    ctx = _SourceContext(run_mode=RunMode.VERIFY, operation_id="source-operation", call_mode_session=session)
+    with pytest.raises(AuditIntegrityError, match=reason):
+        list(source.load(ctx))
+    assert session.preflights == [
+        {
+            "call_type": aws_s3_source.CallType.HTTP,
+            "request_data": {"operation": "read_object", "bucket": "input-bucket", "key": "incoming/data.csv"},
+            "current_state_id": None,
+            "current_operation_id": "source-operation",
+        }
+    ]
+    assert constructions == []
+    assert dispatches == []
+    assert ctx.calls == []
+
+
+def test_verify_s3_source_compares_recorded_download_after_preflight() -> None:
+    from elspeth.contracts import CallStatus, CallType
+
+    source, _, ctx = _source_for(b"id\n1\n")
+    session = _VerifySession()
+    ctx.run_mode = RunMode.VERIFY
+    ctx.operation_id = "source-operation"
+    ctx.call_mode_session = session
+    rows = list(source.load(ctx))
+    assert len(rows) == 1
+    assert session.preflights[0]["request_data"] == ctx.calls[0]["request_data"]
+    assert session.admissions[0]["call_type"] is CallType.HTTP
+    assert session.admissions[0]["current_call_index"] == 0
+    assert session.verifications[0]["current_call_id"] == "call-1"
+    assert session.verifications[0]["live_status"] is CallStatus.SUCCESS
+    assert session.verifications[0]["live_response_data"] == ctx.calls[0]["response_data"]
+
+
+def test_verify_s3_source_compares_recorded_download_error() -> None:
+    from elspeth.contracts import CallStatus
+    from elspeth.plugins.sources.aws_s3_source import S3SourceReadError
+
+    source, _, ctx = _source_for(b"id\n1\n")
+    source._s3_client = _Client({}, {})
+    session = _VerifySession()
+    ctx.run_mode = RunMode.VERIFY
+    ctx.operation_id = "source-operation"
+    ctx.call_mode_session = session
+    with pytest.raises(S3SourceReadError):
+        list(source.load(ctx))
+    assert len(ctx.calls) == 1
+    assert session.admissions[0]["current_call_index"] == 0
+    assert session.verifications[0]["live_status"] is CallStatus.ERROR
+    assert session.verifications[0]["live_error_data"] == ctx.calls[0]["error"]
+
+
+def test_replay_s3_source_load_denies_direct_sdk_dispatch() -> None:
+    source, client, ctx = _source_for(b"id\n1\n")
+    ctx.run_mode = RunMode.REPLAY
+    with pytest.raises(AuditIntegrityError, match="archived source rows"):
+        list(source.load(ctx))
+    assert ctx.calls == []
+    assert client.bodies == []
 
 
 class TestAWSS3SourceRegistrationAndParsing:

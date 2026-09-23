@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, RunMode, SourceRow
 from elspeth.contracts.aws_s3 import (
     S3_PRIVATE_BINDING_OPTION_NAMES,
     S3_PROFILED_AUDIT_SAFE_OPTION_NAMES,
@@ -31,6 +31,7 @@ from elspeth.contracts.aws_s3 import (
 )
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
@@ -844,15 +845,38 @@ def _record_download_call(
     response_data: dict[str, Any] | None = None,
     error_data: dict[str, Any] | None = None,
 ) -> None:
-    ctx.record_call(
+    request_data = {"operation": "read_object", **audit_identity}
+    call = ctx.record_call(
         call_type=CallType.HTTP,
         status=status,
-        request_data={"operation": "read_object", **audit_identity},
+        request_data=request_data,
         response_data=response_data,
         error=error_data,
         latency_ms=latency_ms,
         provider="aws_s3",
     )
+    if ctx.run_mode is RunMode.VERIFY:
+        session = ctx.call_mode_session
+        if session is None or ctx.operation_id is None or call is None:
+            raise AuditIntegrityError("S3 source verify call lacks audited operation and call identity")
+        session.admit_verify_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=None,
+            current_operation_id=ctx.operation_id,
+            current_call_index=call.call_index,
+        )
+        session.verify_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=None,
+            current_operation_id=ctx.operation_id,
+            current_call_index=call.call_index,
+            current_call_id=call.call_id,
+            live_status=status,
+            live_response_data=response_data,
+            live_error_data=error_data,
+        )
 
 
 class AWSS3Source(BaseSource):
@@ -861,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fc49da8dd44c8bbb"
+    source_file_hash: str | None = "sha256:5570ff78dfec18f3"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1007,6 +1031,19 @@ class AWSS3Source(BaseSource):
             raise RuntimeError("aws_s3 source is closed")
         if self._active_download is not None:
             raise RuntimeError("aws_s3 source load is already active")
+
+        if ctx.run_mode is RunMode.REPLAY:
+            raise AuditIntegrityError("S3 source replay must consume archived source rows")
+        if ctx.run_mode is RunMode.VERIFY:
+            session = ctx.call_mode_session
+            if session is None or ctx.operation_id is None:
+                raise AuditIntegrityError("S3 source verify requires an audited source_load operation")
+            session.preflight_verify_request(
+                call_type=CallType.HTTP,
+                request_data={"operation": "read_object", **self._audit_object_identity()},
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+            )
 
         self._first_valid_row_processed = False
         started = time.perf_counter()
