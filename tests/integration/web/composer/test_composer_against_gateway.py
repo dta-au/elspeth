@@ -521,17 +521,25 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
 
 # ---------------------------------------------------------------------------
-# The boot probe against the live gateway. ``probe_composer_config``
-# sends ``max_tokens=16`` for the planner, which LiteLLM's ``openai`` path
-# translates to the wire field ``max_completion_tokens``; the gateway's
-# ``extra="forbid"`` ``ChatRequest`` rejected that as an unknown field, so
-# the probe raised ``ComposerBootConfigError`` and ``app.py`` re-raised it --
-# the web app could not boot at all against this gateway.
+# The boot probe against the live gateway. The probe sends the planner's
+# production-shaped requests: the 42-tool compose-loop list with
+# ``max_tokens=16`` (which LiteLLM's ``openai`` path translates to the wire
+# field ``max_completion_tokens``; the gateway's ``extra="forbid"``
+# ``ChatRequest`` once rejected that as an unknown field, so boot failed
+# against this gateway), and the pipeline planner's discovery tools plus its
+# terminal with the planner's own token cap. Both must be accepted.
 # ---------------------------------------------------------------------------
 
 
+def _planner_probe_requests(tmp_path: Path, gateway_base_url: str, **overrides: Any) -> Any:
+    from elspeth.web.composer.boot_probe import build_composer_probe_requests
+
+    settings = _settings(tmp_path, endpoint_base_url=f"{gateway_base_url}/v1", endpoint_api_key=_INBOUND_BEARER, **overrides)
+    return [request for request in build_composer_probe_requests(settings) if request.role == "planner"]
+
+
 @pytest.mark.asyncio
-async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> None:
+async def test_boot_probe_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
     """Default settings, real probe, live gateway -- boot is not fatal.
 
     ``ComposerBootConfigError`` is asserted by absence deliberately rather
@@ -541,23 +549,19 @@ async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> Non
     """
     from elspeth.web.composer.boot_probe import probe_composer_config
 
-    probed = await probe_composer_config(
-        role="planner",
-        model=_MODEL_ALIAS,
-        temperature=None,
-        seed=None,
-        api_base=f"{gateway_base_url}/v1",
-        api_key=_INBOUND_BEARER,
-    )
+    requests = _planner_probe_requests(tmp_path, gateway_base_url)
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
+    assert requests[0].tool_count == 42
 
-    # True (not the transient-failure False) -- the request was accepted and
-    # answered, so this proves acceptance rather than a swallowed transport
-    # error.
-    assert probed is True
+    for request in requests:
+        # True (not the transient-failure False) -- the request was accepted
+        # and answered, so this proves acceptance rather than a swallowed
+        # transport error.
+        assert await probe_composer_config(request) is True, request.surface
 
 
 @pytest.mark.asyncio
-async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gateway_base_url: str) -> None:
+async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
     """The probe's other real payload shape: temperature + seed alongside the
     translated token cap. ``seed`` is a gated capability the reference
     adapter declares, so this also proves the alias did not disturb the
@@ -565,36 +569,28 @@ async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gatewa
     gpt-5.5 rejects nondefault temperature while reasoning is active."""
     from elspeth.web.composer.boot_probe import probe_composer_config
 
-    probed = await probe_composer_config(
-        role="planner",
-        model=_SAMPLING_MODEL_ALIAS,
-        temperature=0.2,
-        seed=7,
-        api_base=f"{gateway_base_url}/v1",
-        api_key=_INBOUND_BEARER,
+    requests = _planner_probe_requests(
+        tmp_path, gateway_base_url, composer_model=_SAMPLING_MODEL_ALIAS, composer_temperature=0.2, composer_seed=7
     )
 
-    assert probed is True
+    for request in requests:
+        assert await probe_composer_config(request) is True, request.surface
 
 
 @pytest.mark.asyncio
-async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(gateway_base_url: str) -> None:
+async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(tmp_path: Path, gateway_base_url: str) -> None:
     """An endpoint override must not silently drop rejected operator sampling."""
     from litellm.exceptions import UnsupportedParamsError
 
     from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
 
+    loop_request = _planner_probe_requests(tmp_path, gateway_base_url, composer_temperature=0.2, composer_seed=7)[0]
     with pytest.raises(ComposerBootConfigError, match="composer planner boot request rejected") as caught:
-        await probe_composer_config(
-            role="planner",
-            model=_MODEL_ALIAS,
-            temperature=0.2,
-            seed=7,
-            api_base=f"{gateway_base_url}/v1",
-            api_key=_INBOUND_BEARER,
-        )
+        await probe_composer_config(loop_request)
     assert isinstance(caught.value.__cause__, UnsupportedParamsError)
     assert f"by {_MODEL_ALIAS}:" in str(caught.value)
+    assert "surface=loop_tools" in str(caught.value)
+    assert "tool_count=42" in str(caught.value)
     assert "temperature_present=True" in str(caught.value)
     assert "seed_present=True" in str(caught.value)
     assert "reasoning_effort_present=False" in str(caught.value)

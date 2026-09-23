@@ -6,6 +6,7 @@ from types import MappingProxyType
 
 import pytest
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer.guided.planning import guided_redacted_current_state_context
 from elspeth.web.composer.planner_authoring_aids import PlannerPluginContract
@@ -176,9 +177,12 @@ def test_projected_plugin_contract_preserves_owned_encoding_bytes():
         response.readmit(None)
 
 
-@pytest.mark.parametrize("code", [None, "SCHEMA_VALIDATION"])
-def test_argument_error_projection_preserves_exact_bytes(code):
-    error = ToolArgumentError(argument="content", expected="a string", actual_type="int", code=code)
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [(None, None), ("SCHEMA_VALIDATION", ToolArgumentErrorCategory.SCHEMA_SHAPE)],
+)
+def test_argument_error_projection_preserves_exact_bytes(code, category):
+    error = ToolArgumentError(argument="content", expected="a string", actual_type="int", code=code, category=category)
     response = argument_error_response(error)
     expected = {
         "argument_error": {

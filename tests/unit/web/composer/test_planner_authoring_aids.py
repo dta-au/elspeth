@@ -1916,7 +1916,7 @@ class TestExpressionGrammarAid:
 class TestAuthoringAidsPayload:
     def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
         """Prompt examples wrap flat canonical documents exactly as the web tool does."""
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.composer.service import composer_loop_tool_definitions
 
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)
@@ -1930,8 +1930,7 @@ class TestAuthoringAidsPayload:
             payload["fork_coalesce"]["set_pipeline_exemplar"],
             payload["fork_row_union"]["set_pipeline_exemplar"],
         )
-        service = object.__new__(ComposerServiceImpl)
-        provider_tool = next(tool for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+        provider_tool = next(tool for tool in composer_loop_tool_definitions() if tool["function"]["name"] == "set_pipeline")
         provider_schema = provider_tool["function"]["parameters"]
         validator = Draft202012Validator(provider_schema)
 

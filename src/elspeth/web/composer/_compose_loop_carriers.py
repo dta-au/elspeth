@@ -40,6 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
@@ -99,6 +100,7 @@ class _AdmittedLLMProviderMetadata:
     reasoning_content: str | None
     reasoning_details: Any | None
     thinking_blocks: Any | None
+    provider_served: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "reasoning_details", "thinking_blocks")
@@ -155,6 +157,33 @@ _AdvisorCallOutcome = _AdvisorCallSuccess | _AdvisorProviderFailure | _AdvisorFi
 
 
 @dataclass(frozen=True, slots=True)
+class AdvisorArgumentRejection:
+    """Local ``request_advisor_hint`` argument rejection, before any provider call.
+
+    ``error_class`` names the exception class raised (or constructed) by the
+    validator; ``category`` is its closed :class:`ToolArgumentErrorCategory`.
+    ``error`` is the operator-authored message sent back to the planner.
+    """
+
+    error: str
+    error_class: str
+    category: ToolArgumentErrorCategory
+
+    def __post_init__(self) -> None:
+        if type(self.category) is not ToolArgumentErrorCategory:
+            raise TypeError("AdvisorArgumentRejection.category must be a ToolArgumentErrorCategory")
+
+    def to_payload(self) -> dict[str, str]:
+        """The ARG_ERROR tool message and audit payload for this rejection."""
+        return {
+            "status": "ARG_ERROR",
+            "error": self.error,
+            "error_class": self.error_class,
+            "error_category": self.category.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolOutcome:
     """Result of one tool call within a compose turn.
 
@@ -171,6 +200,10 @@ class _ToolOutcome:
     * ``None`` for argument-error and plugin-crash paths, where
       ``error_class`` / ``error_message`` carry the outcome.
 
+    ``error_category`` is the closed :class:`ToolArgumentErrorCategory` of an
+    argument error and ``None`` otherwise; an outcome that carries one must
+    also carry the ``error_class`` that was raised.
+
     ``call`` is the ELSPETH-owned tool-call projection admitted before the raw
     provider response is discarded.
     """
@@ -178,11 +211,17 @@ class _ToolOutcome:
     call: _AdmittedToolCall
     response: _ToolOutcomeResponse
     error_class: str | None
+    error_category: ToolArgumentErrorCategory | None
     error_message: str | None
     pre_version: int
     post_version: int
 
     def __post_init__(self) -> None:
+        if self.error_category is not None:
+            if type(self.error_category) is not ToolArgumentErrorCategory:
+                raise TypeError("_ToolOutcome.error_category must be a ToolArgumentErrorCategory")
+            if self.error_class is None:
+                raise ValueError("_ToolOutcome with an error_category must carry the error_class that was raised")
         freeze_fields(self, "call", "response")
 
 

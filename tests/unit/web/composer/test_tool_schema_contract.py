@@ -34,11 +34,9 @@ def _registered_set_pipeline_schema() -> dict[str, Any]:
 
 
 def _web_set_pipeline_definition() -> dict[str, Any]:
-    from elspeth.web.composer.service import ComposerServiceImpl
-    from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
+    from elspeth.web.composer.service import composer_loop_tool_definitions
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    return next(tool["function"] for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+    return next(tool["function"] for tool in composer_loop_tool_definitions() if tool["function"]["name"] == "set_pipeline")
 
 
 def _provider_transported_set_pipeline_schema(provider: str) -> dict[str, Any]:

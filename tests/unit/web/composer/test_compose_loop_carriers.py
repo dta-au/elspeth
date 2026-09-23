@@ -19,7 +19,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcomeResponse,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMResponseError
+from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMResponseError, composer_loop_tool_definitions
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
 from tests.unit.web.composer._helpers import (
@@ -129,6 +129,7 @@ def test_tool_outcome_freezes_mapping_response() -> None:
         call={"id": "tc_x", "function": {"name": "request_advisor_hint"}},
         response=response_dict,
         error_class=None,
+        error_category=None,
         error_message=None,
         pre_version=1,
         post_version=1,
@@ -209,7 +210,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
     ):
         outcome = await service._call_model_turn(
             llm_messages=[{"role": "user", "content": "build it"}],
-            tools=service._get_litellm_tools(),
+            tools=composer_loop_tool_definitions(),
             state=state,
             initial_version=state.version,
             deadline=asyncio.get_event_loop().time() + 60.0,

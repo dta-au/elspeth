@@ -280,7 +280,7 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     harness = _harness(tmp_path)
     state = _incremental_base_state(tmp_path)
     invalid = _valid_pipeline_args(tmp_path, metadata_name="invalid-plugin")
-    invalid["source"]["plugin"] = "not_installed"
+    invalid["source"]["plugin"] = "uninstalled_canary_plugin"
     repaired = _valid_pipeline_args(tmp_path, metadata_name="repaired")
     llm = _ScriptedLLM(
         _tool_turn("call_invalid", "set_pipeline", invalid),
@@ -324,9 +324,16 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     assert invalid_payload["data"]["status"] == "PREVALIDATION_REJECTED"
     assert invalid_payload["data"]["applied"] is False
     assert invalid_payload["validation"]["errors"][0]["component"] == "rejected_mutation"
-    assert "not_installed" in invalid_feedback["content"]
     persisted_invalid_feedback = _persisted_tool_content(harness, "call_invalid")
-    assert "not_installed" not in persisted_invalid_feedback
+    # Positive control: the model-authored plugin name is present in the
+    # unredacted in-memory audit of the rejected call ...
+    invalid_invocation = next(inv for inv in result.tool_invocations if inv.tool_call_id == "call_invalid")
+    assert "uninstalled_canary_plugin" in invalid_invocation.arguments_canonical
+    # ... and never reaches the persisted tool row. The rejection message stays
+    # redacted; the closed, registered rejection code persists (S0: error_code
+    # survives redaction; it used to be summarized to <redacted-response-text>).
+    assert "uninstalled_canary_plugin" not in persisted_invalid_feedback
+    assert json.loads(persisted_invalid_feedback)["validation"]["errors"][0]["error_code"] == "plugin_not_installed"
 
     assert len(result.tool_invocations) == 2
     assert result.tool_invocations[0].version_after == state.version

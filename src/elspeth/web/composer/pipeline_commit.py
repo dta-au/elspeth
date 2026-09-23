@@ -561,8 +561,8 @@ async def prepare_pipeline_proposal_commit(
         do_dispatch=execute_exact,
         version_after_provider=lambda result: result.updated_state.version,
         arg_error_payload_factory=lambda exc: {
-            "error_class": "ToolArgumentError",
-            "error_code": exc.code or "argument_error",
+            "error_class": type(exc).__name__,
+            "error_code": exc.category.value,
         },
     )
     result = outcome.result

@@ -24,6 +24,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
@@ -1156,7 +1157,9 @@ class TestComposerTextOnlyResponse:
         assert "[ELSPETH-SYSTEM]" in result.message
         assert "still empty" in result.message
         assert "set_pipeline failed before mutation" in result.message
-        assert "MissingRequiredPaths" in result.message
+        # S0: the required-path gate records the ToolArgumentError it builds
+        # (was the hand label "MissingRequiredPaths", a class that never existed).
+        assert "(ToolArgumentError: missing: " in result.message
         assert "source.plugin" in result.message
 
 
@@ -3123,7 +3126,7 @@ class TestComposerErrorHandling:
 
         # The pre-dispatch validator must not have rejected the call.
         # Verify by inspecting the tool-result message content: the
-        # MissingRequiredPaths code path produces a JSON object whose
+        # required-path gate produces a JSON object whose
         # ``error`` field starts with ``Tool 'set_pipeline' missing required
         # argument(s):``. A no-inline payload must not trigger that path,
         # regardless of what the tool handler returns afterwards.
@@ -6603,7 +6606,13 @@ class TestToolArgumentError:
     def test_corrupt_private_code_cannot_silently_erase_audit_classification(self, replacement: object) -> None:
         from elspeth.web.composer.tool_error_payloads import arg_error_payload
 
-        exc = ToolArgumentError(argument="pipeline", expected="a mapping", actual_type="str", code="SCHEMA_VALIDATION")
+        exc = ToolArgumentError(
+            argument="pipeline",
+            expected="a mapping",
+            actual_type="str",
+            code="SCHEMA_VALIDATION",
+            category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        )
         if replacement is None:
             BaseException.__delattr__(exc, "_safe_code")
         else:
@@ -7874,7 +7883,7 @@ class TestEmptyStateFinalizePassthrough:
         and the retry failed. The augmentation should fire."""
         from datetime import UTC, datetime
 
-        from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+        from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
         from elspeth.web.composer.service import _last_mutation_was_pending_proposal
 
         proposal = self._proposal_invocation()
@@ -7894,6 +7903,7 @@ class TestEmptyStateFinalizePassthrough:
             finished_at=datetime(2026, 5, 14, 21, 29, 5, tzinfo=UTC),
             latency_ms=1,
             actor="test",
+            error_category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         )
         assert _last_mutation_was_pending_proposal((proposal, arg_error)) is False
 

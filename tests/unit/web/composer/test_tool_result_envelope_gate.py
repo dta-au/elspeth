@@ -3037,6 +3037,9 @@ def test_every_result_constructor_site_is_attributed() -> None:
 _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     "budget_payload": ("status", "budget_used", "budget_remaining", "guidance"),
     "deadline_payload": ("status", "outbound_call_made", "budget_used", "budget_remaining"),
+    # S0: the pre-call deadline check raises nothing, so its payload names no
+    # exception class; the in-flight timeout names the TimeoutError it caught.
+    "pre_call_timeout_payload": ("status", "error", "budget_used", "budget_remaining"),
     "timeout_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
     "advisor_error_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
     "success_payload": (

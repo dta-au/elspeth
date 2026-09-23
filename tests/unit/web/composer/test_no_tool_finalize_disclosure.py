@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.composer.no_tool_policy import (
     PipelineMutationIntentDecision,
     classify_pipeline_mutation_intent,
@@ -83,6 +83,7 @@ def _failed_set_pipeline_invocation() -> ComposerToolInvocation:
         finished_at=datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC),
         latency_ms=1,
         actor="test",
+        error_category=ToolArgumentErrorCategory.MODEL_VALIDATION,
     )
 
 

@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations,
     compose_empty_state_message,
@@ -60,6 +60,7 @@ def _invocation(
         finished_at=now,
         latency_ms=0,
         actor="test",
+        error_category=ToolArgumentErrorCategory.MODEL_VALIDATION if status is ComposerToolStatus.ARG_ERROR else None,
     )
 
 

@@ -35,6 +35,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
@@ -42,6 +43,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.guided.state_machine import TerminalState
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -176,6 +178,10 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
         # from the columns it admits.
         "created_by": BLOB_CREATORS,
         "creation_modality": frozenset(modality.value for modality in CreationModality),
+        # A rejection's ``validation.errors[].error_code`` is a closed,
+        # server-authored identifier. Only codes in the emitted-code registry
+        # survive; any other value is summarized like free text.
+        "error_code": REGISTERED_ERROR_CODES,
     }
 )
 _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
@@ -191,16 +197,14 @@ _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
         "advisor_latency_ms",
     }
 )
+# Exactly the classes the web ARG_ERROR producers raise, pinned by the
+# producer census in tests/unit/web/composer/test_error_class_producer_census.py.
 _SAFE_ARG_ERROR_CLASSES = frozenset(
     {
-        "CanonicalizationError",
-        "FloatDomainError",
         "IntegerDomainError",
         "JSONDecodeError",
         "JsonBoundaryError",
-        "MissingRequiredPaths",
         "ToolArgumentError",
-        "TypeError",
         "ValidationError",
         "ValueError",
     }
@@ -370,6 +374,7 @@ def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
 def redact_arg_error_response(
     *,
     error_class: str | None,
+    error_category: ToolArgumentErrorCategory | None,
     error_message: str | None,
     result: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -377,8 +382,9 @@ def redact_arg_error_response(
 
     ARG_ERROR payloads are not ToolResult responses and must not validate
     against a tool's success response model. Preserve only a closed exception
-    class and bounded diagnostic shape; arbitrary messages, result values, and
-    result keys never cross the persistence boundary.
+    class, the closed :class:`ToolArgumentErrorCategory` value, and bounded
+    diagnostic shape; arbitrary messages, result values, and result keys
+    never cross the persistence boundary.
     """
     safe_error_class: str | None
     if error_class is None or error_class in _SAFE_ARG_ERROR_CLASSES:
@@ -389,6 +395,7 @@ def redact_arg_error_response(
     projection: dict[str, object] = {
         "_redaction_status": _ARG_ERROR_REDACTION_STATUS,
         "error_class": safe_error_class,
+        "error_category": error_category.value if error_category is not None else None,
         "error_message": _summarize_arg_error_text(error_message, label="message"),
     }
     if result is not None:

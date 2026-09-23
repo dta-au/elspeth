@@ -42,6 +42,7 @@ from elspeth.contracts.blobs_inline import (
     ContentEncoding,
     is_widened_blob_ref,
 )
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
@@ -1598,11 +1599,13 @@ def _execute_create_blob(
                 argument="mime_type",
                 expected=f"one of: {allowed}",
                 actual_type="str",
+                category=ToolArgumentErrorCategory.MODEL_VALIDATION,
             ) from exc
         raise ToolArgumentError(
             argument="create_blob arguments",
             expected="object conforming to CreateBlobArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     # _prepare_blob_create still raises ToolArgumentError on semantic
@@ -1700,6 +1703,7 @@ def _execute_update_blob(
             argument="update_blob arguments",
             expected="object conforming to UpdateBlobArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:

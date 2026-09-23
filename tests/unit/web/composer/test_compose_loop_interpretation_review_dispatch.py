@@ -48,6 +48,7 @@ import structlog
 from sqlalchemy import insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationKind,
@@ -71,6 +72,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.composer.tools import (
+    _SESSION_AWARE_TOOL_HANDLERS,
     RATE_CAP_CODE_TO_TELEMETRY_CAP_TYPE,
     RATE_CAP_PER_SESSION_DAY_CODE,
     RATE_CAP_PER_TERM_CODE,
@@ -949,6 +951,60 @@ async def test_session_aware_tool_crash_is_captured_as_plugin_crash_envelope(
             initial_state=state,
         )
     assert isinstance(exc_info.value.original_exc, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_holds_request_interpretation_review_to_its_closed_schema_before_the_handler(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session-aware dispatch runs the S gate before the handler's model.
+
+    An extra key must be refused by the closed-root flat schema
+    (``schema_shape``), so the handler is never awaited. Without the gate the
+    handler's pydantic model would refuse it instead, as ``model_validation``.
+    """
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_llm_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service)
+    real_handler = _SESSION_AWARE_TOOL_HANDLERS["request_interpretation_review"]
+    awaited: list[str] = []
+
+    async def _recording_handler(**kwargs: Any) -> ToolResult:
+        awaited.append("request_interpretation_review")
+        return await real_handler(**kwargs)
+
+    monkeypatch.setitem(_SESSION_AWARE_TOOL_HANDLERS, "request_interpretation_review", _recording_handler)
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_extra_key",
+                tool_name="request_interpretation_review",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "stray": True,
+                },
+            ),
+            _fake_text_response("I will retry without the stray key."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_state=state,
+    )
+
+    invocations = result.tool_invocations
+    assert len(invocations) == 1
+    assert invocations[0].tool_name == "request_interpretation_review"
+    assert invocations[0].status.value == "arg_error"
+    assert (invocations[0].error_class, invocations[0].error_category) == ("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)
+    assert awaited == []
 
 
 @pytest.mark.asyncio

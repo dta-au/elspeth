@@ -26,6 +26,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import BaseModel, ValidationError, field_validator
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.web.composer.audit import canonicalize_pydantic_cause
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetSourceArgumentsModel
@@ -338,5 +339,11 @@ def test_arg_error_payload_factory_strips_hostile_pydantic_loc_and_message() -> 
 
 def test_tool_argument_error_code_still_reads_constructed_instances() -> None:
     """Legitimately constructed audit classifications survive projection."""
-    exc = ToolArgumentError(argument="pipeline", expected="a mapping", actual_type="str", code="SCHEMA_VALIDATION")
+    exc = ToolArgumentError(
+        argument="pipeline",
+        expected="a mapping",
+        actual_type="str",
+        code="SCHEMA_VALIDATION",
+        category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+    )
     assert exc.code == "SCHEMA_VALIDATION"

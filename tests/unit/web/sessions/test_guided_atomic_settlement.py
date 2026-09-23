@@ -16,7 +16,7 @@ import pytest
 import structlog
 from sqlalchemy import func, select, update
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import (
     ComposerChatInitiator,
@@ -1297,6 +1297,7 @@ def test_audit_preparation_uses_real_typed_evidence_and_omits_hidden_provider_da
         error_class="ToolArgumentError",
         error_message="RAW-VALIDATION-CANARY",
         version_after=None,
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
     )
     unknown_success_tool = replace(
         invocation,
@@ -2583,7 +2584,13 @@ async def test_deferred_intent_cancellation_rejects_inauthentic_audit_or_binding
     emit_intent_cancelled(recorder, intent=cancelled, composition_version=1, actor="alice")
     (authentic,) = recorder.invocations
     if corruption == "arg_error":
-        corrupted = replace(authentic, status=ComposerToolStatus.ARG_ERROR, error_class="ToolArgumentError", version_after=None)
+        corrupted = replace(
+            authentic,
+            status=ComposerToolStatus.ARG_ERROR,
+            error_class="ToolArgumentError",
+            error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
+            version_after=None,
+        )
     elif corruption == "malformed":
         corrupted = replace(authentic, arguments_canonical="{")
     elif corruption == "redacted":

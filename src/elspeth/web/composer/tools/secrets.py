@@ -9,6 +9,7 @@ from typing import Any, Literal, TypedDict
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import SecretInventoryItem, SecretScope, SecretUnavailabilityReason
@@ -234,6 +235,7 @@ def _handle_validate_secret_ref(
             argument="validate_secret_ref arguments",
             expected="object conforming to _ValidateSecretRefArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     name = validated.name
     matching_item: SecretInventoryItem | None = None
@@ -321,6 +323,7 @@ def _execute_wire_secret_ref(
             argument="wire_secret_ref arguments",
             expected="object conforming to _WireSecretRefArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     name = validated.name

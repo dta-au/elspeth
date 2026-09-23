@@ -26,6 +26,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -309,10 +310,11 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
 def get_tool_definitions() -> list[dict[str, Any]]:
     """Return JSON Schema tool definitions for the LLM.
 
-    Returns 43 tools: 13 discovery + 15 mutation + 10 blob tools + 3 secret
-    tools + 1 advisor tool + 1 session-aware interpretation-review tool.
+    Returns 42 tools: 12 discovery + 14 mutation + 11 blob tools (5 discovery,
+    6 mutation) + 3 secret tools (2 discovery, 1 mutation) + 1 advisor tool +
+    1 session-aware interpretation-review tool.
     ``request_advisor_hint`` is always part of the LLM-visible list —
-    advisor is mandatory — see ``ComposerServiceImpl._get_litellm_tools``.
+    advisor is mandatory — see ``service.composer_loop_tool_definitions``.
 
     The tool catalogue is derived from ``_TOOL_DEFS_BY_NAME`` (every
     declared tool) plus two inline definitions for the dispatch-outside-
@@ -384,7 +386,7 @@ def get_discovery_tool_definitions(names: Iterable[str]) -> list[dict[str, Any]]
     but not sufficient. Both halves are required.
 
     Returns the same ``{"type": "function", "function": {...}}`` shape
-    ``ComposerServiceImpl._get_litellm_tools`` produces, so the solver can
+    ``service.composer_loop_tool_definitions`` produces, so the solver can
     concatenate these with its ``resolve_X`` tool and pass them straight to
     ``_litellm_acompletion``. Each def is freshly ``deep_thaw``ed from the
     immutable registry — callers get a mutually-isolated mutable copy.
@@ -433,9 +435,48 @@ def _inject_prior_validation(
 _ALL_MUTATION_TOOL_NAMES: Final[frozenset[str]] = _MUTATION_TOOL_NAMES | _BLOB_MUTATION_TOOL_NAMES | _SECRET_MUTATION_TOOL_NAMES
 
 
+# The single schema lookup over every tool ``get_tool_definitions()``
+# advertises: the declared registry plus the two dispatch-outside-execute_tool
+# carve-outs (``request_advisor_hint``, ``request_interpretation_review``).
+# ``_closed_root_schema`` reads it, so every advertised tool can be held to its
+# closed-root flat schema S, including the two carve-outs. Built once, at
+# import, after the trailing-tool invariant above has run.
+_TOOL_SCHEMA_BY_NAME: Final[Mapping[str, Mapping[str, Any]]] = deep_freeze(
+    {definition["name"]: definition["parameters"] for definition in get_tool_definitions()}
+)
+
+# JSON Schema keywords a strict provider grammar can express (plan §3.3 rule
+# 4). An S failure on one of these is ``schema_shape``: a grammar should have
+# prevented it. A failure on any other keyword (``minLength``, ``maxLength``,
+# ``not``, ``oneOf``, ``uniqueItems``, ...) is ``schema_bound``: a constraint no
+# grammar enforces. S1's wire projection imports this same constant.
+WIRE_KEYWORD_ALLOWLIST: Final[frozenset[str]] = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "anyOf",
+        "description",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+    }
+)
+
+
 def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     """Return the tool's argument schema with a fail-closed root object."""
-    schema = cast(dict[str, Any], deep_thaw(_TOOL_DEFS_BY_NAME[tool_name]["parameters"]))
+    schema = cast(dict[str, Any], deep_thaw(_TOOL_SCHEMA_BY_NAME[tool_name]))
     if schema["type"] == "object" and "additionalProperties" not in schema:
         schema = {**schema, "additionalProperties": False}
     return schema
@@ -487,13 +528,60 @@ def _schema_argument_model_name(tool_name: str) -> str:
     return "".join(part.capitalize() for part in tool_name.split("_")) + "ArgumentsModel"
 
 
+def _schema_error_category(error: ValidationError) -> ToolArgumentErrorCategory:
+    """Split an S failure mechanically by its failing keyword."""
+    if error.validator in WIRE_KEYWORD_ALLOWLIST:
+        return ToolArgumentErrorCategory.SCHEMA_SHAPE
+    return ToolArgumentErrorCategory.SCHEMA_BOUND
+
+
 def _schema_tool_argument_error(tool_name: str, error: ValidationError) -> ToolArgumentError:
     return ToolArgumentError(
         argument=f"{tool_name} arguments",
         expected=f"object conforming to {_schema_argument_model_name(tool_name)} ({_schema_error_summary(error)})",
         actual_type="invalid_schema",
         code="SCHEMA_VALIDATION",
+        category=_schema_error_category(error),
     )
+
+
+def _schema_errors(tool_name: str, arguments: object) -> list[ValidationError]:
+    return _errors_against(Draft202012Validator(_closed_root_schema(tool_name)), arguments)
+
+
+def _errors_against(validator: Draft202012Validator, arguments: object) -> list[ValidationError]:
+    return sorted(validator.iter_errors(arguments), key=lambda error: tuple(error.absolute_path))
+
+
+def _reported_schema_error(errors: list[ValidationError]) -> ValidationError:
+    # The JSON-type guidance and the shape/bound category are decided on the
+    # reported error, so report a type fault whenever one exists, not
+    # whichever error sorts first.
+    return next((error for error in errors if error.validator == "type"), errors[0])
+
+
+def require_schema_valid_arguments(tool_name: str, arguments: object) -> None:
+    """Hold arguments to the tool's closed-root flat schema S, or raise.
+
+    The dispatch-outside-``execute_tool`` carve-outs call this before their
+    pydantic models, so every advertised tool is admitted by the same S gate.
+    """
+    errors = _schema_errors(tool_name, arguments)
+    if errors:
+        raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
+
+
+def require_arguments_conform_to_schema(tool_name: str, validator: Draft202012Validator, arguments: object) -> None:
+    """Hold arguments to a caller-owned closed-root schema, or raise.
+
+    For tools declared outside the web registry (the composer MCP session
+    tools), so they are admitted by the schema they advertise with the same
+    Draft 2020-12 gate, rejection and shape/bound category as the registry
+    tools.
+    """
+    errors = _errors_against(validator, arguments)
+    if errors:
+        raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
 
 
 def _validate_tool_arguments(
@@ -503,15 +591,12 @@ def _validate_tool_arguments(
     *,
     raise_on_error: bool = False,
 ) -> ToolResult | None:
-    schema = _closed_root_schema(tool_name)
-    validator = Draft202012Validator(schema)
-    errors = sorted(validator.iter_errors(arguments), key=lambda error: tuple(error.absolute_path))
+    if raise_on_error:
+        require_schema_valid_arguments(tool_name, arguments)
+        return None
+    errors = _schema_errors(tool_name, arguments)
     if not errors:
         return None
-    if raise_on_error:
-        # The JSON-type guidance is decided on the reported error, so report a
-        # type fault whenever one exists, not whichever error sorts first.
-        raise _schema_tool_argument_error(tool_name, next((error for error in errors if error.validator == "type"), errors[0]))
     return _failure_result(state, f"Invalid arguments for tool '{tool_name}': {_schema_error_summary(errors[0])}.")
 
 

@@ -15,6 +15,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -43,6 +44,7 @@ def _record_shape_arg_error(
     version_before: int,
     actor: str,
     error_class: str,
+    error_category: ToolArgumentErrorCategory,
 ) -> None:
     """Record a value-free ARG_ERROR for malformed provider argument shape."""
     audit, canonicalization_failed = begin_dispatch_or_arg_error(
@@ -58,6 +60,7 @@ def _record_shape_arg_error(
         finish_arg_error(
             audit,
             error_class=error_class,
+            error_category=error_category,
             error_message=error_class,
         )
     )
@@ -156,6 +159,7 @@ def _execute_discovery_call(
                 version_before=state.version,
                 actor=actor,
                 error_class="GuidedSolverResponseShapeError",
+                error_category=ToolArgumentErrorCategory.WIRE_JSON_INVALID,
             )
         raise GuidedSolverResponseShapeError(f"{name} arguments must be a JSON string; got {type(raw_arguments).__name__}")
     # Malformed tool-call arguments are an LLM RESPONSE-SHAPE failure, not a
@@ -176,6 +180,7 @@ def _execute_discovery_call(
                 version_before=state.version,
                 actor=actor,
                 error_class=type(exc).__name__,
+                error_category=ToolArgumentErrorCategory.WIRE_JSON_INVALID,
             )
         raise GuidedSolverResponseShapeError(f"{name} arguments are not valid JSON: {exc}") from exc
     if not isinstance(parsed, Mapping):
@@ -191,6 +196,7 @@ def _execute_discovery_call(
                 version_before=state.version,
                 actor=actor,
                 error_class="GuidedSolverResponseShapeError",
+                error_category=ToolArgumentErrorCategory.WIRE_NOT_OBJECT,
             )
         raise GuidedSolverResponseShapeError(f"{name} arguments must decode to an object; got {type(parsed).__name__}")
     arguments = dict(parsed)
@@ -225,6 +231,7 @@ def _execute_discovery_call(
             invocation = finish_arg_error(
                 audit,
                 error_class=type(canonicalization_failed).__name__,
+                error_category=ToolArgumentErrorCategory.CANONICALIZATION,
                 error_message=type(canonicalization_failed).__name__,
             )
             raise GuidedSolverResponseShapeError(f"{name} arguments could not be canonicalized") from canonicalization_failed
@@ -247,6 +254,7 @@ def _execute_discovery_call(
         invocation = finish_arg_error(
             audit,
             error_class=type(exc).__name__,
+            error_category=exc.category,
             error_message=str(exc),
         )
         raise GuidedSolverResponseShapeError(str(exc)) from exc

@@ -50,7 +50,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence, BlobNotFoundError, BlobRecord, BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableOperation
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
@@ -75,6 +75,7 @@ from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer import tool_error_payloads as _tool_error_payloads
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer._compose_loop_carriers import (
+    AdvisorArgumentRejection,
     _AdmittedAssistantMessage,
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
@@ -228,6 +229,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
@@ -857,6 +859,81 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_base"] = base_url
     if api_key is not None:
         kwargs["api_key"] = api_key
+
+
+def composer_loop_tool_definitions() -> list[dict[str, Any]]:
+    """Return the tool list the freeform compose loop sends, in LiteLLM function format.
+
+    The compose loop and the boot probe both call this, so the probe sends
+    exactly the list production sends.
+
+    Advisor is mandatory, so ``request_advisor_hint`` is always present
+    in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
+    affected; advisor is web-composer only by design (the tool is not
+    registered in the CLI dispatch tables).
+
+    The web-visible ``set_pipeline`` arguments alone carry a required
+    ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
+    unions nested below a property but discard root-level ``oneOf``. The
+    registry and every internal/MCP consumer remain on the flat semantic
+    argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
+    provider envelope before custody, audit, redaction, or dispatch.
+    """
+    definitions = get_tool_definitions()
+    tools: list[dict[str, Any]] = []
+    for defn in definitions:
+        parameters = defn["parameters"]
+        if defn["name"] == "set_pipeline":
+            parameters = {
+                "type": "object",
+                "properties": {"pipeline": parameters},
+                "required": ["pipeline"],
+                "additionalProperties": False,
+            }
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": defn["name"],
+                    "description": defn["description"],
+                    "parameters": parameters,
+                },
+            }
+        )
+    return tools
+
+
+def build_composer_loop_request_kwargs(
+    *,
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    settings: ComposerSettings,
+    api_base: str | None,
+    api_key: str | None,
+) -> dict[str, Any]:
+    """Build the LiteLLM kwargs of one freeform compose-loop or prose call.
+
+    ``_call_llm``, ``_call_text_llm`` and the boot probe's loop-list request
+    all build their request here, so temperature, seed, reasoning and
+    endpoint kwargs cannot drift between the probe and production. An empty
+    ``tools`` sequence omits the key (the prose call).
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    if settings.composer_temperature is not None:
+        kwargs["temperature"] = settings.composer_temperature
+    if settings.composer_seed is not None:
+        kwargs[_COMPOSER_LLM_SEED_PARAM] = settings.composer_seed
+    # Freeform tool-loop and prose calls are interactive tool
+    # choreography — discovery class (elspeth-dc459d438e).
+    apply_reasoning_kwargs(kwargs, model=model, effort=settings.composer_discovery_reasoning_effort)
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    return kwargs
 
 
 async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any) -> Any:
@@ -1509,13 +1586,15 @@ class _SessionAwareDispatchOutcome:
       discovery or composition budget. Session-aware tools that mutate
       composition state report ``False`` so they count as composition
       turns regardless of the success/failure shape.
-    - ``error_class`` / ``error_message`` / ``post_version``: the P4 audit
-      outcome metadata required to preserve the assistant tool-call row.
+    - ``error_class`` / ``error_category`` / ``error_message`` /
+      ``post_version``: the P4 audit outcome metadata required to preserve
+      the assistant tool-call row.
     """
 
     result: ToolResult | None
     is_discovery: bool
     error_class: str | None = None
+    error_category: ToolArgumentErrorCategory | None = None
     error_message: str | None = None
     post_version: int = 0
 
@@ -2677,19 +2756,23 @@ class ComposerServiceImpl:
             )
             return canonical_json(redacted)
         status = ComposerToolStatus.ARG_ERROR if failure_status is None else failure_status
-        projection = (
+        if status is not ComposerToolStatus.ARG_ERROR:
+            return canonical_json(
+                redact_failure_response(
+                    status=status.value,
+                    error_class=outcome.error_class,
+                    error_message=outcome.error_message,
+                )
+            )
+        if outcome.error_category is None:
+            raise AuditIntegrityError("ARG_ERROR tool outcome carries no error_category")
+        return canonical_json(
             redact_arg_error_response(
                 error_class=outcome.error_class,
-                error_message=outcome.error_message,
-            )
-            if status is ComposerToolStatus.ARG_ERROR
-            else redact_failure_response(
-                status=status.value,
-                error_class=outcome.error_class,
+                error_category=outcome.error_category,
                 error_message=outcome.error_message,
             )
         )
-        return canonical_json(projection)
 
     def _state_payload_for_compose_turn(
         self,
@@ -7075,7 +7158,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
-        tools = self._get_litellm_tools()
+        tools = composer_loop_tool_definitions()
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -7716,44 +7799,6 @@ class ComposerServiceImpl:
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
 
-    def _get_litellm_tools(self) -> list[dict[str, Any]]:
-        """Convert tool definitions to LiteLLM function format.
-
-        Advisor is mandatory, so ``request_advisor_hint`` is always present
-        in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
-        affected; advisor is web-composer only by design (the tool is not
-        registered in the CLI dispatch tables).
-
-        The web-visible ``set_pipeline`` arguments alone carry a required
-        ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
-        unions nested below a property but discard root-level ``oneOf``. The
-        registry and every internal/MCP consumer remain on the flat semantic
-        argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
-        provider envelope before custody, audit, redaction, or dispatch.
-        """
-        definitions = get_tool_definitions()
-        tools: list[dict[str, Any]] = []
-        for defn in definitions:
-            parameters = defn["parameters"]
-            if defn["name"] == "set_pipeline":
-                parameters = {
-                    "type": "object",
-                    "properties": {"pipeline": parameters},
-                    "required": ["pipeline"],
-                    "additionalProperties": False,
-                }
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": defn["name"],
-                        "description": defn["description"],
-                        "parameters": parameters,
-                    },
-                }
-            )
-        return tools
-
     async def _call_llm(
         self,
         messages: list[dict[str, Any]],
@@ -7763,20 +7808,14 @@ class ComposerServiceImpl:
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "messages": messages,
-            }
-            if tools:
-                kwargs["tools"] = tools
-            if self._settings.composer_temperature is not None:
-                kwargs["temperature"] = self._settings.composer_temperature
-            if self._settings.composer_seed is not None:
-                kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
-            # Freeform tool-loop and prose calls are interactive tool
-            # choreography — discovery class (elspeth-dc459d438e).
-            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
-            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=tools,
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -7798,18 +7837,14 @@ class ComposerServiceImpl:
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "messages": messages,
-            }
-            if self._settings.composer_temperature is not None:
-                kwargs["temperature"] = self._settings.composer_temperature
-            if self._settings.composer_seed is not None:
-                kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
-            # Freeform tool-loop and prose calls are interactive tool
-            # choreography — discovery class (elspeth-dc459d438e).
-            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
-            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=(),
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -7828,18 +7863,27 @@ class ComposerServiceImpl:
             )
         return response
 
-    def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | dict[str, Any]:
-        """Admit complete public input before advisor budget or provider effects."""
+    def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
+        """Admit complete public input before advisor budget or provider effects.
+
+        The arguments are held to the tool's closed-root flat schema S first,
+        exactly as every ``execute_tool`` dispatch is, then to the pydantic
+        model, then to the prompt-size cap. Each rejection records the class
+        actually raised (or constructed) and its closed category.
+        """
+        schema_error_text = "request_advisor_hint arguments must conform to the published schema; check field types, limits, and extra keys"
+        try:
+            require_schema_valid_arguments("request_advisor_hint", arguments)
+        except ToolArgumentError as exc:
+            return AdvisorArgumentRejection(error=schema_error_text, error_class=type(exc).__name__, category=exc.category)
         try:
             validated = RequestAdvisorHintArgumentsModel.model_validate(arguments)
         except PydanticValidationError as exc:
-            errors = exc.errors(include_input=False, include_context=False, include_url=False)
-            type_error = any(error["type"] in {"string_type", "list_type"} for error in errors)
-            return {
-                "status": "ARG_ERROR",
-                "error": "request_advisor_hint arguments must conform to the published schema; check field types, limits, and extra keys",
-                "error_class": "TypeError" if type_error else "ValueError",
-            }
+            return AdvisorArgumentRejection(
+                error=schema_error_text,
+                error_class=type(exc).__name__,
+                category=ToolArgumentErrorCategory.MODEL_VALIDATION,
+            )
 
         # Approximate provider cost cap: rough 4 chars / token. Compute the
         # exact formatted user-message char count we would emit if the call
@@ -7850,15 +7894,23 @@ class ComposerServiceImpl:
         total_chars = len(_build_advisor_user_message(validated.to_internal_request()))
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _ADVISOR_CHARS_PER_TOKEN
         if total_chars > char_cap:
-            return {
-                "status": "ARG_ERROR",
-                "error": (
+            # Nothing is raised by the cap check; the rejection it records is
+            # the owned ToolArgumentError built here, so its class is honest.
+            budget_rejection = ToolArgumentError(
+                argument="request_advisor_hint arguments",
+                expected="a prompt within composer_advisor_max_prompt_tokens",
+                actual_type="prompt over budget",
+                category=ToolArgumentErrorCategory.PROMPT_BUDGET,
+            )
+            return AdvisorArgumentRejection(
+                error=(
                     f"prompt size {total_chars} chars exceeds cap {char_cap} chars "
                     f"(composer_advisor_max_prompt_tokens={self._settings.composer_advisor_max_prompt_tokens}). "
                     "Truncate your error/action lists or schema excerpt and retry."
                 ),
-                "error_class": "ValueError",
-            }
+                error_class=type(budget_rejection).__name__,
+                category=budget_rejection.category,
+            )
 
         return validated
 
@@ -7901,10 +7953,10 @@ class ComposerServiceImpl:
 
         Pre-conditions:
 
-        * ``session_id`` is not None — session-aware tools are reachable
-          only from authenticated compose-loop calls. ``RuntimeError`` is
-          raised on a missing session id (interpreter-level invariant,
-          not Tier-3).
+        * ``session_id`` is not None — ``compose()`` admits a turn only
+          with COMPOSE session authority bound to its ``session_id`` (the
+          tool list itself is not filtered). ``RuntimeError`` is raised on a
+          missing session id (interpreter-level invariant, not Tier-3).
         * ``current_state_id`` is not None for tools that need a
           composition_state foreign key (currently every session-aware
           tool). If the LLM calls the tool before a successful state-staging
@@ -7918,17 +7970,18 @@ class ComposerServiceImpl:
         method itself does not need to change shape.
         """
         if session_id is None:
-            # Compose-loop invariant: session-aware tools are advertised
-            # to the LLM only when the loop is running against a
-            # persisted session. Reaching this branch with no
-            # ``session_id`` means the LLM somehow named a session-aware
-            # tool in an unsaved-session compose call. That is a
-            # plumbing bug, not a Tier-3 LLM error, so crash with a
-            # diagnostic message.
+            # Compose-loop invariant. ``composer_loop_tool_definitions()`` filters
+            # nothing: every compose turn advertises the session-aware
+            # tools. What guarantees a session here is ``compose()``'s
+            # admission, which refuses a turn without COMPOSE session
+            # authority and requires that authority's fence to name this
+            # ``session_id``. Reaching this branch with no ``session_id``
+            # is therefore a plumbing bug, not a Tier-3 LLM error, so crash
+            # with a diagnostic message.
             raise RuntimeError(
                 f"Session-aware tool {tool_name!r} dispatched without a session_id. "
-                f"_get_litellm_tools() should not advertise session-aware tools to "
-                f"the LLM on unsaved-session compose calls."
+                "compose() admits a turn only with COMPOSE session authority bound to its "
+                "session_id, so the compose loop lost that binding."
             )
         if current_state_id is None:
             # Fresh chat sessions legitimately start without a
@@ -7953,7 +8006,8 @@ class ComposerServiceImpl:
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="ToolArgumentError",
+                    error_class=type(exc).__name__,
+                    error_category=exc.category,
                     error_message=error_message,
                     error_payload=arg_error_payload,
                 )
@@ -7969,7 +8023,8 @@ class ComposerServiceImpl:
             return _SessionAwareDispatchOutcome(
                 result=None,
                 is_discovery=False,
-                error_class="ToolArgumentError",
+                error_class=type(exc).__name__,
+                error_category=exc.category,
                 error_message=error_message,
                 post_version=state.version,
             )
@@ -7989,6 +8044,9 @@ class ComposerServiceImpl:
         )
 
         try:
+            # Hold the arguments to the tool's closed-root flat schema S before
+            # the handler's pydantic model, like every execute_tool dispatch.
+            require_schema_valid_arguments(tool_name, arguments)
             result = await handler(**kwargs)
         except ToolArgumentError as exc:
             # Two sub-paths: rate-cap (write F-6 row + emit F-15 telemetry
@@ -8041,7 +8099,8 @@ class ComposerServiceImpl:
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="ToolArgumentError",
+                    error_class=type(exc).__name__,
+                    error_category=exc.category,
                     error_message=error_message,
                     error_payload=arg_error_payload,
                 )
@@ -8062,7 +8121,8 @@ class ComposerServiceImpl:
             return _SessionAwareDispatchOutcome(
                 result=None,
                 is_discovery=False,
-                error_class="ToolArgumentError",
+                error_class=type(exc).__name__,
+                error_category=exc.category,
                 error_message=error_message,
                 post_version=state.version,
             )

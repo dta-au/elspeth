@@ -2,7 +2,7 @@
 escape hatch for the composer LLM.
 
 Covers:
-- Advisor is mandatory: the tool is always exposed by _get_litellm_tools().
+- Advisor is mandatory: the tool is always exposed by composer_loop_tool_definitions().
 - CLI MCP allowlist (_COMPOSER_TOOL_NAMES) excludes it by design — the
   advisor is web-composer-only because the CLI MCP server's allowlist
   is built from _DISCOVERY_TOOLS / _MUTATION_TOOLS, neither of which
@@ -30,11 +30,17 @@ import pytest
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl, _build_advisor_user_message
+from elspeth.web.composer.service import (
+    ComposerAvailability,
+    ComposerServiceImpl,
+    _build_advisor_user_message,
+    composer_loop_tool_definitions,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
@@ -217,12 +223,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_advisor_tool_exposed() -> None:
-    """Advisor is mandatory, so _get_litellm_tools() always includes
+    """Advisor is mandatory, so composer_loop_tool_definitions() always includes
     request_advisor_hint in the LiteLLM function format.
     """
-    catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
-    tools = service._get_litellm_tools()
+    tools = composer_loop_tool_definitions()
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")
@@ -260,7 +264,7 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     raw_extra_context = "RAW_EXTRA_CONTEXT: raw traceback and source excerpt"
 
-    payload = service._validate_advisor_arguments(
+    rejection = service._validate_advisor_arguments(
         {
             "trigger": "proactive_security_safety",
             "problem_summary": "stuck",
@@ -270,9 +274,13 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
         }
     )
 
-    assert payload is not None
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
-    assert payload["error_class"] == "ValueError"
+    # The closed-root S gate rejects the extra key before the pydantic model:
+    # an honest ToolArgumentError of category schema_shape (was "ValueError").
+    assert payload["error_class"] == "ToolArgumentError"
+    assert payload["error_category"] == "schema_shape"
     assert "extra keys" in payload["error"]
     assert "full_context" not in payload["error"]
     assert raw_extra_context not in payload["error"]
@@ -284,7 +292,7 @@ def test_reactive_trigger_is_retired() -> None:
     must be rejected as an unknown trigger.
     """
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    payload = service._validate_advisor_arguments(
+    rejection = service._validate_advisor_arguments(
         {
             "trigger": "reactive_validation_loop",
             "problem_summary": "stuck",
@@ -292,7 +300,8 @@ def test_reactive_trigger_is_retired() -> None:
             "attempted_actions": ["a1", "a2"],
         }
     )
-    assert payload is not None  # ARG_ERROR
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
     assert "published schema" in payload["error"]
     assert "reactive_validation_loop" not in payload["error"]

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 
@@ -48,7 +48,7 @@ async def test_bedrock_live_smoke_uses_real_composer_service_and_default_credent
     assert service.get_availability().available is True
 
     messages = [{"role": "user", "content": "Reply with exactly: Bedrock smoke passed."}]
-    tools = service._get_litellm_tools()
+    tools = composer_loop_tool_definitions()
     recorder = BufferingRecorder()
     response = await service._call_llm_with_audit(
         messages,

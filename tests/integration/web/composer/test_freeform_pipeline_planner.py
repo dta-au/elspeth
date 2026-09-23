@@ -73,6 +73,8 @@ class _Response:
     usage: Mapping[str, object]
     model: str = "provider/planner-v1"
     id: str = "planner-request-1"
+    # OpenRouter's served-endpoint name; absent unless a test sets it.
+    provider: str | None = None
 
 
 def _empty_state() -> CompositionState:
@@ -295,6 +297,82 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
     assert planner_audit_kinds == ["llm_call_audit", "planner_attempt_audit"]
     assert len(requests) == 1
     assert requests[0]["max_tokens"] == settings.composer_planner_max_completion_tokens
+
+
+@pytest.mark.asyncio
+async def test_planner_llm_call_audit_persists_the_served_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline planner records its call through ``build_llm_call_record(response=...)``.
+
+    That branch reads the provider object directly rather than an admitted
+    metadata carrier, so ``provider_served`` must be proven on the persisted
+    ``llm_call_audit`` row of a real planner turn, not only on the compose loop.
+    """
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("planner-user", "Planner", "local")
+    user_message = await sessions.add_message(
+        session.id,
+        "user",
+        "Build a CSV to JSONL pipeline.",
+        writer_principal="route_user_message",
+    )
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_boot_probe_enabled=False,
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    monkeypatch.setattr(
+        ComposerServiceImpl,
+        "_compute_availability",
+        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(),
+        settings,
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+
+    async def completion(**_kwargs: Any) -> _Response:
+        response = _terminal_response(tmp_path, str(session.id))
+        response.provider = "DeepInfra"
+        return response
+
+    monkeypatch.setattr("litellm.acompletion", completion)
+
+    await composer.compose(
+        "Build a CSV to JSONL pipeline.",
+        [],
+        _empty_state(),
+        session_id=str(session.id),
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    with engine.connect() as conn:
+        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
+    planner_calls = [
+        calls[0]["call"]
+        for role, calls in audit_rows
+        if role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" and calls[0]["call"]["planner_call_ordinal"] is not None
+    ]
+    assert len(planner_calls) == 1
+    assert planner_calls[0]["provider_served"] == "DeepInfra"
 
 
 @pytest.mark.asyncio
