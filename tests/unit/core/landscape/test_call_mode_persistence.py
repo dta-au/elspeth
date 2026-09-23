@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import select
 
@@ -9,6 +11,7 @@ from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataState
 from elspeth.core.landscape.schema import call_verifications_table, calls_table
@@ -150,3 +153,54 @@ def test_rejects_lineage_from_an_unconfigured_source_run() -> None:
             differences_json="{}",
         )
     assert factory.execution.get_verification_decisions_for_run("current") == []
+
+
+def test_state_lookup_binds_node_and_source_row_then_exposes_source_token() -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    source_state_id = "source-state"
+    current_state_id = "current-state"
+    for run_id, state_id, ingest_sequence in (
+        ("source", source_state_id, 3),
+        ("current", current_state_id, 9),
+    ):
+        register_test_node(factory.data_flow, run_id, "transform", plugin_name="transform")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source-node",
+            0,
+            {"value": 1},
+            source_row_index=0,
+            ingest_sequence=ingest_sequence,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+        factory.execution.begin_node_state(
+            token.token_id,
+            "transform",
+            0,
+            {"value": 1},
+            state_id=state_id,
+            member_token=leader_coordination_token(factory, run_id).membership,
+        )
+    with factory._db.write_connection() as conn:
+        conn.execute(
+            calls_table.insert().values(
+                call_id="state-source-call",
+                state_id=source_state_id,
+                operation_id=None,
+                call_index=0,
+                call_type=CallType.HTTP.value,
+                status=CallStatus.SUCCESS.value,
+                request_hash=stable_hash({"url": "https://example.test/a"}),
+                created_at=datetime.now(UTC),
+            )
+        )
+    calls = factory.execution.list_source_calls_for_current_parent(
+        source_run_id="source",
+        call_type=CallType.HTTP,
+        current_state_id=current_state_id,
+        current_operation_id=None,
+    )
+    assert [call.call_id for call in calls] == ["state-source-call"]
+    source_state = factory.execution.get_node_state(calls[0].state_id)
+    assert source_state is not None
+    assert source_state.state_id == source_state_id
+    assert source_state.token_id != factory.execution.get_node_state(current_state_id).token_id
