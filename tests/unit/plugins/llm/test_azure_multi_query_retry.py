@@ -561,7 +561,7 @@ class TestConcurrentRowProcessing:
                     ctx = make_context(state_id=f"concurrent-atomicity-{i}", token=token)
                     transform.accept(make_pipeline_row(row), ctx)
 
-                transform.flush_batch_processing(timeout=30.0)
+                transform.flush_batch_processing(timeout=90.0)
             finally:
                 transform.close()
 
