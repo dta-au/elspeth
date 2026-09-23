@@ -80,6 +80,22 @@ def test_verify_file_option_detects_changed_content(tmp_path: Path) -> None:
     )
 
 
+def test_replay_file_option_binds_unnamed_plugin(tmp_path: Path) -> None:
+    materializer = TemplateOptionMaterializer(tmp_path / "settings.yaml")
+    config = {"transforms": [{"plugin": "reference_join", "options": {"reference_file": "missing.csv"}}]}
+    source_settings = {
+        "transforms": [
+            {
+                "plugin": "reference_join",
+                "options": {"reference_source": "missing.csv", "reference_content": "sku,value\nA,archived\n"},
+            }
+        ]
+    }
+
+    materialized = materializer.materialize_config(config, run_mode=RunMode.REPLAY, source_settings=source_settings)
+    assert materialized["transforms"][0]["options"]["reference_content"] == "sku,value\nA,archived\n"
+
+
 def test_load_settings_replay_binds_reference_file_before_read(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     example = repo_root / "examples/reference_join"

@@ -21,7 +21,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TransformErrorReason
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TransformErrorReason, TransformSuccessReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.pdf_render import (
@@ -381,7 +381,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f25d51fd30dbe3c2"
+    source_file_hash: str | None = "sha256:3b046df8f868e5dc"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -679,29 +679,31 @@ class PDFRasterize(BaseTransform):
         refused: list[PDFRefusedPageData] = []
         page_count: int | None = None
         outcome_kind: str
-        if isinstance(outcome, RasterizeResponse):
+        if type(outcome) is RasterizeResponse:
             outcome_kind = "rasterized"
             page_count = outcome.page_count
             rendered = [
                 {
                     "page_number": page.page_number,
-                    "page_ref": page_refs.get(page.page_number),
+                    "page_ref": page_refs[page.page_number] if page.page_number in page_refs else None,
                     "width_px": page.width_px,
                     "height_px": page.height_px,
-                    "size_bytes": page_sizes.get(page.page_number, page.size_bytes),
+                    "size_bytes": page_sizes[page.page_number] if page.page_number in page_sizes else page.size_bytes,
                     "worker_size_bytes": page.size_bytes,
                     "text": page.text,
                 }
                 for page in outcome.rendered
             ]
             refused = [{"page_number": page.page_number, "kind": page.kind.value, "detail": page.detail} for page in outcome.refused]
-        elif isinstance(outcome, DocumentRefusal):
+        elif type(outcome) is DocumentRefusal:
             outcome_kind = "document_refusal"
             page_count = outcome.page_count
             refused = [{"kind": outcome.kind.value, "detail": outcome.detail}]
-        else:
+        elif type(outcome) is RenderTimedOut:
             outcome_kind = "timeout"
             refused = [{"timeout_seconds": outcome.timeout_seconds}]
+        else:
+            raise FrameworkBugError(f"Unknown PDF renderer result type: {type(outcome).__name__}")
         return {
             "format": "pdf_rasterize/v1",
             "renderer_identity": renderer_identity(),
@@ -716,17 +718,29 @@ class PDFRasterize(BaseTransform):
         }
 
     def _restore_render_receipt(self, receipt: object, input_row: PipelineRow) -> TransformResult:
-        if type(receipt) is not dict or receipt.get("format") != "pdf_rasterize/v1":
+        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != "pdf_rasterize/v1":
             raise AuditIntegrityError("PDF replay source call has no typed render receipt")
-        identity = receipt.get("renderer_identity")
+        identity = receipt["renderer_identity"] if "renderer_identity" in receipt else None
         if type(identity) is not str or _PAYLOAD_REF_PATTERN.fullmatch(identity) is None:
             raise AuditIntegrityError("PDF replay render receipt has no renderer identity")
-        if receipt.get("outcome_kind") not in ("rasterized", "document_refusal", "timeout"):
+        required = {
+            "outcome_kind",
+            "rendered",
+            "refused",
+            "page_count",
+            "rows",
+            "result_status",
+            "success_reason",
+            "error_reason",
+        }
+        if not required.issubset(receipt):
+            raise AuditIntegrityError("PDF replay render receipt is missing required fields")
+        if receipt["outcome_kind"] not in ("rasterized", "document_refusal", "timeout"):
             raise AuditIntegrityError("PDF replay render receipt has no typed worker outcome")
-        rendered = receipt.get("rendered")
-        refused = receipt.get("refused")
-        page_count = receipt.get("page_count")
-        rows = receipt.get("rows")
+        rendered = receipt["rendered"]
+        refused = receipt["refused"]
+        page_count = receipt["page_count"]
+        rows = receipt["rows"]
         if type(rendered) is not list or type(refused) is not list or type(rows) is not list:
             raise AuditIntegrityError("PDF replay render receipt has malformed output rows")
         if receipt["outcome_kind"] == "rasterized":
@@ -734,24 +748,29 @@ class PDFRasterize(BaseTransform):
                 raise AuditIntegrityError("PDF replay render receipt has invalid page count")
         elif rendered:
             raise AuditIntegrityError("PDF replay refusal receipt cannot contain rendered pages")
-        if not isinstance(self._payload_store, SourceBoundPayloadStore):
+        if type(self._payload_store) is not SourceBoundPayloadStore:
             raise AuditIntegrityError("PDF replay requires a source-bound payload store")
-        if receipt.get("result_status") == "error":
-            if rows or type(receipt.get("error_reason")) is not dict:
+        if receipt["result_status"] == "error":
+            error_reason = receipt["error_reason"]
+            if rows or type(error_reason) is not dict or "reason" not in error_reason or type(error_reason["reason"]) is not str:
                 raise AuditIntegrityError("PDF replay error receipt has inconsistent output")
-            return TransformResult.error(receipt["error_reason"], retryable=False)
+            return TransformResult.error(cast(TransformErrorReason, error_reason), retryable=False)
         if (
-            receipt.get("result_status") != "success"
+            receipt["result_status"] != "success"
             or receipt["outcome_kind"] != "rasterized"
             or not rows
             or len(rows) != len(rendered)
-            or type(receipt.get("success_reason")) is not dict
+            or type(receipt["success_reason"]) is not dict
+            or "action" not in receipt["success_reason"]
+            or type(receipt["success_reason"]["action"]) is not str
         ):
             raise AuditIntegrityError("PDF replay success receipt has inconsistent output")
         pages_by_number: dict[int, PDFRenderedPageData] = {}
         for index, page in enumerate(rendered):
-            if type(page) is not dict or type(page.get("page_ref")) is not str or type(page.get("page_number")) is not int:
+            if type(page) is not dict or "page_ref" not in page or "page_number" not in page:
                 raise AuditIntegrityError(f"PDF replay rendered page {index} has no archived payload")
+            if type(page["page_ref"]) is not str or type(page["page_number"]) is not int:
+                raise AuditIntegrityError(f"PDF replay rendered page {index} has malformed payload fields")
             number = page["page_number"]
             if not 1 <= number <= page_count or number in pages_by_number:
                 raise AuditIntegrityError(f"PDF replay rendered page {index} has invalid page number")
@@ -760,8 +779,10 @@ class PDFRasterize(BaseTransform):
                 raise AuditIntegrityError(f"PDF replay rendered page {index} has malformed payload hash")
             archived_bytes = self._payload_store.read_output(page_ref)
             if (
-                type(page.get("size_bytes")) is not int
-                or type(page.get("worker_size_bytes")) is not int
+                "size_bytes" not in page
+                or "worker_size_bytes" not in page
+                or type(page["size_bytes"]) is not int
+                or type(page["worker_size_bytes"]) is not int
                 or len(archived_bytes) != page["size_bytes"]
             ):
                 raise AuditIntegrityError(f"PDF replay rendered page {index} size differs from archived bytes")
@@ -769,32 +790,49 @@ class PDFRasterize(BaseTransform):
         expected_input = input_row.to_dict()
         output_rows: list[PipelineRow] = []
         for index, output in enumerate(rows):
-            if type(output) is not dict or not all(output.get(key) == value for key, value in expected_input.items()):
+            if type(output) is not dict or not all(key in output and output[key] == value for key, value in expected_input.items()):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with input")
-            number = output.get(self._page_number_field)
-            page = pages_by_number.get(number) if type(number) is int else None
-            if page is None or output.get(self._page_blob_ref_field) != page["page_ref"]:
+            if self._page_number_field not in output or type(output[self._page_number_field]) is not int:
+                raise AuditIntegrityError(f"PDF replay output row {index} has no page number")
+            number = output[self._page_number_field]
+            if number not in pages_by_number:
                 raise AuditIntegrityError(f"PDF replay output row {index} has no matching rendered page")
+            page = pages_by_number[number]
+            required_output = {
+                self._page_blob_ref_field,
+                self._page_width_field,
+                self._page_height_field,
+                self._page_size_bytes_field,
+                self._document_id_field,
+                self._page_mime_type_field,
+            }
+            if self._extract_text:
+                required_output.add(self._page_text_field)
+            if not required_output.issubset(output):
+                raise AuditIntegrityError(f"PDF replay output row {index} is missing page fields")
             if (
-                output.get(self._page_width_field) != page.get("width_px")
-                or output.get(self._page_height_field) != page.get("height_px")
-                or output.get(self._page_size_bytes_field) != page.get("size_bytes")
-                or output.get(self._document_id_field) != expected_input[self._blob_ref_field]
-                or output.get(self._page_mime_type_field) != PAGE_MIME_TYPE
+                output[self._page_blob_ref_field] != page["page_ref"]
+                or "width_px" not in page
+                or "height_px" not in page
+                or output[self._page_width_field] != page["width_px"]
+                or output[self._page_height_field] != page["height_px"]
+                or output[self._page_size_bytes_field] != page["size_bytes"]
+                or output[self._document_id_field] != expected_input[self._blob_ref_field]
+                or output[self._page_mime_type_field] != PAGE_MIME_TYPE
             ):
                 raise AuditIntegrityError(f"PDF replay output row {index} disagrees with worker receipt")
-            if self._extract_text and output.get(self._page_text_field) != page.get("text"):
+            if self._extract_text and ("text" not in page or output[self._page_text_field] != page["text"]):
                 raise AuditIntegrityError(f"PDF replay output row {index} text differs from worker receipt")
             contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
             contract = self._apply_declared_output_field_contracts(contract)
             contract = self._align_output_contract(contract)
             output_rows.append(PipelineRow(output, contract))
         for page in pages_by_number.values():
-            page_ref = page["page_ref"]
-            if page_ref is None:
+            restored_ref = page["page_ref"]
+            if type(restored_ref) is not str:
                 raise AuditIntegrityError("PDF replay validated page lost its payload reference")
-            self._payload_store.restore_output(page_ref)
-        return TransformResult.success_multi(output_rows, success_reason=receipt["success_reason"])
+            self._payload_store.restore_output(restored_ref)
+        return TransformResult.success_multi(output_rows, success_reason=cast(TransformSuccessReason, receipt["success_reason"]))
 
     def _record_render_call(
         self,

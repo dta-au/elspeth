@@ -124,16 +124,18 @@ class TemplateOptionMaterializer:
     ) -> dict[str, Any]:
         config = dict(raw_config)
         for collection_name in PLUGIN_OPTION_COLLECTIONS:
-            collection = config.get(collection_name)
-            if not isinstance(collection, list):
+            if collection_name not in config or type(config[collection_name]) is not list:
                 continue
-            source_collection = source_settings.get(collection_name) if type(source_settings) is dict else None
+            collection = config[collection_name]
+            source_collection = (
+                source_settings[collection_name] if type(source_settings) is dict and collection_name in source_settings else None
+            )
             config[collection_name] = [
                 self._materialize_plugin_config(
                     plugin_config,
                     run_mode=run_mode,
                     source_plugin=(
-                        source_collection[index] if isinstance(source_collection, list) and index < len(source_collection) else None
+                        source_collection[index] if type(source_collection) is list and index < len(source_collection) else None
                     ),
                 )
                 for index, plugin_config in enumerate(collection)
@@ -158,7 +160,8 @@ class TemplateOptionMaterializer:
             if run_mode is not RunMode.LIVE:
                 if (
                     type(source_options) is not dict
-                    or source_options.get(rule.source_key) != file_ref
+                    or rule.source_key not in source_options
+                    or source_options[rule.source_key] != file_ref
                     or rule.content_key not in source_options
                 ):
                     raise TemplateFileError(
@@ -212,19 +215,19 @@ class TemplateOptionMaterializer:
         run_mode: RunMode,
         source_plugin: Any,
     ) -> Any:
-        if not isinstance(plugin_config, dict):
+        if type(plugin_config) is not dict:
             return plugin_config
         plugin = dict(plugin_config)
-        options = plugin.get("options")
-        if isinstance(options, dict):
+        options = plugin["options"] if "options" in plugin else None
+        if type(options) is dict:
             source_options = None
             if (
-                isinstance(source_plugin, dict)
-                and source_plugin.get("plugin") == plugin.get("plugin")
-                and source_plugin.get("name") == plugin.get("name")
+                type(source_plugin) is dict
+                and (source_plugin["plugin"] if "plugin" in source_plugin else None) == (plugin["plugin"] if "plugin" in plugin else None)
+                and (source_plugin["name"] if "name" in source_plugin else None) == (plugin["name"] if "name" in plugin else None)
             ):
-                candidate = source_plugin.get("options")
-                if isinstance(candidate, dict):
+                candidate = source_plugin["options"] if "options" in source_plugin else None
+                if type(candidate) is dict:
                     source_options = candidate
             plugin["options"] = self.materialize_options(options, run_mode=run_mode, source_options=source_options)
         return plugin
