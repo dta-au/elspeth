@@ -12,9 +12,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.web.validation import _PII_WARNING_PATTERNS
 
-type AdvisorFindingCategory = Literal["request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"]
+AdvisorFindingCategory = Literal["request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"]
 
-ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(get_args(AdvisorFindingCategory.__value__))
+ADVISOR_FINDING_CATEGORIES: Final[frozenset[str]] = frozenset(get_args(AdvisorFindingCategory))
 ADVISOR_NOTE_MAX_CHARS: Final[int] = 600
 
 
@@ -119,11 +119,49 @@ class SanitizedAdvisorNote:
 _NOTE_ANSI_CSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _NOTE_STRIPPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _NOTE_KEPT_CONTROLS: Final[frozenset[str]] = frozenset("\t\n")
-_NOTE_URL_RE: Final[re.Pattern[str]] = re.compile(r"(?<![a-z0-9])(?:[a-z][a-z0-9+.\-]*://|www\.)[^\s<>\"']+", re.IGNORECASE)
+_NOTE_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![a-z0-9])(?:[a-z][a-z0-9+.\-]*://|www\.|(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,63}/)[^\s<>\"']+",
+    re.IGNORECASE,
+)
 # Reuse the existing egress email matcher without broadening validation.py's
 # other egress surfaces or counting sentinel text already present in a note.
 _NOTE_EMAIL_RE: Final[re.Pattern[str]] = dict(_PII_WARNING_PATTERNS)["email"]
 _NOTE_BLANK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
+
+
+def _markdown_destination_end(match: re.Match[str]) -> int:
+    """Locate the outer close while keeping nested or escaped URL parentheses."""
+    depth = 0
+    escaped = False
+    for offset, character in enumerate(match.group()):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return match.start() + offset
+            depth -= 1
+    return match.end()
+
+
+def _redact_note_urls(text: str) -> tuple[str, int]:
+    """Redact URL destinations, retaining a markdown link's own closing mark."""
+    parts: list[str] = []
+    cursor = 0
+    count = 0
+    while (match := _NOTE_URL_RE.search(text, cursor)) is not None:
+        opening_end = match.start()
+        while opening_end > 0 and text[opening_end - 1].isspace():
+            opening_end -= 1
+        end = _markdown_destination_end(match) if text.endswith("](", 0, opening_end) else match.end()
+        parts.extend((text[cursor : match.start()], "[link removed]"))
+        cursor = end
+        count += 1
+    parts.append(text[cursor:])
+    return "".join(parts), count
 
 
 def sanitize_advisor_note(note: str | None) -> SanitizedAdvisorNote:
@@ -135,15 +173,16 @@ def sanitize_advisor_note(note: str | None) -> SanitizedAdvisorNote:
     body = "\n".join(note.splitlines())
     # Strip ANSI before controls so ESC removal cannot leave visible [31m text.
     body = _NOTE_ANSI_CSI_RE.sub("", body)
-    body = body.replace("BEGIN_UNTRUSTED_ADVISOR_FINDINGS", "").replace("END_UNTRUSTED_ADVISOR_FINDINGS", "")
     body = "".join(
         character
         for character in body
         if character in _NOTE_KEPT_CONTROLS or unicodedata.category(character) not in _NOTE_STRIPPED_CATEGORIES
     )
+    # Filtering removable format characters can reassemble a fence sentinel.
+    body = body.replace("BEGIN_UNTRUSTED_ADVISOR_FINDINGS", "").replace("END_UNTRUSTED_ADVISOR_FINDINGS", "")
     # URLs win overlaps (e.g. an email in a URL path); counts describe the
     # actual substitutions, including matches beyond the eventual note cap.
-    body, url_redactions = _NOTE_URL_RE.subn("[link removed]", body)
+    body, url_redactions = _redact_note_urls(body)
     body, email_redactions = _NOTE_EMAIL_RE.subn("<redacted-sensitive:email>", body)
     body = _NOTE_BLANK_RUN_RE.sub("\n\n", body).strip()
     if len(body) > ADVISOR_NOTE_MAX_CHARS:

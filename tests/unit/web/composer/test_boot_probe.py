@@ -50,24 +50,23 @@ async def test_advisor_probe_uses_production_request_options(monkeypatch: pytest
     assert request == expected
     assert isinstance(messages, list)
     prompt = messages[0]["content"]
-    assert _CLEAN in prompt
-    assert "reply with ok" not in prompt
+    assert all(field not in json.dumps(messages).lower() for field in ("verdict", "findings", "note", "steps", "category"))
+    assert "reply with ok" in prompt.lower()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content",
     [
-        "CLEAN",
+        "ok",
+        f"```json\n{_CLEAN}\n```",
         "",
         '{"verdict":',
         '{"verdict":"FLAGGED","verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}',
-        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "bad"}),
-        json.dumps({"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None}),
         None,
         4,
     ],
-    ids=["prose", "empty", "truncated", "duplicate", "clean-note", "flagged-empty", "reasoning-only", "wrong-type"],
+    ids=["prose", "fenced-json", "empty", "truncated", "duplicate", "reasoning-only", "wrong-type"],
 )
 async def test_advisor_probe_rejects_nonconforming_content(monkeypatch: pytest.MonkeyPatch, content: object) -> None:
     async def complete(**_kwargs: object) -> object:
@@ -100,15 +99,75 @@ async def test_advisor_probe_rejects_malformed_provider_response(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_advisor_probe_names_structured_capability_on_provider_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("role", "model", "temperature", "seed", "reasoning_effort", "expected_presence"),
+    [
+        ("planner", "probe-model", None, None, None, (False, False, False, False, False)),
+        ("planner", "probe-model", 0.0, 7, "low", (True, True, False, False, False)),
+        ("advisor", "probe-model", None, None, "low", (False, False, False, True, False)),
+        ("advisor", "openrouter/probe-model", 0.0, 7, "low", (True, True, True, True, True)),
+        ("advisor", "azure/probe-model", None, None, "low", (False, False, True, True, False)),
+    ],
+)
+async def test_probe_rejection_reports_only_sent_option_presence(
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
+    reasoning_effort: str | None,
+    expected_presence: tuple[bool, bool, bool, bool, bool],
+) -> None:
     from litellm.exceptions import BadRequestError
 
+    provider_error = BadRequestError(message="SENSITIVE_PROVIDER_TEXT", model=model, llm_provider="openai")
+
     async def complete(**_kwargs: object) -> object:
-        raise BadRequestError(message="schema unsupported", model="probe-model", llm_provider="openai")
+        raise provider_error
 
     monkeypatch.setattr(bp, "_litellm_acompletion", complete)
-    with pytest.raises(bp.ComposerBootConfigError, match=r"advisor.*probe-model.*structured-output"):
-        await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
+    with pytest.raises(bp.ComposerBootConfigError) as caught:
+        await bp.probe_composer_config(
+            role=role,
+            model=model,
+            temperature=temperature,
+            seed=seed,
+            reasoning_effort=reasoning_effort,
+            max_tokens=4096,
+        )
+    text = str(caught.value)
+    assert "SENSITIVE_PROVIDER_TEXT" not in text
+    assert text.startswith(f"composer {role} boot request rejected by {model}:")
+    for field, present in zip(
+        ("temperature", "seed", "reasoning_effort", "response_format", "provider_routing"), expected_presence, strict=True
+    ):
+        assert f"{field}_present={present}" in text
+    assert caught.value.__cause__ is provider_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        _CLEAN,
+        json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": "ok"}),
+        json.dumps({"verdict": "CLEAN", "category": "other", "steps": ["step"], "findings": "", "note": None}),
+        json.dumps({"verdict": "FLAGGED", "category": "other", "steps": [], "findings": " ", "note": None}),
+    ],
+    ids=["accepted-clean", "clean-note", "clean-steps", "flagged-empty"],
+)
+async def test_advisor_probe_accepts_schema_valid_without_requiring_checkpoint_semantics(
+    monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    async def complete(**_kwargs: object) -> object:
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    try:
+        accepted = await bp.probe_composer_config(role="advisor", model="probe-model", temperature=None, seed=None, max_tokens=4096)
+    except bp.ComposerBootConfigError:
+        accepted = False
+    assert accepted, "boot must accept schema-valid output even when checkpoint semantics reject it"
 
 
 @pytest.mark.asyncio

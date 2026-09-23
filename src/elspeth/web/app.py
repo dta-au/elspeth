@@ -192,6 +192,7 @@ if TYPE_CHECKING:
 _COMPOSER_BOOT_CONFIG_COUNTER: Counter
 _COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
 _COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+_COMPOSER_ADVISOR_BOOT_PROBE_TIMEOUT_SECONDS = 60.0
 _FORBIDDEN_METRICS_LABEL_PATTERN = re.compile(rb"(?:\{|,)\s*(run_id|session_id|user_id)\s*=")
 _METRICS_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 # Reserve bounded headroom inside the public five-second readiness contract
@@ -700,6 +701,13 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         for role, model, endpoint_base_url, endpoint_api_key in probe_roles:
             composer_probe_start = time.monotonic()
             probe_status = "started"
+            probe_timeout = _COMPOSER_ADVISOR_BOOT_PROBE_TIMEOUT_SECONDS if role == "advisor" else _COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS
+            conformance_warning = {"structured_output_conformance_verified": False} if role == "advisor" else {}
+            failure_action = (
+                "booting; structured-output conformance was not verified this boot"
+                if role == "advisor"
+                else "booting; composer LLM calls will be exercised at first use"
+            )
             attributes: dict[str, AttributeValue] = {
                 "composer_model": settings.composer_model,
                 "composer_temperature": str(settings.composer_temperature),
@@ -722,7 +730,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                         max_tokens=settings.composer_advisor_max_completion_tokens if role == "advisor" else None,
                         reasoning_effort=settings.composer_advisor_reasoning_effort if role == "advisor" else None,
                     ),
-                    timeout=_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS,
+                    timeout=probe_timeout,
                 )
                 if ok:
                     probe_status = "success"
@@ -731,17 +739,21 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                     slog.warning(
                         "composer_boot_probe_transient_failure",
                         model=model,
+                        probed_role=role,
                         failure_class="provider_or_transport_error",
-                        action="booting; composer LLM calls will be exercised at first use",
+                        action=failure_action,
+                        **conformance_warning,
                     )
             except TimeoutError:
                 probe_status = "transient_failure"
                 slog.warning(
                     "composer_boot_probe_transient_failure",
                     model=model,
+                    probed_role=role,
                     failure_class="TimeoutError",
-                    timeout_seconds=_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS,
-                    action="booting; composer LLM calls will be exercised at first use",
+                    timeout_seconds=probe_timeout,
+                    action=failure_action,
+                    **conformance_warning,
                 )
             except ComposerBootConfigError:
                 probe_status = "rejected"

@@ -194,8 +194,9 @@ def test_response_format_uses_the_required_strict_owned_schema() -> None:
     schema = AdvisorCheckpointResponse.model_json_schema()
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == {"verdict", "category", "steps", "findings", "note"}
-    assert schema["properties"]["category"] == {"$ref": "#/$defs/AdvisorFindingCategory"}
-    assert set(schema["$defs"]["AdvisorFindingCategory"]["enum"]) == ADVISOR_FINDING_CATEGORIES
+    assert '"$ref"' not in json.dumps(schema)
+    assert '"$defs"' not in json.dumps(schema)
+    assert set(schema["properties"]["category"]["enum"]) == ADVISOR_FINDING_CATEGORIES
     assert schema["properties"]["steps"] == {"items": {"type": "string"}, "title": "Steps", "type": "array"}
 
 
@@ -253,3 +254,79 @@ def test_redaction_counts_measure_substitutions_and_not_preexisting_sentinels() 
     )
     assert result.url_redactions == 2
     assert result.email_redactions == 2
+
+
+@pytest.mark.parametrize("sentinel", ["BEGIN_UNTRUSTED_ADVISOR_FINDINGS", "END_UNTRUSTED_ADVISOR_FINDINGS"])
+def test_note_removes_sentinels_reassembled_by_format_filter(sentinel: str) -> None:
+    disguised = sentinel.replace("_ADVISOR", chr(0x200B) + "_ADVISOR")
+    result = sanitize_advisor_note("Before " + disguised + " after")
+    assert result.note == "Before  after"
+    assert result.url_redactions == 0
+    assert result.email_redactions == 0
+
+
+def test_note_preserves_prose_resembling_a_fence_sentinel() -> None:
+    result = sanitize_advisor_note("END_UNTRUSTED_ADVISOR_FINDING and advisor findings")
+    assert result.note == "END_UNTRUSTED_ADVISOR_FINDING and advisor findings"
+
+
+@pytest.mark.parametrize("url", ["evil.example.com/login", "sub.evil.io/a?b=c"])
+def test_note_redacts_bare_dotted_host_with_path(url: str) -> None:
+    result = sanitize_advisor_note("Change " + url + " now")
+    assert result.note == "Change [link removed] now"
+    assert result.url_redactions == 1
+    assert result.email_redactions == 0
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "sink.path",
+        "csv_out.options.path",
+        "data.csv",
+        "outputs/results.csv",
+        "v1.2.3",
+        "row.field",
+        "step.with.dots needs a change",
+        "evil.com",
+    ],
+)
+def test_bare_host_rule_preserves_option_paths_files_versions_and_plain_hosts(prose: str) -> None:
+    result = sanitize_advisor_note(prose)
+    assert result.note == prose
+    assert result.url_redactions == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://x.io/a",
+        "https://en.wikipedia.org/wiki/Function_(mathematics)",
+        "https://x.io/a_(b_(c))/d",
+        r"https://x.io/a\)b",
+        "evil.example.com/login",
+    ],
+)
+def test_markdown_url_redaction_preserves_balanced_wrapper(url: str) -> None:
+    result = sanitize_advisor_note(f"Read [docs]({url}) then fix it.")
+    assert result.note == "Read [docs]([link removed]) then fix it."
+    assert result.url_redactions == 1
+
+
+def test_markdown_redaction_preserves_non_url_parentheses_and_finds_adjacent_links() -> None:
+    result = sanitize_advisor_note("(plain prose) [option](sink.path) [a](https://a.io/x)[b](https://b.io/y)")
+    assert result.note == "(plain prose) [option](sink.path) [a]([link removed])[b]([link removed])"
+    assert result.url_redactions == 2
+
+
+@pytest.mark.parametrize("spacing", [" ", "\t", "\n", " \n\t"])
+def test_markdown_url_redaction_preserves_wrapper_after_opening_whitespace(spacing: str) -> None:
+    result = sanitize_advisor_note(f"Read [docs]({spacing}https://x.io/a_(b)) now.")
+    assert result.note == f"Read [docs]({spacing}[link removed]) now."
+    assert result.url_redactions == 1
+
+
+def test_markdown_non_url_destination_with_whitespace_is_unchanged() -> None:
+    result = sanitize_advisor_note("Read [option]( sink.path) now.")
+    assert result.note == "Read [option]( sink.path) now."
+    assert result.url_redactions == 0

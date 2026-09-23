@@ -102,6 +102,47 @@ async def test_first_attempt_and_retry_conformance(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejected", "schema_valid"),
+    [
+        ("PROVIDER_REJECTION_CANARY: not JSON", False),
+        (_reply(note=False, findings="PROVIDER_REJECTION_CANARY"), False),
+        (_reply(verdict="CLEAN", steps=[], note="PROVIDER_REJECTION_CANARY"), True),
+        (_reply(verdict="CLEAN", steps=["PROVIDER_REJECTION_CANARY"], note=None), True),
+        (_reply(findings="  ", note="PROVIDER_REJECTION_CANARY"), True),
+    ],
+    ids=["invalid-json", "invalid-field-type", "clean-note", "clean-steps", "flagged-blank-findings"],
+)
+async def test_retry_wording_distinguishes_schema_from_contract_violation(make_service, simple_state, rejected, schema_valid):
+    service = make_service()
+    replies = iter([rejected, _reply(verdict="CLEAN", steps=[], findings="", note=None)])
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *args, **kwargs: (next(replies), {}))
+    fenced = _fenced_session(service)
+
+    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
+
+    assert verdict.ok and not verdict.blocking
+    first, retry = service._call_advisor_with_audit.calls
+    schema_reprompt = (
+        "The previous reply did not satisfy the checkpoint schema. Return only the required JSON object, "
+        "following the output contract in the system instructions."
+    )
+    contract_reprompt = (
+        "The previous reply satisfied the checkpoint schema but violated the output contract. "
+        "For CLEAN, steps must be empty and note must be null; FLAGGED requires non-empty, non-whitespace findings. "
+        "Return only the required JSON object, following the output contract in the system instructions."
+    )
+    expected = contract_reprompt if schema_valid else schema_reprompt
+    assert retry.args[0] == {**first.args[0], "problem_summary": f"{first.args[0]['problem_summary']} {expected}"}
+    assert "PROVIDER_REJECTION_CANARY" not in repr(retry.args[0])
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == 2
+    assert record["first_attempt_schema_valid"] is schema_valid
+    assert record["first_attempt_accepted"] is False
+    assert record["format_reprompt_sent"] is True
+
+
+@pytest.mark.asyncio
 async def test_deadline_before_format_retry_does_not_record_unsent_reprompt(make_service, simple_state, monkeypatch):
     service = make_service()
     clock = iter([1.0, 3.0])
@@ -204,8 +245,9 @@ async def test_every_invalid_contract_uses_format_retry_then_malformed(make_serv
     assert verdict.failure_class == "malformed"
     assert service._call_advisor_with_audit.await_count == 2
     first, retry = service._call_advisor_with_audit.calls
-    assert service_module._ADVISOR_VERDICT_FORMAT_REPROMPT not in first.args[0]["problem_summary"]
-    assert service_module._ADVISOR_VERDICT_FORMAT_REPROMPT in retry.args[0]["problem_summary"]
+    reprompts = (service_module._ADVISOR_VERDICT_FORMAT_REPROMPT, service_module._ADVISOR_VERDICT_CONTRACT_REPROMPT)
+    assert all(reprompt not in first.args[0]["problem_summary"] for reprompt in reprompts)
+    assert sum(reprompt in retry.args[0]["problem_summary"] for reprompt in reprompts) == 1
 
 
 @pytest.mark.asyncio

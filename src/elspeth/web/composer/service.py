@@ -8958,7 +8958,7 @@ class ComposerServiceImpl:
                     if provider_attempts == 1:
                         first_attempt_schema_valid = False
                         first_attempt_accepted = False
-                    call_arguments = _advisor_arguments_with_format_reprompt(arguments)
+                    call_arguments = _advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
                 else:
                     call_arguments = arguments
                 continue
@@ -8985,7 +8985,7 @@ class ComposerServiceImpl:
             # channel, no second prompt path).
             last_exc = None
             last_response_unparseable = True
-            call_arguments = _advisor_arguments_with_format_reprompt(arguments)
+            call_arguments = _advisor_arguments_with_format_reprompt(arguments, schema_valid=verdict.response_schema_valid is True)
         if last_response_unparseable:
             # The advisor was REACHABLE on the final attempt and still returned
             # no verdict. That is MALFORMED, not unavailable — the distinction
@@ -11063,17 +11063,24 @@ _ADVISOR_VERDICT_FORMAT_REPROMPT: Final[str] = (
     "The previous reply did not satisfy the checkpoint schema. Return only the required JSON object, "
     "following the output contract in the system instructions."
 )
+_ADVISOR_VERDICT_CONTRACT_REPROMPT: Final[str] = (
+    "The previous reply satisfied the checkpoint schema but violated the output contract. "
+    "For CLEAN, steps must be empty and note must be null; FLAGGED requires non-empty, non-whitespace findings. "
+    "Return only the required JSON object, following the output contract in the system instructions."
+)
 
 
-def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a copy of the checkpoint arguments carrying the format re-prompt.
+def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any], *, schema_valid: bool) -> dict[str, Any]:
+    """Return checkpoint arguments with a fixed re-prompt matching the rejection.
 
     The retry must not lose the original problem summary (the rubric, the
     degeneracy directive, the pipeline excerpt) — it only adds an explicit
-    restatement of the output format the previous reply failed to honour.
+    restatement of the schema or semantic rules the previous reply violated.
+    Neither path echoes the rejected provider text.
     """
+    reprompt = _ADVISOR_VERDICT_CONTRACT_REPROMPT if schema_valid else _ADVISOR_VERDICT_FORMAT_REPROMPT
     retry = dict(arguments)
-    retry["problem_summary"] = f"{arguments['problem_summary']} {_ADVISOR_VERDICT_FORMAT_REPROMPT}"
+    retry["problem_summary"] = f"{arguments['problem_summary']} {reprompt}"
     return retry
 
 

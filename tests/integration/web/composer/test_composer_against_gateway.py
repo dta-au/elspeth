@@ -584,7 +584,7 @@ async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(gateway_
 
     from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
 
-    with pytest.raises(ComposerBootConfigError, match="sampling rejected") as caught:
+    with pytest.raises(ComposerBootConfigError, match="composer planner boot request rejected") as caught:
         await probe_composer_config(
             role="planner",
             model=_MODEL_ALIAS,
@@ -594,6 +594,12 @@ async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(gateway_
             api_key=_INBOUND_BEARER,
         )
     assert isinstance(caught.value.__cause__, UnsupportedParamsError)
+    assert f"by {_MODEL_ALIAS}:" in str(caught.value)
+    assert "temperature_present=True" in str(caught.value)
+    assert "seed_present=True" in str(caught.value)
+    assert "reasoning_effort_present=False" in str(caught.value)
+    assert "response_format_present=False" in str(caught.value)
+    assert "provider_routing_present=False" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
