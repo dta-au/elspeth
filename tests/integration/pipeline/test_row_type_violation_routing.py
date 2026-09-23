@@ -928,9 +928,10 @@ def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes
 
 
 # ---------------------------------------------------------------------------
-# The batch plugins' own row checks (elspeth-5887fb7928 plugin half): a
-# wrong-typed value fails the WHOLE batch with a RETURNED error, which the
-# aggregation routes to its on_error sink.
+# The batch plugins' own row checks (elspeth-5887fb7928 plugin half, and the
+# collision ruling on elspeth-d90495084c): a wrong-typed value, or a row that
+# already carries a field the plugin writes, fails the WHOLE batch with a
+# RETURNED error, which the aggregation routes to its on_error sink.
 #
 # Arming (measured per plugin, lane evidence impl-P-*.md): the source AND the
 # aggregation schema are observed — a typed aggregation schema trips the
@@ -938,12 +939,15 @@ def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes
 # observed CSV source makes every value a ``str``, so any row arms a numeric
 # guard. An observed JSON source locks a field's type on row 0, so the
 # offending value is in row 0 and every row carries the same type; that keeps
-# all N rows buffered in one batch. The sentinel is the offending value: it
-# must reach the quarantine sink with the row, and must appear in no audit
-# reason.
+# all N rows buffered in one batch. The sentinel is the offending value (or the
+# value already held under the colliding field): it must reach the quarantine
+# sink with the row, and must appear in no audit reason.
 #
-# Before the fix each case raised a bare ``TypeError`` out of
-# ``Orchestrator.run`` (exit 4, every token abandoned).
+# Before the fix the wrong-type cases raised a bare ``TypeError`` out of
+# ``Orchestrator.run`` (exit 4, every token abandoned). The two collision cases
+# already ROUTED before this fix, through the engine's flush contract-violation
+# arm, with the plugin's free-text message; what they pin is the structured,
+# value-free ``field_collision`` reason, so their assertion is the reason shape.
 # ---------------------------------------------------------------------------
 
 _BATCH_NODE = "batch_node"
@@ -963,6 +967,14 @@ def _wrong_type(field: str, expected: str, found: str, row_index: int) -> dict[s
         "expected": expected,
         "actual_type": found,
         "error": f"must be {expected}, got {found} in row {row_index}",
+    }
+
+
+def _collision(field: str, row_index: int) -> dict[str, Any]:
+    return {
+        "reason": "field_collision",
+        "collisions": [field],
+        "error": f"would overwrite existing input fields {[field]} in row {row_index}",
     }
 
 
@@ -1090,6 +1102,50 @@ _BATCH_PLUGIN_CASES = [
         _wrong_type("g", "a scalar group key", "mappingproxy", 0),
         id="stats-object-group-key",
     ),
+    pytest.param(
+        "batch_outlier_annotator",
+        "csv",
+        _csv_rows(("id", "v"), ("1", "SENTINEL-outlier-5e6d"), ("2", "2.5"), ("3", "3.5")),
+        {"value_field": "v"},
+        "SENTINEL-outlier-5e6d",
+        _wrong_type("v", _NUMERIC, "str", 0),
+        id="outlier_annotator-str-value",
+    ),
+    pytest.param(
+        "batch_replicate",
+        "csv",
+        _csv_rows(("id", "copies"), ("1", "SENTINEL-copies-3c8d"), ("2", "2"), ("3", "1")),
+        {"copies_field": "copies"},
+        "SENTINEL-copies-3c8d",
+        _wrong_type("copies", "int", "str", 0),
+        id="replicate-str-copies",
+    ),
+    pytest.param(
+        "batch_replicate",
+        "json",
+        [
+            {"id": 1, "copies": 2, "copy_index": "SENTINEL-collide-9f2b"},
+            {"id": 2, "copies": 1, "copy_index": "x"},
+            {"id": 3, "copies": 1, "copy_index": "y"},
+        ],
+        {"copies_field": "copies"},
+        "SENTINEL-collide-9f2b",
+        _collision("copy_index", 0),
+        id="replicate-copy_index-collision",
+    ),
+    pytest.param(
+        "batch_outlier_annotator",
+        "json",
+        [
+            {"id": 1, "v": 1.0, "outlier_z_score": "SENTINEL-collide-7a1b"},
+            {"id": 2, "v": 2.0, "outlier_z_score": "x"},
+            {"id": 3, "v": 3.0, "outlier_z_score": "y"},
+        ],
+        {"value_field": "v"},
+        "SENTINEL-collide-7a1b",
+        _collision("outlier_z_score", 0),
+        id="outlier_annotator-outlier_z_score-collision",
+    ),
 ]
 
 
@@ -1193,7 +1249,8 @@ def test_a_batch_plugin_row_fault_routes_the_whole_batch_with_a_value_free_reaso
 ) -> None:
     """The plugin RETURNS the failure; the aggregation routes every buffered
     row to on_error with its original values; the record names the field,
-    expected and found type and the BATCH row index — never the value."""
+    expected and found type (or colliding field) and the BATCH row index —
+    never the value."""
     import json
 
     from elspeth.core.landscape.schema import token_work_items_table
@@ -1224,7 +1281,7 @@ def test_a_batch_plugin_row_fault_routes_the_whole_batch_with_a_value_free_reaso
         )
 
     # The flush state records the plugin's structured reason: field, expected,
-    # found type and the batch row index.
+    # found type (or the colliding field names) and the batch row index.
     [failed_state] = audit["failed_states"]
     assert json.loads(failed_state.error_json) == expected_reason
 
