@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 import respx
 
+from elspeth.contracts.call_mode import ArchivedCallRequestEvidence, ReplayCallEvidence, ReplaySSRFRequest
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
     AzureSearchProvider,
@@ -564,6 +568,9 @@ class TestExecuteSearchHTTP:
             timeout=12.5,
             limiter=limiter,
             headers={"Content-Type": "application/json", "api-key": "test-key"},
+            call_mode_session=None,
+            archived_auth_for_replay=False,
+            semantic_managed_identity_verify=False,
         )
         assert provider._http_client is client_cls.return_value
 
@@ -1087,3 +1094,361 @@ class TestRuntimePreflightProbe:
             with pytest.raises(RetrievalError) as exc_info:
                 self._probe(provider)
         assert exc_info.value.retryable is True
+
+
+def test_replay_search_uses_archived_dns_pin_without_live_dns() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key="test-key",
+    )
+    url = "https://test.search.windows.net/indexes/test-index/docs/search?api-version=2024-07-01"
+    session.replay_ssrf_request.return_value = ReplaySSRFRequest(
+        original_url=url,
+        resolved_ip="93.184.216.34",
+        host_header="test.search.windows.net",
+        port=443,
+        path="/indexes/test-index/docs/search?api-version=2024-07-01",
+        scheme="https",
+        bare_hostname="test.search.windows.net",
+    )
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient"),
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved live DNS")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        safe_request = provider._safe_request(url, state_id="state-1")
+        headers = provider._auth_headers()
+    assert safe_request.resolved_ip == "93.184.216.34"
+    assert headers == {"api-key": "test-key"}
+    session.replay_ssrf_request.assert_called_once_with(
+        original_url=url,
+        call_type=CallType.HTTP,
+        current_state_id="state-1",
+        current_operation_id=None,
+    )
+
+
+def test_replay_managed_identity_defers_credential_to_archived_http_identity() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        use_managed_identity=True,
+    )
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient") as client,
+        patch("azure.identity.ManagedIdentityCredential") as credential,
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        assert provider._auth_headers() == {}
+    assert client.call_args.kwargs["archived_auth_for_replay"] is True
+    credential.assert_not_called()
+
+
+def test_replay_search_restores_chunks_without_dns_or_http_client() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key="test-key",
+    )
+    url = "https://test.search.windows.net/indexes/test-index/docs/search?api-version=2024-07-01"
+    path = "/indexes/test-index/docs/search?api-version=2024-07-01"
+    session.replay_ssrf_request.return_value = ReplaySSRFRequest(
+        original_url=url,
+        resolved_ip="93.184.216.34",
+        host_header="test.search.windows.net",
+        port=443,
+        path=path,
+        scheme="https",
+        bare_hostname="test.search.windows.net",
+    )
+    body = json.dumps({"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]}).encode()
+    session.replay_call.return_value = ReplayCallEvidence(
+        source_call_id="source-azure-call",
+        status=CallStatus.SUCCESS,
+        response_data={
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "body_size": len(body),
+            "body": {"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]},
+            "transport": {
+                "body_b64": base64.b64encode(body).decode("ascii"),
+                "headers": [["content-type", "application/json"]],
+                "request_url": f"https://93.184.216.34{path}",
+                "logical_url": url,
+            },
+        },
+        error_data=None,
+        latency_ms=1,
+    )
+    recorder = _FakeExecutionRecorder()
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved live DNS")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=recorder,
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        chunks = provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    assert [(chunk.source_id, chunk.content) for chunk in chunks] == [("doc-1", "archived content")]
+    assert recorder.recorded_calls[0]["source_call_id"] == "source-azure-call"
+
+
+def test_replay_managed_identity_uses_archived_fingerprint_without_token_or_dns() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    session.source_run_id = "source-run"
+    config = AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="test-index", use_managed_identity=True)
+    url = "https://test.search.windows.net/indexes/test-index/docs/search?api-version=2024-07-01"
+    path = "/indexes/test-index/docs/search?api-version=2024-07-01"
+    session.replay_ssrf_request.return_value = ReplaySSRFRequest(
+        original_url=url,
+        resolved_ip="93.184.216.34",
+        host_header="test.search.windows.net",
+        port=443,
+        path=path,
+        scheme="https",
+        bare_hostname="test.search.windows.net",
+    )
+    session.archived_call_request.return_value = ArchivedCallRequestEvidence(
+        source_call_id="source-mi-call",
+        request_data={
+            "method": "POST",
+            "url": url,
+            "resolved_ip": "93.184.216.34",
+            "headers": {
+                "Content-Type": "application/json",
+                "Host": "test.search.windows.net",
+                "Authorization": f"<fingerprint:{'a' * 64}>",
+            },
+            "json": {
+                "top": 5,
+                "search": "query",
+                "vectorQueries": [{"kind": "text", "text": "query", "fields": "contentVector", "k": 5}],
+            },
+        },
+    )
+    body = json.dumps({"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]}).encode()
+    session.replay_call.return_value = ReplayCallEvidence(
+        source_call_id="source-mi-call",
+        status=CallStatus.SUCCESS,
+        response_data={
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "body_size": len(body),
+            "body": {"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]},
+            "transport": {
+                "body_b64": base64.b64encode(body).decode("ascii"),
+                "headers": [["content-type", "application/json"]],
+                "request_url": f"https://93.184.216.34{path}",
+                "logical_url": url,
+            },
+        },
+        error_data=None,
+        latency_ms=1,
+    )
+    recorder = _FakeExecutionRecorder()
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved live DNS")),
+        patch("azure.identity.ManagedIdentityCredential", side_effect=AssertionError("replay constructed a credential")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=recorder,
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        chunks = provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    assert [(chunk.source_id, chunk.content) for chunk in chunks] == [("doc-1", "archived content")]
+    assert recorder.recorded_calls[0]["source_call_id"] == "source-mi-call"
+    request_data = recorder.recorded_calls[0]["request_data"].to_dict()
+    assert request_data["replay_credential_origin"] == {
+        "source_run_id": "source-run",
+        "source_call_id": "source-mi-call",
+        "identity": "archived_fingerprint",
+    }
+
+
+@pytest.mark.parametrize("managed_identity", [False, True])
+@pytest.mark.parametrize("readiness", [False, True])
+def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity: bool, readiness: bool) -> None:
+    session = MagicMock()
+    session.mode = RunMode.VERIFY
+    session.preflight_verify_http_request.side_effect = RuntimeError("missing source request")
+    session.preflight_verify_http_managed_identity.side_effect = RuntimeError("missing source request")
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key=None if managed_identity else "test-key",
+        use_managed_identity=managed_identity,
+    )
+    with (
+        patch(
+            "elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")
+        ) as client_cls,
+        patch("socket.getaddrinfo", side_effect=AssertionError("verify resolved DNS before admission")),
+        patch("azure.identity.ManagedIdentityCredential", side_effect=AssertionError("verify acquired token before admission")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="verify-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        with pytest.raises(RuntimeError, match="missing source request"):
+            if readiness:
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+            else:
+                provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    client_cls.assert_not_called()
+
+
+@pytest.mark.parametrize("managed_identity", [False, True])
+def test_verify_blocked_archived_pin_refuses_before_dns_or_token(managed_identity: bool) -> None:
+    session = MagicMock()
+    session.mode = RunMode.VERIFY
+    source = ArchivedCallRequestEvidence(source_call_id="source-call", request_data={"resolved_ip": "127.0.0.1"})
+    session.preflight_verify_http_request.return_value = source
+    session.preflight_verify_http_managed_identity.return_value = source
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key=None if managed_identity else "test-key",
+        use_managed_identity=managed_identity,
+    )
+    with (
+        patch(
+            "elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")
+        ) as client_cls,
+        patch("socket.getaddrinfo", side_effect=AssertionError("verify resolved DNS after blocked archive")),
+        patch("azure.identity.ManagedIdentityCredential", side_effect=AssertionError("verify acquired token after blocked archive")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="verify-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        with pytest.raises(RetrievalError, match="source DNS pin blocked"):
+            provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    client_cls.assert_not_called()
+
+
+def test_verify_managed_identity_search_admits_before_token_and_dispatch() -> None:
+    events: list[str] = []
+    session = MagicMock()
+    session.mode = RunMode.VERIFY
+    source = ArchivedCallRequestEvidence(source_call_id="source-mi-call", request_data={"resolved_ip": "93.184.216.34"})
+
+    def preflight(**_kwargs: Any) -> ArchivedCallRequestEvidence:
+        events.append("preflight")
+        return source
+
+    def admit(**_kwargs: Any) -> str:
+        events.append("admit")
+        return "source-mi-call"
+
+    session.preflight_verify_http_managed_identity.side_effect = preflight
+    session.admit_verify_http_managed_identity.side_effect = admit
+    credential = MagicMock()
+
+    def get_token(*_scopes: str) -> SimpleNamespace:
+        events.append("token")
+        return SimpleNamespace(token="current-verify-token")
+
+    credential.get_token.side_effect = get_token
+    config = AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="test-index", use_managed_identity=True)
+    recorder = _FakeExecutionRecorder()
+    with (
+        patch("azure.identity.ManagedIdentityCredential", return_value=credential),
+        patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("93.184.216.34", 0))]),
+        respx.mock,
+    ):
+        route = respx.post(host="93.184.216.34").respond(
+            status_code=200,
+            json={"value": [{"id": "doc-1", "content": "verified content", "@search.score": 0.75}]},
+        )
+        provider = AzureSearchProvider(
+            config=config,
+            execution=recorder,
+            run_id="verify-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        chunks = provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    assert [(chunk.source_id, chunk.content) for chunk in chunks] == [("doc-1", "verified content")]
+    assert events == ["preflight", "token", "admit"]
+    assert route.called
+    session.verify_call.assert_called_once()
+    assert session.verify_call.call_args.kwargs["current_call_id"] == "call-1"
+
+
+def test_verify_managed_identity_readiness_admits_before_token_and_dispatch() -> None:
+    events: list[str] = []
+    session = MagicMock()
+    session.mode = RunMode.VERIFY
+    source = ArchivedCallRequestEvidence(source_call_id="source-readiness", request_data={"resolved_ip": "93.184.216.34"})
+
+    def preflight(**_kwargs: Any) -> ArchivedCallRequestEvidence:
+        events.append("preflight")
+        return source
+
+    def admit(**_kwargs: Any) -> str:
+        events.append("admit")
+        return "source-readiness"
+
+    session.preflight_verify_http_managed_identity.side_effect = preflight
+    session.admit_verify_http_managed_identity.side_effect = admit
+    credential = MagicMock()
+
+    def get_token(*_scopes: str) -> SimpleNamespace:
+        events.append("token")
+        return SimpleNamespace(token="current-verify-token")
+
+    credential.get_token.side_effect = get_token
+    config = AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="test-index", use_managed_identity=True)
+    with (
+        patch("azure.identity.ManagedIdentityCredential", return_value=credential),
+        patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("93.184.216.34", 0))]),
+        respx.mock,
+    ):
+        route = respx.get(host="93.184.216.34").respond(status_code=200, text="7")
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="verify-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
+    assert readiness.count == 7
+    assert events == ["preflight", "token", "admit"]
+    assert route.called
+    session.verify_call.assert_called_once()
+    assert session.verify_call.call_args.kwargs["current_operation_id"] == "operation-1"

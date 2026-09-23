@@ -19,12 +19,13 @@ from __future__ import annotations
 import json
 import urllib.parse
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseAuthConfig,
@@ -167,6 +168,44 @@ def client(transport: MockTransport) -> DataverseClient:
     c._client.close()
     c._client = httpx.Client(transport=transport, timeout=30.0)
     return c
+
+
+def test_verify_callback_refuses_before_token_dns_or_http() -> None:
+    def refuse(_url: str) -> None:
+        raise AuditIntegrityError("archived source call missing")
+
+    client = DataverseClient(environment_url=ENV_URL, credential=cast(Any, FakeCredential()), before_request=refuse)
+    url = f"{ENV_URL}/api/data/v9.2/contacts"
+    with (
+        patch.object(client, "get_auth_headers", side_effect=AssertionError("token acquired")),
+        patch.object(client, "_validate_url_ssrf", side_effect=AssertionError("DNS resolved")),
+        patch.object(client._client, "get", side_effect=AssertionError("HTTP dispatched")),
+        pytest.raises(AuditIntegrityError, match="archived source call missing"),
+    ):
+        client.get_page(url)
+    client.close()
+
+
+def test_verify_callback_refuses_next_link_before_dns_or_http() -> None:
+    initial_url = f"{ENV_URL}/api/data/v9.2/contacts"
+    next_url = f"{initial_url}?$skiptoken=next"
+
+    def admit(url: str) -> None:
+        if url == next_url:
+            raise AuditIntegrityError("archived next page missing")
+
+    client = DataverseClient(environment_url=ENV_URL, credential=cast(Any, FakeCredential()), before_request=admit)
+    transport = MockTransport([_make_json_response({"value": [{"contactid": "1"}], "@odata.nextLink": next_url})])
+    client._client.close()
+    client._client = httpx.Client(transport=transport, timeout=30.0)
+    with (
+        patch.object(client, "_validate_url_ssrf", wraps=client._validate_url_ssrf) as dns,
+        pytest.raises(AuditIntegrityError, match="archived next page missing"),
+    ):
+        list(client.paginate_odata(initial_url))
+    assert dns.call_count == 1
+    assert len(transport.requests) == 1
+    client.close()
 
 
 # ---------------------------------------------------------------------------

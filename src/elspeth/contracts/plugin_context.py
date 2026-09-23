@@ -23,6 +23,7 @@ from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import CallType as CallTypeEnum
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_freeze
@@ -32,8 +33,9 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
+    from elspeth.contracts import Call, CallStatus, CallType, SourceRow, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.identity import TokenInfo
@@ -111,6 +113,11 @@ class PluginContext:
 
     run_id: str
     _config: Mapping[str, Any] = field(repr=False)
+    run_mode: RunMode = RunMode.LIVE
+    replay_from: str | None = None
+    call_mode_session: CallModeSession | None = None
+    audited_sources: Mapping[str, object] | None = None
+    verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
@@ -201,6 +208,11 @@ class PluginContext:
         work_item: TokenWorkItem | None = None,
         _pending_quarantine_validation_errors: list[tuple[str, str]] | None = None,
         _config: Mapping[str, Any] | None = None,
+        run_mode: RunMode = RunMode.LIVE,
+        replay_from: str | None = None,
+        call_mode_session: CallModeSession | None = None,
+        audited_sources: Mapping[str, object] | None = None,
+        verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None,
     ) -> None:
         if config is not None and _config is not None:
             raise TypeError("PluginContext accepts either config or _config, not both")
@@ -209,6 +221,19 @@ class PluginContext:
             raise TypeError("PluginContext missing required argument: 'config'")
 
         self.run_id = run_id
+        if type(run_mode) is not RunMode:
+            raise TypeError("PluginContext.run_mode must be a RunMode")
+        if run_mode is not RunMode.LIVE and not replay_from:
+            raise ValueError("PluginContext.replay_from is required for replay/verify mode")
+        self.run_mode = run_mode
+        self.replay_from = replay_from
+        if run_mode is not RunMode.LIVE and call_mode_session is None:
+            raise ValueError("PluginContext.call_mode_session is required for replay/verify mode")
+        if call_mode_session is not None and call_mode_session.mode is not run_mode:
+            raise ValueError("PluginContext.call_mode_session mode disagrees with run_mode")
+        self.call_mode_session = call_mode_session
+        self.audited_sources = audited_sources
+        self.verified_sources = verified_sources
         # Deep-freeze config so plugins cannot mutate the run configuration
         # after the audit snapshot (settings_json, config_hash) is recorded.
         # PluginContext is not frozen (checkpoint/token need mutation), but
@@ -273,6 +298,11 @@ class PluginContext:
             member_token=self.member_token,
             work_item=self.work_item,
             _pending_quarantine_validation_errors=self._pending_quarantine_validation_errors,
+            run_mode=self.run_mode,
+            replay_from=self.replay_from,
+            call_mode_session=self.call_mode_session,
+            audited_sources=self.audited_sources,
+            verified_sources=self.verified_sources,
         )
 
     def require_coordination_token(self) -> CoordinationToken:

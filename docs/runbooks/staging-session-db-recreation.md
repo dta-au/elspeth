@@ -2,10 +2,10 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 replica recovery, identity admission and prompt provenance (session epoch 66 and Landscape epoch 43)
+## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 66 and Landscape epoch 44)
 
 0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 66 and Landscape
-`SQLITE_SCHEMA_EPOCH` from 38 to 43. Session epoch 54 adds durable Composer
+`SQLITE_SCHEMA_EPOCH` from 38 to 44. Session epoch 54 adds durable Composer
 progress snapshots and exact request lifecycle leases. Landscape epoch 39
 adds immutable web run-start permit binding and recoverable pre-effect
 admission state. Session epoch 55 adds identity ownership foreign keys,
@@ -41,6 +41,11 @@ Landscape digest column: SQLite ignores the declared `VARCHAR` width, so
 `String(64)` alone admitted any text. Landscape epoch 43 also removes the
 never-written `nodes.schema_hash` column and its always-null key in the exported
 node record.
+Landscape epoch 44 records the actual run mode and source run, links replayed
+calls to their source calls, stores verify comparison decisions, and numbers
+source/preflight operation occurrences under the run leader. Populated
+epoch-43 Landscape stores require archive/export as needed and recreation before
+this version starts; no in-place migration is supported.
 Session epoch 63 also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the

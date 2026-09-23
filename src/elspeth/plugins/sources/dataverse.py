@@ -14,14 +14,15 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, Self, TypedDict
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
-from elspeth.contracts.contexts import LifecycleContext, SourceContext
+from elspeth.contracts import Call, CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.events import DataverseLoadStatistics
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -55,6 +56,13 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     resolve_field_names,
 )
+
+
+class _DataverseSourceRequest(TypedDict):
+    method: str
+    url: str | None
+    headers: dict[str, str] | None
+
 
 # OData annotation prefixes to strip from row data
 _ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
@@ -281,7 +289,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4c88242a7d99967d"
+    source_file_hash: str | None = "sha256:83446ab50355e51b"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -356,6 +364,8 @@ class DataverseSource(BaseSource):
 
         # Lazy-constructed client (needs lifecycle context)
         self._client: DataverseClient | None = None
+        self._source_limiter: LimiterProtocol | None = None
+        self._pending_verify_source_call_id: str | None = None
         self._pages_fetched = 0
         self._rows_yielded = 0
         self._quarantine_count = 0
@@ -371,11 +381,20 @@ class DataverseSource(BaseSource):
         self._rows_yielded = 0
         self._quarantine_count = 0
         self._load_state = "not_started"
-        # Construct credential (azure-identity) — validates early
-        credential = self._auth_config.create_credential()
-
         # Obtain rate limiter (with null guard per spec)
         limiter = ctx.rate_limit_registry.get_limiter("dataverse_source") if ctx.rate_limit_registry is not None else None
+        self._source_limiter = limiter
+
+        # VERIFY first binds the source-load operation to an archived call.
+        # Credential and HTTP client construction are deferred until load().
+        session = ctx.call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            self._client = None
+            self._pending_verify_source_call_id = None
+            return
+
+        # Construct credential (azure-identity) — validates early in LIVE.
+        credential = self._auth_config.create_credential()
 
         # Construct DataverseClient
         self._client = DataverseClient(
@@ -386,15 +405,43 @@ class DataverseSource(BaseSource):
             additional_domains=self._additional_domains,
         )
 
+    def _metadata_url(self, logical_name: str) -> str:
+        encoded_entity = urllib.parse.quote(logical_name, safe="")
+        return (
+            f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
+            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
+        )
+
+    @staticmethod
+    def _verify_request_data(url: str) -> _DataverseSourceRequest:
+        return {
+            "method": "GET",
+            "url": fingerprint_url(url),
+            "headers": {
+                "Accept": "application/json",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            },
+        }
+
+    def _preflight_verify_request(self, ctx: SourceContext, url: str) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        operation_id = ctx.operation_id
+        if operation_id is None:
+            raise AuditIntegrityError("Dataverse verify requires a source-load operation")
+        evidence = session.preflight_verify_operation_http_managed_identity(
+            request_data=self._verify_request_data(url),
+            current_operation_id=operation_id,
+        )
+        self._pending_verify_source_call_id = evidence.source_call_id
+
     def _resolve_entity_set_name(self, ctx: SourceContext, logical_name: str) -> str:
         """Resolve a logical table name to its authoritative Web API entity set."""
         if self._client is None:
             raise RuntimeError("on_start() must be called before _resolve_entity_set_name() — this is a bug")
-        encoded_entity = urllib.parse.quote(logical_name, safe="")
-        metadata_url = (
-            f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
-            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
-        )
+        metadata_url = self._metadata_url(logical_name)
         try:
             page = self._client.get_page(metadata_url)
         except DataverseClientError as e:
@@ -668,6 +715,44 @@ class DataverseSource(BaseSource):
 
         return result
 
+    def _verify_recorded_page_call(
+        self,
+        ctx: SourceContext,
+        *,
+        call: Call | None,
+        request_data: Mapping[str, str | dict[str, str] | None],
+        status: CallStatus,
+        response_data: Mapping[str, int | bool | str | dict[str, str] | None] | None = None,
+        error_data: Mapping[str, int | str | None] | None = None,
+    ) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        source_call_id = self._pending_verify_source_call_id
+        operation_id = ctx.operation_id
+        if call is None or source_call_id is None or operation_id is None:
+            raise AuditIntegrityError("Dataverse verify page has no recorded call or pre-token source admission")
+        admitted_call_id = session.admit_verify_operation_http_managed_identity(
+            request_data=request_data,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            source_call_id=source_call_id,
+        )
+        if admitted_call_id != source_call_id:
+            raise AuditIntegrityError("Dataverse source call changed after pre-token admission")
+        session.verify_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=None,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            current_call_id=call.call_id,
+            live_status=status,
+            live_response_data=response_data,
+            live_error_data=error_data,
+        )
+        self._pending_verify_source_call_id = None
+
     def _record_page_call(
         self,
         ctx: SourceContext,
@@ -699,7 +784,7 @@ class DataverseSource(BaseSource):
                 "url": safe_url,
                 "headers": page.request_headers,  # Already fingerprinted by client
             }
-            response_data = {
+            response_data: dict[str, int | bool | str | dict[str, str] | None] = {
                 "status_code": page.status_code,
                 "row_count": len(page.rows),
                 "headers": page.headers,
@@ -708,13 +793,20 @@ class DataverseSource(BaseSource):
                 "more_records": page.more_records,
             }
             try:
-                ctx.record_call(
+                recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
                     status=CallStatus.SUCCESS,
                     request_data=request_data,
                     response_data=response_data,
                     latency_ms=page.latency_ms,
                     provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.SUCCESS,
+                    response_data=response_data,
                 )
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -730,20 +822,27 @@ class DataverseSource(BaseSource):
                 "url": safe_url,
                 "headers": error.request_headers,  # Fingerprinted by client; mirrors the success path
             }
-            error_data = {
+            error_data: dict[str, int | str | None] = {
                 "error_type": type(error).__name__,
                 "message": str(error),
                 "status_code": error.status_code,
                 "reason": error_reason,
             }
             try:
-                ctx.record_call(
+                recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
                     status=CallStatus.ERROR,
                     request_data=request_data,
                     error=error_data,
                     latency_ms=error.latency_ms,
                     provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.ERROR,
+                    error_data=error_data,
                 )
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -778,13 +877,8 @@ class DataverseSource(BaseSource):
         is_first_row = True
         source_row_index = 0
 
-        # Client must be constructed by on_start() before load()
-        if self._client is None:
-            raise RuntimeError("on_start() must be called before load() — this is a bug")
-
         if self._entity is not None:
-            entity_set_name = self._resolve_entity_set_name(ctx, self._entity)
-            url = self._build_query_url(entity_set_name)
+            logical_name = self._entity
         else:
             if self._fetch_xml is None:
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
@@ -795,7 +889,25 @@ class DataverseSource(BaseSource):
             if "name" not in entity_elem.attrib:
                 raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
             logical_name = entity_elem.attrib["name"]
-            entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+
+        if self._client is None:
+            session = ctx.call_mode_session
+            if session is None or session.mode is not RunMode.VERIFY:
+                raise RuntimeError("on_start() must be called before load() — this is a bug")
+            self._preflight_verify_request(ctx, self._metadata_url(logical_name))
+            credential = self._auth_config.create_credential()
+            self._client = DataverseClient(
+                environment_url=self._environment_url,
+                credential=credential,
+                api_version=self._api_version,
+                limiter=self._source_limiter,
+                additional_domains=self._additional_domains,
+                before_request=lambda url: self._preflight_verify_request(ctx, url),
+            )
+
+        entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+        if self._entity is not None:
+            url = self._build_query_url(entity_set_name)
 
         try:
             if self._entity is not None:

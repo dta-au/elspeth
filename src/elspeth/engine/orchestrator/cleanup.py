@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 
 if TYPE_CHECKING:
@@ -139,6 +140,10 @@ def cleanup_plugins(
     sources_for_cleanup = started_sources if started_sources is not None else config.sources
     transforms_for_cleanup = started_transforms if started_transforms is not None else config.transforms
     sinks_for_cleanup = started_sinks if started_sinks is not None else config.sinks
+    if ctx.run_mode is RunMode.REPLAY:
+        sources_for_cleanup = {}
+    if ctx.run_mode is not RunMode.LIVE:
+        sinks_for_cleanup = {}
 
     def record_cleanup_error(hook: str, plugin_name: str, error: Exception) -> None:
         public_error, error_digest, error_length = _safe_cleanup_error_text(error)

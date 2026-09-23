@@ -11,14 +11,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.enums import RunMode
 from elspeth.plugins.transforms.llm.provider import LLMProvider
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import (
     OpenRouterConfig,
     OpenRouterLLMProvider,
@@ -43,6 +45,8 @@ def _ignore_telemetry(event: Any) -> None:
 @dataclass(slots=True)
 class FakeLifecycleContext:
     run_id: str = "test-run"
+    run_mode: RunMode = RunMode.LIVE
+    call_mode_session: Any = None
     landscape: FakeAuditRecorder | None = None
     telemetry_emit: Callable[[Any], None] = _ignore_telemetry
     rate_limit_registry: Any = None
@@ -67,6 +71,41 @@ def _make_azure_config() -> dict[str, Any]:
     }
 
 
+def test_replay_rejects_azure_monitor_before_provider_start() -> None:
+    config = _make_azure_config()
+    config["tracing"] = {"provider": "azure_ai", "connection_string": "InstrumentationKey=test"}
+    transform = LLMTransform(config)
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=RunMode.REPLAY, call_mode_session=Mock(mode=RunMode.REPLAY))
+
+    with (
+        patch("elspeth.plugins.transforms.llm.transform._configure_azure_monitor", side_effect=AssertionError("trace SDK called")),
+        pytest.raises(RuntimeError, match="tracing"),
+    ):
+        transform.on_start(ctx)
+
+    assert transform._provider is None
+
+
+def test_replay_rejects_missing_call_session_before_provider_start() -> None:
+    transform = LLMTransform(_make_azure_config())
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=RunMode.REPLAY)
+
+    with pytest.raises(RuntimeError, match="call-mode session"):
+        transform.on_start(ctx)
+
+    assert transform._provider is None
+
+
+def test_live_rejects_replay_session_before_provider_start() -> None:
+    transform = LLMTransform(_make_azure_config())
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=RunMode.LIVE, call_mode_session=Mock(mode=RunMode.REPLAY))
+
+    with pytest.raises(RuntimeError, match="call-mode session"):
+        transform.on_start(ctx)
+
+    assert transform._provider is None
+
+
 def _make_openrouter_config() -> dict[str, Any]:
     """Build minimal valid OpenRouter LLMTransform config."""
     return {
@@ -89,6 +128,45 @@ def _make_bedrock_config() -> dict[str, Any]:
         "schema": DYNAMIC_SCHEMA,
         "required_input_fields": ["text"],
     }
+
+
+def _make_gateway_config() -> dict[str, Any]:
+    return {
+        "provider": "gateway",
+        "model": "summariser",
+        "endpoint": "https://gateway.example/v1",
+        "api_key": "test-key",
+        "contract_major": 1,
+        "required_capabilities": ["usage"],
+        "prompt_template": "Test: {{ row.text }}",
+        "schema": DYNAMIC_SCHEMA,
+        "required_input_fields": ["text"],
+    }
+
+
+@pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
+@pytest.mark.parametrize(
+    ("config_factory", "provider_class", "client_method"),
+    [
+        (_make_azure_config, AzureLLMProvider, "_get_underlying_client"),
+        (_make_bedrock_config, BedrockLLMProvider, "_get_underlying_client"),
+        (_make_openrouter_config, OpenRouterLLMProvider, "_get_http_client"),
+        (_make_gateway_config, GatewayLLMProvider, "_get_http_client"),
+    ],
+)
+def test_replay_verify_transform_startup_does_not_construct_sdk_or_http_client(
+    mode: RunMode,
+    config_factory: Callable[[], dict[str, Any]],
+    provider_class: type,
+    client_method: str,
+) -> None:
+    transform = LLMTransform(config_factory())
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=mode, call_mode_session=Mock(mode=mode))
+    with patch.object(provider_class, client_method, side_effect=AssertionError("client construction before request admission")) as client:
+        transform.on_start(ctx)
+    client.assert_not_called()
+    assert isinstance(transform._provider, provider_class)
+    transform.close()
 
 
 def _prepare_transform_for_provider_creation(transform: LLMTransform) -> None:

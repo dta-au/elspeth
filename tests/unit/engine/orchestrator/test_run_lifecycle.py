@@ -9,6 +9,7 @@ import pytest
 
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.engine.orchestrator.run_lifecycle import ExecuteRun, InitializeDatabasePhase, RunLifecycleCoordinator
 
 
@@ -61,7 +62,7 @@ class _DatabasePhaseReached(Exception):
 
 
 def _export_enabled_settings() -> SimpleNamespace:
-    return SimpleNamespace(landscape=SimpleNamespace(export=SimpleNamespace(enabled=True)))
+    return SimpleNamespace(run_mode=RunMode.LIVE, replay_from=None, landscape=SimpleNamespace(export=SimpleNamespace(enabled=True)))
 
 
 _EXPORT_RESOURCES: dict[str, object] = {
@@ -84,6 +85,7 @@ def test_run_validates_export_resources_before_any_irreversible_work(omitted: st
     resources BEFORE the run is bootstrapped, processed, finalized, its
     checkpoints deleted, or its leader seat released — not after."""
     coordinator = object.__new__(RunLifecycleCoordinator)
+    coordinator._db = object()
     coordinator._checkpoints = SimpleNamespace(reset_sequence=lambda: None)
     initialize_database_phase = Mock(spec=InitializeDatabasePhase, side_effect=_DatabasePhaseReached)
     execute_run = Mock(spec=ExecuteRun, side_effect=AssertionError("run body must never start"))
@@ -95,7 +97,7 @@ def test_run_validates_export_resources_before_any_irreversible_work(omitted: st
         pytest.raises(ValueError, match=match),
     ):
         coordinator.run(
-            SimpleNamespace(),
+            SimpleNamespace(config={}),
             SimpleNamespace(),
             _export_enabled_settings(),
             payload_store=object(),
@@ -114,17 +116,18 @@ def test_run_with_export_disabled_does_not_require_export_resources() -> None:
     """Control: export-disabled runs keep working without export resources
     (validation stays scoped to export-enabled runs)."""
     coordinator = object.__new__(RunLifecycleCoordinator)
+    coordinator._db = object()
     coordinator._checkpoints = SimpleNamespace(reset_sequence=lambda: None)
     initialize_database_phase = Mock(spec=InitializeDatabasePhase, side_effect=_DatabasePhaseReached)
     execute_run = Mock(spec=ExecuteRun, side_effect=AssertionError("run body must never start"))
-    settings = SimpleNamespace(landscape=SimpleNamespace(export=SimpleNamespace(enabled=False)))
+    settings = SimpleNamespace(run_mode=RunMode.LIVE, replay_from=None, landscape=SimpleNamespace(export=SimpleNamespace(enabled=False)))
 
     with (
         patch("elspeth.engine.orchestrator.run_lifecycle.prepare_for_run"),
         pytest.raises(_DatabasePhaseReached),
     ):
         coordinator.run(
-            SimpleNamespace(),
+            SimpleNamespace(config={}),
             SimpleNamespace(),
             settings,
             payload_store=object(),

@@ -17,13 +17,14 @@ import typer
 import yaml
 from dynaconf.vendor.ruamel.yaml.parser import ParserError as YamlParserError
 from dynaconf.vendor.ruamel.yaml.scanner import ScannerError as YamlScannerError
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import (
     AbandonRefusedError,
     CommencementGateFailedError,
@@ -40,6 +41,7 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
+from elspeth.core.template_materialization import TemplateFileError
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 
 if TYPE_CHECKING:
@@ -381,6 +383,7 @@ def _ensure_output_directories(
     config: ElspethSettings,
     *,
     execution_sink_names: Collection[str] | None = None,
+    include_sink_directories: bool = True,
 ) -> list[str]:
     """Ensure required output directories exist, creating them if needed.
 
@@ -451,6 +454,8 @@ def _ensure_output_directories(
         errors.append(f"Payload store directory is not writable: {payload_path.resolve()}")
 
     # 3. Ensure sink output directories exist (for file-based sinks)
+    if not include_sink_directories:
+        return errors
     for sink_name, sink_config in config.sinks.items():
         if execution_sink_names is not None and sink_name not in execution_sink_names:
             continue
@@ -473,6 +478,184 @@ def _ensure_output_directories(
                     errors.append(f"Sink '{sink_name}' output path parent exists but is not a directory: {resolved_sink_parent}")
 
     return errors
+
+
+def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
+    """Check source-run authority before plugin construction or preflight I/O."""
+    if config.run_mode is RunMode.LIVE:
+        return
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_modes import admit_nonlive_settings, admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import (
+        admit_nonlive_plugin_classes,
+        precheck_nonlive_plugin_names,
+    )
+
+    admit_nonlive_settings(config)
+    precheck_nonlive_plugin_names(config)
+    passphrase = resolve_audit_passphrase(config.landscape)
+    db = LandscapeDB.from_url(
+        config.landscape.url,
+        passphrase=passphrase,
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(config.run_mode, config.replay_from))
+    finally:
+        db.close()
+    admit_nonlive_plugin_classes(config)
+
+
+def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str], object | None]:
+    """Check source-run authority before secrets, file templates, or plugins."""
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.config import ConcurrencySettings, LandscapeSettings, TelemetrySettings
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.engine.orchestrator.run_modes import admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
+
+    raw_config = _load_raw_yaml(settings_path)
+    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
+    try:
+        mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    env_mode = os.environ.get("ELSPETH_RUN_MODE")
+    if env_mode is not None and env_mode != mode.value:
+        raise ValueError("run_mode environment override must match the literal YAML value before execution")
+    if mode is RunMode.LIVE:
+        return mode, frozenset(), None
+
+    # Dynaconf can change invocation authority via environment overrides.
+    # Require these fields in YAML so source-run admission uses the same DB and
+    # ID that the subsequent full settings load will see.
+    if any(name in os.environ for name in ("ELSPETH_REPLAY_FROM", "ELSPETH_LANDSCAPE", "ELSPETH_LANDSCAPE__URL")):
+        raise ValueError("Replay/verify source run and Landscape must be literal YAML settings")
+    forbidden_env_prefixes = (
+        "ELSPETH_CONCURRENCY",
+        "ELSPETH_DEPENDS_ON",
+        "ELSPETH_COLLECTION_PROBES",
+        "ELSPETH_COMMENCEMENT_GATES",
+        "ELSPETH_TELEMETRY",
+        "ELSPETH_SOURCES",
+        "ELSPETH_TRANSFORMS",
+        "ELSPETH_AGGREGATIONS",
+        "ELSPETH_COLLECTORS",
+        "ELSPETH_SINKS",
+    )
+    if any(name == prefix or name.startswith(f"{prefix}__") for name in os.environ for prefix in forbidden_env_prefixes):
+        raise ValueError("Replay/verify admission fields must be literal YAML settings")
+    secrets_config = _parse_raw_secrets_config(raw_config)
+    if secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
+    try:
+        replay_from = TypeAdapter(str).validate_python(raw_config.get("replay_from"), strict=True)
+    except ValidationError as exc:
+        raise ValueError("Replay/verify requires a literal replay_from run ID") from exc
+    if not replay_from.strip():
+        raise ValueError("Replay/verify requires a literal replay_from run ID")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if landscape.export.enabled:
+        raise ValueError("Replay/verify with Landscape export is unsupported")
+    raw_concurrency = raw_config.get("concurrency", {})
+    if ConcurrencySettings.model_validate(raw_concurrency).max_workers != 1:
+        raise ValueError("Replay/verify requires concurrency.max_workers=1")
+    raw_telemetry = raw_config.get("telemetry", {})
+    if TelemetrySettings.model_validate(raw_telemetry).enabled:
+        raise ValueError("Replay/verify with telemetry exporters is unsupported")
+    for side_channel in ("depends_on", "collection_probes", "commencement_gates"):
+        if raw_config.get(side_channel):
+            raise ValueError(f"Replay/verify with {side_channel} is unsupported")
+    db = LandscapeDB.from_url(
+        landscape.url,
+        passphrase=resolve_audit_passphrase(landscape),
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(mode, replay_from))
+        from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+
+        source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
+        if source is None:
+            raise ValueError(f"Replay/verify source run {replay_from!r} disappeared during admission")
+        source_settings, parse_error = parse_json_strict(source.settings_json)
+        if parse_error is not None or type(source_settings) is not dict:
+            raise ValueError(f"Replay/verify source run {replay_from!r} has invalid settings_json")
+    finally:
+        db.close()
+    return mode, requested_plugins, source_settings
+
+
+def _install_nonlive_plugin_scope(mode: RunMode, requested_plugins: frozenset[str]) -> None:
+    """Keep exact built-in discovery active through the CLI command."""
+    if mode is RunMode.LIVE:
+        return
+    from contextlib import ExitStack
+
+    import click
+
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    context = click.get_current_context()
+    manager = build_nonlive_plugin_manager(requested_plugins)
+    stack = ExitStack()
+    stack.enter_context(scoped_plugin_manager(manager))
+    context.call_on_close(stack.close)
+
+
+def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str | None) -> None:
+    """Check persisted mode before resume can resolve secrets or build plugins."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.core.config import LandscapeSettings
+    from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+    from elspeth.engine.orchestrator.run_modes import refuse_nonlive_resume
+
+    raw_config = _load_raw_yaml(settings_path)
+    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
+    try:
+        mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before resume secret resolution: {raw_mode!r}") from exc
+    if mode is not RunMode.LIVE or os.environ.get("ELSPETH_RUN_MODE", RunMode.LIVE.value) != RunMode.LIVE.value:
+        raise ValueError("Replay/verify runs cannot be resumed until mode-aware resume is implemented")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if database is not None:
+        database_path = Path(database).expanduser().resolve()
+        if not database_path.exists():
+            return  # The ordinary resume path reports the existing CLI error.
+        db_url = f"sqlite:///{database_path}"
+    else:
+        if "${" in landscape.url:
+            raise ValueError("Resume requires a literal Landscape URL before secret resolution")
+        db_url = landscape.url
+    try:
+        db = LandscapeDB.from_url(
+            db_url,
+            passphrase=resolve_audit_passphrase(landscape) if landscape.backend == "sqlcipher" else None,
+            create_tables=False,
+            read_only=True,
+        )
+    except (OSError, RuntimeError, SQLAlchemyError, SchemaCompatibilityError):
+        return  # Normal resume diagnostics handle inaccessible or stale DBs.
+    try:
+        try:
+            refuse_nonlive_resume(db, run_id)
+        except (ValueError, SQLAlchemyError, SchemaCompatibilityError):
+            return  # Corrupt/foreign audit state is classified by resume.
+    finally:
+        db.close()
 
 
 def _validate_existing_sqlite_db_url(db_url: str, *, source: str) -> None:
@@ -563,6 +746,8 @@ def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
 
 def _load_settings_with_secrets(
     settings_path: Path,
+    *,
+    source_settings: object | None = None,
 ) -> tuple[ElspethSettings, list[SecretResolutionInput]]:
     """Load settings with Key Vault secret resolution.
 
@@ -597,13 +782,24 @@ def _load_settings_with_secrets(
     # Extract and validate secrets config
     secrets_config = _parse_raw_secrets_config(raw_config)
 
+    # A non-live run must never contact Key Vault before mode admission. The
+    # raw mode is literal here: secret expansion has not happened yet, and an
+    # unknown value cannot safely be treated as live for this early boundary.
+    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
+    try:
+        run_mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+
     # Phase 2: Load secrets from Key Vault if configured
     # Returns resolution records for later audit recording
     secret_resolutions = load_secrets_from_config(secrets_config)
 
     # Phase 3: Full config loading with Dynaconf (resolves ${VAR})
     # Now that secrets are in os.environ, Dynaconf can resolve them
-    config = load_settings(settings_path)
+    config = load_settings(settings_path, source_settings=source_settings)
 
     return config, secret_resolutions
 
@@ -761,11 +957,13 @@ def run(
 
     # Load and validate config with Key Vault secrets (same flow as other commands)
     try:
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-        config, secret_resolutions = _load_settings_with_secrets(settings_path)
+        config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
         _require_marked_export(config)
     except FileNotFoundError:
         typer.echo(f"Error: Settings file not found: {settings}", err=True)
@@ -785,11 +983,19 @@ def run(
     except SinkEffectCapabilityError as e:
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, TemplateFileError, contract_errors.OrchestrationInvariantError) as e:
         typer.echo(f"Configuration error: {e}", err=True)
         raise typer.Exit(1) from None
     except SecretLoadError as e:
         typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Non-live admission precedes plugin construction, which may initialize
+    # SDK clients or credentials. A missing source run cannot reach either.
+    try:
+        _admit_cli_nonlive_run(config)
+    except (OSError, RuntimeError, ValueError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Replay/verify admission failed: {e}", err=True)
         raise typer.Exit(1) from None
 
     # Instantiate plugins before graph construction
@@ -857,7 +1063,7 @@ def run(
 
     # Executable admission: validate the projected pipeline sinks before any
     # output/payload/database directory can be created. Dry-run/configuration
-    # assembly above intentionally remains side-effect and capability-gate free.
+    # assembly above remains free of sink publication preflight.
     try:
         execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
     except contract_errors.TIER_1_ERRORS:
@@ -869,7 +1075,11 @@ def run(
     # Ensure output directories exist BEFORE attempting to create resources
     # Creates directories automatically, only errors if creation fails
     # NOTE: Only when actually executing (not dry-run or validation-only)
-    dir_errors = _ensure_output_directories(config, execution_sink_names=execution_sinks)
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
     if dir_errors:
         typer.echo("Output directory errors:", err=True)
         for dir_error in dir_errors:
@@ -891,8 +1101,11 @@ def run(
     from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
 
     try:
-        probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
-        preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+        if config.run_mode is RunMode.LIVE:
+            probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+            preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+        else:
+            preflight = PreflightResult(dependency_runs=(), gate_results=())
     except (DependencyFailedError, CommencementGateFailedError, ValueError) as e:
         typer.echo(f"Pre-flight check failed: {e}", err=True)
         raise typer.Exit(1) from None
@@ -1579,6 +1792,18 @@ def _execute_pipeline_with_instances(
 
 
 def bootstrap_and_run(settings_path: Path) -> RunResult:
+    """Run a dependency pipeline under exact discovery when non-live."""
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+    if mode is RunMode.LIVE:
+        return _bootstrap_and_run_impl(settings_path)
+    with scoped_plugin_manager(build_nonlive_plugin_manager(requested_plugins)):
+        return _bootstrap_and_run_impl(settings_path, source_settings=source_settings)
+
+
+def _bootstrap_and_run_impl(settings_path: Path, *, source_settings: object | None = None) -> RunResult:
     """Load config, instantiate plugins, build graph, and run a sub-pipeline.
 
     This is the programmatic equivalent of ``elspeth run --execute`` used by
@@ -1594,8 +1819,9 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
 
     _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-    config, secret_resolutions = _load_settings_with_secrets(settings_path)
+    config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
     _require_marked_export(config)
+    _admit_cli_nonlive_run(config)
 
     plugins = _instantiate_plugins_for_runtime_preflight(config)
     execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
@@ -1616,12 +1842,19 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     )
     graph.validate()
 
-    dir_errors = _ensure_output_directories(config, execution_sink_names=execution_sinks)
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
     if dir_errors:
         raise ValueError(f"Failed to create output directories: {'; '.join(dir_errors)}")
 
-    probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
-    preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+    if config.run_mode is RunMode.LIVE:
+        probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+        preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+    else:
+        preflight = PreflightResult(dependency_runs=(), gate_results=())
 
     passphrase = resolve_audit_passphrase(config.landscape)
     if passphrase is not None and config.landscape.dump_to_jsonl:
@@ -3015,6 +3248,7 @@ def resume(
         if execute:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
+            _refuse_cli_nonlive_resume(settings_path, run_id, database)
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.RESUME)
         settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
     except FileNotFoundError:
@@ -3032,7 +3266,7 @@ def resume(
     except SinkEffectCapabilityError as e:
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
         typer.echo(f"Configuration error: {e}", err=True)
         raise typer.Exit(1) from None
     except SecretLoadError as e:
@@ -4006,6 +4240,13 @@ def join(
     except SecretLoadError as e:
         typer.echo(f"Error loading secrets: {e}", err=True)
         raise typer.Exit(1) from None
+
+    # Followers have a separate context and external-call lifecycle. Until
+    # replay/verify carry a shared comparison authority across workers, a
+    # follower must not enter a run that suppresses external sink effects.
+    if settings_config.run_mode is not RunMode.LIVE:
+        typer.echo("Follower join is unavailable for replay and verify runs; use one worker.", err=True)
+        raise typer.Exit(1)
 
     try:
         plugins = _instantiate_plugins_for_runtime_preflight(

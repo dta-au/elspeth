@@ -14,7 +14,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic import Field as PydanticField
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import Determinism, PluginSchema, SourceRow
+from elspeth.contracts import CallType, Determinism, PluginSchema, RunMode, SourceRow
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.contexts import LifecycleContext, SourceContext
@@ -29,7 +29,7 @@ from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
 from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
-from elspeth.plugins.infrastructure.clients.llm import LLMClientError
+from elspeth.plugins.infrastructure.clients.llm import LLMClientError, build_llm_call_request
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed, make_warn_telemetry_before_start
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
@@ -57,6 +57,7 @@ from elspeth.plugins.transforms.llm.validation import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
 logger = structlog.get_logger(__name__)
@@ -122,7 +123,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:41b65a2c5d0527eb"
+    source_file_hash: str | None = "sha256:6d172ccf1b3baeca"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -248,6 +249,9 @@ class LLMSource(BaseSource):
         self._tracing_config: TracingConfig | None = tracing_config
         self._tracer: LangfuseTracer | None = None
         self._provider = None
+        self._recorder: PluginAuditWriterAdapter | None = None
+        self._llm_call_governance: LLMCallGovernance | None = None
+        self._call_mode_session: CallModeSession | None = None
         self._run_id: str | None = None
         self._load_operation_id: str | None = None
         self._telemetry_emit: TelemetryEmitCallback = make_warn_telemetry_before_start(logger)
@@ -263,6 +267,17 @@ class LLMSource(BaseSource):
         return self._config
 
     def on_start(self, ctx: LifecycleContext) -> None:
+        if ctx.call_mode_session is None:
+            if ctx.run_mode is not RunMode.LIVE:
+                raise FrameworkBugError("LLM source replay/verify requires a matching call-mode session")
+        elif ctx.call_mode_session.mode is not ctx.run_mode:
+            raise FrameworkBugError("LLM source run mode and call-mode session disagree")
+        if (
+            ctx.run_mode in (RunMode.REPLAY, RunMode.VERIFY)
+            and self._tracing_config is not None
+            and self._tracing_config.provider != "none"
+        ):
+            raise FrameworkBugError("LLM source tracing is not supported in replay or verify mode")
         super().on_start(ctx)
         recorder = ctx.landscape
         if not isinstance(recorder, PluginAuditWriterAdapter):
@@ -274,6 +289,11 @@ class LLMSource(BaseSource):
 
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
+        self._recorder = recorder
+        self._llm_call_governance = ctx.llm_call_governance
+        self._call_mode_session = ctx.call_mode_session
+        if ctx.run_mode is RunMode.REPLAY:
+            return
         limiter_name = (
             "azure_openai"
             if isinstance(self._config, AzureOpenAILLMSourceConfig)
@@ -284,6 +304,10 @@ class LLMSource(BaseSource):
             else "openrouter"
         )
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
+        # In verify, the source-load operation and exact request do not exist
+        # yet; delay provider construction until that request is admitted.
+        if ctx.run_mode is RunMode.VERIFY:
+            return
         self._provider = self._create_provider(recorder, llm_call_governance=ctx.llm_call_governance)
         try:
             self._tracer = create_langfuse_tracer(transform_name=self.name, tracing_config=self._tracing_config)
@@ -302,7 +326,15 @@ class LLMSource(BaseSource):
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
         if self._load_started:
             raise FrameworkBugError("LLMSource can only be loaded once per lifecycle")
-        if self._provider is None or not self._on_start_called:
+        if not self._on_start_called:
+            raise FrameworkBugError("LLMSource.on_start() must initialize the provider before load()")
+        if self._call_mode_session is not ctx.call_mode_session or ctx.run_mode is not (
+            RunMode.LIVE if self._call_mode_session is None else self._call_mode_session.mode
+        ):
+            raise FrameworkBugError("LLM source load context disagrees with lifecycle run mode")
+        if ctx.run_mode is RunMode.REPLAY:
+            raise FrameworkBugError("LLM source replay must use archived source rows")
+        if self._provider is None and ctx.run_mode is not RunMode.VERIFY:
             raise FrameworkBugError("LLMSource.on_start() must initialize the provider before load()")
         operation_id = self._require_load_operation_id(ctx.operation_id)
         self._load_operation_id = operation_id
@@ -310,9 +342,6 @@ class LLMSource(BaseSource):
         return _LLMSourceLoadSession(self, self._load_once(operation_id, ctx), ctx.shutdown_event)
 
     def _load_once(self, operation_id: str, ctx: SourceContext) -> Generator[SourceRow, None, None]:
-        provider = self._provider
-        if provider is None:
-            raise FrameworkBugError("LLMSource provider disappeared after load admission")
         if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
             return
         rendered = self._template.render_static_with_metadata()
@@ -333,6 +362,35 @@ class LLMSource(BaseSource):
         if self._system_prompt:
             messages.append(ChatMessage(role="system", content=self._system_prompt))
         messages.append(ChatMessage(role="user", content=provider_prompt))
+        if ctx.run_mode is RunMode.VERIFY:
+            session = self._call_mode_session
+            recorder = self._recorder
+            if session is None or recorder is None:
+                raise FrameworkBugError("LLM source verify requires session and recorder before provider construction")
+            extra_kwargs = (
+                {"response_format": response_format}
+                if isinstance(self._config, (AzureOpenAILLMSourceConfig, BedrockLLMSourceConfig)) or response_format is not None
+                else {}
+            )
+            request = build_llm_call_request(
+                model=self._model,
+                messages=messages,
+                temperature=self._temperature,
+                provider=self._config.provider,
+                max_tokens=self._max_tokens,
+                max_tokens_param="max_completion_tokens" if isinstance(self._config, AzureOpenAILLMSourceConfig) else "max_tokens",
+                **extra_kwargs,
+            )
+            session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=None,
+                current_operation_id=operation_id,
+            )
+            self._provider = self._create_provider(recorder, llm_call_governance=self._llm_call_governance)
+        provider = self._provider
+        if provider is None:
+            raise FrameworkBugError("LLMSource provider disappeared after load admission")
         trace_parent = LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=ctx.require_coordination_token())
         started_at = time.monotonic()
         try:
@@ -520,6 +578,7 @@ class LLMSource(BaseSource):
             "limiter": self._limiter,
             "llm_call_governance": llm_call_governance,
             "pricing_model": self._config.pricing_model,
+            "call_mode_session": self._call_mode_session,
         }
         if isinstance(self._config, AzureOpenAILLMSourceConfig):
             return AzureLLMProvider(

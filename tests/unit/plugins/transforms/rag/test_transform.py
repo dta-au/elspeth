@@ -153,6 +153,7 @@ class _LifecycleContextFake:
     rate_limit_registry: None = None
     node_id: str | None = "retrieval"
     operation_id: str | None = None
+    call_mode_session: None = None
     payload_store: None = None
     concurrency_config: None = None
     shutdown_event: None = None
@@ -771,7 +772,11 @@ class TestNoResultsQuarantineContext:
 
 
 class TestRAGTransformReadinessGuard:
-    """Tests for the readiness check in on_start()."""
+    """Tests for the audited readiness check in runtime_preflight()."""
+
+    def _run_preflight(self, transform: RAGRetrievalTransform, ctx: _LifecycleContextFake) -> None:
+        ctx.operation_id = "operation-1"
+        transform.runtime_preflight(ctx)
 
     def _make_mock_provider(
         self,
@@ -816,11 +821,12 @@ class TestRAGTransformReadinessGuard:
             {"chroma": (mock_config_cls, mock_factory)},
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         return transform
 
     def test_populated_collection_passes(self) -> None:
-        """on_start() succeeds when collection has documents."""
+        """Runtime preflight succeeds when collection has documents."""
         mock_provider = self._make_mock_provider(count=10)
         transform = self._run_on_start_with_mock(mock_provider)
 
@@ -828,7 +834,7 @@ class TestRAGTransformReadinessGuard:
         assert mock_provider.check_readiness_calls == 1
 
     def test_readiness_recorded_in_landscape(self) -> None:
-        """on_start() records the readiness check outcome in the audit trail."""
+        """Runtime preflight records readiness in the audit trail."""
         mock_provider = self._make_mock_provider(count=42, collection="my-index")
         mock_config_cls = ChromaSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
@@ -841,6 +847,7 @@ class TestRAGTransformReadinessGuard:
             {"chroma": (mock_config_cls, mock_factory)},
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         _assert_readiness_check(
             lifecycle_ctx,
@@ -852,7 +859,7 @@ class TestRAGTransformReadinessGuard:
             message="Collection 'my-index' has 42 documents",
         )
 
-    def test_follower_start_records_readiness_without_a_leader_token(self) -> None:
+    def test_follower_start_defers_readiness_to_leader_preflight(self) -> None:
         provider = self._make_mock_provider(count=42, collection="my-index")
         ctx = _mock_lifecycle_ctx()
         ctx.coordination_token = None
@@ -865,17 +872,11 @@ class TestRAGTransformReadinessGuard:
         ):
             transform.on_start(ctx)
 
-        _assert_readiness_check(
-            ctx,
-            run_id="run-1",
-            name="rag_retrieval",
-            collection="my-index",
-            reachable=True,
-            count=42,
-            message="Collection 'my-index' has 42 documents",
-        )
+        assert provider.check_readiness_calls == 0
+        assert ctx.landscape is not None
+        assert ctx.landscape.readiness_checks == []
 
-    def test_audit_enabled_start_without_membership_fails_closed(self) -> None:
+    def test_audit_enabled_preflight_without_membership_fails_closed(self) -> None:
         provider = self._make_mock_provider()
         ctx = _mock_lifecycle_ctx()
         ctx.coordination_token = None
@@ -890,9 +891,10 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(FrameworkBugError, match="member token"),
         ):
             transform.on_start(ctx)
+            self._run_preflight(transform, ctx)
 
     def test_empty_collection_raises(self) -> None:
-        """on_start() raises RetrievalNotReadyError for empty collection."""
+        """Runtime preflight raises RetrievalNotReadyError for empty collection."""
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=True)
@@ -910,11 +912,12 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         assert exc_info.value.collection == "test-index"
 
     def test_unreachable_collection_raises(self) -> None:
-        """on_start() raises RetrievalNotReadyError for unreachable collection."""
+        """Runtime preflight raises RetrievalNotReadyError for unreachable collection."""
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=False)
@@ -932,6 +935,7 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         assert exc_info.value.collection == "test-index"
         assert "unreachable" in exc_info.value.reason.lower()
@@ -955,6 +959,7 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(RetrievalNotReadyError) as exc_info,
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         assert exc_info.value.collection == "my-vectors"
         assert "empty" in exc_info.value.reason.lower()
@@ -976,6 +981,7 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(RetrievalNotReadyError),
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         # Even though RetrievalNotReadyError was raised, the readiness check
         # must have been recorded BEFORE the raise — audit gap fix.
@@ -1038,6 +1044,7 @@ class TestRAGTransformReadinessGuard:
             pytest.raises(RetrievalNotReadyError, match="Azure managed identity token acquisition failed"),
         ):
             transform.on_start(lifecycle_ctx)
+            self._run_preflight(transform, lifecycle_ctx)
 
         _assert_readiness_check(
             lifecycle_ctx,

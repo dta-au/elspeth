@@ -26,7 +26,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol, cast, get_args, runtime_checkable
+from typing import Any, Literal, Protocol, cast, get_args, runtime_checkable
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
@@ -254,6 +254,18 @@ class LLMCallResponse:
         }
 
 
+LLMErrorCategory = Literal[
+    "rate_limit",
+    "content_policy",
+    "context_length",
+    "server",
+    "network",
+    "client",
+    "unknown",
+    "response_processing",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class LLMCallError:
     """Audit record for an LLM API error."""
@@ -264,6 +276,7 @@ class LLMCallError:
     pricing_model: str | None = None
     provider_cost: float | None = None
     provider_cost_source: ComposerLLMProviderCostSource = "not_available"
+    category: LLMErrorCategory | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.type, "LLMCallError.type")
@@ -271,6 +284,8 @@ class LLMCallError:
         if type(self.retryable) is not bool:
             raise TypeError(f"LLMCallError.retryable must be bool, got {type(self.retryable).__name__}: {self.retryable!r}")
         _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
+        if self.category is not None and self.category not in get_args(LLMErrorCategory):
+            raise ValueError(f"LLMCallError.category is not recognized: {self.category!r}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -284,6 +299,7 @@ class LLMCallError:
             "pricing_model": self.pricing_model,
             "provider_cost": self.provider_cost,
             "provider_cost_source": self.provider_cost_source,
+            **({"category": self.category} if self.category is not None else {}),
         }
 
 
@@ -366,6 +382,47 @@ class HTTPCallRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class HTTPResponseTransport:
+    """Exact observable HTTP response needed to reconstruct an ``httpx.Response``.
+
+    This is present only when the response can be retained without bypassing
+    the audit redaction policy. An absent transport means replay must fail
+    closed, even when the parsed response body is available.
+    """
+
+    body_b64: str
+    headers: tuple[tuple[str, str], ...]
+    request_url: str
+    logical_url: str | None = None
+    redirect_hops: tuple[HTTPRedirectReplayHop, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_str(self.body_b64, "HTTPResponseTransport.body_b64")
+        _require_non_empty_str(self.request_url, "HTTPResponseTransport.request_url")
+        if self.logical_url is not None:
+            _require_non_empty_str(self.logical_url, "HTTPResponseTransport.logical_url")
+        if type(self.headers) is not tuple:
+            raise TypeError("HTTPResponseTransport.headers must be a tuple")
+        for name, value in self.headers:
+            _require_non_empty_str(name, "HTTPResponseTransport.header name")
+            _require_str(value, "HTTPResponseTransport.header value")
+        if type(self.redirect_hops) is not tuple or any(type(hop) is not HTTPRedirectReplayHop for hop in self.redirect_hops):
+            raise TypeError("HTTPResponseTransport.redirect_hops must contain HTTPRedirectReplayHop values")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "body_b64": self.body_b64,
+            "headers": [[name, value] for name, value in self.headers],
+            "request_url": self.request_url,
+        }
+        if self.logical_url is not None:
+            result["logical_url"] = self.logical_url
+        if self.redirect_hops:
+            result["redirect_hops"] = [hop.to_dict() for hop in self.redirect_hops]
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class HTTPCallResponse:
     """Audit record for an HTTP response.
 
@@ -378,6 +435,7 @@ class HTTPCallResponse:
     body_size: int | None = None
     body: Mapping[str, Any] | tuple[Any, ...] | str | None = None
     redirect_count: int = 0
+    transport: HTTPResponseTransport | None = None
 
     def __post_init__(self) -> None:
         _require_http_status_code(self.status_code, "status_code")
@@ -389,6 +447,8 @@ class HTTPCallResponse:
                 "to_dict() silently drops body from the audit record. "
                 "Set body_size=len(content) or omit body for redirect hops."
             )
+        if self.transport is not None and not isinstance(self.transport, HTTPResponseTransport):
+            raise TypeError("HTTPCallResponse.transport must be HTTPResponseTransport")
         freeze_fields(self, "headers", "body")
 
     def to_dict(self) -> dict[str, Any]:
@@ -403,13 +463,30 @@ class HTTPCallResponse:
         }
         if self.body_size is not None:
             d["body_size"] = self.body_size
-            if isinstance(self.body, (MappingProxyType, dict, tuple)):
+            if type(self.body) in (MappingProxyType, dict, tuple):
                 d["body"] = deep_thaw(self.body)
             else:
                 d["body"] = self.body
         if self.redirect_count > 0:
             d["redirect_count"] = self.redirect_count
+        if self.transport is not None:
+            d["transport"] = self.transport.to_dict()
         return d
+
+
+@dataclass(frozen=True, slots=True)
+class HTTPRedirectReplayHop:
+    """A recorded redirect's complete request and response audit payloads."""
+
+    request: HTTPCallRequest
+    response: HTTPCallResponse
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, HTTPCallRequest) or not isinstance(self.response, HTTPCallResponse):
+            raise TypeError("HTTPRedirectReplayHop requires HTTP call payloads")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"request": self.request.to_dict(), "response": self.response.to_dict()}
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import urllib.parse
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -14,6 +14,8 @@ import pytest
 
 from elspeth.contracts import CallStatus
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseClient,
@@ -236,6 +238,7 @@ class _LifecycleContextFake:
     run_id: str = "test-run-123"
     node_id: str | None = "source-node"
     operation_id: str | None = "op-001"
+    call_mode_session: Any = None
     landscape: Any = None
     payload_store: Any = None
     rate_limit_registry: Any = None
@@ -249,6 +252,7 @@ class _SourceContextFake:
     run_id: str = "test-run-123"
     node_id: str | None = "source-node"
     operation_id: str | None = "op-001"
+    call_mode_session: Any = None
     landscape: Any = None
     telemetry_emit: _CallRecorder = field(default_factory=_CallRecorder)
     record_call: _CallRecorder = field(default_factory=_CallRecorder)
@@ -1181,6 +1185,228 @@ class TestBuildQueryUrl:
 
 class TestDataverseSourceLoadStructured:
     """Tests for load() with structured OData queries."""
+
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_metadata_before_credential_or_client(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        source._client = _DataverseClientFake()
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **_kwargs: Any) -> None:
+                raise AuditIntegrityError(f"source metadata call {reason}")
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        with (
+            patch.object(type(source._auth_config), "create_credential", side_effect=AssertionError("credential constructed")),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=AssertionError("client constructed")),
+            pytest.raises(AuditIntegrityError, match=f"source metadata call {reason}"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        source_ctx.record_call.assert_not_called()
+
+    def test_verify_records_metadata_and_page_verdicts_in_order(self) -> None:
+        source = _make_source(_base_config())
+        headers = {
+            "Authorization": f"<fingerprint:{'a' * 64}>",
+            "Accept": "application/json",
+            "OData-MaxVersion": "4.0",
+            "OData-Version": "4.0",
+        }
+        metadata_page = replace(_make_metadata_page("contact"), request_headers=headers)
+        data_page = replace(_make_page([{"contactid": "1"}]), request_headers=headers)
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **kwargs: Any) -> Any:
+                url = kwargs["request_data"]["url"]
+                kind = "metadata" if "EntityDefinitions" in url else "page"
+                assert kwargs["request_data"]["headers"] == {key: value for key, value in headers.items() if key != "Authorization"}
+                events.append(f"preflight:{kind}")
+                return SimpleNamespace(source_call_id=f"source-{kind}")
+
+            def admit_verify_operation_http_managed_identity(self, **kwargs: Any) -> str:
+                kind = "metadata" if "EntityDefinitions" in kwargs["request_data"]["url"] else "page"
+                assert kwargs["source_call_id"] == f"source-{kind}"
+                events.append(f"admit:{kind}:{kwargs['current_call_index']}")
+                return kwargs["source_call_id"]
+
+            def verify_call(self, **kwargs: Any) -> None:
+                assert kwargs["live_status"] is CallStatus.SUCCESS
+                events.append(f"verify:{kwargs['current_call_index']}")
+
+        session = _VerifySession()
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = session
+        source_ctx.record_call = _CallRecorder(
+            side_effect=lambda **_kwargs: SimpleNamespace(
+                call_index=source_ctx.record_call.call_count - 1, call_id=f"current-{source_ctx.record_call.call_count}"
+            )
+        )
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            assert events == ["preflight:metadata"]
+            events.append("client")
+            client = _DataverseClientFake(metadata_page=metadata_page)
+
+            def get_metadata(url: str) -> DataversePageResponse:
+                before_request(url)
+                events.append("dispatch:metadata")
+                return metadata_page
+
+            def get_pages(url: str) -> Any:
+                before_request(url)
+                events.append("dispatch:page")
+                yield data_page
+
+            client.get_page.side_effect = get_metadata
+            client.paginate_odata.side_effect = get_pages
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+        ):
+            source.on_start(lifecycle_ctx)
+            assert events == []
+            rows = list(source.load(source_ctx))
+        assert len(rows) == 1
+        assert source_ctx.record_call.call_count == 2
+        assert events == [
+            "preflight:metadata",
+            "client",
+            "preflight:metadata",
+            "dispatch:metadata",
+            "admit:metadata:0",
+            "verify:0",
+            "preflight:page",
+            "dispatch:page",
+            "admit:page:1",
+            "verify:1",
+        ]
+
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_page_before_dispatch(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        metadata_page = replace(
+            _make_metadata_page("contact"),
+            request_headers={
+                "Authorization": f"<fingerprint:{'a' * 64}>",
+                "Accept": "application/json",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            },
+        )
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **kwargs: Any) -> Any:
+                if "EntityDefinitions" not in kwargs["request_data"]["url"]:
+                    raise AuditIntegrityError(f"source page call {reason}")
+                events.append("metadata preflight")
+                return SimpleNamespace(source_call_id="source-metadata")
+
+            def admit_verify_operation_http_managed_identity(self, **_kwargs: Any) -> str:
+                return "source-metadata"
+
+            def verify_call(self, **_kwargs: Any) -> None:
+                events.append("metadata verdict")
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-metadata"))
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            client = _DataverseClientFake(metadata_page=metadata_page)
+
+            def get_metadata(url: str) -> DataversePageResponse:
+                before_request(url)
+                return metadata_page
+
+            def get_pages(url: str) -> Any:
+                before_request(url)
+                events.append("page dispatched")
+                yield _make_page([{"contactid": "1"}])
+
+            client.get_page.side_effect = get_metadata
+            client.paginate_odata.side_effect = get_pages
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+            pytest.raises(AuditIntegrityError, match=f"source page call {reason}"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        assert source_ctx.record_call.call_count == 1
+        assert events == ["metadata preflight", "metadata preflight", "metadata verdict"]
+
+    def test_verify_persists_metadata_error_verdict(self) -> None:
+        source = _make_source(_base_config())
+        verdicts: list[Any] = []
+        headers = {
+            "Authorization": f"<fingerprint:{'a' * 64}>",
+            "Accept": "application/json",
+            "OData-MaxVersion": "4.0",
+            "OData-Version": "4.0",
+        }
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **_kwargs: Any) -> Any:
+                return SimpleNamespace(source_call_id="source-metadata-error")
+
+            def admit_verify_operation_http_managed_identity(self, **kwargs: Any) -> str:
+                assert kwargs["source_call_id"] == "source-metadata-error"
+                return "source-metadata-error"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                verdicts.append(kwargs)
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-error"))
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            client = _DataverseClientFake()
+
+            def metadata_error(url: str) -> None:
+                before_request(url)
+                raise DataverseClientError(
+                    "metadata server error",
+                    retryable=True,
+                    status_code=500,
+                    request_url=url,
+                    request_headers=headers,
+                )
+
+            client.get_page.side_effect = metadata_error
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+            pytest.raises(DataverseClientError, match="metadata server error"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        assert source_ctx.record_call.call_count == 1
+        assert verdicts[0]["live_status"] is CallStatus.ERROR
+        assert verdicts[0]["current_call_index"] == 0
+        assert verdicts[0]["live_error_data"]["status_code"] == 500
 
     def test_structured_load_resolves_logical_name_to_entity_set_before_pagination(self) -> None:
         metadata_page = _make_metadata_page("contact", entity_set_name="contacts")

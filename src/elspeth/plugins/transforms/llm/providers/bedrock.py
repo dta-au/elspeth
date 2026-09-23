@@ -10,10 +10,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
+from elspeth.contracts import CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -23,6 +25,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     NetworkError,
     RateLimitError,
     ServerError,
+    build_llm_call_request,
 )
 from elspeth.plugins.llm.config_validation import (
     BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
@@ -49,6 +52,7 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = ["BedrockConfig", "BedrockCredentials", "BedrockLLMProvider"]
@@ -231,6 +235,7 @@ class BedrockLLMProvider:
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._region_name = region_name
         self._credentials = credentials
@@ -241,6 +246,7 @@ class BedrockLLMProvider:
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
         self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
         self._llm_clients: dict[str, AuditedLLMClient] = {}
         self._llm_clients_lock = Lock()
         self._underlying_client: _LiteLLMSDKAdapter | None = None
@@ -258,6 +264,21 @@ class BedrockLLMProvider:
     ) -> LLMQueryResult:
         """Execute one Bedrock request through the authoritative audit client."""
         cache_key = audit_parent.cache_key
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                provider="bedrock",
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
         redacted_error: LLMClientError | None = None
         response = None
         try:
@@ -299,6 +320,21 @@ class BedrockLLMProvider:
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Bedrock call under an operation parent."""
+        smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=smoke_messages,
+                temperature=0.0,
+                provider="bedrock",
+                max_tokens=32,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=None,
+                current_operation_id=operation_id,
+            )
         client = AuditedLLMClient(
             execution=self._recorder,
             state_id=None,
@@ -306,18 +342,21 @@ class BedrockLLMProvider:
             coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
-            underlying_client=self._get_underlying_client(),
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
             provider="bedrock",
             pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
+            call_mode_session=self._call_mode_session,
         )
         redacted_error: LLMClientError | None = None
         try:
             try:
                 client.chat_completion(
                     model=model,
-                    messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+                    messages=smoke_messages,
                     temperature=0.0,
                     max_tokens=32,
                 )
@@ -342,11 +381,14 @@ class BedrockLLMProvider:
                     execution=self._recorder,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
-                    underlying_client=self._get_underlying_client(),
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
                     provider="bedrock",
                     pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

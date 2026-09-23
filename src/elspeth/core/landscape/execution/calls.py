@@ -15,14 +15,15 @@ from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
-from elspeth.contracts.audit import validate_approved_prompt_artifact_hash
+from elspeth.contracts.audit import CallVerification, validate_approved_prompt_artifact_hash
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -37,7 +38,15 @@ from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.schema import calls_table, node_states_table, operations_table
+from elspeth.core.landscape.schema import (
+    call_verifications_table,
+    calls_table,
+    node_states_table,
+    operations_table,
+    rows_table,
+    runs_table,
+    tokens_table,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
@@ -371,6 +380,38 @@ class CallAuditRepository:
             raise AuditIntegrityError("call parent operation does not belong to the authorized run")
 
     @staticmethod
+    def _call_run_on(conn: Connection, call_id: str) -> tuple[str, CallType] | None:
+        call = conn.execute(
+            select(calls_table.c.state_id, calls_table.c.operation_id, calls_table.c.call_type).where(calls_table.c.call_id == call_id)
+        ).one_or_none()
+        if call is None:
+            return None
+        if call.state_id is not None:
+            run_id = conn.execute(select(node_states_table.c.run_id).where(node_states_table.c.state_id == call.state_id)).scalar_one()
+        else:
+            run_id = conn.execute(
+                select(operations_table.c.run_id).where(operations_table.c.operation_id == call.operation_id)
+            ).scalar_one()
+        return run_id, CallType(call.call_type)
+
+    @classmethod
+    def _verify_source_call(cls, conn: Connection, *, source_call_id: str | None, current_run_id: str, call_type: CallType) -> None:
+        if source_call_id is None:
+            return
+        source = cls._call_run_on(conn, source_call_id)
+        run = conn.execute(
+            select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == current_run_id)
+        ).one_or_none()
+        if (
+            source is None
+            or run is None
+            or run.run_mode == RunMode.LIVE.value
+            or source[0] != run.replay_from_run_id
+            or source[1] is not call_type
+        ):
+            raise AuditIntegrityError("source call is missing, outside the configured source run, or has a different call type")
+
+    @staticmethod
     def _update_call_refs_on(conn: Connection, *, call_id: str, request_ref: str | None, response_ref: str | None) -> None:
         result = conn.execute(
             calls_table.update().where(calls_table.c.call_id == call_id).values(request_ref=request_ref, response_ref=response_ref)
@@ -434,6 +475,7 @@ class CallAuditRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call for a node state.
 
@@ -502,6 +544,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
+            "source_call_id": source_call_id,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
             "completion_tokens": token_usage.completion_tokens,
@@ -527,6 +570,7 @@ class CallAuditRepository:
                 verb="record_call",
             ) as conn:
                 self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=member_token.run_id, call_type=call_type)
                 values = self._insert_allocated_call(
                     conn,
                     values,
@@ -573,6 +617,7 @@ class CallAuditRepository:
             request_ref=request_ref,
             response_hash=prepared.response_hash,
             response_ref=response_ref,
+            source_call_id=source_call_id,
             error_json=prepared.error_json,
             latency_ms=latency_ms,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -598,6 +643,7 @@ class CallAuditRepository:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record an external call made during an operation.
 
@@ -652,6 +698,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
+            "source_call_id": source_call_id,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
             "completion_tokens": token_usage.completion_tokens,
@@ -677,6 +724,7 @@ class CallAuditRepository:
                 verb="record_operation_call",
             ) as conn:
                 self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=coordination_token.run_id, call_type=call_type)
                 values = self._insert_allocated_call(
                     conn,
                     values,
@@ -723,6 +771,7 @@ class CallAuditRepository:
             request_ref=request_ref,
             response_hash=prepared.response_hash,
             response_ref=response_ref,
+            source_call_id=source_call_id,
             error_json=prepared.error_json,
             latency_ms=latency_ms,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
@@ -767,6 +816,110 @@ class CallAuditRepository:
         db_rows = self._ops.execute_fetchall(query)
         return [self._call_loader.load(r) for r in db_rows]
 
+    def get_all_calls_for_run(self, run_id: str) -> list[Call]:
+        """Enumerate both state and operation calls with a stable total order."""
+        query = (
+            select(calls_table)
+            .outerjoin(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+            .outerjoin(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+            .where(or_(node_states_table.c.run_id == run_id, operations_table.c.run_id == run_id))
+            .order_by(calls_table.c.created_at, calls_table.c.call_id)
+        )
+        return [self._call_loader.load(row) for row in self._ops.execute_fetchall(query)]
+
+    def record_verification_decision(
+        self,
+        *,
+        current_run_id: str,
+        current_call_id: str,
+        source_run_id: str,
+        source_call_id: str | None,
+        is_match: bool | None,
+        differences_json: str,
+    ) -> CallVerification:
+        """Persist one comparison, checking both call owners in the same transaction."""
+        if type(is_match) not in (bool, type(None)):
+            raise TypeError("is_match must be bool or None")
+        try:
+            differences = json.loads(differences_json, parse_constant=_reject_non_finite_json_constant)
+        except ValueError as exc:
+            raise ValueError("differences_json must be valid finite JSON") from exc
+        if type(differences) is not dict:
+            raise ValueError("differences_json must encode an object")
+        if is_match is True and (source_call_id is None or differences):
+            raise ValueError("matching verification requires a source call and no differences")
+        if current_run_id == source_run_id:
+            raise AuditIntegrityError("verification source and current runs must differ")
+        recorded_at = now()
+        with self._db.write_connection() as conn:
+            run = conn.execute(
+                select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == current_run_id)
+            ).one_or_none()
+            if run is None or run.run_mode != RunMode.VERIFY.value or run.replay_from_run_id != source_run_id:
+                raise AuditIntegrityError("verification run does not name the configured source run")
+            current = self._call_run_on(conn, current_call_id)
+            if current is None or current[0] != current_run_id:
+                raise AuditIntegrityError("verification current call is missing or belongs to another run")
+            if source_call_id is not None:
+                source = self._call_run_on(conn, source_call_id)
+                if source is None or source[0] != source_run_id or source[1] is not current[1]:
+                    raise AuditIntegrityError("verification source call is missing, belongs to another run, or has another type")
+            conn.execute(
+                call_verifications_table.insert().values(
+                    current_call_id=current_call_id,
+                    current_run_id=current_run_id,
+                    source_run_id=source_run_id,
+                    source_call_id=source_call_id,
+                    is_match=is_match,
+                    differences_json=canonical_json(differences),
+                    recorded_at=recorded_at,
+                )
+            )
+        return CallVerification(
+            current_call_id=current_call_id,
+            current_run_id=current_run_id,
+            source_run_id=source_run_id,
+            source_call_id=source_call_id,
+            is_match=is_match,
+            differences_json=canonical_json(differences),
+            recorded_at=recorded_at,
+        )
+
+    def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
+        row = self._ops.execute_fetchone(
+            select(call_verifications_table).where(call_verifications_table.c.current_call_id == current_call_id)
+        )
+        if row is None:
+            return None
+        return CallVerification(
+            current_call_id=row.current_call_id,
+            current_run_id=row.current_run_id,
+            source_run_id=row.source_run_id,
+            source_call_id=row.source_call_id,
+            is_match=row.is_match,
+            differences_json=row.differences_json,
+            recorded_at=row.recorded_at,
+        )
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        rows = self._ops.execute_fetchall(
+            select(call_verifications_table)
+            .where(call_verifications_table.c.current_run_id == current_run_id)
+            .order_by(call_verifications_table.c.recorded_at, call_verifications_table.c.current_call_id)
+        )
+        return [
+            CallVerification(
+                current_call_id=row.current_call_id,
+                current_run_id=row.current_run_id,
+                source_run_id=row.source_run_id,
+                source_call_id=row.source_call_id,
+                is_match=row.is_match,
+                differences_json=row.differences_json,
+                recorded_at=row.recorded_at,
+            )
+            for row in rows
+        ]
+
     def find_call_by_request_hash(
         self,
         run_id: str,
@@ -810,7 +963,7 @@ class CallAuditRepository:
             .where(node_states_table.c.run_id == run_id)
             .where(calls_table.c.call_type == call_type)
             .where(calls_table.c.request_hash == request_hash)
-            .order_by(calls_table.c.created_at)
+            .order_by(calls_table.c.created_at, calls_table.c.call_id)
             .limit(1)
             .offset(sequence_index)
         )
@@ -818,6 +971,132 @@ class CallAuditRepository:
         if row is None:
             return None
         return self._call_loader.load(row)
+
+    def list_source_calls_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> list[Call]:
+        """List source calls bound to the current parent identity.
+
+        State calls bind to the node and the source row's declared identity,
+        step and attempt. Operation calls bind to node and operation type.
+        A repeated operation with identical request/index is ambiguous and
+        must be refused rather than selected by timestamp order.
+        """
+        if (current_state_id is None) == (current_operation_id is None):
+            raise ValueError("exactly one current call parent is required")
+        if current_state_id is not None:
+            current = self._ops.execute_fetchone(
+                select(
+                    node_states_table.c.node_id,
+                    node_states_table.c.step_index,
+                    node_states_table.c.attempt,
+                    rows_table.c.source_node_id,
+                    rows_table.c.source_row_index,
+                )
+                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+                .where(node_states_table.c.state_id == current_state_id)
+            )
+            if current is None:
+                raise AuditIntegrityError("current state is missing for call replay lookup")
+            query = (
+                select(calls_table)
+                .join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+                .where(
+                    node_states_table.c.run_id == source_run_id,
+                    node_states_table.c.node_id == current.node_id,
+                    node_states_table.c.step_index == current.step_index,
+                    node_states_table.c.attempt == current.attempt,
+                    rows_table.c.source_node_id == current.source_node_id,
+                    rows_table.c.source_row_index == current.source_row_index,
+                )
+            )
+        else:
+            current = self._ops.execute_fetchone(
+                select(
+                    operations_table.c.node_id,
+                    operations_table.c.operation_type,
+                    operations_table.c.input_data_hash,
+                    operations_table.c.occurrence_index,
+                ).where(operations_table.c.operation_id == current_operation_id)
+            )
+            if current is None:
+                raise AuditIntegrityError("current operation is missing for call replay lookup")
+            query = (
+                select(calls_table)
+                .join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+                .where(
+                    operations_table.c.run_id == source_run_id,
+                    operations_table.c.node_id == current.node_id,
+                    operations_table.c.operation_type == current.operation_type,
+                    operations_table.c.input_data_hash == current.input_data_hash,
+                )
+            )
+            if current.operation_type in ("source_load", "runtime_preflight") and current.occurrence_index is not None:
+                query = query.where(operations_table.c.occurrence_index == current.occurrence_index)
+        candidates = self._ops.execute_fetchall(
+            query.where(calls_table.c.call_type == call_type).order_by(calls_table.c.call_index, calls_table.c.call_id)
+        )
+        return [self._call_loader.load(row) for row in candidates]
+
+    def find_call_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        request_hash: str | None,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> Call | None:
+        """Find an exact parent-local occurrence without a timestamp offset."""
+        if type(current_call_index) is not int or current_call_index < 0:
+            raise ValueError("current_call_index must be a nonnegative integer")
+        candidates = [
+            call
+            for call in self.list_source_calls_for_current_parent(
+                source_run_id=source_run_id,
+                call_type=call_type,
+                current_state_id=current_state_id,
+                current_operation_id=current_operation_id,
+            )
+            if call.call_index == current_call_index and (request_hash is None or call.request_hash == request_hash)
+        ]
+        if len(candidates) > 1:
+            raise AuditIntegrityError("ambiguous source call for exact parent-local occurrence")
+        return candidates[0] if candidates else None
+
+    def get_call_request_data(self, call_id: str) -> CallDataResult:
+        """Retrieve an archived request object and prove it matches its hash."""
+        row = self._ops.execute_fetchone(select(calls_table).where(calls_table.c.call_id == call_id))
+        if row is None:
+            return CallDataResult(state=CallDataState.CALL_NOT_FOUND, data=None)
+        if row.request_ref is None:
+            return CallDataResult(state=CallDataState.HASH_ONLY, data=None)
+        if self._payload_store is None:
+            return CallDataResult(state=CallDataState.STORE_NOT_CONFIGURED, data=None)
+        try:
+            payload_bytes = self._payload_store.retrieve(row.request_ref)
+        except PayloadNotFoundError:
+            return CallDataResult(state=CallDataState.PURGED, data=None)
+        except (PayloadIntegrityError, OSError) as exc:
+            raise AuditIntegrityError(f"Call request payload retrieval failed for call_id={call_id}") from exc
+        try:
+            decoded = json.loads(payload_bytes.decode("utf-8"), parse_constant=_reject_non_finite_json_constant)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AuditIntegrityError(f"Corrupt call request payload for call_id={call_id}") from exc
+        if type(decoded) is not dict:
+            raise AuditIntegrityError(f"Call request payload is not a JSON object for call_id={call_id}")
+        if hashlib.sha256(payload_bytes).hexdigest() != row.request_hash:
+            raise AuditIntegrityError(f"Call request payload hash mismatch for call_id={call_id}")
+        return CallDataResult(state=CallDataState.AVAILABLE, data=decoded)
 
     def get_call_response_data(self, call_id: str) -> CallDataResult:
         """Retrieve the response data for a call with explicit state.

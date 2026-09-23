@@ -88,7 +88,9 @@ class FakeCallRecorder:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedCall:
+        assert source_call_id is None
         del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         call = RecordedCall(
@@ -123,7 +125,9 @@ class FakeCallRecorder:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedCall:
+        assert source_call_id is None
         del approved_prompt_artifact_hash
         assert token_usage == UNKNOWN_TOKEN_USAGE
         index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)

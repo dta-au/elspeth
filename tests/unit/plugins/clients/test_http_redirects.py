@@ -7,6 +7,7 @@ Verifies that:
    CallType.HTTP_REDIRECT with correct lineage data.
 """
 
+import base64
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -176,6 +177,32 @@ def _make_ssrf_request(url: str, ip: str = "93.184.216.34") -> SSRFSafeRequest:
         scheme=parsed.scheme,
         bare_hostname=parsed.host,
     )
+
+
+def test_successful_redirect_archives_complete_hop_for_replay(ssrf_validator, http_client):
+    initial_request = _make_ssrf_request("https://example.com/start")
+    redirect_response = _make_redirect_response("/end", url="https://93.184.216.34/start")
+    final_response = httpx.Response(
+        200,
+        content=b"final bytes",
+        headers={"content-type": "text/plain"},
+        request=httpx.Request("GET", "https://93.184.216.34/end"),
+    )
+    ssrf_validator.queue(_make_ssrf_request("https://example.com/end"))
+    http_client._test_ephemeral_client.queue_get(redirect_response, final_response)
+
+    response, final_url, _call = http_client.get_ssrf_safe(initial_request, follow_redirects=True)
+
+    assert response.content == b"final bytes"
+    assert final_url == "https://example.com/end"
+    parent = next(item for item in http_client._execution.calls if item["call_type"] is CallType.HTTP)
+    archive = parent["response_data"].to_dict()["transport"]
+    assert archive["request_url"] == "https://93.184.216.34/end"
+    assert archive["logical_url"] == "https://example.com/end"
+    assert archive["body_b64"] == base64.b64encode(b"final bytes").decode("ascii")
+    assert len(archive["redirect_hops"]) == 1
+    assert archive["redirect_hops"][0]["request"]["url"] == "https://example.com/end"
+    assert archive["redirect_hops"][0]["response"]["transport"]["body_b64"] == archive["body_b64"]
 
 
 class TestRelativeRedirectResolution:

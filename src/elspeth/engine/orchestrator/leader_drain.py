@@ -27,7 +27,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunMode, RunStatus
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.errors import (
@@ -36,6 +36,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.events import PhaseCompleted, PipelinePhase
 from elspeth.contracts.types import NodeID
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.orchestrator.aggregation import flush_remaining_aggregation_buffers
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.leader_follower_drain import LeaderFollowerDrain
@@ -357,6 +358,15 @@ class LeaderDrainCoordinator:
                     return True
 
                 _leader_follower_drain.drain_pending_sink_work(_drain_and_flush)
+
+                if loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.finalize()
 
             # ADR-019 Phase 4: deferred cross-table invariant sweep.
             #

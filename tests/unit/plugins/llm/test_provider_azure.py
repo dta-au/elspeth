@@ -13,9 +13,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts import CallType
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -36,6 +39,66 @@ from elspeth.plugins.transforms.llm.provider import (
     UnrecognizedFinishReason,
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
+
+
+def test_replay_client_does_not_construct_azure_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com/",
+        api_key="test-key",
+        api_version="2024-10-21",
+        deployment_name="gpt-4o",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=SimpleNamespace(mode=RunMode.REPLAY),
+    )
+    monkeypatch.setattr(provider, "_get_underlying_client", lambda: pytest.fail("Azure SDK constructed during replay"))
+
+    client = provider._get_llm_client(LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN))
+
+    assert client._client is None
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_verify_source_request_refusal_precedes_azure_sdk_construction(
+    source_problem: str,
+    preflight: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["current_operation_id"] == "op-1"
+            assert kwargs["request_data"]["provider"] == "azure"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    provider = AzureLLMProvider(
+        endpoint="https://test.openai.azure.com/",
+        api_key="test-key",
+        api_version="2024-10-21",
+        deployment_name="gpt-4o",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=VerifySession(),
+    )
+    monkeypatch.setattr(provider, "_get_underlying_client", lambda: pytest.fail("Azure SDK constructed before source admission"))
+
+    with pytest.raises(AuditIntegrityError, match=source_problem):
+        if preflight:
+            provider.runtime_preflight(operation_id="op-1", model="gpt-4o", coordination_token=_LEADER_TOKEN)
+        else:
+            provider.execute_query(
+                [ChatMessage(role="user", content="hello")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=32,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+            )
+
 
 # Mock-only authority: these providers use FakeAuditRecorder, never a database.
 _LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)

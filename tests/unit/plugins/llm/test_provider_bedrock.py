@@ -24,9 +24,12 @@ from litellm.exceptions import (
 from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
 from litellm.types.utils import ModelResponse, Usage
 
+from elspeth.contracts import CallType
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -39,6 +42,62 @@ from elspeth.plugins.infrastructure.clients.llm import (
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockCredentials, BedrockLLMProvider
+
+
+def test_replay_client_does_not_construct_bedrock_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = BedrockLLMProvider(
+        region_name="ap-southeast-2",
+        credentials=BedrockCredentials(),
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=SimpleNamespace(mode=RunMode.REPLAY),
+    )
+    monkeypatch.setattr(provider, "_get_underlying_client", lambda: pytest.fail("Bedrock SDK constructed during replay"))
+
+    client = provider._get_llm_client(LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN))
+
+    assert client._client is None
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_verify_source_request_refusal_precedes_bedrock_sdk_construction(
+    source_problem: str,
+    preflight: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["current_operation_id"] == "op-1"
+            assert kwargs["request_data"]["provider"] == "bedrock"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    provider = BedrockLLMProvider(
+        region_name="ap-southeast-2",
+        credentials=BedrockCredentials(),
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=VerifySession(),
+    )
+    monkeypatch.setattr(provider, "_get_underlying_client", lambda: pytest.fail("Bedrock SDK constructed before source admission"))
+
+    with pytest.raises(AuditIntegrityError, match=source_problem):
+        if preflight:
+            provider.runtime_preflight(operation_id="op-1", model=MODEL, coordination_token=_LEADER_TOKEN)
+        else:
+            provider.execute_query(
+                [ChatMessage(role="user", content="hello")],
+                model=MODEL,
+                temperature=0.0,
+                max_tokens=32,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+            )
+
 
 MODEL = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
 DEFAULT_CHAIN = BedrockCredentials()

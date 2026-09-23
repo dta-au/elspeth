@@ -15,20 +15,24 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.transforms.aws.replay_sdk import require_replay_fields
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit_protocols import CallRecorder
@@ -99,6 +103,46 @@ class TextractIdempotencyInvariantError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("Amazon Textract idempotency invariant failed")
+
+
+def _replay_attempts(evidence: ReplayCallEvidence, *, operation: str) -> tuple[RawCallPayload, int]:
+    retained = require_replay_fields(
+        evidence.response_data, fields=("operation", "attempts", "status"), source_call_id=evidence.source_call_id
+    )
+    payload = retained.data
+    if payload["operation"] != operation:
+        raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} lacks {operation} evidence")
+    attempts = payload["attempts"]
+    if type(attempts) is not int or attempts < 1:
+        raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has invalid attempts")
+    return retained, attempts
+
+
+def _replay_error(evidence: ReplayCallEvidence, *, operation: str, inline: bool = False) -> Exception:
+    retained, _attempts = _replay_attempts(evidence, operation=operation)
+    payload = retained.data
+    error = require_replay_fields(evidence.error_data, fields=("type", "retryable"), source_call_id=evidence.source_call_id).data
+    status = payload["status"]
+    if evidence.status is not CallStatus.ERROR or error["type"] != status:
+        raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has contradictory error evidence")
+    if status in ("malformed_response", "response_too_large") and error["retryable"] is False:
+        message = (
+            "Amazon Textract response exceeded the maximum response size"
+            if status == "response_too_large"
+            else "malformed Amazon Textract response"
+        )
+        return TextractResponseError(message, category=status)
+    if status == "idempotency_invariant" and not inline:
+        code = error["code"] if "code" in error else None
+        retryable = error["retryable"]
+        if type(code) is str and code == _IDEMPOTENCY_MISMATCH_CODE and retryable is False:
+            return TextractIdempotencyInvariantError()
+    if status == "service_error":
+        code = error["code"] if "code" in error else None
+        retryable = error["retryable"]
+        if type(code) is str and 1 <= len(code) <= _MAX_ERROR_CODE_LENGTH and type(retryable) is bool:
+            return TextractServiceError(code=code, retryable=retryable)
+    raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has incomplete error evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +400,7 @@ class _TextractAuditedClient(AuditedClientBase):
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         super().__init__(
             execution, state_id, run_id, telemetry_emit, limiter=limiter, token_id=token_id, member_token=member_token, work_item=work_item
@@ -364,6 +409,117 @@ class _TextractAuditedClient(AuditedClientBase):
             raise ValueError("max_response_bytes must be positive")
         self._region = region
         self._max_response_bytes = max_response_bytes
+        self._call_mode_session = call_mode_session
+
+    def _replay_evidence(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        operation: str,
+        lookup_request: RawCallPayload | None = None,
+    ) -> ReplayCallEvidence | None:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            return None
+        evidence = session.replay_call(
+            call_type=CallType.HTTP,
+            request_data=request_payload.to_dict() if lookup_request is None else lookup_request.to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        return evidence
+
+    def _admit_verify_call(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        lookup_request: RawCallPayload | None = None,
+    ) -> None:
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict() if lookup_request is None else lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+
+    def _record_mode_outcome(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        response_payload: RawCallPayload,
+        error_payload: RawCallPayload | None,
+        status: CallStatus,
+        latency_ms: float,
+        replay_evidence: ReplayCallEvidence | None = None,
+        lookup_request: RawCallPayload | None = None,
+    ) -> None:
+        call = self._record_call(
+            call_index=call_index,
+            call_type=CallType.HTTP,
+            status=status,
+            request_data=request_payload,
+            response_data=response_payload,
+            error=error_payload,
+            latency_ms=latency_ms,
+            source_call_id=None if replay_evidence is None else replay_evidence.source_call_id,
+        )
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict() if lookup_request is None else lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=response_payload.to_dict(),
+                live_error_data=None if error_payload is None else error_payload.to_dict(),
+            )
+
+    def _finish_replay(
+        self,
+        *,
+        evidence: ReplayCallEvidence,
+        call_index: int,
+        request_payload: RawCallPayload,
+        telemetry_request: RawCallPayload,
+        operation: str,
+        lookup_request: RawCallPayload | None = None,
+    ) -> None:
+        payload = evidence.response_data
+        if payload is None:
+            raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has no response")
+        response_payload = RawCallPayload(payload)
+        error_payload = None if evidence.error_data is None else RawCallPayload(evidence.error_data)
+        latency_ms = evidence.latency_ms if evidence.latency_ms is not None else 0.0
+        self._record_mode_outcome(
+            call_index=call_index,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_payload=error_payload,
+            status=evidence.status,
+            latency_ms=latency_ms,
+            replay_evidence=evidence,
+            lookup_request=lookup_request,
+        )
+        attempts = payload["attempts"]
+        telemetry_response = RawCallPayload({"operation": operation, "status": payload["status"], "attempts": attempts})
+        self._emit_after_audit(
+            status=evidence.status,
+            latency_ms=latency_ms,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            telemetry_request=telemetry_request,
+            telemetry_response=telemetry_response,
+        )
 
     def _bounded_semantic_response(
         self,
@@ -451,6 +607,7 @@ class TextractClient(_TextractAuditedClient):
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         super().__init__(
             execution,
@@ -463,6 +620,7 @@ class TextractClient(_TextractAuditedClient):
             token_id=token_id,
             member_token=member_token,
             work_item=work_item,
+            call_mode_session=call_mode_session,
         )
         self._sdk_client = sdk_client
 
@@ -476,6 +634,7 @@ class TextractClient(_TextractAuditedClient):
         queries: Sequence[Mapping[str, Any]],
         client_request_token: str,
         audit_identity: Mapping[str, str] | None = None,
+        source_client_request_token_fingerprint: str | None = None,
     ) -> StartAnalysisReceipt:
         # ``audit_identity`` substitutes the operator-safe location identity
         # (e.g. {"profile": alias, "key": relative_key}) for the literal
@@ -515,6 +674,58 @@ class TextractClient(_TextractAuditedClient):
                 "query_count": len(query_requests),
             }
         )
+        lookup_request: RawCallPayload | None = None
+        if self._call_mode_session is not None:
+            if (
+                type(source_client_request_token_fingerprint) is not str
+                or len(source_client_request_token_fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in source_client_request_token_fingerprint)
+            ):
+                raise AuditIntegrityError("Textract replay/verify requires the source-run client token fingerprint")
+            source_request = request_payload.to_dict()
+            source_request["client_request_token_fingerprint"] = source_client_request_token_fingerprint
+            lookup_request = RawCallPayload(source_request)
+        replay = self._replay_evidence(
+            call_index=call_index,
+            request_payload=request_payload,
+            operation="start_document_analysis",
+            lookup_request=lookup_request,
+        )
+        if replay is not None:
+            retained, _attempts = _replay_attempts(replay, operation="start_document_analysis")
+            payload = retained.data
+            if replay.status is CallStatus.ERROR:
+                replay_error = _replay_error(replay, operation="start_document_analysis")
+                self._finish_replay(
+                    evidence=replay,
+                    call_index=call_index,
+                    request_payload=request_payload,
+                    telemetry_request=telemetry_request,
+                    operation="start_document_analysis",
+                    lookup_request=lookup_request,
+                )
+                raise replay_error
+            payload = require_replay_fields(payload, fields=("job_id", "request_id_present"), source_call_id=replay.source_call_id).data
+            job_id = payload["job_id"]
+            if (
+                replay.status is not CallStatus.SUCCESS
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
+                or type(job_id) is not str
+                or not 1 <= len(job_id) <= _MAX_JOB_ID_LENGTH
+                or replay.error_data is not None
+            ):
+                raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} has incomplete start receipt")
+            self._finish_replay(
+                evidence=replay,
+                call_index=call_index,
+                request_payload=request_payload,
+                telemetry_request=telemetry_request,
+                operation="start_document_analysis",
+                lookup_request=lookup_request,
+            )
+            return StartAnalysisReceipt(job_id=job_id)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload, lookup_request=lookup_request)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -566,14 +777,14 @@ class TextractClient(_TextractAuditedClient):
                 "attempts": attempts,
             }
         )
-        self._record_call(
+        self._record_mode_outcome(
             call_index=call_index,
-            call_type=CallType.HTTP,
             status=call_status,
-            request_data=request_payload,
-            response_data=response_payload,
-            error=error_payload,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_payload=error_payload,
             latency_ms=latency_ms,
+            lookup_request=lookup_request,
         )
         self._emit_after_audit(
             status=call_status,
@@ -611,6 +822,51 @@ class TextractClient(_TextractAuditedClient):
                 "max_results": 1000,
             }
         )
+        replay = self._replay_evidence(call_index=call_index, request_payload=request_payload, operation="get_document_analysis")
+        if replay is not None:
+            retained, _attempts = _replay_attempts(replay, operation="get_document_analysis")
+            payload = retained.data
+            if replay.status is CallStatus.ERROR:
+                replay_error = _replay_error(replay, operation="get_document_analysis")
+                self._finish_replay(
+                    evidence=replay,
+                    call_index=call_index,
+                    request_payload=request_payload,
+                    telemetry_request=telemetry_request,
+                    operation="get_document_analysis",
+                )
+                raise replay_error
+            payload = require_replay_fields(
+                payload,
+                fields=("next_token", "semantic_response", "request_id_present", "next_token_present", "next_token_fingerprint"),
+                source_call_id=replay.source_call_id,
+            ).data
+            token = payload["next_token"]
+            semantic = payload["semantic_response"]
+            if (
+                replay.status is not CallStatus.SUCCESS
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
+                or (token is not None and (type(token) is not str or not 1 <= len(token) <= _MAX_NEXT_TOKEN_LENGTH))
+                or payload["next_token_present"] is not (token is not None)
+                or payload["next_token_fingerprint"] != (None if token is None else _fingerprint(token))
+                or type(semantic) is not MappingProxyType
+                or replay.error_data is not None
+            ):
+                raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} lacks complete result page")
+            try:
+                self._bounded_semantic_response(semantic, exclude=frozenset())
+            except TextractResponseError as error:
+                raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} has invalid result page") from error
+            self._finish_replay(
+                evidence=replay,
+                call_index=call_index,
+                request_payload=request_payload,
+                telemetry_request=telemetry_request,
+                operation="get_document_analysis",
+            )
+            return AnalysisResultPage(semantic_response=semantic, next_token=token)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -638,6 +894,7 @@ class TextractClient(_TextractAuditedClient):
                     "attempts": attempts,
                     "request_id_present": request_id_present,
                     "next_token_present": returned_next_token is not None,
+                    "next_token": returned_next_token,
                     "next_token_fingerprint": None if returned_next_token is None else _fingerprint(returned_next_token),
                     "semantic_response": semantic_response,
                 }
@@ -674,13 +931,12 @@ class TextractClient(_TextractAuditedClient):
                 "next_token_present": returned_next_token is not None,
             }
         )
-        self._record_call(
+        self._record_mode_outcome(
             call_index=call_index,
-            call_type=CallType.HTTP,
             status=call_status,
-            request_data=request_payload,
-            response_data=response_payload,
-            error=error_payload,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_payload=error_payload,
             latency_ms=latency_ms,
         )
         self._emit_after_audit(
@@ -720,6 +976,7 @@ class TextractInlineClient(_TextractAuditedClient):
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         super().__init__(
             execution,
@@ -732,6 +989,7 @@ class TextractInlineClient(_TextractAuditedClient):
             token_id=token_id,
             member_token=member_token,
             work_item=work_item,
+            call_mode_session=call_mode_session,
         )
         self._sdk_client = sdk_client
 
@@ -780,6 +1038,45 @@ class TextractInlineClient(_TextractAuditedClient):
                 "query_count": len(query_requests),
             }
         )
+        replay = self._replay_evidence(call_index=call_index, request_payload=request_payload, operation="analyze_document")
+        if replay is not None:
+            retained, attempts = _replay_attempts(replay, operation="analyze_document")
+            payload = retained.data
+            if replay.status is CallStatus.ERROR:
+                replay_error = _replay_error(replay, operation="analyze_document", inline=True)
+                self._finish_replay(
+                    evidence=replay,
+                    call_index=call_index,
+                    request_payload=request_payload,
+                    telemetry_request=telemetry_request,
+                    operation="analyze_document",
+                )
+                raise replay_error
+            payload = require_replay_fields(
+                payload, fields=("semantic_response", "request_id_present"), source_call_id=replay.source_call_id
+            ).data
+            semantic = payload["semantic_response"]
+            if (
+                replay.status is not CallStatus.SUCCESS
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
+                or type(semantic) is not MappingProxyType
+                or replay.error_data is not None
+            ):
+                raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} lacks complete inline result")
+            try:
+                self._bounded_semantic_response(semantic, exclude=frozenset())
+            except TextractResponseError as error:
+                raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} has invalid inline result") from error
+            self._finish_replay(
+                evidence=replay,
+                call_index=call_index,
+                request_payload=request_payload,
+                telemetry_request=telemetry_request,
+                operation="analyze_document",
+            )
+            return InlineAnalysisResult(semantic_response=semantic, sdk_attempts=attempts)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -833,13 +1130,12 @@ class TextractInlineClient(_TextractAuditedClient):
                 "attempts": attempts,
             }
         )
-        self._record_call(
+        self._record_mode_outcome(
             call_index=call_index,
-            call_type=CallType.HTTP,
             status=call_status,
-            request_data=request_payload,
-            response_data=response_payload,
-            error=error_payload,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_payload=error_payload,
             latency_ms=latency_ms,
         )
         self._emit_after_audit(
