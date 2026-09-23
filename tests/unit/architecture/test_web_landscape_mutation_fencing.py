@@ -239,6 +239,7 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "complete_batch",
             "complete_aggregation_result",
             "complete_aggregation_failure",
+            "complete_collector_failure",
             "retry_batch",
         ),
     ),
@@ -310,7 +311,9 @@ _EXPECTED_API_CATEGORY_COUNTS = {
     "data-flow": 17,
     # C4 (recorded FAILED verdict, operator ruling 2026-09-23): 19 -> 20,
     # ExecutionRepository.complete_aggregation_failure, the batch's one verdict write.
-    "execution": 20,
+    # CODEX-R2 (elspeth-5887fb7928 R4): 20 -> 21,
+    # ExecutionRepository.complete_collector_failure, a collector group's one verdict write.
+    "execution": 21,
     "scheduler": 23,
     "sink-effect": 11,
     "checkpoint": 2,
@@ -720,8 +723,15 @@ _EXPECTED_DML_COUNT = 160
 # table/operation shape after the aggregation batch identity above.
 # Verification writes derive their current run from the fenced token and
 # their source run from the checked persisted run row in that transaction.
+# CODEX-R2 (elspeth-5887fb7928 R4, a collector group's FAILED verdict is one
+# transaction): the K063 donor's count 159 and write shapes 70/70 stayed fixed;
+# the one node_states bulk UPDATE moved from
+# NodeStateRepository.complete_node_states_completed_many (fp 36ac590bf615c1f6) to
+# the status-parameterised _complete_node_states_many (fp 27ab1839b7ac242c), which
+# the COMPLETED wrapper and the new FAILED wrapper share. Measured by
+# scripts/fencing_inventory.py --json against a clean export of 2a1d93652 and the tree.
 # Re-derived on the combined K063/K056 tree with scripts/fencing_inventory.py.
-_EXPECTED_DML_INVENTORY_SHA256 = "84728f51ccaef29acee6132cd4efc8430edb1262102d68a8681be323c176905c"
+_EXPECTED_DML_INVENTORY_SHA256 = "cde69a415209183985430961899a093d07f971b6a9ad3ce1c9f957f462181ecd"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -827,16 +837,24 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # queue arm (#2) keeps the claimed row. Nothing departed.
 # K056 adds seven live call sites across replay verification, readiness,
 # provider lineage, and PDF call auditing. The typed PluginContext PDF
-# record_row_call forwarder adds one more. The complete-tree scanner measured
-# 287 on the combined tree; five existing PluginContext calls also moved line.
-_EXPECTED_CALL_COUNT = 287
+# record_row_call forwarder adds one more; five existing PluginContext calls
+# also moved line.
+# CODEX-R2 (elspeth-5887fb7928 R4): 279 -> 280. Departed:
+# CollectorExecutor._fail_group -> self._execution.complete_node_state#1 (each member
+# hold in its own transaction). Arrived: CollectorExecutor._fail_group ->
+# self._execution.complete_collector_failure#1 (the lost-members arm's verdict) and
+# NodeStateGuard.complete_collector_failure -> self._execution.complete_collector_failure#1
+# (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
+_EXPECTED_CALL_COUNT = 288
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
 # AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
 # C4: 70bb43aa… -> 6c2ff337…, the caller exchange above.
-# R4: 6c2ff337… -> the value below, the one caller added above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "f3b9e7200930082a8d50b90a1f293d196b4f5371c28401806cb41a0f729b6442"
+# R4: 6c2ff337… -> 0478b37d…, the one caller added above.
+# CODEX-R2: 0478b37d… -> 9e7698c9… on the donor, the caller exchange above.
+# Re-derived for the combined K063/K056 tree after the caller exchange.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "f7a7a51f1c07dbf941e97c40571436b092e633adf6aa755c7799e90f2295885d"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -845,8 +863,14 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "f3b9e7200930082a8d50b90a1f293d196b4f5371c2
 # _insert_or_load_routing_decision. NodeStateRepository.record_routing_event ->
 # _insert_or_load_routing_decision stays, its call fingerprint moved (1b40f529… ->
 # 751cf56f…) because the event is now built by prepare_routing_event.
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 143
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "4bdcff84c390aad5cf972c3409f96d4183d9d64744bd3e2dc48b50c8180cc7e7"
+# CODEX-R2 (elspeth-5887fb7928 R4): 143 -> 146, 4bdcff84… -> the value below. Arrived:
+# ExecutionRepository.complete_collector_failure -> NodeStateRepository.complete_node_states_failed_many
+# (the verdict's one write on its fenced connection), and both
+# complete_node_states_completed_many and complete_node_states_failed_many ->
+# NodeStateRepository._complete_node_states_many (the shared bulk UPDATE, fed owned
+# _BulkStateCompletion rows).
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 146
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d86b459406b192b8421605f22d7e967e4504f1c99685be646de7bb95752303d2"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -16770,7 +16794,8 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
 
 def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_one() -> None:
     units = _production_units()
-    assert len(_MUTATION_APIS) == 92
+    # CODEX-R2 (elspeth-5887fb7928 R4): 92 -> 93, ExecutionRepository.complete_collector_failure.
+    assert len(_MUTATION_APIS) == 93
     assert Counter(api.category for api in _MUTATION_APIS) == Counter(_EXPECTED_API_CATEGORY_COUNTS)
     assert len({(api.path, api.symbol) for api in _MUTATION_APIS}) == len(_MUTATION_APIS)
 

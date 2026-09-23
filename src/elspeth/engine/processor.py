@@ -3716,6 +3716,7 @@ class RowProcessor:
         frame_kind: FrameKind = FrameKind.FORK,
         outcome: TerminalOutcome = TerminalOutcome.FAILURE,
         path: TerminalPath = TerminalPath.UNROUTED,
+        already_terminal: frozenset[str] = frozenset(),
     ) -> list[RowResult]:
         """Terminalize a closer's consumed members through the standard
         channel (spec §6.1: no closer writes token terminals directly —
@@ -3795,6 +3796,14 @@ class RowProcessor:
         over the alternative (write nothing until every token is written),
         which would leave a genuinely-failed token with NO terminal at all
         on the exact same class of failure.
+
+        ``already_terminal`` names consumed members whose terminal a previous
+        process already wrote before it crashed: resume completing a RECORDED
+        collector failure verdict (elspeth-5887fb7928 AC-R4). Their write is
+        skipped, but they still take part in the lineage agreement check and
+        the ONE escalation walk. The walk's staged losses ride the journal
+        release, which that crash never committed. Every other caller passes
+        nothing, so its duplicate terminal still fails loudly.
         """
         if not consumed_tokens:
             return []
@@ -3844,6 +3853,8 @@ class RowProcessor:
         terminal_reason = GroupSettlementReason.SCOPE_GROUP_FAILED.value if group_failed else failure_reason
         error_hash = compute_error_hash(terminal_reason) if outcome is TerminalOutcome.FAILURE else None
         for consumed in consumed_tokens:
+            if consumed.token_id in already_terminal:
+                continue
             self._data_flow.record_token_outcome_leader(
                 coordination_token=self._require_coordination_token(),
                 ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
@@ -3868,6 +3879,7 @@ class RowProcessor:
         frame_kind: FrameKind = FrameKind.FORK,
         outcome: TerminalOutcome = TerminalOutcome.FAILURE,
         path: TerminalPath = TerminalPath.UNROUTED,
+        already_terminal: frozenset[str] = frozenset(),
     ) -> list[RowResult]:
         """Public surface for `_record_group_member_terminals` (spec §6.1
         Task 6): the CoalesceCompletionPort / BarrierIntakeCoordinator
@@ -3884,6 +3896,7 @@ class RowProcessor:
             frame_kind=frame_kind,
             outcome=outcome,
             path=path,
+            already_terminal=already_terminal,
         )
 
     def _notify_closer_of_loss(

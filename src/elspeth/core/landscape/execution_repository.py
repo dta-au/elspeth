@@ -1285,6 +1285,125 @@ class ExecutionRepository:
             terminal_token_ids = sorted(str(row.token_id) for row in terminal_rows)
             raise AuditIntegrityError(f"{subject} members already have terminal outcomes: {terminal_token_ids!r}")
 
+    @staticmethod
+    def _validate_verdict_members(member_refs: Sequence[TokenRef], *, run_id: str, subject: str) -> tuple[str, ...]:
+        """The ordered member token ids of a failure verdict, refused when empty, repeated or cross-run.
+
+        Shared by the two group failure verdicts (``complete_aggregation_failure``
+        and ``complete_collector_failure``).
+        """
+        member_token_ids = tuple(ref.token_id for ref in member_refs)
+        if not member_token_ids:
+            raise AuditIntegrityError(f"{subject} requires ordered members")
+        if any(ref.run_id != run_id for ref in member_refs):
+            raise AuditIntegrityError(f"{subject} members cross run identity")
+        if len(set(member_token_ids)) != len(member_token_ids):
+            raise AuditIntegrityError(f"{subject} contains duplicate members")
+        return member_token_ids
+
+    @staticmethod
+    def _lock_verdict_members_on(conn: Connection, *, run_id: str, member_token_ids: Sequence[str], subject: str) -> None:
+        """Lock a failure verdict's member tokens, refusing a missing or foreign one."""
+        token_rows = conn.execute(
+            select(tokens_table.c.token_id, tokens_table.c.run_id)
+            .where(tokens_table.c.token_id.in_(member_token_ids))
+            .order_by(tokens_table.c.token_id)
+            .with_for_update(of=tokens_table)
+        ).all()
+        if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
+            raise AuditIntegrityError(f"{subject} references a missing or foreign member token")
+
+    @staticmethod
+    def _lock_verdict_state_on(conn: Connection, *, run_id: str, state_id: str, node_id: str, subject: str) -> tuple[str, str]:
+        """Lock one node_state a failure verdict completes; return its (status, token_id).
+
+        Refuses a state that is missing, belongs to another run, or sits at
+        another node.
+        """
+        state = conn.execute(
+            select(node_states_table.c.run_id, node_states_table.c.node_id, node_states_table.c.status, node_states_table.c.token_id)
+            .where(node_states_table.c.state_id == state_id)
+            .with_for_update(of=node_states_table)
+        ).one_or_none()
+        if state is None or state.run_id != run_id or state.node_id != node_id:
+            raise AuditIntegrityError(f"{subject} references a missing, foreign, or wrong-node state")
+        return str(state.status), str(state.token_id)
+
+    def complete_collector_failure(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        collector_node_id: str,
+        flush_state_id: str | None,
+        flush_error: ExecutionError | None,
+        flush_duration_ms: float | None,
+        member_holds: Sequence[tuple[TokenRef, str, float]],
+        hold_error: ExecutionError,
+    ) -> None:
+        """Record a collector group's FAILED verdict atomically: the group's one durable failure.
+
+        A collector group fails as a whole (``CollectorExecutor._fail_group``):
+        a ``require_all`` roster closed with lost members, the plugin returned
+        ``TransformResult.error``, or a Tier-2 contract violation. The verdict
+        is ONE leader-fenced transaction:
+
+        - the flush's opener-anchored node_state FAILED with ``flush_error``
+          (absent for the lost-members arm, which never opens a flush);
+        - every arrived member's accept-time hold FAILED with ``hold_error``,
+          the group-level ``CollectorGroupFailure`` each survivor carries.
+
+        So the holds ARE the verdict's witness. OPEN holds mean no verdict:
+        a flush that died before this commits is re-run on resume. FAILED
+        ``CollectorGroupFailure`` holds on members the journal still holds
+        BLOCKED mean a recorded verdict, and resume completes its disposition
+        without the plugin (the aggregation twin is
+        ``complete_aggregation_failure``, operator ruling 2026-09-23). Before
+        this verb each hold completed in its own transaction, so a crash
+        after the first left a group restore treated as closed while its
+        members stayed BLOCKED forever.
+
+        ``member_holds`` is ``(member, hold state_id, hold duration_ms)`` in
+        member order.
+
+        Raises:
+            AuditIntegrityError: The members are empty, repeated or cross the
+                run; a flush state is named without its error or vice versa;
+                a state is missing, foreign, at another node, not OPEN, or a
+                hold does not belong to its member.
+        """
+        subject = "collector failure verdict"
+        run_id = coordination_token.run_id
+        member_token_ids = self._validate_verdict_members(
+            [ref for ref, _state_id, _duration in member_holds], run_id=run_id, subject=subject
+        )
+        if (flush_state_id is None) != (flush_error is None) or (flush_state_id is None) != (flush_duration_ms is None):
+            raise AuditIntegrityError(f"{subject} names a flush state, its error and its duration together or not at all")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_collector_failure",
+        ) as conn:
+            self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject=subject)
+            if flush_state_id is not None:
+                flush_status, _opener = self._lock_verdict_state_on(
+                    conn, run_id=run_id, state_id=flush_state_id, node_id=collector_node_id, subject=subject
+                )
+                if flush_status != NodeStateStatus.OPEN.value:
+                    raise AuditIntegrityError(f"{subject} requires an OPEN flush state")
+            for ref, hold_state_id, _duration in member_holds:
+                hold_status, hold_token_id = self._lock_verdict_state_on(
+                    conn, run_id=run_id, state_id=hold_state_id, node_id=collector_node_id, subject=subject
+                )
+                if hold_status != NodeStateStatus.OPEN.value or hold_token_id != ref.token_id:
+                    raise AuditIntegrityError(f"{subject} requires every member's own OPEN accept-time hold")
+            failed_states: list[tuple[str, float, ExecutionError]] = [
+                (hold_state_id, hold_duration_ms, hold_error) for _ref, hold_state_id, hold_duration_ms in member_holds
+            ]
+            if flush_state_id is not None and flush_error is not None and flush_duration_ms is not None:
+                failed_states.insert(0, (flush_state_id, flush_duration_ms, flush_error))
+            self.node_states.complete_node_states_failed_many(failed_states, conn=conn)
+
     def complete_aggregation_failure(
         self,
         *,
@@ -1328,13 +1447,8 @@ class ExecutionRepository:
                 membership; or a member is not live in the batch lineage.
         """
         run_id = coordination_token.run_id
-        member_token_ids = tuple(ref.token_id for ref, _row in members)
-        if not member_token_ids:
-            raise AuditIntegrityError("aggregation failure verdict requires ordered members")
-        if any(ref.run_id != run_id for ref, _row in members):
-            raise AuditIntegrityError("aggregation failure verdict members cross run identity")
-        if len(set(member_token_ids)) != len(member_token_ids):
-            raise AuditIntegrityError("aggregation failure verdict contains duplicate members")
+        subject = "aggregation failure verdict"
+        member_token_ids = self._validate_verdict_members([ref for ref, _row in members], run_id=run_id, subject=subject)
         if (destination == "discard") != (divert_edge_id is None):
             raise AuditIntegrityError(
                 f"aggregation failure verdict destination {destination!r} disagrees with its DIVERT edge {divert_edge_id!r}: "
@@ -1357,21 +1471,10 @@ class ExecutionRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="complete_aggregation_failure",
         ) as conn:
-            token_rows = conn.execute(
-                select(tokens_table.c.token_id, tokens_table.c.run_id)
-                .where(tokens_table.c.token_id.in_(member_token_ids))
-                .order_by(tokens_table.c.token_id)
-                .with_for_update(of=tokens_table)
-            ).all()
-            if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
-                raise AuditIntegrityError("aggregation failure verdict references a missing or foreign member token")
-            state = conn.execute(
-                select(node_states_table.c.run_id, node_states_table.c.node_id, node_states_table.c.status)
-                .where(node_states_table.c.state_id == state_id)
-                .with_for_update(of=node_states_table)
-            ).one_or_none()
-            if state is None or state.run_id != run_id or state.node_id != aggregation_node_id:
-                raise AuditIntegrityError("aggregation failure verdict references a missing, foreign, or wrong-node state")
+            self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject=subject)
+            state_status, _state_token_id = self._lock_verdict_state_on(
+                conn, run_id=run_id, state_id=state_id, node_id=aggregation_node_id, subject=subject
+            )
             batch = conn.execute(
                 select(
                     batches_table.c.run_id,
@@ -1386,7 +1489,7 @@ class ExecutionRepository:
             if batch is None or batch.run_id != run_id or batch.aggregation_node_id != aggregation_node_id:
                 raise AuditIntegrityError("aggregation failure verdict references a missing, foreign, or wrong-node batch")
             if (
-                state.status != NodeStateStatus.OPEN.value
+                state_status != NodeStateStatus.OPEN.value
                 or batch.status != BatchStatus.EXECUTING.value
                 or batch.aggregation_state_id not in (None, state_id)
             ):

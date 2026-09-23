@@ -168,7 +168,7 @@ files:
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/node_states.py:
     Mapping[str, object]: 14
-    dict[str, object]: 5
+    dict[str, object]: 4
   src/elspeth/core/landscape/execution/operations.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/execution/sink_effect_attempt_results.py:
@@ -1068,5 +1068,5 @@ totals:
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1152
-  dict[str, object]: 410
-  soft: 2800
+  dict[str, object]: 409
+  soft: 2799

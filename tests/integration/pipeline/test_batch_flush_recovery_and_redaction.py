@@ -552,3 +552,48 @@ def test_every_reader_counts_each_failed_token_once_after_a_crash_after_the_verd
     assert "error" not in error_analysis
     assert error_analysis["transform_errors"]["total"] == 3
     assert [group["count"] for group in error_analysis["transform_errors"]["by_transform"]] == [3]
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("on_error", ["quarantine", "discard"])
+def test_a_verdict_whose_acknowledgement_is_lost_reports_the_original_error_not_a_false_open_state(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """The verdict committed, then its call raised before returning (Codex minor, elspeth-5887fb7928).
+
+    The batch cleanup used to re-complete the now-immutable FAILED batch and
+    the guard to re-complete the FAILED flush state, and the run reported
+    "audit trail has permanent OPEN state". Both now read the durable state
+    back: the original exception stands, and resume completes the recorded
+    verdict once.
+    """
+    transform = _FailOnceThenSumBatchTransform()
+    error_sink = CollectSink("quarantine") if on_error == "quarantine" else None
+    env = _pipeline(tmp_path, transform, error_sink=error_sink)
+    real_verdict = execution_repository.ExecutionRepository.complete_aggregation_failure
+    committed: list[bool] = []
+
+    def committed_then_acknowledgement_lost(self: execution_repository.ExecutionRepository, **kwargs: Any) -> None:
+        real_verdict(self, **kwargs)
+        committed.append(True)
+        raise RuntimeError("committed but acknowledgement lost")
+
+    with monkeypatch.context() as lost_ack:
+        lost_ack.setattr(execution_repository.ExecutionRepository, "complete_aggregation_failure", committed_then_acknowledgement_lost)
+        with pytest.raises(RuntimeError, match="committed but acknowledgement lost") as raised:
+            env["orchestrator"].run(env["config"], graph=env["graph"], payload_store=env["payload_store"])
+    assert committed == [True]
+    assert "permanent OPEN" not in str(raised.value)
+
+    run_id = _run_id(env["db"])
+    _resume(env, run_id)
+
+    assert transform.batch_calls == 1
+    assert env["output_sink"].results == []
+    if error_sink is not None:
+        assert error_sink.results == _ROWS
+    audit = _audit(env["db"], run_id)
+    assert audit["transform_error_count"] == 3
+    assert audit["batch_statuses"] == ["failed"]
+    assert audit["work_statuses"] == {"terminal"}
+    assert len(audit["terminals"]) == 3

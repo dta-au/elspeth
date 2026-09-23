@@ -708,7 +708,16 @@ class AggregationExecutor:
         trigger_type: TriggerType,
         state_id: str,
     ) -> None:
-        """Mark a failed flush's batch as FAILED or raise audit-integrity error."""
+        """Mark a failed flush's batch as FAILED or raise audit-integrity error.
+
+        A batch already durably terminal needs no cleanup: the flush's verdict
+        or result receipt committed and its call then raised before returning
+        (a lost acknowledgement). Re-completing an immutable batch would
+        report a non-terminal batch that does not exist.
+        """
+        durable = self._execution.get_batch(batch_id)
+        if durable is not None and durable.status in (BatchStatus.COMPLETED, BatchStatus.FAILED):
+            return
         try:
             self._execution.complete_batch(
                 coordination_token=coordination_token,

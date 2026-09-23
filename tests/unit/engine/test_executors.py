@@ -305,7 +305,7 @@ def _make_factory() -> MagicMock:
     factory.execution.begin_operation.return_value = SimpleNamespace(operation_id="op_001")
 
     batch_counter = 0
-    batch_nodes: dict[str, str] = {}
+    batches: dict[str, SimpleNamespace] = {}
 
     def create_batch_side_effect(*, coordination_token: CoordinationToken, aggregation_node_id: str) -> SimpleNamespace:
         nonlocal batch_counter
@@ -318,14 +318,13 @@ def _make_factory() -> MagicMock:
             status=BatchStatus.DRAFT,
             attempt=0,
         )
-        batch_nodes[batch_id] = str(aggregation_node_id)
+        batches[batch_id] = batch
         return batch
 
     def get_batch_side_effect(batch_id: str) -> SimpleNamespace | None:
-        node_id = batch_nodes.get(batch_id)
-        if node_id is None:
-            return None
-        return SimpleNamespace(batch_id=batch_id, aggregation_node_id=node_id)
+        # The fake never advances a batch's status: every read sees the batch
+        # as created (DRAFT), as a flush whose verdict never committed would.
+        return batches.get(batch_id)
 
     factory.execution.create_batch.side_effect = create_batch_side_effect
     factory.execution.get_batch.side_effect = get_batch_side_effect

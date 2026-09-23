@@ -22,6 +22,7 @@ than re-deriving the join independently.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -42,7 +43,7 @@ from elspeth.contracts import (
     TokenOutcome,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import BatchStatus, FrameKind, OutputMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -85,6 +86,50 @@ class GroupRecordRow:
     # META-38's written release fact: non-NULL only for a collector RELEASE
     # group, whose "opener" is a group member, never a declared scope opener.
     closes_group_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCollectorGroupFailureHold:
+    """One member's hold that records its collector group's FAILED verdict."""
+
+    node_id: str
+    failure_reason: str
+
+
+_COLLECTOR_GROUP_FAILURE_TYPE = "CollectorGroupFailure"
+_SCOPE_GROUP_FAILED = GroupSettlementReason.SCOPE_GROUP_FAILED.value
+
+
+def _collector_group_failure_hold(token_id: str, node_id: str, error_json: str | None) -> RecordedCollectorGroupFailureHold | None:
+    """Parse one FAILED hold's ``error_json``: the group verdict it records, or None for any other failure.
+
+    The shape is the ``ExecutionError`` ``CollectorExecutor._fail_group``
+    writes: ``{"type": "CollectorGroupFailure", "context": {"failure_reason":
+    <str>, "member_disposition": "scope_group_failed", ...}, ...}``. A
+    group-failure hold that deviates from it is audit corruption, not a
+    shape to tolerate.
+    """
+    if error_json is None:
+        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has no error_json")
+    error = json.loads(error_json)
+    if type(error) is not dict or "type" not in error:
+        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has a malformed error_json")
+    if error["type"] != _COLLECTOR_GROUP_FAILURE_TYPE:
+        return None
+    context = error["context"] if "context" in error else None
+    if (
+        type(context) is not dict
+        or "failure_reason" not in context
+        or type(context["failure_reason"]) is not str
+        or not context["failure_reason"]
+        or "member_disposition" not in context
+        or context["member_disposition"] != _SCOPE_GROUP_FAILED
+    ):
+        raise AuditIntegrityError(
+            f"Collector group-failure hold of token {token_id!r} at {node_id!r} does not carry the verdict's failure_reason "
+            "and scope_group_failed disposition"
+        )
+    return RecordedCollectorGroupFailureHold(node_id=node_id, failure_reason=context["failure_reason"])
 
 
 def collector_scoped_completion_conflict(
@@ -302,6 +347,49 @@ class BarrierRestoreReadModel:
             )
             for row in self._ops.execute_fetchall(query):
                 result[row.token_id] = row.state_id
+        return result
+
+    def get_recorded_collector_group_failures(
+        self,
+        run_id: str,
+        *,
+        node_ids: Sequence[str],
+        token_ids: Sequence[str],
+    ) -> dict[str, RecordedCollectorGroupFailureHold]:
+        """Members whose accept-time hold records their collector group's FAILED verdict.
+
+        ``complete_collector_failure`` completes every arrived member's hold
+        FAILED with one ``CollectorGroupFailure`` error, in the verdict's own
+        transaction. Such a hold on a member the journal still holds BLOCKED
+        is a recorded verdict whose disposition the crashed process never
+        finished. Returns ``token_id -> (node_id, failure_reason)`` for those
+        holds at ``node_ids``. A FAILED hold of any other kind (a quarantined
+        member of a successful flush) is not a group verdict and is not
+        returned.
+
+        Raises:
+            AuditIntegrityError: A group-failure hold whose ``error_json`` is
+                not the shape the verdict writes (our own Tier-1 data).
+        """
+        if not node_ids:
+            return {}
+        result: dict[str, RecordedCollectorGroupFailureHold] = {}
+        for i in range(0, len(token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = list(token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            query = (
+                select(node_states_table.c.token_id, node_states_table.c.node_id, node_states_table.c.error_json)
+                .where(node_states_table.c.run_id == run_id)
+                .where(node_states_table.c.node_id.in_(list(node_ids)))
+                .where(node_states_table.c.token_id.in_(chunk))
+                .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
+            )
+            for row in self._ops.execute_fetchall(query):
+                hold = _collector_group_failure_hold(str(row.token_id), str(row.node_id), row.error_json)
+                if hold is None:
+                    continue
+                if row.token_id in result:
+                    raise AuditIntegrityError(f"Token {row.token_id!r} holds more than one collector group-failure verdict")
+                result[str(row.token_id)] = hold
         return result
 
     def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecordRow | None:

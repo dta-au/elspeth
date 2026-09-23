@@ -166,7 +166,12 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # (deleted; its INSERT is now a connection helper) leaves, and
 # ExecutionRepository.complete_aggregation_failure arrives — it opens the ONE
 # fenced_leader_transaction that records the whole verdict. Re-derived by RUNNING the gate.
-_CLOCK_BOUNDARY_DIGEST = "3adddc41cefcfdea32196c0992288925989b68d621e724604f86ae027df0fb7b"
+# CODEX-R2 (elspeth-5887fb7928 R4, a collector group's FAILED verdict is one
+# transaction): 3adddc41… → the value below, +1 identity:
+# ExecutionRepository.complete_collector_failure opens the ONE
+# fenced_leader_transaction that fails the flush state and every member hold.
+# Re-derived by RUNNING the gate on the changed tree.
+_CLOCK_BOUNDARY_DIGEST = "585abca879f8dd46e76df361df075a6594d44d0193f70f5b7b95c75744f48902"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -286,6 +291,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
         ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_failure"),
         ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_result"),
+        ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_collector_failure"),
         ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),

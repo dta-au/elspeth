@@ -1040,8 +1040,11 @@ class BarrierIntakeCoordinator:
             # spec §6.3 "survivors terminate scope_group_failed" write — plus
             # ONE escalation walk over their shared remaining lineage (an
             # enclosing bound frame, if any, is staged a group_failed loss).
-            # A failure arm never flushed, so no member holds a prior
-            # terminal; the seam's own duplicate detection stands.
+            # Live, no member holds a prior terminal. Resume completing a
+            # RECORDED failure verdict may find some or all of them written
+            # by the crashed process (the terminals are separate writes before
+            # the journal release): those are skipped and still walked.
+            unterminalized = self._unterminalized(consumed_tokens)
             cascaded_results = self._record_group_member_terminals(
                 consumed_tokens,
                 group_id=group_id,
@@ -1049,6 +1052,7 @@ class BarrierIntakeCoordinator:
                 child_items=failure_child_items,
                 group_failed=True,
                 frame_kind=FrameKind.EXPAND,
+                already_terminal=frozenset(token.token_id for token in consumed_tokens) - {token.token_id for token in unterminalized},
             )
             if consumed_tokens:
                 self._scheduler.mark_blocked_barrier_terminal(

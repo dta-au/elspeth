@@ -164,13 +164,19 @@ class _TransientFlushFault(RuntimeError):
     """An ordinary plugin exception: not Tier-1, not a contract violation, so the flush aborts the run."""
 
 
-def _build(tmp_path: Path, arm: str) -> dict[str, Any]:
-    arm_yaml, docs, _prefix = _ARMS[arm]
+def build_pipeline(tmp_path: Path, body_yaml: str, docs: list[dict[str, Any]], *, db: LandscapeDB | None = None) -> dict[str, Any]:
+    """Build a checkpointed json-source/json-sink pipeline through the production build path.
+
+    ``body_yaml`` is the processing section (a format string over nothing but
+    literal braces). The audit database is SQLite under ``tmp_path`` unless
+    ``db`` (a PostgreSQL proof) is given. Shared with
+    ``test_collector_failure_verdict.py`` and its PostgreSQL twin.
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)
     input_path = tmp_path / "docs.jsonl"
     input_path.write_text("\n".join(json.dumps(doc) for doc in docs) + "\n")
     output_path = tmp_path / "out.jsonl"
-    settings = load_settings_from_yaml_string((_SOURCE_AND_SINK + arm_yaml).format(input_path=input_path, output_path=output_path))
+    settings = load_settings_from_yaml_string((_SOURCE_AND_SINK + body_yaml).format(input_path=input_path, output_path=output_path))
     bundle = instantiate_plugins_from_config(settings, preflight_mode=True, sink_effect_purpose=SinkEffectExecutionPurpose.FRESH)
     sinks = execution_sinks_for_runtime(settings, bundle.sinks)
     modes = sink_effect_modes_from_runtime_bindings(
@@ -205,7 +211,8 @@ def _build(tmp_path: Path, arm: str) -> dict[str, Any]:
         sink_effect_modes=modes,
         sink_effect_admission=admission,
     )
-    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    if db is None:
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     checkpoints = CheckpointManager(db)
     catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
     return {
@@ -225,7 +232,12 @@ def _build(tmp_path: Path, arm: str) -> dict[str, Any]:
     }
 
 
-def _run(env: dict[str, Any]) -> Any:
+def _build(tmp_path: Path, arm: str) -> dict[str, Any]:
+    arm_yaml, docs, _prefix = _ARMS[arm]
+    return build_pipeline(tmp_path, arm_yaml, docs)
+
+
+def run_pipeline(env: dict[str, Any]) -> Any:
     catalog_sha256, catalog_source = env["catalog"]
     return env["orchestrator"].run(
         env["config"],
@@ -237,10 +249,26 @@ def _run(env: dict[str, Any]) -> Any:
     )
 
 
-def _terminal_counts(db: LandscapeDB) -> list[tuple[str, str, int]]:
+def resume_pipeline(env: dict[str, Any]) -> Any:
+    """Resume the run in ``env`` through RecoveryManager's admission and the production resume path."""
+    with env["db"].connection() as conn:
+        run_id = conn.execute(select(runs_table.c.run_id)).scalar_one()
+    recovery = RecoveryManager(env["db"], env["checkpoints"])
+    check = recovery.can_resume(run_id, env["graph"])
+    assert check.can_resume, check.reason
+    return env["orchestrator"].resume(
+        resume_point=recovery.get_resume_point(run_id, env["graph"]),
+        config=env["config"],
+        graph=env["graph"],
+        settings=env["settings"],
+        payload_store=env["payload_store"],
+    )
+
+
+def terminal_counts(db: LandscapeDB) -> list[tuple[str, str, int]]:
     with db.connection() as conn:
         rows = conn.execute(
-            select(token_outcomes_table.c.outcome, token_outcomes_table.c.path).where(token_outcomes_table.c.completed.is_(True))
+            select(token_outcomes_table.c.outcome, token_outcomes_table.c.path).where(token_outcomes_table.c.completed == 1)
         ).all()
     counts: dict[tuple[str, str], int] = {}
     for outcome, path in rows:
@@ -271,7 +299,7 @@ def test_resume_after_a_flush_fault_hands_the_barrier_the_rows_it_received(
 ) -> None:
     control_env = _build(tmp_path / "control", arm)
     control_calls = _recording_batch_stats(monkeypatch, fail_first_call=False)
-    control = _run(control_env)
+    control = run_pipeline(control_env)
     control_output = control_env["output_path"].read_text()
     assert control.status is RunStatus.COMPLETED
     assert [row["n"] for row in control_calls[0]] == [30, 10, 20]  # the transform's field reached the barrier
@@ -279,12 +307,11 @@ def test_resume_after_a_flush_fault_hands_the_barrier_the_rows_it_received(
     env = _build(tmp_path / "faulted", arm)
     calls = _recording_batch_stats(monkeypatch, fail_first_call=True)
     with pytest.raises(_TransientFlushFault):
-        _run(env)
+        run_pipeline(env)
 
     # The aborted state: every held member's durable row is the row that
     # reached the barrier, including the transform's field.
     with env["db"].connection() as conn:
-        run_id = conn.execute(select(runs_table.c.run_id)).scalar_one()
         held_rows = [
             json.loads(payload)["row"]["data"]
             for (payload,) in conn.execute(
@@ -304,19 +331,10 @@ def test_resume_after_a_flush_fault_hands_the_barrier_the_rows_it_received(
     else:
         assert barrier_state_statuses == [NodeStateStatus.FAILED.value]
 
-    recovery = RecoveryManager(env["db"], env["checkpoints"])
-    check = recovery.can_resume(run_id, env["graph"])
-    assert check.can_resume, check.reason
-    resumed = env["orchestrator"].resume(
-        resume_point=recovery.get_resume_point(run_id, env["graph"]),
-        config=env["config"],
-        graph=env["graph"],
-        settings=env["settings"],
-        payload_store=env["payload_store"],
-    )
+    resumed = resume_pipeline(env)
 
     assert len(calls) == 2
     assert calls[1] == calls[0], "the resumed flush must see exactly the rows the first flush saw"
     assert resumed.status is RunStatus.COMPLETED
     assert env["output_path"].read_text() == control_output
-    assert _terminal_counts(env["db"]) == _terminal_counts(control_env["db"])
+    assert terminal_counts(env["db"]) == terminal_counts(control_env["db"])
