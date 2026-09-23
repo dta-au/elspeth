@@ -32,7 +32,7 @@ The first principles taught here are ELSPETH's, not computing's.
    others are **advisory**.
 5. Name the four advanced shapes (fork + coalesce, row union, scope + collector,
    batch aggregation) and know which one a given problem needs.
-6. Get work *out*: Export YAML, Import YAML, Save for review, revert a version,
+6. Get work *out*: Export YAML, Import YAML, Share inspect link, revert a version,
    fork a message, and switch the detail level.
 
 **The pitch in one line (use it verbatim on slide 1 and slide 30):**
@@ -144,7 +144,7 @@ bottom. Participants watch; they get their own hands in Segment 3.
 - Header: `ELSPETH` · `Session: …` switcher · `v1 ▾` version selector · `Account`
 - Left: the **authoring pane** — the conversation (freeform) or the guided stepper
 - Right: the **pipeline artifact** — tabs `Graph` · `Spec` · `YAML` · `Run`
-- Bottom action bar: `Validation: …` · `Audit: …` · `Save for review` · `Import YAML` · `Run pipeline`
+- Bottom action bar: `Validation: …` · `Audit: …` · `Share inspect link` · `Import YAML` · `Run pipeline`
 - The **Inspector** slides in when you click a status: tabs `Validation` · `Audit` (· `History` in guided)
 
 *Notes.* Point, name, move on. The four artifact tabs become available as the
@@ -411,7 +411,7 @@ time, not discovered afterwards. Open `Explain` and read two sentences of it.
 - Fix it by telling the planner — it uses `explain_validation_error` (you see `Looked up: …`) and proposes a repair
 
 *Notes.* Point out the two gates: `Run pipeline` shows its blocker as a plain
-line above the button; `Save for review` is stricter still (an advisor
+line above the button; `Share inspect link` is stricter still (an advisor
 checkpoint can allow a run while still blocking completion). Advisory checks
 never block Run.
 
@@ -448,8 +448,8 @@ Fast demo; invite participants to try any one thing on their own session.
 - `Import YAML` (action bar): paste or choose a file; live `Parsed preview` + `Validation summary` before anything is sent; bind uploaded files for session-bound sources
 - Import **replaces** the pipeline — the old one stays in version history; in guided it switches you to freeform
 
-**Slide 33 — Save for review.**
-- `Save for review` → `Share for review` → a `Share URL`
+**Slide 33 — Share inspect link.**
+- `Share inspect link` → `Share for review` → a `Share URL`
 - The reviewer must be signed in; sees a frozen snapshot: graph, YAML, and the six-row audit panel *as it stood when you shared*; cannot edit, run, or fork
 - Only available when validation passes and no readiness row is in error — "sharing a known-broken state is share-theatre"
 
@@ -542,7 +542,7 @@ deployment you will teach on.
 - `docs/release/composer-guide.md` — narrative framing, completion gestures
 - `docs/guides/user-manual.md` §"Web Composer: Guided Mode" — stages, parity, nine structures, mode switching
 - `docs/guides/your-first-pipeline.md` Option B — the Segment 3 lab, verbatim prompt
-- `docs/guides/sharing-pipelines.md` — Save for review lifecycle
+- `docs/guides/sharing-pipelines.md` — Share inspect link lifecycle
 - `docs/guides/troubleshooting.md` §"Web Composer — Guided Mode"
 - `docs/guides/landscape-mcp-analysis.md`, `docs/runbooks/investigate-routing.md` — Segment 7 "deeper questions"
 - `docs/architecture/adr/031-tutorial-is-a-fixed-script-canary.md` — tutorial doctrine

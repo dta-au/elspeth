@@ -65,7 +65,7 @@ describe("blockedVerbsFromReadiness", () => {
     expect(blockedVerbsFromReadiness(makeValidationResult().readiness)).toEqual([]);
   });
 
-  it("names Save for review alone when only completion is withheld", () => {
+  it("names Share inspect link alone when only completion is withheld", () => {
     const readiness = {
       ...makeValidationResult().readiness,
       completion_ready: false,
@@ -73,7 +73,7 @@ describe("blockedVerbsFromReadiness", () => {
     expect(blockedVerbsFromReadiness(readiness)).toEqual(["save_for_review"]);
   });
 
-  it("names Run and Save for review when execution is not ready", () => {
+  it("names Run and Share inspect link when execution is not ready", () => {
     const readiness = {
       ...makeValidationResult().readiness,
       execution_ready: false,

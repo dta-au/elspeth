@@ -109,7 +109,7 @@ describe("CompletionBar", () => {
     render(<CompletionBar />);
     const bar = screen.getByTestId("completion-bar");
     expect(within(bar).getAllByRole("button").map((b) => b.textContent)).toEqual([
-      "Save for review",
+      "Share inspect link",
       "Run pipeline",
     ]);
   });
@@ -130,7 +130,7 @@ describe("CompletionBar", () => {
     // edge and visual order must stay tab order (WCAG 2.4.3 — no CSS
     // `order` on interactive controls).
     expect(buttons.map((b) => b.textContent)).toEqual([
-      "Save for review",
+      "Share inspect link",
       "Import YAML",
       "Run pipeline",
     ]);
@@ -143,7 +143,7 @@ describe("CompletionBar", () => {
     }
   });
 
-  it("disables Save for review when validation has not run", () => {
+  it("disables Share inspect link when validation has not run", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     // validationResult: null — no validation has been run.
     render(<CompletionBar />);
@@ -152,7 +152,7 @@ describe("CompletionBar", () => {
     expect(button.getAttribute("title")).toMatch(/fix validation/i);
   });
 
-  it("disables Save for review when validation is invalid", () => {
+  it("disables Share inspect link when validation is invalid", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
@@ -165,7 +165,7 @@ describe("CompletionBar", () => {
     expect(button.disabled).toBe(true);
   });
 
-  it("disables Save for review when a malformed validation response omits readiness", () => {
+  it("disables Share inspect link when a malformed validation response omits readiness", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       // Deliberately model untrusted wire data that violates the mandatory
@@ -188,7 +188,7 @@ describe("CompletionBar", () => {
     ).toBeDisabled();
   });
 
-  it("enables Save for review when validation is valid", () => {
+  it("enables Share inspect link when validation is valid", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -232,7 +232,7 @@ describe("CompletionBar", () => {
     expect(run).not.toBeDisabled();
   });
 
-  it("clicking Save for review invokes openAndMark with the active session id", () => {
+  it("clicking Share inspect link invokes openAndMark with the active session id", () => {
     useSessionStore.setState({ activeSessionId: "sess-XYZ" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -248,7 +248,7 @@ describe("CompletionBar", () => {
     expect(openAndMarkSpy).toHaveBeenCalledWith("sess-XYZ");
   });
 
-  it("disables Save for review while a mark request is in flight", () => {
+  it("disables Share inspect link while a mark request is in flight", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),

@@ -121,7 +121,7 @@ export class ComposerPage {
   }
 
   saveForReview(): Locator {
-    return this.page.getByRole("button", { name: "Save for review" });
+    return this.page.getByRole("button", { name: "Share inspect link" });
   }
 
   importYaml(): Locator {

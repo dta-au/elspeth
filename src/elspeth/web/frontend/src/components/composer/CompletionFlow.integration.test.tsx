@@ -3,7 +3,7 @@
  *
  * Phase 6B Task 11. The unit tests for CompletionBar / SaveForReviewDialog /
  * shareableReviewStore cover each piece in isolation. This test exercises
- * the full chain: click Save for review in the bar → store dispatches
+ * the full chain: click Share inspect link in the bar → store dispatches
  * markReadyForReview → dialog opens, shows the spinner, then the success
  * panel with the share URL → user copies the URL → dialog closes.
  *
@@ -123,7 +123,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     vi.restoreAllMocks();
   });
 
-  it("end-to-end: click Save for review → dialog opens → success URL shown → copy works → close preserves response", async () => {
+  it("end-to-end: click Share inspect link → dialog opens → success URL shown → copy works → close preserves response", async () => {
     const writeText = vi.fn().mockResolvedValueOnce(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
 
@@ -150,7 +150,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
     expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
 
-    // Click Save for review.
+    // Click Share inspect link.
     fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
 
     // Immediately: dialog mounted, spinner visible.
@@ -205,7 +205,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     expect(screen.getByTestId("save-for-review-retry")).toBeInTheDocument();
   });
 
-  it("clicking Save for review is a no-op when validation is invalid", () => {
+  it("clicking Share inspect link is a no-op when validation is invalid", () => {
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
       isExecuting: false,

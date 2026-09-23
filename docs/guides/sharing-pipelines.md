@@ -142,7 +142,7 @@ A shareable link goes through three distinct lifecycle phases.
 
 ### Mark-time
 
-The owner clicks **Save for review** in the composer UI. The backend:
+The owner clicks **Share inspect link** in the composer UI. The backend:
 
 1. Runs validation against the current composition state. Validation
    failures return HTTP 409 — the user fixes the errors and tries again.
@@ -163,7 +163,7 @@ the same instant.
 
 ### Re-mint-time (no new audit row)
 
-If the owner clicks **Save for review** again on the same composition
+If the owner clicks **Share inspect link** again on the same composition
 state — for example, because they lost the URL — the backend reads the
 current state, rebuilds the snapshot, and mints a fresh token. Because
 the content is identical, the `payload_digest` is identical too;
@@ -237,7 +237,7 @@ they can read, not *whether they can read at all*).
 3. **Restart the web service.** The service will load the new key and
    reject every outstanding token immediately.
 4. **Notify users** that previously shared links have been invalidated;
-   they must re-mint by clicking **Save for review** again.
+   they must re-mint by clicking **Share inspect link** again.
 
 There is no per-token revocation in v1 — rotation invalidates all.
 
@@ -250,7 +250,7 @@ a fresh link."
 
 1. The owner of the original session opens the composer at that
    session.
-2. The owner clicks **Save for review** again. This re-mints a fresh
+2. The owner clicks **Share inspect link** again. This re-mints a fresh
    token (the payload store stores the blob again under the same
    digest).
 3. The owner sends the new URL to the reviewer.

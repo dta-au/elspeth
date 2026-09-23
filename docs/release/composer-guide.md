@@ -32,7 +32,7 @@ from a blank YAML file.
 | Review the shape | Inspect the graph view and rendered YAML before running or sharing. |
 | Handle credentials safely | Reference secrets by name instead of placing secret values in pipeline configuration. |
 | Preserve work in progress | Resume after an interrupted authoring session with transcript, redacted tool rows, and state diffs. |
-| Finish in the right way | Save for review, run the pipeline, or export YAML depending on the user's workflow. |
+| Finish in the right way | Share an inspect link, run the pipeline, or export YAML depending on the user's workflow. |
 | Choose the level of detail | Keep the standard detail level, which is the default, or switch to technical for raw plugin settings, every validation check, advanced options, and YAML import. |
 
 ## The Authoring Experience
@@ -110,7 +110,7 @@ Composer gives three ways to finish a composition.
 
 | Action | What happens |
 |---|---|
-| Save for review | Composer marks the current composition as ready for another person to inspect, creates a signed share link, and shows the reviewer the same readiness and YAML evidence. |
+| Share inspect link | Composer marks the current composition as ready for another person to inspect, creates a signed share link, and shows the reviewer the same readiness and YAML evidence. |
 | Run pipeline | ELSPETH starts a background run, streams progress, and records the run in the audit trail. |
 | Export YAML | Composer renders the pipeline as YAML so an operator or engineer can run, review, or store it outside the web UI. |
 

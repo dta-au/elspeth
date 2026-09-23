@@ -171,7 +171,7 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   // Every gap in the bar has to move together. Lowering only the bar's own gap
   // left the group BOUNDARIES at 4px while the gaps INSIDE the status and
   // completion groups stayed at 8px, so the eye bonded "Audit N issues" to
-  // "Save for review" at exactly the viewport where the bar is most crowded.
+  // "Share inspect link" at exactly the viewport where the bar is most crowded.
   const gapBearingSelectors = [
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",

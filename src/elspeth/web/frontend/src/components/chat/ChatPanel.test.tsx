@@ -10566,7 +10566,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
 
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
     expect(
-      within(panel).getByText("Save for review is blocked. Run pipeline is still available."),
+      within(panel).getByText("Share inspect link is blocked. Run pipeline is still available."),
     ).toBeInTheDocument();
     expect(
       within(panel).getByText(
@@ -10646,7 +10646,7 @@ describe("ChatPanel decision panel (elspeth-cb0d4b8dba)", () => {
     });
     render(<ChatPanel />);
     const panel = screen.getByRole("region", { name: "Awaiting your decision (2)" });
-    expect(within(panel).getByText("Save for review is blocked. Run pipeline is still available.")).toBeInTheDocument();
+    expect(within(panel).getByText("Share inspect link is blocked. Run pipeline is still available.")).toBeInTheDocument();
     const apply = within(panel).getByRole("button", { name: /^Apply optional suggestion/ });
     expect(apply).toBeDisabled();
     expect(within(panel).getByRole("status")).toHaveTextContent(

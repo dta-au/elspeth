@@ -340,7 +340,7 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
    as the CLI example: `id: int`, `name: str`, `amount: int`, `category: str`.
 6. When validation passes, use **Run pipeline**.
 
-The completion bar also exposes **Save for review**. If you want to compare the
+The completion bar also exposes **Share inspect link**. If you want to compare the
 browser-authored configuration with `examples/threshold_gate/settings.yaml`,
 open **Export YAML** from the command palette (`Ctrl+Shift+Y`).
 
@@ -810,7 +810,7 @@ elspeth web --host 127.0.0.1 --port 8451
 | `Upload` | Add a session-scoped source file |
 | `Run pipeline` | Execute the validated composition |
 | `Export YAML` | Inspect or download generated YAML |
-| `Save for review` | Create a shareable read-only review link when validation passes |
+| `Share inspect link` | Create a shareable read-only review link when validation passes |
 
 ### Docker Commands
 

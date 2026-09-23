@@ -24,7 +24,7 @@ export interface WorkspaceStatus {
    *  mirrors the validation channel's own failure — counts in exactly one of
    *  them. It may therefore undercount a channel's standalone `text`. */
   issueCount: number;
-  /** Set only when a readiness blocker withholds Run or Save for review
+  /** Set only when a readiness blocker withholds Run or Share inspect link
    *  (elspeth-cb0d4b8dba). The merged Checks projection reads it to say
    *  "Blocked" instead of a bare issue count: a blocker is the user's own
    *  progress being stopped, which a count of warnings does not convey.
@@ -66,7 +66,7 @@ export function projectValidationWorkspaceStatus(
   // A readiness blocker on an otherwise valid result (the advisor sign-off
   // withheld on a green build, a review card awaiting the user) outranks the
   // warning count: measured on session 94f6f00c the badge read "1 warning"
-  // while Save for review was disabled with no visible reason.
+  // while Share inspect link was disabled with no visible reason.
   // Optional chain mirrors ExecuteButton's read of the same field: fixtures
   // and older wire shapes can omit `readiness`, and an absent gate is "no
   // blocker", never a crash on the badge.

@@ -43,7 +43,7 @@
      tighten all of them by overriding just these two. Overriding only the
      bar's own gap (as it used to) left the group BOUNDARIES at 4px while the
      gaps INSIDE the groups stayed 8px, inverting the grouping so "Audit" read
-     as bonded to "Save for review" (elspeth-fca731fb28). Both are tokens, so
+     as bonded to "Share inspect link" (elspeth-fca731fb28). Both are tokens, so
      the bar/collapse-control alignment contract no longer depends on the
      browser root staying at 16px. */
   --workspace-bar-gap: var(--space-sm);
@@ -1085,7 +1085,7 @@
        Overriding only the bar left the group BOUNDARIES at 4px while the gaps
        INSIDE the status and completion groups stayed at 8px — measured
        8/4/8/8/4 at 1280x720 and 1536x760 — so the eye bonded "Audit N issues"
-       to "Save for review" and split controls that belong together, at exactly
+       to "Share inspect link" and split controls that belong together, at exactly
        the viewport where the bar is most crowded. Both the bar's padding and
        the collapse control's standoff across the divider read the inset, so
        the shared bottom edge holds here too (elspeth-fca731fb28). */

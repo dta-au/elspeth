@@ -70,8 +70,23 @@ drained and repair this release forward.
   history, and no historical identity snapshot is invented from current rows.
 - **Workflow-governance readiness switch.** An off-by-default setting now
   refuses `/api/ready` when governance is requested with open local
-  registration or without a compartment marking. The switch prepares the
-  configuration boundary for later approval, review, and library authorities.
+  registration or without a compartment marking. It is the configuration
+  boundary for the approval, review and library authorities below.
+- **Approval, review, shared library and per-person quotas.** With workflow
+  governance on, a session owner can send a state for approval (blocking) or
+  for review (non-blocking), reviewers attest against a server-computed content
+  digest, pipelines can be published to a shared library, and per-identity
+  limits on model tokens per day and stored bytes are admitted at the boundary
+  rather than reported after the fact. Attestation is a ledger, not a control:
+  nothing refuses on it. An approver also gets a read-only audit view of the
+  runs, approvals, attestations and authentication events for the identities in
+  their scope. With governance off — the default — none of this is enforced and
+  runs are admitted without an approval, as before.
+- **The "Save for review" gesture is renamed "Share inspect link".** The old
+  name read as a request addressed to someone, which is what the new send-for-
+  review verb actually does; this one mints a link that anyone holding it can
+  inspect. Only the visible name changes — the endpoint, its telemetry
+  vocabulary and the share-link lifecycle are untouched.
 - **Bedrock credentials in API keys & secrets.** The `llm` transform and LLM
   source accept an optional Amazon Bedrock API key (`api_key`, sent as a
   bearer token) or static IAM credentials (`aws_access_key_id`,

@@ -143,14 +143,14 @@ describe("DecisionPanel", () => {
   it("says which verb is blocked, in plain words, from the readiness axes", () => {
     renderPanel();
     expect(
-      screen.getByText("Save for review is blocked. Run pipeline is still available."),
+      screen.getByText("Share inspect link is blocked. Run pipeline is still available."),
     ).toBeInTheDocument();
   });
 
   it("names both verbs when execution is withheld too", () => {
     renderPanel({ blockedVerbs: ["run", "save_for_review"] });
     expect(
-      screen.getByText("Run pipeline and Save for review are blocked."),
+      screen.getByText("Run pipeline and Share inspect link are blocked."),
     ).toBeInTheDocument();
   });
 

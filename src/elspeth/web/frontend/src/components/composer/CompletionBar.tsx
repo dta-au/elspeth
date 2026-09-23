@@ -4,7 +4,7 @@ import type { JSX } from "react";
  *
  * Renders three buttons, in DOM (= visual = tab) order:
  *
- *   * Save for review  → POSTs mark-ready-for-review, opens dialog with the
+ *   * Share inspect link → POSTs mark-ready-for-review, opens dialog with the
  *                        signed share URL.
  *   * Import YAML      → opens the import modal through the existing
  *                        ImportYamlButton primitive. (Export lives on the
@@ -24,7 +24,7 @@ import type { JSX } from "react";
  * Save → Import → Run because visual order IS tab order (WCAG 2.4.3; no CSS
  * `order` on interactive controls — same rule as ArtifactWorkspace's right
  * cluster); workspace.css pushes the LAST child right with an auto margin.
- * The "Save for review" button follows the backend-owned
+ * The "Share inspect link" button follows the backend-owned
  * completion-readiness axis. This is deliberately stricter than Run: an
  * advisor checkpoint can allow execution while still blocking completion.
  *
@@ -54,7 +54,7 @@ import { ExecuteButton } from "@/components/sidebar/ExecuteButton";
 import { ImportYamlButton } from "@/components/sidebar/ImportYamlButton";
 
 const SAVE_FOR_REVIEW_DISABLED_TITLE =
-  "Fix validation or completion blockers before sharing for review.";
+  "Fix validation or completion blockers before sharing an inspect link.";
 
 export function CompletionBar(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
@@ -99,7 +99,7 @@ export function CompletionBar(): JSX.Element | null {
         }
         data-testid="completion-bar-save-for-review"
       >
-        Save for review
+        Share inspect link
       </Button>
       {showAdvanced && <ImportYamlButton />}
       <ExecuteButton />

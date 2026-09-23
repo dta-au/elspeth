@@ -6,7 +6,7 @@
 // the affordance that clears it, sit where the user is working — above the
 // chat input — never two tab changes away in the Pipeline → Checks sub-tab.
 // Measured on session 94f6f00c: the advisor gate withheld completion, the
-// chat got a fixed note with no action, Save for review was disabled with the
+// chat got a fixed note with no action, Share inspect link was disabled with the
 // reason in a hover title, the Checks badge read "1 warning", and the only
 // button that changed anything (the validator's S1 suggestion's Apply) lived
 // in ChecksView.
@@ -92,9 +92,9 @@ export interface DecisionPanelProps {
 export function blockedVerbsSentence(blockedVerbs: readonly BlockedVerb[]): string | null {
   const run = blockedVerbs.includes("run");
   const save = blockedVerbs.includes("save_for_review");
-  if (run && save) return "Run pipeline and Save for review are blocked.";
+  if (run && save) return "Run pipeline and Share inspect link are blocked.";
   if (run) return "Run pipeline is blocked.";
-  if (save) return "Save for review is blocked. Run pipeline is still available.";
+  if (save) return "Share inspect link is blocked. Run pipeline is still available.";
   return null;
 }
 

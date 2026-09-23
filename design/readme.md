@@ -48,7 +48,7 @@ How ELSPETH writes. The voice is that of an **assurance engineer**: precise, cal
 
 **Person.** Mostly impersonal / system-voice. The UI addresses the user as **"you"** in guidance ("Use it when you want to build, inspect, validate…", "Choose the authoring path that matches how you want to work"). The system describes its own actions in third person ("the composer builds through tools"). Avoid "we"; avoid first-person singular entirely.
 
-**Casing.** Sentence case for everything in the UI — headings, buttons, labels ("Sign in to ELSPETH", "Save for review", "Copy YAML", "Configure API keys"). The single deliberate exception is the brand wordmark **ELSPETH**, always all-caps. Component-type and status badges are **UPPERCASE** by CSS transform (SOURCE, TRANSFORM, RUNNING, COMPLETED) — but authored in normal case in the data.
+**Casing.** Sentence case for everything in the UI — headings, buttons, labels ("Sign in to ELSPETH", "Share inspect link", "Copy YAML", "Configure API keys"). The single deliberate exception is the brand wordmark **ELSPETH**, always all-caps. Component-type and status badges are **UPPERCASE** by CSS transform (SOURCE, TRANSFORM, RUNNING, COMPLETED) — but authored in normal case in the data.
 
 **Terminology — use the product's exact words:**
 - Components are *Sources, Transforms, Gates, Sinks, Aggregations, Coalesce points* — not "nodes" loosely, not "steps".
@@ -62,7 +62,7 @@ How ELSPETH writes. The voice is that of an **assurance engineer**: precise, cal
 
 **Examples to imitate:**
 - Heading: "Sign in to ELSPETH"
-- Button: "Save for review", "Run", "Copy YAML", "Retry connection"
+- Button: "Share inspect link", "Run", "Copy YAML", "Retry connection"
 - Banner: "Service unavailable: The composer cannot reach a usable LLM right now."
 - Eyebrow/label: "PLUGIN CATALOG", "AUDIT READINESS", micro-labels uppercased and tracked.
 - Status: "completed_with_failures" (snake_case in data, rendered as a badge).
