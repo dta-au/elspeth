@@ -961,14 +961,12 @@ def run(
 
     # Load and validate config with Key Vault secrets (same flow as other commands)
     try:
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
-            mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
-            _install_nonlive_plugin_scope(mode, requested_plugins)
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-        else:
-            source_settings = None
         config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
         _require_marked_export(config)
     except FileNotFoundError:
@@ -998,12 +996,11 @@ def run(
 
     # Non-live admission precedes plugin construction, which may initialize
     # SDK clients or credentials. A missing source run cannot reach either.
-    if execute and not dry_run:
-        try:
-            _admit_cli_nonlive_run(config)
-        except (OSError, RuntimeError, ValueError, contract_errors.OrchestrationInvariantError) as e:
-            typer.echo(f"Replay/verify admission failed: {e}", err=True)
-            raise typer.Exit(1) from None
+    try:
+        _admit_cli_nonlive_run(config)
+    except (OSError, RuntimeError, ValueError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Replay/verify admission failed: {e}", err=True)
+        raise typer.Exit(1) from None
 
     # Instantiate plugins before graph construction
     try:
@@ -1070,7 +1067,7 @@ def run(
 
     # Executable admission: validate the projected pipeline sinks before any
     # output/payload/database directory can be created. Dry-run/configuration
-    # assembly above intentionally remains side-effect and capability-gate free.
+    # assembly above remains free of sink publication preflight.
     try:
         execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
     except contract_errors.TIER_1_ERRORS:

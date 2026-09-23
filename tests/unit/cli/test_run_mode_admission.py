@@ -67,7 +67,8 @@ def _settings_path(tmp_path: Path, *, mode: str, source_plugin: str = "csv", key
 
 
 @pytest.mark.parametrize("mode", ["replay", "verify"])
-def test_missing_source_run_refused_before_secrets_loader_plugin_import_or_constructor(tmp_path: Path, mode: str) -> None:
+@pytest.mark.parametrize("run_flag", ["--execute", "--dry-run"])
+def test_missing_source_run_refused_before_secrets_loader_plugin_import_or_constructor(tmp_path: Path, mode: str, run_flag: str) -> None:
     settings_path = _settings_path(tmp_path, mode=mode)
     with (
         patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
@@ -75,7 +76,7 @@ def test_missing_source_run_refused_before_secrets_loader_plugin_import_or_const
         patch("elspeth.cli._preflight_raw_settings_sink_effects", side_effect=AssertionError("raw preflight")) as raw_preflight,
         patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
     ):
-        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), run_flag])
 
     assert result.exit_code == 1, result.output
     assert "does not exist" in result.output
@@ -129,7 +130,8 @@ def test_valid_source_keyvault_refused_before_remote_secret_or_constructor(tmp_p
 
 
 @pytest.mark.parametrize("mode", ["replay", "verify"])
-def test_cli_file_backed_settings_use_admitted_source_content(tmp_path: Path, mode: str) -> None:
+@pytest.mark.parametrize("run_flag", ["--execute", "--dry-run"])
+def test_cli_file_backed_settings_use_admitted_source_content(tmp_path: Path, mode: str, run_flag: str) -> None:
     settings_path = _settings_path(tmp_path, mode=mode)
     raw = yaml.safe_load(settings_path.read_text())
     raw["replay_from"] = "source-run"
@@ -171,7 +173,7 @@ def test_cli_file_backed_settings_use_admitted_source_content(tmp_path: Path, mo
     if mode == "verify":
         reference_path.write_text("id,description\n1,changed\n")
     with patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_FILE_ADMISSION")) as construct:
-        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), run_flag])
     assert result.exit_code == 1, result.output
     if mode == "replay":
         assert "AFTER_FILE_ADMISSION" in result.output
