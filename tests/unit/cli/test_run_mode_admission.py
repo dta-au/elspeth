@@ -136,12 +136,59 @@ def test_supported_mode_reaches_constructor_only_after_cli_admission(tmp_path: P
         )
     finally:
         db.close()
-    with patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_ADMISSION")) as construct:
+    external_dir = tmp_path / "untrusted_plugins"
+    external_dir.mkdir()
+    imported_marker = tmp_path / "plugin_imported"
+    (external_dir / "malicious.py").write_text("from pathlib import Path\n" + f"Path({str(imported_marker)!r}).write_text('imported')\n")
+    with (
+        patch("elspeth.plugins.infrastructure.manager._shared_instance", None),
+        patch(
+            "elspeth.plugins.infrastructure.discovery.PLUGIN_SCAN_CONFIG",
+            {"sources": [str(external_dir)], "transforms": [], "sinks": []},
+        ),
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_ADMISSION")) as construct,
+    ):
         result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+        assert not imported_marker.exists()
+        # Positive instrument control: ordinary global discovery still fires
+        # after the CLI's invocation-scoped registry has been released.
+        get_shared_plugin_manager()
+        assert imported_marker.read_text() == "imported"
     assert result.exit_code == 1, result.output
     assert "AFTER_ADMISSION" in result.output
     construct.assert_called_once()
     assert not (tmp_path / "output.json").exists()
+
+
+def test_programmatic_bootstrap_uses_filtered_registry_with_valid_source(tmp_path: Path) -> None:
+    settings_path = _settings_path(tmp_path, mode="replay")
+    raw = yaml.safe_load(settings_path.read_text())
+    raw["replay_from"] = "source-run"
+    settings_path.write_text(yaml.safe_dump(raw))
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="source-run")
+        factory.run_lifecycle.complete_run(
+            RunStatus.COMPLETED,
+            coordination_token=leader_coordination_token(factory, "source-run"),
+        )
+    finally:
+        db.close()
+    with (
+        patch("elspeth.plugins.infrastructure.manager._shared_instance", None),
+        patch(
+            "elspeth.plugins.infrastructure.discovery.discover_all_plugins",
+            side_effect=AssertionError("MALICIOUS_PLUGIN_IMPORT"),
+        ) as untrusted_scan,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_ADMISSION")) as construct,
+    ):
+        with pytest.raises(RuntimeError, match="AFTER_ADMISSION"):
+            bootstrap_and_run(settings_path)
+        untrusted_scan.assert_not_called()
+        with pytest.raises(AssertionError, match="MALICIOUS_PLUGIN_IMPORT"):
+            get_shared_plugin_manager()
+    construct.assert_called_once()
 
 
 def test_resume_refuses_persisted_replay_run_before_secrets_or_plugins(tmp_path: Path) -> None:

@@ -4,6 +4,9 @@ Uses pluggy for hook-based plugin registration.
 """
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, cast
 
 import pluggy
@@ -315,6 +318,17 @@ class PluginManager:
 
 _shared_instance: PluginManager | None = None
 _shared_lock = threading.Lock()
+_scoped_instance: ContextVar[PluginManager | None] = ContextVar("elspeth_scoped_plugin_manager", default=None)
+
+
+@contextmanager
+def scoped_plugin_manager(manager: PluginManager) -> Iterator[None]:
+    """Use an exact plugin registry within one execution context."""
+    token = _scoped_instance.set(manager)
+    try:
+        yield
+    finally:
+        _scoped_instance.reset(token)
 
 
 def get_shared_plugin_manager() -> PluginManager:
@@ -328,6 +342,10 @@ def get_shared_plugin_manager() -> PluginManager:
     If registration fails, the global is NOT set — the next call will retry
     rather than returning a half-initialized manager.
     """
+    scoped = _scoped_instance.get()
+    if scoped is not None:
+        return scoped
+
     global _shared_instance
     instance = _shared_instance
     if instance is not None:

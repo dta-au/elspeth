@@ -7,7 +7,7 @@ cannot gain replay authority by using a built-in name.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -16,6 +16,7 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 if TYPE_CHECKING:
     from elspeth.core.config import ElspethSettings
     from elspeth.engine.orchestrator.types import PipelineConfig
+    from elspeth.plugins.infrastructure.manager import PluginManager
 
 
 # These identities are a capability inventory, not a plugin discovery list.
@@ -70,6 +71,41 @@ _SINK_CLASSES = {
 }
 
 
+def build_nonlive_plugin_manager(requested_names: Collection[str]) -> PluginManager:
+    """Register only reviewed built-ins, without scanning plugin directories.
+
+    This manager is scoped to one replay/verify invocation. The ordinary live
+    singleton and its discovery behavior remain untouched.
+    """
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager, scoped_plugin_manager
+
+    requested = frozenset(requested_names)
+    unknown = requested.difference(_SOURCE_CLASSES, _TRANSFORM_CLASSES, _SINK_CLASSES)
+    if unknown:
+        raise OrchestrationInvariantError(f"Replay/verify plugin names are not reviewed built-ins: {sorted(unknown)}")
+    manager = PluginManager()
+    registries = (
+        (_SOURCE_CLASSES, "elspeth_get_source"),
+        (_TRANSFORM_CLASSES, "elspeth_get_transforms"),
+        (_SINK_CLASSES, "elspeth_get_sinks"),
+    )
+    # An approved module's own imports must also see this scoped manager. A
+    # nested registry lookup cannot accidentally initialize global discovery.
+    with scoped_plugin_manager(manager):
+        for supported, hook_name in registries:
+            classes = []
+            for name, (module_name, class_name) in supported.items():
+                if name not in requested:
+                    continue
+                plugin_class = vars(import_module(module_name))[class_name]
+                if plugin_class.name != name:
+                    raise OrchestrationInvariantError(f"Reviewed built-in plugin identity drifted: {name!r}")
+                classes.append(plugin_class)
+            manager.register(create_dynamic_hookimpl(classes, hook_name))
+    return manager
+
+
 def precheck_nonlive_plugin_names(settings: ElspethSettings) -> None:
     """Refuse unsupported names before importing the plugin registry."""
     requested = (
@@ -87,8 +123,8 @@ def precheck_nonlive_plugin_names(settings: ElspethSettings) -> None:
                 raise OrchestrationInvariantError(f"Replay/verify does not support {kind} plugin {name!r}")
 
 
-def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> None:
-    """Reject unsupported YAML names without importing the plugin registry."""
+def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> frozenset[str]:
+    """Return reviewed YAML plugin names without importing the registry."""
     if not isinstance(raw_config, dict):
         raise ValueError("Replay/verify settings must be a YAML mapping")
     sections = (
@@ -98,6 +134,7 @@ def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> None:
         ("collectors", _TRANSFORM_CLASSES, False),
         ("sinks", _SINK_CLASSES, True),
     )
+    names: set[str] = set()
     for section_name, supported, named in sections:
         section = raw_config.get(section_name, {} if named else [])
         entries: Iterable[object]
@@ -115,6 +152,8 @@ def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> None:
             name = entry.get("plugin")
             if not isinstance(name, str) or name not in supported:
                 raise OrchestrationInvariantError(f"Replay/verify does not support {section_name} plugin {name!r}")
+            names.add(name)
+    return frozenset(names)
 
 
 def admit_nonlive_plugin_classes(settings: ElspethSettings) -> None:

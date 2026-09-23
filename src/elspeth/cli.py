@@ -508,7 +508,7 @@ def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
     admit_nonlive_plugin_classes(config)
 
 
-def _admit_raw_cli_nonlive_run(settings_path: Path) -> None:
+def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str]]:
     """Check source-run authority before secrets, file templates, or plugins."""
     from elspeth.cli_helpers import resolve_audit_passphrase
     from elspeth.contracts.call_mode import RuntimeRunMode
@@ -527,7 +527,7 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> None:
     if env_mode is not None and env_mode != mode.value:
         raise ValueError("run_mode environment override must match the literal YAML value before execution")
     if mode is RunMode.LIVE:
-        return
+        return mode, frozenset()
 
     # Dynaconf can change invocation authority via environment overrides.
     # Require these fields in YAML so source-run admission uses the same DB and
@@ -540,13 +540,18 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> None:
         "ELSPETH_COLLECTION_PROBES",
         "ELSPETH_COMMENCEMENT_GATES",
         "ELSPETH_TELEMETRY",
+        "ELSPETH_SOURCES",
+        "ELSPETH_TRANSFORMS",
+        "ELSPETH_AGGREGATIONS",
+        "ELSPETH_COLLECTORS",
+        "ELSPETH_SINKS",
     )
     if any(name == prefix or name.startswith(f"{prefix}__") for name in os.environ for prefix in forbidden_env_prefixes):
         raise ValueError("Replay/verify admission fields must be literal YAML settings")
     secrets_config = _parse_raw_secrets_config(raw_config)
     if mode is RunMode.REPLAY and secrets_config.source == "keyvault":
         raise ValueError("Replay cannot fetch Key Vault secrets")
-    precheck_nonlive_plugin_names_from_raw(raw_config)
+    requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
     replay_from = raw_config.get("replay_from")
     if not isinstance(replay_from, str) or not replay_from.strip():
         raise ValueError("Replay/verify requires a literal replay_from run ID")
@@ -579,6 +584,25 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> None:
         admit_source_run(db, RuntimeRunMode(mode, replay_from))
     finally:
         db.close()
+    return mode, requested_plugins
+
+
+def _install_nonlive_plugin_scope(mode: RunMode, requested_plugins: frozenset[str]) -> None:
+    """Keep exact built-in discovery active through the CLI command."""
+    if mode is RunMode.LIVE:
+        return
+    from contextlib import ExitStack
+
+    import click
+
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    context = click.get_current_context()
+    manager = build_nonlive_plugin_manager(requested_plugins)
+    stack = ExitStack()
+    stack.enter_context(scoped_plugin_manager(manager))
+    context.call_on_close(stack.close)
 
 
 def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str | None) -> None:
@@ -929,7 +953,8 @@ def run(
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
-            _admit_raw_cli_nonlive_run(settings_path)
+            mode, requested_plugins = _admit_raw_cli_nonlive_run(settings_path)
+            _install_nonlive_plugin_scope(mode, requested_plugins)
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
         config, secret_resolutions = _load_settings_with_secrets(settings_path)
         _require_marked_export(config)
@@ -1761,6 +1786,18 @@ def _execute_pipeline_with_instances(
 
 
 def bootstrap_and_run(settings_path: Path) -> RunResult:
+    """Run a dependency pipeline under exact discovery when non-live."""
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    mode, requested_plugins = _admit_raw_cli_nonlive_run(settings_path)
+    if mode is RunMode.LIVE:
+        return _bootstrap_and_run_impl(settings_path)
+    with scoped_plugin_manager(build_nonlive_plugin_manager(requested_plugins)):
+        return _bootstrap_and_run_impl(settings_path)
+
+
+def _bootstrap_and_run_impl(settings_path: Path) -> RunResult:
     """Load config, instantiate plugins, build graph, and run a sub-pipeline.
 
     This is the programmatic equivalent of ``elspeth run --execute`` used by
@@ -1775,7 +1812,6 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
     from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
 
-    _admit_raw_cli_nonlive_run(settings_path)
     _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
     config, secret_resolutions = _load_settings_with_secrets(settings_path)
     _require_marked_export(config)
