@@ -16,6 +16,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataState
 from elspeth.core.landscape.schema import call_verifications_table, calls_table
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.helpers.state_engine import capture_state_engine_image
 
 
 def _two_runs() -> tuple[RecorderFactory, str, str]:
@@ -89,6 +90,10 @@ def test_run_and_call_lineage_round_trip_with_verified_request() -> None:
         decision.differences_json,
     )
     assert [item.current_call_id for item in factory.execution.get_verification_decisions_for_run("current")] == [current_call.call_id]
+    current_image = capture_state_engine_image(factory, run_id="current")
+    source_image = capture_state_engine_image(factory, run_id="source")
+    assert [row["current_call_id"] for row in current_image.tables["call_verifications"]] == [current_call.call_id]
+    assert source_image.tables["call_verifications"] == ()
     with factory._db.engine.connect() as conn:
         assert conn.execute(select(call_verifications_table.c.current_call_id)).scalar_one() == current_call.call_id
 
