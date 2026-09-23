@@ -89,6 +89,17 @@ def test_replay_reconstructs_ordered_row_without_loading_source() -> None:
     source.load.assert_not_called()
 
 
+def test_audited_source_detaches_field_resolution_mapping() -> None:
+    factory, source, _row = _source_audit()
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    resolution = {"input": "normalized"}
+
+    frozen = replace(audited, field_resolution=resolution)
+    resolution["input"] = "changed"
+
+    assert frozen.field_resolution == {"input": "normalized"}
+
+
 def test_replay_refuses_missing_payload_before_loading_source() -> None:
     factory, source, _row = _source_audit()
     factory.query.get_row_data.return_value = RowDataResult(state=RowDataState.PURGED, data=None)

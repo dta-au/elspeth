@@ -18,6 +18,7 @@ from elspeth.contracts import SourceRow
 from elspeth.contracts.audit import NodeStateFailed
 from elspeth.contracts.enums import NodeType, RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import sanitize_for_canonical, stable_hash
@@ -46,6 +47,9 @@ class AuditedSource:
     field_resolution: Mapping[str, str] | None
     normalization_version: str | None
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "field_resolution")
+
 
 def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedSource) -> tuple[SourceRow, ...]:
     """Read one live source to EOF and reject every source-level difference."""
@@ -54,7 +58,7 @@ def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedS
     for ordinal, (live, recorded) in enumerate(itertools.zip_longest(source.load(ctx), audited.rows, fillvalue=missing)):
         if live is missing or recorded is missing:
             raise AuditIntegrityError(f"Verify source {audited.name!r}: row count differs at ordinal {ordinal}")
-        if not isinstance(live, SourceRow) or not isinstance(recorded, SourceRow):
+        if type(live) is not SourceRow or type(recorded) is not SourceRow:
             raise OrchestrationInvariantError(f"Verify source {audited.name!r}: source yielded a non-SourceRow value")
         if (
             live.source_row_index != recorded.source_row_index
@@ -99,7 +103,7 @@ def prepare_verified_sources(
     try:
         for name, source in sources.items():
             audited = audited_sources[name]
-            if not isinstance(audited, AuditedSource):
+            if type(audited) is not AuditedSource:
                 raise OrchestrationInvariantError(f"Verify source {name!r}: audited snapshot has wrong type")
             if source.node_id is None:
                 raise OrchestrationInvariantError(f"Verify source {name!r}: node ID is unassigned")
@@ -130,7 +134,7 @@ def _quarantine_details(
         state
         for token in factory.query.get_tokens(row_id)
         for state in factory.query.get_node_states_for_token(token.token_id)
-        if isinstance(state, NodeStateFailed) and state.node_id == source_node_id and state.step_index == 0
+        if type(state) is NodeStateFailed and state.node_id == source_node_id and state.step_index == 0
     ]
     outcomes = factory.data_flow.get_token_outcomes_for_row(run_id, row_id)
     quarantined = [outcome for outcome in outcomes if outcome.path is TerminalPath.QUARANTINED_AT_SOURCE]
@@ -146,9 +150,12 @@ def _quarantine_details(
     if len(source_failures) != 1 or source_failures[0].error_json is None:
         raise AuditIntegrityError(f"Source replay row {row_id}: source validation error evidence missing")
     error_record = json.loads(source_failures[0].error_json)
-    if not isinstance(error_record, dict) or not isinstance(error_record.get("exception"), str) or not error_record["exception"]:
+    if type(error_record) is not dict or "exception" not in error_record:
         raise AuditIntegrityError(f"Source replay row {row_id}: malformed source validation error evidence")
-    return error_record["exception"], outcome.sink_name
+    exception = error_record["exception"]
+    if type(exception) is not str or not exception:
+        raise AuditIntegrityError(f"Source replay row {row_id}: malformed source validation error evidence")
+    return exception, outcome.sink_name
 
 
 def prepare_audited_sources(
@@ -181,13 +188,17 @@ def prepare_audited_sources(
         record = by_name[name]
         if record.lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES:
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} was not exhausted")
-        node = nodes.get(record.source_node_id)
-        if node is None or node.plugin_name != source.name:
+        if record.source_node_id not in nodes:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} node is missing")
+        node = nodes[record.source_node_id]
+        if node.plugin_name != source.name:
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} plugin identity differs")
         audited_config = json.loads(node.config_json)
-        if not isinstance(audited_config, dict) or stable_hash(audited_config) != node.config_hash:
+        if type(audited_config) is not dict or stable_hash(audited_config) != node.config_hash:
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} audited config is corrupt")
-        audited_name = audited_config.pop("source_name", None)
+        if "source_name" not in audited_config:
+            raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} audited name is missing")
+        audited_name = audited_config.pop("source_name")
         if (
             audited_name != name
             or stable_hash(audited_config) != stable_hash(source.config)
@@ -203,7 +214,7 @@ def prepare_audited_sources(
             source_schema = json.loads(record.source_schema_json)
         except json.JSONDecodeError as exc:
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} has malformed schema JSON") from exc
-        if not isinstance(source_schema, dict):
+        if type(source_schema) is not dict:
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} schema is not an object")
         schema_json_by_source[name] = record.source_schema_json
 
@@ -220,9 +231,9 @@ def prepare_audited_sources(
     node_name = {record.source_node_id: name for name, record in by_name.items()}
     for batch in factory.query.iter_rows_for_run(replay_from):
         for row in batch:
-            row_source_name = node_name.get(row.source_node_id)
-            if row_source_name is None:
+            if row.source_node_id not in node_name:
                 raise AuditIntegrityError(f"Source replay row {row.row_id}: undeclared source node {row.source_node_id}")
+            row_source_name = node_name[row.source_node_id]
             payload = factory.query.get_row_data(row.row_id)
             if payload.state is not RowDataState.AVAILABLE or payload.data is None:
                 raise AuditIntegrityError(
@@ -267,7 +278,7 @@ def prepare_audited_sources(
 
     result: dict[str, AuditedSource] = {}
     for name, record in by_name.items():
-        resolution = resolutions.get(record.source_node_id)
+        resolution = resolutions[record.source_node_id] if record.source_node_id in resolutions else None
         result[name] = AuditedSource(
             name=name,
             source_run_node_id=record.source_node_id,

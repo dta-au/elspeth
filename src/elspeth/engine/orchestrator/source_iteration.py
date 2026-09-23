@@ -559,8 +559,10 @@ class SourceIterationDriver:
                 raise OrchestrationInvariantError(f"{ctx.run_mode.value} source iteration requires replay_from")
             if ctx.audited_sources is None:
                 raise OrchestrationInvariantError(f"{ctx.run_mode.value} source iteration has no admitted source snapshot")
-            candidate = ctx.audited_sources.get(active_source_name)
-            if not isinstance(candidate, AuditedSource):
+            if active_source_name not in ctx.audited_sources:
+                raise OrchestrationInvariantError(f"{ctx.run_mode.value} source {active_source_name!r} has no audited source evidence")
+            candidate = ctx.audited_sources[active_source_name]
+            if type(candidate) is not AuditedSource:
                 raise OrchestrationInvariantError(f"{ctx.run_mode.value} source {active_source_name!r} has no audited source evidence")
             audited_source = candidate
             if ctx.run_mode is RunMode.REPLAY:
