@@ -17,15 +17,22 @@ because the source is still ``loading`` when a row fails.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.dialects import sqlite
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import TransformErrorCategory, TransformErrorReason
+from elspeth.core.landscape.data_flow import errors as data_flow_errors
+from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import transform_errors_table
+from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from elspeth.web.execution.failure_samples import load_top_failure_categories
@@ -49,8 +56,8 @@ class _Counts:
     analysis_by_plugin: dict[str, int]
 
 
-def _setup(run_id: str) -> RecorderSetup:
-    setup = make_recorder_with_run(run_id=run_id, source_node_id="src")
+def _setup(run_id: str, db: LandscapeDB | None = None) -> RecorderSetup:
+    setup = make_recorder_with_run(run_id=run_id, source_node_id="src", db=db)
     for node_id, plugin in _PLUGINS.items():
         register_test_node(setup.data_flow, run_id, node_id, node_type=NodeType.TRANSFORM, plugin_name=plugin)
     return setup
@@ -246,3 +253,80 @@ def test_a_failure_a_transform_error_did_not_decide_is_not_counted() -> None:
     assert counts.categories == []
     assert counts.discarded == {}
     assert counts.run_summary_transform == counts.analysis_total == 0
+
+
+def test_a_created_at_tie_still_counts_the_token_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two attempts stamped at the same instant: the ``error_id`` tie-break still picks ONE row.
+
+    Error ids are random (``terr_`` plus a generated id), so which attempt
+    wins a tie means nothing. That exactly one wins is what keeps the token
+    from counting once under each attempt's category.
+    """
+    setup = _setup("created-at-tie")
+    token = _token(setup, 0)
+    instant = datetime(2026, 9, 23, tzinfo=UTC)
+    monkeypatch.setattr(data_flow_errors, "now", lambda: instant)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _error(setup, token, "xform", reason="validation_failed", destination="discard")
+    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    with setup.db.connection() as conn:
+        stamps = conn.execute(select(transform_errors_table.c.created_at).where(transform_errors_table.c.token_id == token)).scalars().all()
+    assert len(stamps) == 2 and len(set(stamps)) == 1, f"control: the two attempts must tie on created_at, got {stamps}"
+
+    counts = _counts(setup)
+
+    assert len(counts.categories) == 1, counts.categories
+    transform_id, category, count = counts.categories[0]
+    assert (transform_id, count) == ("xform", 1)
+    assert category in {"api_error", "validation_failed"}
+    assert counts.discarded == {"xform": 1}
+    assert counts.run_summary_transform == counts.analysis_total == 1
+
+
+def _plan(conn: Connection, sql: str) -> list[tuple[int, int, str]]:
+    """SQLite's EXPLAIN QUERY PLAN rows as (id, parent id, detail)."""
+    return [(row[0], row[1], row[3]) for row in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {sql}")]
+
+
+@pytest.mark.parametrize(
+    "created_last",
+    ["ix_transform_errors_run", "ix_transform_errors_token"],
+)
+def test_the_latest_attempt_is_ranked_in_one_pass_whatever_order_the_indexes_were_created_in(created_last: str) -> None:
+    """Pin the PLAN: the runs' error rows are read once, never once per error row.
+
+    A "latest row for this token" subquery correlated on ``run_id`` and
+    ``token_id`` gives SQLite two single-column index candidates. With no
+    ANALYZE statistics it takes the one created last, and ``create_all``
+    creates a table's indexes in set order, which varies per process. Where
+    the run index came last, every error row rescanned and sorted the whole
+    run: 14.4s for 10k failed tokens on the web run-completion path. Recreating
+    one index forces each order, and the control shows the trap is armed.
+    """
+    column = created_last.removeprefix("ix_transform_errors_")
+    db = LandscapeDB.in_memory()
+    try:
+        with db.write_connection() as conn:
+            conn.exec_driver_sql(f"DROP INDEX {created_last}")
+            conn.exec_driver_sql(f"CREATE INDEX {created_last} ON transform_errors ({column}_id)")
+        with db.read_only_connection() as conn:
+            trap = _plan(conn, "SELECT error_id FROM transform_errors WHERE run_id = 'run-1' AND token_id = 'token-1'")
+            assert any(created_last in detail for _id, _parent, detail in trap), f"control: the trap is not armed: {trap}"
+            query = deciding_transform_errors(("run-1",)).compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True})
+            plan = _plan(conn, str(query))
+    finally:
+        db.close()
+
+    details = {plan_id: detail for plan_id, _parent, detail in plan}
+    parents = {plan_id: parent for plan_id, parent, _detail in plan}
+
+    def ancestors(plan_id: int) -> list[str]:
+        chain = []
+        while parents[plan_id] in details:
+            plan_id = parents[plan_id]
+            chain.append(details[plan_id])
+        return chain
+
+    reads = [plan_id for plan_id, detail in details.items() if "transform_errors" in detail]
+    assert len(reads) == 1, plan
+    assert not any(step.startswith("CORRELATED") for step in ancestors(reads[0])), plan

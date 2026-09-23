@@ -42,13 +42,27 @@ Ordering by ``created_at`` compares wall clocks across a crash and its
 resume. Those are separate process lifetimes, normally seconds to hours
 apart, so the order holds unless the resuming host's clock is behind the
 crashed host's by more than that gap.
+
+The latest row is found by ranking the runs' error rows in ONE pass (a
+``row_number()`` window over ``(run_id, token_id)``), not by a correlated
+"latest row for this token" subquery per error row. The correlated form
+filters on ``run_id`` and ``token_id``, and ``transform_errors`` indexes each
+column on its own. An audit database carries no ANALYZE statistics, so SQLite
+prices the two single-column candidates the same and takes whichever index
+was created last. ``create_all`` creates a table's indexes in set order,
+which differs from process to process. On a database where
+``ix_transform_errors_run`` came last, every error row rescanned and sorted
+the whole run's errors: 14.4s for 10k failed tokens, against 0.02s on a
+database with the other order. It is the trap ``ix_token_outcomes_run_token``
+records in ``schema.py`` (elspeth-c675c8c2d9). The window reads the run's
+errors once, whichever order the indexes were created in.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import Select, and_, exists, select
+from sqlalchemy import Select, and_, exists, func, select
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.enums import TerminalPath
@@ -69,40 +83,50 @@ def deciding_transform_errors(run_ids: Sequence[str]) -> Select[tuple[str, str, 
     ``error_details_json``. See the module docstring for the three conditions.
     """
     errors = transform_errors_table
-    later = transform_errors_table.alias("later_transform_errors")
-    latest_error_id = (
-        select(later.c.error_id)
-        .where(later.c.run_id == errors.c.run_id)
-        .where(later.c.token_id == errors.c.token_id)
-        .order_by(later.c.created_at.desc(), later.c.error_id.desc())
-        .limit(1)
-        .scalar_subquery()
-    )
-    completed_at_node = exists().where(
-        node_states_table.c.run_id == errors.c.run_id,
-        node_states_table.c.token_id == errors.c.token_id,
-        node_states_table.c.node_id == errors.c.transform_id,
-        node_states_table.c.status == NodeStateStatus.COMPLETED,
-    )
-    return (
+    # Rank 1 is the token's latest error row. The window partitions every
+    # error row of the runs, not only the rows the outer filters keep, so a
+    # superseded row can never rank first because the latest row was filtered.
+    ranked = (
         select(
             errors.c.run_id,
             errors.c.token_id,
             errors.c.transform_id,
             errors.c.destination,
             errors.c.error_details_json,
+            func.row_number()
+            .over(
+                partition_by=(errors.c.run_id, errors.c.token_id),
+                order_by=(errors.c.created_at.desc(), errors.c.error_id.desc()),
+            )
+            .label("recency_rank"),
+        )
+        .where(errors.c.run_id.in_(run_ids))
+        .subquery("ranked_attempts")
+    )
+    completed_at_node = exists().where(
+        node_states_table.c.run_id == ranked.c.run_id,
+        node_states_table.c.token_id == ranked.c.token_id,
+        node_states_table.c.node_id == ranked.c.transform_id,
+        node_states_table.c.status == NodeStateStatus.COMPLETED,
+    )
+    return (
+        select(
+            ranked.c.run_id,
+            ranked.c.token_id,
+            ranked.c.transform_id,
+            ranked.c.destination,
+            ranked.c.error_details_json,
         )
         .select_from(
-            errors.join(
+            ranked.join(
                 token_outcomes_table,
                 and_(
-                    token_outcomes_table.c.run_id == errors.c.run_id,
-                    token_outcomes_table.c.token_id == errors.c.token_id,
+                    token_outcomes_table.c.run_id == ranked.c.run_id,
+                    token_outcomes_table.c.token_id == ranked.c.token_id,
                 ),
             )
         )
-        .where(errors.c.run_id.in_(run_ids))
+        .where(ranked.c.recency_rank == 1)
         .where(token_outcomes_table.c.path.in_(TRANSFORM_ERROR_TERMINAL_PATHS))
-        .where(errors.c.error_id == latest_error_id)
         .where(~completed_at_node)
     )
