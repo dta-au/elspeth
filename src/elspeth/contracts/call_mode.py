@@ -242,6 +242,6 @@ class CallModeSession(Protocol):
         live_error_data: Mapping[str, Any] | None,
     ) -> VerificationDecision: ...
 
-    def finalize(self) -> None:
+    def assert_complete(self) -> None:
         """Refuse unmatched or unconsumed source calls and failed comparisons."""
         ...

@@ -366,7 +366,7 @@ class LeaderDrainCoordinator:
                     verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
                     if loop_ctx.ctx.call_mode_session is None:
                         raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
-                    loop_ctx.ctx.call_mode_session.finalize()
+                    loop_ctx.ctx.call_mode_session.assert_complete()
 
             # ADR-019 Phase 4: deferred cross-table invariant sweep.
             #

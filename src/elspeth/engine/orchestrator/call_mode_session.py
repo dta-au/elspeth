@@ -653,7 +653,7 @@ class AuditedCallModeSession:
             differences=deep_thaw(differences),
         )
 
-    def finalize(self) -> None:
+    def assert_complete(self) -> None:
         """Require every state call and runtime-preflight call to be consumed."""
         missing = self._required - self._consumed
         if missing or self._failed_decisions or self._verify_admissions:

@@ -47,7 +47,7 @@ def test_replay_consumes_exact_source_call_and_fails_on_missing_occurrence() -> 
         factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY, coordination_token=_CURRENT_TOKEN
     )
     with pytest.raises(AuditIntegrityError, match="unconsumed"):
-        session.finalize()
+        session.assert_complete()
 
     evidence = session.replay_call(
         call_type=CallType.HTTP,
@@ -57,7 +57,7 @@ def test_replay_consumes_exact_source_call_and_fails_on_missing_occurrence() -> 
         current_call_index=0,
     )
     assert evidence.source_call_id == "source-call"
-    session.finalize()
+    session.assert_complete()
     with pytest.raises(AuditIntegrityError, match="already consumed"):
         session.replay_call(
             call_type=CallType.HTTP,
@@ -114,7 +114,7 @@ def test_verify_persists_mismatch_and_refuses_success() -> None:
     assert recorded["source_call_id"] == "source-call"
     assert recorded["is_match"] is False
     with pytest.raises(AuditIntegrityError, match="failed decisions"):
-        session.finalize()
+        session.assert_complete()
 
 
 def test_verify_refuses_unmatched_request_before_live_dispatch() -> None:
@@ -189,7 +189,7 @@ def test_managed_identity_verify_accepts_rotating_auth_after_non_auth_preflight(
         live_error_data=None,
     )
     assert decision.is_match is True
-    session.finalize()
+    session.assert_complete()
     assert factory.execution.find_call_for_current_parent.call_args.kwargs["request_hash"] is None
 
 
@@ -263,7 +263,7 @@ def test_source_load_managed_identity_requires_pre_token_admission_and_verdict()
         factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
     )
     with pytest.raises(AuditIntegrityError, match="unconsumed"):
-        session.finalize()
+        session.assert_complete()
     partial = {**archived, "headers": {"Accept": "application/json"}}
     evidence = session.preflight_verify_operation_http_managed_identity(request_data=partial, current_operation_id="current-operation")
     current = {**archived, "headers": {"Authorization": f"<fingerprint:{'1' * 64}>", "Accept": "application/json"}}
@@ -288,7 +288,7 @@ def test_source_load_managed_identity_requires_pre_token_admission_and_verdict()
         live_error_data=None,
     )
     assert decision.is_match is True
-    session.finalize()
+    session.assert_complete()
 
 
 def test_source_load_managed_identity_refuses_missing_auth_before_token() -> None:
