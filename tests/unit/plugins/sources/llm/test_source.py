@@ -13,6 +13,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from elspeth.contracts import CallType, Determinism, RunMode, SourceRow
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TelemetryExporterError
 from elspeth.contracts.events import ResourceCleanupFailed
@@ -150,7 +151,7 @@ def test_replay_verify_source_rejects_tracing_before_provider_or_exporter_start(
         "connection_string": "InstrumentationKey=00000000-0000-0000-0000-000000000000",
     }
     source = LLMSource(config)
-    ctx = _mode_context(source_context, mode=mode, session=MagicMock(mode=mode))
+    ctx = _mode_context(source_context, mode=mode, session=MagicMock(spec_set=CallModeSession, mode=mode))
     with (
         patch.object(source, "_create_provider", side_effect=AssertionError("provider construction is forbidden")) as construct,
         patch(

@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.enums import RunMode
 from elspeth.plugins.transforms.llm.provider import LLMProvider
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig
@@ -75,7 +76,9 @@ def test_replay_rejects_azure_monitor_before_provider_start() -> None:
     config = _make_azure_config()
     config["tracing"] = {"provider": "azure_ai", "connection_string": "InstrumentationKey=test"}
     transform = LLMTransform(config)
-    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=RunMode.REPLAY, call_mode_session=Mock(mode=RunMode.REPLAY))
+    ctx = FakeLifecycleContext(
+        landscape=FakeAuditRecorder(), run_mode=RunMode.REPLAY, call_mode_session=Mock(spec_set=CallModeSession, mode=RunMode.REPLAY)
+    )
 
     with (
         patch("elspeth.plugins.transforms.llm.transform._configure_azure_monitor", side_effect=AssertionError("trace SDK called")),
@@ -98,7 +101,9 @@ def test_replay_rejects_missing_call_session_before_provider_start() -> None:
 
 def test_live_rejects_replay_session_before_provider_start() -> None:
     transform = LLMTransform(_make_azure_config())
-    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=RunMode.LIVE, call_mode_session=Mock(mode=RunMode.REPLAY))
+    ctx = FakeLifecycleContext(
+        landscape=FakeAuditRecorder(), run_mode=RunMode.LIVE, call_mode_session=Mock(spec_set=CallModeSession, mode=RunMode.REPLAY)
+    )
 
     with pytest.raises(RuntimeError, match="call-mode session"):
         transform.on_start(ctx)
@@ -161,7 +166,7 @@ def test_replay_verify_transform_startup_does_not_construct_sdk_or_http_client(
     client_method: str,
 ) -> None:
     transform = LLMTransform(config_factory())
-    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=mode, call_mode_session=Mock(mode=mode))
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=mode, call_mode_session=Mock(spec_set=CallModeSession, mode=mode))
     with patch.object(provider_class, client_method, side_effect=AssertionError("client construction before request admission")) as client:
         transform.on_start(ctx)
     client.assert_not_called()
