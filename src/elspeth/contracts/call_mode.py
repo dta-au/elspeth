@@ -207,6 +207,26 @@ class CallModeSession(Protocol):
         """Bind the current MI request to source identity, excluding only rotating auth."""
         ...
 
+    def preflight_verify_operation_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_operation_id: str,
+    ) -> ArchivedCallRequestEvidence:
+        """Bind a source-load HTTP request before credential acquisition."""
+        ...
+
+    def admit_verify_operation_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_operation_id: str,
+        current_call_index: int,
+        source_call_id: str,
+    ) -> str:
+        """Bind the recorded source-load call to its pre-token identity."""
+        ...
+
     def verify_call(
         self,
         *,

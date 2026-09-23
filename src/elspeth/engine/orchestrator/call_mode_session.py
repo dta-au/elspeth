@@ -81,6 +81,7 @@ class AuditedCallModeSession:
         self._verify_admissions: dict[tuple[CallType, str | None, str | None, int | None], str] = {}
         self._mi_verify_admissions: set[tuple[CallType, str | None, str | None, int]] = set()
         self._mi_preflights: dict[tuple[str | None, str | None, str], str] = {}
+        self._operation_mi_preflights: dict[tuple[str, str], str] = {}
         self._required = self._preflight_source_calls()
 
     @property
@@ -101,7 +102,9 @@ class AuditedCallModeSession:
                 operation = self._factory.execution.get_operation(call.operation_id)
                 if operation is None:
                     raise AuditIntegrityError(f"Source operation for call {call.call_id} disappeared")
-                if operation.operation_type != "runtime_preflight":
+                if operation.operation_type != "runtime_preflight" and not (
+                    self._mode is RunMode.VERIFY and operation.operation_type == "source_load"
+                ):
                     continue
             request = self._factory.execution.get_call_request_data(call.call_id)
             if request.state is not CallDataState.AVAILABLE:
@@ -471,6 +474,68 @@ class AuditedCallModeSession:
         key = (CallType.HTTP, current_state_id, current_operation_id, current_call_index)
         if key in self._verify_admissions:
             raise AuditIntegrityError("Managed-identity HTTP call was already admitted")
+        self._verify_admissions[key] = source_call_id
+        self._mi_verify_admissions.add(key)
+        return source_call_id
+
+    def preflight_verify_operation_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_operation_id: str,
+    ) -> ArchivedCallRequestEvidence:
+        if self._mode is not RunMode.VERIFY:
+            raise AuditIntegrityError("Operation HTTP managed-identity preflight requires verify mode")
+        current = _mi_non_auth_request(request_data, before_dns=True)
+        candidates: list[ArchivedCallRequestEvidence] = []
+        for call in self._factory.execution.list_source_calls_for_current_parent(
+            source_run_id=self._source_run_id,
+            call_type=CallType.HTTP,
+            current_state_id=None,
+            current_operation_id=current_operation_id,
+        ):
+            archived = self._factory.execution.get_call_request_data(call.call_id)
+            if archived.state is not CallDataState.AVAILABLE or archived.data is None:
+                raise AuditIntegrityError(f"Source operation HTTP request {call.call_id} is unavailable")
+            if "resolved_ip" in archived.data:
+                raise AuditIntegrityError("Source operation HTTP managed-identity request has unexpected DNS pin")
+            source = _mi_non_auth_request(archived.data, before_dns=False)
+            if source == current:
+                candidates.append(ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=archived.data))
+        if len(candidates) != 1:
+            raise AuditIntegrityError("Operation HTTP managed-identity request is missing or ambiguous before token acquisition")
+        url = request_data.get("url")
+        if type(url) is not str or not url:
+            raise AuditIntegrityError("Operation HTTP managed-identity preflight requires a URL")
+        self._operation_mi_preflights[(current_operation_id, url)] = candidates[0].source_call_id
+        return candidates[0]
+
+    def admit_verify_operation_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_operation_id: str,
+        current_call_index: int,
+        source_call_id: str,
+    ) -> str:
+        if self._mode is not RunMode.VERIFY:
+            raise AuditIntegrityError("Operation HTTP managed-identity admission requires verify mode")
+        source = self.archived_call_request(
+            call_type=CallType.HTTP,
+            current_state_id=None,
+            current_operation_id=current_operation_id,
+            current_call_index=current_call_index,
+        )
+        if source.source_call_id != source_call_id:
+            raise AuditIntegrityError("Operation HTTP source call changed after preflight")
+        url = request_data.get("url")
+        if type(url) is not str or self._operation_mi_preflights.pop((current_operation_id, url), None) != source_call_id:
+            raise AuditIntegrityError("Operation HTTP call has no pre-token source admission")
+        if _mi_non_auth_request(source.request_data, before_dns=False) != _mi_non_auth_request(request_data, before_dns=False):
+            raise AuditIntegrityError("Operation HTTP managed-identity non-auth request fields differ")
+        key = (CallType.HTTP, None, current_operation_id, current_call_index)
+        if key in self._verify_admissions:
+            raise AuditIntegrityError("Operation HTTP managed-identity call was already admitted")
         self._verify_admissions[key] = source_call_id
         self._mi_verify_admissions.add(key)
         return source_call_id

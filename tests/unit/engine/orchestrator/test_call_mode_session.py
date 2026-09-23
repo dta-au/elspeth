@@ -225,3 +225,62 @@ def test_http_verify_refuses_missing_or_invalid_archived_dns_pin_before_egress(m
         preflight = session.preflight_verify_http_request
     with pytest.raises(AuditIntegrityError, match="archived DNS pin"):
         preflight(request_data=request, current_state_id="current-state", current_operation_id=None)
+
+
+def test_source_load_managed_identity_requires_pre_token_admission_and_verdict() -> None:
+    factory, call = _factory()
+    call.state_id = None
+    call.operation_id = "source-operation"
+    factory.query.get_all_calls_for_run.return_value = []
+    factory.execution.get_all_operation_calls_for_run.return_value = [call]
+    factory.execution.get_operation.return_value = SimpleNamespace(operation_type="source_load")
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    archived = {
+        "method": "GET",
+        "url": "https://example.org/source/page",
+        "headers": {"Authorization": f"<fingerprint:{'0' * 64}>", "Accept": "application/json"},
+    }
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    with pytest.raises(AuditIntegrityError, match="unconsumed"):
+        session.finalize()
+    partial = {**archived, "headers": {"Accept": "application/json"}}
+    evidence = session.preflight_verify_operation_http_managed_identity(request_data=partial, current_operation_id="current-operation")
+    current = {**archived, "headers": {"Authorization": f"<fingerprint:{'1' * 64}>", "Accept": "application/json"}}
+    assert (
+        session.admit_verify_operation_http_managed_identity(
+            request_data=current,
+            current_operation_id="current-operation",
+            current_call_index=0,
+            source_call_id=evidence.source_call_id,
+        )
+        == "source-call"
+    )
+    decision = session.verify_call(
+        call_type=CallType.HTTP,
+        request_data=current,
+        current_state_id=None,
+        current_operation_id="current-operation",
+        current_call_index=0,
+        current_call_id="current-call",
+        live_status=CallStatus.SUCCESS,
+        live_response_data={"status_code": 200, "transport": {"body_b64": ""}},
+        live_error_data=None,
+    )
+    assert decision.is_match is True
+    session.finalize()
+
+
+def test_source_load_managed_identity_refuses_missing_auth_before_token() -> None:
+    factory, call = _factory()
+    call.state_id = None
+    call.operation_id = "source-operation"
+    factory.query.get_all_calls_for_run.return_value = []
+    factory.execution.get_all_operation_calls_for_run.return_value = [call]
+    factory.execution.get_operation.return_value = SimpleNamespace(operation_type="source_load")
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    archived = {"method": "GET", "url": "https://example.org/source/page", "headers": {"Accept": "application/json"}}
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    with pytest.raises(AuditIntegrityError, match="fingerprinted Authorization"):
+        session.preflight_verify_operation_http_managed_identity(request_data=archived, current_operation_id="current-operation")
