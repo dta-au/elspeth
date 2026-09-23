@@ -505,3 +505,10 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
     message = str(caught.value)
     assert "_get_litellm_tools" not in message
     assert "COMPOSE session authority" in message
+
+
+def test_every_closed_code_has_a_category_rule() -> None:
+    """A new ToolArgumentError code must be given its category, not hit a KeyError."""
+    from elspeth.web.composer.protocol import _TOOL_ARGUMENT_CATEGORY_BY_CODE, _TOOL_ARGUMENT_ERROR_CODES
+
+    assert {"SCHEMA_VALIDATION", *_TOOL_ARGUMENT_CATEGORY_BY_CODE} == _TOOL_ARGUMENT_ERROR_CODES

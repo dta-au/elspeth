@@ -270,6 +270,12 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("upsert_node", "plugin_options_invalid"),
         ("set_output", "plugin_options_invalid"),
         ("set_pipeline", "plugin_options_invalid"),
+        ("patch_source_options", "plugin_options_invalid"),
+        ("set_source_from_blob", "plugin_options_invalid"),
+        ("set_source_from_blobs", "plugin_options_invalid"),
+        ("splice_transform", "plugin_options_invalid"),
+        ("patch_output_options", "plugin_options_invalid"),
+        ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
     ],
 )
@@ -280,7 +286,22 @@ def test_registered_code_survives_response_redaction(tool_name: str, error_code:
     assert entry["message"] != "Invalid option 'secretvalue'"
 
 
-@pytest.mark.parametrize("tool_name", ["set_source", "upsert_node", "set_output", "set_pipeline", "patch_node_options"])
+# The 10 option-bearing tools (plan §1.2): R1 is decided on their rejection codes.
+_OPTION_TOOLS = (
+    "set_source",
+    "patch_source_options",
+    "set_source_from_blob",
+    "set_source_from_blobs",
+    "set_pipeline",
+    "upsert_node",
+    "splice_transform",
+    "patch_node_options",
+    "set_output",
+    "patch_output_options",
+)
+
+
+@pytest.mark.parametrize("tool_name", _OPTION_TOOLS)
 def test_unregistered_code_is_still_redacted(tool_name: str) -> None:
     entry = _persisted_first_error(tool_name, "zz_not_a_registered_code")
     assert entry["error_code"] == _REDACTED_TEXT

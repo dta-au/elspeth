@@ -23,6 +23,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.redaction import _SAFE_ARG_ERROR_CLASSES
@@ -242,3 +244,18 @@ def test_safe_arg_error_classes_are_exactly_the_produced_classes() -> None:
 def test_producer_census_detects_a_stale_allowlist_entry() -> None:
     stale = {*_SAFE_ARG_ERROR_CLASSES, "MissingRequiredPaths"}
     assert stale != _produced_arg_error_classes()
+
+
+def test_non_text_provider_arguments_never_reach_the_wire_gate() -> None:
+    """Why ``TypeError`` is not produced: admission refuses non-text arguments first."""
+    from types import SimpleNamespace
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+    text_call = SimpleNamespace(id="call_text", function=SimpleNamespace(name="get_pipeline_state", arguments="{}"))
+    assert _admit_tool_batch([text_call]).calls[0].function.arguments == "{}"
+    for non_text in (None, b"{}", {"a": 1}):
+        call = SimpleNamespace(id="call_non_text", function=SimpleNamespace(name="get_pipeline_state", arguments=non_text))
+        with pytest.raises(AuditIntegrityError, match="malformed provider function metadata"):
+            _admit_tool_batch([call])
