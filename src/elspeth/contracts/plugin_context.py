@@ -33,7 +33,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
+    from elspeth.contracts import Call, CallStatus, CallType, SourceRow, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
@@ -116,6 +116,8 @@ class PluginContext:
     run_mode: RunMode = RunMode.LIVE
     replay_from: str | None = None
     call_mode_session: CallModeSession | None = None
+    audited_sources: Mapping[str, object] | None = None
+    verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
@@ -209,6 +211,8 @@ class PluginContext:
         run_mode: RunMode = RunMode.LIVE,
         replay_from: str | None = None,
         call_mode_session: CallModeSession | None = None,
+        audited_sources: Mapping[str, object] | None = None,
+        verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None,
     ) -> None:
         if config is not None and _config is not None:
             raise TypeError("PluginContext accepts either config or _config, not both")
@@ -228,6 +232,8 @@ class PluginContext:
         if call_mode_session is not None and call_mode_session.mode is not run_mode:
             raise ValueError("PluginContext.call_mode_session mode disagrees with run_mode")
         self.call_mode_session = call_mode_session
+        self.audited_sources = audited_sources
+        self.verified_sources = verified_sources
         # Deep-freeze config so plugins cannot mutate the run configuration
         # after the audit snapshot (settings_json, config_hash) is recorded.
         # PluginContext is not frozen (checkpoint/token need mutation), but
@@ -295,6 +301,8 @@ class PluginContext:
             run_mode=self.run_mode,
             replay_from=self.replay_from,
             call_mode_session=self.call_mode_session,
+            audited_sources=self.audited_sources,
+            verified_sources=self.verified_sources,
         )
 
     def require_coordination_token(self) -> CoordinationToken:
