@@ -13,7 +13,7 @@ from elspeth.contracts import CallStatus, RunMode
 from elspeth.contracts.call_mode import ReplayCallEvidence
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.plugins.transforms.aws.guardrails_client import BedrockGuardrailsClient
-from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import HeadBucketClient
 from elspeth.plugins.transforms.aws.textract_client import TextractClient, TextractInlineClient, TextractServiceError
 
@@ -37,6 +37,8 @@ class Session:
     source_run_id: str = "source-run"
     requests: list[dict[str, Any]] = field(default_factory=list)
     verifications: list[dict[str, Any]] = field(default_factory=list)
+    admissions: list[dict[str, Any]] = field(default_factory=list)
+    admission_error: Exception | None = None
 
     def replay_call(self, **kwargs: Any) -> ReplayCallEvidence:
         self.requests.append(kwargs)
@@ -44,6 +46,11 @@ class Session:
 
     def verify_call(self, **kwargs: Any) -> None:
         self.verifications.append(kwargs)
+
+    def admit_verify_call(self, **kwargs: Any) -> None:
+        self.admissions.append(kwargs)
+        if self.admission_error is not None:
+            raise self.admission_error
 
 
 def _evidence(
@@ -353,6 +360,7 @@ def test_textract_verify_records_live_call_and_compares_source_request_identity(
     assert recorder.calls[0]["source_call_id"] is None
     assert session.verifications[0]["current_call_id"] == "new-1"
     assert session.verifications[0]["request_data"]["client_request_token_fingerprint"] == "b" * 64
+    assert session.admissions[0]["request_data"]["client_request_token_fingerprint"] == "b" * 64
 
 
 def test_guardrail_verify_compares_source_target_without_auditing_private_text() -> None:
@@ -412,3 +420,91 @@ def test_guardrail_verify_compares_source_target_without_auditing_private_text()
     )
     assert session.verifications[0]["current_call_id"] == "new-1"
     assert "private text" not in repr(recorder.calls)
+
+
+def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispatch() -> None:
+    builds: list[str] = []
+
+    def forbidden_build() -> object:
+        builds.append("constructed")
+        raise AssertionError("SDK construction escaped verify admission")
+
+    recorder = Recorder()
+    session = Session(_evidence(None), mode=RunMode.VERIFY, admission_error=AuditIntegrityError("missing source call"))
+    sdk = DeferredAWSClient(forbidden_build)
+    common = {
+        **mock_item_audit_authority("run-1"),
+        "execution": recorder,
+        "state_id": "state-1",
+        "run_id": "run-1",
+        "telemetry_emit": lambda _event: None,
+        "call_mode_session": session,
+    }
+    textract = TextractClient(**common, region="ap-southeast-2", sdk_client=sdk, max_response_bytes=100_000)
+    inline = TextractInlineClient(**common, region="ap-southeast-2", sdk_client=sdk, max_response_bytes=100_000)
+    head_bucket = HeadBucketClient(**common, region="ap-southeast-2", sdk_client=sdk)
+    guardrail = BedrockGuardrailsClient(
+        **common,
+        guardrail_identifier="guardrail",
+        guardrail_version="1",
+        region="us-east-1",
+        audit_salt=b"current-run-key-current-run-key-01",
+        source_audit_salt=b"source-run-key-source-run-key-01",
+        sdk_client=sdk,
+    )
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        textract.start_document_analysis(
+            bucket="docs",
+            key="invoice.pdf",
+            version=None,
+            feature_types=("FORMS",),
+            queries=(),
+            client_request_token="a" * 64,
+            source_client_request_token_fingerprint="b" * 64,
+        )
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        textract.get_document_analysis(job_id="job-1", next_token=None)
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        inline.analyze_document(
+            document_bytes=b"document",
+            document_sha256="a" * 64,
+            document_format="pdf",
+            feature_types=("FORMS",),
+            queries=(),
+        )
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        head_bucket.verify_bucket_region("docs")
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        guardrail.apply_guardrail(text="private text", source="INPUT", required_filters=("PROMPT_ATTACK",))
+    assert len(session.admissions) == 5
+    assert builds == []
+    assert recorder.calls == []
+
+
+def test_guardrail_direct_verify_client_defers_sdk_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    builds: list[str] = []
+
+    def forbidden_build(_region: str) -> object:
+        builds.append("constructed")
+        raise AssertionError("SDK constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client", forbidden_build)
+    recorder = Recorder()
+    session = Session(_evidence(None), mode=RunMode.VERIFY, admission_error=AuditIntegrityError("missing source call"))
+    client = BedrockGuardrailsClient(
+        **mock_item_audit_authority("run-1"),
+        execution=recorder,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        guardrail_identifier="guardrail",
+        guardrail_version="1",
+        region="us-east-1",
+        audit_salt=b"current-run-key-current-run-key-01",
+        source_audit_salt=b"source-run-key-source-run-key-01",
+        call_mode_session=session,
+    )
+    with pytest.raises(AuditIntegrityError, match="missing source call"):
+        client.apply_guardrail(text="private text", source="INPUT", required_filters=("PROMPT_ATTACK",))
+    assert builds == []
+    assert recorder.calls == []

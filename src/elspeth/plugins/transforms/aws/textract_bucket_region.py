@@ -388,6 +388,14 @@ class HeadBucketClient(AuditedClientBase):
                 proof=replayed_proof,
                 terminal_error=replayed_error,
             )
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
         started = time.perf_counter()
         proof: BucketRegionProof | None = None
         terminal_error: BucketRegionUnverifiedError | None = None

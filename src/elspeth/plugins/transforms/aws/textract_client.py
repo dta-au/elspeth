@@ -429,6 +429,23 @@ class _TextractAuditedClient(AuditedClientBase):
             raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has no complete {operation} response")
         return evidence
 
+    def _admit_verify_call(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        lookup_request: RawCallPayload | None = None,
+    ) -> None:
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict() if lookup_request is None else lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+
     def _record_mode_outcome(
         self,
         *,
@@ -705,6 +722,7 @@ class TextractClient(_TextractAuditedClient):
                 lookup_request=lookup_request,
             )
             return StartAnalysisReceipt(job_id=job_id)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload, lookup_request=lookup_request)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -841,6 +859,7 @@ class TextractClient(_TextractAuditedClient):
                 operation="get_document_analysis",
             )
             return AnalysisResultPage(semantic_response=semantic, next_token=token)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -1047,6 +1066,7 @@ class TextractInlineClient(_TextractAuditedClient):
                 operation="analyze_document",
             )
             return InlineAnalysisResult(semantic_response=semantic, sdk_attempts=attempts)
+        self._admit_verify_call(call_index=call_index, request_payload=request_payload)
         started = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1

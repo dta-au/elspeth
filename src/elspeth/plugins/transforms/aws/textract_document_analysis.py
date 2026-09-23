@@ -45,7 +45,7 @@ from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputP
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
-from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
     BucketRegionCoordinator,
@@ -311,7 +311,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d33f37ab884d86f"
+    source_file_hash: str | None = "sha256:2911075f35dded16"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -493,6 +493,26 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 self._s3_sdk_client = ReplayOnlySDK()
             if self._sdk_client is None:
                 self._sdk_client = ReplayOnlySDK()
+            return
+        if ctx.run_mode is RunMode.VERIFY:
+            if self._s3_sdk_client is None:
+                self._s3_sdk_client = DeferredAWSClient(
+                    lambda: build_s3_head_bucket_sdk_client(
+                        region=self._region,
+                        aws_access_key_id=self._aws_access_key_id,
+                        aws_secret_access_key=self._aws_secret_access_key,
+                        aws_session_token=self._aws_session_token,
+                    )
+                )
+            if self._sdk_client is None:
+                self._sdk_client = DeferredAWSClient(
+                    lambda: build_textract_sdk_client(
+                        region=self._region,
+                        aws_access_key_id=self._aws_access_key_id,
+                        aws_secret_access_key=self._aws_secret_access_key,
+                        aws_session_token=self._aws_session_token,
+                    )
+                )
             return
         try:
             if self._s3_sdk_client is None:

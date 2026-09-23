@@ -32,7 +32,7 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailSource,
     build_bedrock_runtime_client,
 )
-from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty
 
 
@@ -134,6 +134,8 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._telemetry_emit = ctx.telemetry_emit
         if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
             self._sdk_client = ReplayOnlySDK()
+        elif self._sdk_client is None and ctx.run_mode is RunMode.VERIFY:
+            self._sdk_client = DeferredAWSClient(lambda: build_bedrock_runtime_client(self._region))
         elif self._sdk_client is None:
             self._sdk_client = build_bedrock_runtime_client(self._region)
 

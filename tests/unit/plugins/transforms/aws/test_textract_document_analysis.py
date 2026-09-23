@@ -17,7 +17,7 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionProof,
     BucketRegionUnverifiedError,
@@ -1203,6 +1203,28 @@ def test_replay_start_constructs_no_aws_clients(monkeypatch: pytest.MonkeyPatch)
     transform.on_start(ctx)
     assert isinstance(transform._sdk_client, ReplayOnlySDK)
     assert isinstance(transform._s3_sdk_client, ReplayOnlySDK)
+    transform.close()
+
+
+def test_verify_start_defers_both_aws_clients_until_admitted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client", forbidden_build)
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client", forbidden_build)
+    transform = AWSTextractDocumentAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        run_mode=RunMode.VERIFY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, DeferredAWSClient)
+    assert isinstance(transform._s3_sdk_client, DeferredAWSClient)
     transform.close()
 
 

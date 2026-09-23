@@ -24,6 +24,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit_protocols import CallRecorder
@@ -476,7 +477,12 @@ class BedrockGuardrailsClient(AuditedClientBase):
             raise ValueError("source_audit_salt is required for Guardrail replay/verify matching")
         if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and sdk_client is None:
             raise AuditIntegrityError("Guardrail replay requires the fail-closed SDK stand-in")
-        self._sdk_client = sdk_client if sdk_client is not None else self._build_sdk_client()
+        if sdk_client is not None:
+            self._sdk_client = sdk_client
+        elif call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            self._sdk_client = DeferredAWSClient(self._build_sdk_client)
+        else:
+            self._sdk_client = self._build_sdk_client()
 
     def _record_mode_outcome(
         self,
@@ -684,6 +690,14 @@ class BedrockGuardrailsClient(AuditedClientBase):
                 raise replay_error
             assert decision is not None
             return decision
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
         start = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1

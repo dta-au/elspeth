@@ -20,7 +20,7 @@ from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_client import (
     InlineAnalysisResult,
     TextractResponseError,
@@ -796,6 +796,27 @@ def test_replay_start_constructs_no_textract_client(monkeypatch: pytest.MonkeyPa
     )
     transform.on_start(ctx)
     assert isinstance(transform._sdk_client, ReplayOnlySDK)
+    transform.close()
+
+
+def test_verify_start_defers_textract_client_until_admitted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_inline_analysis.build_textract_sync_sdk_client", forbidden_build)
+    transform = AWSTextractInlineAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        payload_store=FakePayloadStore(),
+        run_mode=RunMode.VERIFY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, DeferredAWSClient)
     transform.close()
 
 
