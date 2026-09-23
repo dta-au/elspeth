@@ -305,7 +305,7 @@ def load_settings(
     # Expand template files in plugin options before validation
     # NOTE: Secrets are NOT fingerprinted here - they stay available for runtime.
     # Fingerprinting happens in resolve_config() when creating the audit copy.
-    run_mode = RunMode(raw_config.get("run_mode", RunMode.LIVE))
+    run_mode = RunMode(raw_config["run_mode"] if "run_mode" in raw_config else RunMode.LIVE)
     if run_mode is RunMode.LIVE:
         raw_config = _expand_config_templates(raw_config, settings_path=config_path)
     else:
