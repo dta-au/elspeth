@@ -49,7 +49,7 @@ _ADVISOR_SIGNOFF_GATE_KEY: Final[str] = "advisor_signoff"
 _GATE_STATUS_BLOCKED: Final[str] = "blocked"
 # Versioned preimage domain so a future envelope change cannot collide with
 # fingerprints already persisted under this schema.
-_FINGERPRINT_SCHEMA: Final[str] = "elspeth.completion_gate_graph.v1"
+_FINGERPRINT_SCHEMA: Final[str] = "elspeth.completion_gate_graph.v2"
 
 # Wording for a gate fact carried forward (by ``merge_composer_meta_updates``)
 # onto a graph the advisor never reviewed. The verdict is not repeated — the
@@ -164,16 +164,18 @@ def _reconcile_advisor_blocker(
 
 
 def completion_gate_fingerprint(state: CompositionState) -> str:
-    """Canonical fingerprint of the graph content a gate verdict applies to.
+    """Canonical fingerprint of the pipeline content a gate verdict applies to.
 
-    ``metadata`` and ``version`` are deliberately excluded: a rename or a
-    version bump does not invalidate an advisor verdict; a change to
-    sources/nodes/edges/outputs — the content the advisor reviewed — does.
+    Includes metadata: the advisor reviews the pipeline name and stated
+    description alongside sources/nodes/edges/outputs. Only ``version`` is
+    excluded from serialized pipeline content: a save alone does not change
+    the evidence the advisor reviewed.
     """
     state_d = state.to_dict()
     return stable_hash(
         {
             "schema": _FINGERPRINT_SCHEMA,
+            "metadata": state_d["metadata"],
             "sources": state_d["sources"],
             "nodes": state_d["nodes"],
             "edges": state_d["edges"],

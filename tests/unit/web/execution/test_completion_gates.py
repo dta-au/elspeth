@@ -392,9 +392,11 @@ class TestFingerprint:
     def test_stable_across_identical_graphs(self) -> None:
         assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(_make_state())
 
-    def test_metadata_change_does_not_rotate(self) -> None:
-        renamed = _make_state(metadata=PipelineMetadata(name="Renamed", description="new words"))
-        assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(renamed)
+    @pytest.mark.parametrize("patch", [{"name": "Renamed"}, {"description": "new words"}])
+    def test_reviewed_metadata_change_rotates(self, patch: dict[str, str]) -> None:
+        state = _make_state()
+        changed = state.with_metadata(patch)
+        assert completion_gate_fingerprint(state) != completion_gate_fingerprint(changed)
 
     def test_version_change_does_not_rotate(self) -> None:
         assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(_make_state(version=5))
