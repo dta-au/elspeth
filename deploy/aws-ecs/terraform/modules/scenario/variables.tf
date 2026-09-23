@@ -896,6 +896,21 @@ variable "gateway_oauth_token_url" {
   }
 }
 
+variable "gateway_oauth_auth_method" {
+  type        = string
+  default     = ""
+  description = "Gateway OAuth2 token-endpoint client authentication method."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? contains(["client_secret_basic", "client_secret_post"], var.gateway_oauth_auth_method)
+      : var.gateway_oauth_auth_method == ""
+    )
+    error_message = "gateway_oauth_auth_method must be client_secret_basic or client_secret_post under custom_gateway, and unset under bedrock."
+  }
+}
+
 variable "gateway_model_mappings_json" {
   type        = string
   default     = ""
@@ -927,6 +942,81 @@ variable "gateway_model_mappings_json" {
       )
     )
     error_message = "under custom_gateway both composer_model and composer_advisor_model must be aliases present in gateway_model_mappings_json."
+  }
+}
+
+variable "gateway_max_messages" {
+  type        = number
+  default     = 0
+  description = "Maximum messages accepted in one gateway request."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_max_messages >= 1 && var.gateway_max_messages == floor(var.gateway_max_messages)
+      : var.gateway_max_messages == 0
+    )
+    error_message = "gateway_max_messages must be a positive integer under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_max_tools" {
+  type        = number
+  default     = 0
+  description = "Maximum tools accepted in one gateway request."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_max_tools >= 1 && var.gateway_max_tools == floor(var.gateway_max_tools)
+      : var.gateway_max_tools == 0
+    )
+    error_message = "gateway_max_tools must be a positive integer under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_max_string_chars" {
+  type        = number
+  default     = 0
+  description = "Maximum characters accepted in a gateway request string."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_max_string_chars >= 1 && var.gateway_max_string_chars == floor(var.gateway_max_string_chars)
+      : var.gateway_max_string_chars == 0
+    )
+    error_message = "gateway_max_string_chars must be a positive integer under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_max_schema_bytes" {
+  type        = number
+  default     = 0
+  description = "Maximum JSON schema size in bytes accepted by the gateway."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_max_schema_bytes >= 1 && var.gateway_max_schema_bytes == floor(var.gateway_max_schema_bytes)
+      : var.gateway_max_schema_bytes == 0
+    )
+    error_message = "gateway_max_schema_bytes must be a positive integer under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_max_schema_depth" {
+  type        = number
+  default     = 0
+  description = "Maximum JSON schema nesting depth accepted by the gateway."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_max_schema_depth >= 1 && var.gateway_max_schema_depth == floor(var.gateway_max_schema_depth)
+      : var.gateway_max_schema_depth == 0
+    )
+    error_message = "gateway_max_schema_depth must be a positive integer under custom_gateway, and unset under bedrock."
   }
 }
 

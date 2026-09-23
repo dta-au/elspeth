@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NoReturn, get_args
@@ -1044,6 +1045,49 @@ def test_read_only_root_filesystem_matches_the_container_contract() -> None:
     assert "readonlyRootFilesystem" not in ecs[ecs.index("candidate_web_container = {") : ecs.index("schema_init_doctor_container = {")]
     assert "rollback_web_container = merge(local.candidate_web_container" in ecs
     assert "rollback_doctor_container = merge(local.runtime_doctor_container" in ecs
+
+
+def test_gateway_sidecar_supplies_every_required_runtime_environment_name() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    gateway = ecs[ecs.index("gateway_container = {") : ecs.index("candidate_web_container = {")]
+    supplied = re.findall(r'\{ name = "(ELSPETH_LLM_GATEWAY_[A-Z_]+)", (?:value|valueFrom) = ', gateway)
+
+    # Ask the gateway's actual loader which names it requires. This keeps the
+    # deployment test tied to the runtime contract as that contract evolves.
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from elspeth_llm_gateway.core.config import ConfigError, load_config; "
+            "\ntry: load_config({})\nexcept ConfigError as exc: "
+            "print(json.dumps([item.removeprefix('missing_env:') for item in exc.errors if item.startswith('missing_env:')]))",
+        ],
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "gateway" / "src")},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    required = set(json.loads(probe.stdout))
+    assert "ELSPETH_LLM_GATEWAY_INBOUND_BEARER" in required  # positive control for the probe
+    assert "ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS" not in required  # known optional setting
+    assert len(supplied) == len(set(supplied))
+    assert required <= set(supplied)
+
+    root = _text("scenario-c/main.tf")
+    root_variables = _text("scenario-c/variables.tf")
+    example = _text("examples/scenario-c.tfvars.example")
+    for suffix, variable in (
+        ("OAUTH_AUTH_METHOD", "gateway_oauth_auth_method"),
+        ("MAX_MESSAGES", "gateway_max_messages"),
+        ("MAX_TOOLS", "gateway_max_tools"),
+        ("MAX_STRING_CHARS", "gateway_max_string_chars"),
+        ("MAX_SCHEMA_BYTES", "gateway_max_schema_bytes"),
+        ("MAX_SCHEMA_DEPTH", "gateway_max_schema_depth"),
+    ):
+        assert re.search(rf'\{{ name = "ELSPETH_LLM_GATEWAY_{suffix}", value = (?:tostring\()?var\.{variable}\)? \}}', gateway)
+        assert re.search(rf"\b{variable}\s*=\s*var\.{variable}\b", root)
+        assert f'variable "{variable}"' in root_variables
+        assert re.search(rf"\b{variable}\s*=", example)
 
 
 def test_database_bootstrap_uses_the_image_trust_verifier() -> None:
