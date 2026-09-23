@@ -7,11 +7,288 @@ checkpoint pass. Manual advisor hints retain their prose contract. The operator'
 subsequent instruction removes backward-compatibility requirements: only the new
 checkpoint contract is supported. The plan was supplied from the primary checkout.
 
-Implementation and validation are complete, with the known base failures and
-lint findings disclosed below. PostgreSQL passed. This document does not claim
-deployment or live-provider acceptance.
+Implementation and review fixes are complete. The follow-up full suite retains
+the two known base failures; its PostgreSQL run recorded one readiness deadline
+failure. The exact results and follow-up checks are disclosed below. This
+document does not claim deployment or live-provider acceptance.
 
-## Candidate and final gates
+## Review follow-up: items 1–5
+
+The follow-up repairs the boot probe, boot diagnostics, retry wording and note
+sanitizer. The independent quality review's final verdict is GO for these bounded
+changes; its earlier markdown-whitespace finding was repaired and re-reviewed.
+No backward-compatibility parser, missing-field default, historical-row upgrade
+or backfill was added. Deployment and live-provider acceptance remain unperformed.
+
+1. **Probe schema conformance with a neutral prompt.**
+   `src/elspeth/web/composer/boot_probe.py` sends only
+   `This is a configuration check. Reply with ok.` in the advisor probe messages.
+   The production schema remains in `response_format` through the shared request
+   builder, with the existing completion budget and provider options. The probe
+   checks strict JSON and field-schema admission, not checkpoint semantics.
+   Schema-valid CLEAN replies containing a note or steps, and FLAGGED replies
+   containing blank findings, therefore pass this configuration check while
+   runtime checkpoints continue to reject them. Prose, fenced/truncated JSON,
+   duplicate keys, empty/reasoning-only content, wrong field types, malformed
+   envelopes and tool calls still fail the probe. A neutral prompt can expose an
+   ignored schema when the provider returns prose; one conforming response cannot
+   prove provider enforcement across future requests.
+
+2. **Use the approved advisor timeout and disclose unverified boots.**
+   `src/elspeth/web/app.py` gives the advisor 60 seconds and retains the planner's
+   5 seconds, selecting by explicit role. Archived runtime evidence contained
+   20 successful advisor checkpoint calls: nearest-rank p50 **4.228 s**, p95
+   **11.018 s**, maximum **50.813 s**; four exceeded 5 seconds. These observations
+   predate the structured-output probe and are not a boot-latency or outage
+   reliability measurement. After disclosure of the **55-second additional
+   maximum startup delay** (sequential probe caps increase from 10 to 65 seconds),
+   the user approved: **“yes 60 seconds is fine”**. Advisor timeout and other
+   nonfatal provider/transport warnings carry
+   `structured_output_conformance_verified=False` and state that conformance was
+   not verified this boot. Planner warnings omit that advisor-specific field.
+   Timeout remains nonfatal; the longer allowance cannot guarantee verification.
+
+3. **Report rejected requests without guessing the cause or copying provider text.**
+   Both planner and advisor `BadRequestError` branches now name the role and model
+   and report actual outbound presence of temperature, seed, reasoning effort,
+   response format and provider routing. Presence is derived from request kwargs,
+   including zero-valued temperature and provider-specific reasoning keys.
+   The former planner message interpolated raw SDK exception text without
+   scrubbing. That was unsafe under the secret-scrub policy because provider
+   errors can contain request data, endpoints or credentials; both roles now
+   apply the same omission rule.
+   Neither public error message interpolates raw provider exception text.
+   Both retain `raise ... from exc`; tests assert the original cause identity.
+   This removes raw text from the public message, not from the preserved exception
+   object or diagnostic chain. The local gateway rejection test checks the new
+   neutral wording, option-presence facts and existing cause contract.
+
+4. **Distinguish schema failures from checkpoint-contract failures.**
+   `src/elspeth/web/composer/service.py` selects one of two fixed backend
+   re-prompts using explicit schema validity. The existing schema-invalid wording
+   remains; the semantic wording says the schema passed but the output contract
+   failed and states the CLEAN/FLAGGED invariants. Both use the existing
+   `problem_summary` channel. Rejected provider text is never echoed. Runtime
+   acceptance, retry bounds, final classification and conformance accounting are
+   unchanged.
+
+5. **Repair sanitization and inline the category schema.**
+   `src/elspeth/web/composer/advisor_output.py` removes fence sentinels after
+   removable Unicode characters, catching sentinels reconstructed by filtering.
+   It redacts dotted hosts followed by a slash/path and counts those substitutions.
+   Bare hosts without paths remain out of scope because they overlap option paths;
+   filenames, relative file paths, versions, dotted step IDs and option paths have
+   unchanged negative controls. Markdown URL redaction preserves its outer closing
+   parenthesis while handling nested and escaped URL parentheses, adjacent links
+   and whitespace after the opening `](`. Non-URL markdown destinations remain
+   unchanged. The category vocabulary now comes from one ordinary Literal alias;
+   Pydantic emits its enum inline, and tests reject `$ref` and `$defs` anywhere in
+   the emitted schema while checking exact vocabulary parity.
+
+### Latency source and measurement limits
+
+The latency instrument opened SQLite databases read-only (`mode=ro` and
+`PRAGMA query_only=on`) and expanded the audit envelope list with
+`json_each(chat_messages.tool_calls)`. The current `data/sessions.db` contained
+zero chat messages. These archived databases supplied the corroborated sample:
+
+| Source relative to the primary checkout | Successful target-model calls | Calls matched to checkpoint passes |
+| --- | ---: | ---: |
+| `data/sessions.db.pre-advisor-note.20260922T132824Z/sessions.db` | 4 | 4 |
+| `data/sessions.db.pre-epoch64-reset.20260921T173323Z/sessions.db` | 4 | 4 |
+| `data/archives/local-refresh-20260921T122615Z/session/sessions.db` | 13 | 12 |
+
+The selected model was `openrouter/z-ai/glm-5.3`. All 21 calls were unique by
+model/start/finish/message hash, successful, without tools or planner policy,
+and carried positive reasoning-token counts. Twenty matched a model-source
+checkpoint pass in the same session within one second of call completion;
+only these twenty form the reported checkpoint sample. The window spans
+2026-09-20 07:18 through 2026-09-21 17:50 UTC. Quantiles use nearest rank
+(`sorted_values[ceil(n*p)-1]`).
+
+Known-positive synthetic audit rows were selected; planner-model, wrong-envelope,
+wrong-role and timeout controls were excluded. Mutating the positive model
+removed the match, and the `1..20` fixture yielded p50=10 and p95=19.
+No session identities, message bodies or credentials were included in the
+measurement report. No deployment environment file was read and no live
+provider request was made.
+
+These archived calls predate the new structured-output boot prompt. Reasoning
+tokens show reasoning occurred, but do not establish the configured effort.
+No failed target-model calls were present. The 60-second allowance covers the
+observed successful maximum with 9.187 seconds of headroom; this small sample
+cannot establish a future timeout rate or guarantee verification at startup.
+
+## Follow-up TDD and focused verification
+
+The following results are the lane-reported completed exits and raw summaries.
+Selections overlap and must not be summed. Artifact names are relative to
+`.claude/lanes/advisor-review-fixes/`.
+
+| Selection / behavior | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Boot admission and symmetric rejection diagnostics | `boot-red.log`: exit 1, **9 failed, 23 passed** | `boot-green.log`: exit 0, **32 passed** |
+| Neutral outbound advisor prompt | `boot-prompt-red.log`: exit 1, **1 failed** | Included in the 32 passing boot tests |
+| Schema-valid but semantically invalid boot responses | `boot-semantic-red.log`: exit 1, **3 failed, 1 passed, 28 deselected** | Included in the 32 passing boot tests |
+| Advisor warning signal | `app-warning-red.log`: exit 1, **one assertion failure**; planner absence control passed | `app-green.log`: exit 0, **9 passed, 225 deselected** |
+| Explicit role timeout selection | `app-timeout-red.log`: exit 1, **one assertion failure**, observed `[5.0, 5.0]` instead of `[5.0, 60.0]` | Included in the 9 passing app cases; real cancellation uses shortened test constants |
+| Schema-versus-semantic retry wording | `reprompt-red.log`: exit 1, **3 failed, 2 passed, 43 deselected** | `reprompt-green-final.log`: exit 0, **316 passed** |
+| Sanitizer repairs and inline enum | `boundary-red.log`: exit 1, **11 failed, 92 passed** | `boundary-green.log`: exit 0, **103 passed** |
+| Markdown destination opening whitespace | `boundary-whitespace-red.log`: exit 1, **4 failed, 1 passed, 103 deselected** | `boundary-whitespace-green.log`: exit 0, **108 passed** |
+| Local gateway rejection integration | Updated existing gateway assertion | `boot-gateway-green.log`: exit 0, **3 passed, 6 deselected, 3 warnings** |
+
+RED failures were behavior/schema assertions. The first `reprompt-green.log`
+attempt exited 4 without collecting tests because a concurrent sanitizer edit
+temporarily had a syntax error; it is not pass evidence. The completed final run
+above supersedes it. Focused Ruff checks and formatting checks passed. Focused
+boundary mypy passed both before and after the whitespace follow-up. Gateway
+verification used a local mock server, not a live provider.
+
+The independent reviewer re-ran a controlled markdown reproducer with no, space,
+tab, newline and mixed opening whitespace: every URL retained a balanced wrapper
+with one substitution, while the non-URL control remained unchanged with zero.
+The reviewer inspected item 2's role-timeout and warning tests but did not repeat
+the coordinator's archived latency measurement or app TDD history.
+
+The combined boot/checkpoint/mock-discipline/masquerade selection also completed:
+`scoped.log` and `scoped.exit` record exit **0**, **595 passed in 305.50s
+(0:05:05)**. The 108 boundary cases and 9 app cases above are separate selections.
+
+## Follow-up candidate and gates
+
+Production candidate: `1d5be5e9f41ef3c48df1fa788855af1c12b4f406`.
+Canonical full-gate evidence:
+`/tmp/advisor-review-fixes-gates/20260923T005132Z-advisor-structured-output-1654288/summary.txt`.
+The gate recorded `frozen=yes`, with the same candidate and tracked-tree state
+before and after.
+
+| Stage | Exit | Result |
+| --- | --- | --- |
+| Ruff | 0 | Passed |
+| Mypy | 0 | Passed |
+| Contracts | 0 | Passed |
+| All-rule lints | 1 | 2,286 findings; unchanged exact corpus against the fresh baseline |
+| Default pytest | 1 | `2 failed, 55921 passed, 100 skipped, 2 xfailed, 98 warnings in 1296.63s (0:21:36)` |
+| PostgreSQL testcontainer | 1 | `1 failed, 559 passed, 1 skipped, 56166 deselected, 12 warnings in 990.71s (0:16:30)`; `frozen=yes` |
+| Current target SHA and merge-tree preview | 0 | `release/0.8.1` at `b6945b49c0861d0292c4e8af1dfb56e0b11fe9f0`; candidate merge tree `6864b2353e876a4275660fa6904d9def9a26d7c8` |
+
+The full gate is **not green**. JUnit identifies only the two known planner
+translation failures:
+
+- `tests/integration/web/composer/test_freeform_planner_failure_translation.py::test_send_message_freeform_planner_failure_is_translated[malformed]`
+- `tests/integration/web/composer/test_freeform_planner_failure_translation.py::test_recompose_freeform_planner_failure_is_translated`
+
+Both were freshly reproduced serially at immutable baseline
+`e4ad02c7264358a08fd1ba2cf704b55bc47157c7` and the production candidate. The base
+run exited **1**, **2 failed in 10.24s**; the candidate exited **1**, **2 failed in
+9.61s**. All four executions failed the same stored-row canary assertion in
+`_assert_no_sentinel_leak` at line 320. The response-body absence assertion
+completed first. This attributes the two failures to behavior also present on the
+base; it does not establish a new root cause. Logs, exits and source/import
+provenance are recorded in `known-reds-report.md` and its companion artifacts.
+
+The fresh lint comparison also uses `e4ad02c72` as its immutable baseline. Exact
+`(path, rule_id, message)` multiset comparison, including multiplicities, found:
+
+```text
+all findings: before=2286 after=2286 added=0 removed=0
+gating findings: before=606 after=606 added=0 removed=0
+note findings: before=1680 after=1680 added=0 removed=0
+controls=12 passed
+comparator_exit=0
+```
+
+The lint scanner exited **1** on both trees. All positive, negative,
+line/column-relocation, multiplicity and synthetic-addition controls passed.
+There are no added or removed findings to classify for this follow-up; the
+standing corpus and signature gate remain unresolved. The existing nonfatal
+boot-probe catch has the same diagnostic identity despite moving lines. The
+complete comparison and provenance are in `lint-comparison-report.md` and
+`lint-comparison.json`. No signing metadata was changed by these lanes.
+
+PostgreSQL evidence:
+`/tmp/advisor-review-fixes-gates/20260923T011844Z-advisor-structured-output-1874848/summary.txt`.
+The single failure was
+`tests/testcontainer/web/test_aws_ecs_readiness_postgres.py::test_ready_returns_200_for_current_postgres`:
+the endpoint returned 503 instead of 200. Captured warnings identify
+`session_db`, `session_schema`, `landscape_db`, and `landscape_schema` with
+`probe timed out`. The readiness runner has an unchanged two-second probe
+deadline, and this test sets `composer_boot_probe_enabled=False`.
+The readiness implementation, test module and PostgreSQL conftest have no diff
+from `e4ad02c72`. The exact failing test passed serially on both trees: candidate
+exit 0, **1 passed in 7.46s**; base exit 0, **1 passed in 7.69s**. The complete
+four-test readiness module also passed on each: candidate exit 0, **4 passed in
+16.92s**; base exit 0, **4 passed in 17.41s**. That module includes a deliberately
+held probe, bounded failed refreshes, and recovery after releasing the probe.
+Logs and exits are `pg-readiness-{base,candidate}-docker.*` and
+`pg-readiness-{base,candidate}-module.*` in the follow-up lane. An initial
+sandbox Docker-permission setup error is separately recorded and is not test
+evidence; the reported reruns had Docker access.
+
+The observed failure is a non-reproduced readiness probe timeout. Its specific
+cause is unproven; these checks do not establish host load as the cause. The
+completed PostgreSQL gate remains failed. Focused passes do not replace the
+full-gate result. No production code changed after either gate, and the full
+PostgreSQL suite was not repeated merely to obtain a green run.
+
+The merge-tree preview is conflict detection only: no merge, push or signing was
+performed. Deployment, service restart and live-provider acceptance were not
+performed. Earlier report gates describe earlier candidates, not this follow-up
+production tree.
+
+## Follow-up test-function inventory
+
+This supplements the report's **first-pass inventory** with the measured
+`e4ad02c72` → `1d5be5e9f` changes. AST comparison found **5 touched test modules,
+12 added, 1 deleted and 6 modified test functions**. It compares full structural
+definitions, including bodies, signatures and decorators, without source-position
+attributes. Relocation/comments do not create changes; parameterization does.
+Helpers, fixtures and functions outside `tests/` are excluded. These are function
+counts, not collected parameterized-case counts. Positive mutation/addition/
+deletion/decorator controls and negative relocation/helper controls passed.
+
+```text
+tests/integration/web/composer/test_composer_against_gateway.py
+Modified:
+  test_boot_probe_rejects_incompatible_reasoning_model_sampling
+
+tests/unit/web/composer/test_advisor_output.py
+Added:
+  test_bare_host_rule_preserves_option_paths_files_versions_and_plain_hosts
+  test_markdown_non_url_destination_with_whitespace_is_unchanged
+  test_markdown_redaction_preserves_non_url_parentheses_and_finds_adjacent_links
+  test_markdown_url_redaction_preserves_balanced_wrapper
+  test_markdown_url_redaction_preserves_wrapper_after_opening_whitespace
+  test_note_preserves_prose_resembling_a_fence_sentinel
+  test_note_redacts_bare_dotted_host_with_path
+  test_note_removes_sentinels_reassembled_by_format_filter
+Modified:
+  test_response_format_uses_the_required_strict_owned_schema
+
+tests/unit/web/composer/test_advisor_structured_checkpoint.py
+Added:
+  test_retry_wording_distinguishes_schema_from_contract_violation
+Modified:
+  test_every_invalid_contract_uses_format_retry_then_malformed
+
+tests/unit/web/composer/test_boot_probe.py
+Added:
+  test_advisor_probe_accepts_schema_valid_without_requiring_checkpoint_semantics
+  test_probe_rejection_reports_only_sent_option_presence
+Deleted:
+  test_advisor_probe_names_structured_capability_on_provider_rejection
+Modified:
+  test_advisor_probe_rejects_nonconforming_content
+  test_advisor_probe_uses_production_request_options
+
+tests/unit/web/test_app.py
+Added:
+  TestLifespanShutdown.test_lifespan_uses_role_specific_composer_probe_timeouts
+Modified:
+  TestLifespanShutdown.test_lifespan_records_transient_failure_when_composer_probe_times_out
+```
+
+## Initial implementation gates (historical)
 
 | Item | Evidence |
 | --- | --- |
@@ -21,7 +298,7 @@ deployment or live-provider acceptance.
 | Compatibility-removal commit | `1d99a03a1` |
 | Production candidate measured by the full gate | `3f5b8bbb958d9fd4f8bffa11af6b0a4c258b6b7a` |
 | Subsequent Bedrock test-only correction | `e4ad02c72` |
-| Final documentation commit | The commit introducing this report; inspect `git log -1 -- docs/reviews/2026-09-23-advisor-structured-output-implementation.md` |
+| Initial documentation commit | `3989303630d35e96c0b01cf9ccffe024fbf531cb` |
 | Target branch and preview base | `release/0.8.1` at `40d5da05b2c8a0793d1b09df58cb4a7dea548cf5` |
 | Validated candidate merge-tree preview | Exit `0` for `e4ad02c7264358a08fd1ba2cf704b55bc47157c7`; tree `3d4b359abcfe5acfeb76175be0794c69eaffbd50`; `merge-preview-final-code.log` and `.exit` in lane evidence. This is conflict detection, not a merge or integrated test run. |
 | Full-gate `summary.txt` | `/tmp/advisor-structured-output-gates/20260922T235210Z-advisor-structured-output-1297943/summary.txt` |
@@ -38,7 +315,7 @@ PostgreSQL validation runs separately with `-m testcontainer -n 0`. Scoped
 results below do not replace either gate. The standing trust-tier signing state
 must be reported independently from newly introduced lint findings.
 
-The full gate is **not green**. Its two planner-translation failures match the
+The initial full gate is **not green**. Its two planner-translation failures match the
 measured base. The third failure was the Bedrock test's mock observing the private
 wrapper callback as if it were a provider argument. Commit `e4ad02c72` moves that
 test to the actual SDK boundary and uses structured checkpoint output. The
@@ -77,9 +354,9 @@ signatures were edited. Operator signing remains a separate package-level step.
 | Plan item | Files and resulting behavior |
 | --- | --- |
 | A: strict response admission | [advisor_output.py](../../src/elspeth/web/composer/advisor_output.py) owns the frozen, strict model and its required `verdict`, `category`, `steps`, `findings`, `note` fields. Extra properties, duplicate keys, non-finite constants and invalid Unicode scalar strings are rejected. Schema admission remains distinguishable from semantic acceptance: CLEAN cannot carry notes/steps, and FLAGGED requires nonblank findings. |
-| A: requests and boot | [advisor_request.py](../../src/elspeth/web/composer/advisor_request.py) builds shared runtime/probe options. Checkpoints receive strict `response_format`; hints do not. [boot_probe.py](../../src/elspeth/web/composer/boot_probe.py) validates advisor replies through the shared boundary with the configured completion budget. [app.py](../../src/elspeth/web/app.py) supplies an explicit role, endpoint and reasoning settings even when model IDs match. Planner request bytes remain unchanged. |
-| B: prompt contract | [service.py](../../src/elspeth/web/composer/service.py) places checkpoint output rules in `_advisor_system_instructions_for_trigger`; the user-message summary carries the situation, preserving existing untrusted fences. Format retries refer to the schema. The old prose scan and verdict-line stripping are removed. |
-| C: user-note sanitization | `advisor_output.py` normalizes line separators, removes ANSI/fence/control characters, redacts links and email addresses, collapses blank runs, trims and finally caps the note. Empty sanitized notes become null. `service.py` publishes this sanitized note while preserving distinct technical findings for fenced repair input. URL/email substitution counts are measured before truncation. |
+| A: requests and boot | [advisor_request.py](../../src/elspeth/web/composer/advisor_request.py) builds shared runtime/probe options. Checkpoints receive strict `response_format`; hints do not. [boot_probe.py](../../src/elspeth/web/composer/boot_probe.py) sends a neutral prose-seeking prompt and checks strict JSON and field-schema admission, using the configured completion budget. It does not require checkpoint semantic acceptance. [app.py](../../src/elspeth/web/app.py) supplies explicit role, endpoint and reasoning settings even when model IDs match; the approved advisor timeout is 60 seconds and the planner remains at 5 seconds. Planner request bytes remain unchanged. |
+| B: prompt contract | [service.py](../../src/elspeth/web/composer/service.py) places checkpoint output rules in `_advisor_system_instructions_for_trigger`; the user-message summary carries the situation, preserving existing untrusted fences. Fixed re-prompts distinguish invalid schema from valid schema that violates checkpoint rules. The old prose scan and verdict-line stripping are removed. |
+| C: user-note sanitization | `advisor_output.py` normalizes line separators, removes ANSI/control/format characters, removes fence sentinels, redacts links and email addresses, collapses blank runs, trims and finally caps the note. Path-bearing hosts are redacted and markdown URL wrappers stay balanced as described in the follow-up above. Empty sanitized notes become null. `service.py` publishes this sanitized note while preserving distinct technical findings for fenced repair input. URL/email substitution counts are measured before truncation. |
 | D: conformance | `service.py` tracks physical SDK dispatch after quota admission, the first attempt's schema/semantic result, whether a format retry actually started, and final accepted-response counts. [advisor_audit.py](../../src/elspeth/web/composer/advisor_audit.py) requires exact types and cross-field invariants before serializing the extended pass. [advisor_checkpoint_telemetry.py](../../src/elspeth/web/composer/advisor_checkpoint_telemetry.py) mirrors it only after persistence; unbounded counts stay out of metric attributes. |
 
 Review found and repaired two boundary defects: escaped unpaired surrogates could
@@ -137,9 +414,13 @@ This establishes the advertised capability, not live acceptance for a deployment
   enforcement. See [Bedrock structured outputs](https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html).
 
 The advisor probe fails boot on provider bad requests and on invalid response
-shape, JSON, schema or semantics. Transport timeouts remain nonfatal. One passing
-probe records observed conformance; it cannot certify that an intermediary never
-ignores the schema.
+shape, JSON or field schema. Checkpoint semantic acceptance remains a runtime
+requirement, separate from this configuration check. Advisor transport timeouts
+remain nonfatal and explicitly report that structured-output conformance was not
+verified this boot. A passing probe establishes that this neutral prose-seeking
+prompt produced a response admitted by strict local JSON and field validation.
+It exposes an ignored schema when the reply is prose; it cannot prove native
+schema enforcement on that request or across future requests.
 
 ## Current audit contract and audit primacy
 
@@ -231,7 +512,10 @@ Composer path for both checks; do not introduce tutorial-specific behavior.
 1. Verify boot telemetry `composer.boot_config` records `probed_role=advisor`,
    `structured_output=true` and `probe_status=success` for the configured model.
    Preserve the deployment/candidate identity with the result. A transient probe
-   failure does not satisfy this check.
+   failure does not satisfy this check. In particular,
+   `structured_output_conformance_verified=False` leaves acceptance unverified.
+   Probe success establishes field-schema admission, separate from runtime
+   checkpoint semantic acceptance.
 2. Exercise one known blocked turn against the deployed advisor. Confirm the
    user sees the category header and plain sanitized note, and technical findings
    remain confined to the repair/audit path. Inspect its durable checkpoint pass:
@@ -252,11 +536,13 @@ forbids infrastructure startup/config logging, so the implementation extends the
 existing counter and latency telemetry with role/capability attributes instead.
 No new successful-startup log is introduced.
 
-## Test-name inventory
+## Initial implementation test-name inventory (historical)
 
-The following names come from the coordinator's AST comparison against the starting
-HEAD and its explicit migration inventory. Parameterized cases retain their
-function name here; this is a change inventory, not a collected-test count.
+The following first-pass names come from the coordinator's AST comparison against
+the starting HEAD and its explicit migration inventory through `e4ad02c72`.
+The follow-up inventory above records subsequent additions, removals and changes.
+Parameterized cases retain their function name here; this is a change inventory,
+not a collected-test count.
 
 ### Added and deleted functions
 
