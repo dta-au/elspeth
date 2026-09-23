@@ -200,3 +200,28 @@ def test_managed_identity_verify_refuses_missing_auth_and_ambiguous_parent() -> 
     factory.execution.list_source_calls_for_current_parent.return_value = [call, SimpleNamespace(**vars(call))]
     with pytest.raises(AuditIntegrityError, match="missing or ambiguous"):
         session.preflight_verify_http_managed_identity(request_data=partial, current_state_id="current-state", current_operation_id=None)
+
+
+@pytest.mark.parametrize("managed_identity", [False, True])
+@pytest.mark.parametrize("archived_ip", [None, "not-an-ip"])
+def test_http_verify_refuses_missing_or_invalid_archived_dns_pin_before_egress(managed_identity: bool, archived_ip: str | None) -> None:
+    factory, call = _factory()
+    archived: dict[str, object] = {
+        "method": "GET",
+        "url": "https://example.org/",
+        "headers": {"Host": "example.org", "Authorization": f"<fingerprint:{'0' * 64}>"},
+        "params": None,
+    }
+    if archived_ip is not None:
+        archived["resolved_ip"] = archived_ip
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    request = {key: value for key, value in archived.items() if key != "resolved_ip"}
+    if managed_identity:
+        request["headers"] = {"Host": "example.org"}
+        preflight = session.preflight_verify_http_managed_identity
+    else:
+        preflight = session.preflight_verify_http_request
+    with pytest.raises(AuditIntegrityError, match="archived DNS pin"):
+        preflight(request_data=request, current_state_id="current-state", current_operation_id=None)

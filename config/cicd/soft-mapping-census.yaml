@@ -273,7 +273,7 @@ files:
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/call_mode_session.py:
-    Mapping[str, Any]: 12
+    Mapping[str, Any]: 13
     dict[str, Any]: 1
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
@@ -1061,10 +1061,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 909
+  Mapping[str, Any]: 910
   Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1152
   dict[str, object]: 410
-  soft: 2794
+  soft: 2795

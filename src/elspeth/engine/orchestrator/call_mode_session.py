@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -27,6 +28,16 @@ if TYPE_CHECKING:
 
 
 _FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
+
+
+def _require_archived_dns_pin(data: Mapping[str, Any]) -> None:
+    resolved_ip = data.get("resolved_ip")
+    if type(resolved_ip) is not str or not resolved_ip:
+        raise AuditIntegrityError("Source HTTP request lacks an archived DNS pin")
+    try:
+        ip_address(resolved_ip)
+    except ValueError as exc:
+        raise AuditIntegrityError("Source HTTP request has an invalid archived DNS pin") from exc
 
 
 def _mi_non_auth_request(data: Mapping[str, Any], *, before_dns: bool) -> dict[str, object]:
@@ -390,6 +401,7 @@ class AuditedCallModeSession:
             archived = self._factory.execution.get_call_request_data(call.call_id)
             if archived.state is not CallDataState.AVAILABLE or archived.data is None:
                 raise AuditIntegrityError(f"Source HTTP request {call.call_id} is unavailable")
+            _require_archived_dns_pin(archived.data)
             source = _mi_non_auth_request(archived.data, before_dns=False)
             source.pop("resolved_ip", None)
             if source == current:
@@ -423,6 +435,7 @@ class AuditedCallModeSession:
             archived = self._factory.execution.get_call_request_data(call.call_id)
             if archived.state is not CallDataState.AVAILABLE or archived.data is None:
                 raise AuditIntegrityError(f"Source HTTP request {call.call_id} is unavailable")
+            _require_archived_dns_pin(archived.data)
             source = dict(archived.data)
             source.pop("resolved_ip", None)
             if source == current:
