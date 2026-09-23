@@ -18,6 +18,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -218,6 +219,11 @@ from elspeth.web.composer.source_demand import (
     sample_header_for_source,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary, _well_formed_query_entries
+from elspeth.web.composer.strict_transport import (
+    ComposerToolContractSummary,
+    StrictTransportDiagnostic,
+    resolve_composer_tool_contract,
+)
 from elspeth.web.composer.tools import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
@@ -860,6 +866,11 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_base"] = base_url
     if api_key is not None:
         kwargs["api_key"] = api_key
+
+
+def _diagnostic_value(diagnostic: StrictTransportDiagnostic | None) -> str | None:
+    """A route diagnostic's closed string value for the resolution log, or ``None``."""
+    return None if diagnostic is None else diagnostic.value
 
 
 def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
@@ -2466,14 +2477,36 @@ class ComposerServiceImpl:
         self._catalog = catalog
         self._sessions_service = sessions_service
         self._model = settings.composer_model
-        # The tool-contract dialect of the compose loop's tool list. It is the
-        # single resolution point: the loop builds the list it sends and the
-        # dialect decode reads from this one value. Every route stays on
-        # ``none`` (today's bytes) until the strict transport resolution lands.
-        # The pipeline planner's ordinary turns share this value; its
-        # escape-hatch (advisor) route has its own.
-        self._planner_dialect = ToolContractDialect.NONE
-        self._hatch_dialect = ToolContractDialect.NONE
+        # The tool-contract dialect of each route, resolved once from the
+        # settings and the process environment (S1 T8, D20; the boot probe
+        # resolves through the same helper). ``_planner_dialect`` is the single
+        # resolution point for the compose loop and the pipeline planner's
+        # ordinary turns: the loop builds the list it sends and decode reads
+        # the dialect from this one value. The planner's escape-hatch
+        # (advisor) route has its own.
+        tool_contract = resolve_composer_tool_contract(settings, env=os.environ)
+        self._planner_dialect = tool_contract.planner.dialect
+        self._hatch_dialect = tool_contract.hatch.dialect
+        loop_tools = composer_loop_tool_definitions(self._planner_dialect)
+        self._tool_contract_summary = ComposerToolContractSummary(
+            contract=tool_contract,
+            loop_strict_tool_count=sum(1 for tool in loop_tools if "strict" in tool["function"] and tool["function"]["strict"] is True),
+            loop_tool_count=len(loop_tools),
+        )
+        # Operator-side only (ruling 2): closed values and counts, never a
+        # URL or an env value (D24).
+        slog.info(
+            "composer_tool_contract_resolved",
+            setting=tool_contract.setting,
+            planner_transport=tool_contract.planner.resolution.transport.value,
+            planner_dialect=tool_contract.planner.dialect.value,
+            planner_diagnostic=_diagnostic_value(tool_contract.planner.resolution.diagnostic),
+            hatch_transport=tool_contract.hatch.resolution.transport.value,
+            hatch_dialect=tool_contract.hatch.dialect.value,
+            hatch_diagnostic=_diagnostic_value(tool_contract.hatch.resolution.diagnostic),
+            loop_strict_tool_count=self._tool_contract_summary.loop_strict_tool_count,
+            loop_tool_count=self._tool_contract_summary.loop_tool_count,
+        )
         # Boot advisory only — the litellm registry has known gaps (see
         # elspeth.web.composer.reasoning), so a False here is a log line for
         # operators, never a gate.
@@ -2591,6 +2624,15 @@ class ComposerServiceImpl:
         # Concurrency: a single session is driven serially through one
         # compose() call at a time; a plain dict is sufficient.
         self._schemas_loaded_by_session: dict[str, set[tuple[str, str]]] = {}
+
+    @property
+    def tool_contract_summary(self) -> ComposerToolContractSummary:
+        """Both routes' resolved tool contract and the compose loop's effective strict count.
+
+        Operator-side and test-facing only: it is never published on the
+        unauthenticated status surface (D14, ruling 2).
+        """
+        return self._tool_contract_summary
 
     @classmethod
     def for_trained_operator(

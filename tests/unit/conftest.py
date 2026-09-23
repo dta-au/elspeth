@@ -15,6 +15,18 @@ from elspeth.contracts.payload_store import PayloadStore
 from elspeth.plugins.infrastructure.manager import PluginManager
 from tests.fixtures.stores import MockPayloadStore
 
+# The composer's strict-transport resolver (S1 T8) reads these base-URL and
+# api-version variables, and pytest loads ``.env``; scrub them so a unit
+# test's tool wire never depends on the developer's shell. Tests that need one
+# set it with ``monkeypatch.setenv``.
+_COMPOSER_ROUTE_ENV = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENROUTER_API_BASE", "AZURE_API_VERSION")
+
+
+@pytest.fixture(autouse=True)
+def _scrub_composer_route_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _COMPOSER_ROUTE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture
 def payload_store() -> PayloadStore:

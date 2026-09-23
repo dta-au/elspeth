@@ -10,10 +10,11 @@ is exactly today's behaviour. Each call's wire facts (``strict_sent`` D16,
 ``wire_conformant`` C23) are recorded on the P4 assistant ``tool_calls`` entry
 (D1) and on the invocation built from the same ``DispatchAudit`` (D21).
 
-Until T8 resolves the dialect from settings, every service is constructed on
-``none``; these tests reach ``openai_strict`` by setting
-``service._planner_dialect`` on the constructed service, which is the single
-value both the sent tool list and decode read.
+The service resolves the dialect from settings (T8): an OpenRouter planner
+with no custom base resolves to ``openai_strict`` under the default
+``preferred`` setting, and the default ``gpt-5.5`` planner resolves to
+``none`` (ruling 7). ``_settings_for`` picks the settings for a dialect, and
+each test asserts the service resolved it before driving the turn.
 """
 
 from __future__ import annotations
@@ -49,6 +50,13 @@ from tests.unit.web.composer._helpers import (
 
 _STRICT = ToolContractDialect.OPENAI_STRICT
 _NONE = ToolContractDialect.NONE
+
+
+def _settings_for(dialect: ToolContractDialect) -> Any:
+    """Settings whose planner route resolves to ``dialect`` (T8): OpenRouter row 4, or the default gpt-5.5."""
+    if dialect is _STRICT:
+        return _make_settings(composer_model="openrouter/deepseek/deepseek-v4.1-flash")
+    return _make_settings()
 
 
 @pytest.fixture(autouse=True)
@@ -110,8 +118,8 @@ class _Turn:
         self.sent_tool_lists: list[list[dict[str, Any]]] = []
 
     async def run(self) -> tuple[ComposerServiceImpl, str, Any]:
-        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        service._planner_dialect = self.dialect
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_settings_for(self.dialect))
+        assert service._planner_dialect is self.dialect
         responses = [_raw_response(*self.calls), _text_response()]
 
         async def _llm(messages: Any, tools: Any) -> FakeLLMResponse:
@@ -306,8 +314,8 @@ class TestPersistedP4RowCarriesTheFacts:
 
     @pytest.mark.asyncio
     async def test_success_arg_error_and_plugin_crash_rows_carry_both_keys(self) -> None:
-        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        service._planner_dialect = _STRICT
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_settings_for(_STRICT))
+        assert service._planner_dialect is _STRICT
         state = _empty_state()
         turns = [
             _raw_response((call_id, "set_metadata", json.dumps({"patch": {"name": f"Step {index}", "description": None}})))

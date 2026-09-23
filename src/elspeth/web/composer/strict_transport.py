@@ -30,17 +30,24 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
-from typing import Final, Literal, get_args
+from typing import TYPE_CHECKING, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.protocol import ComposerSettings
+
 __all__ = [
+    "ComposerRouteToolContract",
+    "ComposerToolContract",
+    "ComposerToolContractSummary",
     "StrictToolsSetting",
     "StrictTransport",
     "StrictTransportDiagnostic",
     "StrictTransportResolution",
     "dialect_for",
+    "resolve_composer_tool_contract",
     "resolve_strict_transport",
 ]
 
@@ -227,3 +234,66 @@ def resolve_strict_transport(
             return _resolution(StrictTransport.ENFORCING) if forward else _NONE  # Row 9 (ruling 7).
         return _NONE  # Row 10.
     return _NONE  # Rows 3 and 11.
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerRouteToolContract:
+    """One composer route's resolved transport and the dialect its tool lists are sent in."""
+
+    resolution: StrictTransportResolution
+    dialect: ToolContractDialect
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerToolContract:
+    """The tool contract of both composer routes under one setting (D20).
+
+    ``planner`` is the compose loop and the pipeline planner's ordinary turns
+    (``composer_model`` + ``composer_endpoint_base_url``); ``hatch`` is the
+    planner's escape-hatch turn (``composer_advisor_model`` +
+    ``composer_advisor_endpoint_base_url``).
+    """
+
+    setting: StrictToolsSetting
+    planner: ComposerRouteToolContract
+    hatch: ComposerRouteToolContract
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerToolContractSummary:
+    """The resolved contract plus the compose loop's effective strict count.
+
+    Operator-side only (structured logs and tests); never published, because
+    per-route transport and the effective count reveal whether a custom
+    endpoint is configured (D14, ruling 2).
+    """
+
+    contract: ComposerToolContract
+    loop_strict_tool_count: int
+    loop_tool_count: int
+
+
+def _route_contract(*, model: str, api_base: str | None, setting: StrictToolsSetting, env: Mapping[str, str]) -> ComposerRouteToolContract:
+    resolution = resolve_strict_transport(model=model, api_base=api_base, setting=setting, env=env)
+    return ComposerRouteToolContract(resolution=resolution, dialect=dialect_for(resolution.transport))
+
+
+def resolve_composer_tool_contract(settings: ComposerSettings, *, env: Mapping[str, str]) -> ComposerToolContract:
+    """Resolve the planner route and the escape-hatch route (D20).
+
+    The composer service and the boot probe both call this, so the lists the
+    probe sends and the lists production sends come from one resolution.
+    ``env`` is the process environment in production; it has no default so a
+    caller cannot silently resolve without it.
+    """
+    setting = settings.composer_strict_tools
+    return ComposerToolContract(
+        setting=setting,
+        planner=_route_contract(model=settings.composer_model, api_base=settings.composer_endpoint_base_url, setting=setting, env=env),
+        hatch=_route_contract(
+            model=settings.composer_advisor_model,
+            api_base=settings.composer_advisor_endpoint_base_url,
+            setting=setting,
+            env=env,
+        ),
+    )

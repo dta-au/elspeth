@@ -747,7 +747,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         # match. Every request shares one deadline (see
         # _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS).
         probe_deadline = loop.time() + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
-        for probe_request in build_composer_probe_requests(settings):
+        for probe_request in build_composer_probe_requests(settings, env=os.environ):
             composer_probe_start = time.monotonic()
             probe_status = "started"
             role = probe_request.role
@@ -827,6 +827,26 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
             except ComposerBootConfigError:
                 probe_status = "rejected"
+                if probe_request.surface == "hatch_terminal":
+                    # Ruling 8 (b): a rejected escape-hatch terminal does not
+                    # stop boot; planner-route and advisor rejections stay
+                    # fatal. Owned request facts only, never the exception
+                    # text or its cause chain.
+                    slog.warning(
+                        "composer_boot_probe_rejected_nonfatal",
+                        model=probe_request.model,
+                        probed_role=role,
+                        probed_surface=probe_request.surface,
+                        tool_count=probe_request.tool_count,
+                        strict_true_count=probe_request.strict_true_count,
+                        strict_false_count=probe_request.strict_false_count,
+                        strict_key_omitted=probe_request.strict_key_omitted,
+                        action=(
+                            "booting; the escape-hatch terminal was rejected at boot; hatch turns will fail until the "
+                            "hatch route or composer_strict_tools is changed"
+                        ),
+                    )
+                    continue
                 raise
             except asyncio.CancelledError:
                 probe_status = "cancelled"

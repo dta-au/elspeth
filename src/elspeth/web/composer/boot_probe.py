@@ -11,8 +11,16 @@ the same function the production call site uses:
   (:func:`~elspeth.web.composer.pipeline_planner.build_planner_request_kwargs`)
   with :func:`~elspeth.web.composer.pipeline_planner.planner_tool_definitions`
   at the candidate reasoning effort;
+- ``hatch_terminal`` (only when the escape-hatch route resolves to a
+  non-``none`` dialect): the planner's escape-hatch turn request on the
+  advisor model and endpoint, with the terminal stamped for that route, at
+  the candidate effort and capped at 16 reply tokens, a rejection check only;
 - ``advisor``: the advisor checkpoint's structured-output request
   (:func:`~elspeth.web.composer.advisor_request.build_advisor_request_options`).
+
+The tool lists are stamped for the dialect each route resolves to
+(:func:`~elspeth.web.composer.strict_transport.resolve_composer_tool_contract`),
+the same resolution the composer service uses.
 
 Sending tools is what puts the probe on the route production uses (on hosted
 OpenAI and Azure gpt-5.4+, LiteLLM selects the Responses bridge by the presence
@@ -22,6 +30,7 @@ enforces any schema.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
@@ -33,7 +42,11 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_response
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
-from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
+from elspeth.web.composer.pipeline_planner import (
+    build_planner_request_kwargs,
+    planner_terminal_tool_definition,
+    planner_tool_definitions,
+)
 from elspeth.web.composer.protocol import ComposerSettings
 from elspeth.web.composer.service import (
     _capture_composer_llm_completion_fields,
@@ -42,8 +55,9 @@ from elspeth.web.composer.service import (
     build_composer_loop_request_kwargs,
     composer_loop_tool_definitions,
 )
+from elspeth.web.composer.strict_transport import resolve_composer_tool_contract
 
-ComposerProbeSurface = Literal["loop_tools", "planner_tools", "advisor"]
+ComposerProbeSurface = Literal["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
 ComposerProbeRole = Literal["planner", "advisor"]
 
 _PLANNER_PROBE_PROMPT: Final = "This is a composer boot-time configuration smoke test. Please reply with ok."
@@ -133,8 +147,15 @@ class ComposerProbeRequest:
         )
 
 
-def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerProbeRequest, ...]:
-    """Build the boot probe requests in send order: loop list, planner list, advisor."""
+def build_composer_probe_requests(settings: ComposerSettings, *, env: Mapping[str, str] = os.environ) -> tuple[ComposerProbeRequest, ...]:
+    """Build the boot probe requests in send order: loop list, planner list, hatch terminal, advisor.
+
+    ``env`` defaults to the process environment itself, the object the
+    composer service resolves against, so the probe and production resolve
+    the same routes (D20). ``hatch_terminal`` is sent only when the
+    escape-hatch route resolves to a non-``none`` dialect.
+    """
+    contract = resolve_composer_tool_contract(settings, env=env)
     primary_key = settings.composer_endpoint_api_key.get_secret_value() if settings.composer_endpoint_api_key is not None else None
     advisor_key = (
         settings.composer_advisor_endpoint_api_key.get_secret_value() if settings.composer_advisor_endpoint_api_key is not None else None
@@ -144,7 +165,7 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
     # The compose loop applies Anthropic cache markers (history-tail marker
     # included) before ``_call_llm`` builds the request; mirror it.
     loop_messages: list[dict[str, Any]] = [{"role": "user", "content": _PLANNER_PROBE_PROMPT}]
-    loop_tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
+    loop_tools = composer_loop_tool_definitions(contract.planner.dialect)
     if supports_anthropic_prompt_cache_markers(model):
         loop_messages, marked_loop_tools = apply_anthropic_cache_markers(loop_messages, loop_tools, mark_history_tail=True)
         assert marked_loop_tools is not None
@@ -164,7 +185,7 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
     # the loop request above already covers the discovery effort on the same
     # model and endpoint.
     planner_messages: list[dict[str, Any]] = [{"role": "user", "content": _PLANNER_PROBE_PROMPT}]
-    planner_tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
+    planner_tools = planner_tool_definitions(dialect=contract.planner.dialect)
     if supports_anthropic_prompt_cache_markers(model):
         planner_messages, marked_planner_tools = apply_anthropic_cache_markers(planner_messages, planner_tools)
         assert marked_planner_tools is not None
@@ -180,6 +201,31 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
         api_base=settings.composer_endpoint_base_url,
         api_key=primary_key,
     )
+
+    # The escape-hatch turn sends only the terminal, stamped for the hatch
+    # route, to the advisor model and endpoint at candidate effort
+    # (``call_model`` on a hatch turn). Ruling 1: the reply is capped at 16
+    # tokens, a rejection check only; that cap is the one deliberate
+    # difference from a hatch turn's request. No cache markers: an
+    # Anthropic-family route always resolves to ``none`` (D8), so it never
+    # gets this request.
+    hatch_request: tuple[ComposerProbeRequest, ...] = ()
+    if contract.hatch.dialect is not ToolContractDialect.NONE:
+        hatch_kwargs = build_planner_request_kwargs(
+            model=settings.composer_advisor_model,
+            messages=[{"role": "user", "content": _PLANNER_PROBE_PROMPT}],
+            tools=[planner_terminal_tool_definition(dialect=contract.hatch.dialect)],
+            max_completion_tokens=settings.composer_planner_max_completion_tokens,
+            temperature=settings.composer_temperature,
+            seed=settings.composer_seed,
+            reasoning_effort=settings.composer_candidate_reasoning_effort,
+            api_base=settings.composer_advisor_endpoint_base_url,
+            api_key=advisor_key,
+        )
+        hatch_kwargs["max_tokens"] = LOOP_PROBE_MAX_TOKENS
+        hatch_request = (
+            ComposerProbeRequest(surface="hatch_terminal", role="planner", model=settings.composer_advisor_model, kwargs=hatch_kwargs),
+        )
 
     advisor_kwargs: dict[str, Any] = dict(
         build_advisor_request_options(
@@ -198,6 +244,7 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
     return (
         ComposerProbeRequest(surface="loop_tools", role="planner", model=model, kwargs=loop_kwargs),
         ComposerProbeRequest(surface="planner_tools", role="planner", model=model, kwargs=planner_kwargs),
+        *hatch_request,
         ComposerProbeRequest(surface="advisor", role="advisor", model=settings.composer_advisor_model, kwargs=advisor_kwargs),
     )
 
