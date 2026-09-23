@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.schema_contract import PipelineRow
 
-__all__ = ["ErrorAuditRepository"]
+__all__ = ["ErrorAuditRepository", "insert_batch_transform_errors_on"]
 
 
 def _require_transform_error_category(error_details: TransformErrorReason) -> None:
@@ -63,6 +63,77 @@ def _require_transform_error_category(error_details: TransformErrorReason) -> No
             f"This is a plugin bug — transforms must use a valid error category. "
             f"Valid categories: {sorted(valid_reasons)}"
         )
+
+
+def insert_batch_transform_errors_on(
+    conn: Connection,
+    *,
+    run_id: str,
+    members: Sequence[tuple[TokenRef, PipelineRow]],
+    transform_id: str,
+    error_details: TransformErrorReason,
+    destination: str,
+) -> tuple[str, ...]:
+    """Insert one transform error per member of a FAILED aggregation batch, on ``conn``.
+
+    The batch-level twin of :meth:`ErrorAuditRepository.record_transform_error`
+    (operator ruling B5). A batch transform that returns
+    ``TransformResult.error`` fails the WHOLE batch, so every buffered member
+    gets its own ``transform_errors`` row carrying its own row and the one
+    (already scrubbed) batch reason, with the ``destination`` the per-row seam
+    records (the ``on_error`` sink name, or ``"discard"``). ONE executemany
+    INSERT, so no crash leaves a partially attributed batch.
+
+    Deliberately a connection-level helper with no transaction of its own:
+    the rows are part of the batch's recorded FAILED verdict, which
+    ``ExecutionRepository.complete_aggregation_failure`` writes in ONE
+    leader-fenced transaction with the flush node_state, the batch row and
+    the DIVERT routing_event. Whether that verdict exists is then never a
+    matter of crash timing.
+
+    Returns:
+        The error_ids, in member order.
+
+    Raises:
+        AuditIntegrityError: The member set is empty, a member belongs to
+            another run, or the reason category is not a known
+            TransformErrorCategory.
+        LandscapeRecordError: The database rejected the write or wrote fewer
+            rows than members.
+    """
+    if not members:
+        raise AuditIntegrityError("insert_batch_transform_errors_on: a failed batch has at least one member")
+    if any(ref.run_id != run_id for ref, _row_data in members):
+        raise AuditIntegrityError("insert_batch_transform_errors_on: token reference does not belong to the authority's run")
+    _require_transform_error_category(error_details)
+
+    # Coerce-and-record exactly as record_transform_error does: the reason
+    # and each member's row are canonicalised before the INSERT runs.
+    error_details_json = canonical_or_recorded_error_details_json(error_details)
+    created_at = now()
+    values = [
+        {
+            "error_id": f"terr_{generate_id()[:12]}",
+            "run_id": run_id,
+            "token_id": ref.token_id,
+            "transform_id": transform_id,
+            "row_hash": canonical_or_recorded_hash(row_data),
+            "row_data_json": canonical_or_recorded_json(row_data),
+            "error_details_json": error_details_json,
+            "destination": destination,
+            "created_at": created_at,
+        }
+        for ref, row_data in members
+    ]
+    try:
+        result = conn.execute(transform_errors_table.insert().returning(transform_errors_table.c.error_id), values)
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"insert_batch_transform_errors_on failed — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if len(result.fetchall()) != len(values):
+        raise LandscapeRecordError("insert_batch_transform_errors_on: incomplete batch — audit write failed")
+    return tuple(str(value["error_id"]) for value in values)
 
 
 class ErrorAuditRepository:
@@ -311,80 +382,6 @@ class ErrorAuditRepository:
             )
 
         return error_id
-
-    def record_batch_transform_errors_leader(
-        self,
-        members: Sequence[tuple[TokenRef, PipelineRow]],
-        transform_id: str,
-        error_details: TransformErrorReason,
-        destination: str,
-        *,
-        coordination_token: CoordinationToken,
-    ) -> tuple[str, ...]:
-        """Record one transform error per member of a FAILED aggregation batch.
-
-        The batch-level twin of :meth:`record_transform_error`. A batch
-        transform that returns ``TransformResult.error`` fails the WHOLE batch,
-        so every buffered member gets its own ``transform_errors`` row carrying
-        its own row and the one (already scrubbed) batch reason, with the same
-        ``destination`` the per-row seam records (the ``on_error`` sink name,
-        or ``"discard"``).
-
-        Leader-fenced, not item-fenced: an aggregation flush always runs
-        out-of-claim (ADR-030 §E.2), so no per-token work-item claim exists to
-        fence on. ONE transaction for all members, so a failed write leaves no
-        partially-attributed batch.
-
-        Returns:
-            The error_ids, in member order.
-
-        Raises:
-            AuditIntegrityError: A member belongs to another run, the reason
-                category is not a known TransformErrorCategory, or the member
-                set is empty.
-        """
-        if not members:
-            raise AuditIntegrityError("record_batch_transform_errors_leader: a failed batch has at least one member")
-        for ref, _row_data in members:
-            if ref.run_id != coordination_token.run_id:
-                raise AuditIntegrityError("record_batch_transform_errors_leader: token reference does not belong to the authority's run")
-            self._ownership.validate_token_run_ownership(ref)
-        _require_transform_error_category(error_details)
-
-        # Coerce-and-record exactly as record_transform_error does: the reason
-        # and each member's row are canonicalised before the transaction opens.
-        error_details_json = canonical_or_recorded_error_details_json(error_details)
-        created_at = now()
-        values = [
-            {
-                "error_id": f"terr_{generate_id()[:12]}",
-                "run_id": coordination_token.run_id,
-                "token_id": ref.token_id,
-                "transform_id": transform_id,
-                "row_hash": canonical_or_recorded_hash(row_data),
-                "row_data_json": canonical_or_recorded_json(row_data),
-                "error_details_json": error_details_json,
-                "destination": destination,
-                "created_at": created_at,
-            }
-            for ref, row_data in members
-        ]
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="record_batch_transform_errors_leader",
-        ) as conn:
-            try:
-                result = conn.execute(transform_errors_table.insert().returning(transform_errors_table.c.error_id), values)
-            except SQLAlchemyError as exc:
-                raise LandscapeRecordError(
-                    f"record_batch_transform_errors_leader failed — database rejected audit write: {type(exc).__name__}"
-                ) from exc
-            if len(result.fetchall()) != len(values):
-                raise LandscapeRecordError("record_batch_transform_errors_leader: incomplete batch — audit write failed")
-
-        return tuple(str(value["error_id"]) for value in values)
 
     def get_validation_errors_for_row(
         self,

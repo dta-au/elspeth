@@ -1507,8 +1507,14 @@ def handle_incomplete_batches(
     """Find and handle incomplete batches for recovery.
 
     - EXECUTING batches: Mark as failed (crash interrupted), then retry
-    - FAILED batches: Retry with incremented attempt
+    - FAILED batches without a recorded verdict (the flush died before
+      recording one): Retry with incremented attempt
     - DRAFT batches: Leave as-is (collection continues)
+
+    A FAILED batch whose verdict was recorded
+    (``ExecutionRepository.complete_aggregation_failure``) never reaches
+    here: ``get_incomplete_batches`` excludes it because the verdict is
+    final, and the journal restore completes its disposition instead.
 
     Args:
         execution: ExecutionRepository for database operations

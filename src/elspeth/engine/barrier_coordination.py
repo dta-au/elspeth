@@ -57,6 +57,7 @@ if TYPE_CHECKING:
         CommittedAggregationOutputReceipt,
         CommittedAggregationResidual,
         CommittedCoalesceResidual,
+        RecordedAggregationFailure,
     )
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.config import AggregationSettings
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
     from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
-    from elspeth.engine.processor import CollectorRelease, _PreparedAggregationRoute
+    from elspeth.engine.processor import CollectorRelease, _FailedFlushDisposition, _PreparedAggregationRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -1669,6 +1670,10 @@ class BarrierRecoveryCoordinator:
             Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedAggregationRoute] | None
         ) = None,
         complete_committed_aggregation_output: Callable[[_PreparedAggregationRoute], None] | None = None,
+        prepare_recorded_aggregation_failure: (
+            Callable[[RecordedAggregationFailure, Sequence[TokenWorkItem]], _FailedFlushDisposition] | None
+        ) = None,
+        complete_recorded_aggregation_failure: Callable[[_FailedFlushDisposition], object] | None = None,
         complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
         collector_executor: CollectorExecutor | None = None,
         collector_node_ids: Mapping[CollectorName, NodeID] | None = None,
@@ -1694,6 +1699,8 @@ class BarrierRecoveryCoordinator:
         self._complete_committed_aggregation_residual = complete_committed_aggregation_residual
         self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
         self._complete_committed_aggregation_output = complete_committed_aggregation_output
+        self._prepare_recorded_aggregation_failure = prepare_recorded_aggregation_failure
+        self._complete_recorded_aggregation_failure = complete_recorded_aggregation_failure
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
 
     def _require_coordination_token(self) -> CoordinationToken:
@@ -1874,6 +1881,7 @@ class BarrierRecoveryCoordinator:
         agg_plans: list[_AggregationRestorePlan] = []
         committed_aggregation_plans: list[tuple[CommittedAggregationResidual, tuple[TokenWorkItem, ...]]] = []
         committed_aggregation_output_plans: list[_PreparedAggregationRoute] = []
+        recorded_failure_plans: list[_FailedFlushDisposition] = []
         committed_coalesce_plans: list[tuple[CommittedCoalesceResidual, tuple[TokenWorkItem, ...]]] = []
         if self._aggregation_settings:
             members_by_batch: dict[str, list[str]] = {}
@@ -1975,6 +1983,30 @@ class BarrierRecoveryCoordinator:
                             )
                         prepared_route = self._prepare_committed_aggregation_output(output_receipt, residual_items)
                         committed_aggregation_output_plans.append(prepared_route)
+                        node_items = [item for item in node_items if item.token_id not in member_ids]
+
+                # A batch whose FAILED verdict was recorded (atomically, by
+                # complete_aggregation_failure) before the crash keeps its
+                # members BLOCKED until their disposition's complete_barrier.
+                # The verdict is final: complete that disposition from the
+                # recorded reason and destination — never re-run the flush
+                # (operator ruling 2026-09-23: crash timing must not change the
+                # outcome). handle_incomplete_batches never retried it, so no
+                # retry batch exists for these members to resolve into.
+                if node_items:
+                    recorded_failures = self._barrier_restore_reads.list_recorded_aggregation_failures(
+                        self._run_id,
+                        aggregation_node_id=str(node_id),
+                        blocked_token_ids=[item.token_id for item in node_items],
+                    )
+                    for recorded_failure in recorded_failures:
+                        if self._prepare_recorded_aggregation_failure is None or self._complete_recorded_aggregation_failure is None:
+                            raise OrchestrationInvariantError(
+                                "Recorded aggregation failure recovery requires prepare and completion callbacks"
+                            )
+                        member_ids = frozenset(recorded_failure.member_token_ids)
+                        failure_items = tuple(item for item in node_items if item.token_id in member_ids)
+                        recorded_failure_plans.append(self._prepare_recorded_aggregation_failure(recorded_failure, failure_items))
                         node_items = [item for item in node_items if item.token_id not in member_ids]
 
                 # Scoped to (FAILURE, UNROUTED): this has no output receipt;
@@ -2473,6 +2505,10 @@ class BarrierRecoveryCoordinator:
             if self._complete_committed_aggregation_output is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed aggregation output recovery requires the completion callback")
             self._complete_committed_aggregation_output(prepared_route)
+        for failure_disposition in recorded_failure_plans:
+            if self._complete_recorded_aggregation_failure is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Recorded aggregation failure recovery requires the completion callback")
+            self._complete_recorded_aggregation_failure(failure_disposition)
         for coalesce_residual, residual_items in committed_coalesce_plans:
             if self._complete_committed_coalesce_residual is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed coalesce residual recovery requires the processor continuation callback")
@@ -2745,7 +2781,11 @@ class BarrierRecoveryCoordinator:
             # able to flush. A terminal tip means the retry chain ends at an
             # attempt that already finished: flushing it would only die later
             # on the immutable-terminal-batch transition, after the restore
-            # had adopted every member into it.
+            # had adopted every member into it. The two legitimate terminal
+            # tips never reach here: a COMPLETED receipt and a recorded FAILED
+            # verdict are dispositioned (and their members removed) by the
+            # restore arms before this derivation, and every FAILED batch
+            # WITHOUT a verdict was retried by handle_incomplete_batches.
             chain = " -> ".join(resolve_retry_chain(restore.batch_id_remap, first_outcome_batch_id))
             raise AuditIntegrityError(
                 f"Restored batch for aggregation node {node_id!r} (run {self._run_id!r}, resume checkpoint "

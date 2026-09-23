@@ -688,20 +688,6 @@ class DataFlowRepository:
             ref, transform_id, row_data, error_details, destination, member_token=member_token, work_item=work_item
         )
 
-    def record_batch_transform_errors_leader(
-        self,
-        members: Sequence[tuple[TokenRef, PipelineRow]],
-        transform_id: str,
-        error_details: TransformErrorReason,
-        destination: str,
-        *,
-        coordination_token: CoordinationToken,
-    ) -> tuple[str, ...]:
-        """Record one transform error per member of a FAILED aggregation batch."""
-        return self.errors.record_batch_transform_errors_leader(
-            members, transform_id, error_details, destination, coordination_token=coordination_token
-        )
-
     def get_validation_errors_for_row(
         self,
         run_id: str,

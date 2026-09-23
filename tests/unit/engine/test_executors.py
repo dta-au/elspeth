@@ -3357,7 +3357,6 @@ class TestAggregationExecutor:
             span_factory,
             _make_step_resolver(),
             run_id="test-run",
-            data_flow=factory.data_flow,
             aggregation_settings={nid: settings},
             error_edge_ids=error_edge_ids,
             clock=clock,
@@ -3648,26 +3647,34 @@ class TestAggregationExecutor:
     # --- Tier-2 contract violations fail the batch (operator ruling 2026-09-23, B2) ---
 
     @staticmethod
-    def _assert_contract_violation_routed(factory: MagicMock, result: TransformResult, *, error_prefix: str) -> None:
+    def _verdict_kwargs(factory: MagicMock) -> dict[str, Any]:
+        """The one FAILED-verdict write of a failed flush, and proof it was the only failure write.
+
+        ``complete_aggregation_failure`` records the transform_errors rows, the
+        DIVERT, the FAILED state and the FAILED batch in ONE transaction, so no
+        separate node_state, batch, routing or transform_errors write may exist.
+        """
+        factory.execution.complete_aggregation_failure.assert_called_once()
+        factory.execution.record_routing_event.assert_not_called()
+        assert not [c for c in factory.execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED]
+        assert not [c for c in factory.execution.complete_batch.call_args_list if c.kwargs.get("status") == BatchStatus.FAILED]
+        return dict(factory.execution.complete_aggregation_failure.call_args.kwargs)
+
+    @classmethod
+    def _assert_contract_violation_routed(cls, factory: MagicMock, result: TransformResult, *, error_prefix: str) -> None:
         """A violation raised before completion is a failed batch, recorded once.
 
         The executor turns it into an error result (``reason="contract_violation"``,
         not retryable) and ``_complete_error_flush`` records it exactly as a
-        returned error: one transform_errors write for the members, the flush
-        state FAILED once with the reason dict, the batch FAILED once.
+        returned error: ONE verdict write carrying the reason dict.
         """
         assert result.status == "error"
         assert result.retryable is False
         assert result.reason is not None
         assert result.reason["reason"] == "contract_violation"
         assert result.reason["error"].startswith(error_prefix)
-        failed = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
-        assert failed["error"] == result.reason
         factory.execution.complete_aggregation_result.assert_not_called()
-        factory.data_flow.record_batch_transform_errors_leader.assert_called_once()
-        assert factory.data_flow.record_batch_transform_errors_leader.call_args.kwargs["error_details"] == result.reason
-        failed_batches = [c for c in factory.execution.complete_batch.call_args_list if c.kwargs.get("status") == BatchStatus.FAILED]
-        assert len(failed_batches) == 1
+        assert cls._verdict_kwargs(factory)["reason"] == result.reason
 
     def test_a_buffered_row_failing_the_input_contract_fails_the_batch_before_process(self) -> None:
         """Schema-invalid buffered rows never reach the plugin; the batch fails, the run goes on."""
@@ -3719,9 +3726,10 @@ class TestAggregationExecutor:
         assert "count: " in result.reason["error"]
         assert "[int_type]" in result.reason["error"]
         assert sentinel not in repr(result.reason)
-        routing = factory.execution.record_routing_event.call_args.kwargs
-        assert routing["mode"] is RoutingMode.DIVERT
-        assert routing["reason"] == result.reason
+        verdict = self._verdict_kwargs(factory)
+        assert verdict["divert_edge_id"] == "edge_err_1"
+        assert verdict["destination"] == "quarantine"
+        assert verdict["reason"] == result.reason
 
     @pytest.mark.parametrize("declared", [True, False], ids=["declared-field", "undeclared-field"])
     def test_the_routed_non_canonical_output_violation_names_no_emitted_value(self, declared: bool) -> None:
@@ -3752,12 +3760,7 @@ class TestAggregationExecutor:
         self._assert_contract_violation_routed(
             factory, result, error_prefix=f"Aggregation transform 'agg_transform' emitted non-canonical data at {located} ("
         )
-        written = (
-            result.reason,
-            factory.data_flow.record_batch_transform_errors_leader.call_args.kwargs["error_details"],
-            factory.execution.record_routing_event.call_args.kwargs["reason"],
-            _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)["error"],
-        )
+        written = (result.reason, self._verdict_kwargs(factory)["reason"])
         assert str(bigint) not in repr(written)
 
     def test_a_contract_violation_raised_by_the_batch_plugin_fails_the_batch_once(self) -> None:
@@ -3793,7 +3796,7 @@ class TestAggregationExecutor:
         with pytest.raises(SinkTransactionalInvariantError, match="commit boundary diverged"):
             executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
 
-        factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+        factory.execution.complete_aggregation_failure.assert_not_called()
         factory.execution.record_routing_event.assert_not_called()
         failed = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         assert failed["error"].exception_type == "SinkTransactionalInvariantError"
@@ -3816,7 +3819,7 @@ class TestAggregationExecutor:
         with pytest.raises(PluginContractViolation, match="cross-check recorded"):
             executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT, validate_success=cross_check)
 
-        factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+        factory.execution.complete_aggregation_failure.assert_not_called()
         factory.execution.record_routing_event.assert_not_called()
         failed_batches = [c for c in factory.execution.complete_batch.call_args_list if c.kwargs.get("status") == BatchStatus.FAILED]
         assert len(failed_batches) == 1
@@ -3868,7 +3871,7 @@ class TestAggregationExecutor:
 
         if not fails:
             assert result.status == "success", "control: a matching count completes the batch"
-            factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+            factory.execution.complete_aggregation_failure.assert_not_called()
             return
         self._assert_contract_violation_routed(
             factory,
@@ -3904,7 +3907,7 @@ class TestAggregationExecutor:
         assert events[0].exception_type == "AggregationResultError"
 
     def test_execute_flush_error_result_marks_batch_failed(self) -> None:
-        """Error result from transform marks batch as FAILED."""
+        """Error result from transform records the batch's FAILED verdict, once."""
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
@@ -3917,7 +3920,7 @@ class TestAggregationExecutor:
         )
         ctx = make_context()
 
-        result, _tokens, _batch_id = executor.execute_flush(
+        result, _tokens, batch_id = executor.execute_flush(
             nid,
             transform,
             ctx,
@@ -3925,10 +3928,9 @@ class TestAggregationExecutor:
         )
 
         assert result.status == "error"
-
-        # Verify batch marked failed
-        failed_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.FAILED]
-        assert len(failed_calls) == 1
+        verdict = self._verdict_kwargs(factory)
+        assert verdict["batch_id"] == batch_id
+        assert verdict["trigger_type"] is TriggerType.COUNT
 
     def test_handled_aggregation_error_result_marks_aggregation_span_error(self) -> None:
         """A TransformResult.error marks the flush span even though routing returns."""
@@ -3971,30 +3973,21 @@ class TestAggregationExecutor:
         result, tokens, _batch_id = executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
         return result, tokens
 
-    def test_named_on_error_records_one_divert_on_the_flush_state_before_it_fails(self) -> None:
-        """A named aggregation on_error records ONE DIVERT routing_event on the
-        flush node_state, the per-member transform_errors rows, and only THEN
-        the FAILED completion (record-before-complete, transform.py parity)."""
-        factory = _make_factory()
-        order: list[str] = []
-        factory.data_flow.record_batch_transform_errors_leader.side_effect = lambda **kwargs: order.append("transform_errors")
-        factory.execution.record_routing_event.side_effect = lambda **kwargs: order.append("routing_event")
-        factory.execution.complete_node_state.side_effect = lambda **kwargs: order.append("complete_node_state")
-        executor, factory, nid = self._make_agg_executor(
-            factory=factory, count=2, on_error="quarantine", error_edge_ids={NodeID("agg_1"): "edge_err_1"}
-        )
+    def test_named_on_error_records_the_verdict_with_its_divert_on_the_flush_state_in_one_write(self) -> None:
+        """A named aggregation on_error's DIVERT rides the batch's ONE verdict
+        write, bound to the flush node_state, with the transform_errors rows,
+        the FAILED state and the FAILED batch (C4: no crash can split them)."""
+        executor, factory, nid = self._make_agg_executor(count=2, on_error="quarantine", error_edge_ids={NodeID("agg_1"): "edge_err_1"})
 
         result, _tokens = self._flush_error_result(executor, nid)
 
-        assert order == ["transform_errors", "routing_event", "complete_node_state"]
-        factory.execution.record_routing_event.assert_called_once()
-        routing = factory.execution.record_routing_event.call_args.kwargs
-        assert routing["state_id"] == "state_001"
-        assert routing["edge_id"] == "edge_err_1"
-        assert routing["mode"] is RoutingMode.DIVERT
-        assert routing["reason"] == result.reason
-        failed_batches = [c for c in factory.execution.complete_batch.call_args_list if c.kwargs.get("status") == BatchStatus.FAILED]
-        assert len(failed_batches) == 1
+        verdict = self._verdict_kwargs(factory)
+        assert verdict["state_id"] == "state_001"
+        assert verdict["divert_edge_id"] == "edge_err_1"
+        assert verdict["destination"] == "quarantine"
+        assert verdict["reason"] == result.reason
+        assert verdict["trigger_type"] is TriggerType.COUNT
+        assert verdict["duration_ms"] >= 0
 
     def test_failed_flush_reason_is_scrubbed_and_written_back(self) -> None:
         """The scrubbed reason replaces result.reason (the processor builds the
@@ -4008,25 +4001,23 @@ class TestAggregationExecutor:
         assert self._SECRET_SHAPED not in repr(result.reason)
         assert result.reason["reason"] == "invalid_input"
         assert result.reason["field"] == "value"
-        failed = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
-        assert failed["error"] == result.reason
+        assert self._verdict_kwargs(factory)["reason"] == result.reason
 
     @pytest.mark.parametrize("on_error", ["quarantine", "discard"])
     def test_failed_flush_records_one_transform_error_per_buffered_token(self, on_error: str) -> None:
-        """Every buffered member gets a transform_errors row carrying its own
-        row and the scrubbed batch reason, in ONE leader-fenced write, for
-        BOTH dispositions (B5). destination is the on_error value."""
+        """Every buffered member is in the verdict with its own row and the
+        scrubbed batch reason, in ONE leader-fenced write, for BOTH
+        dispositions (B5). destination is the on_error value."""
         edge_ids = {NodeID("agg_1"): "edge_err_1"} if on_error != "discard" else None
         executor, factory, nid = self._make_agg_executor(count=2, on_error=on_error, error_edge_ids=edge_ids)
 
         result, tokens = self._flush_error_result(executor, nid)
 
-        factory.data_flow.record_batch_transform_errors_leader.assert_called_once()
-        recorded = factory.data_flow.record_batch_transform_errors_leader.call_args.kwargs
+        recorded = self._verdict_kwargs(factory)
         assert [(ref.token_id, ref.run_id) for ref, _row in recorded["members"]] == [("t1", "test-run"), ("t2", "test-run")]
         assert [row for _ref, row in recorded["members"]] == [token.row_data for token in tokens]
-        assert recorded["transform_id"] == "agg_1"
-        assert recorded["error_details"] == result.reason
+        assert recorded["aggregation_node_id"] == "agg_1"
+        assert recorded["reason"] == result.reason
         assert recorded["destination"] == on_error
         assert recorded["coordination_token"] == _AGGREGATION_LEADER
 
@@ -4035,7 +4026,7 @@ class TestAggregationExecutor:
 
         self._flush_error_result(executor, nid)
 
-        factory.execution.record_routing_event.assert_not_called()
+        assert self._verdict_kwargs(factory)["divert_edge_id"] is None
 
     def test_named_on_error_without_a_divert_edge_fails_closed_before_any_write(self) -> None:
         """No __error_<name>__ edge for a named sink is a builder/orchestration
@@ -4045,7 +4036,7 @@ class TestAggregationExecutor:
         with pytest.raises(OrchestrationInvariantError, match="DIVERT edge"):
             self._flush_error_result(executor, nid)
 
-        factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+        factory.execution.complete_aggregation_failure.assert_not_called()
         factory.execution.record_routing_event.assert_not_called()
 
     def test_failed_flush_with_no_reason_is_an_invariant_violation(self) -> None:
@@ -4063,7 +4054,7 @@ class TestAggregationExecutor:
         with pytest.raises(OrchestrationInvariantError, match="reason is None"):
             executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
 
-        factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+        factory.execution.complete_aggregation_failure.assert_not_called()
 
     def test_execute_flush_exception_marks_batch_failed_and_reraises(self) -> None:
         """Exception from transform marks batch as FAILED and re-raises."""
@@ -4264,7 +4255,6 @@ class TestAggregationExecutor:
             _make_span_factory(),
             _make_step_resolver(),
             run_id="test-run",
-            data_flow=factory.data_flow,
             aggregation_settings={
                 nid: AggregationSettings(
                     name="test_agg",
@@ -5980,7 +5970,6 @@ class TestAggregationExecutorTerminality:
             _make_span_factory(),
             _make_step_resolver(),
             run_id="test-run",
-            data_flow=factory.data_flow,
             aggregation_settings={nid: settings},
         )
         return executor, factory, nid
@@ -6030,17 +6019,15 @@ class TestAggregationExecutorTerminality:
         assert result.reason is not None
         assert result.reason["reason"] == "contract_violation"
         assert "non-canonical data" in result.reason["error"]
-        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
-        assert failed_kwargs["state_id"] == "state_001"
-        assert failed_kwargs["error"] == result.reason
 
-        # Batch: FAILED (the failed-batch record)
-        factory.execution.complete_batch.assert_called_once()
-        batch_kwargs = factory.execution.complete_batch.call_args.kwargs
-        assert batch_kwargs["batch_id"] == "batch_001"
-        assert batch_kwargs["status"] == BatchStatus.FAILED
-        assert batch_kwargs["trigger_type"] == TriggerType.COUNT
-        assert batch_kwargs["state_id"] == "state_001"
+        # State and batch FAILED together: the one verdict write carries both.
+        factory.execution.complete_aggregation_failure.assert_called_once()
+        verdict = factory.execution.complete_aggregation_failure.call_args.kwargs
+        assert verdict["state_id"] == "state_001"
+        assert verdict["reason"] == result.reason
+        assert verdict["batch_id"] == "batch_001"
+        assert verdict["trigger_type"] == TriggerType.COUNT
+        factory.execution.complete_batch.assert_not_called()
 
         # Buffers cleared for recovery
         assert executor.get_buffer_count(nid) == 0

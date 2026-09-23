@@ -69,6 +69,7 @@ from elspeth.contracts.scheduler import BarrierTerminalOutcomeSpec, SourceIngest
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
+from elspeth.core.canonical import canonical_json
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
@@ -3144,7 +3145,7 @@ class TestAggregationFailureMatrix:
                 token_id=captured["token"].token_id,
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
-                error_hash=compute_error_hash(str(reason)),
+                error_hash=compute_error_hash(canonical_json(reason)),
             ),
         )
 
@@ -3198,7 +3199,7 @@ class TestAggregationFailureMatrix:
         assert routed.token.token_id == captured["token"].token_id
         assert routed.final_data == captured["token"].row_data
         assert routed.error is not None
-        assert routed.error.message == str(reason)
+        assert routed.error.message == canonical_json(reason), "the recorded reason text a resume reads back"
 
         record_outcome.assert_not_called()
         complete_barrier.assert_called_once()
@@ -3208,8 +3209,8 @@ class TestAggregationFailureMatrix:
         [emission] = barrier["emitted_pending_sink"]
         assert emission.token_id == captured["token"].token_id
         assert (emission.sink_name, emission.outcome, emission.path) == ("quarantine", "failure", "on_error_routed")
-        assert emission.error_message == str(reason)
-        assert emission.error_hash == compute_error_hash(str(reason), exception_type="TransformError")
+        assert emission.error_message == canonical_json(reason)
+        assert emission.error_hash == compute_error_hash(canonical_json(reason), exception_type="TransformError")
 
     def test_passthrough_success_with_rows_none_raises(self) -> None:
         """Passthrough flush requires rows list; rows=None is an invariant violation."""

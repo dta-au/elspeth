@@ -238,6 +238,7 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "update_batch_status",
             "complete_batch",
             "complete_aggregation_result",
+            "complete_aggregation_failure",
             "retry_batch",
         ),
     ),
@@ -307,7 +308,9 @@ _EXPECTED_API_CATEGORY_COUNTS = {
     "run-lifecycle": 14,
     "run-start-admission": 2,
     "data-flow": 17,
-    "execution": 19,
+    # C4 (recorded FAILED verdict, operator ruling 2026-09-23): 19 -> 20,
+    # ExecutionRepository.complete_aggregation_failure, the batch's one verdict write.
+    "execution": 20,
     "scheduler": 23,
     "sink-effect": 11,
     "checkpoint": 2,
@@ -698,8 +701,15 @@ _EXPECTED_DML_COUNT = 159
 # GraphAuditRepository.register_node's insert fingerprint (and its one
 # subordinate edge below); scripts/fencing_inventory.py against the base tree
 # classifies exactly that one identity as departed/arrived, write shapes 70/70.
-# AGG-ERROR-EDGE: f586b74e… -> the value below for the one identity above.
-_EXPECTED_DML_INVENTORY_SHA256 = "14b71a754d496c74382ecd861bbe304c39c3f3b7e925595a229f76f7c3f9c41a"
+# AGG-ERROR-EDGE: f586b74e… -> 14b71a75… for the one identity above.
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): 14b71a75… -> the value
+# below. Count 159 and write shapes 70/70 unchanged; the transform_errors INSERT
+# (fingerprint 6c23ee1f5d6bfd77, unchanged) moved from the deleted verb
+# ErrorAuditRepository.record_batch_transform_errors_leader to the connection
+# helper insert_batch_transform_errors_on, which ExecutionRepository.
+# complete_aggregation_failure calls inside the verdict's ONE transaction. Measured
+# by scripts/fencing_inventory.py against a clean export of 5e25798db and the tree.
+_EXPECTED_DML_INVENTORY_SHA256 = "2b5bca9afa077a6d550a83a4b32ac1fce1b6296fae12487a350c49a7cef8731f"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -793,14 +803,28 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # (per-member record_token_outcome_leader) and _mark_buffered_scheduler_work_terminal (the
 # separate BLOCKED-row release) are DELETED: a discarded failed batch's terminals now ride
 # complete_barrier's terminal_outcomes, the same transaction as the release.
-_EXPECTED_CALL_COUNT = 279
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): 279 -> 278. Departed:
+# AggregationExecutor._complete_error_flush -> self._execution.record_routing_event#1
+# and -> self._execution.complete_batch#1 (the verdict's separate writes). Arrived:
+# NodeStateGuard.complete_aggregation_failure -> self._execution.complete_aggregation_failure#1,
+# the ONE verdict write (complete_aggregation_failure is listed in _MUTATION_APIS).
+_EXPECTED_CALL_COUNT = 278
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
-# AGG-DISCARD: d82c45a5… -> the value below, the two callers deleted above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "70bb43aa3a1c4434092259a341a96da340b59acd4b8ea2fc3be2dc386a917cff"
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 138
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d3b83b4cef4ce6ceae28d98c48ad49b0162b26ef96b7a7e7551e3ab4be89d26f"
+# AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
+# C4: 70bb43aa… -> the value below, the caller exchange above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "6c2ff337310e10241796599bb6fba9ea7e82c20342ca101bbcf3ffaa211baefd"
+# C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
+# ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
+# -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
+# -> BatchRepository.complete_batch_on (the verdict's four writes on its one fenced
+# connection), and NodeStateRepository.record_routing_event_on ->
+# _insert_or_load_routing_decision. NodeStateRepository.record_routing_event ->
+# _insert_or_load_routing_decision stays, its call fingerprint moved (1b40f529… ->
+# 751cf56f…) because the event is now built by prepare_routing_event.
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 143
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "4bdcff84c390aad5cf972c3409f96d4183d9d64744bd3e2dc48b50c8180cc7e7"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -16715,7 +16739,7 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
 
 def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_one() -> None:
     units = _production_units()
-    assert len(_MUTATION_APIS) == 91
+    assert len(_MUTATION_APIS) == 92
     assert Counter(api.category for api in _MUTATION_APIS) == Counter(_EXPECTED_API_CATEGORY_COUNTS)
     assert len({(api.path, api.symbol) for api in _MUTATION_APIS}) == len(_MUTATION_APIS)
 

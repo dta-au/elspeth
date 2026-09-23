@@ -3093,6 +3093,12 @@ class TestDelegationSignatureAlignment:
             id="complete_aggregation_result",
         ),
         pytest.param(
+            "complete_aggregation_failure",
+            lambda execution: execution.complete_aggregation_failure,
+            ExecutionRepository.complete_aggregation_failure,
+            id="complete_aggregation_failure",
+        ),
+        pytest.param(
             "get_max_node_state_attempts",
             lambda execution: execution.get_max_node_state_attempts,
             ExecutionRepository.get_max_node_state_attempts,

@@ -92,7 +92,12 @@ from elspeth.engine.token_traversal import (
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
 if TYPE_CHECKING:
-    from elspeth.contracts import CommittedAggregationOutputReceipt, CommittedAggregationResidual, CommittedCoalesceResidual
+    from elspeth.contracts import (
+        CommittedAggregationOutputReceipt,
+        CommittedAggregationResidual,
+        CommittedCoalesceResidual,
+        RecordedAggregationFailure,
+    )
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -148,7 +153,7 @@ from elspeth.contracts.scheduler import (
     TokenWorkStatus,
 )
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.config import AggregationSettings, GateSettings
@@ -314,6 +319,21 @@ class _PreparedAggregationRoute:
     output_rows: tuple[PipelineRow, ...]
     quarantined_indices: frozenset[int]
     expansion_parent: TokenInfo | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedFlushDisposition:
+    """A FAILED batch verdict's disposition inputs: live flush or recorded verdict on resume.
+
+    ``error_detail`` is the reason's canonical JSON — the recorded text every
+    member's message and error_hash derive from.
+    """
+
+    node_id: NodeID
+    on_error: str
+    buffered_tokens: tuple[TokenInfo, ...]
+    batch_id: str
+    error_detail: str
 
 
 def make_step_resolver(
@@ -701,7 +721,6 @@ class RowProcessor:
             span_factory,
             self._step_resolver,
             run_id,
-            data_flow=data_flow,
             aggregation_settings=aggregation_settings,
             error_edge_ids=error_edge_ids,
             clock=self._clock,
@@ -952,6 +971,8 @@ class RowProcessor:
                 complete_committed_aggregation_residual=self._complete_committed_aggregation_residual,
                 prepare_committed_aggregation_output=self._prepare_committed_aggregation_output,
                 complete_committed_aggregation_output=self._complete_committed_aggregation_output,
+                prepare_recorded_aggregation_failure=self._prepare_recorded_aggregation_failure,
+                complete_recorded_aggregation_failure=self._dispose_failed_flush,
                 complete_committed_coalesce_residual=self._complete_committed_coalesce_residual,
                 collector_executor=self._collector_executor,
                 collector_node_ids=self._collector_node_ids,
@@ -1282,52 +1303,67 @@ class RowProcessor:
                 return self._row_union_node_ids[row_union_name], row_union_name
         return None, None
 
-    @staticmethod
-    def _discard_flush_error_members(fctx: _FlushContext, error_detail: str) -> tuple[RowResult, ...]:
-        """Plan every member of a failed batch discarded (``on_error: discard``).
+    def _dispose_failed_flush(self, disposition: _FailedFlushDisposition) -> tuple[RowResult, ...]:
+        """Apply a FAILED batch verdict's ``on_error`` to every member — the one disposition.
 
-        The per-row discard twin (``token_traversal``): each member is
-        ``(FAILURE, QUARANTINED_AT_SOURCE)`` carrying the batch reason. Nothing
-        is recorded here — ``_complete_aggregation_flush`` writes every
-        member's terminal inside the SAME ``complete_barrier`` transaction
-        that releases its BLOCKED row, so no crash can split the two.
+        Serves the live flush (``handle_timeout_flush``) and resume of a
+        verdict recorded before a crash (``_prepare_recorded_aggregation_failure``),
+        so crash timing cannot change what happens to a member. Each member
+        carries its ORIGINAL row (``token.row_data``, the pre-batch input) and
+        the one recorded batch reason:
+
+        - ``discard`` matches the per-row discard (operator ruling B3): every
+          member ``(FAILURE, QUARANTINED_AT_SOURCE)``, its terminal written
+          inside the SAME ``complete_barrier`` transaction that releases its
+          BLOCKED row, with an error_hash that binds to the reason (B4);
+        - a named sink gets the whole batch: every member moves BLOCKED ->
+          PENDING_SINK as ``(FAILURE, ON_ERROR_ROUTED)`` in ONE journal
+          transaction, and the sink records each outcome after durability. No
+          processor-side terminal (that would be a second terminal for the
+          same token).
         """
-        failure = FailureInfo(exception_type="TransformError", message=error_detail)
-        return tuple(
-            RowResult(
-                token=token,
-                final_data=token.row_data,
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.QUARANTINED_AT_SOURCE,
-                error=failure,
+        failure = FailureInfo(exception_type="TransformError", message=disposition.error_detail)
+        if disposition.on_error == "discard":
+            results = tuple(
+                RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.QUARANTINED_AT_SOURCE,
+                    error=failure,
+                )
+                for token in disposition.buffered_tokens
             )
-            for token in fctx.buffered_tokens
-        )
-
-    @staticmethod
-    def _route_flush_error_to_sink(fctx: _FlushContext, error_detail: str) -> tuple[RowResult, ...]:
-        """Plan every member of a failed batch to its aggregation's on_error sink.
-
-        The batch is reassembled best effort: each buffered token goes to the
-        sink carrying its ORIGINAL row (``token.row_data``, the pre-batch
-        input) and the one batch reason. Nothing is recorded here — like the
-        per-row routed arm (``token_traversal``), the sink records each
-        ``(FAILURE, ON_ERROR_ROUTED)`` outcome after durability, and
-        ``_complete_aggregation_flush`` hands every member BLOCKED ->
-        PENDING_SINK in one journal transaction first.
-        """
-        failure = FailureInfo(exception_type="TransformError", message=error_detail)
-        return tuple(
+            discarded_results, _no_handoffs = self._complete_aggregation_flush(
+                disposition.node_id,
+                results,
+                disposition.buffered_tokens,
+                [],
+                batch_id=disposition.batch_id,
+                members_terminate=True,
+                quarantine_error_hash=compute_error_hash(disposition.error_detail),
+            )
+            return discarded_results
+        results = tuple(
             RowResult(
                 token=token,
                 final_data=token.row_data,
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.ON_ERROR_ROUTED,
-                sink_name=fctx.settings.on_error,
+                sink_name=disposition.on_error,
                 error=failure,
             )
-            for token in fctx.buffered_tokens
+            for token in disposition.buffered_tokens
         )
+        routed_results, _pending_sink_token_ids = self._complete_aggregation_flush(
+            disposition.node_id,
+            results,
+            disposition.buffered_tokens,
+            [],
+            batch_id=disposition.batch_id,
+            members_terminate=False,
+        )
+        return routed_results
 
     def _cross_check_flush_output(
         self,
@@ -2026,45 +2062,28 @@ class RowProcessor:
         # before committing its receipt.
         if result.status == "success" and not validated_context:
             validate_success(result, buffered_tokens, batch_id)
-        fctx = validated_context[0] if result.status == "success" else build_flush_context(buffered_tokens, batch_id)
-
         if result.status != "success":
-            # The executor has already scrubbed the reason and written it back,
-            # recorded the members' transform_errors rows and (for a named
-            # sink) the DIVERT routing_event, and failed the state and batch.
+            # The executor has already scrubbed the reason, written it back and
+            # recorded the batch's FAILED verdict in one transaction.
             if not result.reason:
                 raise OrchestrationInvariantError(
                     f"Aggregation {settings.name!r} flush failed without a reason; refusing to fabricate one for audit hashing"
                 )
-            error_detail = str(result.reason)
-            if settings.on_error == "discard":
-                # Discard matches the per-row discard (operator ruling B3):
-                # every member (FAILURE, QUARANTINED_AT_SOURCE), each terminal
-                # written in the same transaction that releases its BLOCKED
-                # row, with an error_hash that binds to the batch reason.
-                discarded_results, _no_handoffs = self._complete_aggregation_flush(
-                    node_id,
-                    self._discard_flush_error_members(fctx, error_detail),
-                    buffered_tokens,
-                    [],
-                    batch_id=batch_id,
-                    members_terminate=True,
-                    quarantine_error_hash=compute_error_hash(error_detail),
-                )
-                return discarded_results, []
-            # Named sink: the whole batch goes to it. Every member moves
-            # BLOCKED -> PENDING_SINK in place in ONE journal transaction; the
-            # sink records each outcome after durability. No processor-side
-            # terminal (that would be a second terminal for the same token).
-            routed_results, _pending_sink_token_ids = self._complete_aggregation_flush(
-                node_id,
-                self._route_flush_error_to_sink(fctx, error_detail),
-                buffered_tokens,
-                [],
+            # The reason renders as its canonical JSON: byte for byte the
+            # recorded transform_errors.error_details_json / node_states.error_json
+            # a resume reads back (RecordedAggregationFailure.reason_json), so
+            # every member's message and error_hash are identical whether the
+            # disposition runs here or after a crash.
+            disposition = _FailedFlushDisposition(
+                node_id=node_id,
+                on_error=settings.on_error,
+                buffered_tokens=tuple(buffered_tokens),
                 batch_id=batch_id,
-                members_terminate=False,
+                error_detail=canonical_json(result.reason),
             )
-            return routed_results, []
+            return self._dispose_failed_flush(disposition), []
+
+        fctx = validated_context[0]
 
         # Emit TransformCompleted telemetry for all buffered tokens
         for token in buffered_tokens:
@@ -2114,8 +2133,8 @@ class RowProcessor:
 
         Engine buffers rows and calls transform.process(rows: list[dict])
         when the trigger fires. Flush handling is delegated to shared helpers
-        (_discard_flush_error_members, _route_flush_error_to_sink,
-        _route_passthrough_results, _route_transform_results).
+        (_dispose_failed_flush, _route_passthrough_results,
+        _route_transform_results).
 
         TEMPORAL DECOUPLING:
 
@@ -4605,6 +4624,51 @@ class RowProcessor:
             child_items,
             batch_id=fctx.batch_id,
             members_terminate=not prepared.output_rows,
+        )
+
+    def _prepare_recorded_aggregation_failure(
+        self,
+        verdict: RecordedAggregationFailure,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> _FailedFlushDisposition:
+        """Purely validate a recorded FAILED verdict's disposition before restore mutates.
+
+        The members come back from their BLOCKED journal rows in batch order;
+        the recorded destination must still be this aggregation's
+        ``on_error`` (the error edge moves the topology hash, so a changed
+        route cannot pass the resume topology check — a mismatch is
+        corruption, never a re-route).
+
+        The restore then hands the result to ``_dispose_failed_flush``, the
+        same disposition the live flush runs. Nothing is re-recorded: the
+        verdict (transform_errors rows, DIVERT, FAILED state and batch) was
+        committed whole before the crash, and the batch plugin is never
+        re-invoked. A named sink's members become PENDING_SINK handoffs that
+        the resume sink drain delivers.
+        """
+        items_by_id = {item.token_id: item for item in blocked_items}
+        if len(items_by_id) != len(blocked_items) or frozenset(items_by_id) != frozenset(verdict.member_token_ids):
+            raise AuditIntegrityError(f"Recorded FAILED verdict of batch {verdict.batch_id!r} does not match its exact BLOCKED membership")
+        node_id = NodeID(verdict.aggregation_node_id)
+        try:
+            settings = self._aggregation_settings[node_id]
+        except KeyError as exc:
+            raise AuditIntegrityError(
+                f"Recorded FAILED verdict of batch {verdict.batch_id!r} names aggregation node {node_id!r}, which this graph lacks"
+            ) from exc
+        if settings.on_error != verdict.destination:
+            raise AuditIntegrityError(
+                f"Recorded FAILED verdict of batch {verdict.batch_id!r} was routed to {verdict.destination!r}, but aggregation "
+                f"{settings.name!r} now declares on_error={settings.on_error!r}"
+            )
+        return _FailedFlushDisposition(
+            node_id=node_id,
+            on_error=verdict.destination,
+            buffered_tokens=tuple(
+                self._work_codec.work_item_from_scheduler(items_by_id[token_id]).token for token_id in verdict.member_token_ids
+            ),
+            batch_id=verdict.batch_id,
+            error_detail=verdict.reason_json,
         )
 
     def _load_committed_barrier_payload(

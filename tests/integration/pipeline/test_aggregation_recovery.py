@@ -44,6 +44,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import AggregationName, NodeID
+from elspeth.core.canonical import canonical_json
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
@@ -1049,8 +1050,9 @@ class TestFailedFlushReconcile:
         """B3: a failure INSIDE ``complete_barrier`` while it writes the discard
         terminals rolls back the BLOCKED-row release with them — there is no
         state where a member is terminal but still BLOCKED (the window the
-        reconcile above exists for). Resume retries the batch and every member
-        is quarantined exactly once."""
+        reconcile above exists for). The batch's FAILED verdict had already
+        committed, so resume completes it without re-running the batch, and
+        every member is quarantined exactly once."""
         import elspeth.core.landscape.scheduler.barrier as barrier_module
         from elspeth.core.landscape.schema import token_outcomes_table
         from elspeth.core.payload_store import FilesystemPayloadStore
@@ -1097,8 +1099,9 @@ class TestFailedFlushReconcile:
 
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
         assert (result.rows_failed, result.rows_quarantined) == (3, 3)
-        assert transform.batch_calls == 2
+        assert transform.batch_calls == 1, "the recorded verdict is completed, never re-run"
         with db.connection() as conn:
+            assert list(conn.execute(select(batches_table.c.status).where(batches_table.c.run_id == run_id)).scalars()) == ["failed"]
             quarantined = conn.execute(
                 select(token_outcomes_table.c.token_id, token_outcomes_table.c.path)
                 .where(token_outcomes_table.c.run_id == run_id)
@@ -1117,10 +1120,12 @@ class TestFailedFlushRoutedToErrorSinkResume:
     """elspeth-d2e3f29d10: a failed batch routed to its on_error sink survives
     a crash in either window without routing any member twice.
 
-    The routed arm writes (1) executor-side audit — per-member transform_errors,
-    ONE DIVERT routing_event, node_state FAILED, batch FAILED — then (2) ONE
-    ``complete_barrier`` handing every member BLOCKED -> PENDING_SINK, then
-    (3) the sink write, which records each member's single terminal.
+    The routed arm writes (1) the batch's FAILED verdict in ONE transaction —
+    per-member transform_errors, ONE DIVERT routing_event, node_state FAILED,
+    batch FAILED — then (2) ONE ``complete_barrier`` handing every member
+    BLOCKED -> PENDING_SINK, then (3) the sink write, which records each
+    member's single terminal. The verdict is final once (1) commits: resume
+    completes it and never re-runs the batch (operator ruling 2026-09-23).
     """
 
     @staticmethod
@@ -1182,12 +1187,11 @@ class TestFailedFlushRoutedToErrorSinkResume:
     def test_crash_before_the_barrier_handoff_resumes_and_routes_each_member_once(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Crash after the executor finalized the FAILED batch, before
+        """Crash after the executor recorded the FAILED verdict, before
         ``complete_barrier``: the members are still BLOCKED with live BUFFERED
-        outcomes and no terminal. Resume retries the FAILED batch, the flush
-        runs again and fails again (a second, legitimate attempt: its own
-        node_state and its own DIVERT), and every member reaches the sink
-        exactly once."""
+        outcomes and no terminal. Resume completes the recorded verdict — no
+        second flush, no second DIVERT, no second transform_errors row, no
+        retry batch — and every member reaches the sink exactly once."""
         from elspeth.engine.processor import RowProcessor
 
         error_sink = CollectSink("quarantine")
@@ -1221,18 +1225,18 @@ class TestFailedFlushRoutedToErrorSinkResume:
 
         assert result.status == RunStatus.FAILED
         assert result.rows_routed_failure == 3
-        assert transform.batch_calls == 2, "the batch is retried once on resume"
+        assert transform.batch_calls == 1, "the recorded verdict is completed, never re-run"
         assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}], "every member written exactly once"
         assert output_sink.results == []
         after = self._routed_audit(db, run_id)
         assert sorted(after["terminals"]) == sorted((token_id, "on_error_routed", "quarantine") for token_id, _p, _s in after["terminals"])
         assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
-        # One DIVERT per failed flush attempt, each on its own flush state.
-        assert len(after["routing_state_ids"]) == 2
-        assert set(after["routing_state_ids"]) == after["failed_flush_states"]
-        # The original batch and its resume retry both FAILED: one per attempt.
-        assert sorted(status for _batch_id, status in after["batches"]) == ["failed", "failed"]
-        assert after["transform_error_count"] == 6
+        # The one verdict's one DIVERT, on its flush state.
+        assert after["routing_state_ids"] == before["routing_state_ids"]
+        assert set(after["routing_state_ids"]) <= after["failed_flush_states"]
+        # The verdict is final: no retry batch was ever minted for it.
+        assert [status for _batch_id, status in after["batches"]] == ["failed"]
+        assert after["transform_error_count"] == 3
         assert after["work_statuses"] == {"terminal"}
 
     def test_crash_after_the_barrier_handoff_delivers_the_pending_rows_without_replay(self, tmp_path: Any) -> None:
@@ -1258,7 +1262,7 @@ class TestFailedFlushRoutedToErrorSinkResume:
                 .where(token_work_items_table.c.status == "pending_sink")
             ).all()
         expected_hash = compute_error_hash(
-            str({"reason": "batch_failed", "error": "injected batch flush failure"}), exception_type="TransformError"
+            canonical_json({"reason": "batch_failed", "error": "injected batch flush failure"}), exception_type="TransformError"
         )
         assert pending == [("on_error_routed", expected_hash)] * 3
         assert transform.batch_calls == 1
@@ -1281,11 +1285,12 @@ class TestFailedFlushRoutedToErrorSinkResume:
         after = self._routed_audit(db, run_id)
         assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
         assert {(path, sink) for _t, path, sink in after["terminals"]} == {("on_error_routed", "quarantine")}
-        # handle_incomplete_batches still retries the FAILED batch into a DRAFT
-        # on resume (pre-existing, elspeth-35d03f1f28). With every member
-        # already handed off there is nothing BLOCKED to restore into it, so it
-        # never flushes: inert, which batch_calls == 1 above proves.
-        assert sorted(status for _batch_id, status in after["batches"]) == ["draft", "failed"]
+        # A recorded FAILED verdict is final, so handle_incomplete_batches never
+        # retries it: no inert DRAFT retry batch is minted on resume (it was,
+        # before the C4 unit of elspeth-5887fb7928; that DRAFT was once
+        # attributed here to elspeth-35d03f1f28, whose subject is instead a
+        # copied-membership mismatch after a partial failed terminalisation).
+        assert [status for _batch_id, status in after["batches"]] == ["failed"]
         assert len(after["routing_state_ids"]) == 1, "no second flush attempt, so no second DIVERT"
         assert after["transform_error_count"] == 3
         assert after["work_statuses"] == {"terminal"}
@@ -1847,7 +1852,6 @@ class TestAggregationRecoveryIntegration:
             span_factory=span_factory,
             step_resolver=lambda node_id: 1,
             run_id=run.run_id,
-            data_flow=factory.data_flow,
             aggregation_settings=agg_settings,
         )
 

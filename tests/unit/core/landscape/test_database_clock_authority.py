@@ -161,7 +161,12 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # its own fenced_leader_transaction (one transform_errors row per member of a FAILED
 # aggregation batch), so it reads the Landscape clock to verify-and-extend the seat.
 # Re-derived by RUNNING the gate on the changed tree.
-_CLOCK_BOUNDARY_DIGEST = "f130aec70412db75e572bba7e11a7d2477e20b92e1887836b63600938ed8356a"
+# C4 (recorded FAILED verdict, operator ruling 2026-09-23): f130aec7… → the value
+# below, one identity exchanged: ErrorAuditRepository.record_batch_transform_errors_leader
+# (deleted; its INSERT is now a connection helper) leaves, and
+# ExecutionRepository.complete_aggregation_failure arrives — it opens the ONE
+# fenced_leader_transaction that records the whole verdict. Re-derived by RUNNING the gate.
+_CLOCK_BOUNDARY_DIGEST = "3adddc41cefcfdea32196c0992288925989b68d621e724604f86ae027df0fb7b"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -232,7 +237,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.get_resume_point"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
-        ("src/elspeth/core/landscape/data_flow/errors.py", "ErrorAuditRepository.record_batch_transform_errors_leader"),
         ("src/elspeth/core/landscape/data_flow/errors.py", "ErrorAuditRepository.record_validation_error"),
         ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_edge"),
         ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_node"),
@@ -280,6 +284,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.takeover_expired"),
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
+        ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_failure"),
         ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_result"),
         ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"),

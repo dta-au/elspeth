@@ -23,7 +23,6 @@ from elspeth.contracts.enums import (
     BatchStatus,
     NodeStateStatus,
     OutputMode,
-    RoutingMode,
     TriggerType,
 )
 from elspeth.contracts.errors import (
@@ -41,7 +40,6 @@ from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import AggregationSettings
-from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
@@ -168,7 +166,7 @@ class AggregationExecutor:
     NOT stored in node_states.status (which is always "completed" for successful accepts).
 
     Example:
-        executor = AggregationExecutor(execution, span_factory, step_resolver, run_id, data_flow=data_flow)
+        executor = AggregationExecutor(execution, span_factory, step_resolver, run_id)
 
         # Accept rows into batch
         batch_id, ordinal = executor.open_batch_membership(node_id, coordination_token=coordination_token)
@@ -184,7 +182,6 @@ class AggregationExecutor:
         step_resolver: StepResolver,
         run_id: str,
         *,
-        data_flow: DataFlowRepository,
         aggregation_settings: dict[NodeID, AggregationSettings] | None = None,
         error_edge_ids: Mapping[NodeID, str] | None = None,
         clock: "Clock | None" = None,
@@ -196,8 +193,6 @@ class AggregationExecutor:
             span_factory: Span factory for tracing
             step_resolver: Resolves NodeID to 1-indexed audit step position
             run_id: Run identifier for batch creation
-            data_flow: Data flow repository; records the per-member
-                transform_errors rows of a failed flush.
             aggregation_settings: Map of node_id -> AggregationSettings for trigger evaluation
             error_edge_ids: Map of aggregation node_id -> DIVERT edge_id of its
                 ``__error_<name>__`` edge. Built by the processor from the edge
@@ -206,7 +201,6 @@ class AggregationExecutor:
                    Inject MockClock for deterministic testing.
         """
         self._execution = execution
-        self._data_flow = data_flow
         self._error_edge_ids: Mapping[NodeID, str] = error_edge_ids or {}
         self._spans = span_factory
         self._step_resolver = step_resolver
@@ -656,26 +650,23 @@ class AggregationExecutor:
         trigger_type: TriggerType,
         buffered_tokens: Sequence[TokenInfo],
     ) -> None:
-        """Record a transform-returned batch failure and apply the declared error route.
+        """Record a transform-returned batch failure: the batch's final FAILED verdict.
 
         The whole batch failed (the transform's verdict), so every buffered
-        member shares the one batch reason. In order (record-before-complete,
-        parity with ``TransformExecutor``'s error-result branch):
+        member shares the one batch reason. The reason is required, scrubbed
+        and WRITTEN BACK onto ``result.reason`` — the processor renders each
+        member's disposition from it — and the DIVERT edge of a named
+        ``on_error`` sink is resolved before anything is written, so a missing
+        edge refuses without a partial verdict.
 
-        1. require ``result.reason``, scrub it, and WRITE IT BACK onto
-           ``result.reason`` — the processor builds each routed member's
-           FailureInfo (and so its durable ``pending_error_message``) from it;
-        2. one ``transform_errors`` row per buffered member, destination =
-           ``on_error`` (a sink name, or ``"discard"``), in ONE leader-fenced
-           write;
-        3. for a named sink, ONE DIVERT ``routing_event`` on this flush's
-           node_state along the ``__error_<name>__`` edge;
-        4. the node_state FAILED with the scrubbed reason dict, then the batch
-           FAILED.
-
-        The DIVERT edge is resolved before any write, so a missing edge
-        refuses without leaving half an envelope. A write that raises before
-        step 4 leaves the guard to auto-fail the state and propagates.
+        The verdict itself is ONE transaction
+        (``NodeStateGuard.complete_aggregation_failure``): one
+        ``transform_errors`` row per member (destination = ``on_error``), the
+        DIVERT ``routing_event`` for a named sink, the node_state FAILED with
+        the scrubbed reason, and the batch FAILED. A crash before it commits
+        leaves no verdict (resume re-runs the flush); once it commits the
+        verdict is final (resume completes its disposition from it and never
+        re-invokes the plugin).
         """
         if result.reason is None:
             raise OrchestrationInvariantError(
@@ -697,33 +688,16 @@ class AggregationExecutor:
                     "in from_plugin_instances()."
                 ) from exc
 
-        coordination_token = ctx.require_coordination_token()
-        self._data_flow.record_batch_transform_errors_leader(
-            members=tuple((TokenRef(token_id=token.token_id, run_id=self._run_id), token.row_data) for token in buffered_tokens),
-            transform_id=str(node_id),
-            error_details=scrubbed_reason,
-            destination=on_error,
-            coordination_token=coordination_token,
-        )
-        if divert_edge_id is not None:
-            self._execution.record_routing_event(
-                member_token=ctx.require_member_token(),
-                state_id=guard.state_id,
-                edge_id=divert_edge_id,
-                mode=RoutingMode.DIVERT,
-                reason=scrubbed_reason,
-            )
-        guard.complete(
-            NodeStateStatus.FAILED,
-            duration_ms=duration_ms,
-            error=scrubbed_reason,
-        )
-        self._execution.complete_batch(
-            coordination_token=coordination_token,
+        guard.complete_aggregation_failure(
             batch_id=batch_id,
-            status=BatchStatus.FAILED,
+            coordination_token=ctx.require_coordination_token(),
+            aggregation_node_id=str(node_id),
             trigger_type=trigger_type,
-            state_id=guard.state_id,
+            members=tuple((TokenRef(token_id=token.token_id, run_id=self._run_id), token.row_data) for token in buffered_tokens),
+            reason=scrubbed_reason,
+            destination=on_error,
+            divert_edge_id=divert_edge_id,
+            duration_ms=duration_ms,
         )
 
     def _fail_unfinalized_batch(
@@ -781,9 +755,10 @@ class AggregationExecutor:
         3. Executes the batch-aware transform
         4. Transitions batch to "completed" or "failed"; a returned error —
            or a Tier-2 ``PluginContractViolation`` raised before completion,
-           which ``_run_flush_transform`` turns into one — first records one
-           transform_errors row per member and, for a named on_error sink,
-           one DIVERT routing_event on the flush state
+           which ``_run_flush_transform`` turns into one — is recorded as the
+           batch's final FAILED verdict in one transaction: one
+           transform_errors row per member, the DIVERT routing_event of a
+           named on_error sink, the state and the batch
            (``_complete_error_flush``)
         5. Resets batch_id for next batch
 

@@ -58,6 +58,7 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     token_work_items_table,
 )
+from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.tree_gate import iter_gate_sources
@@ -721,6 +722,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "claim_ready",
         "coalesce_tokens",
         "collect_tokens",
+        "complete_aggregation_failure",
         "complete_aggregation_result",
         "complete_batch",
         "complete_node_state",
@@ -738,7 +740,6 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_routing_event",
         "record_token_outcome_leader",
         "record_validation_error",
-        "record_batch_transform_errors_leader",
         "register_edge",
         "register_node",
         "retry_batch",
@@ -915,6 +916,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         ),
         "coalesce_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_coalesce_materialization_is_leader_fenced"),
         "collect_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_collector_release_is_leader_fenced"),
+        "complete_aggregation_failure": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_aggregation_failure_requires_current_leader",
+        ),
         "complete_aggregation_result": (
             "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
             "test_f10_aggregation_result_requires_current_leader",
@@ -956,10 +961,6 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "test_stale_epoch_refuses_without_payload_mutation",
         ),
         "record_validation_error": (
-            "tests/unit/core/landscape/test_data_flow_fencing.py",
-            "test_stale_epoch_refuses_without_payload_mutation",
-        ),
-        "record_batch_transform_errors_leader": (
             "tests/unit/core/landscape/test_data_flow_fencing.py",
             "test_stale_epoch_refuses_without_payload_mutation",
         ),
@@ -1384,6 +1385,49 @@ def test_f10_aggregation_result_requires_current_leader(harness: _Harness, stale
         completed_batch = execution.get_batch(batch.batch_id)
         assert completed_state is not None and completed_state.status is NodeStateStatus.COMPLETED
         assert completed_batch is not None and completed_batch.status is BatchStatus.COMPLETED
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_aggregation_failure_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    """A batch's FAILED verdict (transform_errors + state + batch, one transaction) needs the current leader."""
+    register_test_node(harness.factory.data_flow, RUN_ID, "aggregation-1", node_type=NodeType.AGGREGATION)
+    _, token_id, _ = _enqueue(harness, "aggregation-member", 0)
+    execution = harness.factory.execution
+    state = execution.begin_node_state(token_id, "aggregation-1", 1, {"value": 1}, member_token=harness.coordination_token.membership)
+    batch = execution.create_batch("aggregation-1", coordination_token=harness.coordination_token)
+    with fenced_leader_transaction(
+        harness.db.engine, token=harness.coordination_token, window_seconds=300, verb="test_aggregation_failure_setup"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token_id, ordinal=0, expected_run_id=RUN_ID)
+        record_buffered_outcome_guarded(conn, run_id=RUN_ID, token_id=token_id, batch_id=batch.batch_id, recorded_at=datetime.now(UTC))
+    execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING, coordination_token=harness.coordination_token)
+
+    def record_verdict() -> None:
+        execution.complete_aggregation_failure(
+            batch_id=batch.batch_id,
+            coordination_token=harness.coordination_token,
+            aggregation_node_id="aggregation-1",
+            state_id=state.state_id,
+            trigger_type=TriggerType.END_OF_SOURCE,
+            members=((TokenRef(token_id=token_id, run_id=RUN_ID), make_pipeline_row({"value": 1})),),
+            reason={"reason": "batch_failed", "error": "flush failed"},
+            destination="discard",
+            divert_edge_id=None,
+            duration_ms=1.0,
+        )
+
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            record_verdict()
+        assert raised.value.verb == "complete_aggregation_failure"
+        _assert_only_fence_refusal(harness, before, verb="complete_aggregation_failure")
+    else:
+        record_verdict()
+        failed_state = execution.get_node_state(state.state_id)
+        failed_batch = execution.get_batch(batch.batch_id)
+        assert failed_state is not None and failed_state.status is NodeStateStatus.FAILED
+        assert failed_batch is not None and failed_batch.status is BatchStatus.FAILED
 
 
 @pytest.mark.parametrize("status", ["departed", "evicted"])

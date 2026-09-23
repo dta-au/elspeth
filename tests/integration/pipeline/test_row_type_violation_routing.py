@@ -27,6 +27,7 @@ from sqlalchemy import select
 from elspeth.contracts import Determinism, PluginSchema, RunStatus, TerminalOutcome, TerminalPath, TransformResult
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import canonical_json
 from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
@@ -432,7 +433,8 @@ def test_wrong_typed_row_at_an_aggregation_routes_the_whole_batch_to_on_error(tr
 
     audit = _failed_flush_audit(db, result.run_id)
     reason = _expected_batch_reason()
-    reason_text = str(reason)
+    # Rendered as the recorded reason: its canonical JSON, the text a resume reads back.
+    reason_text = canonical_json(reason)
 
     # One terminal per token, written by the sink after durability; batch_id
     # stays on batch_members, not on the routed outcome.
@@ -530,7 +532,7 @@ def test_wrong_typed_row_at_a_discard_aggregation_quarantines_every_member_witho
             None,
             1,
         )
-        assert outcome.error_hash == compute_error_hash(str(reason))
+        assert outcome.error_hash == compute_error_hash(canonical_json(reason))
 
     assert audit["routing"] == []
     [failed_state] = audit["failed_states"]
@@ -1310,7 +1312,7 @@ def test_a_batch_plugin_row_fault_routes_the_whole_batch_with_a_value_free_reaso
             .scalars()
             .all()
         )
-    assert pending == [str(expected_reason)] * n
+    assert pending == [canonical_json(expected_reason)] * n
 
     # The value is in exactly one audit text surface: the failed row itself,
     # kept by design. That hit is the scan's positive control; the reason

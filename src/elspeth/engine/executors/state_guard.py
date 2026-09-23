@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from elspeth.contracts import AggregationResultMember, PipelineRow
+    from elspeth.contracts.audit import TokenRef
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
@@ -487,6 +488,35 @@ class NodeStateGuard:
         except LandscapePostCommitError:
             self._terminal_persisted = True
             raise
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_failure(
+        self,
+        *,
+        batch_id: str,
+        coordination_token: CoordinationToken,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        members: Sequence[tuple[TokenRef, PipelineRow]],
+        reason: TransformErrorReason,
+        destination: str,
+        divert_edge_id: str | None,
+        duration_ms: float,
+    ) -> None:
+        """Record the batch's FAILED verdict — node, batch, transform_errors and DIVERT — atomically."""
+        self._execution.complete_aggregation_failure(
+            batch_id=batch_id,
+            coordination_token=coordination_token,
+            aggregation_node_id=aggregation_node_id,
+            state_id=self.state_id,
+            trigger_type=trigger_type,
+            members=members,
+            reason=reason,
+            destination=destination,
+            divert_edge_id=divert_edge_id,
+            duration_ms=duration_ms,
+        )
         self._terminal_persisted = True
         self._completed = True
 

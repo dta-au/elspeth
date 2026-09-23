@@ -7,12 +7,17 @@ because the writes it adds only exist there as SQL the default selection never
 sends to PostgreSQL:
 
 - the per-member ``transform_errors`` executemany INSERT ... RETURNING
-  (``record_batch_transform_errors_leader``, operator ruling B5);
+  (``insert_batch_transform_errors_on``, operator ruling B5), inside the
+  batch's one FAILED-verdict transaction (``complete_aggregation_failure``);
 - the named-sink arm's BLOCKED -> PENDING_SINK ``complete_barrier`` handoff
   carrying ``pending_error_hash``/``pending_error_message`` (the CHECK arm
   on ``token_work_items``);
 - the discard arm's (FAILURE, QUARANTINED_AT_SOURCE) terminals written inside
-  that same transaction (operator ruling B3).
+  that same transaction (operator ruling B3);
+- resume of a recorded FAILED verdict (operator ruling 2026-09-23): the
+  correlated verdict predicate (``recorded_failure_verdict_condition``) that
+  keeps the batch out of ``get_incomplete_batches`` and hands its BLOCKED
+  members to ``list_recorded_aggregation_failures``.
 """
 
 from __future__ import annotations
@@ -22,7 +27,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.fixtures.plugins import CollectSink
 from tests.helpers.postgres_target import postgres_test_target
+from tests.integration.pipeline.test_batch_flush_recovery_and_redaction import (
+    _crash_sequence,
+    _FailOnceThenSumBatchTransform,
+    _outcome_evidence,
+    _pipeline,
+    _resume,
+    _run_id,
+)
 from tests.integration.pipeline.test_row_type_violation_routing import (
     _CSV_ROWS,
     _failed_flush_audit,
@@ -32,6 +46,7 @@ from tests.integration.pipeline.test_row_type_violation_routing import (
 from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.processor import RowProcessor
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from elspeth.web.execution.failure_samples import load_top_failure_categories
@@ -109,3 +124,38 @@ def test_failed_batch_disposition_on_postgres(
         assert error_analysis["transform_errors"]["total"] == 3
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("on_error", ["quarantine", "discard"])
+def test_resume_completes_a_recorded_verdict_on_postgres(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_error: str) -> None:
+    """Crash after the verdict committed, twice: resume completes it without re-invoking the plugin."""
+    with postgres_test_target(driver="psycopg") as fresh_url:
+        db = LandscapeDB.from_url(fresh_url)
+        assert db.engine.dialect.name == "postgresql"
+        try:
+            error_sink = CollectSink("quarantine") if on_error == "quarantine" else None
+            transform = _FailOnceThenSumBatchTransform()
+            env = _pipeline(tmp_path, transform, error_sink=error_sink, db=db)
+            _crash_sequence(
+                [(RowProcessor, "_complete_aggregation_flush", RowProcessor._complete_aggregation_flush, False)], 2, monkeypatch
+            )
+
+            with pytest.raises(RuntimeError, match="injected crash"):
+                env["orchestrator"].run(env["config"], graph=env["graph"], payload_store=env["payload_store"])
+            run_id = _run_id(db)
+            with pytest.raises(RuntimeError, match="injected crash"):
+                _resume(env, run_id)
+            assert RecorderFactory(db).execution.get_incomplete_batches(run_id) == [], "the verdict is never retried"
+            result = _resume(env, run_id)
+
+            assert transform.batch_calls == 1
+            assert result.status is (RunStatus.FAILED if error_sink is not None else RunStatus.COMPLETED_WITH_FAILURES)
+            if error_sink is not None:
+                assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}]
+            evidence = _outcome_evidence(db, run_id)
+            assert sum(evidence["terminals"].values()) == 3
+            assert sum(evidence["transform_errors"].values()) == 3
+            assert evidence["routing_events"] == (1 if error_sink is not None else 0)
+            assert evidence["batch_statuses"] == ["failed"]
+        finally:
+            db.close()

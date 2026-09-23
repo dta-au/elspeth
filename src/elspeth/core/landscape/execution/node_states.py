@@ -878,21 +878,59 @@ class NodeStateRepository:
         Returns:
             RoutingEvent model
         """
-        event_id_was_supplied = event_id is not None
-        routing_group_id_was_supplied = routing_group_id is not None
+        event = self.prepare_routing_event(
+            state_id,
+            edge_id,
+            mode,
+            reason,
+            owner="record_routing_event",
+            event_id=event_id,
+            routing_group_id=routing_group_id,
+            ordinal=ordinal,
+            reason_ref=reason_ref,
+        )
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="record_routing_event") as conn:
+            return self._insert_or_load_routing_decision(
+                [event],
+                conn=conn,
+                run_id=member_token.run_id,
+                owner="record_routing_event",
+                enforce_event_ids=event_id is not None,
+                enforce_group_id=routing_group_id is not None,
+            )[0]
+
+    def prepare_routing_event(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason | None = None,
+        *,
+        owner: str,
+        event_id: str | None = None,
+        routing_group_id: str | None = None,
+        ordinal: int = 0,
+        reason_ref: str | None = None,
+    ) -> RoutingEvent:
+        """Build one route of a state's decision, its reason bytes already durable.
+
+        The pre-transaction half of :meth:`record_routing_event`: identities
+        default to the state's stable decision identity, and a reason is
+        materialized in the payload store BEFORE any transaction that inserts
+        the event (so a crash can never leave an event whose ``reason_ref``
+        points at nothing). :meth:`record_routing_event_on` inserts it.
+        """
         routing_group_id = routing_group_id or self._default_routing_group_id(state_id)
         event_id = event_id or self._default_routing_event_id(routing_group_id, ordinal)
         reason_hash = stable_hash(reason) if reason is not None else None
         if reason is not None and self._payload_store is not None:
-            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner="record_routing_event")
+            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner=owner)
         materialized_reason_ref = self._materialize_routing_reason_before_insert(
             reason=reason,
             reason_hash=reason_hash,
             supplied_reason_ref=reason_ref,
         )
-        timestamp = now()
-
-        event = RoutingEvent(
+        return RoutingEvent(
             event_id=event_id,
             state_id=state_id,
             edge_id=edge_id,
@@ -901,18 +939,24 @@ class NodeStateRepository:
             mode=mode,
             reason_hash=reason_hash,
             reason_ref=materialized_reason_ref,
-            created_at=timestamp,
+            created_at=now(),
         )
 
-        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="record_routing_event") as conn:
-            return self._insert_or_load_routing_decision(
-                [event],
-                conn=conn,
-                run_id=member_token.run_id,
-                owner="record_routing_event",
-                enforce_event_ids=event_id_was_supplied,
-                enforce_group_id=routing_group_id_was_supplied,
-            )[0]
+    def record_routing_event_on(self, event: RoutingEvent, *, conn: Connection, run_id: str, owner: str) -> RoutingEvent:
+        """Insert one :meth:`prepare_routing_event` route as the state's whole decision, on ``conn``.
+
+        For a caller that must record the decision in the same transaction as
+        other writes (a failed aggregation batch's verdict). The state owns
+        exactly one decision; a retry of the identical decision loads it.
+        """
+        return self._insert_or_load_routing_decision(
+            [event],
+            conn=conn,
+            run_id=run_id,
+            owner=owner,
+            enforce_event_ids=False,
+            enforce_group_id=False,
+        )[0]
 
     def record_routing_events(
         self,
