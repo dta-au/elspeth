@@ -11,12 +11,15 @@ import pytest
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
+from elspeth.contracts.enums import RunMode
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.sources.aws_s3_source import AWSS3Source
 
 
 @dataclass
 class _Context:
+    run_mode: RunMode = RunMode.LIVE
+    call_mode_session: None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     validation_errors: list[dict[str, Any]] = field(default_factory=list)
 
