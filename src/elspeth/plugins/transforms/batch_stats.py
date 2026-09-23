@@ -8,6 +8,7 @@ will buffer rows and call process() with a list when the trigger fires.
 """
 
 import math
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -26,6 +27,10 @@ from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
 
 type BatchStatsAggregateRow = dict[str, object]
+
+# Row types a group_by value may carry: the scalar pipeline-row types plus
+# Decimal, whose non-finite form `_is_non_finite_group_key` already rejects.
+_SCALAR_GROUP_KEY_TYPES: tuple[type, ...] = (str, int, float, bool, type(None), Decimal, datetime)
 
 
 class BatchStatsConfig(TransformDataConfig):
@@ -126,7 +131,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fb377389d00c7d3b"
+    source_file_hash: str | None = "sha256:a4c53fefd44cb472"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -342,6 +347,20 @@ class BatchStats(BaseTransform):
         groups: dict[ScalarBucketKey, tuple[Any, list[tuple[int, PipelineRow]]]] = {}
         for row_index, row in enumerate(rows):
             group_value = row[self._group_by]
+            # Groups are dict buckets, so the key must be one scalar value. A
+            # JSON object or array arrives deep-frozen (mappingproxy / tuple):
+            # an object is unhashable and used to abort the run with a bare
+            # TypeError, and an array is not a category. Either one fails the
+            # WHOLE batch with a recorded reason, the same disposition as a
+            # wrong-typed value_field (elspeth-d5034647f0); it is never bucketed
+            # by equality or stringified into a key. None stays a legal key.
+            if type(group_value) not in _SCALAR_GROUP_KEY_TYPES:
+                raise BatchRowTypeError(
+                    field=self._group_by,
+                    row_index=row_index,
+                    expected="a scalar group key",
+                    found=type(group_value).__name__,
+                )
             group_key = scalar_bucket_key(group_value)
             grouped = groups.get(group_key)
             if grouped is None:
@@ -416,7 +435,6 @@ class BatchStats(BaseTransform):
             if skipped_missing_indices:
                 return {}, self._error_for_no_valid_values(
                     grouped_rows,
-                    group_value,
                     skipped_missing_indices,
                     skipped_non_finite_indices,
                 )
@@ -426,9 +444,7 @@ class BatchStats(BaseTransform):
                 "skipped_non_finite": len(skipped_non_finite_indices),
                 "skipped_non_finite_indices": skipped_non_finite_indices,
             }
-            if self._group_by is not None:
-                reason["group_by"] = self._group_by
-                reason["group_value"] = group_value
+            self._locate_group(reason, grouped_rows)
             return {}, TransformResult.error(
                 reason,
                 retryable=False,
@@ -446,9 +462,7 @@ class BatchStats(BaseTransform):
                 "batch_size": len(grouped_rows),
                 "valid_count": count,
             }
-            if self._group_by is not None:
-                overflow_reason["group_by"] = self._group_by
-                overflow_reason["group_value"] = group_value
+            self._locate_group(overflow_reason, grouped_rows)
             return {}, TransformResult.error(overflow_reason, retryable=False)
 
         result: BatchStatsAggregateRow = {
@@ -467,9 +481,7 @@ class BatchStats(BaseTransform):
                     "batch_size": len(grouped_rows),
                     "valid_count": count,
                 }
-                if self._group_by is not None:
-                    mean_error_reason["group_by"] = self._group_by
-                    mean_error_reason["group_value"] = group_value
+                self._locate_group(mean_error_reason, grouped_rows)
                 return {}, TransformResult.error(mean_error_reason, retryable=False)
 
         if skipped_missing_indices:
@@ -488,7 +500,6 @@ class BatchStats(BaseTransform):
     def _error_for_no_valid_values(
         self,
         grouped_rows: list[tuple[int, PipelineRow]],
-        group_value: Any,
         missing_indices: list[int],
         non_finite_indices: list[int],
     ) -> TransformResult:
@@ -511,10 +522,22 @@ class BatchStats(BaseTransform):
             "skipped_count": len(missing_indices) + len(non_finite_indices),
             "row_errors": row_errors,
         }
-        if self._group_by is not None:
-            reason["group_by"] = self._group_by
-            reason["group_value"] = group_value
+        self._locate_group(reason, grouped_rows)
         return TransformResult.error(reason, retryable=False)
+
+    def _locate_group(self, reason: TransformErrorReason, grouped_rows: list[tuple[int, PipelineRow]]) -> None:
+        """Name the failing group in an error reason without recording its value.
+
+        The group_by VALUE is row content (a customer, a tenant, a label), and an
+        audit reason records row indices, never row bodies. The group is named
+        by its field and the batch row where it was first seen, which is how
+        `_group_rows` orders groups. The value still reaches the OUTPUT row of a
+        successful group, where it is data.
+        """
+        if self._group_by is None:
+            return
+        reason["group_by"] = self._group_by
+        reason["error"] = f"group {self._group_by!r} first seen in row {grouped_rows[0][0]}"
 
     def _output_contract_for(self, results: list[BatchStatsAggregateRow]) -> SchemaContract:
         """Build one shared output contract for aggregate result rows."""

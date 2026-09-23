@@ -1077,6 +1077,19 @@ _BATCH_PLUGIN_CASES = [
         _wrong_type("t", "a string", "int", 0),
         id="report_assemble-int-text",
     ),
+    pytest.param(
+        "batch_stats",
+        "json",
+        [
+            {"id": 1, "v": 10, "g": {"tenant": "SENTINEL-group-6b0e"}},
+            {"id": 2, "v": 20, "g": {"tenant": "b"}},
+            {"id": 3, "v": 30, "g": {"tenant": "c"}},
+        ],
+        {"value_field": "v", "group_by": "g"},
+        "SENTINEL-group-6b0e",
+        _wrong_type("g", "a scalar group key", "mappingproxy", 0),
+        id="stats-object-group-key",
+    ),
 ]
 
 
