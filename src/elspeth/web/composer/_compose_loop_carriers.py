@@ -206,6 +206,12 @@ class _ToolOutcome:
 
     ``call`` is the ELSPETH-owned tool-call projection admitted before the raw
     provider response is discarded.
+
+    ``strict_sent`` / ``wire_conformant`` are the call's wire facts, with the
+    meanings of the same fields on ``ComposerToolInvocation``. P4 writes them
+    beside ``function`` on the redacted assistant ``tool_calls`` entry.
+    ``run_tool_batch`` always passes both; the defaults serve direct test
+    constructions only.
     """
 
     call: _AdmittedToolCall
@@ -215,6 +221,8 @@ class _ToolOutcome:
     error_message: str | None
     pre_version: int
     post_version: int
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     def __post_init__(self) -> None:
         if self.error_category is not None:
@@ -222,6 +230,10 @@ class _ToolOutcome:
                 raise TypeError("_ToolOutcome.error_category must be a ToolArgumentErrorCategory")
             if self.error_class is None:
                 raise ValueError("_ToolOutcome with an error_category must carry the error_class that was raised")
+        if self.strict_sent is not None and type(self.strict_sent) is not bool:
+            raise TypeError("_ToolOutcome.strict_sent must be bool or None")
+        if self.wire_conformant is not None and type(self.wire_conformant) is not bool:
+            raise TypeError("_ToolOutcome.wire_conformant must be bool or None")
         freeze_fields(self, "call", "response")
 
 

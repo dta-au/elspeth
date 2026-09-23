@@ -37,7 +37,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttempt,
     ComposerPlannerAttemptLedTo,
@@ -149,10 +149,7 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolResult,
 )
-from elspeth.web.composer.tools._dispatch import (
-    execute_discovery_tool_with_context,
-    get_tool_definitions,
-)
+from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
@@ -169,6 +166,12 @@ from elspeth.web.composer.tools.state_responses import (
     NodeStateResponse,
     OutputStateResponse,
     SourceStateResponse,
+)
+from elspeth.web.composer.tools.wire_projection import (
+    _WIRE_TOOL_DEFS,
+    decode_wire_arguments,
+    stamp_planner_terminal,
+    wire_tool_definitions,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -693,6 +696,13 @@ class PlannerModelConfig:
     # latency on every tool-choreography turn.
     discovery_reasoning_effort: str
     candidate_reasoning_effort: str
+    # The tool-contract dialect each route is sent (S1). The ordinary planner
+    # route and the escape-hatch route resolve independently, exactly as
+    # their models and endpoints do: a hatch turn sends the terminal stamped
+    # for ``escape_hatch_tool_contract_dialect``, every other turn sends the
+    # discovery subset and terminal stamped for ``tool_contract_dialect``.
+    tool_contract_dialect: ToolContractDialect
+    escape_hatch_tool_contract_dialect: ToolContractDialect
     pricing_model: str | None = None
     # Senior advisor model for the one-shot escape-hatch overtime turn.
     # None disables the hatch: budget exhaustion raises exactly as before.
@@ -752,6 +762,12 @@ class PlannerModelConfig:
             raise ValueError("api_base and api_key must be configured together (or both omitted)")
         if (self.escape_hatch_api_base is None) != (self.escape_hatch_api_key is None):
             raise ValueError("escape_hatch_api_base and escape_hatch_api_key must be configured together (or both omitted)")
+        for dialect_field_name, dialect_value in (
+            ("tool_contract_dialect", self.tool_contract_dialect),
+            ("escape_hatch_tool_contract_dialect", self.escape_hatch_tool_contract_dialect),
+        ):
+            if type(dialect_value) is not ToolContractDialect:
+                raise TypeError(f"{dialect_field_name} must be a ToolContractDialect")
         for integer_field_name, integer_value in (
             ("max_composition_turns", self.max_composition_turns),
             ("max_discovery_turns", self.max_discovery_turns),
@@ -1416,8 +1432,18 @@ class _ParsedToolCall:
     name: str
     raw_arguments: str
     arguments: Mapping[str, Any]
+    # Wire facts (S1): ``strict_sent`` mirrors the ``strict`` key sent for
+    # this tool on this call (``None`` when no key was sent, D16);
+    # ``wire_conformant`` is whether the raw arguments validated against the
+    # W that was sent, ``None`` where nothing was decoded (the terminal, or a
+    # name outside the sent palette).
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     def __post_init__(self) -> None:
+        for fact_name, fact in (("strict_sent", self.strict_sent), ("wire_conformant", self.wire_conformant)):
+            if fact is not None and type(fact) is not bool:
+                raise TypeError(f"{fact_name} must be an exact bool or None")
         freeze_fields(self, "arguments")
 
 
@@ -1484,10 +1510,17 @@ def _claimed_deferred_intent_schema() -> _ClaimedDeferredIntentSchema:
 
 def planner_terminal_tool_definition(
     terminal_contract: PlannerTerminalContract | None = None,
+    *,
+    dialect: ToolContractDialect,
 ) -> dict[str, Any]:
-    """Return the sole terminal with the exact request-selected schema."""
+    """Return the sole terminal with the exact request-selected schema, stamped for ``dialect``.
+
+    The terminal is never strict-capable in S1: ``openai_strict`` adds an
+    explicit ``strict: false`` and ``none`` keeps today's bytes. The
+    ``parameters`` are the same on both dialects.
+    """
     selected = terminal_contract or canonical_planner_terminal_contract()
-    return {
+    definition = {
         "type": "function",
         "function": {
             "name": _TERMINAL_TOOL_NAME,
@@ -1503,6 +1536,7 @@ def planner_terminal_tool_definition(
             },
         },
     }
+    return stamp_planner_terminal(definition, dialect)
 
 
 def build_planner_request_kwargs(
@@ -1550,28 +1584,36 @@ def build_planner_request_kwargs(
 def planner_tool_definitions(
     policy: PlannerDiscoveryPolicy | None = None,
     *,
+    dialect: ToolContractDialect,
     terminal_contract: PlannerTerminalContract | None = None,
 ) -> list[dict[str, Any]]:
-    """Return an ordered request-owned read-only subset and sole terminal."""
-    registered = {definition["name"]: definition for definition in get_tool_definitions()}
-    missing = _PLANNER_DISCOVERY_TOOL_NAME_SET - registered.keys()
+    """Return an ordered request-owned read-only subset and sole terminal, stamped for ``dialect``.
+
+    The discovery entries are the loop's own wire entries for ``dialect``
+    (:func:`~elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
+    filtered and ordered by the policy, so a discovery tool is byte-equal on
+    both routes. On ``none`` that is the registry entry unchanged.
+    """
+    wire_entries = {tool["function"]["name"]: tool for tool in wire_tool_definitions(dialect)}
+    missing = _PLANNER_DISCOVERY_TOOL_NAME_SET - wire_entries.keys()
     if missing:
         raise RuntimeError(f"planner discovery declarations are missing: {sorted(missing)}")
     names = PLANNER_DISCOVERY_TOOL_NAMES if policy is None else policy.discovery_tool_names
     if tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name in names) != names:
         raise RuntimeError("planner discovery policy is not an order-preserving registered subset")
-    discovery = [
-        {
-            "type": "function",
-            "function": {
-                "name": registered[name]["name"],
-                "description": registered[name]["description"],
-                "parameters": registered[name]["parameters"],
-            },
-        }
-        for name in names
-    ]
-    return [*discovery, planner_terminal_tool_definition(terminal_contract)]
+    discovery = [wire_entries[name] for name in names]
+    return [*discovery, planner_terminal_tool_definition(terminal_contract, dialect=dialect)]
+
+
+def _assert_tools_stamped_for(tools: Sequence[Mapping[str, Any]], dialect: ToolContractDialect) -> None:
+    """Raise unless every tool carries an exact-bool ``strict`` exactly when ``dialect`` is ``openai_strict``."""
+    stamped = dialect == ToolContractDialect.OPENAI_STRICT
+    for tool in tools:
+        function = tool["function"]
+        if stamped and ("strict" not in function or type(function["strict"]) is not bool):
+            raise AuditIntegrityError("planner tool list is not stamped for its openai_strict route")
+        if not stamped and "strict" in function:
+            raise AuditIntegrityError("planner tool list is stamped although its route sends the none dialect")
 
 
 def _assert_planner_call_matches_manifest(
@@ -1685,7 +1727,21 @@ def _parse_response_tool_calls(
     max_tool_calls: int,
     allow_text: bool = False,
     text_marker: str | None = None,
+    dialect: ToolContractDialect,
+    sent_tool_names: frozenset[str],
 ) -> tuple[Any, tuple[_ParsedToolCall, ...]]:
+    """Parse one planner response into its tool calls.
+
+    Each non-terminal call whose name is in ``sent_tool_names`` (the tools
+    sent on this call, stamped for ``dialect``) is decoded with
+    :func:`~elspeth.web.composer.tools.wire_projection.decode_wire_arguments`
+    before :class:`_ParsedToolCall` is built, so every pre-dispatch reader
+    (information keys, the cycle guard, schema bookkeeping) and dispatch see
+    the semantic form. Any other name keeps its arguments unchanged with no
+    wire facts (D17): the palette is not enforced at dispatch, so decode
+    must not touch a W that was never sent. Both keywords are required
+    (D10): a defaulted form would be a second path that decodes nothing.
+    """
     choices = _provider_field(response, "choices")
     if type(choices) not in {list, tuple} or len(choices) != 1:
         raise PipelinePlannerError("planner response must contain exactly one choice", code="MALFORMED_RESPONSE")
@@ -1735,7 +1791,24 @@ def _parse_response_tool_calls(
             raise PipelinePlannerError("planner response contains duplicate tool call ids", code="MALFORMED_RESPONSE")
         seen_call_ids.add(call_id)
         arguments = _parse_json_object(raw_arguments, label=f"{name} arguments")
-        parsed.append(_ParsedToolCall(call_id, name, cast(str, raw_arguments), arguments))
+        strict_sent: bool | None = None
+        wire_conformant: bool | None = None
+        if name != _TERMINAL_TOOL_NAME and name in sent_tool_names:
+            if dialect == ToolContractDialect.OPENAI_STRICT:
+                strict_sent = _WIRE_TOOL_DEFS[dialect][name].strict_capable
+            decoded = decode_wire_arguments(name, dialect, cast(dict[str, Any], arguments))
+            arguments = decoded.semantic
+            wire_conformant = decoded.wire_conformant
+        parsed.append(
+            _ParsedToolCall(
+                call_id,
+                name,
+                cast(str, raw_arguments),
+                arguments,
+                strict_sent=strict_sent,
+                wire_conformant=wire_conformant,
+            )
+        )
     terminal_calls = tuple(call for call in parsed if call.name == _TERMINAL_TOOL_NAME)
     # One terminal call batched with discovery calls is returned: the loop
     # rejects that turn repairably before dispatching anything in it. Two
@@ -3772,7 +3845,7 @@ async def _plan_pipeline_inner(
     information_manifest = discovery_policy.manifest
     declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
     pending_information = set(declared_pending_information)
-    tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
+    tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect, terminal_contract=terminal_contract)
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state.to_wire()
@@ -3865,7 +3938,22 @@ async def _plan_pipeline_inner(
         nonlocal total_calls, total_cost
         effective_model = model_override or model_config.model_identifier
         effective_pricing_model = model_config.escape_hatch_pricing_model if model_override is not None else model_config.pricing_model
+        # Endpoint affordance: select by the SAME condition that selects
+        # effective_model above (model_override set == hatch turn), so
+        # the escape-hatch call never lands on the primary's endpoint —
+        # the two roles are independent by design. The tool-contract
+        # dialect follows the same condition, so a hatch turn is stamped
+        # for the hatch route.
+        if model_override is not None:
+            api_base, api_key = model_config.escape_hatch_api_base, model_config.escape_hatch_api_key
+            effective_dialect = model_config.escape_hatch_tool_contract_dialect
+        else:
+            api_base, api_key = model_config.api_base, model_config.api_key
+            effective_dialect = model_config.tool_contract_dialect
         active_tools = tools if tools_override is None else tools_override
+        # The manifest and ``tools_spec_hash`` below hash exactly these
+        # bytes, so a list stamped for another route must not reach them.
+        _assert_tools_stamped_for(active_tools, effective_dialect)
         cache_marked_messages, cache_marked_tools = (
             apply_anthropic_cache_markers(messages, active_tools)
             if supports_anthropic_prompt_cache_markers(effective_model)
@@ -3968,14 +4056,6 @@ async def _plan_pipeline_inner(
             started_at = datetime.now(UTC)
             started_ns = time.monotonic_ns()
             response: Any = None
-            # Endpoint affordance: select by the SAME condition that selects
-            # effective_model above (model_override set == hatch turn), so
-            # the escape-hatch call never lands on the primary's endpoint —
-            # the two roles are independent by design.
-            if model_override is not None:
-                api_base, api_key = model_config.escape_hatch_api_base, model_config.escape_hatch_api_key
-            else:
-                api_base, api_key = model_config.api_base, model_config.api_key
             kwargs = build_planner_request_kwargs(
                 model=effective_model,
                 messages=marked_messages,
@@ -4131,6 +4211,8 @@ async def _plan_pipeline_inner(
                     max_tool_calls=model_config.max_tool_calls_per_turn,
                     allow_text=allow_text_reply,
                     text_marker=text_reply_marker,
+                    dialect=effective_dialect,
+                    sent_tool_names=frozenset(tool["function"]["name"] for tool in active_tools),
                 )
             except PipelinePlannerError as exc:
                 if exc.code == "TOOL_CALLS_EXHAUSTED":
@@ -4257,7 +4339,9 @@ async def _plan_pipeline_inner(
                 assert hatch_error is not None
                 message, calls, audited_call = await call_model(
                     model_override=model_config.escape_hatch_model,
-                    tools_override=[planner_terminal_tool_definition(terminal_contract)],
+                    tools_override=[
+                        planner_terminal_tool_definition(terminal_contract, dialect=model_config.escape_hatch_tool_contract_dialect)
+                    ],
                     allow_text_reply=True,
                     reasoning_effort=model_config.candidate_reasoning_effort,
                     attempt_phase_hint=ComposerPlannerAttemptPhase.HATCH,
@@ -5036,6 +5120,8 @@ async def _plan_pipeline_inner(
                 call.arguments,
                 version_before=current_state.version,
                 actor=originating_message.user_id or "pipeline-planner",
+                strict_sent=call.strict_sent,
+                wire_conformant=call.wire_conformant,
             )
 
             async def execute_discovery(call_to_execute: _ParsedToolCall = call) -> _AuditedDiscoveryResult:
@@ -5214,7 +5300,7 @@ async def _plan_pipeline_inner(
         if next(discovery_results, None) is not None:
             raise AuditIntegrityError("planner discovery produced an unowned result")
         discovery_policy = discovery_policy.with_manifest(information_manifest)
-        tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
+        tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect, terminal_contract=terminal_contract)
         trail.finish_attempt(
             "discovery",
             "discovery_executed",

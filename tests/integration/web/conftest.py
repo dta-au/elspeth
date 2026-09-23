@@ -673,6 +673,20 @@ def inject_commit_OperationalError() -> object:
     return _install
 
 
+# The composer's strict-transport resolver (S1 T8) reads these base-URL and
+# api-version variables, and pytest loads ``.env``; scrub them so a web
+# integration test's tool wire never depends on the developer's shell. Not in
+# the root conftest: the live provider tests under tests/integration/plugins/
+# read Azure settings from the environment.
+_COMPOSER_ROUTE_ENV = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENROUTER_API_BASE", "AZURE_API_VERSION")
+
+
+@pytest.fixture(autouse=True)
+def _scrub_composer_route_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _COMPOSER_ROUTE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _fenced_compose_for_legacy_tests(monkeypatch):
     """See tests/helpers/composer_lease.py."""

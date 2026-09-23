@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.plugins.infrastructure.manager import PluginManager
@@ -217,7 +218,7 @@ def test_all_planner_surfaces_share_canonical_core_schema_and_tool_identity() ->
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "Build a complete pipeline."},
             ],
-            tools=planner_tool_definitions(),
+            tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
             canonical_schema=canonical_set_pipeline_schema(),
         )
         for surface, profile, prompt in surfaces

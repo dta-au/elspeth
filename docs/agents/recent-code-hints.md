@@ -8,6 +8,24 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-24 — the wire fidelity matrix pins LiteLLM's strict-tool wire per route, and the root conftest now fixes
+  the cost map on purpose** (composer strict tool contracts S1, task T11; branch `feat/strict-tool-contracts-s1`).
+  `tests/unit/web/composer/test_wire_fidelity_matrix.py` records what LiteLLM 1.102 transmits (loopback
+  `ThreadingHTTPServer` on port 0, `respx` for `api.openai.com`) for requests built by the production builders under
+  each route's resolved dialect. Measured: OpenRouter forwards the stamped list byte-for-byte (an ECMA-only `pattern`,
+  a root `oneOf` and an `enum` `null` included); OpenAI-compatible and hosted chat drop the ECMA-only `pattern`; Azure
+  and hosted chat flatten a root `oneOf`; Bedrock converse drops `null` from an `enum`; native Anthropic drops a forced
+  `strict`; and the Responses bridge writes `"strict": null` on every tool sent without the key, so on a bridged route
+  today's bytes are `strict: null`, not an absent key. ELSPETH's gateway rejects both `strict: true` and
+  `strict: false` (appended rows in `tests/integration/web/composer/test_composer_against_gateway.py`). The matrix
+  asserts the local cost map before every row. That held only by accident: `configure_litellm_pricing()` ran because
+  `tests/unit/web/conftest.py` happened to import ELSPETH pricing before LiteLLM, and a test module outside that tree
+  that imported LiteLLM first got the remote map (measured: `source` was `remote`). The root conftest now calls it
+  after its imports, none of which loads LiteLLM (measured). Lesson: a precondition that holds only through import
+  order in an unrelated conftest is not a precondition — set it where every test inherits it, and assert it where it
+  is relied on.
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
+
 - **2026-09-23 — advisor blocker retry copy now follows the cause it names; the note never swaps a finding for a CLEAN
   sub-heading** (elspeth-032ec69c41 self-review; the withheld-sentence defect from the same review landed separately as
   1809379f6). Pinned in `tests/unit/web/composer/test_advisor_checkpoint.py`. (1) `_ADVISOR_NOTE_VERDICT_LEAD_RE`

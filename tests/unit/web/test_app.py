@@ -2081,6 +2081,89 @@ class TestLifespanShutdown:
         # its own: every probe returned at once, so almost all of it.
         assert 44.0 < timeouts[2] <= 45.0
 
+    @pytest.mark.asyncio
+    async def test_lifespan_caps_three_planner_role_probes_on_a_forwarding_hatch(self, monkeypatch, tmp_path) -> None:
+        """S1 T8 / D9: an OpenRouter advisor adds ``hatch_terminal``, a planner-role probe with the 5 s cap.
+
+        Control: order the hatch after the advisor and the surface order goes red.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
+        surfaces: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            surfaces.append(request.surface)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
+        ):
+            async with lifespan(app):
+                pass
+
+        assert surfaces == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
+        # Every planner-role probe is capped at min(remaining, 5 s); the
+        # advisor gets what is left of the one deadline after all three
+        # (every probe returned at once, so almost all of it).
+        assert timeouts[:3] == [5.0, 5.0, 5.0]
+        assert 44.0 < timeouts[3] <= 45.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rejected_surface", ["hatch_terminal", "planner_tools", "loop_tools", "advisor"])
+    async def test_hatch_terminal_rejection_is_nonfatal(self, monkeypatch, tmp_path, rejected_surface: str) -> None:
+        """Ruling 8 (b): a ``hatch_terminal`` 400 is logged and boot continues; every other surface's 400 stays fatal.
+
+        Control: drop the surface check so every 400 is non-fatal, and the
+        ``planner_tools`` case goes red.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+        sent: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            sent.append(request.surface)
+            if request.surface == rejected_surface:
+                raise ComposerBootConfigError(
+                    f"composer {request.role} boot request rejected by {request.model}: surface={request.surface}"
+                )
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        if rejected_surface == "hatch_terminal":
+            with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+                async with lifespan(app):
+                    pass
+            assert sent == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+            statuses = {attributes["probed_surface"]: attributes["probe_status"] for _amount, attributes in counter.calls}
+            assert statuses == {"loop_tools": "success", "planner_tools": "success", "hatch_terminal": "rejected", "advisor": "success"}
+            [event] = [entry for entry in logs if entry["event"] == "composer_boot_probe_rejected_nonfatal"]
+            assert event["probed_surface"] == "hatch_terminal"
+            assert event["probed_role"] == "planner"
+            assert event["model"] == "openrouter/z-ai/glm-5.3"
+            assert (event["tool_count"], event["strict_true_count"], event["strict_false_count"], event["strict_key_omitted"]) == (
+                1,
+                0,
+                1,
+                0,
+            )
+            assert "hatch" in event["action"]
+            assert "rejected by" not in repr(event)
+        else:
+            with (
+                patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+                pytest.raises(ComposerBootConfigError, match=f"surface={rejected_surface}"),
+            ):
+                async with lifespan(app):
+                    pass
+            assert sent[-1] == rejected_surface
+            assert [attributes["probe_status"] for _amount, attributes in counter.calls][-1] == "rejected"
+
     def test_composer_boot_probe_deadline_fits_the_startup_contract(self) -> None:
         """The probes run before uvicorn binds, so they spend the 150 s startup contract.
 

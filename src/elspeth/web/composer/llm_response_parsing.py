@@ -41,8 +41,10 @@ from elspeth.contracts.composer_llm_audit import (
     PROVIDER_SERVED_UNRECOGNISED,
     ComposerLLMCall,
     ComposerLLMCallStatus,
+    ToolContractDialect,
     is_provider_served_name,
 )
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import stable_hash
@@ -692,6 +694,22 @@ def build_llm_call_record(
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
         provider_served = response_metadata.provider_served
+    # The dialect and strict count are read off the exact list that was sent
+    # (the bytes ``tools_spec_hash`` covers): every tool stamped with an exact
+    # bool is ``openai_strict``, no stamp at all is ``none``, and anything in
+    # between is a list ELSPETH should never have built.
+    tool_contract_dialect: ToolContractDialect | None = None
+    strict_tool_count: int | None = None
+    if tools:
+        stamps = [tool["function"]["strict"] if "strict" in tool["function"] else None for tool in tools]
+        if all(type(stamp) is bool for stamp in stamps):
+            tool_contract_dialect = ToolContractDialect.OPENAI_STRICT
+            strict_tool_count = sum(1 for stamp in stamps if stamp is True)
+        elif not any("strict" in tool["function"] for tool in tools):
+            tool_contract_dialect = ToolContractDialect.NONE
+            strict_tool_count = 0
+        else:
+            raise AuditIntegrityError("sent tool list mixes strict-stamped and unstamped tools")
     call = ComposerLLMCall(
         model_requested=model_requested,
         pricing_model=pricing_model if pricing_model is not None else model_requested,
@@ -725,6 +743,8 @@ def build_llm_call_record(
         planner_policy_hash=planner_policy_hash,
         planner_call_ordinal=planner_call_ordinal,
         provider_served=provider_served,
+        tool_contract_dialect=tool_contract_dialect,
+        strict_tool_count=strict_tool_count,
     )
     return bind_provider_attempt(call)
 

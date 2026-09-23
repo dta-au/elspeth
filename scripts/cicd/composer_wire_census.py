@@ -408,7 +408,10 @@ def _advisor_admission_handler() -> FunctionType:
 
     This deliberately supports the one owned batch adapter, not arbitrary
     method dispatch. A changed receiver, copied subset, or missing call fails
-    closed and requires an explicit provenance extension.
+    closed and requires an explicit provenance extension. The forwarded
+    ``arguments`` are the decoded arguments: ``run_tool_batch`` decodes the
+    provider's wire form through ``wire_projection`` before any gate, so the
+    advisor admission sees the semantic (S) form.
     """
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.tool_batch import run_tool_batch
@@ -434,7 +437,7 @@ def _advisor_admission_handler() -> FunctionType:
         or len(call.args) != 1
         or not _input_expression(call.args[0], "arguments")
     ):
-        raise CensusError("advisor interception does not forward complete original arguments")
+        raise CensusError("advisor interception does not forward the complete decoded arguments")
     handler = vars(ComposerServiceImpl)[call.func.attr]
     if not isinstance(handler, FunctionType):
         raise CensusError("advisor admission is not an owned service method")

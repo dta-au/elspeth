@@ -268,17 +268,66 @@ provided.
 At startup the service also sends short probe requests to the Composer
 models (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`), built
 exactly as production builds them: the planner model receives the compose
-loop's full tool list and, separately, the pipeline planner's tool list, and
-the advisor model receives its structured-output request. A provider *bad
-request* — for example a model that rejects the configured
+loop's full tool list and, separately, the pipeline planner's tool list, each
+stamped with the strict tool contracts its route sends (see
+`ELSPETH_WEB__COMPOSER_STRICT_TOOLS` below), and the advisor model receives
+its structured-output request. When the advisor's route sends strict
+contracts, the advisor model also receives the pipeline planner's
+escape-hatch request (`hatch_terminal`): the proposal tool alone, as a
+16-token check that the request is accepted. A provider *bad request* — for
+example a model that rejects the configured
 `ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED`, or a
 tool schema — fails startup, because that is a fixable operator
-configuration error. All probe requests share one 45-second deadline, and
-each planner request is also capped at 5 seconds. Timeouts and transient
+configuration error. The one exception is a rejected `hatch_terminal`
+request: it is logged as `composer_boot_probe_rejected_nonfatal` and boot
+continues, and escape-hatch turns on that route fail until the route or
+`ELSPETH_WEB__COMPOSER_STRICT_TOOLS` is changed. All probe requests share one
+45-second deadline, and each planner-model request (including
+`hatch_terminal`) is also capped at 5 seconds. Timeouts and transient
 provider, auth, or network failures do not block boot; they are logged as
 `composer_boot_probe_transient_failure` (tool schemas or structured-output
 conformance unverified at boot), and the Composer is exercised again at
-first use.
+first use. The routes each Composer role resolved to are logged once at
+startup as `composer_tool_contract_resolved`.
+
+### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
+
+On routes that can carry it, the Composer can send its tool list with OpenAI
+*strict* tool contracts (`"strict": true`), so the provider constrains the
+model's tool arguments to each tool's schema. Where it does, a field the tool
+treats as optional is sent as required and nullable, and the model's `null`
+is read back as "omitted" before the tool's own argument rules run. Those
+rules still decide whether a call is accepted. The setting chooses which
+routes send `strict`:
+
+| Value | Behaviour |
+| --- | --- |
+| `preferred` (default) | Only OpenRouter routes send `strict` (an `openrouter/` model on OpenRouter's own host, or an OpenAI-shaped model pointed at `https://openrouter.ai/...`). Custom endpoints, hosted OpenAI and Azure OpenAI send the same tool bytes as before this setting existed. Anthropic-family models never send `strict` on any setting. |
+| `forward_to_endpoint` | As `preferred`, and also sends `strict` to custom OpenAI-compatible endpoints and OpenRouter proxies, to hosted OpenAI, and to Azure OpenAI when its api-version (`AZURE_API_VERSION`, else LiteLLM's default) is `preview`, `latest`, `v1` or dated `2024-08-01` or later. Use it only for gateways you have verified accept the `strict` key, or as the opt-in for hosted OpenAI and Azure. ELSPETH's own LLM compatibility gateway rejects any `strict` key, `false` included. |
+| `off` | No route sends `strict`. Every route sends the tool bytes it sent before this setting existed. This is the remedy if a route rejects `strict`. |
+
+`off` restores the tool bytes and turns off the `null`-to-omitted read-back.
+It does not remove the `validation_errors` list that a Composer tool result
+carries when a call breaks its tool's schema (the field, as a declared name
+or a generic `field`/`item`/`index` token, and a fixed kind such as
+`missing` or `out_of_bounds`, never the rejected value or an unexpected
+key's name). That list does not depend on this setting.
+
+The route is decided per Composer role from its model, its configured
+endpoint, and the base-URL environment variables LiteLLM reads
+(`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE`). If one of
+those variables holds a base URL that cannot be parsed, that route sends the
+tool bytes it sent before this setting existed, whatever the setting says.
+
+Under `forward_to_endpoint`, hosted OpenAI (a bare model such as `gpt-5.5`
+with no endpoint, which is the Azure Container Apps bicep default) and Azure
+OpenAI routes with an api-version of at least `2024-08-01` send `strict`
+straight to the provider, and no live endpoint has yet been shown to accept
+it from ELSPETH. The startup probe sends that request, and a rejection on the
+planner route stops the app, so the first boot after opting in is that
+route's live acceptance test; `preferred` or `off` is the remedy. A rejection
+of the advisor-model `hatch_terminal` request is logged and does not stop
+boot.
 
 ### Pointing Composer at your own OpenAI-compatible endpoint
 

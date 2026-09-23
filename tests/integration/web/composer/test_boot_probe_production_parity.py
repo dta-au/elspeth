@@ -145,6 +145,25 @@ async def _capture_production_requests(
     message: str,
 ) -> list[dict[str, Any]]:
     """Run one real ``compose()`` turn and return every LiteLLM request it made."""
+    requests, _composer, _result = await _run_production_turn(tmp_path, monkeypatch, settings, message=message)
+    return requests
+
+
+async def _run_production_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: WebSettings,
+    *,
+    message: str,
+    reach_the_hatch: bool = False,
+) -> tuple[list[dict[str, Any]], ComposerServiceImpl, Any]:
+    """Run one real ``compose()`` turn; return its LiteLLM requests, the service and the result.
+
+    With ``reach_the_hatch``, every full-palette planner request is answered
+    with a discovery call, so the planner exhausts its discovery budget and
+    takes the escape-hatch turn (a terminal-only tool list), which is answered
+    with the terminal proposal.
+    """
     engine = create_session_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     initialize_session_schema(engine)
     with engine.begin() as conn:
@@ -167,6 +186,9 @@ async def _capture_production_requests(
 
     async def completion(**kwargs: Any) -> _Response:
         requests.append(kwargs)
+        if reach_the_hatch and "num_retries" in kwargs and len(kwargs["tools"]) > 1:
+            discovery = _ToolCall(id=f"parity-discovery-{len(requests)}", function=_Function(name="list_sources", arguments="{}"))
+            return _Response(choices=[_Choice(message=_Message(content=None, tool_calls=[discovery]))], usage=_usage())
         if "tools" in kwargs and any(tool["function"]["name"] == "emit_pipeline_proposal" for tool in kwargs["tools"]):
             call = _ToolCall(
                 id="parity-terminal",
@@ -179,7 +201,7 @@ async def _capture_production_requests(
         return _Response(choices=[_Choice(message=_Message(content="I can help you build a pipeline.", tool_calls=[]))], usage=_usage())
 
     monkeypatch.setattr("litellm.acompletion", completion)
-    await composer.compose(
+    result = await composer.compose(
         message,
         [],
         CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -187,7 +209,7 @@ async def _capture_production_requests(
         user_id="parity-user",
         user_message_id=str(user_message.id),
     )
-    return requests
+    return requests, composer, result
 
 
 async def _capture_probe_requests(monkeypatch: pytest.MonkeyPatch, settings: WebSettings) -> dict[str, dict[str, Any]]:
@@ -290,3 +312,148 @@ async def test_mutation_control_changed_planner_token_cap_makes_the_comparison_r
 
     assert probe["max_tokens"] != production["max_tokens"]
     assert _without(probe, "messages", "tools") != _without(production, "messages", "tools")
+
+
+# --- S1 T8: stamped routes ------------------------------------------------------
+
+_ADVISOR = "openrouter/z-ai/glm-5.3"
+_PROXY = "https://proxy.example/v1"
+_PROXY_KEY = "parity-proxy-key"  # secret-scan: allow-this-line
+
+
+def _strict_map(tools: list[dict[str, Any]]) -> dict[str, object]:
+    return {tool["function"]["name"]: (tool["function"]["strict"] if "strict" in tool["function"] else "omitted") for tool in tools}
+
+
+def _hatch_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
+    hatch = [request for request in requests if "num_retries" in request and request["model"] == _ADVISOR]
+    assert len(hatch) == 1, "the planner took no escape-hatch turn"
+    return hatch[0]
+
+
+def _record_planner_llm_calls(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Capture every ``ComposerLLMCall`` the pipeline planner builds (its audited call records)."""
+    recorded: list[Any] = []
+    real_builder = planner_module.build_llm_call_record
+
+    def recording_builder(**kwargs: Any) -> Any:
+        call = real_builder(**kwargs)
+        recorded.append(call)
+        return call
+
+    monkeypatch.setattr(planner_module, "build_llm_call_record", recording_builder)
+    return recorded
+
+
+def _hatch_call(recorded: list[Any]) -> Any:
+    calls = [call for call in recorded if call.model_requested == _ADVISOR]
+    assert len(calls) == 1
+    return calls[0]
+
+
+@pytest.mark.asyncio
+async def test_probe_and_production_send_the_same_strict_flags_on_a_forwarding_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both routes resolve ``openai_strict``; the probe's stamps equal production's on every surface.
+
+    Controls: stamp the probe's loop list with ``NONE`` and it goes red; stamp
+    the probe's planner list with ``NONE`` and it goes red.
+    """
+    import os
+
+    from elspeth.web.composer.strict_transport import resolve_composer_tool_contract
+
+    settings = _settings(tmp_path, composer_endpoint_base_url=None, composer_endpoint_api_key=None, composer_advisor_model=_ADVISOR)
+    loop_production = _loop_request(
+        await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?")
+    )
+    planner_requests, composer, _result = await _run_production_turn(
+        tmp_path, monkeypatch, settings, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
+    )
+    probe = await _capture_probe_requests(monkeypatch, settings)
+
+    assert composer.tool_contract_summary.contract == resolve_composer_tool_contract(settings, env=os.environ)
+    assert [tool["function"]["strict"] for tool in probe["loop_tools"]["tools"]] == [
+        tool["function"]["strict"] for tool in loop_production["tools"]
+    ]
+    assert True in [tool["function"]["strict"] for tool in probe["loop_tools"]["tools"]]
+    production_planner = _strict_map(_planner_request(planner_requests)["tools"])
+    probe_planner = _strict_map(probe["planner_tools"]["tools"])
+    shared = production_planner.keys() & probe_planner.keys()
+    assert shared
+    assert {name: production_planner[name] for name in shared} == {name: probe_planner[name] for name in shared}
+    assert set(production_planner.values()) == {True, False}
+    assert (
+        _strict_map(probe["hatch_terminal"]["tools"])
+        == _strict_map(_hatch_request(planner_requests)["tools"])
+        == {"emit_pipeline_proposal": False}
+    )
+
+
+@pytest.mark.asyncio
+async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex finding 3, direction (i): planner row 4 (FORWARDING) + advisor row 5 (NONE, a proxy base).
+
+    Each ``NONE`` side comes from the routing table, not from D8's Anthropic
+    short-circuit. No hatch probe is sent, and the hatch turn goes to the
+    proxy with today's bytes. Direction (ii) is the next test. Control:
+    substitute the planner's dialect for the hatch dialect (the probe's
+    inclusion check and the service's escape-hatch dialect) and both
+    directions go red.
+    """
+    settings_i = _settings(
+        tmp_path,
+        composer_endpoint_base_url=None,
+        composer_endpoint_api_key=None,
+        composer_advisor_model=_ADVISOR,
+        composer_advisor_endpoint_base_url=_PROXY,
+        composer_advisor_endpoint_api_key=_PROXY_KEY,
+    )
+    probe_i = await _capture_probe_requests(monkeypatch, settings_i)
+    assert set(probe_i) == {"loop_tools", "planner_tools"}
+    assert True in _strict_map(probe_i["loop_tools"]["tools"]).values()
+    assert True in _strict_map(probe_i["planner_tools"]["tools"]).values()
+    recorded_i = _record_planner_llm_calls(monkeypatch)
+    requests_i, _composer_i, _result_i = await _run_production_turn(
+        tmp_path, monkeypatch, settings_i, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
+    )
+    hatch_i = _hatch_request(requests_i)
+    assert hatch_i["api_base"] == _PROXY
+    assert _strict_map(hatch_i["tools"]) == {"emit_pipeline_proposal": "omitted"}
+    assert _hatch_call(recorded_i).tool_contract_dialect.value == "none"
+
+
+@pytest.mark.asyncio
+async def test_hatch_probe_and_hatch_turn_follow_the_hatch_route_when_only_the_hatch_forwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex finding 3, direction (ii): planner row 5 (NONE, a proxy base) + advisor row 4 (FORWARDING).
+
+    The hatch probe is sent to the advisor's effective endpoint (no
+    ``api_base``: OpenRouter's default), not the planner's proxy, with the
+    terminal as ``strict: false``; the planner lists carry no ``strict`` key;
+    a production hatch turn sends the same terminal to the same endpoint.
+    """
+    settings_ii = _settings(
+        tmp_path,
+        composer_endpoint_base_url=_PROXY,
+        composer_endpoint_api_key=_PROXY_KEY,
+        composer_advisor_model=_ADVISOR,
+    )
+    probe_ii = await _capture_probe_requests(monkeypatch, settings_ii)
+    assert set(probe_ii) == {"loop_tools", "planner_tools", "hatch_terminal"}
+    assert set(_strict_map(probe_ii["loop_tools"]["tools"]).values()) == {"omitted"}
+    assert set(_strict_map(probe_ii["planner_tools"]["tools"]).values()) == {"omitted"}
+    assert "api_base" not in probe_ii["hatch_terminal"]
+    assert _strict_map(probe_ii["hatch_terminal"]["tools"]) == {"emit_pipeline_proposal": False}
+    recorded_ii = _record_planner_llm_calls(monkeypatch)
+    requests_ii, _composer_ii, _result_ii = await _run_production_turn(
+        tmp_path, monkeypatch, settings_ii, message="Build a CSV to JSONL pipeline.", reach_the_hatch=True
+    )
+    hatch_ii = _hatch_request(requests_ii)
+    assert "api_base" not in hatch_ii
+    assert _strict_map(hatch_ii["tools"]) == {"emit_pipeline_proposal": False}
+    assert _hatch_call(recorded_ii).tool_contract_dialect.value == "openai_strict"

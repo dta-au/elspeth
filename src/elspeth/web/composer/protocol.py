@@ -10,8 +10,9 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, TypeGuard, final
 from uuid import UUID
 
 from pydantic import ValidationError as PydanticValidationError
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.sessions.protocol import GuidedOperationFence
@@ -1151,6 +1153,53 @@ def _canonical_tool_argument_actual_type(value: object) -> str:
     return "invalid value"
 
 
+class SchemaViolationCode(StrEnum):
+    """Closed code for one S-gate violation (S1 T9).
+
+    A subset of the pydantic canonicaliser's codes (``audit.py``), so the
+    compose loop renders both carriers with one fixed-message table. The
+    canonicaliser's ``invalid_value`` has no S-gate source, and ``truncated``
+    is a rendering of a violation count, never a violation.
+    """
+
+    MISSING = "missing"
+    UNEXPECTED = "unexpected"
+    INVALID_CHOICE = "invalid_choice"
+    INVALID_TYPE = "invalid_type"
+    OUT_OF_BOUNDS = "out_of_bounds"
+    INVALID = "invalid"
+
+
+SCHEMA_VIOLATION_MAX_LOC_DEPTH: Final[int] = 4
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SchemaViolation:
+    """One closed S-gate violation: where (``loc``) and what kind (``code``).
+
+    ``loc`` holds only schema-declared property names or the generic
+    ``field``/``item``/``index`` tokens; the S gate never places a
+    model-authored key in it (plan C10). At most four segments.
+    """
+
+    loc: tuple[str, ...]
+    code: SchemaViolationCode
+
+    def __post_init__(self) -> None:
+        if type(self.loc) is not tuple or len(self.loc) > SCHEMA_VIOLATION_MAX_LOC_DEPTH:
+            raise ValueError("SchemaViolation.loc must be a tuple of at most 4 segments")
+        for segment in self.loc:
+            if type(segment) is not str or not segment or len(segment) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
+                raise ValueError("SchemaViolation.loc segments must be non-empty strings")
+        if type(self.code) is not SchemaViolationCode:
+            raise ValueError("SchemaViolation.code must be a SchemaViolationCode")
+
+
+def _valid_schema_violations(value: object) -> TypeGuard[tuple[SchemaViolation, ...]]:
+    return type(value) is tuple and all(type(item) is SchemaViolation for item in value)
+
+
 @final
 class ToolArgumentError(Exception):
     """Raised by a tool handler when LLM-supplied arguments are unusable.
@@ -1245,6 +1294,7 @@ class ToolArgumentError(Exception):
         "_safe_category",
         "_safe_code",
         "_safe_expected",
+        "_safe_schema_violations",
         "_tool_argument_error_sealed",
     )
 
@@ -1255,6 +1305,7 @@ class ToolArgumentError(Exception):
             "_safe_category",
             "_safe_code",
             "_safe_expected",
+            "_safe_schema_violations",
             "_tool_argument_error_sealed",
             "actual_type",
             "args",
@@ -1263,6 +1314,7 @@ class ToolArgumentError(Exception):
             "code",
             "expected",
             "safe_message",
+            "schema_violations",
         }
     )
     _RUNTIME_MUTABLE_ATTRS: ClassVar[frozenset[str]] = frozenset(
@@ -1286,7 +1338,10 @@ class ToolArgumentError(Exception):
         actual_type: str,
         code: str | None = None,
         category: ToolArgumentErrorCategory | None = None,
+        schema_violations: tuple[SchemaViolation, ...] = (),
     ) -> None:
+        if not _valid_schema_violations(schema_violations):
+            raise ValueError("ToolArgumentError.schema_violations must be a tuple of SchemaViolation")
         if type(argument) is not str or not argument:
             raise ValueError("ToolArgumentError.argument must be a non-empty identifier")
         if type(expected) is not str or not expected:
@@ -1307,6 +1362,7 @@ class ToolArgumentError(Exception):
         BaseException.__setattr__(self, "_safe_actual_type", safe_actual_type)
         BaseException.__setattr__(self, "_safe_code", code)
         BaseException.__setattr__(self, "_safe_category", safe_category)
+        BaseException.__setattr__(self, "_safe_schema_violations", schema_violations)
         super().__init__(safe_message)
         BaseException.__setattr__(self, "_tool_argument_error_sealed", True)
 
@@ -1390,6 +1446,27 @@ class ToolArgumentError(Exception):
         del value
 
     @property
+    def schema_violations(self) -> tuple[SchemaViolation, ...]:
+        """Closed S-gate violations (empty when the rejection is not the S gate's).
+
+        Rendered only by the compose loop's ``arg_error_payload``. A corrupt
+        backing value reads as empty, like the display fallbacks: the
+        violations are a repair hint, not the failure's classification. The
+        constructor always binds the slot, so its absence is a framework bug.
+        """
+        try:
+            value = BaseException.__getattribute__(self, "_safe_schema_violations")
+        except AttributeError:
+            raise FrameworkBugError("ToolArgumentError schema violations are missing") from None
+        if _valid_schema_violations(value):
+            return value
+        return ()
+
+    @schema_violations.setter
+    def schema_violations(self, value: object) -> None:
+        del value
+
+    @property
     def safe_message(self) -> str:
         return f"'{self.argument}' must be {self.expected}, got {self.actual_type}"
 
@@ -1454,6 +1531,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_seed(self) -> int | None: ...
+
+    @property
+    def composer_strict_tools(self) -> StrictToolsSetting: ...
 
     @property
     def composer_discovery_reasoning_effort(self) -> str: ...

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.web.composer._compose_loop_carriers import (
     _CallModelOutcome,
@@ -210,7 +211,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
     ):
         outcome = await service._call_model_turn(
             llm_messages=[{"role": "user", "content": "build it"}],
-            tools=composer_loop_tool_definitions(),
+            tools=composer_loop_tool_definitions(ToolContractDialect.NONE),
             state=state,
             initial_version=state.version,
             deadline=asyncio.get_event_loop().time() + 60.0,

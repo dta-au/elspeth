@@ -18,6 +18,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -55,6 +56,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind, Interp
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
+    ToolContractDialect,
 )
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -217,6 +219,11 @@ from elspeth.web.composer.source_demand import (
     sample_header_for_source,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary, _well_formed_query_entries
+from elspeth.web.composer.strict_transport import (
+    ComposerToolContractSummary,
+    StrictTransportDiagnostic,
+    resolve_composer_tool_contract,
+)
 from elspeth.web.composer.tools import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
@@ -226,13 +233,13 @@ from elspeth.web.composer.tools import (
     ToolResult,
     _sync_list_blobs,
     compute_proof_diagnostics,
-    get_tool_definitions,
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools._registry import resolve_tool_effects
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, interpretation_rate_cap_hit
+from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -861,46 +868,28 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_key"] = api_key
 
 
-def composer_loop_tool_definitions() -> list[dict[str, Any]]:
+def _diagnostic_value(diagnostic: StrictTransportDiagnostic | None) -> str | None:
+    """A route diagnostic's closed string value for the resolution log, or ``None``."""
+    return None if diagnostic is None else diagnostic.value
+
+
+def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
     """Return the tool list the freeform compose loop sends, in LiteLLM function format.
 
     The compose loop and the boot probe both call this, so the probe sends
-    exactly the list production sends.
+    exactly the list production sends. The list is the static wire
+    projection W of the registry for ``dialect``
+    (:func:`elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
+    which also owns the web ``set_pipeline`` envelope;
+    :mod:`elspeth.web.composer.tool_batch` unwraps that envelope before
+    custody, audit, redaction, or dispatch.
 
     Advisor is mandatory, so ``request_advisor_hint`` is always present
     in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
     affected; advisor is web-composer only by design (the tool is not
     registered in the CLI dispatch tables).
-
-    The web-visible ``set_pipeline`` arguments alone carry a required
-    ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
-    unions nested below a property but discard root-level ``oneOf``. The
-    registry and every internal/MCP consumer remain on the flat semantic
-    argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
-    provider envelope before custody, audit, redaction, or dispatch.
     """
-    definitions = get_tool_definitions()
-    tools: list[dict[str, Any]] = []
-    for defn in definitions:
-        parameters = defn["parameters"]
-        if defn["name"] == "set_pipeline":
-            parameters = {
-                "type": "object",
-                "properties": {"pipeline": parameters},
-                "required": ["pipeline"],
-                "additionalProperties": False,
-            }
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": defn["name"],
-                    "description": defn["description"],
-                    "parameters": parameters,
-                },
-            }
-        )
-    return tools
+    return wire_tool_definitions(dialect)
 
 
 def build_composer_loop_request_kwargs(
@@ -2488,6 +2477,36 @@ class ComposerServiceImpl:
         self._catalog = catalog
         self._sessions_service = sessions_service
         self._model = settings.composer_model
+        # The tool-contract dialect of each route, resolved once from the
+        # settings and the process environment (S1 T8, D20; the boot probe
+        # resolves through the same helper). ``_planner_dialect`` is the single
+        # resolution point for the compose loop and the pipeline planner's
+        # ordinary turns: the loop builds the list it sends and decode reads
+        # the dialect from this one value. The planner's escape-hatch
+        # (advisor) route has its own.
+        tool_contract = resolve_composer_tool_contract(settings, env=os.environ)
+        self._planner_dialect = tool_contract.planner.dialect
+        self._hatch_dialect = tool_contract.hatch.dialect
+        loop_tools = composer_loop_tool_definitions(self._planner_dialect)
+        self._tool_contract_summary = ComposerToolContractSummary(
+            contract=tool_contract,
+            loop_strict_tool_count=sum(1 for tool in loop_tools if "strict" in tool["function"] and tool["function"]["strict"] is True),
+            loop_tool_count=len(loop_tools),
+        )
+        # Operator-side only (ruling 2): closed values and counts, never a
+        # URL or an env value (D24).
+        slog.info(
+            "composer_tool_contract_resolved",
+            setting=tool_contract.setting,
+            planner_transport=tool_contract.planner.resolution.transport.value,
+            planner_dialect=tool_contract.planner.dialect.value,
+            planner_diagnostic=_diagnostic_value(tool_contract.planner.resolution.diagnostic),
+            hatch_transport=tool_contract.hatch.resolution.transport.value,
+            hatch_dialect=tool_contract.hatch.dialect.value,
+            hatch_diagnostic=_diagnostic_value(tool_contract.hatch.resolution.diagnostic),
+            loop_strict_tool_count=self._tool_contract_summary.loop_strict_tool_count,
+            loop_tool_count=self._tool_contract_summary.loop_tool_count,
+        )
         # Boot advisory only — the litellm registry has known gaps (see
         # elspeth.web.composer.reasoning), so a False here is a log line for
         # operators, never a gate.
@@ -2605,6 +2624,15 @@ class ComposerServiceImpl:
         # Concurrency: a single session is driven serially through one
         # compose() call at a time; a plain dict is sufficient.
         self._schemas_loaded_by_session: dict[str, set[tuple[str, str]]] = {}
+
+    @property
+    def tool_contract_summary(self) -> ComposerToolContractSummary:
+        """Both routes' resolved tool contract and the compose loop's effective strict count.
+
+        Operator-side and test-facing only: it is never published on the
+        unauthenticated status surface (D14, ruling 2).
+        """
+        return self._tool_contract_summary
 
     @classmethod
     def for_trained_operator(
@@ -4436,6 +4464,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
@@ -4848,6 +4878,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
@@ -5355,6 +5387,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
@@ -5672,6 +5706,7 @@ class ComposerServiceImpl:
             cancellation_requested=cancellation_requested,
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
+            tool_contract_dialect=self._planner_dialect,
             session_operation_authority=(turn_sessions_service.session_operation_authority if turn_sessions_service is not None else None),
             composition_turns_used=composition_turns_used,
             discovery_turns_used=discovery_turns_used,
@@ -7158,7 +7193,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
-        tools = composer_loop_tool_definitions()
+        tools = composer_loop_tool_definitions(self._planner_dialect)
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -7970,7 +8005,7 @@ class ComposerServiceImpl:
         method itself does not need to change shape.
         """
         if session_id is None:
-            # Compose-loop invariant. ``composer_loop_tool_definitions()`` filters
+            # Compose-loop invariant. ``composer_loop_tool_definitions`` filters
             # nothing: every compose turn advertises the session-aware
             # tools. What guarantees a session here is ``compose()``'s
             # admission, which refuses a turn without COMPOSE session

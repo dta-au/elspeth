@@ -353,7 +353,9 @@ def _produced_arg_error_classes() -> set[str]:
     from pydantic import BaseModel, ConfigDict
 
     from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+    from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.composer.protocol import ToolArgumentError
+    from elspeth.web.composer.tools.wire_projection import decode_wire_arguments
 
     class _Strict(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -368,6 +370,8 @@ def _produced_arg_error_classes() -> set[str]:
         # Canonicalization gate over decoded arguments: a JSON integer outside
         # the canonical domain.
         _raised_class_name(lambda: canonical_json(bounded_json_loads('{"a": 100000000000000000000000}', label="a"))),
+        # Wire decode: a malformed set_pipeline envelope.
+        _raised_class_name(lambda: decode_wire_arguments("set_pipeline", ToolContractDialect.NONE, {})),
         # Every other gate records a ToolArgumentError it raised or built.
         type(ToolArgumentError(argument="a", expected="b", actual_type="c", category=ToolArgumentErrorCategory.SEMANTIC_RULE)).__name__,
         # The advisor's pydantic model rejection records pydantic's class.

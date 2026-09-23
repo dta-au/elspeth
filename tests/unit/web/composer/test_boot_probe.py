@@ -19,9 +19,14 @@ import pytest
 from litellm.exceptions import InternalServerError
 
 import elspeth.web.composer.boot_probe as bp
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
+from elspeth.web.composer.pipeline_planner import (
+    build_planner_request_kwargs,
+    planner_terminal_tool_definition,
+    planner_tool_definitions,
+)
 from elspeth.web.composer.service import composer_loop_tool_definitions
 from elspeth.web.config import WebSettings
 
@@ -73,7 +78,7 @@ def test_requests_cover_every_surface_in_send_order(settings_factory: Any) -> No
 def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: Any) -> None:
     request = _request(settings_factory(composer_model="gpt-5.5"), "loop_tools")
 
-    assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions()
+    assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.NONE)
     assert request.to_litellm_kwargs()["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
     assert request.tool_count == 42
     assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 42)
@@ -82,7 +87,7 @@ def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: A
 def test_planner_request_sends_the_planner_tool_list_with_the_planner_token_cap(settings_factory: Any) -> None:
     settings = settings_factory(composer_model="gpt-5.5", composer_planner_max_completion_tokens=9000)
     request = _request(settings, "planner_tools")
-    planner_tools = planner_tool_definitions()
+    planner_tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
 
     assert request.to_litellm_kwargs()["tools"] == planner_tools
     assert request.to_litellm_kwargs()["max_tokens"] == 9000
@@ -104,6 +109,114 @@ def test_strict_counts_are_computed_from_the_sent_tools(settings_factory: Any) -
     )
 
     assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (1, 1, 40)
+
+
+# --- stamped routes (S1 T8) -------------------------------------------------------
+
+_OPENROUTER_PLANNER = "openrouter/deepseek/deepseek-v4.1-flash"
+
+
+def test_loop_request_on_a_forwarding_route_sends_the_stamped_loop_list(settings_factory: Any) -> None:
+    request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "loop_tools")
+
+    assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (32, 10, 0)
+
+
+def test_planner_request_on_a_forwarding_route_sends_the_stamped_planner_list(settings_factory: Any) -> None:
+    request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "planner_tools")
+
+    assert request.to_litellm_kwargs()["tools"] == planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (19, 1, 0)
+
+
+def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -> None:
+    """Control on a stamped base: flipping one ``true`` to ``false`` moves the counts."""
+    request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "loop_tools")
+    tools = [dict(tool, function=dict(tool["function"])) for tool in request.to_litellm_kwargs()["tools"]]
+    first_strict = next(index for index, tool in enumerate(tools) if tool["function"]["strict"] is True)
+    tools[first_strict]["function"]["strict"] = False
+    mutated = bp.ComposerProbeRequest(
+        surface="loop_tools", role="planner", model=_OPENROUTER_PLANNER, kwargs={**request.to_litellm_kwargs(), "tools": tools}
+    )
+
+    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (31, 11, 0)
+
+
+def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory: Any) -> None:
+    """D9 / ruling 1: the hatch route's terminal, sent as a 16-token rejection check to the advisor's endpoint.
+
+    Control: build it with the planner token cap and the ``max_tokens``
+    assertion goes red.
+    """
+    settings = settings_factory(
+        composer_model="gpt-5.5",
+        composer_discovery_reasoning_effort="low",
+        composer_candidate_reasoning_effort="high",
+        composer_advisor_endpoint_base_url="https://openrouter.ai/api/v1",
+        composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+    )
+    requests = bp.build_composer_probe_requests(settings)
+
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+    hatch = requests[2]
+    kwargs = hatch.to_litellm_kwargs()
+    assert (hatch.role, hatch.model) == ("planner", "openrouter/z-ai/glm-5.3")
+    assert kwargs["model"] == "openrouter/z-ai/glm-5.3"
+    assert kwargs["tools"] == [planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT)]
+    assert kwargs["tools"][0]["function"]["strict"] is False
+    assert kwargs["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
+    assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
+    assert kwargs["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+    assert "api_base" not in requests[1].kwargs
+    expected = build_planner_request_kwargs(
+        model="openrouter/z-ai/glm-5.3",
+        messages=[{"role": "user", "content": _PROBE_PROMPT}],
+        tools=[planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT)],
+        max_completion_tokens=settings.composer_planner_max_completion_tokens,
+        temperature=settings.composer_temperature,
+        seed=settings.composer_seed,
+        reasoning_effort="high",
+        api_base="https://openrouter.ai/api/v1",
+        api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+    )
+    expected["max_tokens"] = bp.LOOP_PROBE_MAX_TOKENS
+    assert kwargs == expected
+    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (0, 1, 0)
+
+
+def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: Any) -> None:
+    for advisor in ("anthropic/claude-sonnet-4-6", "probe-model"):
+        requests = bp.build_composer_probe_requests(settings_factory(composer_model=_OPENROUTER_PLANNER, composer_advisor_model=advisor))
+        assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
+
+
+def test_probe_env_defaults_to_the_process_environment_the_service_resolves_against(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any
+) -> None:
+    """D20: with no ``env=``, the probe resolves against ``os.environ``, as the service does.
+
+    ``OPENROUTER_API_BASE`` pointing at a proxy makes both OpenRouter routes
+    resolve to ``none``, so the probe sends no ``strict`` key and no
+    ``hatch_terminal``. The explicit ``env={}`` build is the in-test contrast:
+    the same settings without the variable send the stamped lists, so the
+    variable is what decides the outcome. Control: default the probe's
+    ``env`` to ``{}`` and this test goes red.
+    """
+    monkeypatch.setenv("OPENROUTER_API_BASE", "https://proxy.example/v1")
+    settings = settings_factory(composer_model=_OPENROUTER_PLANNER)
+
+    requests = bp.build_composer_probe_requests(settings)
+
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
+    loop, planner = requests[0], requests[1]
+    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 42)
+    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 20)
+
+    contrast = bp.build_composer_probe_requests(settings, env={})
+    assert [request.surface for request in contrast] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+    assert contrast[0].strict_true_count == 32
+    assert contrast[1].strict_true_count == 19
 
 
 def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_factory: Any) -> None:
@@ -130,7 +243,7 @@ def test_planner_request_is_the_planner_builder_output(settings_factory: Any) ->
     expected = build_planner_request_kwargs(
         model="openrouter/deepseek/deepseek-v4.1-flash",
         messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=planner_tool_definitions(),
+        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
         max_completion_tokens=settings.composer_planner_max_completion_tokens,
         temperature=0.3,
         seed=11,
@@ -174,10 +287,10 @@ def test_anthropic_routes_mirror_the_production_cache_markers(settings_factory: 
     loop = _request(settings, "loop_tools")
     planner = _request(settings, "planner_tools")
     loop_messages, loop_tools = apply_anthropic_cache_markers(
-        [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(), mark_history_tail=True
+        [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(ToolContractDialect.NONE), mark_history_tail=True
     )
     planner_messages, planner_tools = apply_anthropic_cache_markers(
-        [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions()
+        [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions(dialect=ToolContractDialect.NONE)
     )
 
     assert "cache_control" in loop.to_litellm_kwargs()["tools"][-1]
@@ -290,11 +403,22 @@ async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("surface", "tool_count"),
-    [("loop_tools", 42), ("planner_tools", len(planner_tool_definitions())), ("advisor", 0)],
+    ("surface", "tool_count", "strict_counts"),
+    [
+        ("loop_tools", 42, (0, 0, 42)),
+        (
+            "planner_tools",
+            len(planner_tool_definitions(dialect=ToolContractDialect.NONE)),
+            (0, 0, len(planner_tool_definitions(dialect=ToolContractDialect.NONE))),
+        ),
+        # The fixture's default OpenRouter advisor is FORWARDING, so the hatch
+        # terminal goes out with an explicit ``strict: false``.
+        ("hatch_terminal", 1, (0, 1, 0)),
+        ("advisor", 0, (0, 0, 0)),
+    ],
 )
 async def test_bad_request_names_the_surface_and_owned_request_facts(
-    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str, tool_count: int
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str, tool_count: int, strict_counts: tuple[int, int, int]
 ) -> None:
     from litellm.exceptions import BadRequestError
 
@@ -313,7 +437,8 @@ async def test_bad_request_names_the_surface_and_owned_request_facts(
     assert text.startswith(f"composer {request.role} boot request rejected by {request.model}:")
     assert f"surface={surface}," in text
     assert f"tool_count={tool_count}," in text
-    assert f"strict_true_count=0, strict_false_count=0, strict_key_omitted={tool_count}," in text
+    strict_true, strict_false, omitted = strict_counts
+    assert f"strict_true_count={strict_true}, strict_false_count={strict_false}, strict_key_omitted={omitted}," in text
     assert caught.value.__cause__ is provider_error
 
 

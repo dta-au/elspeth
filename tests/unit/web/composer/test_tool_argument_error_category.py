@@ -17,6 +17,7 @@ import pytest
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -495,7 +496,7 @@ def test_planner_rejection_closure_still_collapses_unknown_codes() -> None:
 
 
 def test_tool_list_builder_does_not_filter_session_aware_tools() -> None:
-    names = {tool["function"]["name"] for tool in composer_loop_tool_definitions()}
+    names = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
     assert "request_interpretation_review" in names
 
 

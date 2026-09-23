@@ -870,6 +870,44 @@ allowed_dict_patterns:
   # module, not LLM-supplied); Tier-1 audit-readiness is enforced by
   # the validity check inside the helper before the dict is deep-frozen.
   - "src/elspeth/web/composer/tools/_dispatch.py:_validate_and_freeze_tool_definition:defn"
+  # OpenAI strict-mode checker: each ``node`` is one subschema of an owned
+  # tool JSON Schema (the flat registry S or the wire projection W built from
+  # it). A JSON Schema node is an open keyword map by definition, so a
+  # TypedDict would have to enumerate every keyword the checker exists to
+  # reject; the helpers read it only after a ``type(x) is dict`` check.
+  - "src/elspeth/web/composer/tools/strict_profile.py:_type_names:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_object:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_array:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_keywords:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_object:node"
+  # Static wire projection W of the tool registry: every ``node``,
+  # ``parameters`` and ``function`` below is an owned JSON Schema subschema
+  # or LiteLLM function object derived at import from the registry S, and
+  # the returns are the provider wire format itself (OpenAI-compatible tool
+  # JSON). A JSON Schema node is an open keyword map by definition; the
+  # helpers read it only after a ``type(x) is dict`` check.
+  - "src/elspeth/web/composer/tools/wire_projection.py:_envelope:parameters"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_envelope:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_nullable:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_nullable:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_resolve_description:function"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_apply_overrides:function"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_subschemas:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_is_container_schema:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:wire_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/tools/wire_projection.py:stamp_planner_terminal:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:WireTool.thawed_function:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection._ledger_sentence:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection.project:node"
+  # Wire decode/encode: ``raw`` is the JSON object a provider sent as tool-call
+  # arguments (Tier 3, parsed at the ``@trust_boundary`` on
+  # ``decode_wire_arguments``), ``arguments`` is decode's private working
+  # copy of it, and encode returns the provider wire form. Each is open
+  # model-authored JSON whose keys are exactly what the flat schema S admits;
+  # a TypedDict per tool would duplicate S, which stays the only contract.
+  - "src/elspeth/web/composer/tools/wire_projection.py:decode_wire_arguments:raw"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_strip_null:arguments"
+  - "src/elspeth/web/composer/tools/wire_projection.py:encode_semantic_arguments:return"
   - "src/elspeth/web/composer/tools/sources.py:_execute_set_source:args"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_node:args"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_edge:args"

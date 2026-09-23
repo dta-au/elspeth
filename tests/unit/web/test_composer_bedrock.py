@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl, composer_loop_tool_definitions
@@ -77,7 +78,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     availability = service.get_availability()
     assert availability.available is True
     assert availability.provider == "bedrock"
-    expected_tool_names = {tool["function"]["name"] for tool in composer_loop_tool_definitions()}
+    expected_tool_names = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
 
     engine = service._require_sessions_service()._engine
     try:

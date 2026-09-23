@@ -220,11 +220,12 @@ class TestToolListOrderIsCacheKeyContract:
         ``get_tool_definitions``." Set inequality (one filtered out) is fine;
         order swap (cache-invalidating reorder) is not.
         """
+        from elspeth.contracts.composer_llm_audit import ToolContractDialect
         from elspeth.web.composer.service import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
 
         defn_names = [d["name"] for d in get_tool_definitions()]
-        tool_names = [t["function"]["name"] for t in composer_loop_tool_definitions()]
+        tool_names = [t["function"]["name"] for t in composer_loop_tool_definitions(ToolContractDialect.NONE)]
 
         # Subsequence-order invariant: every tool emitted is in the definition
         # list, and the indices form a strictly increasing sequence (i.e., no
@@ -240,11 +241,12 @@ class TestToolListOrderIsCacheKeyContract:
         assert set(tool_names).issubset(set(defn_names))
 
     def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
+        from elspeth.contracts.composer_llm_audit import ToolContractDialect
         from elspeth.web.composer.service import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
 
         definitions = get_tool_definitions()
-        tools = composer_loop_tool_definitions()
+        tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
 
         assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
         for definition, tool in zip(definitions, tools, strict=True):

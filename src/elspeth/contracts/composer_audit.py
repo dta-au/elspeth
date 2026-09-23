@@ -198,15 +198,31 @@ class ComposerToolInvocation:
         The closed :class:`ToolArgumentErrorCategory` of an ``ARG_ERROR``.
         Required on ``ARG_ERROR`` and ``None`` on every other status.
 
+    ``strict_sent``
+        The ``strict`` key sent for this tool on the call that produced it:
+        ``True``, ``False`` (an explicit ``strict: false`` was sent), or
+        ``None`` (no key was sent: the ``none`` tool-contract dialect, a tool
+        name that was not in the sent list, or a surface that sends no wire
+        schema, such as standalone MCP).
+
+    ``wire_conformant``
+        Whether the provider-authored arguments validated against the wire
+        schema they were sent under. Classification only: the flat registry
+        schema remains the admission contract. ``None`` exactly where no
+        arguments were decoded. There is no implication between the two
+        facts: a decoded call on the ``none`` dialect has
+        ``strict_sent=None`` and a boolean ``wire_conformant``.
+
     Immutability and the cross-field check
     --------------------------------------
     Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``, so
     ``frozen=True`` alone is sufficient. Deep-freezing exists because
     ``frozen=True`` leaves container contents mutable through the attribute
     reference; a scalar-only record has no container to reach through, so
-    no freeze guard is defined. ``__post_init__`` exists only for the
-    status/category cross-field check: an argument rejection must say which
-    closed category rejected it, and no other status may carry one.
+    no freeze guard is defined. ``__post_init__`` exists for the
+    status/category cross-field check (an argument rejection must say which
+    closed category rejected it, and no other status may carry one) and for
+    the exact-``bool``-or-``None`` type check on the two wire facts.
     """
 
     tool_call_id: str
@@ -228,10 +244,16 @@ class ComposerToolInvocation:
     authority_arguments_canonical: str | None = None
     authority_arguments_hash: str | None = None
     error_category: ToolArgumentErrorCategory | None = None
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     def __post_init__(self) -> None:
         if self.error_category is not None and type(self.error_category) is not ToolArgumentErrorCategory:
             raise TypeError("ComposerToolInvocation.error_category must be a ToolArgumentErrorCategory")
+        if self.strict_sent is not None and type(self.strict_sent) is not bool:
+            raise TypeError(f"ComposerToolInvocation.strict_sent must be bool or None, got {type(self.strict_sent).__name__}")
+        if self.wire_conformant is not None and type(self.wire_conformant) is not bool:
+            raise TypeError(f"ComposerToolInvocation.wire_conformant must be bool or None, got {type(self.wire_conformant).__name__}")
         if self.status is ComposerToolStatus.ARG_ERROR and self.error_category is None:
             raise ValueError("ComposerToolInvocation with status ARG_ERROR requires an error_category")
         if self.status is not ComposerToolStatus.ARG_ERROR and self.error_category is not None:
