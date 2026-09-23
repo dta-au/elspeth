@@ -182,8 +182,8 @@ Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 62. Landscape epoch 43
-is the current release boundary, so a Landscape database left at epoch 42 or
+session epoch is a recreate boundary, including epoch 62. Landscape epoch 44
+is the current release boundary, so a Landscape database left at epoch 43 or
 below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -206,7 +206,7 @@ and epochs; forward and backward compatibility decisions; and an explicit
 the freshly recreated current databases. Rollback across this boundary is
 unsupported: keep the service drained, repair the epoch-66 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-66/Landscape-epoch-43 record when binding candidate and rollback
+session-epoch-66/Landscape-epoch-44 record when binding candidate and rollback
 decisions.
 
 For a later candidate that has used identity administration, the window also
@@ -825,7 +825,7 @@ resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
 sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 66 (== SESSION_SCHEMA_EPOCH)
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 43 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 44 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 Any predecessor session or Landscape epoch is not repairable in place: keep the
