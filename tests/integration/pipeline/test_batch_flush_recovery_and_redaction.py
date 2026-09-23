@@ -32,6 +32,7 @@ from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape import execution_repository
+from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
@@ -215,7 +216,7 @@ def _crash_inside_the_verdict_transaction(crashes: int, monkeypatch: pytest.Monk
     flush's own cleanup marks the state and batch failed as a crash, exactly
     as for a plugin that raised.
     """
-    original = execution_repository.insert_batch_transform_errors_on
+    original = insert_batch_transform_errors_on
     raised = [0]
 
     def crash(*args: Any, **kwargs: Any) -> Any:

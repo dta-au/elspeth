@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import Table, func, select, update
 from sqlalchemy.sql import Executable
 
-from elspeth.contracts import BatchStatus, NodeStateStatus, NodeType, RoutingMode, TriggerType
+from elspeth.contracts import Batch, BatchStatus, NodeStateFailed, NodeStateStatus, NodeType, RoutingMode, TriggerType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import AuditIntegrityError, TransformErrorReason
 from elspeth.core.canonical import canonical_json
@@ -98,11 +98,23 @@ def _count(setup: RecorderSetup, table: Table) -> int:
         return int(conn.execute(select(func.count()).select_from(table)).scalar_one())
 
 
+def _batch(setup: RecorderSetup, batch_id: str) -> Batch:
+    batch = setup.execution.get_batch(batch_id)
+    assert batch is not None
+    return batch
+
+
+def _state_status(setup: RecorderSetup, state_id: str) -> NodeStateStatus:
+    state = setup.execution.get_node_state(state_id)
+    assert state is not None
+    return state.status
+
+
 def _nothing_recorded(setup: RecorderSetup, batch_id: str, state_id: str) -> None:
     assert _count(setup, transform_errors_table) == 0
     assert _count(setup, routing_events_table) == 0
-    assert setup.execution.get_node_state(state_id).status is NodeStateStatus.OPEN
-    assert setup.execution.get_batch(batch_id).status is BatchStatus.EXECUTING
+    assert _state_status(setup, state_id) is NodeStateStatus.OPEN
+    assert _batch(setup, batch_id).status is BatchStatus.EXECUTING
 
 
 _ARMS = [
@@ -132,9 +144,10 @@ class TestTheVerdictIsOneTransaction:
         assert [tuple(row) for row in errors] == [(token_id, _REASON_JSON, destination) for token_id in _TOKENS]
         assert [tuple(row) for row in routes] == ([(_DIVERT_EDGE, RoutingMode.DIVERT.value, state_id)] if diverts else [])
         state = setup.execution.get_node_state(state_id)
-        assert state.status is NodeStateStatus.FAILED
+        assert type(state) is NodeStateFailed
+        assert state.error_json is not None
         assert json.loads(state.error_json) == _REASON
-        batch = setup.execution.get_batch("batch-1")
+        batch = _batch(setup, "batch-1")
         assert batch.status is BatchStatus.FAILED
         assert batch.aggregation_state_id == state_id
         assert batch.trigger_type is TriggerType.END_OF_SOURCE
@@ -196,7 +209,7 @@ class TestTheVerdictIsOneTransaction:
             _record_verdict(setup, "batch-1", state.state_id, destination="discard", divert_edge_id=None)
 
         assert _count(setup, transform_errors_table) == 0
-        assert setup.execution.get_batch("batch-1").status is BatchStatus.DRAFT
+        assert _batch(setup, "batch-1").status is BatchStatus.DRAFT
 
     def test_a_second_verdict_for_the_same_flush_is_refused(self) -> None:
         setup = _setup()
