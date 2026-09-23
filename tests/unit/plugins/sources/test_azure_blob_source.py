@@ -6,12 +6,16 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from azure.core.exceptions import AzureError
 
+from elspeth.contracts import CallStatus
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from tests.fixtures.factories import make_operation_context
@@ -71,6 +75,7 @@ class _SourceContextFake:
     run_id: str = "test-run"
     node_id: str | None = "source"
     operation_id: str | None = "operation-001"
+    call_mode_session: Any = None
     landscape: Any = None
     telemetry_emit: _CallRecorder = field(default_factory=_CallRecorder)
     record_call: _CallRecorder = field(default_factory=_CallRecorder)
@@ -1020,6 +1025,92 @@ class TestAzureBlobSourceAuditAndErrors:
     @pytest.fixture
     def ctx(self) -> PluginContext:
         return make_operation_context(plugin_name="azure_blob")
+
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_source_call_before_blob_client_construction(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **_kwargs: Any) -> str:
+                raise AuditIntegrityError(f"source call {reason}")
+
+        ctx.call_mode_session = _VerifySession()
+        with (
+            patch(PATCH_AUTH, side_effect=AssertionError("blob SDK client constructed")),
+            pytest.raises(AuditIntegrityError, match=f"source call {reason}"),
+        ):
+            list(source.load(ctx))
+
+        assert ctx.record_call.call_count == 0
+
+    def test_verify_admits_before_download_and_persists_call_decision(self) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+        ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=3, call_id="current-call"))
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **kwargs: Any) -> str:
+                assert kwargs["current_operation_id"] == "operation-001"
+                assert kwargs["request_data"]["operation"] == "download_blob"
+                events.append("preflight")
+                return "source-call"
+
+            def admit_verify_call(self, **kwargs: Any) -> str:
+                assert kwargs["current_call_index"] is None
+                events.append("admit")
+                return "source-call"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                assert kwargs["current_call_index"] == 3
+                assert kwargs["current_call_id"] == "current-call"
+                assert kwargs["live_status"].value == "success"
+                events.append("verify")
+
+        ctx.call_mode_session = _VerifySession()
+
+        def create_service(*_args: Any, **_kwargs: Any) -> Any:
+            assert events == ["preflight", "admit"]
+            events.append("client")
+            return _fake_blob_service(b"id,name\n1,Ada\n")
+
+        with patch(PATCH_AUTH, side_effect=create_service):
+            rows = list(source.load(ctx))
+
+        assert len(rows) == 1
+        assert events == ["preflight", "admit", "client", "verify"]
+
+    def test_verify_persists_download_error_decision(self) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+        ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=2, call_id="current-error"))
+        verdicts: list[Any] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **_kwargs: Any) -> str:
+                return "source-error"
+
+            def admit_verify_call(self, **_kwargs: Any) -> str:
+                return "source-error"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                verdicts.append(kwargs)
+
+        ctx.call_mode_session = _VerifySession()
+        fake_service = _fake_blob_service(download_error=AzureError("connection refused"))
+        with patch(PATCH_AUTH, return_value=fake_service), pytest.raises(RuntimeError, match="Failed to download blob"):
+            list(source.load(ctx))
+        assert ctx.record_call.call_count == 1
+        assert verdicts[0]["live_status"] is CallStatus.ERROR
+        assert verdicts[0]["live_error_data"] == {"type": "AzureError"}
+        assert verdicts[0]["current_call_index"] == 2
 
     def test_download_failure_raises_runtime_error(self, ctx: PluginContext) -> None:
         """Azure download failure raises RuntimeError."""
