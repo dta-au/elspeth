@@ -39,7 +39,7 @@ files:
     Mapping[str, Any]: 8
     dict[str, Any]: 15
   src/elspeth/contracts/call_mode.py:
-    Mapping[str, Any]: 10
+    Mapping[str, Any]: 13
   src/elspeth/contracts/chat_parts.py:
     dict[str, Any]: 7
   src/elspeth/contracts/checkpoint.py:
@@ -271,8 +271,9 @@ files:
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/call_mode_session.py:
-    Mapping[str, Any]: 8
+    Mapping[str, Any]: 12
     dict[str, Any]: 1
+    dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
     Mapping[str, object]: 2
   src/elspeth/engine/orchestrator/run_status.py:
@@ -1056,10 +1057,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 899
+  Mapping[str, Any]: 906
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1152
-  dict[str, object]: 409
-  soft: 2779
+  dict[str, object]: 410
+  soft: 2787

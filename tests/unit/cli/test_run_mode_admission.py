@@ -1,0 +1,207 @@
+"""The CLI must settle replay authority before external startup work."""
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+import yaml
+from typer.testing import CliRunner
+
+from elspeth.cli import app, bootstrap_and_run
+from elspeth.contracts.enums import RunMode, RunStatus
+from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.core.config import ElspethSettings
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.run_mode_capabilities import (
+    admit_nonlive_plugin_classes,
+    precheck_nonlive_plugin_names,
+    precheck_nonlive_plugin_names_from_raw,
+)
+from tests.fixtures.landscape import leader_coordination_token
+
+
+def _settings_path(tmp_path: Path, *, mode: str, source_plugin: str = "csv", keyvault: bool = False) -> Path:
+    (tmp_path / "input.csv").write_text("id\n1\n")
+    landscape_path = tmp_path / "landscape.db"
+    db = LandscapeDB.from_url(f"sqlite:///{landscape_path}")
+    db.close()
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        yaml.safe_dump(
+            {
+                "run_mode": mode,
+                "replay_from": "run-does-not-exist",
+                "sources": {
+                    "primary": {
+                        "plugin": source_plugin,
+                        "on_success": "output",
+                        "options": {
+                            "path": str(tmp_path / "input.csv"),
+                            "on_validation_failure": "discard",
+                            "schema": {"mode": "observed"},
+                        },
+                    }
+                },
+                "sinks": {
+                    "output": {
+                        "plugin": "json",
+                        "on_write_failure": "discard",
+                        "options": {"path": str(tmp_path / "output.json"), "schema": {"mode": "observed"}},
+                    }
+                },
+                "landscape": {"url": f"sqlite:///{landscape_path}"},
+                "concurrency": {"max_workers": 1},
+                "payload_store": {"base_path": str(tmp_path / "payloads")},
+                **(
+                    {"secrets": {"source": "keyvault", "vault_url": "https://example.vault.azure.net", "mapping": {"TOKEN": "secret"}}}
+                    if keyvault
+                    else {}
+                ),
+            }
+        )
+    )
+    return settings_path
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_missing_source_run_refused_before_secrets_loader_plugin_import_or_constructor(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode)
+    with (
+        patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin imports during settings load")) as loader,
+        patch("elspeth.cli._preflight_raw_settings_sink_effects", side_effect=AssertionError("raw preflight")) as raw_preflight,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+
+    assert result.exit_code == 1, result.output
+    assert "does not exist" in result.output
+    secrets.assert_not_called()
+    loader.assert_not_called()
+    raw_preflight.assert_not_called()
+    construct.assert_not_called()
+    assert not (tmp_path / "output.json").exists()
+    assert not (tmp_path / "payloads").exists()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_keyvault_refused_before_any_secret_or_plugin_work(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode, keyvault=True)
+    with (
+        patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin import")) as loader,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+
+    assert result.exit_code == 1, result.output
+    assert ("cannot fetch Key Vault" if mode == "replay" else "does not exist") in result.output
+    secrets.assert_not_called()
+    loader.assert_not_called()
+
+
+def test_unsupported_plugin_name_refused_before_registry_import(tmp_path: Path) -> None:
+    settings_path = _settings_path(tmp_path, mode="replay", source_plugin="malicious_source")
+    with patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin import")) as loader:
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    assert "malicious_source" in result.output
+    loader.assert_not_called()
+
+
+def test_programmatic_bootstrap_uses_same_early_admission(tmp_path: Path) -> None:
+    settings_path = _settings_path(tmp_path, mode="replay")
+    with (
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin import")) as loader,
+        pytest.raises(OrchestrationInvariantError, match="does not exist"),
+    ):
+        bootstrap_and_run(settings_path)
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_supported_mode_reaches_constructor_only_after_cli_admission(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode)
+    raw = yaml.safe_load(settings_path.read_text())
+    raw["replay_from"] = "source-run"
+    settings_path.write_text(yaml.safe_dump(raw))
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="source-run")
+        factory.run_lifecycle.complete_run(
+            RunStatus.COMPLETED,
+            coordination_token=leader_coordination_token(factory, "source-run"),
+        )
+    finally:
+        db.close()
+    with patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=RuntimeError("AFTER_ADMISSION")) as construct:
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    assert "AFTER_ADMISSION" in result.output
+    construct.assert_called_once()
+    assert not (tmp_path / "output.json").exists()
+
+
+def test_resume_refuses_persisted_replay_run_before_secrets_or_plugins(tmp_path: Path) -> None:
+    settings_path = _settings_path(tmp_path, mode="live")
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        lifecycle = RecorderFactory(db).run_lifecycle
+        lifecycle.begin_run(config={}, canonical_version="v1", run_id="original-run")
+        lifecycle.begin_run(
+            config={},
+            canonical_version="v1",
+            run_id="replay-attempt",
+            run_mode=RunMode.REPLAY,
+            replay_from_run_id="original-run",
+        )
+    finally:
+        db.close()
+    with (
+        patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin import")) as loader,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "resume", "replay-attempt", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    assert "Cannot resume replay run" in result.output
+    secrets.assert_not_called()
+    loader.assert_not_called()
+    construct.assert_not_called()
+
+
+def test_live_mode_remains_outside_nonlive_capability_gate(tmp_path: Path) -> None:
+    settings_path = _settings_path(tmp_path, mode="live", source_plugin="malicious_source")
+    # Live keeps its existing loader/registry behavior. The raw admission
+    # must not reject its plugin vocabulary as a replay capability verdict.
+    from elspeth.cli import _admit_raw_cli_nonlive_run
+
+    _admit_raw_cli_nonlive_run(settings_path)
+
+
+def test_capability_inventory_positive_and_negative_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = ElspethSettings(
+        sources={"primary": {"plugin": "csv", "on_success": "output"}},
+        transforms=[{"name": "pass", "plugin": "passthrough", "input": "primary", "on_success": "output", "on_error": "discard"}],
+        sinks={"output": {"plugin": "json", "on_write_failure": "discard"}},
+        run_mode=RunMode.REPLAY,
+        replay_from="source-run",
+    )
+    precheck_nonlive_plugin_names(settings)
+    admit_nonlive_plugin_classes(settings)
+    precheck_nonlive_plugin_names_from_raw(
+        {"sources": {"primary": {"plugin": "csv"}}, "transforms": [{"plugin": "passthrough"}], "sinks": {"output": {"plugin": "json"}}}
+    )
+    with pytest.raises(OrchestrationInvariantError, match="unsupported_plugin"):
+        precheck_nonlive_plugin_names_from_raw({"sources": {"primary": {"plugin": "unsupported_plugin"}}})
+
+    manager = get_shared_plugin_manager()
+
+    class Impostor:
+        name = "csv"
+
+    monkeypatch.setattr(manager, "get_source_by_name", lambda _name: Impostor)
+    with pytest.raises(OrchestrationInvariantError, match="not the reviewed built-in class"):
+        admit_nonlive_plugin_classes(settings)

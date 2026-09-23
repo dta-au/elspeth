@@ -465,6 +465,7 @@ def _make_resume_config_and_database(tmp_path: Path) -> tuple[Path, Path]:
 
 def _fake_config(*, with_depends_on: bool) -> SimpleNamespace:
     return SimpleNamespace(
+        run_mode=RunMode.LIVE,
         depends_on=[SimpleNamespace(name="indexer")] if with_depends_on else [],
         collection_probes=[SimpleNamespace(name="probe")] if with_depends_on else [],
         gates=[],
@@ -648,13 +649,14 @@ def test_cli_resume_rejects_legacy_sink_before_resume_mutation_or_payload_access
         result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
 
     assert result.exit_code == 1
-    # The resume-mode switch precedes admission (elspeth-fc9906e398), so a
-    # sink without resume support is rejected by the supports_resume gate —
-    # still before any live-instance mutation, passphrase, or database access.
+    # The persisted run-mode guard reads Landscape before plugin construction;
+    # sink capability refusal still precedes any live-instance mutation.
     assert "does not support resume/append mode" in result.output.lower()
     sink.configure_for_resume.assert_not_called()
     resolve_passphrase.assert_not_called()
-    open_database.assert_not_called()
+    open_database.assert_called_once()
+    assert open_database.call_args.kwargs["read_only"] is True
+    assert open_database.call_args.kwargs["create_tables"] is False
     assert not (tmp_path / "payloads").exists()
 
 
