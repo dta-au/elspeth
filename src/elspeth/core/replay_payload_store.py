@@ -95,9 +95,9 @@ def collect_source_payload_refs(
     for state in factory.query.get_all_node_states_for_run(source_run_id):
         if state.node_id in pdf_node_ids:
             pdf_state_ids.add(state.state_id)
-        if isinstance(state, NodeStateCompleted) and state.node_id in pdf_node_ids:
+        if type(state) is NodeStateCompleted and state.node_id in pdf_node_ids:
             pdf_completed_states.add(state.state_id)
-        reason_json = state.success_reason_json if isinstance(state, NodeStateCompleted) else None
+        reason_json = state.success_reason_json if type(state) is NodeStateCompleted else None
         if reason_json is None:
             continue
         try:
