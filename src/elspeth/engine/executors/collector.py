@@ -32,6 +32,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.canonical import stable_hash
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
@@ -39,6 +40,7 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
 from elspeth.engine.spans import SpanFactory
@@ -1007,8 +1009,9 @@ class CollectorExecutor:
             # same batch-transform contract (`NESTED_CONTRACT_OPTIONS_NODE_TYPES`).
             #
             # A Tier-2 ``PluginContractViolation`` from that preflight, from the
-            # plugin, or from the success result's output checks fails the WHOLE
-            # group, as a returned error does (operator ruling 2026-09-23,
+            # plugin, or from the success result's output checks (output schema,
+            # canonical hashing of the rows to release) fails the WHOLE group,
+            # as a returned error does (operator ruling 2026-09-23,
             # elspeth-5887fb7928 B2): a wrongly-typed row under a typed
             # collector schema is a fact about that row, so it must not end the
             # run. Nothing is minted before these checks; the Tier-1 subclasses
@@ -1026,6 +1029,21 @@ class CollectorExecutor:
                     # Postflight, before the rows are released downstream — the
                     # other half of the aggregation parity restored here.
                     validate_success_outputs(transform, result, node_kind="Collector")
+                    # The released rows must canonicalize, as the aggregation
+                    # flush and the per-row seam require of theirs: an emitted
+                    # value outside canonical JSON (an int beyond 2**53, a
+                    # non-finite float) would otherwise be released and end
+                    # the run at the next node's input hash. The violation
+                    # names no emitted value.
+                    try:
+                        result.output_hash = stable_hash(result.row) if result.row is not None else stable_hash(result.rows)
+                    except (TypeError, ValueError) as exc:
+                        raise non_canonical_output_violation(
+                            producer=f"Collector transform '{transform.name}'",
+                            output_schema=transform.output_schema,
+                            result=result,
+                            exc=exc,
+                        ) from exc
             except contract_errors.TIER_1_ERRORS:
                 raise
             except PluginContractViolation as violation:

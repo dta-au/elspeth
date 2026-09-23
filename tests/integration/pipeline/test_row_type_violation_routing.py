@@ -929,6 +929,133 @@ def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes
     assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
 
 
+# Each page value is inside the JSON safe integer range (2**53 - 1 =
+# 9007199254740991), so the source and the explode hash them cleanly; the
+# collector's batch_stats keeps an int sum an int, and the two of them add up
+# past that range. The sum is a value the collector EMITTED, not one it
+# received, so only the collector's own output check can stop it.
+_BIG_PAGE_VALUE = 5_000_000_000_000_000
+_NON_CANONICAL_SUM = 2 * _BIG_PAGE_VALUE
+
+
+def _summing_collector_settings(tmp_path: Any) -> str:
+    _write_jsonl(
+        tmp_path / "docs.jsonl",
+        (
+            {"doc_id": "DOC-2", "pages": [_BIG_PAGE_VALUE, _BIG_PAGE_VALUE]},
+            {"doc_id": "DOC-1", "pages": [1, 2]},
+        ),
+    )
+    return f"""sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "docs.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+concurrency:
+  max_workers: 1
+transforms:
+- name: explode_pages
+  plugin: json_explode
+  input: rows
+  on_success: pages
+  on_error: discard
+  options:
+    array_field: pages
+    output_field: page
+    schema:
+      mode: observed
+collectors:
+- name: page_totals
+  plugin: batch_stats
+  input: pages
+  on_success: out
+  options:
+    value_field: page
+    compute_mean: false
+    schema:
+      mode: observed
+scopes:
+- name: document_pages
+  opener: explode_pages
+  closer: page_totals
+  policy: require_all
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+
+
+def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_value(tmp_path: Any) -> None:
+    """The collector flush checks what it RELEASES, as the aggregation and per-row seams do.
+
+    Before the check, the collector released the out-of-range sum and the run
+    died at the next node's canonical hash: one row's data ended the run. Now
+    the group fails as a Tier-2 contract violation (whole group, value-free),
+    DOC-1's group still releases, and no audit cell holds the emitted value.
+    """
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import node_states_table, nodes_table
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _summing_collector_settings(tmp_path))
+
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+    assert str(_NON_CANONICAL_SUM) not in cli.output
+
+    released = _read_jsonl(tmp_path / "out.jsonl")
+    assert [(row["count"], row["sum"]) for row in released] == [(2, 3)]
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [collector_node_id] = conn.execute(select(nodes_table.c.node_id).where(nodes_table.c.plugin_name == "batch_stats")).scalars().all()
+        states = conn.execute(select(node_states_table).where(node_states_table.c.node_id == collector_node_id)).all()
+
+    assert not [state for state in states if state.status == "open"], "no member hold may be left OPEN"
+    failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
+    [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
+    assert flush_error["phase"] == "collector_flush"
+    # batch_stats under an observed schema declares no output field, so the
+    # field name is withheld too (a field name can itself be row data).
+    assert flush_error["exception"].startswith(
+        "Collector transform 'batch_stats' emitted non-canonical data at emitted row 0, "
+        "in a field its output schema does not declare (IntegerDomainError). "
+    )
+    member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
+    assert len(member_errors) == 2
+    assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
+
+    # The emitted sum is persisted nowhere: no Landscape text cell (the reasons
+    # live there) and no payload (the row values live there; nothing was
+    # released, so no child row was stored). Each scan has a positive control
+    # in the same run: the DB scan finds the violation text in the very cell
+    # a leak would reach, and the payload scan finds the page values the
+    # source and the explode legitimately stored.
+    assert ("node_states", "error_json") in _audit_cells_containing(db, "emitted non-canonical data")
+    assert _audit_cells_containing(db, str(_NON_CANONICAL_SUM)) == []
+    payloads = [path.read_bytes() for path in (tmp_path / "payloads").rglob("*") if path.is_file()]
+    assert any(str(_BIG_PAGE_VALUE).encode() in payload for payload in payloads)
+    assert not any(str(_NON_CANONICAL_SUM).encode() in payload for payload in payloads)
+
+
 # ---------------------------------------------------------------------------
 # The batch plugins' own row checks (elspeth-5887fb7928 plugin half, and the
 # collision ruling on elspeth-d90495084c): a wrong-typed value, or a row that

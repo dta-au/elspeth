@@ -87,6 +87,18 @@ class _StrictAssembledSchema(PluginSchema):
     assembled: bool
 
 
+class _DeclaresAssembledSchema(PluginSchema):
+    """An output schema that DECLARES `assembled` (as an int) and admits the rest."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
+
+    assembled: int
+
+
+# Beyond the JSON safe integer range (2**53 - 1): canonical JSON refuses it.
+_NON_CANONICAL_INT = 1152921504606859321
+
+
 class _SpanFactorySentinel:
     """Unused by CollectorExecutor's shown behaviour — stored, never invoked."""
 
@@ -110,6 +122,9 @@ class _FakeCollectorTransform:
         self.return_zero_rows = False
         self.return_error = False
         self.echo_rows = False
+        # The value emitted under ``assembled``; a test swaps in a value canonical
+        # JSON refuses (an int beyond 2**53) to arm the flush's output hash.
+        self.emit_assembled: Any = True
         self.raise_on_process: BaseException | None = None
         self.seen_rows: list[dict[str, Any]] = []
         self.call_count = 0
@@ -150,7 +165,7 @@ class _FakeCollectorTransform:
             out_rows = tuple(rows)
         else:
             contract = rows[0].contract
-            out_rows = (PipelineRow({"assembled": True, "count": len(rows)}, contract),)
+            out_rows = (PipelineRow({"assembled": self.emit_assembled, "count": len(rows)}, contract),)
         return TransformResult.success_multi(out_rows, success_reason=success_reason)
 
 
@@ -1051,6 +1066,40 @@ class TestFlushContractPreflight:
         assert env.transform.call_count == 1
         [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
         assert "output validation failed for emitted row 0: " in flush_error["exception"]
+
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+    def test_emitted_non_canonical_output_fails_the_group_naming_no_value(self, collector_env: _CollectorEnv, declared: bool) -> None:
+        """The rows to release must canonicalize, as at the aggregation and per-row seams.
+
+        Released, the value would end the run at the next node's input hash. The
+        violation comes from the shared value-free builder: it names the field
+        only when the output schema declares it, and never the value.
+        """
+        env = collector_env
+        env.transform.emit_assembled = _NON_CANONICAL_INT
+        if declared:
+            env.transform.output_schema = _DeclaresAssembledSchema
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        outcome = env.executor.accept(members[1], "stitch", ctx=env.ctx)
+
+        assert outcome.held is False
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert outcome.released_tokens == ()
+        assert env.transform.call_count == 1
+        member_ids = {member.token_id for member in members}
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids=member_ids)
+        location = "emitted row 0 field 'assembled'" if declared else "emitted row 0, in a field its output schema does not declare"
+        assert flush_error["type"] == "PluginContractViolation"
+        assert flush_error["phase"] == "collector_flush"
+        assert flush_error["exception"].startswith(
+            f"Collector transform 'recording_stitch' emitted non-canonical data at {location} (IntegerDomainError). "
+        )
+        member_errors = [env.node_state_error_for_token(node="stitch", token_id=token_id) for token_id in sorted(member_ids)]
+        assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
+        assert str(_NON_CANONICAL_INT) not in repr([flush_error, *member_errors])
 
     def test_a_contract_violation_raised_by_the_plugin_fails_the_group(self, collector_env: _CollectorEnv) -> None:
         env = collector_env
