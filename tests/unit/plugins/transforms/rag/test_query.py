@@ -341,9 +341,13 @@ class TestWorkerFailureDetection:
                 submitted.append(args)
                 return super().submit(*args, **kwargs)
 
+        # If the value did reach the worker, answer as re.Pattern.search()
+        # does for an int, so a missing pre-check fails fast and faithfully.
+        worker_answer: Future = Future()
+        worker_answer.set_exception(TypeError("expected string or bytes-like object, got 'int'"))
         assert builder._regex_pool is not None
         builder._regex_pool.shutdown(wait=False)
-        builder._regex_pool = _RecordingPool(Future())
+        builder._regex_pool = _RecordingPool(worker_answer)
         try:
             result = builder.build({"text": 12345})
         finally:
