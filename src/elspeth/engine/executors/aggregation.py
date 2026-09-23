@@ -46,6 +46,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import AggregationJournalRestorer
 from elspeth.engine.spans import SpanFactory
@@ -479,10 +480,11 @@ class AggregationExecutor:
             else:
                 result.output_hash = None
         except (TypeError, ValueError) as exc:
-            raise PluginContractViolation(
-                f"Aggregation transform '{transform.name}' emitted non-canonical data: {exc}. "
-                f"Ensure output contains only JSON-serializable types. "
-                f"Use None instead of NaN for missing values."
+            raise non_canonical_output_violation(
+                producer=f"Aggregation transform '{transform.name}'",
+                output_schema=transform.output_schema,
+                result=result,
+                exc=exc,
             ) from exc
         result.duration_ms = duration_ms
 

@@ -3723,6 +3723,43 @@ class TestAggregationExecutor:
         assert routing["mode"] is RoutingMode.DIVERT
         assert routing["reason"] == result.reason
 
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared-field", "undeclared-field"])
+    def test_the_routed_non_canonical_output_violation_names_no_emitted_value(self, declared: bool) -> None:
+        """B2 routes this violation, so its text reaches every audit write of the failed batch.
+
+        ``rfc8785`` renders an out-of-range integer in its own error text;
+        the reason must carry the exception type, row and declared field only.
+        """
+        from elspeth.contracts import PluginSchema
+
+        class DeclaredOutput(PluginSchema):
+            total: int
+
+        bigint = 2**60 + 12345
+        executor, factory, nid = self._make_agg_executor(count=1, on_error="quarantine", error_edge_ids={NodeID("agg_1"): "edge_err_1"})
+        contract = _make_contract()
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": 1}, token_id="t1", contract=contract))
+        transform = _make_aggregation_transform("agg_transform")
+        if declared:
+            transform.output_schema = DeclaredOutput
+        transform.process.return_value = TransformResult.success(
+            make_row({"total": bigint}, contract=contract), success_reason={"action": "aggregated"}
+        )
+
+        result, _tokens, _batch_id = executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
+
+        located = "emitted row 0 field 'total'" if declared else "emitted row 0, in a field its output schema does not declare"
+        self._assert_contract_violation_routed(
+            factory, result, error_prefix=f"Aggregation transform 'agg_transform' emitted non-canonical data at {located} ("
+        )
+        written = (
+            result.reason,
+            factory.data_flow.record_batch_transform_errors_leader.call_args.kwargs["error_details"],
+            factory.execution.record_routing_event.call_args.kwargs["reason"],
+            _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)["error"],
+        )
+        assert str(bigint) not in repr(written)
+
     def test_a_contract_violation_raised_by_the_batch_plugin_fails_the_batch_once(self) -> None:
         """The plugin's own Tier-2 violation leaves the state open for the route to complete.
 
@@ -5812,6 +5849,39 @@ class TestTransformExecutorTerminality:
         # as well — which is what elspeth-82d4c5146c added while the violation
         # still aborted the run — is a duplicate the audit store rejects.
         factory.data_flow.record_token_outcome.assert_not_called()
+
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared-field", "undeclared-field"])
+    def test_non_canonical_output_violation_names_no_emitted_value(self, declared: bool) -> None:
+        """An out-of-range integer is reported by type, row and declared field — never by value.
+
+        ``rfc8785`` renders the value in its own error text; the violation is
+        routed, so that text would reach transform_errors, the DIVERT reason
+        and the failed state.
+        """
+        from elspeth.contracts import PluginSchema
+
+        class DeclaredOutput(PluginSchema):
+            value: int
+
+        bigint = 2**60 + 12345
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        if declared:
+            transform.output_schema = DeclaredOutput
+        transform.process.return_value = TransformResult.success(
+            make_row({"value": bigint}, contract=_make_contract()), success_reason={"action": "tested"}
+        )
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            executor.execute_transform(transform, _make_token(), make_context())
+
+        message = str(excinfo.value)
+        assert str(bigint) not in message
+        located = "emitted row 0 field 'value'" if declared else "emitted row 0, in a field its output schema does not declare"
+        assert message.startswith(f"Transform 'test_transform' emitted non-canonical data at {located} (")
+        assert "Error)" in message, "the exception type is reported"
+        assert str(bigint) not in repr(factory.execution.complete_node_state.call_args.kwargs["error"])
 
     def test_contract_evolution_failure_marks_state_failed(self) -> None:
         """Contract evolution failure → state FAILED, not COMPLETED-then-crash.

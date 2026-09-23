@@ -53,6 +53,7 @@ from elspeth.engine.executors.declaration_dispatch import (
     run_post_emission_checks,
     run_pre_emission_checks,
 )
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.spans import SpanFactory
 
@@ -615,12 +616,12 @@ class TransformExecutor:
             else:
                 result.output_hash = None
         except (TypeError, ValueError) as e:
-            canonicalization_violation = PluginContractViolation(
-                f"Transform '{transform.name}' emitted non-canonical data: {e}. "
-                f"Ensure output contains only JSON-serializable types. "
-                f"Use None instead of NaN for missing values."
-            )
-            raise canonicalization_violation from e
+            raise non_canonical_output_violation(
+                producer=f"Transform '{transform.name}'",
+                output_schema=transform.output_schema,
+                result=result,
+                exc=e,
+            ) from e
         result.duration_ms = duration_ms
 
     def _prepare_success_completion(
