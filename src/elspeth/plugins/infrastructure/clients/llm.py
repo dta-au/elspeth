@@ -696,6 +696,15 @@ class AuditedLLMClient(AuditedClientBase):
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             )
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.admit_verify_call(
+                call_type=CallType.LLM,
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+
         # A rate limiter is part of live dispatch and must not run during replay.
         self._acquire_rate_limit()
 

@@ -383,6 +383,13 @@ class OpenRouterLLMProvider:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=llm_request_payload.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
         logical_start = time.perf_counter()
 
         replaying = self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY

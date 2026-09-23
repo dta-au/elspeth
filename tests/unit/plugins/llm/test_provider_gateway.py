@@ -26,6 +26,7 @@ from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -76,6 +77,43 @@ def test_replay_mode_reaches_gateway_completion_and_readyz_transport() -> None:
         provider._check_readyz(operation_id="op-1", model="model", coordination_token=_LEADER_TOKEN)
     assert transport.call_args_list[0].kwargs["call_mode_session"] is session
     assert transport.call_args_list[1].kwargs["call_mode_session"] is session
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+def test_verify_semantic_request_preflight_refuses_egress(source_problem: str) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "standard"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    recorder = FakeAuditRecorder()
+    provider = GatewayLLMProvider(
+        endpoint=_ENDPOINT,
+        api_key="test-key",
+        contract_major=1,
+        required_capabilities=("usage",),
+        recorder=recorder,
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=VerifySession(),
+    )
+    with (
+        patch.object(provider, "_get_http_client", side_effect=AssertionError("HTTP must not be constructed")) as transport,
+        pytest.raises(AuditIntegrityError, match=source_problem),
+    ):
+        provider.execute_query(
+            [ChatMessage(role="user", content="hello")],
+            model="standard",
+            temperature=0.0,
+            max_tokens=32,
+            audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+        )
+
+    transport.assert_not_called()
+    assert recorder.operation_calls == []
 
 
 @dataclass

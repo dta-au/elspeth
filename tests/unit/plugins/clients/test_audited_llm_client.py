@@ -16,6 +16,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
@@ -92,7 +93,13 @@ def test_verify_llm_call_submits_audited_response_for_persisted_comparison() -> 
         mode = RunMode.VERIFY
 
         def __init__(self) -> None:
+            self.admissions: list[dict[str, Any]] = []
             self.comparisons: list[dict[str, Any]] = []
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            self.admissions.append(kwargs)
+            assert sdk.create_calls == []
+            return "source-call-1"
 
         def verify_call(self, **kwargs: Any) -> SimpleNamespace:
             self.comparisons.append(kwargs)
@@ -114,12 +121,43 @@ def test_verify_llm_call_submits_audited_response_for_persisted_comparison() -> 
     client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
 
     assert len(sdk.create_calls) == 1
+    assert len(session.admissions) == 1
+    assert session.admissions[0]["request_data"] == execution.last_record_call_kwargs["request_data"].to_dict()
     assert len(session.comparisons) == 1
     comparison = session.comparisons[0]
     assert comparison["call_type"] is CallType.LLM
     assert comparison["current_call_id"] == "call-1"
     assert comparison["live_status"] is CallStatus.SUCCESS
     assert comparison["live_response_data"] == execution.last_record_call_kwargs["response_data"].to_dict()
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+def test_verify_llm_refuses_unmatched_source_request_before_sdk(source_problem: str) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "gpt-4"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    sdk = FakeOpenAIClient(response=provider_response())
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_verify",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=VerifySession(),
+    )
+
+    with pytest.raises(AuditIntegrityError, match=source_problem):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.recorded_calls == []
 
 
 @pytest.mark.parametrize(

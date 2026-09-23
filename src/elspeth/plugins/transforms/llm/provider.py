@@ -179,6 +179,14 @@ class LLMAuditParent:
             if evidence.status is not status or evidence.response_data != actual_response or evidence.error_data != actual_error:
                 raise AuditIntegrityError("Replayed semantic LLM response differs from its source call")
             source_identity["source_call_id"] = evidence.source_call_id
+        if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            call_mode_session.admit_verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+            )
         if self.operation_id is not None:
             call = recorder.record_operation_call(
                 coordination_token=self._require_coordination_token(),
