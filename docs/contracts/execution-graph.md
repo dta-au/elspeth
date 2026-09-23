@@ -640,18 +640,31 @@ aggregations:
 When a batch transform returns `TransformResult.error(...)` at a flush (any
 trigger: count, condition, timeout, end of source), the WHOLE batch fails:
 
-1. `AggregationExecutor._complete_error_flush` scrubs the reason, records one
-   `transform_errors` row per buffered token (destination = `on_error`), and
-   for a named sink ONE DIVERT `routing_event` on the flush node_state along
-   `__error_<name>__`; the node_state is FAILED with the reason, the batch
-   FAILED.
-2. Named sink: `RowProcessor.handle_timeout_flush` hands EVERY buffered token,
-   with its original row, to the sink as `(failure, on_error_routed)` — all
-   members move BLOCKED → PENDING_SINK in one `complete_barrier`, and the sink
-   records each terminal after durability.
+1. `AggregationExecutor._complete_error_flush` scrubs the reason and records
+   the batch's FAILED verdict in ONE transaction
+   (`ExecutionRepository.complete_aggregation_failure`): one
+   `transform_errors` row per buffered token (destination = `on_error`), for a
+   named sink ONE DIVERT `routing_event` on the flush node_state along
+   `__error_<name>__`, the node_state FAILED with the reason, the batch FAILED.
+2. Named sink: `RowProcessor._dispose_failed_flush` hands EVERY buffered
+   token, with its original row, to the sink as `(failure, on_error_routed)` —
+   all members move BLOCKED → PENDING_SINK in one `complete_barrier`, and the
+   sink records each terminal after durability.
 3. `"discard"`: every buffered token is `(failure, quarantined_at_source)`,
    the per-row discard pair, written inside that same `complete_barrier`
    transaction.
+
+Each member's failure message, and so its error hash, is the reason's
+canonical JSON — the text the verdict records.
+
+A recorded verdict is final (operator ruling 2026-09-23). If the run crashes
+after step 1 commits but before step 2 or 3 completes, resume does not retry
+the batch: `handle_incomplete_batches` never sees it (`get_incomplete_batches`
+excludes a recorded verdict, and `retry_batch` refuses one), and the journal
+restore completes the recorded disposition from the recorded reason and
+destination (`BarrierRestoreReadModel.list_recorded_aggregation_failures`),
+without invoking the batch transform again. A flush that died before step 1
+committed recorded no verdict, and resume re-runs it.
 
 A raised Tier-2 `PluginContractViolation` fails the batch the same way, before
 anything is recorded (`AggregationExecutor.execute_flush` converts it to a

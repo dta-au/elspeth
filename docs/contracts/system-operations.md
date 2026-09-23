@@ -711,9 +711,10 @@ AggregationExecutor.accept(token, node_id)
         ├── Retrieve buffered rows as list[dict]
         ├── Call transform.process(rows, ctx)
         ├── Returned error → the WHOLE batch fails (see Aggregation Invariants 2):
-        │   one transform_errors row per member, one DIVERT routing_event for a
-        │   named on_error sink, batch executing → failed, and every member goes
-        │   to on_error (below). Nothing else in this diagram runs.
+        │   ONE transaction records the verdict — one transform_errors row per
+        │   member, one DIVERT routing_event for a named on_error sink, the
+        │   state and batch executing → failed — then every member goes to
+        │   on_error (below). Nothing else in this diagram runs.
         ├── Batch state: executing → completed
         │
         ├── transform mode:
@@ -735,6 +736,14 @@ buffered token is a BLOCKED `token_work_items` row, written at buffer time.
 - Trigger evaluators resume from the journal's `barrier_blocked_at`
   timestamps plus the checkpoint's `barrier_scalars_json` trigger latches
 - In-progress batches survive crashes and can be resumed
+- A batch whose flush died before recording a verdict (the transform raised,
+  or the process died mid-flush) is retried: `handle_incomplete_batches`
+  marks it failed and creates a retry batch, and the restore follows the retry
+  chain
+- A batch whose FAILED verdict was recorded is never retried: resume completes
+  that verdict's disposition (the named `on_error` sink or the discard pair,
+  with the recorded reason) without invoking the transform again, so crash
+  timing cannot change a failed batch's outcome
 
 ### Timeout Behavior
 
@@ -746,7 +755,7 @@ rows.
 ### Aggregation Invariants
 
 1. **Engine owns the buffer** — Transforms never manage batch state. This enables crash recovery, consistent trigger evaluation, and clean audit trail.
-2. **Atomic batch execution** — If the transform returns `error`, ALL buffered rows fail together, and every one of them follows the aggregation's `on_error` (elspeth-d2e3f29d10). A named sink receives each buffered row with its ORIGINAL values as `(failure, on_error_routed)` — all members hand off BLOCKED → PENDING_SINK in one `complete_barrier`, and the sink records each terminal after durability. `discard` records each member `(failure, quarantined_at_source)`, the per-row discard pair, inside that same transaction. Either way each member gets a `transform_errors` row carrying the batch reason, which names the row index, field and expected/found type, never a row value. A Tier-2 plugin contract violation raised before the flush records anything — a buffered row that fails the aggregation's typed input schema, the plugin raising one, or a success result failing its output checks — fails the batch the same way (operator ruling 2026-09-23). A Tier-1 error, the batch-flush declaration cross-check, and any other exception the transform raises still abort the run.
+2. **Atomic batch execution** — If the transform returns `error`, ALL buffered rows fail together, and every one of them follows the aggregation's `on_error` (elspeth-d2e3f29d10). A named sink receives each buffered row with its ORIGINAL values as `(failure, on_error_routed)` — all members hand off BLOCKED → PENDING_SINK in one `complete_barrier`, and the sink records each terminal after durability. `discard` records each member `(failure, quarantined_at_source)`, the per-row discard pair, inside that same transaction. Either way each member gets a `transform_errors` row carrying the batch reason, which names the row index, field and expected/found type, never a row value; those rows, the DIVERT, and the FAILED state and batch are one transaction, and once it commits the verdict is final — a resume completes its disposition and never re-runs the batch. A Tier-2 plugin contract violation raised before the flush records anything — a buffered row that fails the aggregation's typed input schema, the plugin raising one, or a success result failing its output checks — fails the batch the same way (operator ruling 2026-09-23). A Tier-1 error, the batch-flush declaration cross-check, and any other exception the transform raises still abort the run.
 3. **Cardinality validation** — If `expected_output_count` is set and the transform returns a different count, the batch fails.
 4. **Passthrough preserves token identity** — In `passthrough` mode, the same `token_id` values continue after enrichment.
 5. **Transform mode creates new lineage** — New tokens are created via `expand_token()` with parent linkage.
