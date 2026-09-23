@@ -422,7 +422,8 @@ def test_guardrail_verify_compares_source_target_without_auditing_private_text()
     assert "private text" not in repr(recorder.calls)
 
 
-def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispatch() -> None:
+@pytest.mark.parametrize("admission_message", ["missing source call", "ambiguous source call"])
+def test_verify_invalid_source_call_prevents_all_aws_sdk_construction_and_dispatch(admission_message: str) -> None:
     builds: list[str] = []
 
     def forbidden_build() -> object:
@@ -430,7 +431,7 @@ def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispat
         raise AssertionError("SDK construction escaped verify admission")
 
     recorder = Recorder()
-    session = Session(_evidence(None), mode=RunMode.VERIFY, admission_error=AuditIntegrityError("missing source call"))
+    session = Session(_evidence(None), mode=RunMode.VERIFY, admission_error=AuditIntegrityError(admission_message))
     sdk = DeferredAWSClient(forbidden_build)
     common = {
         **mock_item_audit_authority("run-1"),
@@ -452,7 +453,7 @@ def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispat
         source_audit_salt=b"source-run-key-source-run-key-01",
         sdk_client=sdk,
     )
-    with pytest.raises(AuditIntegrityError, match="missing source call"):
+    with pytest.raises(AuditIntegrityError, match=admission_message):
         textract.start_document_analysis(
             bucket="docs",
             key="invoice.pdf",
@@ -462,9 +463,9 @@ def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispat
             client_request_token="a" * 64,
             source_client_request_token_fingerprint="b" * 64,
         )
-    with pytest.raises(AuditIntegrityError, match="missing source call"):
+    with pytest.raises(AuditIntegrityError, match=admission_message):
         textract.get_document_analysis(job_id="job-1", next_token=None)
-    with pytest.raises(AuditIntegrityError, match="missing source call"):
+    with pytest.raises(AuditIntegrityError, match=admission_message):
         inline.analyze_document(
             document_bytes=b"document",
             document_sha256="a" * 64,
@@ -472,9 +473,9 @@ def test_verify_missing_source_call_prevents_all_aws_sdk_construction_and_dispat
             feature_types=("FORMS",),
             queries=(),
         )
-    with pytest.raises(AuditIntegrityError, match="missing source call"):
+    with pytest.raises(AuditIntegrityError, match=admission_message):
         head_bucket.verify_bucket_region("docs")
-    with pytest.raises(AuditIntegrityError, match="missing source call"):
+    with pytest.raises(AuditIntegrityError, match=admission_message):
         guardrail.apply_guardrail(text="private text", source="INPUT", required_filters=("PROMPT_ATTACK",))
     assert len(session.admissions) == 5
     assert builds == []
