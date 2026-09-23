@@ -131,7 +131,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a4c53fefd44cb472"
+    source_file_hash: str | None = "sha256:8bc2fe4afa94f1eb"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -223,24 +223,25 @@ class BatchStats(BaseTransform):
             stat_fields.add(cfg.group_by)
         self.declared_output_fields = frozenset(stat_fields)
 
-        # Declare group_by as required input when configured, so the DAG builder
-        # can validate upstream output guarantees. value_field is enforced at
-        # runtime via direct field access (KeyError = upstream bug) rather than
-        # build-time schema requirements — observed-mode schemas don't declare
-        # guaranteed fields, so a build-time requirement would reject valid pipelines.
+        # Declare every column process() reads as required input: value_field,
+        # and group_by when configured. The flush preflight enforces this set on
+        # every buffered row, so a row that omits one fails the batch as a routed
+        # contract violation instead of a KeyError inside process()
+        # (elspeth-5887fb7928 R1). It adds no build-time requirement: the DAG's
+        # edge check reads the authored config, not this rebuilt one, so an
+        # observed upstream still validates.
+        base_required = set(cfg.schema_config.required_fields or ())
+        base_required.add(cfg.value_field)
         if cfg.group_by is not None:
-            base_required = set(cfg.schema_config.required_fields or ())
             base_required.add(cfg.group_by)
-            if base_required != set(cfg.schema_config.required_fields or ()):
-                schema_config = SchemaConfig(
-                    mode=cfg.schema_config.mode,
-                    fields=cfg.schema_config.fields,
-                    guaranteed_fields=cfg.schema_config.guaranteed_fields,
-                    audit_fields=cfg.schema_config.audit_fields,
-                    required_fields=tuple(base_required),
-                )
-            else:
-                schema_config = cfg.schema_config
+        if base_required != set(cfg.schema_config.required_fields or ()):
+            schema_config = SchemaConfig(
+                mode=cfg.schema_config.mode,
+                fields=cfg.schema_config.fields,
+                guaranteed_fields=cfg.schema_config.guaranteed_fields,
+                audit_fields=cfg.schema_config.audit_fields,
+                required_fields=tuple(base_required),
+            )
         else:
             schema_config = cfg.schema_config
 
@@ -379,7 +380,7 @@ class BatchStats(BaseTransform):
         skipped_missing_indices: list[int] = []
         skipped_non_finite_indices: list[int] = []
         for row_index, row in grouped_rows:
-            # Direct access - field must exist (KeyError = upstream bug)
+            # Present on every row: declared required, enforced by the flush preflight.
             raw_value = row[self._value_field]
 
             # None is a missing value, not a type error: skip-and-report it the
@@ -567,8 +568,9 @@ class BatchStats(BaseTransform):
         Returns:
             TransformResult with aggregated statistics
 
-        Raises:
-            KeyError: If value_field is missing from any row (upstream bug)
+        Every row carries ``value_field`` (and ``group_by`` when configured):
+        both are declared required, and the flush preflight fails the batch
+        before this runs when a row omits one.
         """
         if not rows:
             # Empty batch is an anomaly — return error, not fabricated statistics.
