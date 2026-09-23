@@ -641,3 +641,287 @@ def test_a_row_failing_a_declared_input_schema_is_routed_without_its_value_in_th
     assert _SENTINEL not in routed_reason
 
     assert _audit_cells_containing(db, _SENTINEL) == [("transform_errors", "row_data_json")]
+
+
+# ---------------------------------------------------------------------------
+# The batch seams' own contract check (operator ruling 2026-09-23, B2): a
+# buffered row that fails a TYPED batch node's declared input schema fails the
+# whole batch — routed to the aggregation's on_error, or failing the
+# collector's group — instead of aborting the run. Driven through the CLI so
+# the operator-visible exit code and the absence of a traceback are measured,
+# not inferred.
+#
+# Arming (measured, engine-seams ``aggpre3``): an OBSERVED JSON source locks a
+# field's type on its first row, so the one wrongly-typed row must come first,
+# and ``null`` is the value that lets the later ints through. A typed schema
+# over an observed CSV would fail every row, and an observed upstream transform
+# whose output type varies row to row aborts earlier with ContractMergeError.
+# ---------------------------------------------------------------------------
+
+_BATCH_ROWS = (
+    {"id": 1, "name": "A", "copies": None, "category": "s"},
+    {"id": 2, "name": "B", "copies": 2, "category": "s"},
+    {"id": 3, "name": "C", "copies": 1, "category": "s"},
+)
+
+
+def _write_jsonl(path: Any, rows: Any) -> None:
+    import json
+
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def _run_cli(tmp_path: Any, settings_yaml: str) -> Any:
+    """``elspeth validate`` then ``elspeth run --execute`` on ``settings_yaml``."""
+    from typer.testing import CliRunner
+
+    from elspeth.cli import app
+
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(settings_yaml)
+    runner = CliRunner()
+    validated = runner.invoke(app, ["validate", "-s", str(settings_path)])
+    assert validated.exit_code == 0, validated.output
+    return runner.invoke(app, ["run", "-s", str(settings_path), "--execute"])
+
+
+def _typed_aggregation_settings(tmp_path: Any, *, on_error: str, trigger: str) -> str:
+    _write_jsonl(tmp_path / "input.jsonl", _BATCH_ROWS)
+    trigger_block = "  trigger:\n    count: 3\n" if trigger == "count" else ""
+    quarantine_sink = (
+        f"""  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        if on_error == "quarantine"
+        else ""
+    )
+    return f"""sources:
+  primary:
+    plugin: json
+    on_success: batch_in
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+aggregations:
+- name: replicate_batch
+  plugin: batch_replicate
+  input: batch_in
+  on_success: output
+  on_error: {on_error}
+{trigger_block}  output_mode: transform
+  options:
+    schema:
+      mode: fixed
+      fields:
+      - 'id: int'
+      - 'name: str'
+      - 'copies: int'
+      - 'category: str'
+    copies_field: copies
+    default_copies: 1
+    include_copy_index: true
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "output.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+{quarantine_sink}landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+
+
+_BUFFERED_ROW_0_VIOLATION = (
+    "Aggregation transform 'batch_replicate' input validation failed for buffered row 0: 1 validation error: copies: "
+)
+
+
+@pytest.mark.parametrize("trigger", ["count", "end_of_source"])
+def test_a_row_failing_a_typed_aggregation_schema_routes_the_whole_batch_to_on_error(trigger: str, tmp_path: Any) -> None:
+    """Before B2 this aborted the run (exit 4, a traceback, 3 tokens abandoned)."""
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _typed_aggregation_settings(tmp_path, on_error="quarantine", trigger=trigger))
+
+    # Every row failed and was routed: FAILED, which the CLI maps to exit 2.
+    assert cli.exit_code == cli_completion_for(RunStatus.FAILED)[1] == 2, cli.output
+    assert "Traceback" not in cli.output
+    assert "PluginContractViolation" not in cli.output
+
+    assert _read_jsonl(tmp_path / "quarantine.jsonl") == list(_BATCH_ROWS)
+    assert _read_jsonl(tmp_path / "output.jsonl") == []
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [run_id] = conn.execute(select(token_outcomes_table.c.run_id).distinct()).scalars().all()
+    audit = _failed_flush_audit(db, run_id)
+
+    assert len(audit["outcomes"]) == 3
+    assert {outcome.token_id for outcome in audit["outcomes"]} == audit["row_token_ids"]
+    for outcome in audit["outcomes"]:
+        assert (outcome.outcome, outcome.path, outcome.sink_name) == (
+            TerminalOutcome.FAILURE.value,
+            TerminalPath.ON_ERROR_ROUTED.value,
+            "quarantine",
+        )
+
+    [failed_state] = audit["failed_states"]
+    reason = json.loads(failed_state.error_json)
+    assert reason["reason"] == "contract_violation"
+    assert reason["error"].startswith(_BUFFERED_ROW_0_VIOLATION)
+    assert "[int_type]" in reason["error"]
+
+    [routing] = audit["routing"]
+    assert (routing.mode, routing.label, routing.state_id) == ("divert", "__error_replicate_batch__", failed_state.state_id)
+    [batch] = audit["batches"]
+    assert (batch.status, batch.trigger_type) == ("failed", trigger)
+    assert len(audit["transform_errors"]) == 3
+    for error_row in audit["transform_errors"]:
+        assert error_row.destination == "quarantine"
+        assert json.loads(error_row.error_details_json) == reason
+
+
+def test_a_row_failing_a_typed_aggregation_schema_under_discard_quarantines_the_batch(tmp_path: Any) -> None:
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _typed_aggregation_settings(tmp_path, on_error="discard", trigger="count"))
+
+    # Every row discarded: COMPLETED_WITH_FAILURES, exit 1 (the per-row discard's disposition).
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [run_id] = conn.execute(select(token_outcomes_table.c.run_id).distinct()).scalars().all()
+    audit = _failed_flush_audit(db, run_id)
+    assert {(outcome.outcome, outcome.path) for outcome in audit["outcomes"]} == {
+        (TerminalOutcome.FAILURE.value, TerminalPath.QUARANTINED_AT_SOURCE.value)
+    }
+    assert len(audit["outcomes"]) == 3
+    assert audit["routing"] == []
+    assert {row.destination for row in audit["transform_errors"]} == {"discard"}
+
+
+def _typed_collector_settings(tmp_path: Any) -> str:
+    # The document-level ``copies`` is copied onto every exploded page. DOC-2 is
+    # first (an observed JSON source locks types on row 0, and ``null`` lets
+    # DOC-1's int through) and carries copies=null under a collector schema
+    # that declares ``copies: int``; DOC-1 is well typed. Lifting a per-page
+    # value through an observed transform instead would abort earlier on
+    # ContractMergeError (row-to-row type variance), which is not this seam.
+    _write_jsonl(
+        tmp_path / "docs.jsonl",
+        (
+            {"doc_id": "DOC-2", "copies": None, "pages": [1, 2]},
+            {"doc_id": "DOC-1", "copies": 2, "pages": [1, 2]},
+        ),
+    )
+    return f"""sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "docs.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+concurrency:
+  max_workers: 1
+transforms:
+- name: explode_pages
+  plugin: json_explode
+  input: rows
+  on_success: pages
+  on_error: discard
+  options:
+    array_field: pages
+    output_field: page
+    schema:
+      mode: observed
+collectors:
+- name: page_rep
+  plugin: batch_replicate
+  input: pages
+  on_success: out
+  options:
+    copies_field: copies
+    default_copies: 1
+    include_copy_index: true
+    schema:
+      mode: flexible
+      fields:
+      - 'copies: int'
+scopes:
+- name: document_pages
+  opener: explode_pages
+  closer: page_rep
+  policy: require_all
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+
+
+def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes_on(tmp_path: Any) -> None:
+    """Before B2 this aborted the run and left every member hold OPEN."""
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import node_states_table, nodes_table
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _typed_collector_settings(tmp_path))
+
+    # DOC-1's group released; DOC-2's group failed: COMPLETED_WITH_FAILURES, exit 1.
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+
+    released = _read_jsonl(tmp_path / "out.jsonl")
+    assert {row["doc_id"] for row in released} == {"DOC-1"}
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [collector_node_id] = (
+            conn.execute(select(nodes_table.c.node_id).where(nodes_table.c.plugin_name == "batch_replicate")).scalars().all()
+        )
+        states = conn.execute(select(node_states_table).where(node_states_table.c.node_id == collector_node_id)).all()
+
+    assert not [state for state in states if state.status == "open"], "no member hold may be left OPEN"
+    failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
+    [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
+    assert flush_error["phase"] == "collector_flush"
+    assert "input validation failed for buffered row 0: 1 validation error: copies: " in flush_error["exception"]
+    member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
+    assert len(member_errors) == 2
+    assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}

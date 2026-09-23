@@ -1664,8 +1664,17 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
     ``on_error`` destination and counts the row as failed, rather than aborting
     the run (elspeth-181db83da7); registering a subclass in ``TIER_1_ERRORS`` is
     what opts it back out of that, per ADR-008 §"TIER_1 registration is
-    load-bearing". Seams other than the transform executor — sinks, the
-    aggregation flush — still abort; that asymmetry is tracked, not designed.
+    load-bearing". The batch seams route it too (operator ruling 2026-09-23,
+    elspeth-5887fb7928 B2): a violation raised before a flush records any
+    terminal — the buffered-input preflight, the batch plugin itself, the
+    result's canonical hashing and its output checks — fails the WHOLE batch,
+    which follows the aggregation's ``on_error`` or, at a collector, fails the
+    group. The flush's declaration cross-check is the exception: it writes each
+    member's terminal before it raises, so its violation still aborts. The sink
+    seam still aborts.
+
+    Every seam that routes it builds the reason with
+    :meth:`to_transform_error_reason`, so the routed shape is one rule.
 
     This docstring previously read "plugin bugs MUST crash the pipeline per
     CLAUDE.md's 'plugin bugs must crash' rule", citing a CLAUDE.md section that
@@ -1692,6 +1701,14 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
         the Landscape records it through canonical JSON serialization.
         """
         return {"exception_type": type(self).__name__, "message": scrub_text_for_audit(str(self))}
+
+    def to_transform_error_reason(self) -> TransformErrorReason:
+        """The reason a routed violation carries to ``on_error``.
+
+        Secret-scrubbed; value discipline is the raise site's (the engine's own
+        schema checks render ``contracts.safe_validation_errors``).
+        """
+        return {"reason": "contract_violation", "error": scrub_text_for_audit(str(self))}
 
 
 # TIER-2: Plugin success-empty misuse — row-level contract bug remains fully auditable and does not imply Tier-1 framework or audit-record corruption.

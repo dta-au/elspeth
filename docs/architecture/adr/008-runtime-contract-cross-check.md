@@ -80,11 +80,17 @@ Without the registration: a transform with `on_error="quarantine_sink"` would ca
 > `TransformResult.error` the whole batch follows it — every buffered row to the
 > named sink as `(failure, on_error_routed)`, or `(failure,
 > quarantined_at_source)` under `discard` — with one DIVERT routing_event on the
-> flush node_state and one `transform_errors` row per member. What limit (2)
-> says about EXCEPTIONS still stood at this correction: an exception raised at
-> the aggregation-flush seam records FAILED and re-raises, so it aborts the run
-> and `on_error` does not fire. The 2026-08-21 correction above is left as
-> written; this note supersedes only its last clause.
+> flush node_state and one `transform_errors` row per member. It is closed for
+> an unregistered `PluginContractViolation` too (operator ruling 2026-09-23,
+> elspeth-5887fb7928 B2): one raised at the aggregation or collector flush
+> before anything is recorded — the buffered-input schema preflight, the batch
+> plugin itself, the result's canonical hashing or its output checks — fails
+> the whole batch exactly as a returned error does (at a collector, the group
+> fails). Three things still abort: a `TIER_1_ERRORS` subclass (registration
+> stays load-bearing), the batch-flush declaration cross-check (it records each
+> member's terminal before raising), and any other exception from the plugin.
+> The sink seam still records and re-raises. The 2026-08-21 correction above is
+> left as written; this note supersedes only its last clause.
 
 ### Audit-recording path
 

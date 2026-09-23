@@ -22,7 +22,12 @@ from pydantic import ConfigDict
 from elspeth.contracts import PluginSchema, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    OrchestrationInvariantError,
+    PluginContractViolation,
+    SinkTransactionalInvariantError,
+)
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
@@ -463,6 +468,27 @@ class _CollectorEnv:
         assert isinstance(parsed, dict)
         return parsed
 
+    def failed_flush_state_errors(self, *, node: str, member_token_ids: set[str]) -> list[dict[str, Any]]:
+        """The parsed error_json of every FAILED state at the collector node that is
+        NOT a member's own hold — i.e. the opener-anchored flush guard state(s)."""
+        import json
+
+        from sqlalchemy import select
+
+        assert node == "stitch"
+        with self.db.connection() as conn:
+            rows = (
+                conn.execute(
+                    select(node_states_table.c.token_id, node_states_table.c.error_json)
+                    .where(node_states_table.c.run_id == self.run_id)
+                    .where(node_states_table.c.node_id == str(self.node_id))
+                    .where(node_states_table.c.status == "failed")
+                )
+                .mappings()
+                .all()
+            )
+        return [json.loads(row["error_json"]) for row in rows if row["token_id"] not in member_token_ids]
+
     def node_state_error_exception_for_token(self, *, node: str, token_id: str) -> str:
         """The error_json['exception'] text for THIS token's own hold state —
         disambiguates from the flush guard's separate opener-anchored state,
@@ -869,12 +895,17 @@ class TestFlush:
             env.executor.accept(members[1], "stitch")
 
     def test_success_with_neither_row_nor_rows_is_a_contract_violation(self, collector_env: _CollectorEnv) -> None:
-        # aggregation.py:527-532 guard, replicated with the same semantics.
+        # aggregation.py's guard, replicated with the same semantics: a Tier-2
+        # violation that fails the group (operator ruling 2026-09-23, B2).
         env = collector_env
         env.transform.return_empty_success = True
         members, _group_id = env.seed_group(count=1)
-        with pytest.raises(PluginContractViolation, match="neither row nor rows"):
-            env.executor.accept(members[0], "stitch")
+        outcome = env.executor.accept(members[0], "stitch")
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.released_tokens == ()
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "PluginContractViolation"
+        assert "neither row nor rows" in flush_error["exception"]
 
     def test_passthrough_quarantine_goes_through_ordinary_transform_mode_handling(self, collector_env: _CollectorEnv) -> None:
         # Collectors are transform-only; a plugin returning per-row passthrough
@@ -966,7 +997,9 @@ class TestFlushContractPreflight:
     merely missing a diagnostic.
     """
 
-    def test_buffered_row_violating_the_declared_input_contract_raises(self, collector_env: _CollectorEnv) -> None:
+    def test_buffered_row_violating_the_declared_input_contract_fails_the_group(self, collector_env: _CollectorEnv) -> None:
+        """The violation fails the WHOLE group, as a returned error would, and the
+        run goes on (operator ruling 2026-09-23, elspeth-5887fb7928 B2)."""
         env = collector_env
         # The closer admits `assembled` only, so the arriving member `{"item": 0}`
         # carries a forbidden extra AND misses a required field — the same shape
@@ -974,26 +1007,35 @@ class TestFlushContractPreflight:
         env.transform.input_schema = _StrictAssembledSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation, match=r"Collector transform .* input validation failed for buffered row 0"):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
+        assert outcome.held is False
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert outcome.released_tokens == ()
         # The plugin must never have seen the violating row — preflight, not postmortem.
         assert env.transform.call_count == 0
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "PluginContractViolation"
+        assert flush_error["exception"].startswith("Collector transform ")
+        assert "input validation failed for buffered row 0: " in flush_error["exception"]
+        # The member's own hold is closed with the group cause, not left OPEN.
+        member_error = env.node_state_error_for_token(node="stitch", token_id=members[0].token_id)
+        assert member_error["context"]["failure_reason"] == "collector_contract_violation"
 
     def test_the_preflight_failure_is_audited_against_the_flush_phase(self, collector_env: _CollectorEnv) -> None:
-        # Raised INSIDE the NodeStateGuard, so the flush state auto-fails and
-        # the violation is recorded rather than escaping unattributed. Same
-        # phase the plugin-exception case records.
+        # Recorded on the flush state, in the same phase the plugin-exception
+        # case records, rather than escaping unattributed.
         env = collector_env
         env.transform.input_schema = _StrictAssembledSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
-        assert env.latest_node_state_error_phase(node="stitch") == "collector_flush"
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["phase"] == "collector_flush"
 
-    def test_emitted_row_violating_the_declared_output_contract_raises(self, collector_env: _CollectorEnv) -> None:
+    def test_emitted_row_violating_the_declared_output_contract_fails_the_group(self, collector_env: _CollectorEnv) -> None:
         # The OUTPUT half. The audit lane could only ARGUE this one, because it
         # could not author a plugin that violates its own output schema without
         # writing one — which is exactly what a stand-in transform is for.
@@ -1001,11 +1043,38 @@ class TestFlushContractPreflight:
         env.transform.output_schema = _StrictItemSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation, match=r"Collector transform .* output validation failed for emitted row 0"):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.released_tokens == ()
         # The plugin DID run — this is postflight, unlike the input case above.
         assert env.transform.call_count == 1
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert "output validation failed for emitted row 0: " in flush_error["exception"]
+
+    def test_a_contract_violation_raised_by_the_plugin_fails_the_group(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        env.transform.raise_on_process = PluginContractViolation("plugin rejected row 0")
+        members, _group_id = env.seed_group(count=1)
+
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        assert outcome.failure_reason == "collector_contract_violation"
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["exception"] == "plugin rejected row 0"
+
+    def test_a_tier_1_contract_violation_still_aborts(self, collector_env: _CollectorEnv) -> None:
+        """``SinkTransactionalInvariantError`` is a PluginContractViolation AND Tier 1;
+        registration opts it out of the group-failure arm (ADR-008)."""
+        env = collector_env
+        env.transform.raise_on_process = SinkTransactionalInvariantError("commit boundary diverged")
+        members, _group_id = env.seed_group(count=1)
+
+        with pytest.raises(SinkTransactionalInvariantError, match="commit boundary diverged"):
+            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "SinkTransactionalInvariantError"
 
     def test_a_conforming_group_still_flushes_under_the_same_locked_contract(self, collector_env: _CollectorEnv) -> None:
         """The paired control, and it must use a LOCKED schema too.

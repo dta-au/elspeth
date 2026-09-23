@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
@@ -29,6 +30,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.identity import innermost_own_frame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -62,7 +64,8 @@ class CollectorOutcome:
     consumed_tokens: tuple[TokenInfo, ...] = ()
     collector_name: str | None = None
     group_id: str | None = None
-    # "collector_missing_members" | "collector_transform_error" | GroupSettlementReason.EMPTY_EXPANSION | None
+    # "collector_missing_members" | "collector_transform_error" | "collector_contract_violation"
+    # | GroupSettlementReason.EMPTY_EXPANSION | None
     failure_reason: str | None = None
     # GroupSettlementReason.ALL_MEMBERS_LOST | GroupSettlementReason.EMPTY_EXPANSION | None (ADR-042 closed vocabulary)
     closed_without_plugin: str | None = None
@@ -988,8 +991,47 @@ class CollectorExecutor:
             # over it, where the identical plugin under `aggregations:` raised.
             # Shared with AggregationExecutor rather than copied — both run the
             # same batch-transform contract (`NESTED_CONTRACT_OPTIONS_NODE_TYPES`).
-            validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
-            result = transform.process(pipeline_rows, ctx)
+            #
+            # A Tier-2 ``PluginContractViolation`` from that preflight, from the
+            # plugin, or from the success result's output checks fails the WHOLE
+            # group, as a returned error does (operator ruling 2026-09-23,
+            # elspeth-5887fb7928 B2): a wrongly-typed row under a typed
+            # collector schema is a fact about that row, so it must not end the
+            # run. Nothing is minted before these checks; the Tier-1 subclasses
+            # still abort.
+            try:
+                validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
+                result = transform.process(pipeline_rows, ctx)
+                if result.status == "success":
+                    if result.row is None and result.rows is None:
+                        raise PluginContractViolation(
+                            f"Collector transform '{transform.name}' returned success status but "
+                            f"neither row nor rows contains data. Batch-aware transforms must return "
+                            f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
+                        )
+                    # Postflight, before the rows are released downstream — the
+                    # other half of the aggregation parity restored here.
+                    validate_success_outputs(transform, result, node_kind="Collector")
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except PluginContractViolation as violation:
+                guard.complete(
+                    NodeStateStatus.FAILED,
+                    duration_ms=(self._clock.monotonic() - now) * 1000,
+                    error=ExecutionError(
+                        exception=scrub_text_for_audit(str(violation)),
+                        exception_type=type(violation).__name__,
+                        phase="collector_flush",
+                        context=violation.to_audit_dict(),
+                    ),
+                )
+                return self._fail_group(
+                    collector_name,
+                    key,
+                    pending,
+                    failure_reason="collector_contract_violation",
+                    coordination_token=ctx.require_coordination_token(),
+                )
             if result.status != "success":
                 guard.complete(
                     NodeStateStatus.FAILED,
@@ -1007,16 +1049,7 @@ class CollectorExecutor:
                     coordination_token=ctx.require_coordination_token(),
                 )
 
-            if result.row is None and result.rows is None:
-                raise PluginContractViolation(
-                    f"Collector transform '{transform.name}' returned success status but "
-                    f"neither row nor rows contains data. Batch-aware transforms must return "
-                    f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
-                )
             output_rows: tuple[PipelineRow, ...] = (result.row,) if result.row is not None else tuple(result.rows or ())
-            # Postflight, before the rows are released downstream — the other
-            # half of the aggregation parity restored here.
-            validate_success_outputs(transform, result, node_kind="Collector")
             quarantined = validated_quarantined_indices(result, buffered_token_count=len(members), aggregation_name=collector_name)
             surviving = tuple(entry for index, entry in enumerate(entries) if index not in quarantined)
             if not surviving:

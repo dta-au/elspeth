@@ -2284,10 +2284,7 @@ class RowProcessor:
                 f"Transform '{transform.name}' has on_error=None — this should be impossible since TransformSettings requires on_error"
             )
 
-        error_details: TransformErrorReason = {
-            "reason": "contract_violation",
-            "error": scrub_text_for_audit(str(exc)),
-        }
+        error_details = exc.to_transform_error_reason()
         record_transform_error_with_routing(
             ctx=ctx,
             execution=self._execution,

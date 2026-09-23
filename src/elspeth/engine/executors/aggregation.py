@@ -432,7 +432,12 @@ class AggregationExecutor:
         ctx: PluginContext,
         guard: NodeStateGuard,
     ) -> tuple[TransformResult, float]:
-        """Run the batch transform and record direct plugin failures."""
+        """Run the batch transform and record direct plugin failures.
+
+        A Tier-2 ``PluginContractViolation`` passes through with the state
+        still open: ``execute_flush`` routes it as a failed batch and completes
+        the state itself, with the routed reason.
+        """
         start = time.perf_counter()
         try:
             result = transform.process(list(pipeline_rows), ctx)
@@ -440,6 +445,8 @@ class AggregationExecutor:
         except (RunLeadershipLostError, RunMembershipLostError):
             raise
         except contract_errors.TIER_1_ERRORS:
+            raise
+        except PluginContractViolation:
             raise
         except Exception as exc:
             duration_ms = (time.perf_counter() - start) * 1000
@@ -479,6 +486,91 @@ class AggregationExecutor:
             ) from exc
         result.duration_ms = duration_ms
 
+    def _run_flush_transform(
+        self,
+        *,
+        node: _AggregationNodeState,
+        transform: BatchTransformProtocol,
+        pipeline_rows: Sequence[PipelineRow],
+        ctx: PluginContext,
+        guard: NodeStateGuard,
+        input_hash: str,
+    ) -> tuple[TransformResult, float]:
+        """Produce the flush's result: the plugin's own, or its contract violation as a failed batch.
+
+        A Tier-2 ``PluginContractViolation`` raised here — the buffered-input
+        preflight, the batch plugin itself, canonical hashing of its result, or
+        the success result's output checks — fails the WHOLE batch as a
+        returned error would (operator ruling 2026-09-23, elspeth-5887fb7928
+        B2): ``_complete_error_flush`` then records it and the processor
+        applies the aggregation's ``on_error`` to every buffered row. A
+        wrongly-typed row under a typed aggregation schema is a fact about that
+        row, not only about the configuration, so it must not end the run.
+
+        Nothing is recorded before these checks, so a routed batch cannot also
+        hold a terminal. The Tier-1 subclasses (``SinkTransactionalInvariantError``)
+        still abort, and so does the processor's declaration cross-check, which
+        runs after this and writes each member's terminal before it raises.
+        """
+        start = time.perf_counter()
+        try:
+            self._validate_batch_inputs(transform, pipeline_rows)
+            result, duration_ms = self._invoke_batch_transform(
+                transform=transform,
+                pipeline_rows=pipeline_rows,
+                ctx=ctx,
+                guard=guard,
+            )
+            self._populate_result_audit_fields(
+                transform=transform,
+                result=result,
+                input_hash=input_hash,
+                duration_ms=duration_ms,
+            )
+            if result.status == "success":
+                self._check_successful_result(node=node, transform=transform, result=result)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except PluginContractViolation as violation:
+            failed_batch = TransformResult.error(violation.to_transform_error_reason(), retryable=False)
+            failed_duration_ms = (time.perf_counter() - start) * 1000
+            self._populate_result_audit_fields(
+                transform=transform,
+                result=failed_batch,
+                input_hash=input_hash,
+                duration_ms=failed_duration_ms,
+            )
+            return failed_batch, failed_duration_ms
+        return result, duration_ms
+
+    def _check_successful_result(
+        self,
+        *,
+        node: _AggregationNodeState,
+        transform: BatchTransformProtocol,
+        result: TransformResult,
+    ) -> None:
+        """The plugin-contract checks a success result must pass before completion.
+
+        Each raises a Tier-2 ``PluginContractViolation``, which ``execute_flush``
+        routes as a failed batch — they run before anything is recorded.
+        """
+        self._validate_success_outputs(transform, result)
+
+        if result.row is None and result.rows is None:
+            raise PluginContractViolation(
+                f"Aggregation transform '{transform.name}' returned success status but "
+                f"neither row nor rows contains data. Batch-aware transforms must return "
+                f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
+            )
+
+        output_count = 1 if result.row is not None else len(result.rows or ())
+        expected_count = node.settings.expected_output_count
+        if node.settings.output_mode is OutputMode.TRANSFORM and expected_count is not None and output_count != expected_count:
+            raise PluginContractViolation(
+                f"Aggregation {node.settings.name!r} produced {output_count} output row(s), but expected_output_count={expected_count}."
+            )
+
     def _complete_successful_flush(
         self,
         *,
@@ -494,16 +586,7 @@ class AggregationExecutor:
         buffered_tokens: Sequence[TokenInfo],
         coordination_token: CoordinationToken,
     ) -> None:
-        """Record successful node-state and batch completion."""
-        self._validate_success_outputs(transform, result)
-
-        if result.row is None and result.rows is None:
-            raise PluginContractViolation(
-                f"Aggregation transform '{transform.name}' returned success status but "
-                f"neither row nor rows contains data. Batch-aware transforms must return "
-                f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
-            )
-
+        """Record successful node-state and batch completion (``_check_successful_result`` passed)."""
         output_rows = (result.row,) if result.row is not None else tuple(result.rows or ())
         quarantined_indices = validated_quarantined_indices(
             result,
@@ -511,11 +594,6 @@ class AggregationExecutor:
             aggregation_name=node.settings.name,
         )
         if node.settings.output_mode is OutputMode.TRANSFORM:
-            if node.settings.expected_output_count is not None and len(output_rows) != node.settings.expected_output_count:
-                raise PluginContractViolation(
-                    f"Aggregation {node.settings.name!r} produced {len(output_rows)} output row(s), "
-                    f"but expected_output_count={node.settings.expected_output_count}."
-                )
             non_quarantined_tokens = tuple(token for index, token in enumerate(buffered_tokens) if index not in quarantined_indices)
             if output_rows and not non_quarantined_tokens:
                 raise OrchestrationInvariantError(
@@ -699,9 +777,11 @@ class AggregationExecutor:
         1. Transitions batch to "executing" with trigger reason
         2. Records node_state for the flush operation
         3. Executes the batch-aware transform
-        4. Transitions batch to "completed" or "failed"; a returned error
-           first records one transform_errors row per member and, for a
-           named on_error sink, one DIVERT routing_event on the flush state
+        4. Transitions batch to "completed" or "failed"; a returned error —
+           or a Tier-2 ``PluginContractViolation`` raised before completion,
+           which ``_run_flush_transform`` turns into one — first records one
+           transform_errors row per member and, for a named on_error sink,
+           one DIVERT routing_event on the flush state
            (``_complete_error_flush``)
         5. Resets batch_id for next batch
 
@@ -718,7 +798,11 @@ class AggregationExecutor:
             Tuple of (TransformResult with audit fields, list of consumed tokens, batch_id)
 
         Raises:
-            Exception: Re-raised from transform.process() after recording failure
+            Exception: Any other exception from transform.process() (recorded
+                FAILED first), a Tier-1 error, or a violation raised by
+                ``validate_success`` (the processor's declaration cross-check,
+                which records each member's terminal before raising). The batch
+                is marked FAILED and the run aborts.
         """
         node = self._get_node(node_id, "execute_flush")
         batch_id = node.batch_id
@@ -786,18 +870,13 @@ class AggregationExecutor:
             batch_finalized = False
 
             try:
-                self._validate_batch_inputs(transform, snapshot.pipeline_rows)
-                result, duration_ms = self._invoke_batch_transform(
+                result, duration_ms = self._run_flush_transform(
+                    node=node,
                     transform=transform,
                     pipeline_rows=snapshot.pipeline_rows,
                     ctx=ctx,
                     guard=guard,
-                )
-                self._populate_result_audit_fields(
-                    transform=transform,
-                    result=result,
                     input_hash=input_hash,
-                    duration_ms=duration_ms,
                 )
 
                 # Complete node state and batch

@@ -1887,7 +1887,7 @@ aggregations:
 | `plugin` | string | **Yes** | Aggregation plugin name |
 | `input` | string | **Yes** | Connection name to receive data from |
 | `on_success` | string | No | Where successful output rows go (sink name or connection name) |
-| `on_error` | string | **Yes** | Where the rows of a FAILED batch go. A batch fails as a whole: when the batch transform returns an error, EVERY buffered row is written to this sink with its original values (each recorded `on_error_routed` with the batch reason), or with `discard` each row is recorded quarantined without being written. A batch transform that raises still aborts the run. |
+| `on_error` | string | **Yes** | Where the rows of a FAILED batch go. A batch fails as a whole: when the batch transform returns an error, EVERY buffered row is written to this sink with its original values (each recorded `on_error_routed` with the batch reason), or with `discard` each row is recorded quarantined without being written. A plugin contract violation raised before the flush records anything (for example a buffered row that fails the aggregation's typed `schema`) fails the batch the same way; any other exception the batch transform raises still aborts the run. |
 | `trigger` | object | No | When to flush the batch early; omit for end-of-source only |
 | `output_mode` | string | No | `passthrough` or `transform` (default: `transform`) |
 | `expected_output_count` | int | No | For `transform` mode: validate output row count |

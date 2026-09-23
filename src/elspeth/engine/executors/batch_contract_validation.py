@@ -20,15 +20,22 @@ and nothing makes them drift together. ``node_kind`` is the ONLY thing the two
 callers vary, and it varies solely to name the node in the operator-facing
 message.
 
-Both raise rather than returning a routable error, deliberately. What they
-check is a function of the CONFIG, not of the row: the node's declared contract
-either admits the arriving shape or it does not, identically for every row in
-the group. Routing it per-row would quarantine an entire dataset and report
-PARTIAL, telling the operator their data was bad when the pipeline was
-misconfigured — the disposition ADR-008 §Alternative 3 rejects, and the same
-reasoning ``TransformExecutor._run_preflight`` records for its own lifecycle
-guard. This is the opposite polarity from elspeth-5887fb7928, where the checks
-WERE facts about one row and had to become routable returns.
+Both raise a Tier-2 ``PluginContractViolation``, and both executors ROUTE it:
+the whole batch fails, following the aggregation's ``on_error`` or failing the
+collector's group, as a returned error would (``AggregationExecutor.
+_run_flush_transform``, ``CollectorExecutor._execute_flush``). This reverses the
+decision recorded here before 2026-09-23, which held that the checks were a
+function of the CONFIG alone and so had to abort. Measurement refuted that: a
+typed aggregation schema over an observed upstream is ordinary, and one
+wrongly-typed row of three failed the check while the other two passed, so it
+is a fact about that row and the run must not end on it. Operator ruling
+2026-09-23 (elspeth-5887fb7928 B2) chose to route; the per-row seam already
+routes the same violation (``RowProcessor._convert_contract_violation_to_error_result``).
+When every row fails because the configuration is wrong, every batch is routed
+and the run reports its failures instead of a traceback.
+
+The message names the row index, field and error type, never the row VALUE
+(``contracts.safe_validation_errors``): it becomes the routed reason.
 """
 
 from __future__ import annotations
