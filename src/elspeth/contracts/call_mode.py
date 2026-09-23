@@ -119,6 +119,7 @@ class CallModeSession(Protocol):
         self,
         *,
         original_url: str,
+        audited_url: str | None = None,
         call_type: CallType,
         current_state_id: str | None,
         current_operation_id: str | None,

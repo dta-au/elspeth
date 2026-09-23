@@ -6,7 +6,8 @@ import json
 import re
 from collections.abc import Mapping
 from ipaddress import ip_address
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 from elspeth.contracts.call_mode import (
@@ -31,7 +32,7 @@ _FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
 
 
 def _require_archived_dns_pin(data: Mapping[str, Any]) -> None:
-    resolved_ip = data.get("resolved_ip")
+    resolved_ip = data["resolved_ip"] if "resolved_ip" in data else None
     if type(resolved_ip) is not str or not resolved_ip:
         raise AuditIntegrityError("Source HTTP request lacks an archived DNS pin")
     try:
@@ -42,21 +43,23 @@ def _require_archived_dns_pin(data: Mapping[str, Any]) -> None:
 
 def _mi_non_auth_request(data: Mapping[str, Any], *, before_dns: bool) -> dict[str, object]:
     """Preserve every HTTP request field except the rotating MI fingerprint."""
-    raw_headers = data.get("headers")
-    if not isinstance(raw_headers, Mapping):
+    raw_headers = data["headers"] if "headers" in data else None
+    if type(raw_headers) not in (dict, MappingProxyType):
         raise AuditIntegrityError("Managed-identity HTTP request has no structured headers")
-    auth_names = [name for name in raw_headers if isinstance(name, str) and name.lower() == "authorization"]
+    raw_headers = cast("Mapping[str, object]", raw_headers)
+    auth_names = [name for name in raw_headers if type(name) is str and name.lower() == "authorization"]
     if len(auth_names) > 1:
         raise AuditIntegrityError("Managed-identity HTTP request has ambiguous Authorization headers")
     if not before_dns:
-        if len(auth_names) != 1 or not isinstance(raw_headers[auth_names[0]], str):
+        fingerprint = raw_headers[auth_names[0]] if len(auth_names) == 1 else None
+        if type(fingerprint) is not str:
             raise AuditIntegrityError("Managed-identity HTTP request lacks fingerprinted Authorization")
-        if _FINGERPRINTED_AUTH.fullmatch(raw_headers[auth_names[0]]) is None:
+        if _FINGERPRINTED_AUTH.fullmatch(fingerprint) is None:
             raise AuditIntegrityError("Managed-identity HTTP Authorization is not a fingerprint")
     comparison = dict(data)
     comparison["headers"] = {name: value for name, value in raw_headers.items() if name not in auth_names}
-    if before_dns:
-        comparison.pop("resolved_ip", None)
+    if before_dns and "resolved_ip" in comparison:
+        del comparison["resolved_ip"]
     return comparison
 
 
@@ -120,16 +123,20 @@ class AuditedCallModeSession:
                 parsed_error = json.loads(call.error_json)
                 if type(parsed_error) is not dict:
                     raise AuditIntegrityError(f"Source error call {call.call_id} lacks structured error evidence")
-                if call.call_type is CallType.LLM and parsed_error.get("category") not in {
-                    "rate_limit",
-                    "content_policy",
-                    "context_length",
-                    "server",
-                    "network",
-                    "client",
-                    "unknown",
-                    "response_processing",
-                }:
+                if call.call_type is CallType.LLM and (
+                    "category" not in parsed_error
+                    or parsed_error["category"]
+                    not in {
+                        "rate_limit",
+                        "content_policy",
+                        "context_length",
+                        "server",
+                        "network",
+                        "client",
+                        "unknown",
+                        "response_processing",
+                    }
+                ):
                     raise AuditIntegrityError(f"Source LLM error call {call.call_id} lacks owned error category")
             required.add(call.call_id)
         return frozenset(required)
@@ -201,6 +208,7 @@ class AuditedCallModeSession:
         self,
         *,
         original_url: str,
+        audited_url: str | None = None,
         call_type: CallType,
         current_state_id: str | None,
         current_operation_id: str | None,
@@ -208,6 +216,7 @@ class AuditedCallModeSession:
         if self._mode not in (RunMode.REPLAY, RunMode.VERIFY):
             raise AuditIntegrityError("Archived DNS pin requires replay or verify mode")
         matches: set[str] = set()
+        expected_url = audited_url if audited_url is not None else original_url
         for call in self._factory.execution.list_source_calls_for_current_parent(
             source_run_id=self._source_run_id,
             call_type=call_type,
@@ -217,8 +226,12 @@ class AuditedCallModeSession:
             request = self._factory.execution.get_call_request_data(call.call_id)
             if request.state is not CallDataState.AVAILABLE or request.data is None:
                 raise AuditIntegrityError(f"Source call {call.call_id} has no retained request for DNS replay")
-            if request.data.get("url") == original_url and request.data.get("hop_number") is None:
-                pin = request.data.get("resolved_ip")
+            if (
+                "url" in request.data
+                and request.data["url"] == expected_url
+                and ("hop_number" not in request.data or request.data["hop_number"] is None)
+            ):
+                pin = request.data["resolved_ip"] if "resolved_ip" in request.data else None
                 if type(pin) is not str or not pin:
                     raise AuditIntegrityError(f"Source call {call.call_id} lacks a DNS pin")
                 matches.add(pin)
@@ -406,12 +419,12 @@ class AuditedCallModeSession:
                 raise AuditIntegrityError(f"Source HTTP request {call.call_id} is unavailable")
             _require_archived_dns_pin(archived.data)
             source = _mi_non_auth_request(archived.data, before_dns=False)
-            source.pop("resolved_ip", None)
+            del source["resolved_ip"]
             if source == current:
                 candidates.append(ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=archived.data))
         if len(candidates) != 1:
             raise AuditIntegrityError("Managed-identity source request is missing or ambiguous before token acquisition")
-        url = request_data.get("url")
+        url = request_data["url"] if "url" in request_data else None
         if type(url) is not str:
             raise AuditIntegrityError("Managed-identity HTTP preflight requires a URL")
         self._mi_preflights[(current_state_id, current_operation_id, url)] = candidates[0].source_call_id
@@ -427,7 +440,8 @@ class AuditedCallModeSession:
         if self._mode is not RunMode.VERIFY:
             raise AuditIntegrityError("HTTP preflight requires verify mode")
         current = dict(request_data)
-        current.pop("resolved_ip", None)
+        if "resolved_ip" in current:
+            del current["resolved_ip"]
         candidates: list[ArchivedCallRequestEvidence] = []
         for call in self._factory.execution.list_source_calls_for_current_parent(
             source_run_id=self._source_run_id,
@@ -440,7 +454,7 @@ class AuditedCallModeSession:
                 raise AuditIntegrityError(f"Source HTTP request {call.call_id} is unavailable")
             _require_archived_dns_pin(archived.data)
             source = dict(archived.data)
-            source.pop("resolved_ip", None)
+            del source["resolved_ip"]
             if source == current:
                 candidates.append(ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=archived.data))
         if len(candidates) != 1:
@@ -466,8 +480,9 @@ class AuditedCallModeSession:
         )
         if source.source_call_id != source_call_id:
             raise AuditIntegrityError("Managed-identity source call changed after preflight")
-        url = request_data.get("url")
-        if type(url) is not str or self._mi_preflights.pop((current_state_id, current_operation_id, url), None) != source_call_id:
+        url = request_data["url"] if "url" in request_data else None
+        preflight_key = (current_state_id, current_operation_id, url)
+        if type(url) is not str or preflight_key not in self._mi_preflights or self._mi_preflights.pop(preflight_key) != source_call_id:
             raise AuditIntegrityError("Managed-identity HTTP call has no pre-token source admission")
         if _mi_non_auth_request(source.request_data, before_dns=False) != _mi_non_auth_request(request_data, before_dns=False):
             raise AuditIntegrityError("Managed-identity HTTP non-auth request fields differ")
@@ -504,7 +519,7 @@ class AuditedCallModeSession:
                 candidates.append(ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=archived.data))
         if len(candidates) != 1:
             raise AuditIntegrityError("Operation HTTP managed-identity request is missing or ambiguous before token acquisition")
-        url = request_data.get("url")
+        url = request_data["url"] if "url" in request_data else None
         if type(url) is not str or not url:
             raise AuditIntegrityError("Operation HTTP managed-identity preflight requires a URL")
         self._operation_mi_preflights[(current_operation_id, url)] = candidates[0].source_call_id
@@ -528,8 +543,13 @@ class AuditedCallModeSession:
         )
         if source.source_call_id != source_call_id:
             raise AuditIntegrityError("Operation HTTP source call changed after preflight")
-        url = request_data.get("url")
-        if type(url) is not str or self._operation_mi_preflights.pop((current_operation_id, url), None) != source_call_id:
+        url = request_data["url"] if "url" in request_data else None
+        preflight_key = (current_operation_id, url)
+        if (
+            type(url) is not str
+            or preflight_key not in self._operation_mi_preflights
+            or self._operation_mi_preflights.pop(preflight_key) != source_call_id
+        ):
             raise AuditIntegrityError("Operation HTTP call has no pre-token source admission")
         if _mi_non_auth_request(source.request_data, before_dns=False) != _mi_non_auth_request(request_data, before_dns=False):
             raise AuditIntegrityError("Operation HTTP managed-identity non-auth request fields differ")
@@ -556,9 +576,10 @@ class AuditedCallModeSession:
         if self._mode is not RunMode.VERIFY:
             raise AuditIntegrityError("Verification requested outside verify mode")
         key = (call_type, current_state_id, current_operation_id, current_call_index)
-        admitted_source_call_id = self._verify_admissions.pop(key, None)
+        admitted_source_call_id = self._verify_admissions.pop(key) if key in self._verify_admissions else None
         if admitted_source_call_id is None:
-            admitted_source_call_id = self._verify_admissions.pop((call_type, current_state_id, current_operation_id, None), None)
+            parent_key = (call_type, current_state_id, current_operation_id, None)
+            admitted_source_call_id = self._verify_admissions.pop(parent_key) if parent_key in self._verify_admissions else None
         if admitted_source_call_id is None:
             raise AuditIntegrityError("Verification call reached settlement without pre-dispatch source admission")
         semantic_mi = key in self._mi_verify_admissions

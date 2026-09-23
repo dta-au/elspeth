@@ -42,8 +42,10 @@ def admit_source_configuration(
         raise AuditIntegrityError("Replay source canonical version differs")
     current_settings: dict[str, Any] = dict(config.config)
     for field in _INVOCATION_FIELDS:
-        source_settings.pop(field, None)
-        current_settings.pop(field, None)
+        if field in source_settings:
+            del source_settings[field]
+        if field in current_settings:
+            del current_settings[field]
     if stable_hash(source_settings) != stable_hash(current_settings):
         raise AuditIntegrityError("Replay execution settings differ from the source run")
 

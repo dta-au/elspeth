@@ -288,7 +288,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2f75c312e0b43ecc"
+    source_file_hash: str | None = "sha256:04caeac653f577b2"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -483,6 +483,7 @@ class BlobFetch(BaseTransform):
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
                     original_url=url,
+                    audited_url=fingerprint_url(url),
                     call_type=CallType.HTTP,
                     current_state_id=ctx.state_id,
                     current_operation_id=None,
@@ -491,6 +492,7 @@ class BlobFetch(BaseTransform):
             elif session is not None and session.mode is RunMode.VERIFY:
                 archived = session.replay_ssrf_request(
                     original_url=url,
+                    audited_url=fingerprint_url(url),
                     call_type=CallType.HTTP,
                     current_state_id=ctx.state_id,
                     current_operation_id=None,

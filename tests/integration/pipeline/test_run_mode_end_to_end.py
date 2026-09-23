@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 import respx
 import yaml
 from sqlalchemy import select
@@ -257,6 +258,59 @@ def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: P
     assert corrupt.exit_code != 0, corrupt.output
     assert "payload" in corrupt.output.lower() or "integrity" in corrupt.output.lower()
     assert sink_path.read_bytes() == artifact
+
+
+def test_cli_replay_refuses_sensitive_query_without_exact_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "web-scrape-test-key")
+    (tmp_path / "input.csv").write_text("url\nhttps://example.org/page?token=synthetic-value\n")
+    settings["transforms"] = [
+        {
+            "name": "fetch",
+            "plugin": "web_scrape",
+            "input": "source_out",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "format": "text",
+                "http": {"abuse_contact": "audit@example.org", "scraping_reason": "Replay refusal test"},
+            },
+        }
+    ]
+    settings_path = tmp_path / "settings.yaml"
+    runner = CliRunner()
+    ip = "104.18.27.120"
+
+    def invoke() -> object:
+        settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+        return runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    def fixed_dns(_host: str, port: int, *_args: object, **_kwargs: object) -> list[tuple[object, ...]]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    with respx.mock(assert_all_mocked=True) as router, patch("socket.getaddrinfo", side_effect=fixed_dns):
+        route = router.get(f"https://{ip}:443/page?token=synthetic-value").mock(
+            return_value=httpx.Response(200, text="safe page", headers={"content-type": "text/html"})
+        )
+        live = invoke()
+    assert live.exit_code == 0, live.output
+    assert route.call_count == 1
+    artifact = (tmp_path / "output.json").read_bytes()
+    settings["run_mode"] = "replay"
+    settings["replay_from"] = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved DNS")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("replay opened HTTP client")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("replay published sink")),
+    ):
+        replay = invoke()
+    assert replay.exit_code != 0, replay.output
+    assert "lacks transport" in replay.output
+    assert (tmp_path / "output.json").read_bytes() == artifact
 
 
 def test_cli_llm_replay_skips_sdk_and_verify_persists_mismatch(tmp_path: Path) -> None:

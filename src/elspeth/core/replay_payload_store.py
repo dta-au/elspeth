@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
@@ -42,8 +43,9 @@ def _audited_ref(value: object, *, location: str) -> str:
 
 
 def _row_refs(row: object, *, fields: frozenset[str], location: str) -> Iterable[str]:
-    if not isinstance(row, Mapping):
+    if type(row) not in (dict, MappingProxyType):
         raise AuditIntegrityError(f"{location}: audited row is not an object")
+    row = cast("dict[str, object] | MappingProxyType[str, object]", row)
     for field_name in fields:
         if field_name in row:
             yield _audited_ref(row[field_name], location=f"{location}.{field_name}")
@@ -102,15 +104,12 @@ def collect_source_payload_refs(
             reason = json.loads(reason_json)
         except (UnicodeDecodeError, ValueError) as exc:
             raise AuditIntegrityError(f"Source run {source_run_id}: state {state.state_id} success reason is invalid JSON") from exc
-        if isinstance(reason, dict) and isinstance(reason.get("metadata"), dict) and "fetch_payload_hash" in reason["metadata"]:
-            metadata = reason.get("metadata")
-            if type(metadata) is not dict or "fetch_payload_hash" not in metadata:
-                raise AuditIntegrityError(f"Source run {source_run_id}: blob fetch state {state.state_id} has no payload hash")
+        metadata = reason["metadata"] if type(reason) is dict and "metadata" in reason else None
+        if type(metadata) is dict and "fetch_payload_hash" in metadata:
             ref = _audited_ref(metadata["fetch_payload_hash"], location=f"state {state.state_id}")
             input_refs.add(ref)
             output_refs.add(ref)
-        if isinstance(reason, dict) and isinstance(reason.get("metadata"), dict) and "fetch_response_processed_hash" in reason["metadata"]:
-            metadata = reason["metadata"]
+        if type(metadata) is dict and "fetch_response_processed_hash" in metadata:
             output_refs.add(_audited_ref(metadata["fetch_response_processed_hash"], location=f"state {state.state_id}"))
 
     for call in factory.query.get_all_calls_for_run(source_run_id):
@@ -122,26 +121,31 @@ def collect_source_payload_refs(
         if response.state is not CallDataState.AVAILABLE or response.data is None:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no retained render receipt")
         receipt: Any = deep_thaw(response.data)
-        if type(receipt) is not dict or receipt.get("format") != "pdf_rasterize/v1":
+        if type(receipt) is not dict or "format" not in receipt or receipt["format"] != "pdf_rasterize/v1":
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF state {call.state_id} has no typed render receipt")
-        identity = receipt.get("renderer_identity")
+        identity = receipt["renderer_identity"] if "renderer_identity" in receipt else None
         if type(identity) is not str or _HASH.fullmatch(identity) is None:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no renderer identity")
-        if receipt.get("outcome_kind") not in ("rasterized", "document_refusal", "timeout"):
+        if "outcome_kind" not in receipt or receipt["outcome_kind"] not in ("rasterized", "document_refusal", "timeout"):
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no typed worker outcome")
-        if receipt.get("result_status") not in ("success", "error") or type(receipt.get("rows")) is not list:
+        if (
+            "result_status" not in receipt
+            or receipt["result_status"] not in ("success", "error")
+            or "rows" not in receipt
+            or type(receipt["rows"]) is not list
+        ):
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no typed result")
         if call.state_id in pdf_receipt_states:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF state {call.state_id} has multiple render receipts")
         if call.state_id is not None:
             pdf_receipt_states.add(call.state_id)
-        rendered = receipt.get("rendered")
+        rendered = receipt["rendered"] if "rendered" in receipt else None
         if type(rendered) is not list:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has malformed rendered pages")
         for index, page in enumerate(rendered):
             if type(page) is not dict or "page_ref" not in page:
                 raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} page {index} has no payload ref")
-            if page["page_ref"] is None and receipt.get("result_status") == "error":
+            if page["page_ref"] is None and receipt["result_status"] == "error":
                 continue
             output_refs.add(_audited_ref(page["page_ref"], location=f"PDF call {call.call_id} page {index}"))
 

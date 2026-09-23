@@ -37,6 +37,12 @@ mode contract is refused before construction or `on_start`; unknown third
 party plugins are refused. This is a capability refusal, not a quiet downgrade
 to `live`.
 
+An HTTP response whose exact request URL contains a sensitive query value
+cannot be reconstructed from the redacted audit URL. Live execution still
+records its safe audit view; replay refuses that source call without network
+contact because retaining the raw URL would expose the value and substituting
+its fingerprint would change the observable response request URL.
+
 ## External calls
 
 Each recorded call is bound to the source run, source node or operation,

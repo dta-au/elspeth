@@ -170,9 +170,9 @@ class RunContextFactory:
             for transform in config.transforms:
                 if transform.name not in {"blob_csv_expand", "blob_json_expand", "blob_text_expand", "pdf_rasterize"}:
                     continue
-                if transform.name == "blob_csv_expand" and transform.config.get("source") == "field":
+                if transform.name == "blob_csv_expand" and "source" in transform.config and transform.config["source"] == "field":
                     continue
-                field_name = transform.config.get("blob_ref_field") or "blob_ref"
+                field_name = transform.config["blob_ref_field"] if "blob_ref_field" in transform.config else "blob_ref"
                 if type(field_name) is not str or not field_name:
                     raise RuntimeError(f"Invalid blob_ref_field for {transform.name}")
                 blob_ref_fields.add(field_name)

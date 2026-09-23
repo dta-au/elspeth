@@ -222,10 +222,12 @@ class RunLifecycleCoordinator:
             # on the fresh path, no read-back.
             run_id = run_id or (run_start_permit.run_id if run_start_permit is not None else generate_id())
             worker_id = mint_worker_id(run_id)
+            configured_mode = config.config["run_mode"] if "run_mode" in config.config else RunMode.LIVE
+            replay_from_run_id = config.config["replay_from"] if "replay_from" in config.config else None
             run = factory.run_lifecycle.begin_run(
                 config=config.config,
-                run_mode=RunMode(config.config.get("run_mode", RunMode.LIVE)),
-                replay_from_run_id=config.config.get("replay_from"),
+                run_mode=RunMode(configured_mode),
+                replay_from_run_id=replay_from_run_id,
                 canonical_version=self._canonical_version,
                 source_schema_json=source_schema_json,
                 run_id=run_id,
