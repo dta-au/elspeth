@@ -178,6 +178,69 @@ class TestBlobRowsLoad:
         assert all(not isinstance(value, (bytes, bytearray)) for value in rows[0].row.values())
 
 
+class TestBlobRowsValidationFailureText:
+    """A schema failure's recorded text must not echo the row's values (elspeth-a300402c58).
+
+    ``str(ValidationError)`` carries ``input_value=...``; for blob_rows that is
+    custody metadata such as the filename, which then lands in the
+    ``validation_errors.error`` cell and the quarantine reason.
+    """
+
+    SENTINEL = "PATIENT-SMITH-582971.png"
+
+    @pytest.mark.parametrize("on_validation_failure", ["quarantine", "discard"])
+    def test_recorded_and_quarantine_text_carry_the_field_not_the_value(self, on_validation_failure: str) -> None:
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import validation_errors_table
+        from tests.fixtures.landscape import make_recorder_with_run
+
+        setup = make_recorder_with_run(run_id="blob-rows-redaction", source_node_id="source", source_plugin_name="blob_rows")
+        ctx = PluginContext(
+            run_id=setup.run_id,
+            node_id=setup.source_node_id,
+            config={},
+            landscape=setup.factory.plugin_audit_writer(),
+            coordination_token=setup.coordination_token,
+        )
+        source, _ = _make_source(
+            _config(
+                [_entry(1, filename=self.SENTINEL)],
+                schema={"mode": "flexible", "fields": ["blob_filename: int"]},
+                on_validation_failure=on_validation_failure,
+            )
+        )
+
+        rows = list(source.load(ctx))
+
+        with setup.db.connection() as conn:
+            recorded = [row.error for row in conn.execute(select(validation_errors_table.c.error)).fetchall()]
+        assert len(recorded) == 1
+        assert self.SENTINEL not in recorded[0]
+        assert "blob_filename" in recorded[0], "the failing field must survive for triage"
+        assert "[int_type]" in recorded[0], "the pydantic type code must survive for triage"
+        if on_validation_failure == "discard":
+            assert rows == []
+        else:
+            assert len(rows) == 1
+            assert rows[0].is_quarantined is True
+            assert rows[0].quarantine_error == recorded[0]
+            # The raw row still travels to the quarantine sink by design.
+            assert rows[0].row["blob_filename"] == self.SENTINEL
+
+    def test_a_non_schema_value_error_is_a_plugin_bug_not_a_quarantine(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.contract_builder import ContractBuilder
+
+        def _collide(*_args: Any, **_kwargs: Any) -> None:
+            raise ValueError("field_resolution collision: this is a source plugin bug")
+
+        monkeypatch.setattr(ContractBuilder, "process_first_row", _collide)
+        source, _ = _make_source(_config([_entry(1)]))
+
+        with pytest.raises(ValueError, match="source plugin bug"):
+            list(source.load(ctx))
+
+
 class TestBlobRowsDiscovery:
     def test_manager_discovers_blob_rows(self) -> None:
         from elspeth.plugins.infrastructure.manager import PluginManager
