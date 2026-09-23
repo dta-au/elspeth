@@ -361,7 +361,9 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 64 admits the distinct cost-accounting failure classification.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
-    assert SESSION_SCHEMA_EPOCH == 65
+    # Epoch 66 binds control-message provenance in the v2 checksum; v1 rows
+    # must be rejected at startup rather than during conversation replay.
+    assert SESSION_SCHEMA_EPOCH == 66
     expected_tables = frozenset(
         {
             "web_instances",

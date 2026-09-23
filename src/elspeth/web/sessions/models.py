@@ -355,7 +355,11 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     Pairs with Landscape epoch 43. Pre-1.0 delete/recreate.
 # 64: guided operation failures distinguish unavailable cost accounting from
 #     malformed provider content. Pre-1.0 delete/recreate.
-SESSION_SCHEMA_EPOCH = 65
+# 65: durable advisor gate notes become required envelope fields.
+# 66: control-message v2 binds origin and provider role alongside content.
+#     Semantic JSON cut: reject v1 histories at startup; no migration or replay
+#     fallback to the content-only checksum. Pre-1.0 delete/recreate.
+SESSION_SCHEMA_EPOCH = 66
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

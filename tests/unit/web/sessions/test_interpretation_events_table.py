@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_65() -> None:
+def test_current_session_schema_epoch_is_66() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -242,7 +242,8 @@ def test_current_session_schema_epoch_is_65() -> None:
     # class as well as the length (elspeth-f99b16fc2f).
     # 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
-    assert SESSION_SCHEMA_EPOCH == 65
+    # 66: control-message v2 binds provenance alongside content. No v1 replay.
+    assert SESSION_SCHEMA_EPOCH == 66
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
