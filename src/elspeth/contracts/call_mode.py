@@ -147,6 +147,34 @@ class CallModeSession(Protocol):
         """Read the exact source request without matching run-scoped fields."""
         ...
 
+    def admit_verify_call(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int | None,
+    ) -> str:
+        """Require a unique source call before a verify adapter dispatches live I/O.
+
+        An adapter that records its semantic call after a nested transport may
+        omit the not-yet-allocated index only when request hash and parent
+        identify exactly one source call.
+        """
+        ...
+
+    def preflight_verify_request(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> str:
+        """Check a unique parent-local semantic request before nested transport."""
+        ...
+
     def verify_call(
         self,
         *,

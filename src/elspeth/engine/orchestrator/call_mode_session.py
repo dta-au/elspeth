@@ -43,6 +43,8 @@ class AuditedCallModeSession:
         self._mode = mode
         self._consumed: set[str] = set()
         self._failed_decisions: set[str] = set()
+        self._verify_admissions: dict[tuple[CallType, str | None, str | None, int | None], str] = {}
+        self._required = self._preflight_source_calls()
 
     @property
     def mode(self) -> RunMode:
@@ -51,6 +53,46 @@ class AuditedCallModeSession:
     @property
     def source_run_id(self) -> str:
         return self._source_run_id
+
+    def _preflight_source_calls(self) -> frozenset[str]:
+        """Reject incomplete call archives before any plugin lifecycle hook."""
+        calls = self._factory.query.get_all_calls_for_run(self._source_run_id)
+        calls.extend(self._factory.execution.get_all_operation_calls_for_run(self._source_run_id))
+        required: set[str] = set()
+        for call in calls:
+            if call.operation_id is not None:
+                operation = self._factory.execution.get_operation(call.operation_id)
+                if operation is None:
+                    raise AuditIntegrityError(f"Source operation for call {call.call_id} disappeared")
+                if operation.operation_type != "runtime_preflight":
+                    continue
+            request = self._factory.execution.get_call_request_data(call.call_id)
+            if request.state is not CallDataState.AVAILABLE:
+                raise AuditIntegrityError(f"Source call {call.call_id} has no complete request archive")
+            response = self._factory.execution.get_call_response_data(call.call_id)
+            if call.status is CallStatus.SUCCESS and response.state is not CallDataState.AVAILABLE:
+                raise AuditIntegrityError(f"Source call {call.call_id} has no complete response archive")
+            if call.status is CallStatus.ERROR:
+                if response.state not in (CallDataState.AVAILABLE, CallDataState.NEVER_STORED):
+                    raise AuditIntegrityError(f"Source error call {call.call_id} has incomplete response archive")
+                if call.error_json is None:
+                    raise AuditIntegrityError(f"Source error call {call.call_id} lacks structured error evidence")
+                parsed_error = json.loads(call.error_json)
+                if type(parsed_error) is not dict:
+                    raise AuditIntegrityError(f"Source error call {call.call_id} lacks structured error evidence")
+                if call.call_type is CallType.LLM and parsed_error.get("category") not in {
+                    "rate_limit",
+                    "content_policy",
+                    "context_length",
+                    "server",
+                    "network",
+                    "client",
+                    "unknown",
+                    "response_processing",
+                }:
+                    raise AuditIntegrityError(f"Source LLM error call {call.call_id} lacks owned error category")
+            required.add(call.call_id)
+        return frozenset(required)
 
     def _source_call(
         self,
@@ -230,6 +272,72 @@ class AuditedCallModeSession:
             raise AuditIntegrityError(f"Source request {call.call_id} is unavailable")
         return ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=request.data)
 
+    def admit_verify_call(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int | None,
+    ) -> str:
+        if self._mode is not RunMode.VERIFY:
+            raise AuditIntegrityError("Verification admission requested outside verify mode")
+        if current_call_index is None:
+            candidates = [
+                candidate
+                for candidate in self._factory.execution.list_source_calls_for_current_parent(
+                    source_run_id=self._source_run_id,
+                    call_type=call_type,
+                    current_state_id=current_state_id,
+                    current_operation_id=current_operation_id,
+                )
+                if candidate.request_hash == stable_hash(request_data)
+                and candidate.call_id not in self._consumed
+                and candidate.call_id not in self._verify_admissions.values()
+            ]
+            if len(candidates) != 1:
+                raise AuditIntegrityError("Verification source request is missing or ambiguous before live dispatch")
+            call = candidates[0]
+        else:
+            call = self._source_call(
+                call_type=call_type,
+                request_data=request_data,
+                current_state_id=current_state_id,
+                current_operation_id=current_operation_id,
+                current_call_index=current_call_index,
+            )
+        key = (call_type, current_state_id, current_operation_id, current_call_index)
+        if key in self._verify_admissions:
+            raise AuditIntegrityError("Verification call was already admitted")
+        self._verify_admissions[key] = call.call_id
+        return call.call_id
+
+    def preflight_verify_request(
+        self,
+        *,
+        call_type: CallType,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> str:
+        """Find one semantic source request without allocating a current call index."""
+        if self._mode is not RunMode.VERIFY:
+            raise AuditIntegrityError("Verification preflight requested outside verify mode")
+        candidates = [
+            call
+            for call in self._factory.execution.list_source_calls_for_current_parent(
+                source_run_id=self._source_run_id,
+                call_type=call_type,
+                current_state_id=current_state_id,
+                current_operation_id=current_operation_id,
+            )
+            if call.request_hash == stable_hash(request_data) and call.call_id not in self._consumed
+        ]
+        if len(candidates) != 1:
+            raise AuditIntegrityError("Verification source request is missing or ambiguous before nested transport")
+        return candidates[0].call_id
+
     def verify_call(
         self,
         *,
@@ -245,6 +353,12 @@ class AuditedCallModeSession:
     ) -> VerificationDecision:
         if self._mode is not RunMode.VERIFY:
             raise AuditIntegrityError("Verification requested outside verify mode")
+        key = (call_type, current_state_id, current_operation_id, current_call_index)
+        admitted_source_call_id = self._verify_admissions.pop(key, None)
+        if admitted_source_call_id is None:
+            admitted_source_call_id = self._verify_admissions.pop((call_type, current_state_id, current_operation_id, None), None)
+        if admitted_source_call_id is None:
+            raise AuditIntegrityError("Verification call reached settlement without pre-dispatch source admission")
         call = self._factory.execution.find_call_for_current_parent(
             source_run_id=self._source_run_id,
             call_type=call_type,
@@ -255,11 +369,11 @@ class AuditedCallModeSession:
         )
         if call is not None and call.call_id in self._consumed:
             raise AuditIntegrityError(f"Source call {call.call_id} was already consumed")
+        if call is None or call.call_id != admitted_source_call_id:
+            raise AuditIntegrityError("Verification source call changed after pre-dispatch admission")
         differences: dict[str, Any] = {}
         is_match: bool | None = None
-        if call is None:
-            differences["source_call"] = "missing_or_ambiguous"
-        else:
+        if call is not None:
             source_response = self._factory.execution.get_call_response_data(call.call_id)
             if source_response.state is CallDataState.AVAILABLE:
                 recorded_response = source_response.data
@@ -303,21 +417,9 @@ class AuditedCallModeSession:
 
     def finalize(self) -> None:
         """Require every state call and runtime-preflight call to be consumed."""
-        source_calls = self._factory.query.get_all_calls_for_run(self._source_run_id)
-        source_calls.extend(self._factory.execution.get_all_operation_calls_for_run(self._source_run_id))
-        required: set[str] = set()
-        for call in source_calls:
-            if call.state_id is not None:
-                required.add(call.call_id)
-            elif call.operation_id is not None:
-                operation = self._factory.execution.get_operation(call.operation_id)
-                if operation is None:
-                    raise AuditIntegrityError(f"Source operation for call {call.call_id} disappeared")
-                if operation.operation_type == "runtime_preflight":
-                    required.add(call.call_id)
-        missing = required - self._consumed
-        if missing or self._failed_decisions:
+        missing = self._required - self._consumed
+        if missing or self._failed_decisions or self._verify_admissions:
             raise AuditIntegrityError(
                 f"{self._mode.value} call verification incomplete: {len(missing)} unconsumed source calls, "
-                f"{len(self._failed_decisions)} failed decisions"
+                f"{len(self._failed_decisions)} failed decisions, {len(self._verify_admissions)} unsettled admissions"
             )
