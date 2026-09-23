@@ -1673,8 +1673,9 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
     member's terminal before it raises, so its violation still aborts. The sink
     seam still aborts.
 
-    Every seam that routes it builds the reason with
-    :meth:`to_transform_error_reason`, so the routed shape is one rule.
+    The per-row and aggregation seams build the routed reason with
+    :meth:`to_transform_error_reason`, so its shape is one rule; the collector
+    records :meth:`to_audit_dict` on its flush state and fails the group.
 
     This docstring previously read "plugin bugs MUST crash the pipeline per
     CLAUDE.md's 'plugin bugs must crash' rule", citing a CLAUDE.md section that
