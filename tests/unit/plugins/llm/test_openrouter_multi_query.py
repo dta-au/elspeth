@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -455,6 +456,8 @@ class TestSingleQueryProcessing:
             shutdown_event=None,
             payload_store=None,
             llm_call_governance=None,
+            call_mode_session=None,
+            run_mode=RunMode.LIVE,
         )
         transform.on_start(ctx)
 
