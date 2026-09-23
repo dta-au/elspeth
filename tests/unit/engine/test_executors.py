@@ -3336,6 +3336,7 @@ class TestAggregationExecutor:
         span_factory: SpanFactory | None = None,
         on_error: str = "discard",
         error_edge_ids: Mapping[NodeID, str] | None = None,
+        expected_output_count: int | None = None,
     ) -> tuple[AggregationExecutor, MagicMock, NodeID]:
         """Create an AggregationExecutor with a single configured node."""
         if factory is None:
@@ -3349,6 +3350,7 @@ class TestAggregationExecutor:
             input="default",
             on_error=on_error,
             trigger=TriggerConfig(count=count),
+            expected_output_count=expected_output_count,
         )
         executor = AggregationExecutor(
             factory.execution,
@@ -3806,6 +3808,36 @@ class TestAggregationExecutor:
             factory, result, error_prefix="Aggregation transform 'agg_transform' output validation failed for emitted row 0: "
         )
         assert all(c.kwargs.get("status") != NodeStateStatus.COMPLETED for c in factory.execution.complete_node_state.call_args_list)
+
+    @pytest.mark.parametrize(("expected", "emitted", "fails"), [(5, 1, True), (1, 2, True), (2, 2, False)])
+    def test_an_expected_output_count_mismatch_fails_the_batch(self, expected: int, emitted: int, fails: bool) -> None:
+        """B2 moved the count check into the routable region: a mismatch is a failed batch.
+
+        Without it the flush would record the batch COMPLETED and the
+        processor's own count check would then abort the run.
+        """
+        executor, factory, nid = self._make_agg_executor(count=1, expected_output_count=expected)
+        contract = _make_contract()
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        transform = _make_aggregation_transform("agg_transform")
+        rows = [make_row({"value": index}, contract=contract) for index in range(emitted)]
+        transform.process.return_value = (
+            TransformResult.success(rows[0], success_reason={"action": "aggregated"})
+            if emitted == 1
+            else TransformResult.success_multi(rows, success_reason={"action": "aggregated"})
+        )
+
+        result, _tokens, _batch_id = executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
+
+        if not fails:
+            assert result.status == "success", "control: a matching count completes the batch"
+            factory.data_flow.record_batch_transform_errors_leader.assert_not_called()
+            return
+        self._assert_contract_violation_routed(
+            factory,
+            result,
+            error_prefix=f"Aggregation 'test_agg' produced {emitted} output row(s), but expected_output_count={expected}.",
+        )
 
     def test_post_invocation_output_validation_failure_marks_aggregation_span_error(self) -> None:
         """The aggregation span covers output validation; a failed batch marks it ERROR."""
