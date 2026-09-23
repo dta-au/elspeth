@@ -7,24 +7,36 @@ import hashlib
 import re
 import shutil
 import tempfile
+import time
 from itertools import chain
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES, binary_document_signature_matches
+from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
+from elspeth.contracts.enums import CallStatus, CallType, RunMode
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TransformErrorReason
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
+from elspeth.contracts.pdf_render import (
+    PDFRefusedPageData,
+    PDFRenderedPageData,
+    PDFRenderReceiptData,
+    PDFRenderRequestData,
+)
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.replay_payload_store import SourceBoundPayloadStore
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.rasterize.identity import renderer_identity
 from elspeth.plugins.infrastructure.rasterize.protocol import (
     DocumentRefusal,
     DocumentRefusalKind,
@@ -369,7 +381,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9d3d1b4c3b85addd"
+    source_file_hash: str | None = "sha256:f25d51fd30dbe3c2"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -509,7 +521,6 @@ class PDFRasterize(BaseTransform):
         super().close()
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
-        del ctx
         field_name = self._blob_ref_field
         if field_name not in row:
             return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
@@ -571,11 +582,245 @@ class PDFRasterize(BaseTransform):
                 retryable=False,
             )
 
+        request_data = self._render_request(blob_ref)
+        call_index: int | None = None
+        if ctx.landscape is not None and ctx.state_id is not None:
+            call_index = ctx.landscape.allocate_call_index(
+                ctx.state_id,
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
+            )
+        if ctx.run_mode is RunMode.REPLAY:
+            if call_index is None or ctx.call_mode_session is None:
+                raise AuditIntegrityError("PDF replay requires a node-state call parent and source-run session")
+            evidence = ctx.call_mode_session.replay_call(
+                call_type=CallType.FILESYSTEM,
+                request_data=request_data,
+                current_state_id=ctx.state_id,
+                current_operation_id=None,
+                current_call_index=call_index,
+            )
+            if evidence.status is not CallStatus.SUCCESS or evidence.response_data is None:
+                raise AuditIntegrityError("PDF replay source call has no successful retained render receipt")
+            receipt = deep_thaw(evidence.response_data)
+            replayed = self._restore_render_receipt(receipt, row)
+            self._record_render_call(ctx, call_index, request_data, receipt, source_call_id=evidence.source_call_id, latency_ms=0.0)
+            return replayed
+
+        if ctx.run_mode is RunMode.VERIFY:
+            if call_index is None or ctx.call_mode_session is None:
+                raise AuditIntegrityError("PDF verify requires a node-state call parent and source-run session")
+            ctx.call_mode_session.admit_verify_call(
+                call_type=CallType.FILESYSTEM,
+                request_data=request_data,
+                current_state_id=ctx.state_id,
+                current_operation_id=None,
+                current_call_index=call_index,
+            )
+
+        started = time.perf_counter()
         result, output_dir = self._renderer.render(body)
         try:
-            return self._map_document_result(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
+            mapped = self._map_document_result(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
+            if call_index is None:
+                if ctx.run_mode is RunMode.VERIFY:
+                    raise AuditIntegrityError("PDF verify requires a node-state call parent")
+                return mapped
+            receipt = self._render_receipt(result, mapped)
+            call = self._record_render_call(
+                ctx,
+                call_index,
+                request_data,
+                receipt,
+                source_call_id=None,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+            if ctx.run_mode is RunMode.VERIFY:
+                if ctx.call_mode_session is None:
+                    raise AuditIntegrityError("PDF verify requires a source-run session")
+                decision = ctx.call_mode_session.verify_call(
+                    call_type=CallType.FILESYSTEM,
+                    request_data=request_data,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                    current_call_index=call_index,
+                    current_call_id=call.call_id,
+                    live_status=CallStatus.SUCCESS,
+                    live_response_data=receipt,
+                    live_error_data=None,
+                )
+                if decision.is_match is not True:
+                    raise AuditIntegrityError("PDF verify render receipt differs from source-run evidence")
+            return mapped
         finally:
             self._renderer.discard(output_dir)
+
+    def _render_request(self, blob_ref: str) -> PDFRenderRequestData:
+        return {
+            "format": "pdf_rasterize/v1",
+            "input_pdf_hash": blob_ref,
+            "render_limits": {
+                "dpi": self._limits.dpi,
+                "max_pages": self._limits.max_pages,
+                "max_page_pixels": self._limits.max_page_pixels,
+                "max_page_bytes": self._limits.max_page_bytes,
+                "render_timeout_seconds": self._limits.render_timeout_seconds,
+                "worker_memory_limit_bytes": self._limits.worker_memory_limit_bytes,
+                "extract_text": self._limits.extract_text,
+                "max_page_text_bytes": self._limits.max_page_text_bytes,
+            },
+        }
+
+    def _render_receipt(self, outcome: RenderResult, mapped: TransformResult) -> PDFRenderReceiptData:
+        output_rows = [item.to_dict() for item in mapped.rows] if mapped.rows is not None else []
+        page_refs = {item[self._page_number_field]: item[self._page_blob_ref_field] for item in output_rows}
+        page_sizes = {item[self._page_number_field]: item[self._page_size_bytes_field] for item in output_rows}
+        rendered: list[PDFRenderedPageData] = []
+        refused: list[PDFRefusedPageData] = []
+        page_count: int | None = None
+        outcome_kind: str
+        if isinstance(outcome, RasterizeResponse):
+            outcome_kind = "rasterized"
+            page_count = outcome.page_count
+            rendered = [
+                {
+                    "page_number": page.page_number,
+                    "page_ref": page_refs.get(page.page_number),
+                    "width_px": page.width_px,
+                    "height_px": page.height_px,
+                    "size_bytes": page_sizes.get(page.page_number, page.size_bytes),
+                    "worker_size_bytes": page.size_bytes,
+                    "text": page.text,
+                }
+                for page in outcome.rendered
+            ]
+            refused = [{"page_number": page.page_number, "kind": page.kind.value, "detail": page.detail} for page in outcome.refused]
+        elif isinstance(outcome, DocumentRefusal):
+            outcome_kind = "document_refusal"
+            page_count = outcome.page_count
+            refused = [{"kind": outcome.kind.value, "detail": outcome.detail}]
+        else:
+            outcome_kind = "timeout"
+            refused = [{"timeout_seconds": outcome.timeout_seconds}]
+        return {
+            "format": "pdf_rasterize/v1",
+            "renderer_identity": renderer_identity(),
+            "outcome_kind": outcome_kind,
+            "page_count": page_count,
+            "rendered": rendered,
+            "refused": refused,
+            "result_status": mapped.status,
+            "rows": list(output_rows),
+            "success_reason": deep_thaw(mapped.success_reason),
+            "error_reason": deep_thaw(mapped.reason),
+        }
+
+    def _restore_render_receipt(self, receipt: object, input_row: PipelineRow) -> TransformResult:
+        if type(receipt) is not dict or receipt.get("format") != "pdf_rasterize/v1":
+            raise AuditIntegrityError("PDF replay source call has no typed render receipt")
+        identity = receipt.get("renderer_identity")
+        if type(identity) is not str or _PAYLOAD_REF_PATTERN.fullmatch(identity) is None:
+            raise AuditIntegrityError("PDF replay render receipt has no renderer identity")
+        if receipt.get("outcome_kind") not in ("rasterized", "document_refusal", "timeout"):
+            raise AuditIntegrityError("PDF replay render receipt has no typed worker outcome")
+        rendered = receipt.get("rendered")
+        refused = receipt.get("refused")
+        page_count = receipt.get("page_count")
+        rows = receipt.get("rows")
+        if type(rendered) is not list or type(refused) is not list or type(rows) is not list:
+            raise AuditIntegrityError("PDF replay render receipt has malformed output rows")
+        if receipt["outcome_kind"] == "rasterized":
+            if type(page_count) is not int or not 0 <= page_count <= self._max_pages:
+                raise AuditIntegrityError("PDF replay render receipt has invalid page count")
+        elif rendered:
+            raise AuditIntegrityError("PDF replay refusal receipt cannot contain rendered pages")
+        if not isinstance(self._payload_store, SourceBoundPayloadStore):
+            raise AuditIntegrityError("PDF replay requires a source-bound payload store")
+        if receipt.get("result_status") == "error":
+            if rows or type(receipt.get("error_reason")) is not dict:
+                raise AuditIntegrityError("PDF replay error receipt has inconsistent output")
+            return TransformResult.error(receipt["error_reason"], retryable=False)
+        if (
+            receipt.get("result_status") != "success"
+            or receipt["outcome_kind"] != "rasterized"
+            or not rows
+            or len(rows) != len(rendered)
+            or type(receipt.get("success_reason")) is not dict
+        ):
+            raise AuditIntegrityError("PDF replay success receipt has inconsistent output")
+        pages_by_number: dict[int, PDFRenderedPageData] = {}
+        for index, page in enumerate(rendered):
+            if type(page) is not dict or type(page.get("page_ref")) is not str or type(page.get("page_number")) is not int:
+                raise AuditIntegrityError(f"PDF replay rendered page {index} has no archived payload")
+            number = page["page_number"]
+            if not 1 <= number <= page_count or number in pages_by_number:
+                raise AuditIntegrityError(f"PDF replay rendered page {index} has invalid page number")
+            page_ref = page["page_ref"]
+            if _PAYLOAD_REF_PATTERN.fullmatch(page_ref) is None:
+                raise AuditIntegrityError(f"PDF replay rendered page {index} has malformed payload hash")
+            archived_bytes = self._payload_store.read_output(page_ref)
+            if (
+                type(page.get("size_bytes")) is not int
+                or type(page.get("worker_size_bytes")) is not int
+                or len(archived_bytes) != page["size_bytes"]
+            ):
+                raise AuditIntegrityError(f"PDF replay rendered page {index} size differs from archived bytes")
+            pages_by_number[number] = cast(PDFRenderedPageData, page)
+        expected_input = input_row.to_dict()
+        output_rows: list[PipelineRow] = []
+        for index, output in enumerate(rows):
+            if type(output) is not dict or not all(output.get(key) == value for key, value in expected_input.items()):
+                raise AuditIntegrityError(f"PDF replay output row {index} disagrees with input")
+            number = output.get(self._page_number_field)
+            page = pages_by_number.get(number) if type(number) is int else None
+            if page is None or output.get(self._page_blob_ref_field) != page["page_ref"]:
+                raise AuditIntegrityError(f"PDF replay output row {index} has no matching rendered page")
+            if (
+                output.get(self._page_width_field) != page.get("width_px")
+                or output.get(self._page_height_field) != page.get("height_px")
+                or output.get(self._page_size_bytes_field) != page.get("size_bytes")
+                or output.get(self._document_id_field) != expected_input[self._blob_ref_field]
+                or output.get(self._page_mime_type_field) != PAGE_MIME_TYPE
+            ):
+                raise AuditIntegrityError(f"PDF replay output row {index} disagrees with worker receipt")
+            if self._extract_text and output.get(self._page_text_field) != page.get("text"):
+                raise AuditIntegrityError(f"PDF replay output row {index} text differs from worker receipt")
+            contract = narrow_contract_to_output(input_contract=input_row.contract, output_row=output)
+            contract = self._apply_declared_output_field_contracts(contract)
+            contract = self._align_output_contract(contract)
+            output_rows.append(PipelineRow(output, contract))
+        for page in pages_by_number.values():
+            page_ref = page["page_ref"]
+            if page_ref is None:
+                raise AuditIntegrityError("PDF replay validated page lost its payload reference")
+            self._payload_store.restore_output(page_ref)
+        return TransformResult.success_multi(output_rows, success_reason=receipt["success_reason"])
+
+    def _record_render_call(
+        self,
+        ctx: TransformContext,
+        call_index: int,
+        request_data: PDFRenderRequestData,
+        response_data: PDFRenderReceiptData,
+        *,
+        source_call_id: str | None,
+        latency_ms: float,
+    ) -> Any:
+        if ctx.landscape is None or ctx.state_id is None:
+            raise AuditIntegrityError("PDF render call has no audit parent")
+        writer = cast(Any, ctx.landscape)
+        return writer.record_call(
+            state_id=ctx.state_id,
+            call_index=call_index,
+            call_type=CallType.FILESYSTEM,
+            status=CallStatus.SUCCESS,
+            request_data=RawCallPayload(request_data),
+            response_data=RawCallPayload(response_data),
+            latency_ms=latency_ms,
+            source_call_id=source_call_id,
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
+        )
 
     def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow, output_dir: Path | None) -> TransformResult:
         if isinstance(result, DocumentRefusal):

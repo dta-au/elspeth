@@ -85,7 +85,7 @@ files:
     Mapping[str, object]: 2
   src/elspeth/contracts/plugin_context.py:
     Mapping[str, Any]: 4
-    Mapping[str, object]: 1
+    Mapping[str, object]: 3
     dict[str, Any]: 4
   src/elspeth/contracts/plugin_protocols.py:
     Mapping[str, object]: 2
@@ -190,6 +190,8 @@ files:
     Mapping[str, object]: 20
   src/elspeth/core/landscape/exporter.py:
     dict[str, Any]: 5
+  src/elspeth/core/landscape/factory.py:
+    Mapping[str, object]: 1
   src/elspeth/core/landscape/formatters.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
@@ -276,6 +278,8 @@ files:
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
     Mapping[str, object]: 2
+  src/elspeth/engine/orchestrator/run_lifecycle.py:
+    Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/run_status.py:
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/runtime_preflight.py:
@@ -323,7 +327,7 @@ files:
   src/elspeth/plugins/infrastructure/clients/dataverse.py:
     dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/http.py:
-    Mapping[str, Any]: 13
+    Mapping[str, Any]: 16
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/clients/json_utils.py:
     dict[str, Any]: 2
@@ -1057,10 +1061,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 906
-  Mapping[str, object]: 306
+  Mapping[str, Any]: 909
+  Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1152
   dict[str, object]: 410
-  soft: 2787
+  soft: 2794

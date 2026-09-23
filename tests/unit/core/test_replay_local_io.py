@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from elspeth.config_loading import load_settings
-from elspeth.contracts.enums import RunMode
+from elspeth.contracts.audit import NodeStateCompleted
+from elspeth.contracts.enums import CallStatus, CallType, NodeStateStatus, RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError
 from elspeth.core.config import resolve_config
-from elspeth.core.replay_payload_store import SourceBoundPayloadStore
+from elspeth.core.landscape.row_data import CallDataResult, CallDataState, RowDataResult, RowDataState
+from elspeth.core.replay_payload_store import SourceBoundPayloadStore, collect_source_payload_refs
 from elspeth.core.template_materialization import TemplateFileError, TemplateOptionMaterializer
 from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
@@ -171,3 +177,61 @@ def test_blob_expanders_read_audited_source_bytes(
     assert result.rows is not None and len(result.rows) >= 1
     assert source.reads == [content_hash]
     assert current.reads == []
+
+
+def test_payload_collector_binds_row_token_and_pdf_receipt_refs() -> None:
+    source_bytes = b"source blob"
+    output_bytes = b"rendered page"
+    source_ref = hashlib.sha256(source_bytes).hexdigest()
+    output_ref = hashlib.sha256(output_bytes).hexdigest()
+    token_bytes = json.dumps({"blob_ref": source_ref}).encode()
+    token_ref = hashlib.sha256(token_bytes).hexdigest()
+    store = _MemoryStore({source_ref: source_bytes, output_ref: output_bytes, token_ref: token_bytes})
+    state = NodeStateCompleted(
+        state_id="pdf-state",
+        token_id="token",
+        node_id="pdf-node",
+        step_index=1,
+        attempt=0,
+        status=NodeStateStatus.COMPLETED,
+        input_hash="0" * 64,
+        output_hash="1" * 64,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        duration_ms=1.0,
+    )
+    query = SimpleNamespace(
+        iter_rows_for_run=lambda run_id: [[SimpleNamespace(row_id="source-row")]],
+        get_row_data=lambda row_id: RowDataResult(state=RowDataState.AVAILABLE, data={"blob_ref": source_ref, "unrelated_hash": "f" * 64}),
+        get_all_tokens_for_run=lambda run_id: [SimpleNamespace(token_id="token", token_data_ref=token_ref)],
+        get_all_node_states_for_run=lambda run_id: [state],
+        get_all_calls_for_run=lambda run_id: [
+            SimpleNamespace(call_id="pdf-call", call_type=CallType.FILESYSTEM, status=CallStatus.SUCCESS, state_id="pdf-state")
+        ],
+    )
+    factory = SimpleNamespace(
+        query=query,
+        data_flow=SimpleNamespace(get_nodes=lambda run_id: [SimpleNamespace(node_id="pdf-node", plugin_name="pdf_rasterize")]),
+        execution=SimpleNamespace(
+            get_call_response_data=lambda call_id: CallDataResult(
+                state=CallDataState.AVAILABLE,
+                data={
+                    "format": "pdf_rasterize/v1",
+                    "renderer_identity": "a" * 64,
+                    "outcome_kind": "rasterized",
+                    "result_status": "success",
+                    "rows": [{}],
+                    "rendered": [{"page_ref": output_ref}],
+                },
+            )
+        ),
+    )
+
+    refs = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields={"blob_ref"})
+    assert refs.input_refs == {source_ref}
+    assert refs.output_refs == {output_ref}
+    assert source_ref in store.reads and output_ref in store.reads
+
+    query.get_all_calls_for_run = lambda run_id: []
+    with pytest.raises(AuditIntegrityError, match="without typed render receipts"):
+        collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields={"blob_ref"})

@@ -153,6 +153,9 @@ class TransformContext(Protocol):
     def require_work_item(self) -> TokenWorkItem: ...
 
     @property
+    def landscape(self) -> PluginAuditWriter | None: ...
+
+    @property
     def run_id(self) -> str: ...
 
     @property
