@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 import httpx
 from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts.call_mode import CallModeSession
+from elspeth.contracts.call_data import HTTPCallRequest, RawCallPayload
+from elspeth.contracts.call_mode import CallModeSession, ReplaySSRFRequest
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import CallType, RunMode
 from elspeth.contracts.probes import CollectionReadinessResult
@@ -24,6 +25,7 @@ from elspeth.core.security.web import (
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
@@ -242,11 +244,6 @@ class AzureSearchProvider:
         from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 
         self._config = config
-        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and config.use_managed_identity:
-            raise RetrievalError(
-                "Azure AI Search managed-identity replay cannot reproduce the audited credential fingerprint without live token acquisition",
-                retryable=False,
-            )
         self._execution = execution
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
@@ -277,12 +274,22 @@ class AzureSearchProvider:
             limiter=self._limiter,
             headers=headers,
             call_mode_session=call_mode_session,
+            archived_auth_for_replay=(
+                call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and config.use_managed_identity
+            ),
+            semantic_managed_identity_verify=(
+                call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY and config.use_managed_identity
+            ),
         )
 
     def _auth_headers(self) -> dict[str, str]:
         if self._config.api_key:
             return {"api-key": self._config.api_key}
         if self._config.use_managed_identity:
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+                # HTTP replay binds the exact archived credential fingerprint
+                # to the source call without constructing an Azure credential.
+                return {}
             credential = self._get_managed_identity_credential()
             try:
                 from azure.core.exceptions import AzureError
@@ -328,6 +335,72 @@ class AzureSearchProvider:
             return validate_archived_ssrf_request(url, archived)
         return validate_url_for_ssrf(url)
 
+    def _verify_preflight_request(
+        self,
+        *,
+        method: Literal["GET", "POST"],
+        url: str,
+        json_body: RawCallPayload | None,
+        state_id: str | None,
+        operation_id: str | None,
+    ) -> str | None:
+        """Bind a verify request to one source call before DNS or token acquisition."""
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return None
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        if hostname is None:
+            raise RetrievalError("Azure AI Search verify request has no hostname", retryable=False)
+        port = parsed.port or 443
+        host_for_header = f"[{hostname}]" if ":" in hostname else hostname
+        host_header = f"{host_for_header}:{port}" if port != 443 else host_for_header
+        headers = {"Host": host_header}
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+        if self._config.api_key is not None:
+            headers["api-key"] = self._config.api_key
+        request_data = HTTPCallRequest(
+            method=method,
+            url=fingerprint_url(url),
+            headers=fingerprint_headers(headers),
+            json=json_body.to_dict() if json_body is not None else None,
+        ).to_dict()
+        if self._config.use_managed_identity:
+            evidence = session.preflight_verify_http_managed_identity(
+                request_data=request_data,
+                current_state_id=state_id,
+                current_operation_id=operation_id,
+            )
+        else:
+            evidence = session.preflight_verify_http_request(
+                request_data=request_data,
+                current_state_id=state_id,
+                current_operation_id=operation_id,
+            )
+        archived_ip = evidence.request_data.get("resolved_ip")
+        if type(archived_ip) is not str:
+            raise RetrievalError("Azure AI Search source request lacks an archived DNS pin", retryable=False)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        if parsed.fragment:
+            path = f"{path}#{parsed.fragment}"
+        archived_request = ReplaySSRFRequest(
+            original_url=url,
+            resolved_ip=archived_ip,
+            host_header=host_header,
+            port=port,
+            path=path,
+            scheme=parsed.scheme.lower(),
+            bare_hostname=hostname,
+        )
+        try:
+            validate_archived_ssrf_request(url, archived_request)
+        except SSRFBlockedError as exc:
+            raise RetrievalError(f"Azure AI Search source DNS pin blocked by SSRF validation: {exc}", retryable=False) from exc
+        return evidence.source_call_id
+
     def search(
         self,
         query: str,
@@ -372,6 +445,9 @@ class AzureSearchProvider:
         self._http_client.update_call_context(state_id, token_id, member_token=member_token, work_item=work_item)
 
         try:
+            verify_source_call_id = self._verify_preflight_request(
+                method="POST", url=self._search_url, json_body=RawCallPayload(body), state_id=state_id, operation_id=None
+            )
             try:
                 safe_request = self._safe_request(self._search_url, state_id=state_id)
             except SSRFBlockedError as exc:
@@ -384,6 +460,7 @@ class AzureSearchProvider:
                 safe_request,
                 headers=self._auth_headers(),
                 json=body,
+                verify_source_call_id=verify_source_call_id if self._config.use_managed_identity else None,
             )
 
             status_code = response.status_code
@@ -579,6 +656,9 @@ class AzureSearchProvider:
 
         index_name = self._config.index
         count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
+        verify_source_call_id = self._verify_preflight_request(
+            method="GET", url=count_url, json_body=None, state_id=None, operation_id=operation_id
+        )
         try:
             safe_request = self._safe_request(count_url, operation_id=operation_id)
         except SSRFBlockedError as exc:
@@ -596,9 +676,19 @@ class AzureSearchProvider:
             operation_id=operation_id,
             coordination_token=coordination_token,
             call_mode_session=self._call_mode_session,
+            archived_auth_for_replay=(
+                self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY and self._config.use_managed_identity
+            ),
+            semantic_managed_identity_verify=(
+                self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY and self._config.use_managed_identity
+            ),
         )
         try:
-            response, _final_url, _call = client.get_ssrf_safe(safe_request, headers=self._auth_headers())
+            response, _final_url, _call = client.get_ssrf_safe(
+                safe_request,
+                headers=self._auth_headers(),
+                verify_source_call_id=verify_source_call_id if self._config.use_managed_identity else None,
+            )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
             raise RetrievalError(f"Readiness probe failed: {exc}", retryable=True) from exc
         except httpx.HTTPError as exc:
