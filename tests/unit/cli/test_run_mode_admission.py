@@ -343,3 +343,60 @@ def test_file_and_http_transform_capabilities_resolve_exact_builtin_classes() ->
     manager = build_nonlive_plugin_manager(requested)
     assert manager.get_transform_by_name("reference_join") is ReferenceJoin
     assert manager.get_transform_by_name("web_scrape") is WebScrapeTransform
+
+
+def test_nonlive_transform_capability_inventory_matches_live_builtin_registry() -> None:
+    live_names = {plugin.name for plugin in get_shared_plugin_manager().get_transforms()}
+    assert "web_scrape" in live_names
+    assert "llm" in live_names
+    assert "not_a_plugin" not in live_names
+    nonlive = build_nonlive_plugin_manager(live_names)
+    assert {plugin.name for plugin in nonlive.get_transforms()} == live_names
+
+
+@pytest.mark.parametrize("provider", ["langfuse", "azure_ai"])
+@pytest.mark.parametrize("section", ["sources", "transforms"])
+def test_nonlive_llm_tracing_refused_before_settings_loader_or_constructor(tmp_path: Path, provider: str, section: str) -> None:
+    settings_path = _settings_path(tmp_path, mode="verify")
+    raw = yaml.safe_load(settings_path.read_text())
+    llm = {"plugin": "llm", "options": {"tracing": {"provider": provider}}}
+    if section == "sources":
+        raw["sources"]["primary"] = llm
+    else:
+        raw["transforms"] = [{"name": "model", **llm}]
+    settings_path.write_text(yaml.safe_dump(raw))
+    with (
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("settings loaded")) as loader,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    assert "LLM tracing is unsupported" in result.output
+    loader.assert_not_called()
+    construct.assert_not_called()
+
+
+def test_nonlive_llm_noop_tracing_remains_admissible() -> None:
+    requested = precheck_nonlive_plugin_names_from_raw({"transforms": [{"plugin": "llm", "options": {"tracing": {"provider": "none"}}}]})
+    assert requested == frozenset({"llm"})
+
+
+def test_parsed_nonlive_llm_tracing_refused_before_constructor() -> None:
+    settings = ElspethSettings(
+        sources={"primary": {"plugin": "csv", "on_success": "output"}},
+        transforms=[
+            {
+                "name": "model",
+                "plugin": "llm",
+                "input": "primary",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {"tracing": {"provider": "langfuse"}},
+            }
+        ],
+        sinks={"output": {"plugin": "json", "on_write_failure": "discard"}},
+        run_mode=RunMode.VERIFY,
+        replay_from="source-run",
+    )
+    with pytest.raises(OrchestrationInvariantError, match="LLM tracing is unsupported"):
+        precheck_nonlive_plugin_names(settings)

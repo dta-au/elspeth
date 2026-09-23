@@ -35,6 +35,14 @@ _SOURCE_CLASSES = {
 }
 
 _TRANSFORM_CLASSES = {
+    "aws_bedrock_content_safety": ("elspeth.plugins.transforms.aws.bedrock_content_safety", "AWSBedrockContentSafety"),
+    "aws_bedrock_prompt_shield": ("elspeth.plugins.transforms.aws.bedrock_prompt_shield", "AWSBedrockPromptShield"),
+    "aws_textract_document_analysis": ("elspeth.plugins.transforms.aws.textract_document_analysis", "AWSTextractDocumentAnalysis"),
+    "aws_textract_inline_analysis": ("elspeth.plugins.transforms.aws.textract_inline_analysis", "AWSTextractInlineAnalysis"),
+    "azure_ai_search": ("elspeth.plugins.transforms.azure.ai_search", "AzureAISearchTransform"),
+    "azure_content_safety": ("elspeth.plugins.transforms.azure.content_safety", "AzureContentSafety"),
+    "azure_document_intelligence": ("elspeth.plugins.transforms.azure.document_intelligence", "AzureDocumentIntelligence"),
+    "azure_prompt_shield": ("elspeth.plugins.transforms.azure.prompt_shield", "AzurePromptShield"),
     "batch_classifier_metrics": ("elspeth.plugins.transforms.batch_classifier_metrics", "BatchClassifierMetrics"),
     "batch_data_quality_report": ("elspeth.plugins.transforms.batch_data_quality_report", "BatchDataQualityReport"),
     "batch_distribution_profile": ("elspeth.plugins.transforms.batch_distribution_profile", "BatchDistributionProfile"),
@@ -47,11 +55,18 @@ _TRANSFORM_CLASSES = {
     "batch_stats": ("elspeth.plugins.transforms.batch_stats", "BatchStats"),
     "batch_threshold_summary": ("elspeth.plugins.transforms.batch_threshold_summary", "BatchThresholdSummary"),
     "batch_top_k": ("elspeth.plugins.transforms.batch_top_k", "BatchTopK"),
+    "blob_csv_expand": ("elspeth.plugins.transforms.blob_csv_expand", "BlobCSVExpand"),
+    "blob_fetch": ("elspeth.plugins.transforms.blob_fetch", "BlobFetch"),
+    "blob_json_expand": ("elspeth.plugins.transforms.blob_json_expand", "BlobJSONExpand"),
+    "blob_text_expand": ("elspeth.plugins.transforms.blob_text_expand", "BlobTextExpand"),
     "field_mapper": ("elspeth.plugins.transforms.field_mapper", "FieldMapper"),
     "json_explode": ("elspeth.plugins.transforms.json_explode", "JSONExplode"),
     "keyword_filter": ("elspeth.plugins.transforms.keyword_filter", "KeywordFilter"),
     "line_explode": ("elspeth.plugins.transforms.line_explode", "LineExplode"),
+    "llm": ("elspeth.plugins.transforms.llm.transform", "LLMTransform"),
     "passthrough": ("elspeth.plugins.transforms.passthrough", "PassThrough"),
+    "pdf_rasterize": ("elspeth.plugins.transforms.pdf_rasterize", "PDFRasterize"),
+    "rag_retrieval": ("elspeth.plugins.transforms.rag.transform", "RAGRetrievalTransform"),
     "reference_join": ("elspeth.plugins.transforms.reference_join", "ReferenceJoin"),
     "report_assemble": ("elspeth.plugins.transforms.report_assemble", "ReportAssemble"),
     "truncate": ("elspeth.plugins.transforms.truncate", "Truncate"),
@@ -59,6 +74,18 @@ _TRANSFORM_CLASSES = {
     "value_transform": ("elspeth.plugins.transforms.value_transform", "ValueTransform"),
     "web_scrape": ("elspeth.plugins.transforms.web_scrape", "WebScrapeTransform"),
 }
+
+
+def _admit_nonlive_llm_tracing(options: object) -> None:
+    """Refuse tracer construction before a non-live LLM plugin is imported."""
+    if not isinstance(options, dict):
+        raise OrchestrationInvariantError("Replay/verify LLM options must be a mapping")
+    tracing = options.get("tracing")
+    if tracing is None:
+        return
+    if not isinstance(tracing, dict) or tracing.get("provider", "none") != "none":
+        raise OrchestrationInvariantError("Replay/verify LLM tracing is unsupported")
+
 
 _SINK_CLASSES = {
     "aws_s3": ("elspeth.plugins.sinks.aws_s3_sink", "AWSS3Sink"),
@@ -123,6 +150,14 @@ def precheck_nonlive_plugin_names(settings: ElspethSettings) -> None:
         for name in names:
             if name not in supported:
                 raise OrchestrationInvariantError(f"Replay/verify does not support {kind} plugin {name!r}")
+    for source_plugin in settings.sources.values():
+        if source_plugin.plugin == "llm":
+            _admit_nonlive_llm_tracing(source_plugin.options)
+    # LLM is a row transform; aggregate/collector validation rejects it as
+    # non-batch-aware before those sections can construct a runtime plugin.
+    for transform_plugin in settings.transforms:
+        if transform_plugin.plugin == "llm":
+            _admit_nonlive_llm_tracing(transform_plugin.options)
 
 
 def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> frozenset[str]:
@@ -154,6 +189,8 @@ def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> frozenset[str]
             name = entry.get("plugin")
             if not isinstance(name, str) or name not in supported:
                 raise OrchestrationInvariantError(f"Replay/verify does not support {section_name} plugin {name!r}")
+            if name == "llm":
+                _admit_nonlive_llm_tracing(entry.get("options", {}))
             names.add(name)
     return frozenset(names)
 
