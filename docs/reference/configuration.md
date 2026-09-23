@@ -93,8 +93,19 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | Mode | Behavior |
 |------|----------|
 | `live` | Execute normally, make real external calls |
-| `replay` | Use recorded responses from a previous run |
-| `verify` | Compare new results against a previous run |
+| `replay` | Reconstruct audited source rows and external responses from `replay_from`; execute the pipeline without contacting those providers or publishing configured sinks |
+| `verify` | Read current sources and call providers, compare complete source and call evidence with `replay_from`, and publish no configured sinks |
+
+Replay and verify require a completed, compatible source run with retained
+payloads and call evidence. The runtime rejects missing or ambiguous evidence,
+changed graph or plugin implementations, and capabilities it cannot safely
+run in the selected mode. Both modes write a new Landscape audit run. They
+compare canonical rows at each sink boundary, including node, role, ingest
+sequence, disposition, and payload hash; this does not compare serialized sink
+bytes or external artifacts. A mismatch makes verify fail. Concurrency must
+be one worker. Dependency runs, collection probes, commencement gates, audit
+export, remote telemetry, and remote Key Vault secrets are refused in these
+modes until they have an explicit replay or verify contract.
 
 ---
 

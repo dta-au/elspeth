@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
+import httpx
+import respx
 import yaml
+from sqlalchemy import select
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.schema import call_verifications_table, node_states_table, runs_table
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sources.csv_source import CSVSource
 from elspeth.plugins.transforms.passthrough import PassThrough
@@ -76,7 +83,11 @@ def test_cli_live_replay_verify_preserves_sink_artifact(tmp_path: Path) -> None:
         patch.object(CSVSource, "on_start", side_effect=AssertionError("replay started live source")),
         patch.object(CSVSource, "load", side_effect=AssertionError("replay read live source")),
         patch.object(JSONSink, "on_start", side_effect=AssertionError("replay started live sink")),
+        patch.object(JSONSink, "inspect_effect", side_effect=AssertionError("replay inspected live sink")),
+        patch.object(JSONSink, "prepare_effect", side_effect=AssertionError("replay prepared live sink")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("replay committed live sink")),
         patch.object(JSONSink, "write", side_effect=AssertionError("replay wrote sink")),
+        patch.object(JSONSink, "close", side_effect=AssertionError("replay closed live sink")),
     ):
         replay = invoke()
     assert replay["status"] == "completed"
@@ -85,7 +96,11 @@ def test_cli_live_replay_verify_preserves_sink_artifact(tmp_path: Path) -> None:
     settings["run_mode"] = "verify"
     with (
         patch.object(JSONSink, "on_start", side_effect=AssertionError("verify started live sink")),
+        patch.object(JSONSink, "inspect_effect", side_effect=AssertionError("verify inspected live sink")),
+        patch.object(JSONSink, "prepare_effect", side_effect=AssertionError("verify prepared live sink")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("verify committed live sink")),
         patch.object(JSONSink, "write", side_effect=AssertionError("verify wrote sink")),
+        patch.object(JSONSink, "close", side_effect=AssertionError("verify closed live sink")),
     ):
         verify = invoke()
     assert verify["status"] == "completed"
@@ -94,8 +109,7 @@ def test_cli_live_replay_verify_preserves_sink_artifact(tmp_path: Path) -> None:
 
 def test_verify_rejects_late_source_drift_before_transform_start(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    sources = settings["sources"]
-    assert isinstance(sources, dict)
+    sources = cast("dict[str, object]", settings["sources"])
     second_path = tmp_path / "second.csv"
     second_path.write_text("value\n9\n")
     sources["second"] = {
@@ -103,8 +117,7 @@ def test_verify_rejects_late_source_drift_before_transform_start(tmp_path: Path)
         "on_success": "second_output",
         "options": {"path": str(second_path), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
     }
-    sinks = settings["sinks"]
-    assert isinstance(sinks, dict)
+    sinks = cast("dict[str, object]", settings["sinks"])
     sinks["second_output"] = {
         "plugin": "json",
         "on_write_failure": "discard",
@@ -126,3 +139,120 @@ def test_verify_rejects_late_source_drift_before_transform_start(tmp_path: Path)
     assert result.exit_code != 0, result.output
     assert "source" in result.output.lower()
     startup.assert_not_called()
+
+
+def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (tmp_path / "input.csv").write_text("url\nhttps://example.org/page\n")
+    settings["transforms"] = [
+        {
+            "name": "fetch",
+            "plugin": "web_scrape",
+            "input": "source_out",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "format": "text",
+                "http": {"abuse_contact": "audit@example.org", "scraping_reason": "Replay verification test"},
+            },
+        }
+    ]
+    settings_path = tmp_path / "settings.yaml"
+    sink_path = tmp_path / "output.json"
+    runner = CliRunner()
+    ip = "104.18.27.120"
+
+    def invoke() -> object:
+        settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+        return runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    def fixed_dns(_host: str, port: int, *_args: object, **_kwargs: object) -> list[tuple[object, ...]]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    with respx.mock(assert_all_mocked=True) as router, patch("socket.getaddrinfo", side_effect=fixed_dns):
+        route = router.get(f"https://{ip}:443/page").mock(
+            return_value=httpx.Response(200, text="<html><body>original page</body></html>", headers={"content-type": "text/html"})
+        )
+        live = invoke()
+        assert live.exit_code == 0, live.output
+        assert route.call_count == 1
+    live_run_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    artifact = sink_path.read_bytes()
+
+    settings["run_mode"] = "replay"
+    settings["replay_from"] = live_run_id
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved DNS")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("replay opened HTTP client")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("replay published sink")),
+    ):
+        replay = invoke()
+    assert replay.exit_code == 0, replay.output
+    assert sink_path.read_bytes() == artifact
+
+    settings["run_mode"] = "verify"
+    with respx.mock(assert_all_mocked=True) as router, patch("socket.getaddrinfo", side_effect=fixed_dns):
+        router.get(f"https://{ip}:443/page").mock(
+            return_value=httpx.Response(200, text="<html><body>original page</body></html>", headers={"content-type": "text/html"})
+        )
+        verify = invoke()
+    assert verify.exit_code == 0, verify.output
+    verify_run_id = json.loads(verify.output.strip().splitlines()[-1])["run_id"]
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        decisions = (
+            connection.execute(
+                select(call_verifications_table.c.is_match).where(call_verifications_table.c.current_run_id == verify_run_id)
+            )
+            .scalars()
+            .all()
+        )
+        assert decisions and all(decisions)
+        before = set(connection.execute(select(runs_table.c.run_id)).scalars())
+
+    with respx.mock(assert_all_mocked=True) as router, patch("socket.getaddrinfo", side_effect=fixed_dns):
+        router.get(f"https://{ip}:443/page").mock(
+            return_value=httpx.Response(200, text="<html><body>changed page</body></html>", headers={"content-type": "text/html"})
+        )
+        mismatch = invoke()
+    assert mismatch.exit_code != 0, mismatch.output
+    assert sink_path.read_bytes() == artifact
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        after = set(connection.execute(select(runs_table.c.run_id)).scalars())
+        (failed_run_id,) = after - before
+        decisions = connection.execute(
+            select(call_verifications_table.c.is_match, call_verifications_table.c.source_call_id).where(
+                call_verifications_table.c.current_run_id == failed_run_id
+            )
+        ).all()
+        assert any(is_match is False and source_call_id is not None for is_match, source_call_id in decisions)
+
+        reasons = connection.execute(
+            select(node_states_table.c.success_reason_json).where(node_states_table.c.run_id == live_run_id)
+        ).scalars()
+        output_refs = [
+            metadata["fetch_response_processed_hash"]
+            for reason_json in reasons
+            if reason_json is not None
+            if (metadata := json.loads(reason_json).get("metadata")) is not None
+            if "fetch_response_processed_hash" in metadata
+        ]
+        assert len(output_refs) == 1
+
+    # Corrupt the retained transform output. Admission must reject it before
+    # replay can use the archived HTTP response or touch the sink.
+    output_ref = output_refs[0]
+    (tmp_path / "payloads" / output_ref[:2] / output_ref).write_bytes(b"tampered archived output")
+    settings["run_mode"] = "replay"
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("corrupt replay resolved DNS")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("corrupt replay opened HTTP client")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("corrupt replay published sink")),
+    ):
+        corrupt = invoke()
+    assert corrupt.exit_code != 0, corrupt.output
+    assert "payload" in corrupt.output.lower() or "integrity" in corrupt.output.lower()
+    assert sink_path.read_bytes() == artifact

@@ -64,7 +64,7 @@ def collect_source_payload_refs(
     receipts. Each discovered blob must still exist with its matching hash.
     """
     fields = frozenset(blob_ref_fields)
-    if not fields or any(type(field_name) is not str or not field_name for field_name in fields):
+    if any(type(field_name) is not str or not field_name for field_name in fields):
         raise ValueError("blob_ref_fields must contain admitted field names")
     input_refs: set[str] = set()
     output_refs: set[str] = set()
@@ -106,7 +106,12 @@ def collect_source_payload_refs(
             metadata = reason.get("metadata")
             if type(metadata) is not dict or "fetch_payload_hash" not in metadata:
                 raise AuditIntegrityError(f"Source run {source_run_id}: blob fetch state {state.state_id} has no payload hash")
-            input_refs.add(_audited_ref(metadata["fetch_payload_hash"], location=f"state {state.state_id}"))
+            ref = _audited_ref(metadata["fetch_payload_hash"], location=f"state {state.state_id}")
+            input_refs.add(ref)
+            output_refs.add(ref)
+        if isinstance(reason, dict) and isinstance(reason.get("metadata"), dict) and "fetch_response_processed_hash" in reason["metadata"]:
+            metadata = reason["metadata"]
+            output_refs.add(_audited_ref(metadata["fetch_response_processed_hash"], location=f"state {state.state_id}"))
 
     for call in factory.query.get_all_calls_for_run(source_run_id):
         if call.state_id not in pdf_state_ids:
@@ -208,7 +213,15 @@ class SourceBoundPayloadStore:
 
     def store(self, content: bytes) -> str:
         if self._mode is RunMode.REPLAY:
-            raise IntegrityError("Replay cannot store a newly computed payload")
+            content_hash = hashlib.sha256(content).hexdigest()
+            if content_hash not in self._output_refs:
+                raise IntegrityError("Replay output has no source-run payload evidence")
+            if self.read_output(content_hash) != content:
+                raise IntegrityError("Replay output bytes differ from source-run evidence")
+            stored_ref = self._current_store.store(content)
+            if stored_ref != content_hash:
+                raise IntegrityError("New-run audit store returned a different output hash")
+            return stored_ref
         return self._current_store.store(content)
 
     def exists(self, content_hash: str) -> bool:

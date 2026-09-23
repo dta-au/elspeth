@@ -25,6 +25,7 @@ from pydantic import AfterValidator, BaseModel, Field, field_validator, model_va
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_data import HTTPCallRequest
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
@@ -44,7 +45,7 @@ from elspeth.core.security.web import (
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -490,7 +491,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3452f1a3deaf5f94"
+    source_file_hash: str | None = "sha256:858ecc6ed775eebb"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -802,6 +803,32 @@ class WebScrapeTransform(BaseTransform):
                     current_operation_id=None,
                 )
                 safe_request = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+            elif session is not None and session.mode is RunMode.VERIFY:
+                archived = session.replay_ssrf_request(
+                    original_url=url,
+                    call_type=CallType.HTTP,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                archived_safe = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+                pre_dns_request = HTTPCallRequest(
+                    method="GET",
+                    url=fingerprint_url(url),
+                    headers=fingerprint_headers(
+                        {
+                            "X-Abuse-Contact": self._abuse_contact,
+                            "X-Scraping-Reason": self._scraping_reason,
+                            "Host": archived_safe.host_header,
+                        }
+                    ),
+                    params=None,
+                )
+                session.preflight_verify_http_request(
+                    request_data=pre_dns_request.to_dict(),
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
             else:
                 safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
         except (KeyError, SSRFBlockedError, SSRFNetworkError, TypeError) as e:

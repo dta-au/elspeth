@@ -205,8 +205,8 @@ class AuditedCallModeSession:
         current_state_id: str | None,
         current_operation_id: str | None,
     ) -> ReplaySSRFRequest:
-        if self._mode is not RunMode.REPLAY:
-            raise AuditIntegrityError("Archived DNS pin requested outside replay mode")
+        if self._mode not in (RunMode.REPLAY, RunMode.VERIFY):
+            raise AuditIntegrityError("Archived DNS pin requires replay or verify mode")
         matches: set[str] = set()
         for call in self._factory.execution.list_source_calls_for_current_parent(
             source_run_id=self._source_run_id,

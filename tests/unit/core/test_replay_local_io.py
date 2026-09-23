@@ -119,8 +119,9 @@ def test_replay_payload_reads_only_source_run_evidence_and_restores_archived_out
     assert current.reads == []
     with pytest.raises(IntegrityError, match="absent from source-run"):
         store.retrieve(output_hash)
-    with pytest.raises(IntegrityError, match="newly computed"):
+    with pytest.raises(IntegrityError, match="no source-run payload evidence"):
         store.store(b"new live page")
+    assert store.store(output_bytes) == output_hash
     assert store.restore_output(output_hash) == output_hash
     assert current.blobs == {output_hash: output_bytes}
 
@@ -137,6 +138,23 @@ def test_payload_corruption_and_verify_drift_fail_closed() -> None:
     source.blobs[content_hash] = b"corrupt source"
     with pytest.raises(IntegrityError, match="source-run hash"):
         store.retrieve(content_hash)
+
+
+def test_replay_output_store_requires_exact_retained_source_bytes() -> None:
+    content = b"archived processed response"
+    content_hash = hashlib.sha256(content).hexdigest()
+    source = _MemoryStore({content_hash: b"corrupt retained response"})
+    current = _MemoryStore()
+    store = SourceBoundPayloadStore(
+        mode=RunMode.REPLAY,
+        source_store=source,
+        current_store=current,
+        source_refs=(),
+        output_refs={content_hash},
+    )
+    with pytest.raises(IntegrityError, match="source-run hash"):
+        store.store(content)
+    assert current.blobs == {}
 
 
 @pytest.mark.parametrize(
@@ -235,3 +253,36 @@ def test_payload_collector_binds_row_token_and_pdf_receipt_refs() -> None:
     query.get_all_calls_for_run = lambda run_id: []
     with pytest.raises(AuditIntegrityError, match="without typed render receipts"):
         collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields={"blob_ref"})
+
+
+def test_payload_collector_authorizes_only_audited_web_output_hash() -> None:
+    processed = b"verified page text"
+    processed_ref = hashlib.sha256(processed).hexdigest()
+    store = _MemoryStore({processed_ref: processed})
+    state = NodeStateCompleted(
+        state_id="web-state",
+        token_id="token",
+        node_id="web-node",
+        step_index=1,
+        attempt=0,
+        status=NodeStateStatus.COMPLETED,
+        input_hash="0" * 64,
+        output_hash="1" * 64,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        duration_ms=1.0,
+        success_reason_json=json.dumps({"metadata": {"fetch_response_processed_hash": processed_ref}}),
+    )
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda run_id: [[SimpleNamespace(row_id="row")]],
+            get_row_data=lambda row_id: RowDataResult(state=RowDataState.AVAILABLE, data={"url": "https://example.org/"}),
+            get_all_tokens_for_run=lambda run_id: [],
+            get_all_node_states_for_run=lambda run_id: [state],
+            get_all_calls_for_run=lambda run_id: [],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda run_id: []),
+    )
+    refs = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=())
+    assert refs.input_refs == frozenset()
+    assert refs.output_refs == {processed_ref}

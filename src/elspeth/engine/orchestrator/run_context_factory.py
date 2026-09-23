@@ -176,23 +176,18 @@ class RunContextFactory:
                 if type(field_name) is not str or not field_name:
                     raise RuntimeError(f"Invalid blob_ref_field for {transform.name}")
                 blob_ref_fields.add(field_name)
-            source_refs: frozenset[str] = frozenset()
-            output_refs: frozenset[str] = frozenset()
-            if blob_ref_fields:
-                refs = collect_source_payload_refs(
-                    factory,
-                    source_run_id,
-                    source_store=payload_store,
-                    blob_ref_fields=blob_ref_fields,
-                )
-                source_refs = refs.input_refs
-                output_refs = refs.output_refs
+            refs = collect_source_payload_refs(
+                factory,
+                source_run_id,
+                source_store=payload_store,
+                blob_ref_fields=blob_ref_fields,
+            )
             plugin_payload_store = SourceBoundPayloadStore(
                 mode=runtime_mode.mode,
                 source_store=payload_store,
                 current_store=payload_store,
-                source_refs=source_refs,
-                output_refs=output_refs,
+                source_refs=refs.input_refs,
+                output_refs=refs.output_refs,
             )
             if self._call_mode_session_factory is None:
                 call_mode_session = AuditedCallModeSession(
