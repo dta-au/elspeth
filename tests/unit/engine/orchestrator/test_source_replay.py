@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from elspeth.contracts import PluginSchema, SourceRow
 from elspeth.contracts.audit import NodeStateFailed
-from elspeth.contracts.enums import NodeStateStatus, NodeType, TerminalPath
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import NodeStateStatus, NodeType, RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
@@ -19,7 +22,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
 from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
-from elspeth.engine.orchestrator.source_replay import prepare_audited_sources
+from elspeth.engine.orchestrator.source_replay import _verified_rows, prepare_audited_sources, prepare_verified_sources
 
 
 class _ReplaySchema(PluginSchema):
@@ -143,7 +146,7 @@ def test_replay_refuses_failed_source_state_without_quarantine_outcome() -> None
         prepare_audited_sources(factory, "previous-run", {"primary": source})
 
 
-def test_verify_detects_source_row_drift_before_yielding_changed_row() -> None:
+def test_verify_detects_source_row_drift_before_returning_snapshot() -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
     assert audited.schema_contract is not None
@@ -151,6 +154,147 @@ def test_verify_detects_source_row_drift_before_yielding_changed_row() -> None:
     ctx = PluginContext(run_id="verify-run", config={})
 
     with pytest.raises(AuditIntegrityError, match="differs from audited run"):
-        list(SourceIterationDriver._verify_source_rows(source, ctx, audited))
+        _verified_rows(source, ctx, audited)
 
     source.load.assert_called_once_with(ctx)
+
+
+def test_verify_accepts_empty_and_quarantined_streams() -> None:
+    factory, source, _row = _source_audit()
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    ctx = PluginContext(run_id="verify-run", config={})
+    source.load = MagicMock(return_value=iter(()))
+
+    assert _verified_rows(source, ctx, replace(audited, rows=())) == ()
+
+    quarantined = SourceRow.quarantined({"value": "bad"}, "invalid", "quarantine", source_row_index=3)
+    source.load = MagicMock(return_value=iter([quarantined]))
+    assert _verified_rows(source, ctx, replace(audited, rows=(quarantined,))) == (quarantined,)
+
+
+def test_verify_snapshots_mutable_rows_before_source_reuses_buffer() -> None:
+    factory, source, _row = _source_audit()
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    assert audited.schema_contract is not None
+    buffer = {"value": 7}
+
+    def load_with_reused_buffer(_ctx: PluginContext) -> object:
+        yield SourceRow.valid(buffer, contract=audited.schema_contract, source_row_index=5)
+        buffer["value"] = 999
+
+    source.load = MagicMock(side_effect=load_with_reused_buffer)
+    ctx = PluginContext(run_id="verify-run", config={})
+
+    verified = _verified_rows(source, ctx, audited)
+
+    assert verified[0].row == {"value": 7}
+    assert buffer == {"value": 999}
+
+
+def test_verify_late_source_drift_refuses_complete_preload() -> None:
+    factory, source, _row = _source_audit()
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    assert audited.schema_contract is not None
+    first = SimpleNamespace(name="first", node_id="source-1")
+    second = SimpleNamespace(name="second", node_id="source-2")
+    first.load = MagicMock(return_value=iter(audited.rows))
+    second.load = MagicMock(return_value=iter([SourceRow.valid({"value": 999}, contract=audited.schema_contract, source_row_index=5)]))
+
+    @contextmanager
+    def audited_operation(**kwargs: object) -> object:
+        yield SimpleNamespace(operation=SimpleNamespace(operation_id=f"operation-{kwargs['node_id']}"))
+
+    ctx = PluginContext(
+        run_id="verify-run",
+        config={},
+        run_mode=RunMode.VERIFY,
+        replay_from="previous-run",
+        call_mode_session=SimpleNamespace(mode=RunMode.VERIFY),
+    )
+    token = CoordinationToken(run_id="verify-run", worker_id="worker:verify-run:test", leader_epoch=1)
+    with (
+        patch("elspeth.engine.orchestrator.source_replay.track_operation", side_effect=audited_operation),
+        pytest.raises(AuditIntegrityError, match="differs from audited run"),
+    ):
+        prepare_verified_sources(
+            factory,
+            "verify-run",
+            {"first": replace(audited, name="first"), "second": replace(audited, name="second")},
+            {"first": first, "second": second},
+            ctx,
+            token,
+        )
+
+    first.load.assert_called_once_with(ctx)
+    second.load.assert_called_once_with(ctx)
+
+
+def test_verify_materializes_all_sources_once_with_source_operation_identity() -> None:
+    factory, first, _row = _source_audit()
+    audited_first = prepare_audited_sources(factory, "previous-run", {"primary": first})["primary"]
+    second = SimpleNamespace(node_id="source-2", name="rows-2")
+    first.node_id = "source-1"
+    observed_operations: list[str] = []
+
+    def load_with_audit(ctx: PluginContext) -> object:
+        assert ctx.operation_id is not None
+        observed_operations.append(ctx.operation_id)
+        return iter(audited_first.rows)
+
+    first.load = MagicMock(side_effect=load_with_audit)
+    second.load = MagicMock(side_effect=load_with_audit)
+
+    @contextmanager
+    def audited_operation(**kwargs: object) -> object:
+        operation_id = f"operation-{kwargs['node_id']}"
+        yield SimpleNamespace(operation=SimpleNamespace(operation_id=operation_id))
+
+    ctx = PluginContext(
+        run_id="verify-run",
+        config={},
+        run_mode=RunMode.VERIFY,
+        replay_from="previous-run",
+        call_mode_session=SimpleNamespace(mode=RunMode.VERIFY),
+    )
+    token = CoordinationToken(run_id="verify-run", worker_id="worker:verify-run:test", leader_epoch=1)
+    with patch("elspeth.engine.orchestrator.source_replay.track_operation", side_effect=audited_operation) as tracked:
+        verified = prepare_verified_sources(
+            factory,
+            "verify-run",
+            {"primary": audited_first, "secondary": replace(audited_first, name="secondary")},
+            {"primary": first, "secondary": second},
+            ctx,
+            token,
+        )
+
+    assert list(verified) == ["primary", "secondary"]
+    assert verified["primary"] == audited_first.rows
+    assert verified["secondary"] == audited_first.rows
+    assert observed_operations == ["operation-source-1", "operation-source-2"]
+    assert tracked.call_count == 2
+    first.load.assert_called_once_with(ctx)
+    second.load.assert_called_once_with(ctx)
+    assert ctx.operation_id is None
+
+
+def test_idle_timeout_context_preserves_verify_call_mode() -> None:
+    session = SimpleNamespace(mode=RunMode.VERIFY)
+    audited_sources: dict[str, object] = {}
+    verified_sources: dict[str, tuple[SourceRow, ...]] = {}
+    source_ctx = PluginContext(
+        run_id="verify-run",
+        config={},
+        run_mode=RunMode.VERIFY,
+        replay_from="previous-run",
+        call_mode_session=session,
+        audited_sources=audited_sources,
+        verified_sources=verified_sources,
+    )
+
+    idle_ctx = SourceIterationDriver._idle_timeout_context(SourceIterationDriver.__new__(SourceIterationDriver), source_ctx)
+
+    assert idle_ctx.run_mode is RunMode.VERIFY
+    assert idle_ctx.replay_from == "previous-run"
+    assert idle_ctx.call_mode_session is session
+    assert idle_ctx.audited_sources is audited_sources
+    assert idle_ctx.verified_sources is verified_sources

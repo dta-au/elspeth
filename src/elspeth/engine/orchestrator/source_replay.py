@@ -7,23 +7,30 @@ replay request into a partly live execution.
 
 from __future__ import annotations
 
+import copy
+import itertools
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import SourceRow
 from elspeth.contracts.audit import NodeStateFailed
-from elspeth.contracts.enums import NodeType, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.enums import NodeType, RunMode, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.core.canonical import stable_hash
+from elspeth.contracts.types import NodeID
+from elspeth.core.canonical import sanitize_for_canonical, stable_hash
 from elspeth.core.landscape.row_data import RowDataState
 from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
+from elspeth.core.operations import track_operation
+from elspeth.engine.orchestrator.quarantine_router import _bound_quarantine_error
 from elspeth.engine.orchestrator.schema_reconstruction import reconstruct_schema_from_json
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 
 
@@ -38,6 +45,81 @@ class AuditedSource:
     source_schema_json: str
     field_resolution: Mapping[str, str] | None
     normalization_version: str | None
+
+
+def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedSource) -> tuple[SourceRow, ...]:
+    """Read one live source to EOF and reject every source-level difference."""
+    rows: list[SourceRow] = []
+    missing = object()
+    for ordinal, (live, recorded) in enumerate(itertools.zip_longest(source.load(ctx), audited.rows, fillvalue=missing)):
+        if live is missing or recorded is missing:
+            raise AuditIntegrityError(f"Verify source {audited.name!r}: row count differs at ordinal {ordinal}")
+        if not isinstance(live, SourceRow) or not isinstance(recorded, SourceRow):
+            raise OrchestrationInvariantError(f"Verify source {audited.name!r}: source yielded a non-SourceRow value")
+        if (
+            live.source_row_index != recorded.source_row_index
+            or live.is_quarantined != recorded.is_quarantined
+            or stable_hash(sanitize_for_canonical(live.row) if live.is_quarantined else live.row) != stable_hash(recorded.row)
+            or (_bound_quarantine_error(live.quarantine_error) if live.quarantine_error is not None else None) != recorded.quarantine_error
+            or live.quarantine_destination != recorded.quarantine_destination
+            or (live.contract.version_hash() if live.contract is not None else None)
+            != (recorded.contract.version_hash() if recorded.contract is not None else None)
+        ):
+            raise AuditIntegrityError(f"Verify source {audited.name!r}: row {ordinal} differs from audited run")
+        # SourceRow is frozen, but its payload may be a mutable object reused
+        # by the source generator. Preserve the exact value we compared before
+        # advancing the generator to its next yield.
+        rows.append(replace(live, row=copy.deepcopy(live.row)))
+    return tuple(rows)
+
+
+def prepare_verified_sources(
+    factory: RecorderFactory,
+    run_id: str,
+    audited_sources: Mapping[str, AuditedSource],
+    sources: Mapping[str, SourceProtocol],
+    ctx: PluginContext,
+    coordination_token: CoordinationToken,
+) -> Mapping[str, tuple[SourceRow, ...]]:
+    """Verify every complete live source stream before transform startup.
+
+    Each source.load executes exactly once under its own source_load audit
+    operation. The caller invokes this after source.on_start and before any
+    transform or sink on_start, then passes the cached rows to the driver.
+    """
+    if coordination_token.run_id != run_id or ctx.run_id != run_id:
+        raise OrchestrationInvariantError("Verify source preflight run identity mismatch")
+    if ctx.run_mode is not RunMode.VERIFY:
+        raise OrchestrationInvariantError("Verify source preflight requires verify run mode")
+    if set(audited_sources) != set(sources):
+        raise AuditIntegrityError("Verify source preflight declarations differ from audited snapshot")
+    verified: dict[str, tuple[SourceRow, ...]] = {}
+    saved_node_id = ctx.node_id
+    saved_operation_id = ctx.operation_id
+    try:
+        for name, source in sources.items():
+            audited = audited_sources[name]
+            if not isinstance(audited, AuditedSource):
+                raise OrchestrationInvariantError(f"Verify source {name!r}: audited snapshot has wrong type")
+            if source.node_id is None:
+                raise OrchestrationInvariantError(f"Verify source {name!r}: node ID is unassigned")
+            source_id = NodeID(source.node_id)
+            ctx.node_id = source_id
+            with track_operation(
+                recorder=factory.execution,
+                run_id=run_id,
+                node_id=source_id,
+                operation_type="source_load",
+                ctx=ctx,
+                input_data={"source_plugin": source.name},
+            ) as operation:
+                ctx.operation_id = operation.operation.operation_id
+                verified[name] = _verified_rows(source, ctx, audited)
+            ctx.operation_id = None
+    finally:
+        ctx.node_id = saved_node_id
+        ctx.operation_id = saved_operation_id
+    return verified
 
 
 def _quarantine_details(
