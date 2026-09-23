@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Self, cast
 import structlog
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import CallType, Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.aws_s3 import S3_MAX_KEY_BYTES, validate_relative_s3_path
 from elspeth.contracts.aws_textract import (
@@ -28,6 +28,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import (
+    AuditIntegrityError,
     BucketRegionVerificationEvidence,
     FrameworkBugError,
     TransformErrorCategory,
@@ -44,6 +45,7 @@ from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputP
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
     BucketRegionCoordinator,
@@ -309,7 +311,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:eb0303eb99d0cb68"
+    source_file_hash: str | None = "sha256:5d33f37ab884d86f"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -486,6 +488,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._bucket_region_coordinator = BucketRegionCoordinator()
         created_s3 = False
         created_textract = False
+        if ctx.run_mode is RunMode.REPLAY:
+            if self._s3_sdk_client is None:
+                self._s3_sdk_client = ReplayOnlySDK()
+            if self._sdk_client is None:
+                self._sdk_client = ReplayOnlySDK()
+            return
         try:
             if self._s3_sdk_client is None:
                 self._s3_sdk_client = build_s3_head_bucket_sdk_client(
@@ -569,6 +577,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 max_response_bytes=self._max_result_bytes,
                 limiter=self._limiter,
                 token_id=token_id,
+                call_mode_session=ctx.call_mode_session,
             )
             self._row_clients[state_id] = client
             return client
@@ -767,6 +776,26 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             key=key,
             version=version,
         )
+        source_token_fingerprint: str | None = None
+        session = ctx.call_mode_session
+        if session is not None:
+            source_parent = session.source_parent_identity(
+                call_type=CallType.HTTP,
+                current_state_id=state_id,
+                current_operation_id=None,
+            )
+            source_token_id = source_parent.source_token_id
+            if not source_token_id:
+                raise AuditIntegrityError("Textract source call parent has no token identity")
+            source_token = self._client_request_token(
+                run_id=source_parent.source_run_id,
+                node_id=source_parent.source_node_id,
+                token_id=source_token_id,
+                bucket=bucket,
+                key=key,
+                version=version,
+            )
+            source_token_fingerprint = hashlib.sha256(source_token.encode("utf-8")).hexdigest()
         try:
             receipt = client.start_document_analysis(
                 bucket=bucket,
@@ -776,6 +805,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 queries=self._query_requests,
                 client_request_token=request_token,
                 audit_identity=self._audit_location_identity(key),
+                source_client_request_token_fingerprint=source_token_fingerprint,
             )
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
@@ -859,6 +889,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             region=self._region,
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
+            call_mode_session=ctx.call_mode_session,
         ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
 
     def _poll_and_collect(

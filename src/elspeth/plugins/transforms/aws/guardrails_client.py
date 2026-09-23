@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 import structlog
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -442,10 +444,12 @@ class BedrockGuardrailsClient(AuditedClientBase):
         guardrail_version: str,
         region: str,
         audit_salt: bytes,
+        source_audit_salt: bytes | None = None,
         sdk_client: BedrockRuntimeClient | None = None,
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id, member_token=member_token, work_item=work_item)
         if len(audit_salt) < 16:
@@ -458,7 +462,57 @@ class BedrockGuardrailsClient(AuditedClientBase):
             f"{guardrail_identifier}\0{guardrail_version}\0{region}".encode(),
             hashlib.sha256,
         ).hexdigest()
+        self._source_target_fingerprint = (
+            None
+            if source_audit_salt is None
+            else hmac.new(
+                source_audit_salt,
+                f"{guardrail_identifier}\0{guardrail_version}\0{region}".encode(),
+                hashlib.sha256,
+            ).hexdigest()
+        )
+        self._call_mode_session = call_mode_session
+        if call_mode_session is not None and self._source_target_fingerprint is None:
+            raise ValueError("source_audit_salt is required for Guardrail replay/verify matching")
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and sdk_client is None:
+            raise AuditIntegrityError("Guardrail replay requires the fail-closed SDK stand-in")
         self._sdk_client = sdk_client if sdk_client is not None else self._build_sdk_client()
+
+    def _record_mode_outcome(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        lookup_request: RawCallPayload,
+        response_payload: RawCallPayload,
+        error_payload: RawCallPayload | None,
+        status: CallStatus,
+        latency_ms: float,
+        replay_evidence: ReplayCallEvidence | None = None,
+    ) -> None:
+        call = self._record_call(
+            call_index=call_index,
+            call_type=CallType.HTTP,
+            status=status,
+            request_data=request_payload,
+            response_data=response_payload,
+            error=error_payload,
+            latency_ms=latency_ms,
+            source_call_id=None if replay_evidence is None else replay_evidence.source_call_id,
+        )
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=response_payload.to_dict(),
+                live_error_data=None if error_payload is None else error_payload.to_dict(),
+            )
 
     @property
     def sdk_client(self) -> BedrockRuntimeClient:
@@ -530,6 +584,106 @@ class BedrockGuardrailsClient(AuditedClientBase):
                 "required_filters": required_filters,
             }
         )
+        # Guardrail text is deliberately absent from the call payload. Source
+        # input compatibility and parent-local call order bind it during
+        # replay/verify. The target HMAC is keyed by the run, so lookup uses
+        # the source run's fingerprint while the new audit uses its own.
+        source_request = request_payload.to_dict()
+        if self._source_target_fingerprint is not None:
+            source_request["target_fingerprint"] = self._source_target_fingerprint
+        lookup_request = RawCallPayload(source_request)
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.REPLAY:
+            evidence = session.replay_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+            payload = evidence.response_data
+            if payload is None or payload.get("operation") != "apply_guardrail":
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has no complete response")
+            attempts = payload.get("attempts")
+            if type(attempts) is not int or not 1 <= attempts <= 11:
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid attempts")
+            replay_error: Exception | None = None
+            decision: GuardrailDecision | None = None
+            if evidence.status is CallStatus.SUCCESS:
+                detected = payload.get("detected")
+                intervened = payload.get("intervened")
+                filters = payload.get("matched_filters")
+                request_id = payload.get("request_id")
+                if (
+                    payload.get("status") not in ("safe", "blocked")
+                    or type(detected) is not bool
+                    or type(intervened) is not bool
+                    or not isinstance(filters, tuple | list)
+                    or any(type(item) is not str for item in filters)
+                    or not set(filters) <= set(required_filters)
+                    or len(set(filters)) != len(filters)
+                    or bool(filters) is not detected
+                    or (intervened and not detected)
+                    or "request_id" not in payload
+                    or (request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256))
+                    or payload.get("request_id_present") is not (request_id is not None)
+                    or payload.get("status") != ("blocked" if detected else "safe")
+                    or evidence.error_data is not None
+                ):
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has incomplete decision")
+                try:
+                    usage = _parse_usage(payload.get("usage"))
+                except GuardrailResponseError as error:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid usage") from error
+                decision = GuardrailDecision(
+                    detected=detected,
+                    intervened=intervened,
+                    matched_filters=tuple(filters),
+                    usage=usage,
+                    request_id=request_id,
+                )
+            elif evidence.status is CallStatus.ERROR:
+                error_data = evidence.error_data
+                status = payload.get("status")
+                if error_data is None or error_data.get("type") != status or type(error_data.get("retryable")) is not bool:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has contradictory error")
+                if status == "partial_coverage" and error_data["retryable"] is False:
+                    key = payload.get("coverage_key")
+                    guarded = payload.get("guarded_units")
+                    total = payload.get("total_units")
+                    if key in ("textCharacters", "images") and type(guarded) is int and type(total) is int and 0 <= guarded < total:
+                        replay_error = GuardrailPartialCoverageError(coverage_key=key, guarded=guarded, total=total)
+                elif status == "malformed_response" and error_data["retryable"] is False:
+                    replay_error = GuardrailResponseError()
+                elif status == "service_error" and type(error_data["retryable"]) is bool:
+                    replay_error = GuardrailServiceError(retryable=error_data["retryable"])
+                if replay_error is None:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has incomplete error")
+            else:
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid status")
+            response_payload = RawCallPayload(payload)
+            error_payload = None if evidence.error_data is None else RawCallPayload(evidence.error_data)
+            latency_ms = evidence.latency_ms if evidence.latency_ms is not None else 0.0
+            self._record_mode_outcome(
+                call_index=call_index,
+                request_payload=request_payload,
+                lookup_request=lookup_request,
+                response_payload=response_payload,
+                error_payload=error_payload,
+                status=evidence.status,
+                latency_ms=latency_ms,
+                replay_evidence=evidence,
+            )
+            self._emit_after_audit(
+                status=evidence.status,
+                latency_ms=latency_ms,
+                request_payload=request_payload,
+                response_payload=response_payload,
+            )
+            if replay_error is not None:
+                raise replay_error
+            assert decision is not None
+            return decision
         start = time.perf_counter()
         terminal_error: Exception | None = None
         attempts = 1
@@ -558,6 +712,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
                     "intervened": decision.intervened,
                     "matched_filters": decision.matched_filters,
                     "usage": dict(decision.usage.units),
+                    "request_id": decision.request_id,
                     "request_id_present": decision.request_id is not None,
                 }
             )
@@ -593,13 +748,13 @@ class BedrockGuardrailsClient(AuditedClientBase):
             decision = None
 
         latency_ms = (time.perf_counter() - start) * 1000
-        self._record_call(
+        self._record_mode_outcome(
             call_index=call_index,
-            call_type=CallType.HTTP,
+            request_payload=request_payload,
+            lookup_request=lookup_request,
+            response_payload=response_payload,
+            error_payload=error_payload,
             status=call_status,
-            request_data=request_payload,
-            response_data=response_payload,
-            error=error_payload,
             latency_ms=latency_ms,
         )
         self._emit_after_audit(

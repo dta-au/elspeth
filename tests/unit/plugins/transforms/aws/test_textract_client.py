@@ -196,7 +196,7 @@ def test_start_sorts_features_and_builds_queries_config() -> None:
     ]
 
 
-def test_get_replaces_raw_next_token_with_fingerprint_in_audit() -> None:
+def test_get_retains_next_token_for_replay_only_in_protected_call_response(caplog: pytest.LogCaptureFixture) -> None:
     marker = "provider-document-text"
     sdk = FakeSDK(
         get_responses=[
@@ -221,8 +221,11 @@ def test_get_replaces_raw_next_token_with_fingerprint_in_audit() -> None:
     audited = recorder.calls[0]["response_data"].to_dict()
     assert audited["attempts"] == 3
     assert audited["next_token_present"] is True
+    assert audited["next_token"] == "opaque-next-token"
     assert audited["next_token_fingerprint"]
-    assert "opaque-next-token" not in repr(audited)
+    assert "opaque-next-token" not in repr(recorder.calls[0]["request_data"].to_dict())
+    assert "opaque-next-token" not in repr(events)
+    assert "opaque-next-token" not in caplog.text
     assert marker in repr(audited)
     assert marker not in repr(events)
     assert "provider-header" not in repr(audited)

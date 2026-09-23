@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import structlog
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -255,10 +257,12 @@ class HeadBucketClient(AuditedClientBase):
         token_id: str | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id, member_token=member_token, work_item=work_item)
         self._region = region
         self._sdk_client = sdk_client
+        self._call_mode_session = call_mode_session
 
     def _emit(
         self,
@@ -324,6 +328,66 @@ class HeadBucketClient(AuditedClientBase):
         call_index = self._next_call_index()
         location_identity: Mapping[str, str | None] = {"bucket": bucket} if audit_identity is None else dict(audit_identity)
         request_payload = RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region, **location_identity})
+        session = self._call_mode_session
+        replay_evidence: ReplayCallEvidence | None = None
+        if session is not None and session.mode is RunMode.REPLAY:
+            replay_evidence = session.replay_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+            retained = replay_evidence.response_data
+            if retained is None or retained.get("operation") != "head_bucket_region":
+                raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has no region proof")
+            attempts = retained.get("attempts")
+            replayed_http_status = retained.get("http_status")
+            if type(attempts) is not int or attempts < 1 or (replayed_http_status is not None and type(replayed_http_status) is not int):
+                raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has invalid response metadata")
+            if replay_evidence.status is CallStatus.SUCCESS:
+                region = retained.get("observed_region")
+                source = retained.get("proof_source")
+                code = retained.get("provider_code")
+                if (
+                    retained.get("status") != "verified"
+                    or type(region) is not str
+                    or not is_supported_textract_region(region)
+                    or source not in ("response_field", "response_header", "error_header")
+                    or type(replayed_http_status) is not int
+                    or (code is not None and type(code) is not str)
+                    or replay_evidence.error_data is not None
+                ):
+                    raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has incomplete region proof")
+                replayed_proof = BucketRegionProof(region=region, source=source, http_status=replayed_http_status, provider_code=code)
+                replayed_error = None
+            elif replay_evidence.status is CallStatus.ERROR:
+                error = replay_evidence.error_data
+                if (
+                    retained.get("status") != "unverified"
+                    or error is None
+                    or error.get("type") != "bucket_region_unverified"
+                    or type(error.get("code")) is not str
+                    or type(error.get("retryable")) is not bool
+                ):
+                    raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has incomplete region failure")
+                replayed_proof = None
+                replayed_error = BucketRegionUnverifiedError(
+                    code=error["code"],
+                    retryable=error["retryable"],
+                    http_status=replayed_http_status,
+                )
+            else:
+                raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has invalid status")
+            # The validated evidence follows the same recording and telemetry
+            # path below, with no SDK construction or dispatch.
+            return self._finish_replay_bucket(
+                call_index=call_index,
+                request_payload=request_payload,
+                evidence=replay_evidence,
+                proof=replayed_proof,
+                terminal_error=replayed_error,
+            )
         started = time.perf_counter()
         proof: BucketRegionProof | None = None
         terminal_error: BucketRegionUnverifiedError | None = None
@@ -376,7 +440,7 @@ class HeadBucketClient(AuditedClientBase):
             proof_source = None
             provider_code = terminal_error.code
             observed_region = None
-        self._record_call(
+        call = self._record_call(
             call_index=call_index,
             call_type=CallType.HTTP,
             status=status,
@@ -385,6 +449,18 @@ class HeadBucketClient(AuditedClientBase):
             error=error_payload,
             latency_ms=latency_ms,
         )
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_payload.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=response_payload.to_dict(),
+                live_error_data=None if error_payload is None else error_payload.to_dict(),
+            )
         self._emit(
             status=status,
             latency_ms=latency_ms,
@@ -396,6 +472,46 @@ class HeadBucketClient(AuditedClientBase):
             observed_region=observed_region,
         )
         if terminal_error is not None and proof is None:
+            raise terminal_error
+        assert proof is not None
+        return proof
+
+    def _finish_replay_bucket(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        evidence: ReplayCallEvidence,
+        proof: BucketRegionProof | None,
+        terminal_error: BucketRegionUnverifiedError | None,
+    ) -> BucketRegionProof:
+        retained = evidence.response_data
+        if retained is None:
+            raise AuditIntegrityError(f"S3 replay call {evidence.source_call_id} lost its response")
+        response_payload = RawCallPayload(retained)
+        error_payload = None if evidence.error_data is None else RawCallPayload(evidence.error_data)
+        latency_ms = evidence.latency_ms if evidence.latency_ms is not None else 0.0
+        self._record_call(
+            call_index=call_index,
+            call_type=CallType.HTTP,
+            status=evidence.status,
+            request_data=request_payload,
+            response_data=response_payload,
+            error=error_payload,
+            latency_ms=latency_ms,
+            source_call_id=evidence.source_call_id,
+        )
+        self._emit(
+            status=evidence.status,
+            latency_ms=latency_ms,
+            response_status=retained["status"],
+            attempts=retained["attempts"],
+            http_status=retained["http_status"],
+            proof_source=None if proof is None else proof.source,
+            provider_code=(terminal_error.code if terminal_error is not None else proof.provider_code if proof is not None else None),
+            observed_region=None if proof is None else proof.region,
+        )
+        if terminal_error is not None:
             raise terminal_error
         assert proof is not None
         return proof

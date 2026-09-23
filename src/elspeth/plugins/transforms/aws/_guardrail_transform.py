@@ -9,7 +9,7 @@ from typing import Any, ClassVar
 
 from pydantic import ConfigDict, Field, field_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
@@ -32,6 +32,7 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailSource,
     build_bedrock_runtime_client,
 )
+from elspeth.plugins.transforms.aws.replay_sdk import ReplayOnlySDK
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty
 
 
@@ -131,7 +132,9 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._recorder = ctx.landscape
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
-        if self._sdk_client is None:
+        if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
+            self._sdk_client = ReplayOnlySDK()
+        elif self._sdk_client is None:
             self._sdk_client = build_bedrock_runtime_client(self._region)
 
     def close(self) -> None:
@@ -214,8 +217,14 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             guardrail_version=self._guardrail_version,
             region=self._region,
             audit_salt=hashlib.sha256(f"elspeth-bedrock-guardrail:{self._run_id}".encode()).digest(),
+            source_audit_salt=(
+                hashlib.sha256(f"elspeth-bedrock-guardrail:{ctx.call_mode_session.source_run_id}".encode()).digest()
+                if ctx.call_mode_session is not None
+                else None
+            ),
             sdk_client=self._sdk_client,
             token_id=token_id,
+            call_mode_session=ctx.call_mode_session,
         )
 
         for field_name in self._fields:
