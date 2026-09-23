@@ -870,6 +870,16 @@ allowed_dict_patterns:
   # module, not LLM-supplied); Tier-1 audit-readiness is enforced by
   # the validity check inside the helper before the dict is deep-frozen.
   - "src/elspeth/web/composer/tools/_dispatch.py:_validate_and_freeze_tool_definition:defn"
+  # OpenAI strict-mode checker: each ``node`` is one subschema of an owned
+  # tool JSON Schema (the flat registry S or the wire projection W built from
+  # it). A JSON Schema node is an open keyword map by definition, so a
+  # TypedDict would have to enumerate every keyword the checker exists to
+  # reject; the helpers read it only after a ``type(x) is dict`` check.
+  - "src/elspeth/web/composer/tools/strict_profile.py:_type_names:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_object:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_array:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_keywords:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_object:node"
   - "src/elspeth/web/composer/tools/sources.py:_execute_set_source:args"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_node:args"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_edge:args"

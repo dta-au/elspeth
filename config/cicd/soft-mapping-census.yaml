@@ -896,6 +896,9 @@ files:
     dict[str, Any]: 13
   src/elspeth/web/composer/tools/state_responses.py:
     Mapping[str, object]: 1
+  src/elspeth/web/composer/tools/strict_profile.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 5
   src/elspeth/web/composer/tools/transforms.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 19
@@ -1049,10 +1052,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 881
+  Mapping[str, Any]: 882
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1147
+  dict[str, Any]: 1152
   dict[str, object]: 409
-  soft: 2756
+  soft: 2762
