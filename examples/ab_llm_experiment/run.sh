@@ -74,9 +74,9 @@ if ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
     exit 1
 fi
 
-run_experiment() {  # settings  label  output  audit_db  variant_field  expected_exit  expected_pairs  expected_llm_calls
+run_experiment() {  # settings  label  output  audit_db  variant_field  expected_exit  expected_pairs  expected_row_calls  expected_preflight_calls
     local settings="$1" label="$2" out="$3" db="$4" field="$5"
-    local expect_rc="$6" pairs="$7" llm_calls="$8"
+    local expect_rc="$6" pairs="$7" row_calls="$8" preflight_calls="$9"
     echo "--- $label ---"
     local rc=0
     .venv/bin/elspeth run --settings "$settings" --execute || rc=$?
@@ -94,11 +94,11 @@ run_experiment() {  # settings  label  output  audit_db  variant_field  expected
     echo ""
     # Self-verification. Exit 0 alone is a weak oracle: a pipeline that scored
     # nothing also exits 0. These three facts are what prove the mechanics ran.
-    .venv/bin/python - "$out" "$db" "$field" "$pairs" "$llm_calls" <<'PYCHECK'
+    .venv/bin/python - "$out" "$db" "$field" "$pairs" "$row_calls" "$preflight_calls" <<'PYCHECK'
 import json, sqlite3, sys
 
 out_path, db_path, variant_field = sys.argv[1], sys.argv[2], sys.argv[3]
-pairs, expected_llm = int(sys.argv[4]), int(sys.argv[5])
+pairs, expected_row_llm, expected_preflight_llm = map(int, sys.argv[4:7])
 report = json.loads(open(out_path).read().strip().splitlines()[-1])
 
 failures = []
@@ -110,23 +110,34 @@ if report["baseline_count"] != pairs or report["variant_count"] != pairs:
 # 2. The comparison ran over the intended discriminator.
 if report["variant_field"] != variant_field:
     failures.append(f"variant_field {report['variant_field']!r} != {variant_field!r}")
-# 3. Provider calls actually made. Where an arm is lost this DIFFERS from
-#    2 x pairs, and the gap is the work paid for and thrown away.
-llm_calls = sqlite3.connect(db_path).execute(
-    "SELECT COUNT(*) FROM calls WHERE call_type = 'llm'"
+# 3. Row calls prove that each arm reached the provider. Runtime preflight
+#    calls are audited too, but do not assess a case study.
+conn = sqlite3.connect(db_path)
+row_llm_calls = conn.execute(
+    "SELECT COUNT(*) FROM calls WHERE call_type = 'llm' AND state_id IS NOT NULL"
 ).fetchone()[0]
-if llm_calls != expected_llm:
-    failures.append(f"{llm_calls} audited llm calls != {expected_llm}")
+preflight_llm_calls = conn.execute(
+    "SELECT COUNT(*) FROM calls AS c JOIN operations AS o ON c.operation_id = o.operation_id "
+    "WHERE c.call_type = 'llm' AND o.operation_type = 'runtime_preflight'"
+).fetchone()[0]
+total_llm_calls = conn.execute("SELECT COUNT(*) FROM calls WHERE call_type = 'llm'").fetchone()[0]
+if row_llm_calls != expected_row_llm:
+    failures.append(f"{row_llm_calls} audited row llm calls != {expected_row_llm}")
+if preflight_llm_calls != expected_preflight_llm:
+    failures.append(f"{preflight_llm_calls} audited preflight llm calls != {expected_preflight_llm}")
+if total_llm_calls != row_llm_calls + preflight_llm_calls:
+    failures.append(f"{total_llm_calls} total llm calls include unexpected operation calls")
 
 if failures:
     print("VERIFICATION FAILED:", file=sys.stderr)
     for f in failures:
         print(f"  - {f}", file=sys.stderr)
     raise SystemExit(1)
-wasted = expected_llm - pairs * 2
+wasted = expected_row_llm - pairs * 2
 note = f", {wasted} llm calls discarded with their invalidated rows" if wasted else ""
 print(
-    f"VERIFIED: {expected_llm} llm calls, {pairs}+{pairs} paired observations "
+    f"VERIFIED: {row_llm_calls} row llm calls + {preflight_llm_calls} preflight llm calls, "
+    f"{pairs}+{pairs} paired observations "
     f"released as whole groups{note}; "
     f"{report['baseline_variant']} {report['baseline_mean']:.2f} -> "
     f"{report['variant']} {report['variant_mean']:.2f} "
@@ -140,13 +151,13 @@ run_experiment examples/ab_llm_experiment/settings.yaml \
     "A/B by PROMPT — one model, terse rubric vs weighted rubric" \
     examples/ab_llm_experiment/output/prompt_experiment.json \
     examples/ab_llm_experiment/runs/audit.db \
-    prompt_variant 0 8 16
+    prompt_variant 0 8 16 2
 
 run_experiment examples/ab_llm_experiment/settings_models.yaml \
     "A/B by MODEL — one prompt, analyst-v1 vs analyst-v2" \
     examples/ab_llm_experiment/output/model_experiment.json \
     examples/ab_llm_experiment/runs/audit_models.db \
-    model_variant 0 8 16
+    model_variant 0 8 16 2
 
 # The fail-closed fixture. 24 cases, 3 of them missing the field arm B needs.
 # Expected exit is 1, and 21 pairs from 45 llm calls: three arm-A assessments
@@ -156,7 +167,7 @@ run_experiment examples/ab_llm_experiment/settings_arm_loss.yaml \
     "ARM LOSS — 24 cases, 3 lose one arm; the whole row is invalidated" \
     examples/ab_llm_experiment/output/arm_loss_experiment.json \
     examples/ab_llm_experiment/runs/audit_arm_loss.db \
-    prompt_variant 1 21 45
+    prompt_variant 1 21 45 2
 
 echo ""
 echo "Done. Audit trails:"

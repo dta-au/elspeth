@@ -71,9 +71,9 @@ if ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
     exit 1
 fi
 
-run_case() {  # settings  label  output  audit_db  expected_exit  expected_docs  expected_llm  expected_losses
+run_case() {  # settings  label  output  audit_db  expected_exit  expected_docs  expected_row_llm  expected_preflight_llm  expected_losses
     local settings="$1" label="$2" out="$3" db="$4"
-    local expect_rc="$5" docs="$6" llm="$7" losses="$8"
+    local expect_rc="$5" docs="$6" row_llm="$7" preflight_llm="$8" losses="$9"
     echo "--- $label ---"
     local rc=0
     .venv/bin/elspeth run --settings "$settings" --execute || rc=$?
@@ -82,11 +82,11 @@ run_case() {  # settings  label  output  audit_db  expected_exit  expected_docs 
         return 1
     fi
     echo ""
-    .venv/bin/python - "$out" "$db" "$docs" "$llm" "$losses" <<'PYCHECK'
+    .venv/bin/python - "$out" "$db" "$docs" "$row_llm" "$preflight_llm" "$losses" <<'PYCHECK'
 import json, os, sqlite3, sys
 
 out_path, db_path = sys.argv[1], sys.argv[2]
-expect_docs, expect_llm, expect_losses = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+expect_docs, expect_row_llm, expect_preflight_llm, expect_losses = map(int, sys.argv[3:7])
 conn = sqlite3.connect(db_path)
 failures = []
 
@@ -106,12 +106,22 @@ else:
         if report["count"] != expect_docs:
             failures.append(f"published count {report['count']} != {expect_docs} documents")
 
-# Provider calls actually made, and group losses actually recorded. A cascade
-# that left no ledger entry would be a silent loss, which is the thing this
-# example exists to rule out.
-llm_calls = conn.execute("SELECT COUNT(*) FROM calls WHERE call_type = 'llm'").fetchone()[0]
-if llm_calls != expect_llm:
-    failures.append(f"{llm_calls} audited llm calls != {expect_llm}")
+# Row-level provider calls prove the reviews happened. Runtime preflight calls
+# are audited separately and do not review a page.
+row_llm_calls = conn.execute(
+    "SELECT COUNT(*) FROM calls WHERE call_type = 'llm' AND state_id IS NOT NULL"
+).fetchone()[0]
+preflight_llm_calls = conn.execute(
+    "SELECT COUNT(*) FROM calls AS c JOIN operations AS o ON c.operation_id = o.operation_id "
+    "WHERE c.call_type = 'llm' AND o.operation_type = 'runtime_preflight'"
+).fetchone()[0]
+total_llm_calls = conn.execute("SELECT COUNT(*) FROM calls WHERE call_type = 'llm'").fetchone()[0]
+if row_llm_calls != expect_row_llm:
+    failures.append(f"{row_llm_calls} audited row llm calls != {expect_row_llm}")
+if preflight_llm_calls != expect_preflight_llm:
+    failures.append(f"{preflight_llm_calls} audited preflight llm calls != {expect_preflight_llm}")
+if total_llm_calls != row_llm_calls + preflight_llm_calls:
+    failures.append(f"{total_llm_calls} total llm calls include unexpected operation calls")
 losses = conn.execute("SELECT COUNT(*) FROM group_losses").fetchone()[0]
 if losses != expect_losses:
     failures.append(f"{losses} group_losses rows != {expect_losses}")
@@ -127,7 +137,7 @@ ledger = conn.execute(
 ).fetchall()
 where = "; ".join(f"{c} ({r}) x{n}" for c, r, n in ledger) or "no losses"
 published = f"{expect_docs} document(s) in the published verdict" if expect_docs else "NOTHING published"
-print(f"VERIFIED: {llm_calls} llm calls, {published}; ledger: {where}")
+print(f"VERIFIED: {row_llm_calls} row llm calls + {preflight_llm_calls} preflight llm calls, {published}; ledger: {where}")
 PYCHECK
     echo ""
 }
@@ -136,19 +146,19 @@ run_case examples/document_review_panel/settings.yaml \
     "CLEAN — 4 documents, 12 pages, every page reviewed twice" \
     examples/document_review_panel/output/corpus_summary.jsonl \
     examples/document_review_panel/runs/clean.db \
-    0 4 24 0
+    0 4 24 2 0
 
 run_case examples/document_review_panel/settings_incomplete.yaml \
     "CASCADE — one page missing one field; page, then document, then the number" \
     examples/document_review_panel/output/corpus_summary_incomplete.jsonl \
     examples/document_review_panel/runs/incomplete.db \
-    1 3 23 2
+    1 3 23 2 2
 
 run_case examples/document_review_panel/settings_run_as_row.yaml \
     "RUN AS ONE ROW — the same loss, and now nothing is published at all" \
     examples/document_review_panel/output/corpus_verdict.jsonl \
     examples/document_review_panel/runs/run_as_row.db \
-    1 0 3 1
+    1 0 3 1 1
 
 echo "Done. Audit trails under examples/document_review_panel/runs/."
 echo "Inspect the unroll with:"

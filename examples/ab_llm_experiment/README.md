@@ -79,10 +79,11 @@ each run, and fails the launcher if any is wrong:
    the `row_union` released only WHOLE pairs, rather than passing single tokens
    through. For `settings_arm_loss.yaml` that count is 21, not 24.
 2. `variant_field` is the intended discriminator for that config.
-3. The Landscape trail holds the expected number of `call_type = 'llm'`
-   records. Every arm genuinely called the provider; nothing was templated
-   server-side. In the arm-loss run this is 45 against 42 admitted
-   observations, and the launcher reports the three discarded calls explicitly.
+3. The Landscape trail holds the expected row-level LLM calls and runtime
+   preflight calls separately. Every arm genuinely called the provider;
+   nothing was templated server-side. In the arm-loss run, 45 row calls
+   produced 42 admitted observations, so the launcher reports three discarded
+   calls. Two additional preflight calls are audited before row processing.
 
 ## Why `row_union` And Not `coalesce` Or A Queue
 
@@ -113,7 +114,7 @@ before it will assess anything. Those three arm-B tokens are discarded.
 baseline_count  21   <- not 24. The three arm-A survivors are invalidated.
 variant_count   21
 batch_size      42   <- 21 whole pairs, not 45 surviving tokens
-llm calls       45   <- 24 on arm A, 21 on arm B
+row LLM calls   45   <- 24 on arm A, 21 on arm B
 ```
 
 `baseline_count` is the tell, and the 45-vs-42 gap is the price. Arm A ran to
