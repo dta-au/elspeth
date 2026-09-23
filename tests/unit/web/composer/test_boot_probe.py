@@ -191,6 +191,34 @@ def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: 
         assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
 
 
+def test_probe_env_defaults_to_the_process_environment_the_service_resolves_against(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any
+) -> None:
+    """D20: with no ``env=``, the probe resolves against ``os.environ``, as the service does.
+
+    ``OPENROUTER_API_BASE`` pointing at a proxy makes both OpenRouter routes
+    resolve to ``none``, so the probe sends no ``strict`` key and no
+    ``hatch_terminal``. The explicit ``env={}`` build is the in-test contrast:
+    the same settings without the variable send the stamped lists, so the
+    variable is what decides the outcome. Control: default the probe's
+    ``env`` to ``{}`` and this test goes red.
+    """
+    monkeypatch.setenv("OPENROUTER_API_BASE", "https://proxy.example/v1")
+    settings = settings_factory(composer_model=_OPENROUTER_PLANNER)
+
+    requests = bp.build_composer_probe_requests(settings)
+
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
+    loop, planner = requests[0], requests[1]
+    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 42)
+    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 20)
+
+    contrast = bp.build_composer_probe_requests(settings, env={})
+    assert [request.surface for request in contrast] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+    assert contrast[0].strict_true_count == 32
+    assert contrast[1].strict_true_count == 19
+
+
 def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_factory: Any) -> None:
     """The loop sends discovery effort (``_call_llm``); the planner request sends candidate effort."""
     settings = settings_factory(
