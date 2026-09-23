@@ -129,10 +129,12 @@ class BarrierJournalRestoreContext:
             unlatched / no-losses defaults. The scalars snapshot is
             NON-transactional vs the journal (D3 staleness model): an absent
             entry always means not-fired / re-derivable, never corruption.
-        batch_id_remap: old->retry batch_id mapping returned by
+        batch_id_remap: old->retry batch_id edges returned by
             ``handle_incomplete_batches`` — BUFFERED token_outcomes still
             reference the dead original batch ids, so the restored in-progress
-            batch id must be read through this remap.
+            batch id is read through this remap. Each entry is ONE retry hop;
+            after repeated crashes the edges form a chain (A->B, B->C), and
+            ``resolve_retry_chain`` is the only reader that follows it.
     """
 
     resume_checkpoint_id: str
@@ -143,6 +145,35 @@ class BarrierJournalRestoreContext:
         if not self.resume_checkpoint_id:
             raise ValueError("BarrierJournalRestoreContext.resume_checkpoint_id must not be empty")
         object.__setattr__(self, "batch_id_remap", deep_freeze(self.batch_id_remap))
+
+
+def resolve_retry_chain(batch_id_remap: Mapping[str, str], batch_id: str) -> tuple[str, ...]:
+    """Follow ``batch_id``'s old->retry edges to the live end of its chain.
+
+    ``handle_incomplete_batches`` records one edge per retried batch. A crash
+    inside a retried flush leaves the retry FAILED too, so the next resume
+    retries IT and the edges chain: ``{A: B, B: C}``. BUFFERED outcomes still
+    carry ``A``; the batch the members must be restored into is ``C``. One
+    lookup would land on the dead ``B`` (elspeth-5887fb7928 engine review).
+
+    Returns:
+        The chain, starting at ``batch_id`` and ending at the batch to use.
+        A batch that was never retried is a chain of one.
+
+    Raises:
+        AuditIntegrityError: If the edges loop back on themselves — a retry
+            always creates a fresh batch, so a cycle is audit corruption.
+    """
+    chain = [batch_id]
+    while chain[-1] in batch_id_remap:
+        successor = batch_id_remap[chain[-1]]
+        if successor in chain:
+            raise AuditIntegrityError(
+                f"Aggregation batch retry chain is cyclic: {' -> '.join([*chain, successor])} — a retry always "
+                "creates a new batch, so the old->retry remap is corrupt."
+            )
+        chain.append(successor)
+    return tuple(chain)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2641,19 +2672,21 @@ class BarrierRecoveryCoordinator:
 
         Source of truth: each buffered token's BUFFERED token_outcome carries
         the batch_id it was accepted into (written by the fenced adoption
-        verb since ADR-030 §E.2), read through the
-        ``handle_incomplete_batches`` old->retry remap because the audit
-        outcomes still reference the dead original batch when a crash
-        interrupted a flush.
+        verb since ADR-030 §E.2), resolved through the
+        ``handle_incomplete_batches`` old->retry edges to the END of the retry
+        chain (``resolve_retry_chain``): the audit outcomes keep the original
+        acceptance batch id however many resumes have retried it since.
 
         Raises:
             AuditIntegrityError: If any token lacks a BUFFERED outcome with a
-                batch_id, the group's tokens disagree on the (remapped)
-                batch_id, the batch row is missing, or the batch belongs to a
-                different aggregation node.
+                batch_id, the group's tokens disagree on the resolved
+                batch_id, the retry chain is cyclic, the batch row is
+                missing, the batch belongs to a different aggregation node,
+                or the resolved batch is already terminal.
         """
         batch_id: str | None = None
         first_token_id: str | None = None
+        first_outcome_batch_id: str | None = None
         for item in node_items:
             live_buffered = self._barrier_restore_reads.list_live_buffered_outcomes(TokenRef(token_id=item.token_id, run_id=self._run_id))
             if len(live_buffered) > 1:
@@ -2681,10 +2714,11 @@ class BarrierRecoveryCoordinator:
                     f"matching BUFFERED token_outcome with a batch_id (got {outcome!r}) — the journal "
                     "and the audit trail disagree about this token being buffered."
                 )
-            resolved = restore.batch_id_remap.get(outcome.batch_id, outcome.batch_id)
+            resolved = resolve_retry_chain(restore.batch_id_remap, outcome.batch_id)[-1]
             if batch_id is None:
                 batch_id = resolved
                 first_token_id = item.token_id
+                first_outcome_batch_id = outcome.batch_id
             elif resolved != batch_id:
                 raise AuditIntegrityError(
                     f"BLOCKED journal rows at aggregation node {node_id!r} (run {self._run_id!r}, resume "
@@ -2692,7 +2726,7 @@ class BarrierRecoveryCoordinator:
                     f"{first_token_id!r} resolves batch_id={batch_id!r} but token {item.token_id!r} "
                     f"resolves batch_id={resolved!r}. One node has exactly one in-progress batch."
                 )
-        if batch_id is None:  # pragma: no cover - callers pass non-empty node_items
+        if batch_id is None or first_outcome_batch_id is None:  # pragma: no cover - callers pass non-empty node_items
             raise AuditIntegrityError(f"_derive_restored_batch_id called with no journal rows for node {node_id!r}.")
         batch = self._execution.get_batch(batch_id)
         if batch is None:
@@ -2705,5 +2739,18 @@ class BarrierRecoveryCoordinator:
                 f"Restored batch_id {batch_id!r} belongs to aggregation node "
                 f"{batch.aggregation_node_id!r}, but the journal BLOCKED rows carry barrier_key "
                 f"{str(node_id)!r} (run {self._run_id!r}) — journal/audit disagreement."
+            )
+        if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED):
+            # The BLOCKED rows are still held, so their batch must still be
+            # able to flush. A terminal tip means the retry chain ends at an
+            # attempt that already finished: flushing it would only die later
+            # on the immutable-terminal-batch transition, after the restore
+            # had adopted every member into it.
+            chain = " -> ".join(resolve_retry_chain(restore.batch_id_remap, first_outcome_batch_id))
+            raise AuditIntegrityError(
+                f"Restored batch for aggregation node {node_id!r} (run {self._run_id!r}, resume checkpoint "
+                f"{restore.resume_checkpoint_id!r}) resolves through the retry chain {chain} to batch "
+                f"{batch_id!r} with terminal status {batch.status.value!r}; the BLOCKED rows need a live "
+                "(draft) batch to flush into."
             )
         return batch_id

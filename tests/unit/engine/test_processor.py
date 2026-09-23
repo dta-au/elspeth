@@ -17,6 +17,7 @@ This avoids the anti-pattern of testing mocks instead of behavior.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import threading
 from contextlib import nullcontext
@@ -1371,6 +1372,142 @@ class TestConstructorErrorEdgeMap:
                 aggregation_settings=self._agg_settings(agg_node),
                 barrier_restore=self._restore_ctx(batch_id_remap={own_batch.batch_id: foreign_batch.batch_id}),
             )
+
+    def _seed_failed_retry_chain(self, factory: RecorderFactory, agg_node: NodeID, *, attempts: int) -> list[str]:
+        """Original batch A plus ``attempts - 1`` retries, every one FAILED.
+
+        The shape repeated crashes inside a flush leave: each resume retries
+        the dead batch, and the retry dies too. The members' BUFFERED
+        outcomes keep A's id throughout.
+        """
+        leader = leader_coordination_token(factory, "test-run")
+        batch = factory.execution.create_batch(aggregation_node_id=str(agg_node), coordination_token=leader)
+        for ordinal, token_id in enumerate(["t1", "t2"]):
+            self._seed_buffered_member(factory, token_id=token_id, ordinal=ordinal, agg_node=agg_node, batch_id=batch.batch_id)
+        chain = [batch.batch_id]
+        factory.execution.complete_batch(batch.batch_id, BatchStatus.FAILED, coordination_token=leader)
+        for _ in range(attempts - 1):
+            retry = factory.execution.retry_batch(chain[-1], coordination_token=leader)
+            factory.execution.complete_batch(retry.batch_id, BatchStatus.FAILED, coordination_token=leader)
+            chain.append(retry.batch_id)
+        return chain
+
+    @pytest.mark.parametrize("attempts", [2, 3])
+    def test_resume_restore_follows_the_retry_chain_to_its_live_end(self, attempts: int) -> None:
+        """Repeated crashes: the remap is a CHAIN, and the restore lands on its end.
+
+        ``handle_incomplete_batches`` (the real builder) maps every FAILED
+        batch to its retry: A -> B, B -> C (-> D). BUFFERED outcomes still say
+        A. One lookup would land on the dead B and the flush would die on the
+        immutable-terminal transition with every member left BLOCKED.
+        """
+        from elspeth.engine.orchestrator.resume import handle_incomplete_batches
+
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        self._register_aggregation_node(factory, agg_node)
+        chain = self._seed_failed_retry_chain(factory, agg_node, attempts=attempts)
+
+        remap = handle_incomplete_batches(factory.execution, coordination_token=leader_coordination_token(factory, "test-run"))
+        live = remap[chain[-1]]
+        assert remap == {**dict(itertools.pairwise(chain)), chain[-1]: live}
+
+        processor = _make_processor(
+            factory,
+            aggregation_settings=self._agg_settings(agg_node),
+            barrier_restore=self._restore_ctx(batch_id_remap=remap),
+        )
+
+        node = processor._aggregation_executor._nodes[agg_node]
+        assert node.batch_id == live
+        assert factory.execution.get_batch(live).status is BatchStatus.DRAFT
+        assert [t.token_id for t in node.tokens] == ["t1", "t2"]
+        assert node.accepted_count_total == 2
+
+    def test_resume_restore_rejects_a_retry_chain_ending_at_a_terminal_batch(self) -> None:
+        """BLOCKED rows whose chain ends at a finished attempt have nowhere to flush.
+
+        The refusal happens at restore and names the whole chain, instead of
+        the flush dying later on the immutable-terminal transition.
+        """
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        self._register_aggregation_node(factory, agg_node)
+        chain = self._seed_failed_retry_chain(factory, agg_node, attempts=3)
+        remap = dict(itertools.pairwise(chain))
+
+        with pytest.raises(AuditIntegrityError, match="terminal status 'failed'") as excinfo:
+            _make_processor(
+                factory,
+                aggregation_settings=self._agg_settings(agg_node),
+                barrier_restore=self._restore_ctx(batch_id_remap=remap),
+            )
+        assert " -> ".join(chain) in str(excinfo.value)
+
+    def test_resume_restore_rejects_a_cyclic_retry_chain(self) -> None:
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        self._register_aggregation_node(factory, agg_node)
+        chain = self._seed_failed_retry_chain(factory, agg_node, attempts=2)
+        cyclic = {chain[0]: chain[1], chain[1]: chain[0]}
+
+        with pytest.raises(AuditIntegrityError, match="retry chain is cyclic") as excinfo:
+            _make_processor(
+                factory,
+                aggregation_settings=self._agg_settings(agg_node),
+                barrier_restore=self._restore_ctx(batch_id_remap=cyclic),
+            )
+        assert f"cyclic: {chain[0]} -> {chain[1]} -> {chain[0]} — " in str(excinfo.value)
+
+    def test_incomplete_batch_repair_keeps_a_completed_retry_history(self) -> None:
+        """Negative control: A FAILED whose retry B COMPLETED is healthy history.
+
+        A stays FAILED for the rest of the run, so every later resume maps it
+        to the finished B again. The builder must not refuse that: only a
+        BLOCKED row resolving to B is corruption, and the restore decides it.
+        """
+        from elspeth.engine.orchestrator.resume import handle_incomplete_batches
+
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        self._register_aggregation_node(factory, agg_node)
+        leader = leader_coordination_token(factory, "test-run")
+        original = factory.execution.create_batch(aggregation_node_id=str(agg_node), coordination_token=leader)
+        factory.execution.complete_batch(original.batch_id, BatchStatus.FAILED, coordination_token=leader)
+        retry = factory.execution.retry_batch(original.batch_id, coordination_token=leader)
+        factory.execution.complete_batch(retry.batch_id, BatchStatus.COMPLETED, coordination_token=leader)
+
+        assert handle_incomplete_batches(factory.execution, coordination_token=leader) == {original.batch_id: retry.batch_id}
+
+
+class TestResolveRetryChain:
+    """``resolve_retry_chain``: the one reader of the old->retry edges."""
+
+    def test_a_batch_never_retried_is_a_chain_of_one(self) -> None:
+        from elspeth.engine.barrier_coordination import resolve_retry_chain
+
+        assert resolve_retry_chain({"other": "x"}, "a") == ("a",)
+
+    def test_follows_every_hop(self) -> None:
+        from elspeth.engine.barrier_coordination import resolve_retry_chain
+
+        assert resolve_retry_chain({"a": "b", "b": "c", "c": "d"}, "a") == ("a", "b", "c", "d")
+        assert resolve_retry_chain({"a": "b", "b": "c", "c": "d"}, "b") == ("b", "c", "d")
+
+    @pytest.mark.parametrize(
+        ("remap", "named"),
+        [
+            ({"a": "a"}, "a -> a"),
+            ({"a": "b", "b": "c", "c": "a"}, "a -> b -> c -> a"),
+            ({"a": "b", "b": "c", "c": "b"}, "a -> b -> c -> b"),
+        ],
+    )
+    def test_a_cycle_is_audit_corruption_naming_the_chain(self, remap: dict[str, str], named: str) -> None:
+        from elspeth.engine.barrier_coordination import resolve_retry_chain
+
+        with pytest.raises(AuditIntegrityError, match="retry chain is cyclic") as excinfo:
+            resolve_retry_chain(remap, "a")
+        assert f"cyclic: {named} — " in str(excinfo.value), "the message names the chain up to the first repeat, no further"
 
 
 class TestTraversalNextNodeInvariants:

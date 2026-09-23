@@ -1515,10 +1515,13 @@ def handle_incomplete_batches(
         coordination_token: Acquired leadership of the run being recovered
 
     Returns:
-        Mapping of old_batch_id to new_batch_id for retried batches.
-        Callers must use this to rebind batch_ids in restored checkpoint
-        state so that resumed execution references the retry batches,
-        not the dead originals.
+        Mapping of old_batch_id to new_batch_id for retried batches: one
+        retry hop per entry. ``retry_batch`` is idempotent, so a batch that
+        an earlier resume already retried maps to that same retry; when the
+        retry itself failed, it has its own entry and the edges chain
+        (``{A: B, B: C}``). The journal restore reads the chain through
+        ``barrier_coordination.resolve_retry_chain`` to reach the batch the
+        buffered members must flush in — never with a single lookup.
     """
     from elspeth.contracts.enums import BatchStatus
 
