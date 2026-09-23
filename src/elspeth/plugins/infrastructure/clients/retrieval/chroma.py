@@ -28,8 +28,10 @@ import httpx
 from pydantic import BaseModel, field_validator, model_validator
 
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.coordination import WorkerMembershipToken
-from elspeth.contracts.enums import CallStatus, CallType
+from elspeth.contracts.call_mode import CallModeSession
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallStatus, CallType, RunMode
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -167,13 +169,24 @@ class ChromaSearchProvider:
         *,
         execution: ExecutionRepository,
         run_id: str,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._config = config
         self._distance_function = config.distance_function
         self._execution = execution
         self._run_id = run_id
+        self._call_mode_session = call_mode_session
+        self._operation_id: str | None = None
+        self._coordination_token: CoordinationToken | None = None
         self.last_skipped_count: int = 0
         self.last_skipped_reasons: list[dict[str, Any]] = []
+
+        self._client: chromadb.api.ClientAPI | None = None
+        self._collection: Any = None
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY:
+            # Chroma's constructors and get_collection may contact a server or
+            # touch a persistent index. Replay must intercept before both.
+            return
 
         client: chromadb.api.ClientAPI
         if config.mode == "ephemeral":
@@ -192,7 +205,7 @@ class ChromaSearchProvider:
                     ssl=config.ssl,
                 )
             )
-        self._client: chromadb.api.ClientAPI | None = client
+        self._client = client
 
         # Retrieval providers must NOT create collections — that's a sink/indexing
         # concern. Using get_collection() ensures a typo in the collection name
@@ -233,8 +246,17 @@ class ChromaSearchProvider:
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
+        request_payload = RawCallPayload({"query": query, "top_k": top_k, "collection": self._config.collection})
+        request_data = request_payload.to_dict()
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_search(
+                request_payload,
+                state_id=state_id,
+                member_token=member_token,
+                work_item=work_item,
+            )
         count_start = time.monotonic()
-        count_request = RawCallPayload({"query": query, "top_k": top_k, "collection": self._config.collection})
+        count_request = request_payload
         try:
             collection_count = self._collection.count()
         except (
@@ -273,24 +295,46 @@ class ChromaSearchProvider:
             # it from a populated query that simply matched nothing.
             empty_elapsed_ms = (time.monotonic() - count_start) * 1000
             call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
-            self._execution.record_call(
+            response_payload = RawCallPayload(
+                {
+                    "result_count": 0,
+                    "skipped_count": 0,
+                    "top_score": None,
+                    "collection_count": 0,
+                    "chunks": [],
+                    "skipped_items": [],
+                }
+            )
+            recorded = self._execution.record_call(
                 member_token=member_token,
                 work_item=work_item,
                 state_id=state_id,
                 call_index=call_index,
                 call_type=CallType.VECTOR,
                 status=CallStatus.SUCCESS,
-                request_data=RawCallPayload({"query": query, "top_k": 0, "collection": self._config.collection}),
-                response_data=RawCallPayload({"result_count": 0, "skipped_count": 0, "top_score": None, "collection_count": 0}),
+                request_data=count_request,
+                response_data=response_payload,
                 latency_ms=round(empty_elapsed_ms),
             )
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+                self._call_mode_session.verify_call(
+                    call_type=CallType.VECTOR,
+                    request_data=request_data,
+                    current_state_id=state_id,
+                    current_operation_id=None,
+                    current_call_index=call_index,
+                    current_call_id=recorded.call_id,
+                    live_status=CallStatus.SUCCESS,
+                    live_response_data=response_payload.to_dict(),
+                    live_error_data=None,
+                )
             self.last_skipped_count = 0
             self.last_skipped_reasons = []
             return []
         effective_top_k = min(top_k, collection_count)
 
         start_time = time.monotonic()
-        request_payload = RawCallPayload({"query": query, "top_k": effective_top_k, "collection": self._config.collection})
+        request_payload = count_request
         try:
             results = self._collection.query(
                 query_texts=[query],
@@ -335,6 +379,96 @@ class ChromaSearchProvider:
         self.last_skipped_reasons = skipped_items
 
         call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
+        response_payload = RawCallPayload(
+            {
+                "result_count": len(chunks),
+                "skipped_count": len(skipped_items),
+                "top_score": chunks[0].score if chunks else None,
+                "collection_count": collection_count,
+                "chunks": [
+                    {"content": chunk.content, "score": chunk.score, "source_id": chunk.source_id, "metadata": deep_thaw(chunk.metadata)}
+                    for chunk in chunks
+                ],
+                "skipped_items": skipped_items,
+            }
+        )
+        recorded = self._execution.record_call(
+            member_token=member_token,
+            work_item=work_item,
+            state_id=state_id,
+            call_index=call_index,
+            call_type=CallType.VECTOR,
+            status=CallStatus.SUCCESS,
+            request_data=request_payload,
+            response_data=response_payload,
+            latency_ms=round(elapsed_ms),
+        )
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=state_id,
+                current_operation_id=None,
+                current_call_index=call_index,
+                current_call_id=recorded.call_id,
+                live_status=CallStatus.SUCCESS,
+                live_response_data=response_payload.to_dict(),
+                live_error_data=None,
+            )
+
+        return chunks
+
+    def _replay_search(
+        self,
+        request_payload: RawCallPayload,
+        *,
+        state_id: str,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> list[RetrievalChunk]:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise RuntimeError("Chroma replay requires a replay call session")
+        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
+        evidence = session.replay_call(
+            call_type=CallType.VECTOR,
+            request_data=request_payload.to_dict(),
+            current_state_id=state_id,
+            current_operation_id=None,
+            current_call_index=call_index,
+        )
+        response = evidence.response_data
+        if evidence.status is not CallStatus.SUCCESS or response is None:
+            raise RetrievalError("Chroma replay source call did not succeed or has no retained response", retryable=False)
+        raw_chunks = response.get("chunks")
+        raw_skips = response.get("skipped_items")
+        count = response.get("collection_count")
+        if not isinstance(raw_chunks, (list, tuple)) or not isinstance(raw_skips, (list, tuple)) or type(count) is not int or count < 0:
+            raise RetrievalError("Chroma replay source call lacks complete chunk, skip, or count evidence", retryable=False)
+        chunks: list[RetrievalChunk] = []
+        for raw_chunk in raw_chunks:
+            if not isinstance(raw_chunk, Mapping):
+                raise RetrievalError("Chroma replay source call has malformed chunk evidence", retryable=False)
+            content = raw_chunk.get("content")
+            score = raw_chunk.get("score")
+            source_id = raw_chunk.get("source_id")
+            metadata = raw_chunk.get("metadata")
+            if (
+                type(content) is not str
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or type(source_id) is not str
+                or not isinstance(metadata, Mapping)
+            ):
+                raise RetrievalError("Chroma replay source call has incomplete chunk fields", retryable=False)
+            chunks.append(RetrievalChunk(content=content, score=float(score), source_id=source_id, metadata=deep_thaw(metadata)))
+        skips = deep_thaw(raw_skips)
+        if not isinstance(skips, list) or any(not isinstance(item, dict) for item in skips):
+            raise RetrievalError("Chroma replay source call has malformed skip evidence", retryable=False)
+        if response.get("result_count") != len(chunks) or response.get("skipped_count") != len(skips):
+            raise RetrievalError("Chroma replay source call summary disagrees with retained chunks", retryable=False)
+        self.last_skipped_count = len(skips)
+        self.last_skipped_reasons = skips
         self._execution.record_call(
             member_token=member_token,
             work_item=work_item,
@@ -343,12 +477,10 @@ class ChromaSearchProvider:
             call_type=CallType.VECTOR,
             status=CallStatus.SUCCESS,
             request_data=request_payload,
-            response_data=RawCallPayload(
-                {"result_count": len(chunks), "skipped_count": len(skipped_items), "top_score": chunks[0].score if chunks else None}
-            ),
-            latency_ms=round(elapsed_ms),
+            response_data=RawCallPayload(deep_thaw(response)),
+            latency_ms=evidence.latency_ms,
+            source_call_id=evidence.source_call_id,
         )
-
         return chunks
 
     def _parse_and_build_chunks(
@@ -492,7 +624,12 @@ class ChromaSearchProvider:
         """
         elapsed_ms = (time.monotonic() - start_time) * 1000
         call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
-        self._execution.record_call(
+        error_data = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "retryable": retryable,
+        }
+        recorded = self._execution.record_call(
             member_token=member_token,
             work_item=work_item,
             state_id=state_id,
@@ -500,25 +637,72 @@ class ChromaSearchProvider:
             call_type=CallType.VECTOR,
             status=CallStatus.ERROR,
             request_data=request_data,
-            error=RawCallPayload(
-                {
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "retryable": retryable,
-                }
-            ),
+            error=RawCallPayload(error_data),
             latency_ms=round(elapsed_ms),
         )
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data.to_dict(),
+                current_state_id=state_id,
+                current_operation_id=None,
+                current_call_index=call_index,
+                current_call_id=recorded.call_id,
+                live_status=CallStatus.ERROR,
+                live_response_data=None,
+                live_error_data=error_data,
+            )
 
     def check_readiness(self) -> CollectionReadinessResult:
         """Check that the ChromaDB collection is reachable and has documents.
 
-        Called during on_start() AFTER provider construction. self._collection
-        is always set by __init__ (which calls get_collection — fails fast
+        Called during runtime preflight AFTER provider construction. self._collection
+        is set by __init__ (which calls get_collection — fails fast
         if collection doesn't exist). If __init__ fails, the provider doesn't
         exist and this method is never called.
         """
         collection_name = self._config.collection
+        request_data = {"operation": "readiness_count", "collection": collection_name}
+        session = self._call_mode_session
+        operation_id = self._operation_id
+        coordination_token = self._coordination_token
+        if session is not None and (operation_id is None or coordination_token is None):
+            raise RetrievalError("Chroma replay/verify readiness requires an audited operation parent", retryable=False)
+        if session is not None and session.mode is RunMode.REPLAY:
+            assert operation_id is not None and coordination_token is not None
+            call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+            evidence = session.replay_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=operation_id,
+                current_call_index=call_index,
+            )
+            response = evidence.response_data
+            if evidence.status is not CallStatus.SUCCESS or response is None:
+                raise RetrievalError("Chroma replay readiness has no successful retained response", retryable=False)
+            count = response.get("collection_count")
+            if type(count) is not int or count < 0:
+                raise RetrievalError("Chroma replay readiness has no valid retained collection count", retryable=False)
+            self._execution.record_operation_call(
+                operation_id=operation_id,
+                coordination_token=coordination_token,
+                call_index=call_index,
+                call_type=CallType.VECTOR,
+                status=CallStatus.SUCCESS,
+                request_data=RawCallPayload(request_data),
+                response_data=RawCallPayload({"collection_count": count}),
+                latency_ms=evidence.latency_ms,
+                source_call_id=evidence.source_call_id,
+            )
+            return CollectionReadinessResult(
+                collection=collection_name,
+                reachable=True,
+                count=count,
+                message=f"Collection '{collection_name}' has {count} documents"
+                if count > 0
+                else f"Collection '{collection_name}' is empty",
+            )
 
         try:
             count = self._collection.count()
@@ -528,6 +712,30 @@ class ChromaSearchProvider:
                 message = f"Collection '{collection_name}' has {count} documents"
             else:
                 message = f"Collection '{collection_name}' is empty"
+            if operation_id is not None and coordination_token is not None:
+                call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+                response_data = {"collection_count": count}
+                recorded = self._execution.record_operation_call(
+                    operation_id=operation_id,
+                    coordination_token=coordination_token,
+                    call_index=call_index,
+                    call_type=CallType.VECTOR,
+                    status=CallStatus.SUCCESS,
+                    request_data=RawCallPayload(request_data),
+                    response_data=RawCallPayload(response_data),
+                )
+                if session is not None and session.mode is RunMode.VERIFY:
+                    session.verify_call(
+                        call_type=CallType.VECTOR,
+                        request_data=request_data,
+                        current_state_id=None,
+                        current_operation_id=operation_id,
+                        current_call_index=call_index,
+                        current_call_id=recorded.call_id,
+                        live_status=CallStatus.SUCCESS,
+                        live_response_data=response_data,
+                        live_error_data=None,
+                    )
             return CollectionReadinessResult(
                 collection=collection_name,
                 reachable=True,
@@ -544,6 +752,12 @@ class ChromaSearchProvider:
                 count=None,
                 message=f"Collection '{collection_name}' unreachable: {type(exc).__name__}: {exc}",
             )
+
+    def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
+        """Run the collection check beneath the engine's preflight operation."""
+        self._operation_id = operation_id
+        self._coordination_token = coordination_token
+        return self.check_readiness()
 
     def close(self) -> None:
         client = self._client

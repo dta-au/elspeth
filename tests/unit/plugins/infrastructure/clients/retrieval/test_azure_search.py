@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 import respx
 
+from elspeth.contracts.call_mode import ReplayCallEvidence, ReplaySSRFRequest
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
     AzureSearchProvider,
@@ -564,6 +568,7 @@ class TestExecuteSearchHTTP:
             timeout=12.5,
             limiter=limiter,
             headers={"Content-Type": "application/json", "api-key": "test-key"},
+            call_mode_session=None,
         )
         assert provider._http_client is client_cls.return_value
 
@@ -1087,3 +1092,123 @@ class TestRuntimePreflightProbe:
             with pytest.raises(RetrievalError) as exc_info:
                 self._probe(provider)
         assert exc_info.value.retryable is True
+
+
+def test_replay_search_uses_archived_dns_pin_without_live_dns() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key="test-key",
+    )
+    url = "https://test.search.windows.net/indexes/test-index/docs/search?api-version=2024-07-01"
+    session.replay_ssrf_request.return_value = ReplaySSRFRequest(
+        original_url=url,
+        resolved_ip="93.184.216.34",
+        host_header="test.search.windows.net",
+        port=443,
+        path="/indexes/test-index/docs/search?api-version=2024-07-01",
+        scheme="https",
+        bare_hostname="test.search.windows.net",
+    )
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient"),
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved live DNS")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        safe_request = provider._safe_request(url, state_id="state-1")
+        headers = provider._auth_headers()
+    assert safe_request.resolved_ip == "93.184.216.34"
+    assert headers == {"api-key": "test-key"}
+    session.replay_ssrf_request.assert_called_once_with(
+        original_url=url,
+        call_type=CallType.HTTP,
+        current_state_id="state-1",
+        current_operation_id=None,
+    )
+
+
+def test_replay_managed_identity_fails_before_client_or_token_construction() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        use_managed_identity=True,
+    )
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient") as client,
+        patch("azure.identity.ManagedIdentityCredential") as credential,
+        pytest.raises(RetrievalError, match="cannot reproduce the audited credential fingerprint"),
+    ):
+        AzureSearchProvider(
+            config=config,
+            execution=_FakeExecutionRecorder(),
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+    client.assert_not_called()
+    credential.assert_not_called()
+
+
+def test_replay_search_restores_chunks_without_dns_or_http_client() -> None:
+    session = MagicMock()
+    session.mode = RunMode.REPLAY
+    config = AzureSearchProviderConfig(
+        endpoint="https://test.search.windows.net",
+        index="test-index",
+        api_key="test-key",
+    )
+    url = "https://test.search.windows.net/indexes/test-index/docs/search?api-version=2024-07-01"
+    path = "/indexes/test-index/docs/search?api-version=2024-07-01"
+    session.replay_ssrf_request.return_value = ReplaySSRFRequest(
+        original_url=url,
+        resolved_ip="93.184.216.34",
+        host_header="test.search.windows.net",
+        port=443,
+        path=path,
+        scheme="https",
+        bare_hostname="test.search.windows.net",
+    )
+    body = json.dumps({"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]}).encode()
+    session.replay_call.return_value = ReplayCallEvidence(
+        source_call_id="source-azure-call",
+        status=CallStatus.SUCCESS,
+        response_data={
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "body_size": len(body),
+            "body": {"value": [{"id": "doc-1", "content": "archived content", "@search.score": 0.75}]},
+            "transport": {
+                "body_b64": base64.b64encode(body).decode("ascii"),
+                "headers": [["content-type", "application/json"]],
+                "request_url": f"https://93.184.216.34{path}",
+                "logical_url": url,
+            },
+        },
+        error_data=None,
+        latency_ms=1,
+    )
+    recorder = _FakeExecutionRecorder()
+    with (
+        patch("socket.getaddrinfo", side_effect=AssertionError("replay resolved live DNS")),
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")),
+    ):
+        provider = AzureSearchProvider(
+            config=config,
+            execution=recorder,
+            run_id="replay-run",
+            telemetry_emit=_TelemetrySink(),
+            call_mode_session=session,
+        )
+        chunks = provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+    assert [(chunk.source_id, chunk.content) for chunk in chunks] == [("doc-1", "archived content")]
+    assert recorder.recorded_calls[0]["source_call_id"] == "source-azure-call"

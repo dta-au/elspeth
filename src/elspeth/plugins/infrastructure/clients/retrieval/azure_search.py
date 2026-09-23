@@ -10,13 +10,17 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 import httpx
 from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallType, RunMode
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.security.web import (
     NetworkError,
     SSRFBlockedError,
+    SSRFSafeRequest,
+    validate_archived_ssrf_request,
     validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
@@ -233,14 +237,21 @@ class AzureSearchProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: LimiterProtocol | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 
         self._config = config
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and config.use_managed_identity:
+            raise RetrievalError(
+                "Azure AI Search managed-identity replay cannot reproduce the audited credential fingerprint without live token acquisition",
+                retryable=False,
+            )
         self._execution = execution
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
+        self._call_mode_session = call_mode_session
 
         self._search_url = f"{config.endpoint.rstrip('/')}/indexes/{config.index}/docs/search?api-version={config.api_version}"
         self._score_range = _SCORE_RANGES[config.search_mode]
@@ -265,6 +276,7 @@ class AzureSearchProvider:
             timeout=self._config.request_timeout,
             limiter=self._limiter,
             headers=headers,
+            call_mode_session=call_mode_session,
         )
 
     def _auth_headers(self) -> dict[str, str]:
@@ -302,6 +314,19 @@ class AzureSearchProvider:
             credential = ManagedIdentityCredential(client_id=client_id) if client_id is not None else ManagedIdentityCredential()
             self._managed_identity_credential = cast(_ManagedIdentityCredential, credential)
         return self._managed_identity_credential
+
+    def _safe_request(self, url: str, *, state_id: str | None = None, operation_id: str | None = None) -> SSRFSafeRequest:
+        """Validate a live URL or an exact archived DNS pin for replay."""
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.REPLAY:
+            archived = session.replay_ssrf_request(
+                original_url=url,
+                call_type=CallType.HTTP,
+                current_state_id=state_id,
+                current_operation_id=operation_id,
+            )
+            return validate_archived_ssrf_request(url, archived)
+        return validate_url_for_ssrf(url)
 
     def search(
         self,
@@ -348,7 +373,7 @@ class AzureSearchProvider:
 
         try:
             try:
-                safe_request = validate_url_for_ssrf(self._search_url)
+                safe_request = self._safe_request(self._search_url, state_id=state_id)
             except SSRFBlockedError as exc:
                 raise RetrievalError(f"Azure AI Search endpoint blocked by SSRF validation: {exc}", retryable=False) from exc
             except NetworkError as exc:
@@ -555,7 +580,7 @@ class AzureSearchProvider:
         index_name = self._config.index
         count_url = f"{self._config.endpoint.rstrip('/')}/indexes/{index_name}/docs/$count?api-version={self._config.api_version}"
         try:
-            safe_request = validate_url_for_ssrf(count_url)
+            safe_request = self._safe_request(count_url, operation_id=operation_id)
         except SSRFBlockedError as exc:
             raise RetrievalError(f"Azure AI Search endpoint blocked by SSRF validation: {exc}", retryable=False) from exc
         except NetworkError as exc:
@@ -570,6 +595,7 @@ class AzureSearchProvider:
             limiter=self._limiter,
             operation_id=operation_id,
             coordination_token=coordination_token,
+            call_mode_session=self._call_mode_session,
         )
         try:
             response, _final_url, _call = client.get_ssrf_safe(safe_request, headers=self._auth_headers())

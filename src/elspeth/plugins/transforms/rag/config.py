@@ -36,7 +36,14 @@ def _get_providers() -> dict[str, _ProviderEntry]:
             ChromaSearchProviderConfig,
         )
 
-        def _chroma_factory(config: ChromaSearchProviderConfig, *, execution: Any, run_id: Any, **_kwargs: Any) -> ChromaSearchProvider:
+        def _chroma_factory(
+            config: ChromaSearchProviderConfig,
+            *,
+            execution: Any,
+            run_id: Any,
+            call_mode_session: Any = None,
+            **_kwargs: Any,
+        ) -> ChromaSearchProvider:
             """Chroma uses the SDK directly — passes execution repo and run_id for audit trail.
 
             execution and run_id are mandatory (not defaulted to None) because Chroma
@@ -44,7 +51,12 @@ def _get_providers() -> dict[str, _ProviderEntry]:
             ever calls this factory without execution, it should crash at startup, not
             silently skip audit recording at query time.
             """
-            return ChromaSearchProvider(config=config, execution=execution, run_id=run_id)
+            return ChromaSearchProvider(
+                config=config,
+                execution=execution,
+                run_id=run_id,
+                call_mode_session=call_mode_session,
+            )
 
         providers["chroma"] = (ChromaSearchProviderConfig, _chroma_factory)
     except ModuleNotFoundError as exc:

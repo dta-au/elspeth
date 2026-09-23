@@ -2,12 +2,12 @@
 
 The provider-neutral work (query, search, formatting, output fields,
 telemetry) lives in ``core.RetrievalTransformBase``. This module selects the
-provider from the PROVIDERS registry and runs its on_start readiness check.
+provider from the PROVIDERS registry and runs readiness in runtime preflight.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
@@ -37,10 +37,11 @@ class RAGRetrievalTransform(RetrievalTransformBase):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:375b2337d23fa0ad"
+    source_file_hash: str | None = "sha256:e7348a633aaa5e5b"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
+    requires_runtime_preflight = True
     content_trust = ContentTrust.UNTRUSTED
     capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
 
@@ -85,7 +86,7 @@ class RAGRetrievalTransform(RetrievalTransformBase):
         self._provider_label = self._rag_config.provider
 
     def _build_searcher(self, ctx: LifecycleContext) -> RetrievalSearcher:
-        """Construct the provider from the registry and refuse an unready collection."""
+        """Construct the provider; audited readiness runs in runtime_preflight."""
         provider_name = self._rag_config.provider
         config_cls, factory = PROVIDERS[provider_name]
         provider_config = config_cls(**self._rag_config.provider_config)
@@ -96,17 +97,47 @@ class RAGRetrievalTransform(RetrievalTransformBase):
                 provider_config,
                 execution=ctx.landscape,
                 run_id=ctx.run_id,
+                call_mode_session=ctx.call_mode_session,
                 telemetry_emit=ctx.telemetry_emit,
                 limiter=(ctx.rate_limit_registry.get_limiter(provider_name) if ctx.rate_limit_registry is not None else None),
             )
             # Held before the readiness check so close() releases a provider
             # whose collection turns out not to be ready.
             self._searcher = provider
+        except RetrievalError as exc:
+            self._record_readiness_check(
+                ctx,
+                collection=collection_name,
+                reachable=False,
+                count=None,
+                message=str(exc),
+            )
+            raise RetrievalNotReadyError(collection=collection_name, reason=str(exc)) from exc
 
-            # Readiness check — refuse to start against empty/missing collection.
-            # Two distinct failure modes: unreachable (infra problem) and empty
-            # (operator error). Both crash startup, but the message distinguishes them.
-            readiness = provider.check_readiness()
+        return provider
+
+    def runtime_preflight(self, ctx: LifecycleContext) -> None:
+        """Check Chroma readiness under a real operation before source load."""
+        from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProvider
+
+        if ctx.operation_id is None:
+            raise FrameworkBugError("RAGRetrievalTransform runtime_preflight requires an operation audit parent")
+        provider = cast("RetrievalProvider | None", self._searcher)
+        if provider is None:
+            raise FrameworkBugError("RAGRetrievalTransform runtime_preflight called before provider initialization")
+        collection_name = self._rag_config.provider_config["collection"]
+        if not isinstance(collection_name, str):
+            raise FrameworkBugError("RAGRetrievalTransform collection configuration changed after validation")
+        try:
+            if isinstance(provider, ChromaSearchProvider):
+                readiness = provider.runtime_preflight(
+                    operation_id=ctx.operation_id,
+                    coordination_token=ctx.require_coordination_token(),
+                )
+            else:
+                # The registry can be replaced by tests or extensions. Its
+                # declared RetrievalProvider contract includes readiness.
+                readiness = provider.check_readiness()
         except RetrievalError as exc:
             self._record_readiness_check(
                 ctx,
@@ -134,7 +165,6 @@ class RAGRetrievalTransform(RetrievalTransformBase):
                 collection=readiness.collection,
                 reason=readiness.message,
             )
-        return provider
 
     def _configured_collection_name(self, provider_name: str, provider_config: Any) -> str:
         """Read readiness identity from the nominal config for a known provider."""
