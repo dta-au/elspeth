@@ -510,6 +510,7 @@ class TokenTraversalEngine:
         current_on_success_sink: str,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
+        attempt_offset: int = 0,
     ) -> _GateOutcome:
         """Handle a gate node: evaluate, then fork/route/divert/continue.
 
@@ -535,6 +536,7 @@ class TokenTraversalEngine:
             token=current_token,
             ctx=ctx,
             token_manager=self._processor._token_manager,
+            attempt_offset=attempt_offset,
         )
         current_token = outcome.updated_token
 
@@ -1196,6 +1198,7 @@ class TokenTraversalEngine:
                     last_on_success_sink,
                     row_union_node_id,
                     row_union_name,
+                    attempt_offset,
                 )
                 if isinstance(gate_outcome, _GateTerminal):
                     return gate_outcome.result, child_items

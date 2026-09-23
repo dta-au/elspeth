@@ -2188,6 +2188,36 @@ class TestGateExecutor:
 
     # --- execute_config_gate ---
 
+    @pytest.mark.parametrize(
+        ("resume_offset", "claim_offset", "checkpoint_id", "expected_attempt"),
+        [(0, 2, None, 2), (3, 0, "cp-recovery", 3)],
+        ids=["lease_claim", "checkpoint_resume"],
+    )
+    def test_config_gate_records_recovery_attempt_and_provenance(
+        self, resume_offset: int, claim_offset: int, checkpoint_id: str | None, expected_attempt: int
+    ) -> None:
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            route_resolution_map={(NodeID("cg_1"), "true"): RouteDestination.discard()},
+        )
+        config = GateSettings(name="my_gate", input="in_conn", condition="True", routes={"true": "discard", "false": "discard"})
+        token = _make_token(contract=_make_contract())
+        token = TokenInfo(
+            row_id=token.row_id,
+            token_id=token.token_id,
+            row_data=token.row_data,
+            resume_attempt_offset=resume_offset,
+            resume_checkpoint_id=checkpoint_id,
+        )
+
+        executor.execute_config_gate(config, "cg_1", token, make_context(), attempt_offset=claim_offset)
+
+        assert factory.execution.begin_node_state.call_args.kwargs["attempt"] == expected_attempt
+        assert factory.execution.begin_node_state.call_args.kwargs["resume_checkpoint_id"] == checkpoint_id
+
     def test_config_gate_boolean_true_routes_via_true_label(self) -> None:
         """Boolean True condition evaluates to 'true' label."""
         factory = _make_factory()

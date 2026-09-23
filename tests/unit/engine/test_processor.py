@@ -3845,7 +3845,7 @@ class TestProcessRowGateBranching:
             success_reason={"action": "expand"},
         )
 
-        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None, attempt_offset=0):
             return GateOutcome(
                 result=gate_result,
                 updated_token=token,
@@ -4070,7 +4070,7 @@ class TestProcessRowGateBranching:
 
         # Mock gate executor to return FORK outcome with two child tokens.
         # This isolates the fork routing logic from gate execution infrastructure.
-        def mock_execute_config_gate(gate_config, node_id, token, ctx, token_manager=None):
+        def mock_execute_config_gate(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             child_a = TokenInfo(
                 row_id=token.row_id,
                 token_id="token-fork-a",
@@ -10692,19 +10692,21 @@ class TestGateSinkRoutingNotifiesCoalesce:
         ctx.work_item = _claim_processor_token(factory, token, node_id="gate-1")
 
         with (
-            patch.object(processor._gate_executor, "execute_config_gate", return_value=discard_outcome),
+            patch.object(processor._gate_executor, "execute_config_gate", return_value=discard_outcome) as gate_execution,
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
         ):
             result, _child_items = processor._process_single_token(
                 token=token,
                 ctx=ctx,
                 current_node_id=gate_node,
+                attempt_offset=2,
             )
 
         assert result is not None
         assert not isinstance(result, tuple)
         _assert_outcome_pair(result, TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED)
         assert result.sink_name is None
+        assert gate_execution.call_args.kwargs["attempt_offset"] == 2
         record_outcome.assert_called_once()
         assert record_outcome.call_args.kwargs["outcome"] == TerminalOutcome.SUCCESS
         assert record_outcome.call_args.kwargs["path"] == TerminalPath.GATE_DISCARDED
@@ -10786,7 +10788,7 @@ class TestGateJumpPastCoalesceInvariant:
             contract=gate_contract,
         )
 
-        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None, attempt_offset=0):
             return GateOutcome(
                 result=gate_result,
                 updated_token=token,
@@ -10855,7 +10857,7 @@ class TestGateJumpPastCoalesceInvariant:
             contract=_make_contract(),
         )
 
-        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None, attempt_offset=0):
             return GateOutcome(result=gate_result, updated_token=token, next_node_id=past_row_union_node)
 
         token = make_token_info(
@@ -10946,7 +10948,7 @@ class TestGateJumpPastCoalesceInvariant:
             contract=gate_contract,
         )
 
-        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None, attempt_offset=0):
             return GateOutcome(
                 result=gate_result,
                 updated_token=token,

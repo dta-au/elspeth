@@ -1538,6 +1538,8 @@ class TestForkRecoveryInvariant:
 
     def _setup_coalesce_pipeline(
         self,
+        *,
+        branch_gate: bool = False,
     ) -> tuple[
         LandscapeDB,
         MockPayloadStore,
@@ -1550,7 +1552,7 @@ class TestForkRecoveryInvariant:
         """Shared setup: build and run a fork→PassTransform→coalesce→sink pipeline.
 
         Topology: source → gate(fork_to=[path_a, path_b])
-                    → path_a: PassTransform(pass_a) → coalesce 'merge'
+                    → path_a: [optional branch_gate] → PassTransform(pass_a) → coalesce 'merge'
                     → path_b: PassTransform(pass_b) → coalesce 'merge'
                     → sink 'output'
 
@@ -1591,6 +1593,16 @@ class TestForkRecoveryInvariant:
             routes={"true": "fork", "false": "output"},
             fork_to=["path_a", "path_b"],
         )
+        gates = [gate]
+        if branch_gate:
+            gates.append(
+                GateSettings(
+                    name="branch_gate",
+                    input="path_a",
+                    condition="True",
+                    routes={"true": "gated_a", "false": "gated_a"},
+                )
+            )
 
         # branches dict maps branch-name → final-connection-into-coalesce.
         # wire_transforms wires: path_a → pass_a → done_a (consumed by coalesce 'merge').
@@ -1602,7 +1614,7 @@ class TestForkRecoveryInvariant:
             on_success="output",
         )
 
-        wired_a = wire_transforms([pass_a], source_connection="path_a", final_sink="done_a", names=["pass_a"])
+        wired_a = wire_transforms([pass_a], source_connection="gated_a" if branch_gate else "path_a", final_sink="done_a", names=["pass_a"])
         wired_b = wire_transforms([pass_b], source_connection="path_b", final_sink="done_b", names=["pass_b"])
 
         graph = ExecutionGraph.from_plugin_instances(
@@ -1610,7 +1622,7 @@ class TestForkRecoveryInvariant:
             source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
             transforms=wired_a + wired_b,
             sinks={"output": as_sink(sink)},
-            gates=[gate],
+            gates=gates,
             aggregations={},
             coalesce_settings=[coalesce],
         )
@@ -1619,14 +1631,14 @@ class TestForkRecoveryInvariant:
             sources={"primary": as_source(source)},
             transforms=[as_transform(pass_a), as_transform(pass_b)],
             sinks={"output": as_sink(sink)},
-            gates=[gate],
+            gates=gates,
             coalesce_settings=[coalesce],
         )
 
         settings_obj = ElspethSettings(
             sources={"primary": {"plugin": "test", "on_success": "gate_in", "options": {}}},
             sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-            gates=[gate],
+            gates=gates,
             coalesce=[coalesce],
         )
 
@@ -1635,7 +1647,8 @@ class TestForkRecoveryInvariant:
         run_id = run.run_id
         return db, payload_store, config, graph, settings_obj, run_id, run
 
-    def test_resume_fork_to_coalesce_before_barrier(self) -> None:
+    @pytest.mark.parametrize("branch_gate", [False, True], ids=["transform_branch", "gate_branch"])
+    def test_resume_fork_to_coalesce_before_barrier(self, branch_gate: bool) -> None:
         """Re-driving branch tokens interrupted BEFORE the coalesce barrier must not
         double-emit: the barrier fires exactly once and conservation holds.
 
@@ -1645,6 +1658,8 @@ class TestForkRecoveryInvariant:
 
         The PassTransform on each branch makes branch_first_node a REAL processing
         node distinct from the coalesce node, exercising resolve_branch_first_node().
+        When branch_gate=True, the first node on path_a is a config gate that
+        already has an attempt-0 node_state before the branch is re-driven.
 
         Interruption: after a complete run, undo the barrier entirely by deleting:
           - the merged token's terminal outcome, node_states, durable coalesce
@@ -1682,7 +1697,7 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import token_outcomes_table, token_parents_table, tokens_table
 
-        db, payload_store, config, graph, settings_obj, run_id, _run1 = self._setup_coalesce_pipeline()
+        db, payload_store, config, graph, settings_obj, run_id, _run1 = self._setup_coalesce_pipeline(branch_gate=branch_gate)
 
         # ── Baseline (run-1 completed) ──────────────────────────────────────────
         def _outcome_counts() -> dict[tuple[str, str], int]:
@@ -1868,6 +1883,22 @@ class TestForkRecoveryInvariant:
         assert all(n == 1 for n in after.values()), f"No (row_id, sink_name) may carry two outcomes after resume: {after}"
         assert resume_result.status == RunStatus.COMPLETED, resume_result.status
 
+        if branch_gate:
+            branch_gate_id = graph.get_config_gate_id_map()[GateName("branch_gate")]
+            with db.engine.connect() as conn:
+                gate_attempts = conn.execute(
+                    text("""
+                        SELECT attempt, resume_checkpoint_id
+                        FROM node_states
+                        WHERE run_id = :run_id AND node_id = :node_id
+                        ORDER BY attempt
+                    """),
+                    {"run_id": run_id, "node_id": branch_gate_id},
+                ).fetchall()
+            assert len(gate_attempts) == 2, gate_attempts
+            assert gate_attempts[0].attempt == 0 and gate_attempts[0].resume_checkpoint_id is None
+            assert gate_attempts[1].attempt > 0 and gate_attempts[1].resume_checkpoint_id is not None
+
         post_stats = get_fork_group_stats(db, run_id)
         assert post_stats["total_fork_groups"] == 1, f"Fork-group count must remain 1 (one row, one fork); got {post_stats}"
 
@@ -1879,7 +1910,7 @@ class TestForkRecoveryInvariant:
         re-drives.
 
         Topology (shared _setup_coalesce_pipeline):
-            source → gate(fork) → [path_a: PassTransform, path_b: PassTransform]
+            source → gate(fork) → [path_a: optional gate → PassTransform, path_b: PassTransform]
                    → coalesce('merge', require_all, on_success='output') → sink 'output'
 
         Construction of the partial-fan-in interrupt state (genuine, via production run +
