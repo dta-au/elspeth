@@ -331,7 +331,13 @@ class RunSummaryCounts(TypedDict):
 
 
 class RunSummaryErrors(TypedDict):
-    """Error count sub-dict inside ``RunSummaryReport``."""
+    """Error count sub-dict inside ``RunSummaryReport``.
+
+    ``validation`` counts ``validation_errors`` rows (a source row that failed
+    validation has no token). ``transform`` counts distinct tokens with a
+    transform error, not ``transform_errors`` rows: a resumed attempt writes
+    again the rows of an error write that committed before the crash.
+    """
 
     validation: int
     transform: int
@@ -430,7 +436,7 @@ class ValidationErrorGroup(TypedDict):
 
 
 class TransformErrorGroup(TypedDict):
-    """Transform error group by transform plugin."""
+    """Transform error group by transform plugin; ``count`` is distinct failed tokens, not rows."""
 
     transform_plugin: str
     count: int
@@ -445,7 +451,7 @@ class ValidationErrorSummary(TypedDict):
 
 
 class TransformErrorSummary(TypedDict):
-    """Transform errors sub-dict in ``ErrorAnalysisReport``."""
+    """Transform errors sub-dict in ``ErrorAnalysisReport``; ``total`` is distinct failed tokens, not rows."""
 
     total: int
     by_transform: list[TransformErrorGroup]

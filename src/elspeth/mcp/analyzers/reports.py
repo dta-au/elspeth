@@ -115,9 +115,13 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             or 0
         )
 
-        # Count transform errors
+        # Count tokens with a transform error, not transform_errors rows: an
+        # error write that committed before a crash is written again by the
+        # resumed attempt, so one token can own several rows.
         transform_error_count = (
-            conn.execute(select(func.count()).select_from(transform_errors_table).where(transform_errors_table.c.run_id == run_id)).scalar()
+            conn.execute(
+                select(func.count(func.distinct(transform_errors_table.c.token_id))).where(transform_errors_table.c.run_id == run_id)
+            ).scalar()
             or 0
         )
 
@@ -396,11 +400,13 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
         )
         val_rows = conn.execute(val_by_node).fetchall()
 
-        # Transform errors by transform node using composite key
+        # Transform errors by transform node using composite key. Counted as
+        # distinct tokens: a resumed attempt re-writes the rows of an error
+        # write that committed before the crash.
         trans_by_node = (
             select(
                 nodes_table.c.plugin_name,
-                func.count(transform_errors_table.c.error_id).label("count"),
+                func.count(func.distinct(transform_errors_table.c.token_id)).label("count"),
             )
             .outerjoin(
                 nodes_table,

@@ -22,6 +22,7 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape.data_flow.errors import ErrorAuditRepository
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     batches_table,
     token_outcomes_table,
@@ -31,7 +32,10 @@ from elspeth.core.landscape.schema import (
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.processor import RowProcessor
+from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from elspeth.web.execution.failure_samples import load_top_failure_categories
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
@@ -231,3 +235,52 @@ def test_a_successful_flush_completes_after_the_plugin_crashed_on_every_earlier_
     audit = _audit(env["db"], run_id)
     assert audit["work_statuses"] == {"terminal"}
     assert audit["batch_statuses"] == ["completed"] + ["failed"] * crashes
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("on_error", ["quarantine", "discard"])
+def test_every_reader_counts_each_failed_token_once_after_a_crash_after_the_error_write(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """A resumed attempt writes the failed batch's transform_errors rows again (elspeth-5887fb7928 E8).
+
+    Both attempts' rows stay as audit evidence (6 rows for 3 tokens), but every
+    reader that answers "how many tokens failed here" must say 3: the web
+    discard summary, the run-failure category summary, and the MCP run summary
+    and error analysis.
+    """
+    error_sink = CollectSink("quarantine") if on_error == "quarantine" else None
+    env = _pipeline(tmp_path, _FailBatchTransform(), error_sink=error_sink)
+    _crash_first(
+        ErrorAuditRepository,
+        "record_batch_transform_errors_leader",
+        ErrorAuditRepository.record_batch_transform_errors_leader,
+        1,
+        after=True,
+        monkeypatch=monkeypatch,
+    )
+    with pytest.raises(RuntimeError, match="injected crash"):
+        env["orchestrator"].run(env["config"], graph=env["graph"], payload_store=env["payload_store"])
+    run_id = _run_id(env["db"])
+    _resume(env, run_id)
+
+    db = env["db"]
+    audit = _audit(db, run_id)
+    assert audit["transform_error_count"] == 6, "control: each attempt recorded its own per-member rows"
+    assert len(audit["terminals"]) == len({token_id for token_id, _p, _s in audit["terminals"]}) == 3
+    assert audit["work_statuses"] == {"terminal"}
+
+    discard_summaries = load_discard_summaries_from_db(db, [run_id])
+    if on_error == "discard":
+        assert discard_summaries[run_id].transform_errors == 3
+    else:
+        assert discard_summaries == {}, "a routed batch discards nothing"
+    assert [summary.count for summary in load_top_failure_categories(db, run_id)] == [3]
+    factory = RecorderFactory(db)
+    run_summary = get_run_summary(db, factory, run_id)
+    assert "error" not in run_summary
+    assert run_summary["errors"]["transform"] == 3
+    error_analysis = get_error_analysis(db, factory, run_id)
+    assert "error" not in error_analysis
+    assert error_analysis["transform_errors"]["total"] == 3
+    assert [group["count"] for group in error_analysis["transform_errors"]["by_transform"]] == [3]

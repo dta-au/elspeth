@@ -2,13 +2,15 @@
 
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+
 from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.schema import transform_errors_table, validation_errors_table
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import claim_test_work_item, leader_member_token, make_recorder_with_run, register_test_node
 
 
 def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -> None:
@@ -294,6 +296,50 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
             "node_id": "normalize_url",
             "count": 1,
         },
+    ]
+
+
+def test_discard_summary_counts_each_token_once_when_a_resumed_attempt_rewrote_its_error() -> None:
+    """Two attempts' transform_errors rows for N tokens count N, not 2N (elspeth-5887fb7928 E8).
+
+    ``transform_errors`` has no ``(token_id, transform_id)`` uniqueness: an
+    error write that committed before a crash is written again by the resumed
+    attempt, through the same writer. Both rows stay as audit evidence; the
+    discard summary counts discarded tokens.
+    """
+    setup = make_recorder_with_run(run_id="discard-two-attempts-run", source_node_id="source-0")
+    transform_id = register_test_node(setup.data_flow, setup.run_id, "batch_sum", node_type=NodeType.TRANSFORM, plugin_name="batch_sum")
+    member = leader_member_token(setup.factory, setup.run_id)
+    for index in range(3):
+        _row, token = setup.data_flow.create_row_with_token(
+            coordination_token=setup.coordination_token,
+            source_node_id=setup.source_node_id,
+            row_index=index,
+            data={"id": index},
+            source_row_index=index,
+            ingest_sequence=index,
+        )
+        work_item = claim_test_work_item(setup.factory, member_token=member, token_id=token.token_id, node_id=transform_id)
+        for _attempt in range(2):
+            setup.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+                transform_id=transform_id,
+                row_data={"id": index},
+                error_details={"reason": "validation_failed"},
+                destination="discard",
+                member_token=member,
+                work_item=work_item,
+            )
+    with setup.db.connection() as conn:
+        rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == setup.run_id)).all()
+    assert len(rows) == 6, "control: both attempts' rows are in the audit trail"
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    assert summary.transform_errors == 3
+    assert summary.total == 3
+    assert [stage.model_dump() for stage in summary.stages] == [
+        {"stage": "transform_validation", "node_id": transform_id, "count": 3},
     ]
 
 

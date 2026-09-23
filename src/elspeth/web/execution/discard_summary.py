@@ -96,11 +96,16 @@ def load_discard_summaries_from_db(
                 )
             )
 
+        # Tokens, not rows: transform_errors has no (token_id, transform_id)
+        # uniqueness, and a flush or row whose error write committed before a
+        # crash writes its rows again on the resumed attempt. Each attempt's
+        # rows are real audit evidence; the discard count is how many tokens
+        # were discarded here, as the gate stage below already counts it.
         transform_query = (
             select(
                 transform_errors_table.c.run_id,
                 transform_errors_table.c.transform_id,
-                func.count().label("count"),
+                func.count(func.distinct(transform_errors_table.c.token_id)).label("count"),
             )
             .where(transform_errors_table.c.run_id.in_(run_ids))
             .where(transform_errors_table.c.destination == DISCARD_DESTINATION)

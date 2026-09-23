@@ -35,7 +35,7 @@ This module therefore never lets free text out.  Only three things leave it:
 * an error *category* proved to be a member of the closed
   :data:`~elspeth.contracts.errors.TransformErrorCategory` vocabulary, or one
   of two fixed sentinels when it is not; and
-* a row count.
+* a count of distinct failed tokens.
 
 Per-row free text is not dropped from the system — it stays behind the
 authenticated, ownership-verified ``GET /api/runs/{run_id}/diagnostics``,
@@ -92,7 +92,7 @@ _MAX_NODE_ID_CHARS = 64
 
 @dataclass(frozen=True, slots=True)
 class ClientSafeFailureSummary:
-    """One (failing node, error category) pair with the number of rows it hit.
+    """One (failing node, error category) pair with the number of tokens it failed.
 
     Deliberately carries **no** free-text field.  The client-path formatter
     accepts only this type, so the per-row ``error``/``message``/``repr`` text
@@ -162,28 +162,36 @@ def load_top_failure_categories(
     message and sliced before collapsing, so a category spread across many
     distinct message texts lost to a category with one repeated text, and the
     reported counts were per-message rather than per-category.  A count here
-    means "rows in this run that failed at this node with this category".
+    means "distinct tokens in this run that failed at this node with this
+    category" — not ``transform_errors`` rows: the table has no
+    ``(token_id, transform_id)`` uniqueness, and an error write that committed
+    before a crash is written again by the resumed attempt, so one token can
+    own several rows.
 
-    The scan is bounded by ``scan_cap`` to stay safe on runs with very large
-    error counts; accuracy on the long tail is not the goal — naming the
-    dominant failure modes for the operator is.
+    The scan is bounded by ``scan_cap`` ROWS (not tokens) to stay safe on runs
+    with very large error counts; accuracy on the long tail is not the goal —
+    naming the dominant failure modes for the operator is.
     """
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if scan_cap < limit:
         raise ValueError("scan_cap must be >= limit")
 
-    counter: Counter[tuple[str, str]] = Counter()
+    # Insertion-ordered set of (node, category, token): a token's rows from
+    # several attempts collapse to one key, and first-seen order keeps the
+    # most_common tie order what it was when rows were counted.
+    failed_tokens: dict[tuple[str, str, str], None] = {}
     with db.read_only_connection() as conn:
         stmt = (
             select(
                 transform_errors_table.c.transform_id,
+                transform_errors_table.c.token_id,
                 transform_errors_table.c.error_details_json,
             )
             .where(transform_errors_table.c.run_id == landscape_run_id)
             .limit(scan_cap)
         )
-        for transform_id, error_details_json in conn.execute(stmt):
+        for transform_id, token_id, error_details_json in conn.execute(stmt):
             # No NULL guard and no ``WHERE error_details_json IS NOT NULL``:
             # the column is nominally nullable (schema.py: ``Column(..., Text)``)
             # but its sole writer — ``DataFlowRepository.
@@ -197,8 +205,9 @@ def load_top_failure_categories(
             # Aggregate on the FULL node id — bounding is a rendering concern,
             # and truncating here would collapse two distinct long ids into
             # one bucket.
-            counter[(transform_id, _client_safe_category(details))] += 1
+            failed_tokens[(transform_id, _client_safe_category(details), token_id)] = None
 
+    counter = Counter((node_id, category) for node_id, category, _token_id in failed_tokens)
     return [
         ClientSafeFailureSummary(transform_id=tid, category=category, count=count) for (tid, category), count in counter.most_common(limit)
     ]
@@ -207,7 +216,7 @@ def load_top_failure_categories(
 def format_failure_categories(summaries: list[ClientSafeFailureSummary]) -> str:
     """Render summaries as a single multi-line string suitable for inlining.
 
-    Each summary renders on its own bullet with the row count, the failing
+    Each summary renders on its own bullet with the token count, the failing
     node, and the error category.  The node is shown unconditionally: it is
     half of what the operator needs to act, and hiding it on single-node runs
     (as the previous renderer did) saved a few characters at the cost of the
