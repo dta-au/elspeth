@@ -1,6 +1,7 @@
 """Tests for shared template infrastructure."""
 
 import pickle
+import threading
 from types import MappingProxyType
 
 import pytest
@@ -66,6 +67,16 @@ def test_context_transport_limits_unique_parent_work(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(template_infrastructure, "_MAX_CONTEXT_NODES", 8)
     with pytest.raises(TemplateError, match="parent packing limit"):
         template_infrastructure._pack_context_value({"items": [{"value": i} for i in range(9)]})
+
+
+def test_saturated_template_workers_refuse_after_bounded_queue_wait(monkeypatch: pytest.MonkeyPatch):
+    slot = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(template_infrastructure, "_WORKER_SLOTS", slot)
+    monkeypatch.setattr(template_infrastructure, "_WORKER_QUEUE_TIMEOUT_SECONDS", 0.01)
+    template = create_sandboxed_environment().from_string("{{ row.text }}")
+
+    with slot, pytest.raises(TemplateError, match="Too many concurrent template workers"):
+        template.render(row={"text": "hello"})
 
 
 def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:

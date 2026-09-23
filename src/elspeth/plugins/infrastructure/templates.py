@@ -47,6 +47,10 @@ _MAX_CONTEXT_NODES = 65536
 # address size that depends on which web/test modules Python imported.
 _MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
 _WORKER_TIMEOUT_SECONDS = 5.0
+# The two workers bound CPU and memory use. Ordinary concurrent rows may queue
+# behind one another, so their bounded admission wait is longer than a single
+# worker's execution deadline.
+_WORKER_QUEUE_TIMEOUT_SECONDS = 30.0
 _WORKER_SLOTS = threading.BoundedSemaphore(2)
 
 
@@ -209,7 +213,7 @@ def _run_template_worker(source: str, payload: bytes) -> str:
     _check_template_source(source)
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
-    if not _WORKER_SLOTS.acquire(timeout=_WORKER_TIMEOUT_SECONDS):
+    if not _WORKER_SLOTS.acquire(timeout=_WORKER_QUEUE_TIMEOUT_SECONDS):
         raise TemplateError("Too many concurrent template workers")
     process_context = multiprocessing.get_context("spawn")
     parent, child = process_context.Pipe(duplex=False)
