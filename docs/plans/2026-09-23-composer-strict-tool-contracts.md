@@ -2,8 +2,10 @@
 
 - **Date:** 2026-09-23
 - **Goal (John):** "ultimately we want a strict contract for every tool call" made by the Web Composer planner.
-- **Status:** S0 implemented on `design/strict-tool-contracts` (not merged; the full-suite gate and S0 acceptance
-  items 2, 4 and 5 are owed, see "S0 review fixes" below). S1 onward is plan only.
+- **Status:** S0 implemented and merged into local `release/0.8.1` (`85ebf2739`); S0 acceptance items 2, 4 and 5
+  are owed (see "S0 review fixes" below). **S1 implemented** on `feat/strict-tool-contracts-s1` (one commit per task on
+  `85ebf2739`, see "S1 as implemented" at the end of §4 S1); its full-suite gate, merge, CHANGELOG line and dev
+  deployment acceptance are owed. S2 onward is plan only.
 - **Code base the citations use:** `path:line` citations were measured at `6d8f7f729`. The branch
   `design/strict-tool-contracts` was then fast-forwarded to `release/0.8.1` at `c6e12fc44`. **Python `src` changes**
   in `6d8f7f729..c6e12fc44` are limited to `control_messages.py`, `sessions/models.py` and `sessions/schema.py`, so
@@ -998,6 +1000,85 @@ Acceptance:
    State the result plainly. **S1 may change nothing measurable**, because the 32 tools rarely fail. The value of
    S1 is the contract plus the per-endpoint conformance evidence it produces.
 
+**S1 as implemented: corrections and decisions.** Recorded after implementing; where this differs from the S1
+bullets above, this paragraph is the current state. The task-level plan is
+`docs/plans/2026-09-23-composer-strict-tool-contracts-s1.md` (`29e1b78ee`, revised `da4af9142`); its §3 (C1-C24),
+§1.3 (D1-D24) and §7.3 (lead rulings) hold the evidence for each item below.
+
+- **Status.** Implemented on `feat/strict-tool-contracts-s1`, based on `85ebf2739`, one commit per task: T1
+  `2198ba34a` (`strict_profile`), T2 `c0f54f09d` (`wire_projection` W, ledger, limits, faithfulness gate), T3
+  `1718dc3ca` (decode/encode), T4 `be1bd209e` (`strict_transport`, `composer_strict_tools`), T5 `faa8f6224` (audit
+  fields), T6 `da6b5b2dc` (compose-loop decode, every route still `none`), T7 `2cbf36b98` (planner dialect plumbing),
+  T8 `14e4a6ce5` (**the only wire flip**), T9 `f2fae72de` (S-gate repair signal), T10 `4c41ee4ca` (status endpoint),
+  T11 `e8d35e83d` (wire fidelity matrix), T12 (this record and Appendix A). Owed: the full-suite gate (S1 plan §6),
+  the merge on John's word, the CHANGELOG line (the release it belongs to is John's call and was not inferred), the
+  operator's sign-bundle, and the dev-deployment acceptance items (S1 plan §8).
+- **Corrections to this section (S1 plan §3).** C1: a bare model plus an api_base is not always provider `openai`
+  (LiteLLM checks 47 known hosts first), so the resolver asks `litellm.get_llm_provider`. C2: the compose loop
+  persists no `ComposerToolInvocation`; its wire facts live on the P4 assistant `tool_calls` entries (D1), which is
+  where Appendix A now reads them. C3: planner decode runs inside `_parse_response_tool_calls`, before
+  `_ParsedToolCall` is frozen. C4: planner stamping precedes the capability-manifest hash, and the endpoint choice was
+  hoisted above it (a pure move). C5: encode applies only to semantic `set_pipeline` arguments; sentinels keep
+  today's bytes. C6: six omission instructions, and the faithfulness gate scans every description in a
+  strict-capable W. C7: nullable promotion uses `anyOf`, never `null` inside an `enum`. C8: the three promoted
+  defaults read "Pass null to use the default (X)." C9: `upsert_edge`'s root `examples` goes into the tool
+  description. C10: the repair signal never echoes a model-authored key. C11: Azure `preview`/`latest`/`v1` count as
+  strict-capable; `azure_ai/` is `NONE`. C12: `openrouter/` with a non-OpenRouter base is `NONE` unless
+  `forward_to_endpoint`. C13: the gateway rejects explicit `false` too. C14: the hatch probe has its own surface
+  (`hatch_terminal`). C15: `/api/system/status` publishes no per-route fact. C16: the extra gates (CEC1, Check 2, the
+  wire census's `arguments` binding, the producer and construction-site censuses). C17: under ruling 7 only tests that
+  name an OpenRouter route or `forward_to_endpoint` change wire. C18/C24: the fidelity matrix asserts LiteLLM's local
+  cost map, and the root `tests/conftest.py` now calls `configure_litellm_pricing()` on purpose. C19: the stale
+  citations. C20: `upsert_node` already has two `null`-bearing enums in S, so the no-`null`-enum check applies to
+  strict-capable W only. C21: the planner palette is not enforced at dispatch. C22: the repair signal's only renderer
+  is the compose loop. C23: `strict_sent` is three-valued.
+- **Decisions taken (S1 plan §1.3).** D1 wire facts on the assistant `tool_calls` entries; D2 the resolver reads
+  LiteLLM's routing provider; D3 an injected env mapping (`OPENAI_BASE_URL`, `OPENAI_API_BASE`,
+  `OPENROUTER_API_BASE`, `AZURE_API_VERSION`); D4 one setting for both routes; D5 conservative Azure version rule; D6
+  the advisor's OpenRouter rule (unifying the detectors is a follow-on); D7 `openrouter/auto` is `FORWARDING`; D8
+  every Anthropic-family route is `NONE`; D9 the `hatch_terminal` probe (`max_tokens` 16, 5 s cap, non-fatal
+  rejection); D10 required `dialect` on every tool-list builder; D11 `tool_contract_dialect`/`strict_tool_count`
+  derived in `build_llm_call_record` from the tools it receives; D12 decode's only rejection is `WIRE_ENVELOPE`; D13
+  omission prose outside W unchanged; D14 route-independent status payload; D15 frontend unchanged; D16
+  `strict_sent` mirrors the sent key (`true`, `false` or `null`); D17 names outside the sent list are not decoded;
+  D18 encode's null branch deferred to S2; D19 the repair signal is compose-loop only; D20 one resolution helper for
+  the service and the probe; D21 `begin_dispatch*` wire-fact keywords default to `None` with a parity pin; D22 ledger
+  text for description-less array items; D23 `strict_profile`'s kind vocabulary, allowed keywords exactly
+  `WIRE_KEYWORD_ALLOWLIST`; D24 an unparseable env base resolves to `NONE` with a closed diagnostic.
+- **Lead rulings (provisional; John may overrule; S1 plan §7.3).** 1: the hatch probe is an acceptance check only
+  (`max_tokens` 16). 2: the public status payload is `{setting, strict_capable_tool_count: 32, tool_count: 42}`;
+  per-route facts and probe outcomes go to structured logs. 3: D1 accepted. 4: D13 unchanged. 5: D6 a follow-on. 6:
+  `RejectionRecord` untouched. 7: hosted OpenAI and Azure are `NONE` under `preferred` until R8, `ENFORCING` only
+  under `forward_to_endpoint`, so under the default the wire change reaches OpenRouter routes only. 8: a
+  `hatch_terminal` rejection is non-fatal; planner-route and advisor rejections stay fatal. 9: the repair signal
+  stays compose-loop only. 10: T9 ships with S1; if S0 and S1 deploy together, take the S0 baseline window with
+  `composer_strict_tools=off`. Owed: rulings on D16-D24.
+- **Measured figures.** The 32 strict-capable tools are 28,497 B on `none` and 29,462 B on `openai_strict` (+965 B:
+  448 B of `"strict":true` stamps, 517 B of `anyOf` promotions, ledger text and "pass null" overrides); the whole
+  42-tool loop list goes from 63,872 B to 64,987 B (+1,115 B, with the 10 `"strict":false` stamps). Compact UTF-8
+  form throughout; this replaces the enum-null figure in §2.1 (28,464 → 28,814). The compose-loop byte envelope is
+  216,295 B on the default `gpt-5.5` route (unchanged) and 217,479 B on an OpenRouter planner, against the 300,000 B
+  ceiling. The planner's first request is 198,905 B on `none` and 199,192 B on `openai_strict` (+287 B) against a
+  2,097,152 B budget. The soft-mapping census moved from 2756 to 2798.
+- **`none` routes send today's bytes.** At the branch tip after T11, the loop list (42 tools, 63,872 B,
+  `6c7f60dd…`), the `policy=None` planner list (20 tools, 29,264 B, `7e958245…`) and the two production palettes
+  (FREEFORM 16 tools, 25,424 B, `709b4176…`; TUTORIAL_PROFILE 15 tools, 23,960 B, `50fdbefd…`) hash identically on
+  the tip and on a clean export of `85ebf2739`. That SHA comparison is evidence for this branch only; the durable pin
+  is T2's relational test (`test_none_w_is_s_plus_the_envelope`: the `none` W equals S plus the envelope, with
+  type-sensitive equality and no `strict` key), which a legitimate later edit to S does not move.
+- **What the wire fidelity matrix measured (T11, LiteLLM 1.102.0).** OpenRouter forwards the stamped list
+  byte-for-byte. OpenAI-compatible chat (custom base or hosted) forwards the stamps and drops an ECMA-only `pattern`;
+  hosted and Azure chat flatten a root `oneOf`; Bedrock converse drops `null` from an `enum`; native Anthropic drops
+  a forced `strict`. The Responses bridge (hosted `gpt-5.5`, `azure/gpt-5.5`) forwards the stamps, but for a tool sent
+  with no `strict` key it writes `"strict": null`, so on a bridged `none` route today's bytes carry `strict: null`,
+  not an absent key. ELSPETH's gateway rejects `strict: true` and `strict: false` and accepts the `preferred` list.
+- **Trust-tier corpus.** Two additions for the operator, each prescribed by the plan: an R6 at
+  `strict_transport._routing_provider` (`except BadRequestError`, D2) and the `web/composer/tool_batch.py` per-file
+  rule at 6 of 5 (the decode `except ToolArgumentError`). No signed fingerprint went stale. Nothing was staged.
+- **Not done in S1 (unchanged from the S1 plan §1.4).** No change to S, no options carrier, no `tool_choice` or
+  `parallel_tool_calls`, no gateway change, no DDL and no epoch bump; the only new provider call is the boot-time
+  `hatch_terminal` probe request.
+
 ### S2 — Options carrier and structure maps (blocked on R1 and R2)
 
 Starts only if John rules R1 in, using the S0/S1 data. Content:
@@ -1186,7 +1267,11 @@ It is value-free, and it is persisted on every ARG_ERROR alongside `field_count`
 ### 5.3 Measurement before and after
 
 The census is Appendix A. It is keyed on `(tool, status, error_category | error_code, strict_sent,
-wire_conformant, provider_served)`.
+wire_conformant)`. `strict_sent` and `wire_conformant` are read from the compose loop's persisted assistant
+`tool_calls` entries, where turn audit writes them beside `function` (S1 D1). They are not read from the
+invocation: the compose loop persists no invocation envelope (S1 C2). `provider_served` lives on the LLM-call record
+(`ComposerLLMCall`, in the `llm_call_audit` envelope), not on the tool call, so Appendix A does not join it; the
+per-`provider_served` split in the table below needs that join first.
 
 | When | What to read | Decision it feeds |
 |---|---|---|
@@ -1323,8 +1408,10 @@ against the served deployment's live file.
 
 ```sql
 WITH calls AS (
-  SELECT json_extract(tc.value, '$.id')            AS call_id,
-         json_extract(tc.value, '$.function.name') AS tool
+  SELECT json_extract(tc.value, '$.id')              AS call_id,
+         json_extract(tc.value, '$.function.name')   AS tool,
+         json_extract(tc.value, '$.strict_sent')     AS strict_sent,
+         json_extract(tc.value, '$.wire_conformant') AS wire_conformant
   FROM chat_messages m, json_each(m.tool_calls) tc
   WHERE m.role = 'assistant' AND m.tool_calls IS NOT NULL
 )
@@ -1338,16 +1425,38 @@ SELECT c.tool,
            THEN 'rejected:' || coalesce(json_extract(t.content, '$.validation.errors[0].error_code'), 'uncoded')
          ELSE 'ok'
        END AS outcome,
+       c.strict_sent,
+       c.wire_conformant,
        count(*) AS n
 FROM chat_messages t
 JOIN calls c ON c.call_id = t.tool_call_id
 WHERE t.role = 'tool' AND json_valid(t.content)
-GROUP BY 1, 2
-ORDER BY 1, 2;
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2, 3, 4;
 ```
 
-- Not yet verified: which JSON path the persisted ARG_ERROR content uses for `error_category`. S0 decides that path,
-  so update the query in the same commit.
-- `strict_sent`, `wire_conformant` and `provider_served` are read from the invocation and LLM-call envelopes once
-  S0/S1 add them.
+- The ARG_ERROR content carries `error_category` at the top level (`$.error_category`), as S0 recorded.
+- `strict_sent` and `wire_conformant` come from the assistant `tool_calls` entry of the call (S1 D1; §5.3). SQLite's
+  `json_extract` reads JSON `true` as 1, `false` as 0, and both JSON `null` and a missing key as `NULL`. So
+  `strict_sent` is 1 (a `strict: true` tool was sent), 0 (an explicit `strict: false` was sent: one of the 10 option
+  tools on a strict route) or `NULL` (no key was sent: a `none` route, or a name outside the sent list, D16).
+  `wire_conformant` is 1 or 0 where arguments were decoded, and `NULL` where they were not.
+- A row written before S1 has neither key, so it reads `NULL`/`NULL`. A `none`-route row reads `NULL` for
+  `strict_sent` but has `wire_conformant` set. That is why the query groups by both columns: grouping by
+  `strict_sent` alone would merge the two.
+- For the after-S1 read in §5.3, filter to `strict_sent = 1` and compare the `wire_conformant = 0` rate per tool.
+- **Controlled at S1 (T12).** The query above, read verbatim from this plan, was run read-only against a fixture DB
+  written through `persist_compose_turn`. The strict-route and `none`-route rows came from real compose turns, so
+  their wire facts were written by turn audit. The route was an OpenRouter planner (`openai_strict`) or the default
+  `gpt-5.5` (`none`). The CANCELLED control and the pre-S1 entry were built by hand, as in S0, because the compose
+  loop cannot write either. It returned exactly the 8 expected groups:
+  - strict conformant (1, 1) and non-conformant (1, 0) `get_pipeline_state` calls;
+  - the strict-route option tool `patch_node_options` (0, 0), apart from the same call on the `none` route
+    (`NULL`, 0);
+  - the `none`-route `get_pipeline_state` (`NULL`, 1), apart from the pre-S1 entry (`NULL`, `NULL`);
+  - the PLUGIN_CRASH and CANCELLED controls under `other_failure:`.
+
+  Two negative controls on the query:
+  - making `strict_sent` two-valued (`coalesce(…, 0)`) merges the two option-tool rows;
+  - dropping the `wire_conformant` column merges the `none`-route row with the pre-S1 one.
 - Before S0, the `rejected:` arm returns `<redacted-response-text>` (§2.3).
