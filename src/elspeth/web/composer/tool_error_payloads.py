@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
 
-from elspeth.web.composer.audit import canonicalize_pydantic_cause
+from elspeth.web.composer.audit import canonicalize_pydantic_cause, canonicalize_schema_violations
 from elspeth.web.composer.protocol import ToolArgumentError
 
 INVALID_TOOL_ARGUMENTS_REDACTION_STATUS: Final[str] = "invalid_tool_arguments"
@@ -31,9 +31,17 @@ def unknown_tool_response_redaction() -> Mapping[str, Any]:
 
 
 def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, Any]:
-    """Build the structured payload for an ARG_ERROR audit record and LLM tool message."""
+    """Build the structured payload for an ARG_ERROR audit record and LLM tool message.
+
+    ``validation_errors`` comes from a pydantic ``__cause__`` when there is
+    one, otherwise from the S gate's closed violations (S1 T9). The compose
+    loop is this function's only caller, so the S-gate repair signal reaches
+    only the compose loop (MCP and planner discovery build their own bodies).
+    """
     payload: dict[str, Any] = {"error": f"Tool '{tool_name}' failed: {exc.safe_message}"}
     validation_errors = canonicalize_pydantic_cause(exc.__cause__)
+    if validation_errors is None:
+        validation_errors = canonicalize_schema_violations(exc.schema_violations)
     if validation_errors is not None:
         payload["validation_errors"] = validation_errors
     return payload

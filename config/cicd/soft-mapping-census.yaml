@@ -716,7 +716,7 @@ files:
     dict[str, object]: 2
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 8
-    dict[str, Any]: 3
+    dict[str, Any]: 4
     dict[str, object]: 7
   src/elspeth/web/composer/audit_storage.py:
     dict[str, Any]: 1
@@ -861,7 +861,7 @@ files:
     dict[str, Any]: 29
     dict[str, object]: 1
   src/elspeth/web/composer/tools/_dispatch.py:
-    Mapping[str, Any]: 7
+    Mapping[str, Any]: 12
     dict[str, Any]: 6
   src/elspeth/web/composer/tools/_generation_responses.py:
     dict[str, object]: 1
@@ -1056,10 +1056,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 890
+  Mapping[str, Any]: 895
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 66
-  dict[str, Any]: 1174
+  dict[str, Any]: 1175
   dict[str, object]: 409
-  soft: 2792
+  soft: 2798

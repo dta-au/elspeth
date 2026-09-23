@@ -48,6 +48,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Final
 
 import rfc8785
@@ -70,7 +71,7 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt, Com
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 __all__ = [
@@ -82,6 +83,7 @@ __all__ = [
     "begin_dispatch_or_arg_error",
     "build_canonicalization_sentinel",
     "canonicalize_pydantic_cause",
+    "canonicalize_schema_violations",
     "dispatch_with_audit",
     "finish_arg_error",
     "finish_cancelled",
@@ -1280,6 +1282,20 @@ _SAFE_PYDANTIC_CAUSE_LOC_FIELDS = frozenset(
         "user_term",
     }
 )
+# The fixed message per closed validation code. Shared by the pydantic
+# canonicaliser below and the S-gate violation renderer, so the model reads
+# one vocabulary whichever gate rejected the call.
+VALIDATION_ERROR_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "invalid": "Validation failed",
+        "invalid_choice": "Value is not an allowed choice",
+        "invalid_type": "Value has invalid type",
+        "invalid_value": "Value is invalid",
+        "missing": "Required value is missing",
+        "out_of_bounds": "Value is outside allowed bounds",
+        "unexpected": "Unexpected value",
+    }
+)
 
 
 def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any]] | None:
@@ -1344,15 +1360,6 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
     raw_errors = exc.errors()
     if not raw_errors:
         return None
-    type_messages = {
-        "invalid": "Validation failed",
-        "invalid_choice": "Value is not an allowed choice",
-        "invalid_type": "Value has invalid type",
-        "invalid_value": "Value is invalid",
-        "missing": "Required value is missing",
-        "out_of_bounds": "Value is outside allowed bounds",
-        "unexpected": "Unexpected value",
-    }
 
     def error_code(raw_type: object) -> str:
         value = raw_type if type(raw_type) is str and len(raw_type) <= 128 else ""
@@ -1388,8 +1395,36 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
         canonicalized.append(
             {
                 "loc": loc,
-                "msg": type_messages[code],
+                "msg": VALIDATION_ERROR_MESSAGES[code],
                 "type": code,
             }
         )
     return canonicalized
+
+
+def canonicalize_schema_violations(violations: tuple[SchemaViolation, ...]) -> list[dict[str, Any]] | None:
+    """Render S-gate violations in the pydantic canonicaliser's shape (S1 T9).
+
+    The violations are already closed (owned ``SchemaViolation``: declared
+    names or generic tokens, a closed code), so this only applies the same
+    eight-error cap and fixed messages as :func:`canonicalize_pydantic_cause`.
+    ``()`` → ``None``: the absence of ``validation_errors`` is the signal.
+    """
+    if not violations:
+        return None
+    if len(violations) > _MAX_PYDANTIC_CAUSE_ERRORS:
+        return [
+            {
+                "loc": [],
+                "msg": f"Validation produced more than {_MAX_PYDANTIC_CAUSE_ERRORS} errors",
+                "type": "truncated",
+            }
+        ]
+    return [
+        {
+            "loc": list(violation.loc),
+            "msg": VALIDATION_ERROR_MESSAGES[violation.code.value],
+            "type": violation.code.value,
+        }
+        for violation in violations
+    ]

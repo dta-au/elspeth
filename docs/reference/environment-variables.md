@@ -306,6 +306,13 @@ routes send `strict`:
 | `forward_to_endpoint` | As `preferred`, and also sends `strict` to custom OpenAI-compatible endpoints and OpenRouter proxies, to hosted OpenAI, and to Azure OpenAI when its api-version (`AZURE_API_VERSION`, else LiteLLM's default) is `preview`, `latest`, `v1` or dated `2024-08-01` or later. Use it only for gateways you have verified accept the `strict` key, or as the opt-in for hosted OpenAI and Azure. ELSPETH's own LLM compatibility gateway rejects any `strict` key, `false` included. |
 | `off` | No route sends `strict`. Every route sends the tool bytes it sent before this setting existed. This is the remedy if a route rejects `strict`. |
 
+`off` restores the tool bytes and turns off the `null`-to-omitted read-back.
+It does not remove the `validation_errors` list that a Composer tool result
+carries when a call breaks its tool's schema (the field, as a declared name
+or a generic `field`/`item`/`index` token, and a fixed kind such as
+`missing` or `out_of_bounds`, never the rejected value or an unexpected
+key's name). That list does not depend on this setting.
+
 The route is decided per Composer role from its model, its configured
 endpoint, and the base-URL environment variables LiteLLM reads
 (`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE`). If one of

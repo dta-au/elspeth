@@ -33,6 +33,9 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import (
     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+    SCHEMA_VIOLATION_MAX_LOC_DEPTH,
+    SchemaViolation,
+    SchemaViolationCode,
     ToolArgumentError,
 )
 from elspeth.web.composer.state import (
@@ -535,13 +538,121 @@ def _schema_error_category(error: ValidationError) -> ToolArgumentErrorCategory:
     return ToolArgumentErrorCategory.SCHEMA_BOUND
 
 
-def _schema_tool_argument_error(tool_name: str, error: ValidationError) -> ToolArgumentError:
+_OUT_OF_BOUNDS_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    }
+)
+
+
+def _schema_violation_code(error: ValidationError) -> SchemaViolationCode:
+    """Map the failing keyword to its closed repair code (S1 T9)."""
+    if error.validator in ("enum", "const"):
+        return SchemaViolationCode.INVALID_CHOICE
+    if error.validator == "type":
+        return SchemaViolationCode.INVALID_TYPE
+    if error.validator in _OUT_OF_BOUNDS_KEYWORDS:
+        return SchemaViolationCode.OUT_OF_BOUNDS
+    if error.validator == "additionalProperties":
+        return SchemaViolationCode.UNEXPECTED
+    return SchemaViolationCode.INVALID
+
+
+def _schema_node_branches(node: object) -> tuple[Mapping[str, Any], ...]:
+    """The schema node plus its ``anyOf``/``oneOf``/``allOf`` branches, recursively.
+
+    Tool schemas are our own JSON dicts (thawed, or the MCP session
+    declarations); a boolean subschema (``items: true``) declares no names.
+    """
+    if type(node) is not dict:
+        return ()
+    branches: list[Mapping[str, Any]] = [node]
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        if combinator in node:
+            for branch in cast(list[object], node[combinator]):
+                branches.extend(_schema_node_branches(branch))
+    return tuple(branches)
+
+
+def _schema_violation_loc(schema: Mapping[str, Any], path: tuple[str | int, ...]) -> tuple[str, ...]:
+    """Walk an instance path through the tool's own schema into a closed loc.
+
+    A string segment survives only when it is a property name declared at
+    that schema node; an array index becomes ``index``; anything else (a
+    model-named key, never echoed, plan C10) becomes ``field`` at position 0
+    and ``item`` after. Capped at four segments.
+    """
+    loc: list[str] = []
+    nodes = _schema_node_branches(schema)
+    for position, segment in enumerate(path[:SCHEMA_VIOLATION_MAX_LOC_DEPTH]):
+        if type(segment) is int:
+            loc.append("index")
+            nodes = tuple(branch for node in nodes if "items" in node for branch in _schema_node_branches(node["items"]))
+            continue
+        name = cast(str, segment)
+        declared = tuple(
+            cast(Mapping[str, object], node["properties"])[name]
+            for node in nodes
+            if "properties" in node and name in cast(Mapping[str, object], node["properties"])
+        )
+        if declared:
+            loc.append(name)
+            nodes = tuple(branch for child in declared for branch in _schema_node_branches(child))
+            continue
+        loc.append("field" if position == 0 else "item")
+        nodes = tuple(
+            branch for node in nodes if "additionalProperties" in node for branch in _schema_node_branches(node["additionalProperties"])
+        )
+    return tuple(loc)
+
+
+def _schema_violations(schema: Mapping[str, Any], errors: list[ValidationError]) -> tuple[SchemaViolation, ...]:
+    """One closed violation per jsonschema error, in the gate's sorted order.
+
+    jsonschema raises one ``required`` error per missing name, each carrying
+    the whole ``required`` list, so the names are read once per required
+    keyword location: a missing name is schema-owned, never model-authored.
+    """
+    violations: list[SchemaViolation] = []
+    required_locations: set[tuple[tuple[str | int, ...], tuple[str | int, ...]]] = set()
+    for error in errors:
+        path = tuple(error.absolute_path)
+        if error.validator == "required":
+            location = (path, tuple(error.absolute_schema_path))
+            if location in required_locations:
+                continue
+            required_locations.add(location)
+            parent = _schema_violation_loc(schema, path)
+            instance = cast(Mapping[str, Any], error.instance)
+            for name in cast(list[str], error.validator_value):
+                if name not in instance:
+                    violations.append(
+                        SchemaViolation(loc=(*parent, name)[:SCHEMA_VIOLATION_MAX_LOC_DEPTH], code=SchemaViolationCode.MISSING)
+                    )
+            continue
+        violations.append(SchemaViolation(loc=_schema_violation_loc(schema, path), code=_schema_violation_code(error)))
+    return tuple(violations)
+
+
+def _schema_tool_argument_error(tool_name: str, errors: list[ValidationError], schema: Mapping[str, Any]) -> ToolArgumentError:
+    # The reported error sets the text and the shape/bound category; the
+    # violations (the compose loop's repair signal) come from every error.
+    error = _reported_schema_error(errors)
     return ToolArgumentError(
         argument=f"{tool_name} arguments",
         expected=f"object conforming to {_schema_argument_model_name(tool_name)} ({_schema_error_summary(error)})",
         actual_type="invalid_schema",
         code="SCHEMA_VALIDATION",
         category=_schema_error_category(error),
+        schema_violations=_schema_violations(schema, errors),
     )
 
 
@@ -568,7 +679,7 @@ def require_schema_valid_arguments(tool_name: str, arguments: object) -> None:
     """
     errors = _schema_errors(tool_name, arguments)
     if errors:
-        raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
+        raise _schema_tool_argument_error(tool_name, errors, _closed_root_schema(tool_name))
 
 
 def require_arguments_conform_to_schema(tool_name: str, validator: Draft202012Validator, arguments: object) -> None:
@@ -581,7 +692,7 @@ def require_arguments_conform_to_schema(tool_name: str, validator: Draft202012Va
     """
     errors = _errors_against(validator, arguments)
     if errors:
-        raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
+        raise _schema_tool_argument_error(tool_name, errors, cast(Mapping[str, Any], validator.schema))
 
 
 def _validate_tool_arguments(

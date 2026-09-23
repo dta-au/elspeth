@@ -165,12 +165,10 @@ def _first_schema_error(schema: dict[str, Any], instance: object) -> Any:
 
 
 def test_schema_type_violation_keeps_json_type_guidance() -> None:
-    error = _first_schema_error(
-        {"type": "object", "properties": {"options": {"type": "object"}}},
-        {"options": "{}"},
-    )
+    schema: dict[str, Any] = {"type": "object", "properties": {"options": {"type": "object"}}}
+    error = _first_schema_error(schema, {"options": "{}"})
 
-    exc = _schema_tool_argument_error("splice_transform", error)
+    exc = _schema_tool_argument_error("splice_transform", [error], schema)
 
     assert exc.expected == "object conforming to SpliceTransformArgumentsModel" + _GUIDANCE
     assert exc.actual_type == "invalid_schema"
@@ -187,7 +185,7 @@ def test_schema_type_violation_keeps_json_type_guidance() -> None:
     ids=["required", "additionalProperties", "enum", "maxLength"],
 )
 def test_schema_non_type_violation_drops_json_type_guidance(schema: dict[str, Any], instance: object) -> None:
-    exc = _schema_tool_argument_error("splice_transform", _first_schema_error(schema, instance))
+    exc = _schema_tool_argument_error("splice_transform", [_first_schema_error(schema, instance)], schema)
 
     assert exc.expected == "object conforming to SpliceTransformArgumentsModel"
 
