@@ -171,7 +171,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # ExecutionRepository.complete_collector_failure opens the ONE
 # fenced_leader_transaction that fails the flush state and every member hold.
 # Re-derived by RUNNING the gate on the changed tree.
-_CLOCK_BOUNDARY_DIGEST = "585abca879f8dd46e76df361df075a6594d44d0193f70f5b7b95c75744f48902"
+_CLOCK_BOUNDARY_DIGEST = "66e5132fe9261d24d289426ba25a644fd32810253f12a3ed51697bb842613293"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -265,6 +265,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository._record_operation_call_payload_refs"),
         ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository.allocate_operation_call_index"),
         ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository.record_operation_call"),
+        ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository.record_verification_decision"),
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.begin_node_states_many"),
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state"),
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state_on"),

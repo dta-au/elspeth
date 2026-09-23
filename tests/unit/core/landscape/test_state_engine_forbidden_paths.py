@@ -711,6 +711,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "fork_token",
         "record_call",
         "record_call_payload_refs",
+        "record_verification_decision",
         "record_routing_events",
         "record_token_outcome",
         "record_transform_error",
@@ -875,6 +876,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_call_payload_refs": (
             "tests/unit/core/landscape/test_call_recording.py",
             "test_f10_call_payload_refs_refuse_reclaimed_item",
+        ),
+        "record_verification_decision": (
+            "tests/unit/core/landscape/test_call_mode_persistence.py",
+            "test_verification_decision_requires_current_live_leader_before_write",
         ),
         "record_routing_events": (
             "tests/unit/core/landscape/test_node_state_recording.py",

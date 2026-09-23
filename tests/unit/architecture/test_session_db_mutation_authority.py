@@ -4044,7 +4044,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "730473cf9d5628ab",
         1,
         "SessionSchemaAuthority",
-        line=275,
+        line=274,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4054,7 +4054,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         1,
         "SessionSchemaAuthority",
-        line=293,
+        line=292,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4064,7 +4064,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         2,
         "SessionSchemaAuthority",
-        line=294,
+        line=293,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4074,7 +4074,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "dc1da0e98009a36e",
         1,
         "SessionSchemaAuthority",
-        line=297,
+        line=296,
     ),
     # src/elspeth/web/sessions/dead_site_supersession.py :: SessionInterpretationAuthority
     WriterIdentity(
@@ -4958,7 +4958,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d7ac5811a7ee7916",
         1,
         "SessionSchemaAuthority",
-        line=310,
+        line=309,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4968,7 +4968,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "23a842a553f2f5b5",
         1,
         "SessionSchemaAuthority",
-        line=423,
+        line=422,
     ),
     # src/elspeth/web/sessions/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -5359,10 +5359,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RunLifecycleRepository.begin_run",
         "<non-session-write-connection>",
         "write_connection",
-        "2bc28d29678393bf",
+        "6d338cdb36214a65",
         1,
         None,
-        line=484,
+        line=498,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5373,7 +5373,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "35f1c0951a247db5",
         1,
         None,
-        line=607,
+        line=621,
         connection_escape=True,
     ),
     # ADR-047 fresh-time amendment: the PRAGMA verifier installs the reviewed
@@ -5399,7 +5399,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=837,
+        line=856,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
     # to ``read_schema_identities`` behind a plain import, whose body executes
@@ -5412,7 +5412,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=862,
+        line=881,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5422,7 +5422,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=960,
+        line=979,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5432,7 +5432,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1180,
+        line=1199,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5442,7 +5442,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1325,
+        line=1344,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -5455,7 +5455,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1346,
+        line=1365,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -5468,7 +5468,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "91a7ddcfb7d2279c",
         1,
         None,
-        line=1359,
+        line=1378,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5479,7 +5479,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1386,
+        line=1405,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5489,7 +5489,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "a6bc0744250eff32",
         1,
         None,
-        line=1645,
+        line=1664,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5499,7 +5499,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2130,
+        line=2149,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5510,7 +5510,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2112,
+        line=2131,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5777,7 +5777,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c585a80de69ed5e2",
         1,
         None,
-        line=851,
+        line=865,
     ),
     # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
     # hold ages; the read connection is handed to read_landscape_transaction_time.
@@ -18764,7 +18764,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1398,
+            line=1417,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
@@ -18871,7 +18871,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=275,
+            line=274,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -18881,7 +18881,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=310,
+            line=309,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -18891,7 +18891,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "23a842a553f2f5b5",
             1,
             "SessionSchemaAuthority",
-            line=423,
+            line=422,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable

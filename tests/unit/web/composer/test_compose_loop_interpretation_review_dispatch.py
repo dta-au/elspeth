@@ -3769,8 +3769,11 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
     assert end_calls, "P5 budget-exhaustion END advisor gate must fire for a PT pipeline"
     from elspeth.web.composer.advisor_decision import AdvisorGatePassed
     from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+    from elspeth.web.sessions.converters import state_from_record
 
-    assert result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state))
+    current_state = await sessions_service.get_current_state(session_id)
+    assert current_state is not None
+    assert result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state_from_record(current_state)))
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     assert any(e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE for e in events)
 
