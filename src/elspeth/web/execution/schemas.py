@@ -1122,8 +1122,9 @@ class RunDiagnosticDiscard(_StrictResponse):
     ``tokens``.
 
     ``error`` is already boundary-scrubbed at the recording site
-    (``contracts/safe_validation_errors.py``, elspeth-a300402c58):
-    loc/msg/type only, input echo dropped — so it is projected verbatim with
+    (``contracts/safe_validation_errors.py``, elspeth-a300402c58): the
+    top-level field and pydantic's type code only — no input echo, no
+    free-text message, no nested dict key — so it is projected verbatim with
     no second scrubber.  ``row_data_json`` is audit material and is never
     projected (module rule, ``web/execution/diagnostics.py``).  The structured
     violation columns (``violation_type`` etc.) are None on the
