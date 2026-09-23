@@ -3,6 +3,7 @@
 import pytest
 from jinja2 import TemplateSyntaxError
 
+from elspeth.plugins.infrastructure import templates as template_infrastructure
 from elspeth.plugins.infrastructure.templates import (
     TemplateError,
     create_sandboxed_environment,
@@ -16,6 +17,22 @@ def test_create_sandboxed_environment_returns_immutable_sandbox():
     assert result == "Hello world"
 
 
+def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    original = template_infrastructure._run_template_worker
+
+    def record_worker(source: str, payload: bytes) -> str:
+        calls.append(source)
+        return original(source, payload)
+
+    monkeypatch.setattr(template_infrastructure, "_run_template_worker", record_worker)
+    env = create_sandboxed_environment()
+    assert env.from_string("output.jsonl").render(run_id="example") == "output.jsonl"
+    assert calls == []
+    assert env.from_string("output/{{ run_id }}.jsonl").render(run_id="example") == "output/example.jsonl"
+    assert calls == ["output/{{ run_id }}.jsonl"]
+
+
 def test_sandboxed_environment_strict_undefined():
     env = create_sandboxed_environment()
     template = env.from_string("{{ missing }}")
@@ -27,6 +44,29 @@ def test_sandboxed_environment_rejects_invalid_syntax():
     env = create_sandboxed_environment()
     with pytest.raises(TemplateSyntaxError):
         env.from_string("{% if unclosed")
+
+
+def test_template_source_limits_apply_before_parse_and_compile():
+    env = create_sandboxed_environment()
+    oversized = "a" * 16385
+    with pytest.raises(TemplateError, match="exceeds"):
+        env.parse(oversized)
+    with pytest.raises(TemplateError, match="exceeds"):
+        env.from_string(oversized)
+
+
+def test_render_output_is_bounded():
+    env = create_sandboxed_environment()
+    template = env.from_string("{{ row.text * 5000000 }}")
+    with pytest.raises(TemplateError, match="Rendered template exceeds"):
+        template.render(row={"text": "x"})
+
+
+def test_render_context_is_bounded_before_worker_start():
+    env = create_sandboxed_environment()
+    template = env.from_string("{{ row.text }}")
+    with pytest.raises(TemplateError, match="Template context exceeds"):
+        template.render(row={"text": "x" * (8 * 1024 * 1024)})
 
 
 def test_template_error_is_exception():

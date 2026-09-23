@@ -41,6 +41,15 @@ _OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
 class TestLLMConfigBase:
     """Tests for LLMConfig base class changes."""
 
+    def test_config_validation_rejects_constant_power_template(self) -> None:
+        with pytest.raises(ValidationError, match="Invalid Jinja2 template"):
+            LLMConfig(
+                provider="azure",
+                prompt_template="{{ (3**(3**15)) % 7 }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=[],
+            )
+
     def test_model_optional_defaults_to_none(self) -> None:
         """model field is optional and defaults to None."""
         config = LLMConfig(

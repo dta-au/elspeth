@@ -21,8 +21,7 @@ import json
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
-from jinja2 import StrictUndefined, TemplateSyntaxError
-from jinja2.sandbox import SandboxedEnvironment
+from jinja2 import TemplateSyntaxError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import ArtifactDescriptor, CallType, Determinism, PluginSchema
@@ -61,6 +60,7 @@ from elspeth.plugins.infrastructure.display_headers import (
     set_resume_field_resolution,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
 from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, build_diversion_attribution
 from elspeth.plugins.sinks._remote_object_effects import (
     RemoteObjectEffectError,
@@ -345,10 +345,10 @@ class AzureBlobSinkConfig(DataPluginConfig):
         Moved from AzureBlobSink.__init__ so from_dict() catches it
         (pre-validation / engine-validation agreement).
         """
-        env = SandboxedEnvironment(undefined=StrictUndefined)
+        env = create_sandboxed_environment()
         try:
             env.from_string(self.blob_path)
-        except TemplateSyntaxError as e:
+        except (TemplateError, TemplateSyntaxError) as e:
             raise ValueError(f"Invalid blob_path template: {e}") from e
         return self
 
@@ -390,7 +390,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:93a9850ffde729d1"
+    source_file_hash: str | None = "sha256:91dc2714aede9956"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -483,7 +483,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         # Pre-compile blob path template at init for runtime use.
         # Syntax validation is now handled by AzureBlobSinkConfig.validate_blob_path_template
         # model_validator — from_dict() above already proved the template is valid.
-        env = SandboxedEnvironment(undefined=StrictUndefined)
+        env = create_sandboxed_environment()
         self._blob_path_compiled = env.from_string(self._blob_path_template)
 
         # CSV options are already validated Pydantic model
