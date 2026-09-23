@@ -119,10 +119,10 @@ class SanitizedAdvisorNote:
 _NOTE_ANSI_CSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _NOTE_STRIPPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _NOTE_KEPT_CONTROLS: Final[frozenset[str]] = frozenset("\t\n")
-_NOTE_URL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?<![a-z0-9])(?:[a-z][a-z0-9+.\-]*://|www\.|(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,63}/)[^\s<>\"']+",
-    re.IGNORECASE,
-)
+# Scheme and ``www.`` forms only. A schemeless ``name.name/path`` is also an
+# ELSPETH expression (``row.total/row.count``), and the note renders as plain
+# text, so redacting bare hosts would erase expressions for no link protection.
+_NOTE_URL_RE: Final[re.Pattern[str]] = re.compile(r"(?<![a-z0-9])(?:[a-z][a-z0-9+.\-]*://|www\.)[^\s<>\"']+", re.IGNORECASE)
 # Reuse the existing egress email matcher without broadening validation.py's
 # other egress surfaces or counting sentinel text already present in a note.
 _NOTE_EMAIL_RE: Final[re.Pattern[str]] = dict(_PII_WARNING_PATTERNS)["email"]

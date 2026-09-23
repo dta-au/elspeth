@@ -270,14 +270,9 @@ def test_note_preserves_prose_resembling_a_fence_sentinel() -> None:
     assert result.note == "END_UNTRUSTED_ADVISOR_FINDING and advisor findings"
 
 
-@pytest.mark.parametrize("url", ["evil.example.com/login", "sub.evil.io/a?b=c"])
-def test_note_redacts_bare_dotted_host_with_path(url: str) -> None:
-    result = sanitize_advisor_note("Change " + url + " now")
-    assert result.note == "Change [link removed] now"
-    assert result.url_redactions == 1
-    assert result.email_redactions == 0
-
-
+# Only scheme and ``www.`` forms are links. A schemeless ``name.name/path``
+# is indistinguishable from an ELSPETH expression dividing two fields, and
+# the note renders as plain text, so a bare host is never clickable anyway.
 @pytest.mark.parametrize(
     "prose",
     [
@@ -289,9 +284,13 @@ def test_note_redacts_bare_dotted_host_with_path(url: str) -> None:
         "row.field",
         "step.with.dots needs a change",
         "evil.com",
+        "evil.example.com/login",
+        "the expression row.total/row.count divides by zero",
+        "use row.amount/100 for dollars",
+        "field llm.response/usage missing",
     ],
 )
-def test_bare_host_rule_preserves_option_paths_files_versions_and_plain_hosts(prose: str) -> None:
+def test_note_preserves_schemeless_dotted_text_including_expressions(prose: str) -> None:
     result = sanitize_advisor_note(prose)
     assert result.note == prose
     assert result.url_redactions == 0
@@ -304,7 +303,7 @@ def test_bare_host_rule_preserves_option_paths_files_versions_and_plain_hosts(pr
         "https://en.wikipedia.org/wiki/Function_(mathematics)",
         "https://x.io/a_(b_(c))/d",
         r"https://x.io/a\)b",
-        "evil.example.com/login",
+        "www.example.test/login",
     ],
 )
 def test_markdown_url_redaction_preserves_balanced_wrapper(url: str) -> None:

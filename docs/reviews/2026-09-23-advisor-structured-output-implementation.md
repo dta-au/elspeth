@@ -12,6 +12,21 @@ the two known base failures; its PostgreSQL run recorded one readiness deadline
 failure. The exact results and follow-up checks are disclosed below. This
 document does not claim deployment or live-provider acceptance.
 
+## Pre-merge correction: schemeless hosts are no longer redacted
+
+Review of `1d5be5e9f` found that the bare-host arm added for item 5b also
+redacted ELSPETH expressions: `row.total/row.count`, `row.amount/100` and
+`llm.response/usage` each became `[link removed]` in the user note. The note
+renders as plain text (`DecisionPanel.tsx`), so a schemeless host was never
+clickable and the arm protected nothing. `_NOTE_URL_RE` in `advisor_output.py`
+now matches scheme and `www.` forms only. `evil.example.com/login` and the three
+expressions are pinned as preserved text. RED was 4 assertion failures in
+`test_advisor_output.py`, exactly those four cases. After the fix, the advisor
+output, structured-checkpoint, checkpoint, CLEAN-table and boot-probe suites
+passed (466 tests), and ruff and mypy are clean. The change is one module-level
+pattern with a single consumer (`sanitize_advisor_note`), so the full suite was
+not rerun; the item 5b row below records the superseded behaviour.
+
 ## Review follow-up: items 1–5
 
 The follow-up repairs the boot probe, boot diagnostics, retry wording and note
