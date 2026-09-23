@@ -182,6 +182,21 @@ def test_http_audit_keeps_exact_replay_transport(http_client, mock_execution):
     }
 
 
+def test_http_audit_accepts_unbound_response_without_replay_transport(http_client, mock_execution, mock_telemetry_emit):
+    response_from_mock = httpx.Response(200, json={"result": "success"})
+    with patch.object(http_client._client, "post", return_value=response_from_mock):
+        response = http_client.post("https://api.example.com/submit", json={"input": "test"})
+
+    assert response is response_from_mock
+    assert mock_execution.record_call.call_count == 1
+    recorded = mock_execution.record_call.call_args[1]
+    assert recorded["status"] is CallStatus.SUCCESS
+    response_payload = recorded["response_data"].to_dict()
+    assert response_payload["body"] == {"result": "success"}
+    assert "transport" not in response_payload
+    assert mock_telemetry_emit.call_count == 1
+
+
 @respx.mock
 def test_http_audit_rejects_replay_transport_with_redacted_header(http_client, mock_execution):
     respx.get("https://api.example.com/login").mock(

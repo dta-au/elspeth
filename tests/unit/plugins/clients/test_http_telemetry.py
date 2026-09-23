@@ -73,6 +73,8 @@ class _RecordingExecution:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
         }
+        if source_call_id is not None:
+            kwargs["source_call_id"] = source_call_id
         self.record_call_calls.append(kwargs)
         if isinstance(self.record_call_effect, Exception):
             raise self.record_call_effect

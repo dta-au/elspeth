@@ -791,7 +791,13 @@ class AuditedHTTPClient(AuditedClientBase):
             return None
         if "content-encoding" in response.headers:
             return None
-        request_url = str(response.request.url)
+        try:
+            request_url = str(response.request.url)
+        except RuntimeError:
+            # A test or custom transport can return a response without its
+            # originating request. Audit the response, but it cannot be
+            # reconstructed exactly for replay without that URL.
+            return None
         try:
             if _fingerprint_url(request_url) != request_url:
                 return None
