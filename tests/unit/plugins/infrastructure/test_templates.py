@@ -1,10 +1,12 @@
 """Tests for shared template infrastructure."""
 
+import pickle
 from types import MappingProxyType
 
 import pytest
 from jinja2 import TemplateSyntaxError
 
+from elspeth.contracts.freeze import FrozenJsonArray
 from elspeth.plugins.infrastructure import templates as template_infrastructure
 from elspeth.plugins.infrastructure.templates import (
     TemplateError,
@@ -27,6 +29,43 @@ def test_worker_preserves_nested_pipeline_rows_and_frozen_lookups():
     lookup = MappingProxyType({"labels": MappingProxyType({"primary": "world"})})
 
     assert template.render(row=row, lookup=lookup) == "hello world"
+
+
+def test_worker_preserves_shared_mapping_identity():
+    env = create_sandboxed_environment()
+    shared = {"value": "same"}
+    template = env.from_string("{{ row.a is sameas row.b }}")
+
+    assert template.render(row={"a": shared, "b": shared}) == "True"
+
+
+def test_worker_carries_frozen_json_array_with_nested_mapping():
+    env = create_sandboxed_environment()
+    values = FrozenJsonArray((MappingProxyType({"label": "kept"}),))
+    template = env.from_string("{{ row['values'][0].label }}")
+
+    assert template.render(row={"values": values}) == "kept"
+
+
+def test_context_transport_shares_dag_and_rejects_cycles():
+    shared: object = ("leaf",)
+    for _ in range(18):
+        shared = (shared, shared)
+
+    packed = template_infrastructure._pack_context_value(shared)
+    assert packed[0] is packed[1]
+    assert len(pickle.dumps(packed, protocol=5)) < 2048
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    with pytest.raises(TemplateError, match="cyclic"):
+        template_infrastructure._pack_context_value(cyclic)
+
+
+def test_context_transport_limits_unique_parent_work(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(template_infrastructure, "_MAX_CONTEXT_NODES", 8)
+    with pytest.raises(TemplateError, match="parent packing limit"):
+        template_infrastructure._pack_context_value({"items": [{"value": i} for i in range(9)]})
 
 
 def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:

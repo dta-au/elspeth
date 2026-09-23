@@ -15,6 +15,7 @@ import multiprocessing
 import os
 import pickle
 import resource
+import sys
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ class TemplateError(Exception):
 
 _MAX_RENDER_BYTES = 4 * 1024 * 1024
 _MAX_CONTEXT_BYTES = 8 * 1024 * 1024
+_MAX_PARENT_PACK_BYTES = 32 * 1024 * 1024
+_MAX_CONTEXT_NODES = 65536
 # RLIMIT_AS is virtual address space, including the interpreter's existing
 # mappings. Cap growth from the spawned worker's own baseline, not an absolute
 # address size that depends on which web/test modules Python imported.
@@ -66,35 +69,92 @@ class _RowTransport:
     contract: bytes
 
 
-def _pack_context_value(value: Any, *, depth: int = 0) -> Any:
-    """Detach owned frozen row carriers before the worker's pickle boundary."""
+def _pack_context_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    memo: dict[int, Any] | None = None,
+    active: set[int] | None = None,
+    budget: list[int] | None = None,
+) -> Any:
+    """Detach frozen carriers with alias preservation and a parent work cap."""
+    from elspeth.contracts.freeze import FrozenJsonArray
     from elspeth.contracts.schema_contract import PipelineRow
 
     if depth > 64:
         raise TemplateError("Template context nesting exceeds 64 levels")
-    if type(value) is PipelineRow:
-        return _RowTransport(pickle.dumps(value.to_dict(), protocol=5), pickle.dumps(value.contract.to_checkpoint_format(), protocol=5))
-    if type(value) in (dict, MappingProxyType):
-        return {key: _pack_context_value(item, depth=depth + 1) for key, item in value.items()}
-    if type(value) is list:
-        return [_pack_context_value(item, depth=depth + 1) for item in value]
-    if type(value) is tuple:
-        return tuple(_pack_context_value(item, depth=depth + 1) for item in value)
-    return value
+    if memo is None:
+        memo = {}
+    if active is None:
+        active = set()
+    if budget is None:
+        budget = [0, 0]
+    identity = id(value)
+    if identity in active:
+        raise TemplateError("Template context contains a cyclic container")
+    if identity in memo:
+        return memo[identity]
+    budget[0] += 1
+    if type(value) is MappingProxyType:
+        estimated_bytes = 64 + 72 * len(value)
+    elif type(value) in (dict, list, tuple, FrozenJsonArray, str, bytes, int, float, bool):
+        estimated_bytes = sys.getsizeof(value)
+    else:
+        estimated_bytes = 128
+    budget[1] += estimated_bytes
+    if budget[0] > _MAX_CONTEXT_NODES or budget[1] > _MAX_PARENT_PACK_BYTES:
+        raise TemplateError("Template context exceeds the parent packing limit")
+    active.add(identity)
+    try:
+        if type(value) is PipelineRow:
+            data = pickle.dumps(value.to_dict(), protocol=5)
+            contract = pickle.dumps(value.contract.to_checkpoint_format(), protocol=5)
+            budget[1] += len(data) + len(contract)
+            if budget[1] > _MAX_PARENT_PACK_BYTES:
+                raise TemplateError("Template context exceeds the parent packing limit")
+            packed: Any = _RowTransport(data, contract)
+        elif type(value) in (dict, MappingProxyType):
+            packed = {
+                key: _pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for key, item in value.items()
+            }
+        elif type(value) is list:
+            packed = [_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value]
+        elif type(value) is FrozenJsonArray:
+            packed = FrozenJsonArray(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
+        elif type(value) is tuple:
+            packed = tuple(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
+        else:
+            packed = value
+    finally:
+        active.remove(identity)
+    memo[identity] = packed
+    return packed
 
 
-def _restore_context_value(value: Any) -> Any:
+def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) -> Any:
+    from elspeth.contracts.freeze import FrozenJsonArray
+
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
     if type(value) is _RowTransport:
         from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 
-        return PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
-    if type(value) is dict:
-        return {key: _restore_context_value(item) for key, item in value.items()}
-    if type(value) is list:
-        return [_restore_context_value(item) for item in value]
-    if type(value) is tuple:
-        return tuple(_restore_context_value(item) for item in value)
-    return value
+        restored: Any = PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
+    elif type(value) is dict:
+        restored = {key: _restore_context_value(item, memo=memo) for key, item in value.items()}
+    elif type(value) is list:
+        restored = [_restore_context_value(item, memo=memo) for item in value]
+    elif type(value) is FrozenJsonArray:
+        restored = FrozenJsonArray(_restore_context_value(item, memo=memo) for item in value)
+    elif type(value) is tuple:
+        restored = tuple(_restore_context_value(item, memo=memo) for item in value)
+    else:
+        restored = value
+    memo[identity] = restored
+    return restored
 
 
 def _check_template_source(source: str) -> None:
