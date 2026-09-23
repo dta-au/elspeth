@@ -350,7 +350,7 @@ def test_ssrf_http_replay_uses_archived_pin_without_network_client(mock_executio
 
 @pytest.mark.parametrize("archived_auth", [False, True])
 def test_ssrf_http_replay_records_redirect_hop_before_parent_without_network(mock_execution, mock_telemetry_emit, archived_auth):
-    auth_headers = {"Authorization": "<fingerprint:source-credential>"} if archived_auth else {}
+    auth_headers = {"Authorization": "<fingerprint:" + "a" * 64 + ">"} if archived_auth else {}
     hop_response = {
         "status_code": 200,
         "headers": {"content-type": "text/plain"},
@@ -656,7 +656,7 @@ def test_ssrf_replay_uses_archived_managed_identity_fingerprint_with_explicit_or
         "method": "GET",
         "url": "https://api.example.com/raw",
         "resolved_ip": "93.184.216.34",
-        "headers": {"Host": "api.example.com", "Authorization": "<fingerprint:source-credential>"},
+        "headers": {"Host": "api.example.com", "Authorization": "<fingerprint:" + "a" * 64 + ">"},
         "params": None,
     }
     payload = {
@@ -708,7 +708,7 @@ def test_ssrf_replay_uses_archived_managed_identity_fingerprint_with_explicit_or
     call_args = mock_execution.record_call.call_args[1]
     assert call_args["source_call_id"] == "source-call"
     request_record = call_args["request_data"].to_dict()
-    assert request_record["headers"]["Authorization"] == "<fingerprint:source-credential>"
+    assert request_record["headers"]["Authorization"] == "<fingerprint:" + "a" * 64 + ">"
     assert request_record["replay_credential_origin"] == {
         "source_run_id": "source-run",
         "source_call_id": "source-call",
@@ -721,7 +721,7 @@ def test_ssrf_replay_refuses_archived_auth_when_non_auth_fields_differ(mock_exec
         "method": "GET",
         "url": "https://api.example.com/other",
         "resolved_ip": "93.184.216.34",
-        "headers": {"Host": "api.example.com", "Authorization": "<fingerprint:source-credential>"},
+        "headers": {"Host": "api.example.com", "Authorization": "<fingerprint:" + "a" * 64 + ">"},
         "params": None,
     }
 
