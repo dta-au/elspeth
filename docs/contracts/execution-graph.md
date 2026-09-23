@@ -678,6 +678,31 @@ run leadership or membership, any other exception the batch transform
 raises, and the processor's declaration cross-check, which runs after the
 flush and writes each member's terminal before it raises.
 
+### Collector Group Failures
+
+A collector (a scope's closer) has no `on_error`: a failed group is a
+structural verdict. It fails when a `require_all` roster closes with a lost
+member (the plugin never runs), when the plugin returns
+`TransformResult.error`, or when a Tier-2 `PluginContractViolation` is raised by
+the plugin or by the engine's checks on the members or the output. The
+verdict is ONE leader-fenced transaction
+(`ExecutionRepository.complete_collector_failure`). The flush node_state, if
+the plugin ran, and every arrived member's accept-time hold node_state are
+completed FAILED together; each hold carries the `CollectorGroupFailure`
+reason. The settle seam then terminalizes the members as
+`(failure, unrouted)` (or escalates to an enclosing scope) and releases their
+journal rows.
+
+The holds are the verdict's witness on resume. OPEN holds mean no verdict was
+recorded (the flush died first), and the group is re-flushed from the rows the
+members arrived with. FAILED `CollectorGroupFailure` holds on members the
+journal still holds BLOCKED mean a recorded verdict. The journal restore
+completes its disposition with the recorded reason, without invoking the
+plugin again (`BarrierRestoreReadModel.get_recorded_collector_group_failures`),
+and refuses a verdict that covers only some of the held members. Any other
+exception the plugin raises at the flush aborts the run with no verdict, and
+resume re-flushes the group.
+
 ### DIVERT Edge Properties
 
 - DIVERT edges are **structural** — they exist in the graph at construction time

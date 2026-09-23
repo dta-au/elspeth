@@ -364,3 +364,60 @@ def test_a_tampered_recorded_verdict_is_refused_not_re_flushed_or_stranded(
     with pytest.raises(AuditIntegrityError, match=match):
         resume_pipeline(env)
     assert len(calls) == 1
+
+
+# The lost-members arm: a transform inside the scope drops one member (a zero
+# divisor is a row error, discarded), the other two arrive, and the require_all
+# roster closes with a loss. The plugin never runs; the verdict has no flush
+# state, only the two arrived members' holds.
+_LOSSY_PIPELINE = _COLLECTOR_PIPELINE.replace(
+    """    on_success: pages
+    on_error: discard
+    options:
+      array_field: items""",
+    """    on_success: exploded
+    on_error: discard
+    options:
+      array_field: items""",
+).replace(
+    "collectors:",
+    """  - name: invert
+    plugin: value_transform
+    input: exploded
+    on_success: pages
+    on_error: discard
+    options:
+      schema: {{mode: observed}}
+      operations:
+        - target: inverse
+          expression: "1000 / row['item']"
+collectors:""",
+)
+_LOSSY_DOCS = [{"id": 1, "items": [5, 0, 2]}]
+
+
+@pytest.mark.parametrize("window", ["after_verdict", "before_release"])
+def test_a_recorded_lost_members_verdict_is_completed_once_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: str) -> None:
+    """The flush-less arm: resume completes the recorded verdict, and the loss replay does not fail the group twice."""
+    assert "invert" in _LOSSY_PIPELINE and "on_success: exploded" in _LOSSY_PIPELINE  # the rewrite landed
+    control_env = build_pipeline(tmp_path / "control", _LOSSY_PIPELINE, _LOSSY_DOCS)
+    control_calls = _count_calls(monkeypatch)
+    control = run_pipeline(control_env)
+    assert control_calls == [], "a require_all group with a lost member never invokes the plugin"
+
+    env = build_pipeline(tmp_path / "crashed", _LOSSY_PIPELINE, _LOSSY_DOCS)
+    calls = _count_calls(monkeypatch)
+    with monkeypatch.context() as crash_patch:
+        fired = _inject(crash_patch, window)
+        with pytest.raises(_Crash):
+            run_pipeline(env)
+    assert fired == [window]
+    # Two arrived members, both holds FAILED by the one verdict (no flush state exists).
+    assert _collector_hold_statuses(env) == [NodeStateStatus.FAILED.value] * 2
+
+    resumed = resume_pipeline(env)
+
+    assert calls == []
+    assert resumed.status is control.status
+    assert terminal_counts(env["db"]) == terminal_counts(control_env["db"])
+    assert _journal_statuses(env) == _journal_statuses(control_env)
