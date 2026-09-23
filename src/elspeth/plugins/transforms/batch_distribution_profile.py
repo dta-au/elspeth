@@ -22,6 +22,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 if TYPE_CHECKING:
@@ -108,7 +109,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3515c098fc194ed5"
+    source_file_hash: str | None = "sha256:dc649721e20a2c30"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -315,11 +316,22 @@ class BatchDistributionProfile(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # Use type() instead of isinstance() to reject bool (bool is subclass of int).
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The branches either side of
+                # this one skip-and-report deliberately (a missing value and a
+                # non-finite float are recoverable); a wrong TYPE is not, and
+                # John's ruling (elspeth-d5034647f0) fails the whole batch
+                # rather than publishing a profile over a set the operator never
+                # specified. No coercion: a str that is not a number is not a
+                # number. Raised here and converted once in `process`, because
+                # this helper returns values, not results. `row_index` is the
+                # BATCH index (`_group_rows` carries it through every group).
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -333,7 +345,6 @@ class BatchDistributionProfile(BaseTransform):
     def _error_for_no_finite_values(
         self,
         grouped_rows: list[tuple[int, PipelineRow]],
-        group_value: Any,
         missing_indices: list[int],
         non_finite_indices: list[int],
     ) -> TransformResult:
@@ -351,8 +362,10 @@ class BatchDistributionProfile(BaseTransform):
             "row_errors": row_errors,
         }
         if self._group_by is not None:
+            # The group is named by its field and identified by the batch row
+            # indices in `row_errors` (every member is listed: valid_count is
+            # 0). Its VALUE is row content and stays out of the audit reason.
             reason["group_by"] = self._group_by
-            reason["group_value"] = group_value
         return TransformResult.error(reason, retryable=False)
 
     @staticmethod
@@ -395,7 +408,7 @@ class BatchDistributionProfile(BaseTransform):
     ) -> tuple[BatchDistributionProfileRow, TransformResult | None]:
         values, missing_indices, non_finite_indices = self._finite_values_for(grouped_rows)
         if not values:
-            return {}, self._error_for_no_finite_values(grouped_rows, group_value, missing_indices, non_finite_indices)
+            return {}, self._error_for_no_finite_values(grouped_rows, missing_indices, non_finite_indices)
 
         sorted_values = sorted(values)
         count = len(values)
@@ -416,8 +429,9 @@ class BatchDistributionProfile(BaseTransform):
                 "valid_count": count,
             }
             if self._group_by is not None:
+                # Field name only: the group VALUE is row content and stays out
+                # of the audit reason.
                 reason["group_by"] = self._group_by
-                reason["group_value"] = group_value
             return {}, TransformResult.error(reason, retryable=False)
 
         result: BatchDistributionProfileRow = {
@@ -477,6 +491,21 @@ class BatchDistributionProfile(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
+        try:
+            return self._profile_all_groups(rows)
+        except BatchRowTypeError as exc:
+            # A wrongly-typed value fails the WHOLE batch with a value-free
+            # reason naming the batch row, the field, and the expected and found
+            # types. The structural caller owns disposition: an aggregation
+            # applies its declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason and the DIVERT; RowProcessor.handle_timeout_flush
+            # sends every buffered row to the on_error sink, or records it
+            # discarded), while a collector turns this into a whole-group
+            # failure settled by scope policy and nesting.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+    def _profile_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
+        """Group, profile and assemble — the body `process` guards."""
         results: list[BatchDistributionProfileRow] = []
         for group_value, grouped_rows in self._group_rows(rows):
             profile, error = self._aggregate_group(grouped_rows, group_value)

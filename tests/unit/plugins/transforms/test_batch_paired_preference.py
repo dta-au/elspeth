@@ -186,19 +186,39 @@ class TestBatchPairedPreference:
         )
 
         rows = [
-            _make_row({"case_id": "p1", "variant": "A", "score": -1e308}),
-            _make_row({"case_id": "p1", "variant": "B", "score": 1e308}),
+            _make_row({"case_id": "case_q7", "variant": "control_arm_q7", "score": -1e308}),
+            _make_row({"case_id": "case_q7", "variant": "treatment_arm_q7", "score": 1e308}),
         ]
 
         result = transform.process(rows, ctx)
 
         assert result.status == "error"
+        assert result.retryable is False
         assert result.reason is not None
         assert result.reason["reason"] == "float_overflow"
         assert result.reason["operation"] == "paired_delta"
-        assert result.reason["group_value"] == "B"
+        assert result.reason["field"] == "score"
+        # WHERE the overflow is, by batch row index -- never the variant labels,
+        # which are row content.
+        assert result.reason["row_errors"] == [
+            {"row_index": 0, "reason": "float_overflow"},
+            {"row_index": 1, "reason": "float_overflow"},
+        ]
+        assert "group_value" not in result.reason
+        assert "value" not in result.reason
+        rendered = repr(sorted(result.reason.items()))
+        assert "control_arm_q7" not in rendered
+        assert "treatment_arm_q7" not in rendered
 
-    def test_non_numeric_scores_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_non_numeric_score_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A wrong-typed score fails the BATCH with a value-free reason (elspeth-d5034647f0).
+
+        Not skipped like a missing or non-finite score, and never coerced: the
+        whole batch fails, the reason names the field, the expected and found
+        types and the BATCH row index, and the offending value never reaches the
+        audit reason. The structural caller (aggregation on_error / collector
+        group failure) owns where the buffered rows go.
+        """
         from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
 
         transform = BatchPairedPreference(
@@ -207,11 +227,28 @@ class TestBatchPairedPreference:
 
         rows = [
             _make_row({"case_id": "p1", "variant": "A", "score": 0.5}),
-            _make_row({"case_id": "p1", "variant": "B", "score": "high"}),
+            _make_row({"case_id": "p1", "variant": "B", "score": 0.7}),
+            _make_row({"case_id": "p2", "variant": "A", "score": 0.4}),
+            # Batch row 3 -- the second row of pair p2, so a pair-local index would say 1.
+            _make_row({"case_id": "p2", "variant": "B", "score": "high_pref_z91"}),
         ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        # BATCH granularity: no comparison is published over the surviving pair.
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        assert "must be numeric (int or float), got str" in result.reason["error"]
+        assert "in row 3" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "high_pref_z91" not in repr(sorted(result.reason.items()))
 
     @pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_group_key_returns_error_before_success(self, ctx: PluginContext, non_finite: float) -> None:
@@ -243,8 +280,8 @@ class TestBatchPairedPreference:
         )
 
         rows = [
-            _make_row({"case_id": "p1", "variant": "A", "score": 0.5}),
-            _make_row({"case_id": "p2", "variant": "B", "score": 0.8}),
+            _make_row({"case_id": "p1", "variant": "control_arm_k4", "score": 0.5}),
+            _make_row({"case_id": "p2", "variant": "treatment_arm_k4", "score": 0.8}),
         ]
 
         result = transform.process(rows, ctx)
@@ -253,7 +290,47 @@ class TestBatchPairedPreference:
         assert result.reason is not None
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["cause"] == "no_complete_pairs"
-        assert result.reason["group_value"] == "B"
+        assert result.reason["field"] == "variant"
+        assert result.reason["batch_size"] == 2
+        assert result.reason["count"] == 2
+        # The variant that had no complete pair is row content: named by field, never by value.
+        assert "group_value" not in result.reason
+        rendered = repr(sorted(result.reason.items()))
+        assert "control_arm_k4" not in rendered
+        assert "treatment_arm_k4" not in rendered
+
+    def test_missing_configured_baseline_counts_variants_without_listing_them(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
+
+        transform = BatchPairedPreference(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "pair_field": "case_id",
+                "variant_field": "variant",
+                "score_field": "score",
+                "baseline_variant": "control",
+            }
+        )
+        rows = [
+            _make_row({"case_id": "p1", "variant": "arm_m2", "score": 0.5}),
+            _make_row({"case_id": "p1", "variant": "arm_n3", "score": 0.8}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["reason"] == "validation_failed"
+        assert result.reason["cause"] == "baseline_variant_missing"
+        assert result.reason["field"] == "variant"
+        # `expected` is the configured baseline (config, not row content).
+        assert result.reason["expected"] == "control"
+        assert result.reason["count"] == 2
+        assert "errors" not in result.reason
+        rendered = repr(sorted(result.reason.items()))
+        assert "arm_m2" not in rendered
+        assert "arm_n3" not in rendered
 
     def test_empty_batch_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
@@ -348,9 +425,11 @@ class TestBatchPairedPreference:
             {"schema": DYNAMIC_SCHEMA, "pair_field": "case_id", "variant_field": "variant", "score_field": "score"}
         )
         rows = [
-            _make_row({"case_id": "p1", "variant": "A", "score": 0.4}),
-            _make_row({"case_id": "p1", "variant": "A", "score": 0.7}),  # duplicate variant within pair
-            _make_row({"case_id": "p1", "variant": "B", "score": 0.6}),
+            _make_row({"case_id": "case_d8", "variant": "A", "score": 0.4}),
+            _make_row({"case_id": "case_e9", "variant": "A", "score": 0.3}),
+            _make_row({"case_id": "case_d8", "variant": "A", "score": 0.7}),  # duplicate variant within pair
+            _make_row({"case_id": "case_d8", "variant": "B", "score": 0.6}),
+            _make_row({"case_id": "case_e9", "variant": "B", "score": 0.2}),
         ]
 
         result = transform.process(rows, ctx)
@@ -359,6 +438,13 @@ class TestBatchPairedPreference:
         assert result.reason is not None
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["cause"] == "duplicate_variant_in_pair"
+        assert result.reason["field"] == "variant"
+        # The repeated entry is named by BATCH row index; the pair id is row content.
+        assert result.reason["row_errors"] == [{"row_index": 2, "reason": "duplicate_variant_in_pair"}]
+        assert "duplicate_pair_ids" not in result.reason
+        rendered = repr(sorted(result.reason.items()))
+        assert "case_d8" not in rendered
+        assert "case_e9" not in rendered
         assert not result.retryable
 
 

@@ -1,5 +1,6 @@
 """Tests for BatchEffectSize aggregation transform."""
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -102,13 +103,143 @@ class TestBatchEffectSize:
         assert result.reason["row_errors"] == [{"row_index": 1, "reason": "non_finite_variant"}]
         assert not result.retryable
 
-    def test_non_numeric_score_raises_type_error(self, ctx: PluginContext) -> None:
+    @pytest.mark.parametrize(
+        ("bad_score", "found"),
+        [
+            ("SENTINEL-score-7f3a91", "str"),
+            (True, "bool"),
+            (datetime(2031, 7, 19, 13, 47, 11, tzinfo=UTC), "datetime"),
+        ],
+    )
+    def test_wrong_typed_score_fails_the_whole_batch_with_a_recorded_reason(
+        self, ctx: PluginContext, bad_score: object, found: str
+    ) -> None:
+        """A wrong-typed score fails the BATCH with a returned, value-free reason (elspeth-5887fb7928).
+
+        The bad row sits in the second-seen group at batch index 3, so a
+        group-local index (it is row 1 of group B) would be reported wrongly.
+        """
         from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
 
         transform = BatchEffectSize({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+        rows = [
+            _make_row({"variant": "A", "score": 1.0}),
+            _make_row({"variant": "B", "score": 2.0}),
+            _make_row({"variant": "A", "score": 3.0}),
+            _make_row({"variant": "B", "score": bad_score}),
+        ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process([_make_row({"variant": "A", "score": 1.0}), _make_row({"variant": "B", "score": "high"})], ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.row is None
+        assert result.rows is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == found
+        assert "in row 3" in result.reason["error"]
+        assert str(bad_score) not in repr(result.reason)
+        assert repr(bad_score) not in repr(result.reason)
+
+    def test_no_finite_score_reason_names_the_group_by_index_not_by_label(self, ctx: PluginContext) -> None:
+        """The variant label is row data: the audit reason records row indices, never the label."""
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
+
+        transform = BatchEffectSize({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+        rows = [
+            _make_row({"variant": "A", "score": 1.0}),
+            _make_row({"variant": "SENTINEL-label-5c2e", "score": None}),
+            _make_row({"variant": "SENTINEL-label-5c2e", "score": float("nan")}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["cause"] == "variant_has_no_finite_scores"
+        assert result.reason["group_by"] == "variant"
+        assert result.reason["field"] == "score"
+        assert result.reason["row_errors"] == [
+            {"row_index": 1, "reason": "missing_value"},
+            {"row_index": 2, "reason": "non_finite_value"},
+        ]
+        assert "group_value" not in result.reason
+        assert "SENTINEL-label-5c2e" not in repr(result.reason)
+
+    def test_missing_baseline_reason_counts_the_batch_variants_without_naming_them(self, ctx: PluginContext) -> None:
+        """The configured baseline is config and may be named; the variants present are row data and may not."""
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
+
+        transform = BatchEffectSize(
+            {"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score", "baseline_variant": "control"}
+        )
+        rows = [
+            _make_row({"variant": "SENTINEL-label-a1", "score": 1.0}),
+            _make_row({"variant": "SENTINEL-label-b2", "score": 2.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["cause"] == "baseline_variant_missing"
+        assert result.reason["expected"] == "control"
+        assert result.reason["group_by"] == "variant"
+        assert result.reason["count"] == 2
+        assert "errors" not in result.reason
+        assert "SENTINEL-label" not in repr(result.reason)
+
+    def test_first_seen_variant_is_the_baseline_when_none_is_configured(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
+
+        transform = BatchEffectSize({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+        rows = [
+            _make_row({"variant": "B", "score": 3.0}),
+            _make_row({"variant": "A", "score": 1.0}),
+            _make_row({"variant": "B", "score": 4.0}),
+            _make_row({"variant": "A", "score": 2.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["baseline_variant"] == "B"
+        assert result.row["variant"] == "A"
+        assert result.row["mean_delta"] == -2.0
+
+    def test_float_overflow_reason_names_groups_by_first_row_index_not_by_label(self, ctx: PluginContext) -> None:
+        """An overflowing mean fails the batch; the reason points at rows, never at variant labels."""
+        from elspeth.plugins.transforms.batch_effect_size import BatchEffectSize
+
+        transform = BatchEffectSize({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+        rows = [
+            _make_row({"variant": "SENTINEL-base-9d", "score": 1e308}),
+            _make_row({"variant": "SENTINEL-base-9d", "score": 1e308}),
+            _make_row({"variant": "SENTINEL-cand-4b", "score": 1.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["reason"] == "float_overflow"
+        assert result.reason["operation"] == "baseline_mean"
+        assert result.reason["group_by"] == "variant"
+        assert result.reason["field"] == "score"
+        assert result.reason["error"] == (
+            "overflow comparing the variant group first seen in row 2 with the baseline group first seen in row 0"
+        )
+        assert "group_value" not in result.reason
+        assert "value" not in result.reason
+        assert "SENTINEL" not in repr(result.reason)
 
     def test_single_value_group_reports_none_stdev(self, ctx: PluginContext) -> None:
         """n=1 stdev is undefined -- must emit None, never 0.0 (B4.5-a-effect_size-stdev)."""

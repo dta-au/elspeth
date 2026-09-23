@@ -16,6 +16,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 
 type ThresholdOperator = Literal["<", "<=", ">", ">=", "==", "!="]
 type BatchThresholdSummaryRow = dict[str, object]
@@ -103,7 +104,7 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0674b3782a36ee52"
+    source_file_hash: str | None = "sha256:871caf28db77c49e"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -145,7 +146,8 @@ class BatchThresholdSummary(BaseTransform):
                 summary="Counts how many finite numeric batch values match named thresholds.",
                 composer_hints=(
                     "Use batch_threshold_summary under aggregations with a trigger; it emits one summary row per threshold.",
-                    "value_field must be numeric; missing and non-finite values are skipped and counted.",
+                    "value_field must be numeric; missing and non-finite values are skipped and counted, "
+                    "and a non-numeric value fails the whole batch.",
                     "Each threshold needs a unique name, an operator from < <= > >= == !=, and a finite numeric value.",
                     "Output is threshold summary rows, not pass-through source data.",
                 ),
@@ -221,11 +223,15 @@ class BatchThresholdSummary(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # A wrong TYPE fails the whole batch (elspeth-d5034647f0): no summary
+            # is published over survivors the operator never specified. Raised
+            # here and converted in `process`, because this helper returns values.
             if type(value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(value).__name__,
                 )
 
             if type(value) is float and not math.isfinite(value):
@@ -326,7 +332,13 @@ class BatchThresholdSummary(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
 
-        values, missing_indices, non_finite_indices = self._finite_values_for(rows)
+        try:
+            values, missing_indices, non_finite_indices = self._finite_values_for(rows)
+        except BatchRowTypeError as exc:
+            # The batch records that it failed and why (row, field, expected and
+            # found type; never the value). The aggregation applies its declared
+            # on_error to every buffered row; a collector fails the whole group.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         if not values:
             return self._error_for_no_finite_values(
                 batch_size=len(rows),

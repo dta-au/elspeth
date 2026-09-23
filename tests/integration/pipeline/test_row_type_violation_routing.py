@@ -925,3 +925,297 @@ def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes
     member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
     assert len(member_errors) == 2
     assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
+
+
+# ---------------------------------------------------------------------------
+# The batch plugins' own row checks (elspeth-5887fb7928 plugin half): a
+# wrong-typed value fails the WHOLE batch with a RETURNED error, which the
+# aggregation routes to its on_error sink.
+#
+# Arming (measured per plugin, lane evidence impl-P-*.md): the source AND the
+# aggregation schema are observed — a typed aggregation schema trips the
+# engine's batch-input validation first and the plugin body never runs. An
+# observed CSV source makes every value a ``str``, so any row arms a numeric
+# guard. An observed JSON source locks a field's type on row 0, so the
+# offending value is in row 0 and every row carries the same type; that keeps
+# all N rows buffered in one batch. The sentinel is the offending value: it
+# must reach the quarantine sink with the row, and must appear in no audit
+# reason.
+#
+# Before the fix each case raised a bare ``TypeError`` out of
+# ``Orchestrator.run`` (exit 4, every token abandoned).
+# ---------------------------------------------------------------------------
+
+_BATCH_NODE = "batch_node"
+
+
+def _csv_rows(header: tuple[str, ...], *rows: tuple[str, ...]) -> list[dict[str, Any]]:
+    return [dict(zip(header, row, strict=True)) for row in rows]
+
+
+def _wrong_type(field: str, expected: str, found: str, row_index: int) -> dict[str, Any]:
+    """The reason ``BatchRowTypeError.as_reason()`` renders, written out literally
+    so this file collects on a tree that predates the plugin fixes."""
+    return {
+        "reason": "invalid_input",
+        "error_type": "wrong_type",
+        "field": field,
+        "expected": expected,
+        "actual_type": found,
+        "error": f"must be {expected}, got {found} in row {row_index}",
+    }
+
+
+_NUMERIC = "numeric (int or float)"
+
+# (case id, plugin, source kind, input rows, plugin options, sentinel, expected reason)
+_BATCH_PLUGIN_CASES = [
+    pytest.param(
+        "batch_distribution_profile",
+        "csv",
+        _csv_rows(("id", "v"), ("1", "SENTINEL-dist-4b2e"), ("2", "77.5"), ("3", "12.0")),
+        {"value_field": "v"},
+        "SENTINEL-dist-4b2e",
+        _wrong_type("v", _NUMERIC, "str", 0),
+        id="distribution_profile-str-value",
+    ),
+    pytest.param(
+        "batch_drift_compare",
+        "csv",
+        _csv_rows(("c", "v"), ("base", "SENTINEL-drift-91c4"), ("cur", "2"), ("base", "3"), ("cur", "4")),
+        {"cohort_field": "c", "value_field": "v", "value_type": "numeric"},
+        "SENTINEL-drift-91c4",
+        _wrong_type("v", _NUMERIC, "str", 0),
+        id="drift_compare-numeric-str-value",
+    ),
+    pytest.param(
+        "batch_drift_compare",
+        "json",
+        [{"c": "base", "v": 6173.375}, {"c": "cur", "v": 2.5}, {"c": "base", "v": 3.5}, {"c": "cur", "v": 4.5}],
+        {"cohort_field": "c", "value_field": "v", "value_type": "categorical"},
+        "6173.375",
+        _wrong_type("v", "a scalar category (str, int, or bool)", "float", 0),
+        id="drift_compare-categorical-float-value",
+    ),
+    pytest.param(
+        "batch_effect_size",
+        "csv",
+        _csv_rows(
+            ("id", "variant", "score"),
+            ("1", "control", "SENTINEL-effect-5d71"),
+            ("2", "control", "2.0"),
+            ("3", "treatment", "3.5"),
+            ("4", "treatment", "4.25"),
+        ),
+        {"variant_field": "variant", "score_field": "score", "baseline_variant": "control"},
+        "SENTINEL-effect-5d71",
+        _wrong_type("score", _NUMERIC, "str", 0),
+        id="effect_size-str-score",
+    ),
+    pytest.param(
+        "batch_experiment_compare",
+        "csv",
+        _csv_rows(
+            ("variant", "score", "id"),
+            ("control", "SENTINEL-exp-7ab3", "1"),
+            ("treat", "0.7713", "2"),
+            ("control", "0.6121", "3"),
+        ),
+        {"variant_field": "variant", "score_field": "score"},
+        "SENTINEL-exp-7ab3",
+        _wrong_type("score", _NUMERIC, "str", 0),
+        id="experiment_compare-str-score",
+    ),
+    pytest.param(
+        "batch_paired_preference",
+        "csv",
+        _csv_rows(
+            ("case_id", "variant", "score"),
+            ("CASE-1", "A", "SENTINEL-score-7f3a"),
+            ("CASE-1", "B", "0.9"),
+            ("CASE-2", "A", "0.4"),
+            ("CASE-2", "B", "0.6"),
+        ),
+        {"pair_field": "case_id", "variant_field": "variant", "score_field": "score"},
+        "SENTINEL-score-7f3a",
+        _wrong_type("score", _NUMERIC, "str", 0),
+        id="paired_preference-str-score",
+    ),
+    pytest.param(
+        "batch_threshold_summary",
+        "csv",
+        _csv_rows(("id", "v"), ("1", "SENTINEL-thresh-2e9a"), ("2", "0.9"), ("3", "0.4")),
+        {"value_field": "v", "thresholds": [{"name": "hi", "operator": ">=", "value": 0.5}]},
+        "SENTINEL-thresh-2e9a",
+        _wrong_type("v", _NUMERIC, "str", 0),
+        id="threshold_summary-str-value",
+    ),
+]
+
+
+def _run_batch_plugin_pipeline(
+    tmp_path: Any, *, plugin: str, source: str, rows: list[dict[str, Any]], options: dict[str, Any]
+) -> tuple[Any, Any, Any, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Observed source -> ``plugin`` under ``aggregations:`` (observed schema,
+    one count-triggered batch holding every row, ``on_error: quarantine``) ->
+    JSON sinks, through the same production assembly path as the batch_stats
+    harness above (settings -> instantiate -> graph.validate -> preflight ->
+    Orchestrator)."""
+    import json
+
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.config_loading import load_settings_from_yaml_string
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+
+    if source == "csv":
+        input_path = tmp_path / "input.csv"
+        header = list(rows[0])
+        input_path.write_text(",".join(header) + "\n" + "".join(",".join(row[name] for name in header) + "\n" for row in rows))
+        source_options: dict[str, Any] = {}
+    else:
+        input_path = tmp_path / "input.jsonl"
+        _write_jsonl(input_path, rows)
+        source_options = {"format": "jsonl"}
+
+    def _sink(name: str) -> dict[str, Any]:
+        return {
+            "plugin": "json",
+            "on_write_failure": "discard",
+            "options": {"path": str(tmp_path / f"{name}.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+        }
+
+    settings = load_settings_from_yaml_string(
+        # JSON is YAML; building the document as data keeps list/dict options exact.
+        json.dumps(
+            {
+                "sources": {
+                    "primary": {
+                        "plugin": source,
+                        "on_success": "batch_in",
+                        "options": {
+                            "path": str(input_path),
+                            "on_validation_failure": "discard",
+                            "schema": {"mode": "observed"},
+                            **source_options,
+                        },
+                    }
+                },
+                "aggregations": [
+                    {
+                        "name": _BATCH_NODE,
+                        "plugin": plugin,
+                        "input": "batch_in",
+                        "on_success": "output",
+                        "on_error": "quarantine",
+                        "trigger": {"count": len(rows)},
+                        "output_mode": "transform",
+                        "options": {**options, "schema": {"mode": "observed"}},
+                    }
+                ],
+                "sinks": {"output": _sink("output"), "quarantine": _sink("quarantine")},
+            }
+        )
+    )
+    bundle = instantiate_plugins_from_config(settings)
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=bundle.sources,
+        source_settings_map=bundle.source_settings_map,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        gates=list(settings.gates),
+    )
+    graph.validate()
+    config = assemble_and_validate_pipeline_config(
+        sources=bundle.sources,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        settings=settings,
+        graph=graph,
+    )
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
+    return result, db, payload_store, _read_jsonl(tmp_path / "output.jsonl"), _read_jsonl(tmp_path / "quarantine.jsonl")
+
+
+@pytest.mark.parametrize(("plugin", "source", "rows", "options", "sentinel", "expected_reason"), _BATCH_PLUGIN_CASES)
+def test_a_batch_plugin_row_fault_routes_the_whole_batch_with_a_value_free_reason(
+    plugin: str,
+    source: str,
+    rows: list[dict[str, Any]],
+    options: dict[str, Any],
+    sentinel: str,
+    expected_reason: dict[str, Any],
+    tmp_path: Any,
+) -> None:
+    """The plugin RETURNS the failure; the aggregation routes every buffered
+    row to on_error with its original values; the record names the field,
+    expected and found type and the BATCH row index — never the value."""
+    import json
+
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    # Returning at all is the first assertion: before the fix the plugin's
+    # TypeError escaped Orchestrator.run.
+    result, db, payload_store, output_rows, quarantine_rows = _run_batch_plugin_pipeline(
+        tmp_path, plugin=plugin, source=source, rows=rows, options=options
+    )
+    n = len(rows)
+
+    assert result.status is RunStatus.FAILED
+    assert (result.rows_processed, result.rows_succeeded, result.rows_failed) == (n, 0, n)
+    assert (result.rows_routed_failure, result.rows_quarantined) == (n, 0)
+
+    # Every buffered row reaches the on_error sink with its ORIGINAL values.
+    assert quarantine_rows == rows
+    assert output_rows == []
+
+    audit = _failed_flush_audit(db, result.run_id)
+    assert len(audit["outcomes"]) == n
+    assert {outcome.token_id for outcome in audit["outcomes"]} == audit["row_token_ids"]
+    for outcome in audit["outcomes"]:
+        assert (outcome.outcome, outcome.path, outcome.sink_name) == (
+            TerminalOutcome.FAILURE.value,
+            TerminalPath.ON_ERROR_ROUTED.value,
+            "quarantine",
+        )
+
+    # The flush state records the plugin's structured reason: field, expected,
+    # found type and the batch row index.
+    [failed_state] = audit["failed_states"]
+    assert json.loads(failed_state.error_json) == expected_reason
+
+    [routing] = audit["routing"]
+    assert (routing.mode, routing.label, routing.state_id) == ("divert", f"__error_{_BATCH_NODE}__", failed_state.state_id)
+    # The DIVERT reason lives in the payload store, not a Landscape column.
+    routed_reason = payload_store.retrieve(routing.reason_ref).decode()
+    assert json.loads(routed_reason) == expected_reason
+    assert sentinel not in routed_reason
+
+    [batch] = audit["batches"]
+    assert batch.status == "failed"
+
+    assert len(audit["transform_errors"]) == n
+    for error_row in audit["transform_errors"]:
+        assert error_row.destination == "quarantine"
+        assert json.loads(error_row.error_details_json) == expected_reason
+
+    with db.engine.connect() as conn:
+        pending = (
+            conn.execute(
+                select(token_work_items_table.c.pending_error_message)
+                .where(token_work_items_table.c.run_id == result.run_id)
+                .where(token_work_items_table.c.pending_path == TerminalPath.ON_ERROR_ROUTED.value)
+            )
+            .scalars()
+            .all()
+        )
+    assert pending == [str(expected_reason)] * n
+
+    # The value is in exactly one audit text surface: the failed row itself,
+    # kept by design. That hit is the scan's positive control; the reason
+    # columns (error_details_json, error_json, pending_error_message) are clean.
+    assert set(_audit_cells_containing(db, sentinel)) == {("transform_errors", "row_data_json")}

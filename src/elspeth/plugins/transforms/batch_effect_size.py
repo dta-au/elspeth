@@ -19,6 +19,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchEffectSizeRow = dict[str, object]
@@ -53,6 +54,9 @@ _EFFECT_SIZE_OUTPUT_FIELDS = frozenset(
 @dataclass(frozen=True, slots=True)
 class _VariantStats:
     value: Any
+    # Batch index of the group's first row: the value-free handle an audit
+    # reason uses to name the group (the variant label is row data).
+    first_row_index: int
     total_count: int
     values: tuple[int | float, ...]
     missing_indices: tuple[int, ...]
@@ -115,7 +119,7 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e62f3d946b8a4518"
+    source_file_hash: str | None = "sha256:8e4adf4a85229544"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
     usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
@@ -263,11 +267,20 @@ class BatchEffectSize(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # type() rather than isinstance() so a bool is rejected, not read as 0/1.
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._score_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The missing and non-finite
+                # branches either side skip-and-report deliberately; a wrong
+                # TYPE fails the whole batch (ruling elspeth-d5034647f0) rather
+                # than publishing an effect size over a set the operator never
+                # specified. No coercion: a str that is not a number is not a
+                # number. Raised here because this helper returns values;
+                # `process` converts it to the batch's returned error.
+                raise BatchRowTypeError(
+                    field=self._score_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -278,6 +291,7 @@ class BatchEffectSize(BaseTransform):
 
         return _VariantStats(
             value=variant_value,
+            first_row_index=grouped_rows[0][0],
             total_count=len(grouped_rows),
             values=tuple(values),
             missing_indices=tuple(missing_indices),
@@ -290,10 +304,14 @@ class BatchEffectSize(BaseTransform):
             row_errors.append({"row_index": row_index, "reason": "missing_value"})
         for row_index in stats.non_finite_indices:
             row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
+        # The group is named by its field and its rows' batch indices, never by
+        # its variant label: the label is row data, and an audit reason records
+        # the row INDEX, never the row body.
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "baseline_has_no_finite_scores" if baseline else "variant_has_no_finite_scores",
-            "group_value": stats.value,
+            "group_by": self._variant_field,
+            "field": self._score_field,
             "total_count": stats.total_count,
             "valid_count": 0,
             "skipped_count": stats.missing_count + stats.non_finite_count,
@@ -365,11 +383,17 @@ class BatchEffectSize(BaseTransform):
                 hedges_g = cohens_d * (1 - (3 / hedges_denominator))
                 hedges_g = self._require_finite(hedges_g, operation="hedges_g")
         except OverflowError as exc:
+            # Groups named by the batch index of their first row, not by their
+            # variant labels (row data; see _no_finite_score_error).
             reason: TransformErrorReason = {
                 "reason": "float_overflow",
                 "operation": str(exc) or "effect_size",
-                "group_value": variant.value,
-                "value": str(baseline.value),
+                "group_by": self._variant_field,
+                "field": self._score_field,
+                "error": (
+                    f"overflow comparing the variant group first seen in row {variant.first_row_index} "
+                    f"with the baseline group first seen in row {baseline.first_row_index}"
+                ),
             }
             return {}, TransformResult.error(reason, retryable=False)
 
@@ -435,7 +459,17 @@ class BatchEffectSize(BaseTransform):
             return non_finite_variant_error
 
         grouped = self._group_rows(rows)
-        stats_by_variant = [self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped]
+        try:
+            stats_by_variant = [self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped]
+        except BatchRowTypeError as exc:
+            # The whole batch fails with a recorded, value-free reason naming
+            # the field, the required and found types, and the batch row. The
+            # structural caller owns disposition: an aggregation applies its
+            # declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason; RowProcessor.handle_timeout_flush sends every
+            # buffered row to the on_error sink, or records it discarded), and
+            # a collector turns it into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
 
         if len(stats_by_variant) < 2:
             return TransformResult.error(
@@ -447,33 +481,30 @@ class BatchEffectSize(BaseTransform):
                 retryable=False,
             )
 
-        if self._baseline_variant is not None and not any(
-            same_scalar_bucket_value(stats.value, self._baseline_variant) for stats in stats_by_variant
-        ):
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(self._baseline_variant),
-                    "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
+        if self._baseline_variant is None:
+            # First-seen variant is the baseline.
+            baseline = stats_by_variant[0]
+        else:
+            configured_baseline = next(
+                (stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, self._baseline_variant)),
+                None,
             )
-
-        baseline_value = self._baseline_variant if self._baseline_variant is not None else stats_by_variant[0].value
-        baseline = next((stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, baseline_value)), None)
-        if baseline is None:
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(baseline_value),
-                    "message": f"Baseline variant {baseline_value!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
-            )
+            if configured_baseline is None:
+                # `expected` and `message` carry the CONFIGURED baseline, which
+                # is config, not row data. The variants the batch did contain
+                # are row data, so only their count is recorded.
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "cause": "baseline_variant_missing",
+                        "group_by": self._variant_field,
+                        "expected": str(self._baseline_variant),
+                        "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
+                        "count": len(stats_by_variant),
+                    },
+                    retryable=False,
+                )
+            baseline = configured_baseline
         if baseline.count == 0:
             return self._no_finite_score_error(baseline, baseline=True)
 
