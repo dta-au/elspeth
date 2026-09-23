@@ -10,6 +10,7 @@ import pytest
 from elspeth.contracts.enums import Determinism, NodeType, RoutingMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator.source_compatibility import admit_registered_graph, admit_source_configuration
 
 
@@ -19,7 +20,7 @@ def _run_record() -> SimpleNamespace:
 
 
 def test_invocation_fields_are_excluded_but_execution_drift_is_refused() -> None:
-    factory = Mock()
+    factory = Mock(spec=RecorderFactory)
     factory.run_lifecycle.get_run.return_value = _run_record()
     config = SimpleNamespace(
         config={
@@ -37,7 +38,7 @@ def test_invocation_fields_are_excluded_but_execution_drift_is_refused() -> None
 
 
 def test_source_settings_hash_and_canonical_version_are_checked() -> None:
-    factory = Mock()
+    factory = Mock(spec=RecorderFactory)
     source = _run_record()
     factory.run_lifecycle.get_run.return_value = source
     config = SimpleNamespace(config={"sources": {"primary": {"plugin": "csv"}}, "sinks": {"output": {"plugin": "json"}}})
@@ -50,7 +51,7 @@ def test_source_settings_hash_and_canonical_version_are_checked() -> None:
 
 
 def test_registered_plugin_implementation_and_route_drift_are_refused() -> None:
-    factory = Mock()
+    factory = Mock(spec=RecorderFactory)
     source_node = SimpleNamespace(
         node_id="source-node",
         node_type=NodeType.SOURCE,

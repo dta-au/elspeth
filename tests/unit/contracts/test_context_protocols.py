@@ -104,6 +104,11 @@ EXECUTOR_ONLY_FIELDS = {
     # accessors declared by their phase protocols.
     "member_token",
     "work_item",
+    # Replay lineage and eagerly validated source streams are orchestrator
+    # bookkeeping. Plugins receive only the mode/session in phase protocols.
+    "replay_from",
+    "audited_sources",
+    "verified_sources",
 }
 
 # [R4] Engine-internal methods: on PluginContext but called by engine, not plugins.
@@ -189,12 +194,11 @@ class TestProtocolFieldCoverage:
 class TestProtocolOverlapDocumentation:
     """Document field overlap between protocols.
 
-    run_id is intentionally in all 4 protocols. Other fields should
-    have minimal overlap. This test serves as documentation — it
-    fails if overlap changes unexpectedly.
+    Run identity, mode, call session, and audit writer are intentionally in
+    all four protocols. This test fails if the shared surface changes.
     """
 
-    EXPECTED_UNIVERSAL: frozenset[str] = frozenset({"run_id"})  # In all protocols by design
+    EXPECTED_UNIVERSAL: frozenset[str] = frozenset({"run_id", "run_mode", "landscape", "call_mode_session"})
 
     @staticmethod
     def _protocol_properties(cls: type) -> set[str]:
@@ -202,11 +206,11 @@ class TestProtocolOverlapDocumentation:
         return {name for name, val in vars(cls).items() if not name.startswith("_") and isinstance(val, property)}
 
     def test_universal_fields_are_only_run_id(self) -> None:
-        """Only run_id should appear in all 4 protocols."""
+        """All four protocols expose the mode-aware audit identity surface."""
         source_fields = self._protocol_properties(SourceContext)
         transform_fields = self._protocol_properties(TransformContext)
         sink_fields = self._protocol_properties(SinkContext)
         lifecycle_fields = self._protocol_properties(LifecycleContext)
 
         universal = source_fields & transform_fields & sink_fields & lifecycle_fields
-        assert universal == self.EXPECTED_UNIVERSAL, f"Expected only {self.EXPECTED_UNIVERSAL} in all protocols, got {universal}"
+        assert universal == self.EXPECTED_UNIVERSAL, f"Expected {self.EXPECTED_UNIVERSAL} in all protocols, got {universal}"

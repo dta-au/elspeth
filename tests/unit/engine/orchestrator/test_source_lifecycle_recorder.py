@@ -100,8 +100,8 @@ class TestRecordRunSourceLifecycle:
         recorder = SourceLifecycleRecorder(ceremony=MagicMock(spec=RunCeremony))
         factory = MagicMock(spec=RecorderFactory)
         source = _make_source()
-        source.get_field_resolution = MagicMock(side_effect=AssertionError("live source metadata called"))
-        source.get_schema_contract = MagicMock(side_effect=AssertionError("live source metadata called"))
+        source.get_field_resolution = MagicMock(spec=source.get_field_resolution, side_effect=AssertionError("live source metadata called"))
+        source.get_schema_contract = MagicMock(spec=source.get_schema_contract, side_effect=AssertionError("live source metadata called"))
         audited = AuditedSource(
             name="rows",
             source_run_node_id="old-source",

@@ -7,14 +7,18 @@ from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
 from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
 
+_CURRENT_TOKEN = CoordinationToken(run_id="current", worker_id="worker:current:test", leader_epoch=1)
+
 
 def _factory() -> tuple[Mock, SimpleNamespace]:
-    factory = Mock()
+    factory = Mock(spec=RecorderFactory)
     call = SimpleNamespace(
         call_id="source-call",
         state_id="source-state",
@@ -39,7 +43,9 @@ def _factory() -> tuple[Mock, SimpleNamespace]:
 
 def test_replay_consumes_exact_source_call_and_fails_on_missing_occurrence() -> None:
     factory, _ = _factory()
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY, coordination_token=_CURRENT_TOKEN
+    )
     with pytest.raises(AuditIntegrityError, match="unconsumed"):
         session.finalize()
 
@@ -70,13 +76,17 @@ def test_missing_archived_response_refuses_before_replay() -> None:
     factory, _ = _factory()
     factory.execution.get_call_response_data.return_value = CallDataResult(state=CallDataState.HASH_ONLY, data=None)
     with pytest.raises(AuditIntegrityError, match="complete response archive"):
-        AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY)
+        AuditedCallModeSession(
+            factory, current_run_id="current", source_run_id="source", mode=RunMode.REPLAY, coordination_token=_CURRENT_TOKEN
+        )
     factory.execution.find_call_for_current_parent.assert_not_called()
 
 
 def test_verify_persists_mismatch_and_refuses_success() -> None:
     factory, _ = _factory()
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     assert (
         session.admit_verify_call(
             call_type=CallType.HTTP,
@@ -111,7 +121,9 @@ def test_verify_refuses_unmatched_request_before_live_dispatch() -> None:
     factory, _ = _factory()
     factory.execution.find_call_for_current_parent.return_value = None
     factory.execution.list_source_calls_for_current_parent.return_value = []
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     with pytest.raises(AuditIntegrityError, match="No exact source"):
         session.admit_verify_call(
             call_type=CallType.HTTP,
@@ -146,7 +158,9 @@ def test_managed_identity_verify_accepts_rotating_auth_after_non_auth_preflight(
     call.request_hash = "unused-for-semantic-match"
     factory.execution.list_source_calls_for_current_parent.return_value = [call]
     factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     partial = {key: value for key, value in current.items() if key != "resolved_ip"}
     partial["headers"] = {"Host": "example.org"}
     evidence = session.preflight_verify_http_managed_identity(
@@ -190,7 +204,9 @@ def test_managed_identity_verify_refuses_missing_auth_and_ambiguous_parent() -> 
     }
     factory.execution.list_source_calls_for_current_parent.return_value = [call]
     factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     partial = {key: value for key, value in archived.items() if key != "resolved_ip"}
     with pytest.raises(AuditIntegrityError, match="fingerprinted Authorization"):
         session.preflight_verify_http_managed_identity(request_data=partial, current_state_id="current-state", current_operation_id=None)
@@ -216,7 +232,9 @@ def test_http_verify_refuses_missing_or_invalid_archived_dns_pin_before_egress(m
         archived["resolved_ip"] = archived_ip
     factory.execution.list_source_calls_for_current_parent.return_value = [call]
     factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     request = {key: value for key, value in archived.items() if key != "resolved_ip"}
     if managed_identity:
         request["headers"] = {"Host": "example.org"}
@@ -241,7 +259,9 @@ def test_source_load_managed_identity_requires_pre_token_admission_and_verdict()
         "headers": {"Authorization": f"<fingerprint:{'0' * 64}>", "Accept": "application/json"},
     }
     factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     with pytest.raises(AuditIntegrityError, match="unconsumed"):
         session.finalize()
     partial = {**archived, "headers": {"Accept": "application/json"}}
@@ -281,6 +301,8 @@ def test_source_load_managed_identity_refuses_missing_auth_before_token() -> Non
     factory.execution.list_source_calls_for_current_parent.return_value = [call]
     archived = {"method": "GET", "url": "https://example.org/source/page", "headers": {"Accept": "application/json"}}
     factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
-    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
     with pytest.raises(AuditIntegrityError, match="fingerprinted Authorization"):
         session.preflight_verify_operation_http_managed_identity(request_data=archived, current_operation_id="current-operation")

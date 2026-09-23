@@ -25,6 +25,7 @@ from elspeth.core.landscape.row_data import CallDataState
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit import Call
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.core.landscape.factory import RecorderFactory
 
 
@@ -72,13 +73,24 @@ class AuditedCallModeSession:
     call never becomes permission to dispatch a live replay call.
     """
 
-    def __init__(self, factory: RecorderFactory, *, current_run_id: str, source_run_id: str, mode: RunMode) -> None:
+    def __init__(
+        self,
+        factory: RecorderFactory,
+        *,
+        current_run_id: str,
+        source_run_id: str,
+        mode: RunMode,
+        coordination_token: CoordinationToken,
+    ) -> None:
         if mode is RunMode.LIVE:
             raise ValueError("A call-mode session requires replay or verify mode")
         self._factory = factory
         self._current_run_id = current_run_id
         self._source_run_id = source_run_id
         self._mode = mode
+        if coordination_token.run_id != current_run_id:
+            raise AuditIntegrityError("Call session token does not belong to the current run")
+        self._coordination_token = coordination_token
         self._consumed: set[str] = set()
         self._failed_decisions: set[str] = set()
         self._verify_admissions: dict[tuple[CallType, str | None, str | None, int | None], str] = {}
@@ -630,6 +642,7 @@ class AuditedCallModeSession:
             source_call_id=call.call_id if call is not None else None,
             is_match=is_match,
             differences_json=canonical_json(differences),
+            coordination_token=self._coordination_token,
         )
         if is_match is not True:
             self._failed_decisions.add(current_call_id)

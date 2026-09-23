@@ -29,6 +29,11 @@ class _ReplaySchema(PluginSchema):
     value: int
 
 
+def _bound_source_load(_ctx: PluginContext) -> object:
+    """The one-argument signature seen on a bound SourceProtocol.load."""
+    raise AssertionError("signature-only source load")
+
+
 def _source_audit(*, payload: dict[str, object] | None = None) -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
     payload = {"value": 7} if payload is None else payload
     factory = MagicMock(spec=RecorderFactory)
@@ -38,7 +43,7 @@ def _source_audit(*, payload: dict[str, object] | None = None) -> tuple[MagicMoc
         plugin_version="1",
         source_file_hash=None,
         output_schema=_ReplaySchema,
-        load=MagicMock(side_effect=AssertionError("source.load must not run during admission")),
+        load=MagicMock(spec=_bound_source_load, side_effect=AssertionError("source.load must not run during admission")),
     )
     factory.run_lifecycle.get_run_source_lifecycle_records.return_value = {
         "source-old": SimpleNamespace(
@@ -161,7 +166,9 @@ def test_verify_detects_source_row_drift_before_returning_snapshot() -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
     assert audited.schema_contract is not None
-    source.load = MagicMock(return_value=iter([SourceRow.valid({"value": 9}, contract=audited.schema_contract, source_row_index=5)]))
+    source.load = MagicMock(
+        spec=_bound_source_load, return_value=iter([SourceRow.valid({"value": 9}, contract=audited.schema_contract, source_row_index=5)])
+    )
     ctx = PluginContext(run_id="verify-run", config={})
 
     with pytest.raises(AuditIntegrityError, match="differs from audited run"):
@@ -174,12 +181,12 @@ def test_verify_accepts_empty_and_quarantined_streams() -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
     ctx = PluginContext(run_id="verify-run", config={})
-    source.load = MagicMock(return_value=iter(()))
+    source.load = MagicMock(spec=_bound_source_load, return_value=iter(()))
 
     assert _verified_rows(source, ctx, replace(audited, rows=())) == ()
 
     quarantined = SourceRow.quarantined({"value": "bad"}, "invalid", "quarantine", source_row_index=3)
-    source.load = MagicMock(return_value=iter([quarantined]))
+    source.load = MagicMock(spec=_bound_source_load, return_value=iter([quarantined]))
     assert _verified_rows(source, ctx, replace(audited, rows=(quarantined,))) == (quarantined,)
 
 
@@ -193,7 +200,7 @@ def test_verify_snapshots_mutable_rows_before_source_reuses_buffer() -> None:
         yield SourceRow.valid(buffer, contract=audited.schema_contract, source_row_index=5)
         buffer["value"] = 999
 
-    source.load = MagicMock(side_effect=load_with_reused_buffer)
+    source.load = MagicMock(spec=_bound_source_load, side_effect=load_with_reused_buffer)
     ctx = PluginContext(run_id="verify-run", config={})
 
     verified = _verified_rows(source, ctx, audited)
@@ -208,8 +215,10 @@ def test_verify_late_source_drift_refuses_complete_preload() -> None:
     assert audited.schema_contract is not None
     first = SimpleNamespace(name="first", node_id="source-1")
     second = SimpleNamespace(name="second", node_id="source-2")
-    first.load = MagicMock(return_value=iter(audited.rows))
-    second.load = MagicMock(return_value=iter([SourceRow.valid({"value": 999}, contract=audited.schema_contract, source_row_index=5)]))
+    first.load = MagicMock(spec=_bound_source_load, return_value=iter(audited.rows))
+    second.load = MagicMock(
+        spec=_bound_source_load, return_value=iter([SourceRow.valid({"value": 999}, contract=audited.schema_contract, source_row_index=5)])
+    )
 
     @contextmanager
     def audited_operation(**kwargs: object) -> object:
@@ -252,8 +261,8 @@ def test_verify_materializes_all_sources_once_with_source_operation_identity() -
         observed_operations.append(ctx.operation_id)
         return iter(audited_first.rows)
 
-    first.load = MagicMock(side_effect=load_with_audit)
-    second.load = MagicMock(side_effect=load_with_audit)
+    first.load = MagicMock(spec=_bound_source_load, side_effect=load_with_audit)
+    second.load = MagicMock(spec=_bound_source_load, side_effect=load_with_audit)
 
     @contextmanager
     def audited_operation(**kwargs: object) -> object:

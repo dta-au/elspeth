@@ -622,7 +622,7 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # into transform_errors (one row per member of a FAILED aggregation batch), inside its
 # own fenced_leader_transaction. Write set UNCHANGED (transform_errors/insert already
 # existed via record_transform_error). Measured by scripts/fencing_inventory.py.
-_EXPECTED_DML_COUNT = 159
+_EXPECTED_DML_COUNT = 160
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -715,7 +715,13 @@ _EXPECTED_DML_COUNT = 159
 # fingerprint a3c95c278555df16 -> 9bea65003336f796 because the BLOCKED image now
 # writes row_payload_json. Measured by scripts/fencing_inventory.py --json against a
 # clean export of c5ea22fa7 and the tree.
-_EXPECTED_DML_INVENTORY_SHA256 = "4856baad46ee2158dda70fcf902a1aebaca375d8dc8947fe05be9f87a3e85c28"
+# K056 adds the owned call_verifications INSERT and its source-run lineage.
+# Combined K063/K056 inventory adds the verification identity and its new
+# table/operation shape after the aggregation batch identity above.
+# Verification writes derive their current run from the fenced token and
+# their source run from the checked persisted run row in that transaction.
+# Re-derived on the combined K063/K056 tree with scripts/fencing_inventory.py.
+_EXPECTED_DML_INVENTORY_SHA256 = "84728f51ccaef29acee6132cd4efc8430edb1262102d68a8681be323c176905c"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -730,6 +736,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("batches", "update"),
         ("calls", "insert"),
         ("calls", "update"),
+        ("call_verifications", "insert"),
         ("checkpoints", "delete"),
         ("checkpoints", "insert"),
         ("coalesce_effect_members", "insert"),
@@ -818,14 +825,17 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # SchedulerDrainCoordinator._mark_claimed_scheduler_work_blocked -> self._scheduler.mark_blocked#2.
 # The barrier arm (#1) writes the recorded arrival's barrier_key and held row; the
 # queue arm (#2) keeps the claimed row. Nothing departed.
-_EXPECTED_CALL_COUNT = 279
+# K056 adds seven live call sites across replay verification, readiness,
+# provider lineage, and PDF call auditing; the complete-tree scanner measured
+# 286 after combining those sites with the K063 callers above.
+_EXPECTED_CALL_COUNT = 286
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
 # AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
 # C4: 70bb43aa… -> 6c2ff337…, the caller exchange above.
 # R4: 6c2ff337… -> the value below, the one caller added above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "0478b37dfdcc456f81565420769be2a27c95473406d9f1d964885e204798f41a"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "ba1bb6159620dcd69bc300169be0042769f42fc3a56beb783abd4f5c5bb36fb6"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -7772,7 +7782,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # attachment and precedes schema initialization/return on both dialects.
     # Approved prompt artifact rename changes the required column/index names;
     # database construction and deadline guard installation are unchanged.
-    "src/elspeth/core/landscape/database.py": "4430861bca6a169282ba94364224571b8c29bc6991200403ac6d22b3031c76b8",
+    # K056 adds schema checks for run lineage, call verification, and
+    # operation occurrence without changing the deadline issuance path.
+    "src/elspeth/core/landscape/database.py": "ab066128381ea24d2799479e20e80985190da4bf8847bbe093985d59c6ae54f4",
 }
 
 
@@ -9170,21 +9182,27 @@ def _coordination_repo(self) -> RunCoordinationRepository:
     return self._run_coordination
 """,
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
-def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None) -> Run:
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None, run_start_permit: RunStartPermitBinding | None=None, run_mode: RunMode=RunMode.LIVE, replay_from_run_id: str | None=None) -> Run:
     if status == RunStatus.COMPLETED:
         raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
+    if type(run_mode) is not RunMode:
+        raise AuditIntegrityError('run_mode must be a RunMode')
+    if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
+        raise AuditIntegrityError('live runs have no replay source; replay/verify runs require one')
     validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
     _validate_openrouter_catalog_snapshot(sha256=openrouter_catalog_sha256, source=openrouter_catalog_source)
     if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
         raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
     run_id = run_id or generate_id()
+    if replay_from_run_id == run_id:
+        raise AuditIntegrityError('a replay/verify run cannot cite itself as its source')
     if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
         raise AuditIntegrityError('Run start permit must bind the exact run UUID')
     settings_json = canonical_json(config)
     config_hash = stable_hash(config)
     timestamp = now()
     runtime_val_manifest_json = _frozen_runtime_val_manifest_json()
-    run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, reproducibility_grade=reproducibility_grade)
+    run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, run_mode=run_mode, replay_from_run_id=replay_from_run_id, reproducibility_grade=reproducibility_grade)
     worker_id = leader_worker_id or mint_worker_id(run.run_id)
     coordination = self._coordination_repo
     try:
@@ -9193,7 +9211,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
                 if existing is not None:
                     return existing
-            conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
+            conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, run_mode=run.run_mode.value, replay_from_run_id=run.replay_from_run_id, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
             if run_start_permit is not None:
                 conn.execute(run_start_admissions_table.insert().values(run_id=run_id, permit_id=run_start_permit.permit_id, permit_epoch=run_start_permit.permit_epoch, subject_hash=run_start_permit.subject_hash, state='prepared'))
             if initiated_by_user_id is not None and auth_provider_type is not None:
@@ -9302,6 +9320,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
     ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): {
         "Run": "elspeth.contracts.Run",
         "RunStatus": "elspeth.contracts.RunStatus",
+        "RunMode": "elspeth.contracts.enums.RunMode",
         "validate_run_attribution": "elspeth.core.landscape.run_lifecycle_repository.validate_run_attribution",
         "_validate_openrouter_catalog_snapshot": "elspeth.core.landscape.run_lifecycle_repository._validate_openrouter_catalog_snapshot",
         "canonical_json": "elspeth.core.canonical.canonical_json",

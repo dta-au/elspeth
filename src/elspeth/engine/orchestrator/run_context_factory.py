@@ -190,11 +190,14 @@ class RunContextFactory:
                 output_refs=refs.output_refs,
             )
             if self._call_mode_session_factory is None:
+                if coordination_token is None:
+                    raise RuntimeError("Replay/verify requires a current leader token before call comparison")
                 call_mode_session = AuditedCallModeSession(
                     factory,
                     current_run_id=run_id,
                     source_run_id=source_run_id,
                     mode=runtime_mode.mode,
+                    coordination_token=coordination_token,
                 )
             else:
                 call_mode_session = self._call_mode_session_factory(factory, runtime_mode, run_id)

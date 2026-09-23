@@ -722,6 +722,7 @@ class ExecutionRepository:
         source_call_id: str | None,
         is_match: bool | None,
         differences_json: str,
+        coordination_token: CoordinationToken,
     ) -> CallVerification:
         return self.calls.record_verification_decision(
             current_run_id=current_run_id,
@@ -730,6 +731,7 @@ class ExecutionRepository:
             source_call_id=source_call_id,
             is_match=is_match,
             differences_json=differences_json,
+            coordination_token=coordination_token,
         )
 
     def get_verification_decision(self, current_call_id: str) -> CallVerification | None:

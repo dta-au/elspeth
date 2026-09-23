@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -10,7 +11,7 @@ from sqlalchemy import select
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import RunMode
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataState
@@ -80,6 +81,7 @@ def test_run_and_call_lineage_round_trip_with_verified_request() -> None:
         source_call_id=source_call.call_id,
         is_match=False,
         differences_json='{"status":{"expected":201,"actual":200}}',
+        coordination_token=leader_coordination_token(factory, "current"),
     )
     persisted = factory.execution.get_verification_decision(current_call.call_id)
     assert persisted is not None
@@ -112,11 +114,36 @@ def test_rejects_wrong_run_source_call_and_verification_without_partial_write() 
             source_call_id=current_call.call_id,
             is_match=True,
             differences_json="{}",
+            coordination_token=leader_coordination_token(factory, "current"),
         )
     assert factory.execution.get_verification_decision(current_call.call_id) is None
     assert [call.call_id for call in factory.execution.get_operation_calls(current_operation)] == [current_call.call_id]
     with factory._db.engine.connect() as conn:
         assert conn.execute(select(calls_table.c.call_id).where(calls_table.c.source_call_id == source_call.call_id)).all() == []
+
+
+def test_verification_decision_requires_current_live_leader_before_write() -> None:
+    factory, source_operation, current_operation = _two_runs()
+    source_call = _record(factory, "source", source_operation)
+    current_call = _record(factory, "current", current_operation)
+    current_token = leader_coordination_token(factory, "current")
+    kwargs = {
+        "current_run_id": "current",
+        "current_call_id": current_call.call_id,
+        "source_run_id": "source",
+        "source_call_id": source_call.call_id,
+        "is_match": True,
+        "differences_json": "{}",
+    }
+
+    with pytest.raises(AuditIntegrityError, match="token does not belong"):
+        factory.execution.record_verification_decision(**kwargs, coordination_token=leader_coordination_token(factory, "source"))
+    with pytest.raises(RunLeadershipLostError):
+        factory.execution.record_verification_decision(
+            **kwargs,
+            coordination_token=replace(current_token, leader_epoch=current_token.leader_epoch + 1),
+        )
+    assert factory.execution.get_verification_decision(current_call.call_id) is None
 
 
 def test_repeated_source_loads_bind_transactional_occurrence() -> None:
@@ -197,6 +224,7 @@ def test_rejects_lineage_from_an_unconfigured_source_run() -> None:
             source_call_id=other_call.call_id,
             is_match=True,
             differences_json="{}",
+            coordination_token=leader_coordination_token(factory, "current"),
         )
     assert factory.execution.get_verification_decisions_for_run("current") == []
 

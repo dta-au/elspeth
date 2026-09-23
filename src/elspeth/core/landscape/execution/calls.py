@@ -836,6 +836,7 @@ class CallAuditRepository:
         source_call_id: str | None,
         is_match: bool | None,
         differences_json: str,
+        coordination_token: CoordinationToken,
     ) -> CallVerification:
         """Persist one comparison, checking both call owners in the same transaction."""
         if type(is_match) not in (bool, type(None)):
@@ -851,7 +852,14 @@ class CallAuditRepository:
         if current_run_id == source_run_id:
             raise AuditIntegrityError("verification source and current runs must differ")
         recorded_at = now()
-        with self._db.write_connection() as conn:
+        if coordination_token.run_id != current_run_id:
+            raise AuditIntegrityError("verification decision token does not belong to the current run")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_verification_decision",
+        ) as conn:
             run = conn.execute(
                 select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == current_run_id)
             ).one_or_none()
@@ -867,8 +875,8 @@ class CallAuditRepository:
             conn.execute(
                 call_verifications_table.insert().values(
                     current_call_id=current_call_id,
-                    current_run_id=current_run_id,
-                    source_run_id=source_run_id,
+                    current_run_id=coordination_token.run_id,
+                    source_run_id=run.replay_from_run_id,
                     source_call_id=source_call_id,
                     is_match=is_match,
                     differences_json=canonical_json(differences),
