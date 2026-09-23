@@ -89,6 +89,7 @@ import {
   humaniseStepTitle,
   stepLabelForNodeId,
 } from "./interpretationStepLabel";
+import { ApprovalReadinessRow } from "@/components/workflow/ApprovalReadinessRow";
 import { DecisionPanel, DecisionPanelLiveRegion } from "./DecisionPanel";
 import { projectDecisionRows } from "./decisionPanelRows";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -2022,6 +2023,7 @@ export function ChatPanel({
   // suggestion/fallback handlers send provider chat; proposal and
   // interpretation decisions use their existing approval APIs.
   const validationResult = useExecutionStore((s) => s.validationResult);
+  const pendingApproval = useExecutionStore((s) => s.pendingApproval);
   const decisionRows = useMemo(
     () =>
       projectDecisionRows({
@@ -2319,6 +2321,20 @@ export function ChatPanel({
       decisionIds={decisionRows.rows.map((row) => row.id)}
     />
   );
+  // A pending approval withholds execution, so it is a blocking state and belongs
+  // at the top level beside the decision panel — never behind the Checks sub-tab
+  // (operator placement ruling). It is rendered separately rather than as a
+  // DecisionPanel row because that panel returns null with nothing to decide,
+  // which is exactly when a clean composition is ready to be sent for approval.
+  // The row self-hides unless workflow governance is on.
+  const approvalReadiness =
+    activeSessionId !== null && compositionState !== null ? (
+      <ApprovalReadinessRow
+        sessionId={activeSessionId}
+        stateId={compositionState.id}
+        pendingApproval={pendingApproval}
+      />
+    ) : null;
   const decisionPanel = (
     <>
       <DecisionPanel
@@ -2704,6 +2720,7 @@ export function ChatPanel({
         )}
         <div className="chat-panel-dock" tabIndex={0} ref={attachDock}>
           {decisionPanel}
+          {approvalReadiness}
         </div>
         {buildGuidedComposer({
           placeholder: GUIDED_COMPLETED_CHAT_PLACEHOLDER,
@@ -3265,6 +3282,7 @@ export function ChatPanel({
                 tabIndex={0}
               >
                 {decisionPanel}
+          {approvalReadiness}
               </div>
               {stepComposer}
             </>
@@ -3636,6 +3654,7 @@ export function ChatPanel({
         {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
 
         {decisionPanel}
+          {approvalReadiness}
       </div>
 
       {/* Input */}

@@ -6,6 +6,7 @@ import { AuditReadinessPanel } from "./AuditReadinessPanel";
 import { useSessionStore } from "../../stores/sessionStore";
 import { useAuditReadinessStore, getInitialState } from "../../stores/auditReadinessStore";
 import { useExecutionStore } from "../../stores/executionStore";
+import { useMailboxStore } from "@/stores/mailboxStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -169,6 +170,24 @@ describe("AuditReadinessPanel", () => {
     resetStore(useInterpretationEventsStore);
     resetStore(usePreferencesStore);
     vi.clearAllMocks();
+  });
+
+  it("does not host the approval controls — a blocking state belongs at the top level, not in this sub-tab", async () => {
+    // Operator placement ruling: a blocking state and the control that clears it
+    // sit in the chat/action bar, never behind Pipeline -> Checks. A pending
+    // approval withholds execution, so the request controls moved to ChatPanel
+    // beside the decision panel. This pins the absence so they cannot drift back.
+    useMailboxStore.setState({
+      summary: { governance: "on", roles: ["approver"], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0 },
+    } as never);
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
+    );
+    render(<AuditReadinessPanel />);
+    await waitFor(() => expect(api.fetchAuditReadiness).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Request approval" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Request review" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Workflow approval readiness")).not.toBeInTheDocument();
   });
 
   it("auto-fetches on mount using compositionState.version", async () => {
