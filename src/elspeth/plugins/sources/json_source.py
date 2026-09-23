@@ -176,7 +176,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:33fd5411565563bb"
+    source_file_hash: str | None = "sha256:9773d7d4da8358a9"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -644,7 +644,7 @@ class JSONSource(BaseSource):
                 row=normalized_row,
                 # Input-free text: str(e) echoes the offending Tier-3 value
                 # into audit surfaces (elspeth-a300402c58).
-                error_msg=safe_validation_error_text(e),
+                error_msg=safe_validation_error_text(e, self._schema_class),
                 source_row_index=source_row_index,
             )
             if quarantined is not None:

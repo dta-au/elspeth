@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:efc30ff9f58d734b"
+    source_file_hash: str | None = "sha256:aaaf6619345f0665"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1475,7 +1475,7 @@ class AWSS3Source(BaseSource):
                     source_row_index=source_row_index,
                 )
         except ValidationError as exc:
-            message = safe_validation_error_text(exc)
+            message = safe_validation_error_text(exc, self._schema_class)
             ctx.record_validation_error(
                 row=row_to_validate,
                 error=message,

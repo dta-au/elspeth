@@ -448,7 +448,7 @@ class TransformExecutor:
             transform.input_schema.model_validate(input_dict, strict=True)
         except ValidationError as e:
             input_violation = PluginContractViolation(
-                f"Transform '{transform.name}' input validation failed: {safe_validation_error_text(e)}. "
+                f"Transform '{transform.name}' input validation failed: {safe_validation_error_text(e, transform.input_schema)}. "
                 "This indicates an upstream transform/source schema bug."
             )
             raise input_violation from e
@@ -580,7 +580,7 @@ class TransformExecutor:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
                 output_violation = PluginContractViolation(
-                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {safe_validation_error_text(e)}. "
+                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {safe_validation_error_text(e, transform.output_schema)}. "
                     "This indicates a transform schema bug."
                 )
                 raise output_violation from e

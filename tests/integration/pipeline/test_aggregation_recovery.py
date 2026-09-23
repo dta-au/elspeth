@@ -267,7 +267,7 @@ class _CountingPassTransform(BaseTransform):
 
 def _build_eof_aggregation_pipeline(
     source: Any,
-    transform: _SumBatchTransform,
+    transform: BaseTransform,
     output_sink: CollectSink,
     downstream: _CountingPassTransform | None = None,
     *,

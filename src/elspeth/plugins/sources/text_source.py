@@ -78,7 +78,7 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f105f1caab76bd05"
+    source_file_hash: str | None = "sha256:7ca541ba2dd25398"
     config_model = TextSourceConfig
     _on_validation_failure: str
 
@@ -280,7 +280,7 @@ class TextSource(BaseSource):
         except ValidationError as exc:
             # Input-free text: str(exc) echoes the offending Tier-3 value
             # into audit surfaces (elspeth-a300402c58).
-            error_text = safe_validation_error_text(exc)
+            error_text = safe_validation_error_text(exc, self._schema_class)
             ctx.record_validation_error(
                 row=row,
                 error=error_text,

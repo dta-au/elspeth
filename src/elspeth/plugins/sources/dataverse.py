@@ -289,7 +289,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7ad819d762287fcb"
+    source_file_hash: str | None = "sha256:f97eb2c8e80ef0b1"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -986,7 +986,7 @@ class DataverseSource(BaseSource):
                     except ValidationError as e:
                         # Input-free text: str(e) echoes the offending Tier-3
                         # value into audit surfaces (elspeth-a300402c58).
-                        error_text = safe_validation_error_text(e)
+                        error_text = safe_validation_error_text(e, self._schema_class)
                         ctx.record_validation_error(
                             row=normalized_row,
                             error=error_text,

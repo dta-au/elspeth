@@ -126,7 +126,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7e1960a59e9bbff5"
+    source_file_hash: str | None = "sha256:8027d28c8aec8228"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the
@@ -259,7 +259,7 @@ class BlobRowsSource(BaseSource):
             # custody filename) into audit surfaces (elspeth-a300402c58).
             # Only a schema failure quarantines; any other ValueError in this
             # block is a ContractBuilder "source plugin bug" and must crash.
-            error_msg = f"blob_rows row failed schema validation: {safe_validation_error_text(exc)}"
+            error_msg = f"blob_rows row failed schema validation: {safe_validation_error_text(exc, self._schema_class)}"
             ctx.record_validation_error(
                 row=row,
                 error=error_msg,

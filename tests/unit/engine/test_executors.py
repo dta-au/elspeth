@@ -727,7 +727,8 @@ class TestTransformExecutor:
         """The violation message is routed as the row's reason; it must not echo the value.
 
         ``str(ValidationError)`` carries ``input_value=...``; the executor renders
-        loc/msg/type only (``contracts.safe_validation_errors``).
+        the declared field and pydantic's type code only
+        (``contracts.safe_validation_errors``).
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)

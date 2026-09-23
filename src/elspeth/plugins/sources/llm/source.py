@@ -123,7 +123,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ce638da90cb01908"
+    source_file_hash: str | None = "sha256:99b763673930d1cd"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -485,7 +485,7 @@ class LLMSource(BaseSource):
             validated = self._schema_class.model_validate(output)
             validated_row = validated.to_row()
         except ValidationError as exc:
-            yield from self._validation_failure(output, safe_validation_error_text(exc), ctx)
+            yield from self._validation_failure(output, safe_validation_error_text(exc, self._schema_class), ctx)
             return
 
         if self._contract_builder is not None:

@@ -99,7 +99,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5d131927c2baea3a"
+    source_file_hash: str | None = "sha256:081b2eaaf545bb99"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -617,7 +617,7 @@ class CSVSource(BaseSource):
             except ValidationError as e:
                 # Input-free text: str(e) echoes the offending Tier-3 value
                 # into audit surfaces (elspeth-a300402c58).
-                error_text = safe_validation_error_text(e)
+                error_text = safe_validation_error_text(e, self._schema_class)
                 ctx.record_validation_error(
                     row=row,
                     error=error_text,

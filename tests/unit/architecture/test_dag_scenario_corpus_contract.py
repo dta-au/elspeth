@@ -721,6 +721,23 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # ValueTransform metadata/output declaration repair changes only its three
 # source_file_hash tokens in union-collision-fail audit node records. The
 # token-normalized manifest is byte-identical; runtime oracle data is unchanged.
+# Rotated 2026-09-23 (elspeth-5887fb7928, E2): a SEMANTIC move ruled by the
+# operator plus a plugin provenance rotation. The validation renderer became
+# value-free and model-aware (safe_validation_error_text(exc, schema): a
+# top-level name only when the validated schema declares it, pydantic-core type
+# codes only, never msg), which changed each source plugin's call line.
+# (1) Ruled text move in retry-quarantine-discard-routed-errors /
+# source-quarantine-routed: validation_errors.error and node_states.error
+# "1 validation error: id: Input should be a valid integer, unable to parse
+# string as an integer [int_parsing]" -> "1 validation error: id: [int_parsing]",
+# terminal error_hash 00616901a7f46051 -> 8a4095b278791181; its frozen oracle
+# snapshot was rewritten for that one case only (the only oracle_freeze file
+# that moved). (2) csv_source source_file_hash 5d131927c2baea3a ->
+# 081b2eaaf545bb99 (15 manifest pins) and json_source 33fd5411565563bb ->
+# 9773d7d4da8358a9 (1 pin), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash on the tree rebased
+# onto release/0.8.1 @ e991b35fb. The reopen-resume projection digest and this
+# digest are re-derived once, on the final rebased tree (see the latest entry).
 EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

@@ -111,6 +111,8 @@ def test_statistics_do_not_count_failed_audit_writes(audit_failure: str) -> None
 
 # Dynamic schema config for tests
 DYNAMIC_SCHEMA = {"mode": "observed"}
+# A declared field the fixture rows omit, so validation fails through the real schema.
+_REQUIRED_FIELD_SCHEMA = {"mode": "fixed", "fields": ["contactid: str", "required_field: str"]}
 FIXED_SCHEMA = {
     "mode": "fixed",
     "fields": [
@@ -281,14 +283,6 @@ class _SourceContextFake:
 
 
 @dataclass(frozen=True, slots=True)
-class _ValidatedRow:
-    row: dict[str, Any]
-
-    def to_row(self) -> dict[str, Any]:
-        return dict(self.row)
-
-
-@dataclass(frozen=True, slots=True)
 class _CredentialToken:
     token: str = "test-token"
 
@@ -343,15 +337,6 @@ def _make_metadata_page(
         paging_cookie=None,
         more_records=None,
     )
-
-
-def _schema_class(validate: Callable[[dict[str, Any]], Any]) -> type[Any]:
-    class _Schema:
-        @staticmethod
-        def model_validate(row: dict[str, Any]) -> Any:
-            return validate(row)
-
-    return _Schema
 
 
 def _mock_lifecycle_context(run_id: str = "test-run-123") -> _LifecycleContextFake:
@@ -419,24 +404,11 @@ def _make_source_unlocked(config: dict[str, Any]) -> Any:
     return _make_source(config)
 
 
-def _make_source_for_load(
-    pages: list[DataversePageResponse],
-    config: dict[str, Any],
-    *,
-    schema_validate_side_effect: Any = None,
-) -> Any:
+def _make_source_for_load(pages: list[DataversePageResponse], config: dict[str, Any]) -> Any:
     """Create DataverseSource for load() tests with a fake client."""
     from elspeth.plugins.sources.dataverse import DataverseSource
 
-    if schema_validate_side_effect is not None:
-        schema_cls = _schema_class(schema_validate_side_effect)
-        with patch(
-            "elspeth.plugins.sources.dataverse.create_schema_from_config",
-            return_value=schema_cls,
-        ):
-            source = DataverseSource(config)
-    else:
-        source = DataverseSource(config)
+    source = DataverseSource(config)
 
     if source._entity is not None:
         metadata_url = (
@@ -458,20 +430,11 @@ def _make_source_for_start_and_load(
     config: dict[str, Any],
     *,
     mock_client: _DataverseClientFake,
-    schema_validate_side_effect: Any = None,
 ) -> Any:
     """Create DataverseSource for lifecycle + load() tests with a patched client."""
     from elspeth.plugins.sources.dataverse import DataverseSource
 
-    if schema_validate_side_effect is not None:
-        schema_cls = _schema_class(schema_validate_side_effect)
-        with patch(
-            "elspeth.plugins.sources.dataverse.create_schema_from_config",
-            return_value=schema_cls,
-        ):
-            source = DataverseSource(config)
-    else:
-        source = DataverseSource(config)
+    source = DataverseSource(config)
 
     lifecycle_ctx = _mock_lifecycle_context()
     with (
@@ -1720,57 +1683,22 @@ class TestDataverseSourceLoadStructured:
         ctx.record_validation_error.assert_called_once()
 
     def test_load_schema_validation_failure_quarantines(self) -> None:
-        """Rows failing schema validation are quarantined."""
-        from pydantic import ValidationError
-
-        def failing_validate(row: dict[str, Any]) -> None:
-            raise ValidationError.from_exception_data(
-                title="DataverseRowSchema",
-                line_errors=[
-                    {
-                        "type": "missing",
-                        "loc": ("required_field",),
-                        "input": row,
-                    }
-                ],
-            )
-
+        """Rows failing schema validation are quarantined, the failure named by its declared field."""
         pages = [_make_page([{"contactid": "1"}])]
-        source = _make_source_for_load(
-            pages,
-            _base_config(),
-            schema_validate_side_effect=failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema=_REQUIRED_FIELD_SCHEMA))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
         assert len(rows) == 1
         assert rows[0].is_quarantined
         assert rows[0].quarantine_destination == QUARANTINE_SINK
+        assert rows[0].quarantine_error == "1 validation error: required_field: [missing]"
         ctx.record_validation_error.assert_called_once()
 
     def test_load_schema_validation_failure_discard(self) -> None:
         """Schema validation failure with discard yields no rows."""
-        from pydantic import ValidationError
-
-        def failing_validate(row: dict[str, Any]) -> None:
-            raise ValidationError.from_exception_data(
-                title="DataverseRowSchema",
-                line_errors=[
-                    {
-                        "type": "missing",
-                        "loc": ("required_field",),
-                        "input": row,
-                    }
-                ],
-            )
-
         pages = [_make_page([{"contactid": "1"}])]
-        source = _make_source_for_load(
-            pages,
-            _base_config(on_validation_failure="discard"),
-            schema_validate_side_effect=failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema=_REQUIRED_FIELD_SCHEMA, on_validation_failure="discard"))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
@@ -1812,26 +1740,6 @@ class TestDataverseSourceLoadStructured:
 
     def test_load_valid_and_quarantined_mixed(self) -> None:
         """Valid and quarantined rows can be interleaved."""
-        from pydantic import ValidationError
-
-        call_count = 0
-
-        def sometimes_failing_validate(row: dict[str, Any]) -> _ValidatedRow:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 2:
-                raise ValidationError.from_exception_data(
-                    title="DataverseRowSchema",
-                    line_errors=[
-                        {
-                            "type": "missing",
-                            "loc": ("field",),
-                            "input": row,
-                        }
-                    ],
-                )
-            return _ValidatedRow(dict(row))
-
         pages = [
             _make_page(
                 [
@@ -1841,18 +1749,15 @@ class TestDataverseSourceLoadStructured:
                 ]
             ),
         ]
-        source = _make_source_for_load(
-            pages,
-            _base_config(),
-            schema_validate_side_effect=sometimes_failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema={"mode": "fixed", "fields": ["contactid: str", "fullname: str"]}))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
         valid_rows = [r for r in rows if not r.is_quarantined]
         quarantined_rows = [r for r in rows if r.is_quarantined]
-        assert len(valid_rows) == 2
-        assert len(quarantined_rows) == 1
+        assert [r.row["contactid"] for r in valid_rows] == ["1", "3"]
+        assert [r.row["contactid"] for r in quarantined_rows] == ["2"]
+        assert quarantined_rows[0].quarantine_error == "1 validation error: fullname: [missing]"
 
 
 # ─────────────────────────────────────────────────────────────────────────

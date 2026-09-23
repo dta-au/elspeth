@@ -102,7 +102,7 @@ def validate_batch_inputs(
         except ValidationError as exc:
             raise PluginContractViolation(
                 f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: "
-                f"{safe_validation_error_text(exc)}. "
+                f"{safe_validation_error_text(exc, transform.input_schema)}. "
                 "This indicates an upstream transform/source schema bug."
             ) from exc
 
@@ -137,6 +137,6 @@ def validate_success_outputs(
         except ValidationError as exc:
             raise PluginContractViolation(
                 f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: "
-                f"{safe_validation_error_text(exc)}. "
+                f"{safe_validation_error_text(exc, transform.output_schema)}. "
                 "This indicates a transform schema bug."
             ) from exc

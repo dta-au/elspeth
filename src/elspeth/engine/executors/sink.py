@@ -293,7 +293,7 @@ class SinkExecutor:
                     sink.input_schema.model_validate(row)
                 except ValidationError as e:
                     raise PluginContractViolation(
-                        f"Sink '{sink.name}' input validation failed: {safe_validation_error_text(e)}. "
+                        f"Sink '{sink.name}' input validation failed: {safe_validation_error_text(e, sink.input_schema)}. "
                         "This indicates an upstream transform/source schema bug."
                     ) from e
 
