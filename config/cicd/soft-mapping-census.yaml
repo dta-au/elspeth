@@ -904,8 +904,9 @@ files:
     dict[str, Any]: 19
     dict[str, object]: 2
   src/elspeth/web/composer/tools/wire_projection.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 20
+    Mapping[str, Any]: 7
+    boundary: 1
+    dict[str, Any]: 23
   src/elspeth/web/composer/turn_audit.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
@@ -1055,10 +1056,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 887
+  Mapping[str, Any]: 889
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
-  boundary: 65
-  dict[str, Any]: 1171
+  boundary: 66
+  dict[str, Any]: 1174
   dict[str, object]: 409
-  soft: 2786
+  soft: 2791

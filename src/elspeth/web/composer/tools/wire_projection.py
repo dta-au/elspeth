@@ -28,10 +28,16 @@ provider. It is derived from S once, at import, by one pure walk per
   The 10 option-bearing tools keep their ``none`` parameters, and the wire
   list stamps them ``strict: false``.
 
-Decode, encode and conformance (``decode_wire_arguments``) land with their
-first reader; this module owns the projection, the ledger, the limits check
-and the faithfulness gate, all of which run at import, so a projection that
-is not faithful to S stops web boot rather than reaching a provider.
+This module owns the projection, the ledger, the limits check and the
+faithfulness gate, all of which run at import, so a projection that is not
+faithful to S stops web boot rather than reaching a provider.
+
+It also owns the way back. :func:`decode_wire_arguments` classifies the
+provider's arguments against the W that was sent (``wire_conformant``),
+unwraps the set_pipeline envelope (its one rejection), and on
+``openai_strict`` turns a ``null`` at a promoted position back into the
+omission S expects. It never admits or rejects on W: S stays the only
+contract. :func:`encode_semantic_arguments` is the inverse of the envelope.
 """
 
 from __future__ import annotations
@@ -44,13 +50,19 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, cast
 
+from jsonschema import Draft202012Validator
+
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.tools._dispatch import _TOOL_SCHEMA_BY_NAME, WIRE_KEYWORD_ALLOWLIST, get_tool_definitions
 from elspeth.web.composer.tools.strict_profile import StrictViolationKind, check_openai_strict
 
 __all__ = [
     "OPENAI_STRICT_LIMITS",
+    "DecodedArguments",
     "EnvelopeUnwrap",
     "LedgerEntry",
     "StripNull",
@@ -60,6 +72,8 @@ __all__ = [
     "WireTool",
     "assert_wire_projection_faithful",
     "build_wire_tool_defs",
+    "decode_wire_arguments",
+    "encode_semantic_arguments",
     "omission_instruction_matches",
     "project_tool",
     "stamp_planner_terminal",
@@ -134,6 +148,22 @@ class WireTool:
 
     def thawed_function(self) -> dict[str, Any]:
         return cast(dict[str, Any], deep_thaw(self.function))
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedArguments:
+    """Provider arguments decoded back to the flat semantic form S admits.
+
+    ``semantic`` is deep-frozen. ``wire_conformant`` records whether the raw
+    arguments conformed to the W they were sent under; it is a
+    classification, never an admission decision.
+    """
+
+    semantic: Mapping[str, Any]
+    wire_conformant: bool
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "semantic")
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,3 +828,101 @@ def stamp_planner_terminal(definition: Mapping[str, Any], dialect: ToolContractD
     if dialect == ToolContractDialect.OPENAI_STRICT:
         stamped["function"]["strict"] = False
     return stamped
+
+
+# ---------------------------------------------------------------- decode / encode
+
+# One compiled validator per sent W, so ``wire_conformant`` holds the raw
+# arguments to exactly the schema the provider was given.
+_WIRE_VALIDATORS: Final[Mapping[ToolContractDialect, Mapping[str, Draft202012Validator]]] = MappingProxyType(
+    {
+        dialect: MappingProxyType({name: Draft202012Validator(tool.thawed_function()["parameters"]) for name, tool in tools.items()})
+        for dialect, tools in _WIRE_TOOL_DEFS.items()
+    }
+)
+
+
+def _sent_wire_tool(tool_name: str, dialect: ToolContractDialect) -> WireTool:
+    tools = _WIRE_TOOL_DEFS[dialect]
+    if tool_name not in tools:
+        # A caller bug, not a model error: callers decode only the names in
+        # the list sent on that call. The name is not echoed, because a
+        # buggy caller could pass a model-authored one.
+        raise WireProjectionError(f"no {dialect} wire projection for the requested tool name")
+    return tools[tool_name]
+
+
+def _strip_null(arguments: dict[str, Any], path: tuple[str, ...]) -> None:
+    """Remove the key at ``path`` when it is present and ``null``; touch nothing else."""
+    node: Any = arguments
+    for key in path[:-1]:
+        if type(node) is not dict or key not in node:
+            return
+        node = node[key]
+    leaf = path[-1]
+    if type(node) is dict and leaf in node and node[leaf] is None:
+        del node[leaf]
+
+
+@trust_boundary(
+    tier=3,
+    source="the JSON-decoded tool-call arguments a composer provider sent under one dialect's wire schema W",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ToolArgumentError (category wire_envelope) before use when set_pipeline arguments are not exactly "
+        "one 'pipeline' object field; never rejects on W, which is classified as wire_conformant only; removes a "
+        "null only at a promoted position on openai_strict and never inserts, coerces or recurses into an "
+        "undeclared key"
+    ),
+    test_ref="tests/unit/web/composer/test_wire_decode.py::test_decode_rejects_a_malformed_set_pipeline_envelope",
+    test_fingerprint="47b22a3ef9296ebe6e0f2070c36202350754f4a371ce89d1faab81c2c9913c1b",
+)
+def decode_wire_arguments(tool_name: str, dialect: ToolContractDialect, raw: dict[str, Any]) -> DecodedArguments:
+    """Decode provider arguments sent under ``dialect`` into S's semantic form.
+
+    1. ``wire_conformant``: whether ``raw`` validates against the W that was
+       sent. Classification only.
+    2. ``EnvelopeUnwrap``: set_pipeline arguments must be exactly
+       ``{"pipeline": <object>}``, or :class:`ToolArgumentError` (category
+       ``wire_envelope``) is raised. This is decode's only rejection.
+    3. ``StripNull`` (``openai_strict`` only): a ``null`` at a promoted
+       position becomes an omitted key.
+
+    Callers decode only a tool name that was in the list sent on that call;
+    any other name raises :class:`WireProjectionError` (a caller bug).
+    """
+    tool = _sent_wire_tool(tool_name, dialect)
+    if type(raw) is not dict:
+        raise WireProjectionError("decode takes the JSON object the caller already decoded")
+    wire_conformant = next(iter(_WIRE_VALIDATORS[dialect][tool_name].iter_errors(raw)), None) is None
+    semantic: dict[str, Any] = deepcopy(raw)
+    for node in tool.decode_plan:
+        if type(node) is EnvelopeUnwrap:
+            if set(semantic) != {node.key} or type(semantic[node.key]) is not dict:
+                raise ToolArgumentError(
+                    argument=f"{tool_name} arguments",
+                    expected="an object conforming to the declared argument schema",
+                    actual_type="invalid_schema",
+                    category=ToolArgumentErrorCategory.WIRE_ENVELOPE,
+                )
+            semantic = semantic[node.key]
+    if dialect == ToolContractDialect.OPENAI_STRICT:
+        for node in tool.decode_plan:
+            if type(node) is StripNull:
+                _strip_null(semantic, node.path)
+    return DecodedArguments(semantic=semantic, wire_conformant=wire_conformant)
+
+
+def encode_semantic_arguments(tool_name: str, dialect: ToolContractDialect, semantic: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the wire form of semantic arguments: the inverse of the envelope only.
+
+    set_pipeline becomes ``{"pipeline": semantic}``; every other tool is
+    returned unchanged (as a fresh plain-JSON copy) on both dialects.
+    """
+    tool = _sent_wire_tool(tool_name, dialect)
+    arguments = cast(dict[str, Any], deep_thaw(semantic))
+    for node in tool.decode_plan:
+        if type(node) is EnvelopeUnwrap:
+            return {node.key: arguments}
+    return arguments
