@@ -17,9 +17,9 @@ from elspeth.core.security.web import (
     NetworkError,
     SSRFBlockedError,
     SSRFSafeRequest,
+    validate_literal_ip_for_ssrf,
     validate_url_for_ssrf,
 )
-from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode_enabled
 
 ChromaConnectionMode = Literal["persistent", "client"]
 ChromaSearchMode = Literal["ephemeral", "persistent", "client"]
@@ -166,9 +166,13 @@ class ChromaConnectionConfig(BaseModel):
                     f"got host={self.host!r} with ssl=False. "
                     f"Non-SSL connections are only permitted for localhost."
                 )
-            # The SSRF check resolves DNS, so it must not run during preflight
-            # (preflight validates config purely, without network I/O). It runs
-            # at real runtime — before the Chroma SDK opens any connection.
-            if not plugin_preflight_mode_enabled():
-                _validate_chroma_http_target(self.host, self.port, ssl=self.ssl)
+            # Config parsing also runs during replay admission. Keep it local:
+            # reject literal private targets now, then resolve and pin named
+            # hosts only when the live SDK client is constructed.
+            _host_url(self.host, self.port, ssl=self.ssl)
+            allowed_ranges = _LOOPBACK_ALLOWED_RANGES if _is_loopback_host(self.host) else ()
+            try:
+                validate_literal_ip_for_ssrf(self.host.strip("[]"), allowed_ranges=allowed_ranges)
+            except SSRFBlockedError as exc:
+                raise ValueError(f"ChromaDB host {self.host!r} is blocked by the SSRF policy: {exc}") from exc
         return self
