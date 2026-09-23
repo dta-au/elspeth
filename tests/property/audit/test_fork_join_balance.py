@@ -2170,6 +2170,7 @@ class TestForkRecoveryInvariant:
         scheduler_repo.mark_blocked(
             member_token=seed_member,
             work_item_id=held_item.work_item_id,
+            row_payload_json=held_item.row_payload_json,
             queue_key=None,
             barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
             expected_lease_owner="test-harness",
@@ -3679,6 +3680,7 @@ class TestForkRecoveryInvariant:
         scheduler_repo.mark_blocked(
             member_token=seed_member,
             work_item_id=seeded_item.work_item_id,
+            row_payload_json=seeded_item.row_payload_json,
             queue_key=None,
             barrier_key=barrier_key_for_seed,
             expected_lease_owner="test-harness",
@@ -3993,6 +3995,7 @@ class TestForkRecoveryInvariant:
             scheduler_repo.mark_blocked(
                 member_token=seed_member,
                 work_item_id=seeded_item.work_item_id,
+                row_payload_json=seeded_item.row_payload_json,
                 queue_key=None,
                 barrier_key=str(agg_node_id),
                 expected_lease_owner="test-harness",

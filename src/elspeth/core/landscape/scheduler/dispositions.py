@@ -44,8 +44,13 @@ class _PendingSinkTerminalMiss(Exception):
 
 @dataclass(frozen=True, slots=True)
 class BlockedImage:
-    """Column image of a BLOCKED disposition: the hold location.
+    """Column image of a BLOCKED disposition: the hold location and the token as held.
 
+    ``row_payload_json`` is the token's row at the hold. A claim can traverse
+    several nodes before it reaches a barrier, so this is not the payload the
+    item was enqueued with: every barrier restore and follower hand-off
+    rebuilds the arriving token from this column, exactly as a PENDING_SINK
+    park carries its post-traversal row.
     ``barrier_blocked_at`` is stamped from Landscape database time inside the
     transaction (ADR-047); the lease is cleared. Nothing here is a deadline a
     caller can supply.
@@ -53,6 +58,7 @@ class BlockedImage:
 
     queue_key: str | None
     barrier_key: str | None
+    row_payload_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,13 +105,15 @@ class SchedulerDispositionRepository:
         work_item_id: str,
         queue_key: str | None,
         barrier_key: str | None,
+        row_payload_json: str,
         expected_lease_owner: str,
     ) -> TokenWorkItem:
-        """Move an item to BLOCKED at a queue or barrier.
+        """Move an item to BLOCKED at a queue or barrier, recording the token as held.
 
         Required ``member_token`` proves membership — see
         :meth:`mark_terminal`. The hold's ``barrier_blocked_at`` is Landscape
         database time read inside the transaction (ADR-047).
+        ``row_payload_json`` is the held token's row (see :class:`BlockedImage`).
         """
         if queue_key is None and barrier_key is None:
             raise AuditIntegrityError(
@@ -117,7 +125,7 @@ class SchedulerDispositionRepository:
             status=TokenWorkStatus.BLOCKED,
             expected_lease_owner=expected_lease_owner,
             member_token=member_token,
-            image=BlockedImage(queue_key=queue_key, barrier_key=barrier_key),
+            image=BlockedImage(queue_key=queue_key, barrier_key=barrier_key, row_payload_json=row_payload_json),
         )
 
     def mark_terminal(
@@ -869,6 +877,7 @@ class SchedulerDispositionRepository:
                     updated_at=database_now,
                     queue_key=image.queue_key,
                     barrier_key=image.barrier_key,
+                    row_payload_json=image.row_payload_json,
                     barrier_blocked_at=database_now,
                     lease_owner=None,
                     lease_expires_at=None,

@@ -179,6 +179,7 @@ def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierE
     return repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
+        row_payload_json=PAYLOAD,
         queue_key="queue-a",
         barrier_key=None,
         expected_lease_owner=WRONG_OWNER,

@@ -1822,6 +1822,7 @@ class TestAggregationRecoveryIntegration:
             assert claimed is not None and claimed.token_id == token.token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
+                row_payload_json=claimed.row_payload_json,
                 queue_key=None,
                 barrier_key="sum_aggregator",
                 expected_lease_owner="seeder",

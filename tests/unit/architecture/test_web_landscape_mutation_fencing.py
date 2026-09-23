@@ -709,7 +709,13 @@ _EXPECTED_DML_COUNT = 159
 # helper insert_batch_transform_errors_on, which ExecutionRepository.
 # complete_aggregation_failure calls inside the verdict's ONE transaction. Measured
 # by scripts/fencing_inventory.py against a clean export of 5e25798db and the tree.
-_EXPECTED_DML_INVENTORY_SHA256 = "2b5bca9afa077a6d550a83a4b32ac1fce1b6296fae12487a350c49a7cef8731f"
+# R4 (elspeth-5887fb7928 AC-R4, a BLOCKED hold records the token as held): 2b5bca9a… ->
+# the value below. Count 159 and write shapes 70/70 unchanged; the one identity
+# SchedulerDispositionRepository._transition_on update token_work_items changed
+# fingerprint a3c95c278555df16 -> 9bea65003336f796 because the BLOCKED image now
+# writes row_payload_json. Measured by scripts/fencing_inventory.py --json against a
+# clean export of c5ea22fa7 and the tree.
+_EXPECTED_DML_INVENTORY_SHA256 = "4856baad46ee2158dda70fcf902a1aebaca375d8dc8947fe05be9f87a3e85c28"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -808,13 +814,18 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # and -> self._execution.complete_batch#1 (the verdict's separate writes). Arrived:
 # NodeStateGuard.complete_aggregation_failure -> self._execution.complete_aggregation_failure#1,
 # the ONE verdict write (complete_aggregation_failure is listed in _MUTATION_APIS).
-_EXPECTED_CALL_COUNT = 278
+# R4 (elspeth-5887fb7928 AC-R4): 278 -> 279. Arrived:
+# SchedulerDrainCoordinator._mark_claimed_scheduler_work_blocked -> self._scheduler.mark_blocked#2.
+# The barrier arm (#1) writes the recorded arrival's barrier_key and held row; the
+# queue arm (#2) keeps the claimed row. Nothing departed.
+_EXPECTED_CALL_COUNT = 279
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
 # AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
-# C4: 70bb43aa… -> the value below, the caller exchange above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "6c2ff337310e10241796599bb6fba9ea7e82c20342ca101bbcf3ffaa211baefd"
+# C4: 70bb43aa… -> 6c2ff337…, the caller exchange above.
+# R4: 6c2ff337… -> the value below, the one caller added above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "0478b37dfdcc456f81565420769be2a27c95473406d9f1d964885e204798f41a"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,

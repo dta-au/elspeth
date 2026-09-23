@@ -528,6 +528,7 @@ class TestMissingTokenBarrierRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -600,6 +601,7 @@ class TestMissingTokenBarrierRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -630,6 +632,7 @@ class TestMissingTokenBarrierRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -894,6 +897,7 @@ class TestStaleTokenFenceRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -916,6 +920,7 @@ class TestStaleTokenFenceRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -936,6 +941,7 @@ class TestStaleTokenFenceRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -973,6 +979,7 @@ class TestStaleTokenFenceRefusals:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key="b1",
             expected_lease_owner=WORKER,
@@ -1526,6 +1533,7 @@ class TestValidTokenFenceSemantics:
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
             work_item_id=work_item_id,
+            row_payload_json=_payload_json(),
             queue_key=None,
             barrier_key=f"b{sequence}",
             expected_lease_owner=WORKER,

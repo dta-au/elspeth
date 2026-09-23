@@ -877,6 +877,7 @@ class TestDispositionMembershipFence:
             ),
             "mark_blocked": lambda: repo.mark_blocked(
                 work_item_id=work_item_id,
+                row_payload_json="{}",
                 queue_key=None,
                 barrier_key="barrier-1",
                 expected_lease_owner="worker-a",

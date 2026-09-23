@@ -379,14 +379,16 @@ class TokenSchedulerRepository:
         work_item_id: str,
         queue_key: str | None,
         barrier_key: str | None,
+        row_payload_json: str,
         expected_lease_owner: str,
     ) -> TokenWorkItem:
-        """Move an item to BLOCKED at a queue or barrier."""
+        """Move an item to BLOCKED at a queue or barrier, recording the token as held."""
         return self.dispositions.mark_blocked(
             member_token=member_token,
             work_item_id=work_item_id,
             queue_key=queue_key,
             barrier_key=barrier_key,
+            row_payload_json=row_payload_json,
             expected_lease_owner=expected_lease_owner,
         )
 

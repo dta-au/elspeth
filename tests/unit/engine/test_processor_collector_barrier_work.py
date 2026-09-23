@@ -100,6 +100,7 @@ def _persist_blocked_collector_member(factory: RecorderFactory, processor: RowPr
     processor._scheduler.mark_blocked(
         member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
         expected_lease_owner=processor._scheduler_lease_owner,
@@ -114,6 +115,7 @@ def _persist_blocked_queue_hold(factory: RecorderFactory, processor: RowProcesso
     processor._scheduler.mark_blocked(
         member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=str(_COLLECTOR_NODE),
         barrier_key=None,
         expected_lease_owner=processor._scheduler_lease_owner,

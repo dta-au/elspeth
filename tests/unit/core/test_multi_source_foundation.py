@@ -2081,6 +2081,8 @@ def _apply_scheduler_transition(
         return repo.mark_blocked(
             member_token=member_token,
             work_item_id=work_item_id,
+            # The transition contract under test is status/lease, not the held row.
+            row_payload_json="{}",
             queue_key="queue:inbound",
             barrier_key="barrier:row-1",
             expected_lease_owner=expected_lease_owner,
@@ -2509,6 +2511,7 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     blocked = repo.mark_blocked(
         member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key="queue:inbound",
         barrier_key="barrier:row-1",
         expected_lease_owner="worker-a",
@@ -2594,6 +2597,7 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
     repo.mark_blocked(
         member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=first.work_item_id,
+        row_payload_json=first.row_payload_json,
         queue_key=None,
         barrier_key="merge",
         expected_lease_owner="worker-a",
@@ -2605,6 +2609,7 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
     repo.mark_blocked(
         member_token=_scheduler_member(engine, "worker-b"),
         work_item_id=second.work_item_id,
+        row_payload_json=second.row_payload_json,
         queue_key=None,
         barrier_key="merge",
         expected_lease_owner="worker-b",
@@ -2705,6 +2710,7 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
         repo.mark_blocked(
             member_token=_scheduler_member(engine, "worker-a"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key=None,
             expected_lease_owner="worker-a",
@@ -2983,6 +2989,7 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
         repo.mark_blocked(
             member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner=f"worker-{index}",
@@ -3040,6 +3047,7 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
         repo.mark_blocked(
             member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner=f"worker-{index}",
@@ -3098,6 +3106,7 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
         repo.mark_blocked(
             member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner=f"worker-{index}",

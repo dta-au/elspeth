@@ -1236,11 +1236,12 @@ class TokenTraversalEngine:
                 # leader-only per §B.2).  If this batch-aware transform sits at
                 # a known aggregation node, the follower must NOT execute it
                 # row-wise — doing so produces wrong aggregate output and
-                # bypasses the leader's barrier.  Return (None, []) so that
-                # _drain_scheduler_claims hits the ``result is None and not
-                # child_items`` arm (line 4241) and calls mark_blocked with the
-                # aggregation barrier key.  The leader's next journal-intake
-                # adopts the arrival and runs trigger evaluation.
+                # bypasses the leader's barrier.  The arrival is recorded, then
+                # (None, []) sends _drain_scheduler_claims to its ``result is
+                # None and not child_items`` arm, which marks the row BLOCKED
+                # under the aggregation barrier key with the token as it
+                # arrived here. The leader's next journal-intake adopts that
+                # row and runs trigger evaluation.
                 if (
                     row_transform.is_batch_aware
                     and transform_node_id is not None
@@ -1251,6 +1252,7 @@ class TokenTraversalEngine:
                         current_token.token_id,
                         transform_node_id,
                     )
+                    self._processor._record_barrier_arrival(current_token, barrier_key=str(transform_node_id))
                     return None, child_items
 
                 # NOTE: child_items is mutated inside (deagg appends, coalesce notifications).

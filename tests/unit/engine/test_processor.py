@@ -276,6 +276,7 @@ def _persist_blocked_scheduler_work(
     processor._scheduler.mark_blocked(
         member_token=member_token,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key=barrier_key,
         expected_lease_owner=member_token.worker_id,
@@ -957,6 +958,7 @@ class TestConstructorErrorEdgeMap:
             assert claimed is not None and claimed.token_id == token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
+                row_payload_json=claimed.row_payload_json,
                 queue_key=None,
                 barrier_key=str(agg_node),
                 expected_lease_owner=_TEST_LEADER_WORKER_ID,
@@ -1030,6 +1032,7 @@ class TestConstructorErrorEdgeMap:
         )
         factory.scheduler.mark_blocked(
             work_item_id=ghost_item.work_item_id,
+            row_payload_json=ghost_item.row_payload_json,
             queue_key=None,
             barrier_key="ghost-barrier",
             expected_lease_owner=_TEST_LEADER_WORKER_ID,
@@ -1079,6 +1082,7 @@ class TestConstructorErrorEdgeMap:
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key="queue-1",
             barrier_key=None,
             expected_lease_owner=_TEST_LEADER_WORKER_ID,
@@ -1179,6 +1183,7 @@ class TestConstructorErrorEdgeMap:
         assert claimed is not None and claimed.token_id == token_id
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key=None,
             barrier_key=str(agg_node),
             expected_lease_owner=_TEST_LEADER_WORKER_ID,
@@ -2711,14 +2716,13 @@ class TestProcessRowNoTransforms:
         processor = _make_processor(factory)
 
         with pytest.raises(AuditIntegrityError, match="no live barrier hold stash"):
-            processor._barrier_key_for_live_hold("token-a")
+            processor._live_barrier_hold("token-a")
 
-        processor._live_barrier_holds["token-a"] = _LiveBarrierHold(
-            token=make_token_info(row_id="row-a", token_id="token-a", data={"value": 1}),
-            barrier_key="aggregation_a",
-            arrived_monotonic=processor._clock.monotonic(),
-        )
-        assert processor._barrier_key_for_live_hold("token-a") == "aggregation_a"
+        arriving = make_token_info(row_id="row-a", token_id="token-a", data={"value": 1})
+        processor._record_barrier_arrival(arriving, barrier_key="aggregation_a")
+        hold = processor._live_barrier_hold("token-a")
+        assert hold.barrier_key == "aggregation_a"
+        assert hold.token is arriving
 
     def test_empty_batch_flush_plans_dropped_outcomes_without_early_audit_writes(self) -> None:
         """Zero-row routing stays pure until the atomic barrier completion."""
@@ -6472,6 +6476,7 @@ class TestDurableSchedulerResumeDrain:
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner="seeder",
@@ -6647,6 +6652,7 @@ class TestDurableSchedulerResumeDrain:
         assert stray_claim.work_item_id == stray_work.work_item_id
         factory.scheduler.mark_blocked(
             work_item_id=stray_work.work_item_id,
+            row_payload_json=stray_work.row_payload_json,
             queue_key=None,
             barrier_key=str(agg_node),
             expected_lease_owner="test-worker",
@@ -9067,6 +9073,7 @@ class TestCompleteCoalesceMerge:
         assert claimed is not None and claimed.token_id == "token-held-a"
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner="seeder",

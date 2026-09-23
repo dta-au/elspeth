@@ -2188,11 +2188,7 @@ class RowProcessor:
         # NOTE: Do NOT emit TokenCompleted telemetry here!
         # TokenCompleted must be deferred to flush time so that
         # TransformCompleted can be emitted first.
-        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
-            token=current_token,
-            barrier_key=str(node_id),
-            arrived_monotonic=self._clock.monotonic(),
-        )
+        self._record_barrier_arrival(current_token, barrier_key=str(node_id))
         return (
             RowResult(
                 token=current_token,
@@ -3245,7 +3241,7 @@ class RowProcessor:
         # trigger evaluation (§B.2: trigger evaluation is leader-only).
         # Returning (True, None) with no child items triggers the
         # `result is None and not child_items` arm of _drain_scheduler_claims
-        # which calls mark_blocked (§E.2).
+        # which calls mark_blocked (§E.2) with the arrival recorded below.
         if self._coalesce_executor is None:
             logger.debug(
                 "follower: coalesce barrier hold for token %r at node %r (coalesce=%r) — marking blocked; leader adopts via journal-intake",
@@ -3253,7 +3249,6 @@ class RowProcessor:
                 current_node_id,
                 coalesce_name,
             )
-            return True, None
 
         # ADR-030 §E.2 (slice 3, journal-first barrier acceptance): the
         # arriving branch token is NOT accepted in-claim. It is held
@@ -3265,11 +3260,7 @@ class RowProcessor:
         # and late-arrival releases (§E.3a) all surface from that intake step.
         # The live token is stashed so intake feeds the executor the exact
         # post-transform token the old in-claim accept used (N=1 parity).
-        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
-            token=current_token,
-            barrier_key=str(coalesce_name),
-            arrived_monotonic=self._clock.monotonic(),
-        )
+        self._record_barrier_arrival(current_token, barrier_key=str(coalesce_name))
         return True, None
 
     def _maybe_row_union_token(
@@ -3286,7 +3277,8 @@ class RowProcessor:
         arrival is never accepted in-claim — the live token is stashed and
         the drain marks its journal row BLOCKED under
         ``barrier_key=row_union_name``; the leader's next intake adopts it
-        and runs the executor accept. Followers hold without stashing.
+        and runs the executor accept. A follower records the same arrival:
+        the drain persists the arriving token's row from it.
         """
         if current_token.branch_name is None or row_union_name is None or row_union_node_id is None or current_node_id != row_union_node_id:
             return False, None
@@ -3298,13 +3290,7 @@ class RowProcessor:
                 current_node_id,
                 row_union_name,
             )
-            return True, None
-
-        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
-            token=current_token,
-            barrier_key=str(row_union_name),
-            arrived_monotonic=self._clock.monotonic(),
-        )
+        self._record_barrier_arrival(current_token, barrier_key=str(row_union_name))
         return True, None
 
     def _collector_node_for_cursor(self, collector_name: CollectorName) -> NodeID:
@@ -3368,13 +3354,7 @@ class RowProcessor:
                 current_node_id,
                 collector_name,
             )
-            return True, None
-
-        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
-            token=current_token,
-            barrier_key=collector_barrier_key(str(collector_name), frame.group_id),
-            arrived_monotonic=self._clock.monotonic(),
-        )
+        self._record_barrier_arrival(current_token, barrier_key=collector_barrier_key(str(collector_name), frame.group_id))
         return True, None
 
     def _first_bound_frame(self, current_token: TokenInfo) -> tuple[LineageFrame, GroupBinding] | None:
@@ -5474,9 +5454,26 @@ class RowProcessor:
         """
         self._scheduler_drain.heartbeat_active_claim()
 
-    def _barrier_key_for_live_hold(self, token_id: str) -> str:
-        """Resolve the barrier owning a token about to be marked BLOCKED (delegate)."""
-        return self._scheduler_drain.barrier_key_for_live_hold(token_id)
+    def _live_barrier_hold(self, token_id: str) -> _LiveBarrierHold:
+        """Resolve the recorded arrival of a token about to be marked BLOCKED (delegate)."""
+        return self._scheduler_drain.live_barrier_hold(token_id)
+
+    def _record_barrier_arrival(self, token: TokenInfo, *, barrier_key: str) -> None:
+        """Record a token arriving at a barrier, as the drain will persist it.
+
+        The ONE producer of ``_LiveBarrierHold`` (aggregation, coalesce,
+        row_union, collector; leader and follower alike). The drain writes the
+        BLOCKED row's barrier_key and row from it, so the durable row is the
+        token as it arrived after any transforms run earlier in the same claim.
+        On a leader the next intake then consumes it for the exact live token
+        and arrival instant (N=1 parity); on a follower the drain drops it once
+        the row is durable.
+        """
+        self._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token,
+            barrier_key=barrier_key,
+            arrived_monotonic=self._clock.monotonic(),
+        )
 
     def _enqueue_scheduler_work_item(
         self,

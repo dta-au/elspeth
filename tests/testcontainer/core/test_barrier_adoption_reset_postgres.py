@@ -63,6 +63,7 @@ def test_stale_restore_reset_preserves_successor_adoption(postgres_db: Landscape
     factory.scheduler.mark_blocked(
         member_token=former.membership,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key=barrier,
         expected_lease_owner=former.worker_id,

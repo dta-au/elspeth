@@ -90,13 +90,18 @@ GROUP_FAILED_REASON = "group_failed"
 class _LiveBarrierHold:
     """In-memory companion of one durable BLOCKED barrier hold (ADR-030 §E.2).
 
-    Stashed by the processor at the moment a claimed token is about to block
-    at a barrier (aggregation buffering / coalesce hold) and consumed by the
-    next drain iteration's journal-first intake: the LIVE token preserves the
-    exact post-transform payload and resume provenance the old in-claim accept
-    used (N=1 parity). Inherited rows with no stash entry (leader takeover)
-    fall back to journal rehydration with audit-derived attempt offsets —
-    the same semantics as the restore path.
+    Recorded by the processor (``RowProcessor._record_barrier_arrival``, the
+    one producer) at the moment a claimed token arrives at a barrier:
+    aggregation buffering or a coalesce / row_union / collector hold, on a
+    leader or a follower. The drain writes the BLOCKED row's barrier_key and
+    held row from it, so the durable row is the token as it ARRIVED, after any
+    transforms the claim ran on the way (elspeth-5887fb7928 AC-R4). On a leader
+    the next drain iteration's journal-first intake then consumes it: the LIVE
+    token keeps its resume provenance and this process's arrival instant (N=1
+    parity). On a follower the drain drops it once the row is durable, because
+    the leader adopts from the journal. Rows with no record (leader takeover,
+    a follower's hand-off, resume) rehydrate from that same durable row with
+    audit-derived attempt offsets, the same semantics as the restore path.
 
     ``arrived_monotonic`` is this process's exact witness of the arrival
     instant on the monotonic scale. The durable ``barrier_blocked_at`` is

@@ -363,6 +363,7 @@ def test_membership_loss_refuses_scheduler_mutation(queue_harness: _QueueHarness
                 queue_harness.repo.mark_blocked(
                     member_token=member,
                     work_item_id=claimed.work_item_id,
+                    row_payload_json=claimed.row_payload_json,
                     expected_lease_owner="worker-a",
                     queue_key="q",
                     barrier_key=None,

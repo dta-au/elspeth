@@ -268,8 +268,6 @@ class SchedulerDrainHost(Protocol):
 
     def _queue_key_for_blocked_item(self, item: WorkItem) -> str | None: ...
 
-    def _barrier_key_for_blocked_item(self, item: WorkItem) -> str | None: ...
-
 
 class SchedulerDrainCoordinator:
     """Owns the durable scheduler claim/drain loop for one RowProcessor."""
@@ -735,12 +733,7 @@ class SchedulerDrainCoordinator:
                 if result is not None and is_buffered_scheduler_result(result):
                     for child_item in child_items:
                         self.enqueue_work_item(child_item, pending_items)
-                    self._mark_claimed_scheduler_work_blocked(
-                        claimed,
-                        item,
-                        queue_key=None,
-                        barrier_key=self.barrier_key_for_live_hold(claimed.token_id),
-                    )
+                    self._mark_claimed_scheduler_work_blocked(claimed, item, hold=self.live_barrier_hold(claimed.token_id))
                     if _is_result_tuple(result):
                         results.extend(result)
                     else:
@@ -752,7 +745,14 @@ class SchedulerDrainCoordinator:
                     continue
 
                 if result is None and not child_items:
-                    self._mark_claimed_scheduler_work_blocked(claimed, item)
+                    # A barrier arrival (coalesce / row_union / collector, or a
+                    # follower's aggregation hold) was recorded by the processor;
+                    # anything else is a structural queue hold.
+                    self._mark_claimed_scheduler_work_blocked(
+                        claimed,
+                        item,
+                        hold=self._live_barrier_holds[claimed.token_id] if claimed.token_id in self._live_barrier_holds else None,
+                    )
                     # §E.2: ALWAYS take another iteration (see the buffered arm).
                     continue
 
@@ -964,22 +964,46 @@ class SchedulerDrainCoordinator:
         claimed: TokenWorkItem,
         item: WorkItem,
         *,
-        queue_key: str | None = None,
-        barrier_key: str | None = None,
+        hold: _LiveBarrierHold | None,
     ) -> None:
-        """Persist BLOCKED state only when resume has a durable release key."""
-        queue_key = self._processor._queue_key_for_blocked_item(item) if queue_key is None and barrier_key is None else queue_key
-        barrier_key = self._processor._barrier_key_for_blocked_item(item) if queue_key is None and barrier_key is None else barrier_key
-        if queue_key is None and barrier_key is None:
+        """Persist BLOCKED state, recording the token exactly as it is held.
+
+        A barrier hold takes its barrier_key AND its row from the arrival the
+        processor recorded (``hold``): the claim may have run transforms since
+        the item was enqueued, and every barrier restore, takeover intake and
+        follower hand-off rebuilds the arriving token from this row. The
+        claim-start ``item`` would hand them the pre-traversal row. A queue
+        hold is taken where the claim starts (a structural queue node), so the
+        claimed row is already the held row.
+
+        On a follower no intake ever consumes the recorded arrival — the
+        leader adopts this row instead — so the follower drops it once the
+        row is durable.
+        """
+        if hold is not None:
+            self._scheduler.mark_blocked(
+                work_item_id=claimed.work_item_id,
+                queue_key=None,
+                barrier_key=hold.barrier_key,
+                row_payload_json=self._scheduler.serialize_row_payload(hold.token.row_data),
+                expected_lease_owner=self._claimed_scheduler_lease_owner(claimed),
+                member_token=self._member_token,
+            )
+            if self._mode is ProcessorMode.FOLLOWER:
+                del self._live_barrier_holds[claimed.token_id]
+            return
+        queue_key = self._processor._queue_key_for_blocked_item(item)
+        if queue_key is None:
             raise OrchestrationInvariantError(
                 f"Work item {claimed.work_item_id!r} (token={item.token.token_id!r}, node={item.current_node_id!r}) "
-                "produced no result and no children, but has no queue or barrier key; cannot be unblocked. "
-                "This is a processor bug."
+                "produced no result and no children, but has no queue or barrier key (no barrier arrival was "
+                "recorded); cannot be unblocked. This is a processor bug."
             )
         self._scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=queue_key,
-            barrier_key=barrier_key,
+            barrier_key=None,
+            row_payload_json=claimed.row_payload_json,
             expected_lease_owner=self._claimed_scheduler_lease_owner(claimed),
             member_token=self._member_token,
         )
@@ -1097,22 +1121,21 @@ class SchedulerDrainCoordinator:
         )
         self._last_heartbeat_at = now
 
-    def barrier_key_for_live_hold(self, token_id: str) -> str:
-        """Resolve the barrier that owns a token about to be marked BLOCKED.
+    def live_barrier_hold(self, token_id: str) -> _LiveBarrierHold:
+        """Resolve the recorded arrival of a token about to be marked BLOCKED.
 
         §E.2: the historical derivation read the in-claim BUFFERED outcome's
         batch_id, which no longer exists at block time — the producer
-        (``_process_batch_aggregation_node`` / ``_maybe_coalesce_token``)
-        stashed the barrier_key alongside the live token instead.
+        (``RowProcessor._record_barrier_arrival``) records the barrier_key
+        alongside the arriving token instead, and the drain persists both.
         """
         try:
-            hold = self._live_barrier_holds[token_id]
+            return self._live_barrier_holds[token_id]
         except KeyError:
             raise AuditIntegrityError(
                 f"Buffered scheduler result for token {token_id!r} has no live barrier hold stash; "
                 "cannot persist a durable release barrier. Processor bug."
             ) from None
-        return hold.barrier_key
 
     # ─────────────────────────────────────────────────────────────────────────
     # READY work-item persistence
