@@ -11,7 +11,7 @@ import re
 import sys
 import time
 import weakref
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -200,8 +200,8 @@ _COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
 _BOOT_PROVIDER_PROBE_BUDGET_SECONDS = 60.0
 # One deadline shared by every composer probe request (loop list, planner
 # list, advisor), so the worst case is this value, not a sum of per-request
-# timeouts. With the OpenRouter catalog prime (connect + read, see
-# _OPENROUTER_CATALOG_PRIME_TIMEOUT) it fits the 60 s budget. Measured advisor
+# timeouts. With the OpenRouter catalog prime's total deadline
+# (_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS) it fits the 60 s budget. Measured advisor
 # checkpoint latency (23 archived calls): p95 11.0 s, max 50.8 s. With both
 # planner requests at their cap the advisor still has 35 s, about 3x its p95;
 # a call as slow as the 50.8 s outlier becomes a nonfatal, logged unverified
@@ -214,7 +214,12 @@ _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
 # loop calls with at most 200 completion tokens (11 archived calls, prompts of
 # 56k-104k tokens): p50 1.6 s, max 2.75 s.
 _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+# httpx's connect and read timeouts are per operation: the read timeout
+# bounds each wait for a chunk, so a response that trickles in never trips it.
+# The prime is therefore also held to a total deadline, which is what the boot
+# budget counts (10 s + the 45 s probe deadline = 55 s of the 60 s).
 _OPENROUTER_CATALOG_PRIME_TIMEOUT = httpx.Timeout(5.0, connect=5.0)
+_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS = 10.0
 _FORBIDDEN_METRICS_LABEL_PATTERN = re.compile(rb"(?:\{|,)\s*(run_id|session_id|user_id)\s*=")
 _METRICS_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 # Reserve bounded headroom inside the public five-second readiness contract
@@ -489,6 +494,26 @@ def _configured_llm_providers(settings: WebSettings) -> tuple[str, ...]:
     return tuple(sorted({profile.provider for profile in settings.llm_profiles.values()}))
 
 
+async def _prime_openrouter_catalog_within_deadline(
+    http_get: Callable[[str], Awaitable[httpx.Response]],
+) -> Literal["primed", "failed", "deadline_exceeded"]:
+    """Run the live catalog prime under its total boot deadline.
+
+    Cancellation at the deadline can land only in ``http_get``: the prime has
+    no other await and publishes its snapshot after the response is read, so a
+    cancelled prime leaves no live snapshot (and at boot there is no earlier
+    one to clear).
+    """
+    try:
+        primed = await asyncio.wait_for(
+            prime_openrouter_catalog_from_live(http_get=http_get),
+            timeout=_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS,
+        )
+    except TimeoutError:
+        return "deadline_exceeded"
+    return "primed" if primed else "failed"
+
+
 async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
     """Prime the OpenRouter model catalog iff OpenRouter is a configured provider.
 
@@ -528,12 +553,20 @@ async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
             # ``dict.get`` reads, not HTTP client method calls).
             return await _probe_client.request("GET", url)
 
-        primed = await prime_openrouter_catalog_from_live(http_get=_probe_get)
+        outcome = await _prime_openrouter_catalog_within_deadline(_probe_get)
     probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
-    if primed:
+    if outcome == "primed":
         slog.info(
             "openrouter_catalog_boot_prime_complete",
             latency_ms=probe_latency_ms,
+        )
+    elif outcome == "deadline_exceeded":
+        slog.warning(
+            "openrouter_catalog_boot_prime_failed",
+            latency_ms=probe_latency_ms,
+            failure_class="PrimeDeadlineExceeded",
+            deadline_seconds=_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS,
+            action="serving bundled litellm catalog (may include retired models)",
         )
     else:
         slog.warning(

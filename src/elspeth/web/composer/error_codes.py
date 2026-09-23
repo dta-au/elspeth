@@ -13,14 +13,19 @@ load time).
 Membership is pinned by
 ``tests/unit/web/composer/test_error_code_redaction.py``: every code a
 producer passes as ``error_code`` (keyword, ``ValidationEntry`` positional, or
-``"error_code"`` dict key) under ``web/composer`` is registered, and the
-guidance catalogue ``_VALIDATION_GUIDANCE_BY_CODE`` is a subset.
+``"error_code"`` dict key) anywhere under ``web/`` is registered, apart from
+the census's named exclusions (guided mode and the deployment acceptance
+clients). That covers the producers outside ``web/composer`` whose codes reach
+a tool response: plugin-policy findings (``validate_composition_state``) and
+execution validation (``ToolResult.runtime_preflight``). The guidance
+catalogue ``_VALIDATION_GUIDANCE_BY_CODE`` is a subset.
 """
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, get_args
 
+from elspeth.contracts.blobs_inline import BlobInlineValidationCategory
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
@@ -203,9 +208,61 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Codes produced outside ``web/composer`` that reach a composer tool response.
+_EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        # web/plugin_policy/validation.py findings, embedded as ValidationEntry
+        # by validate_authored_composition_state.
+        "aws_s3_endpoint_url_not_allowed",
+        "profile_alias_used_as_bucket",
+        "required_control_coverage",
+        "required_control_unavailable",
+        # web/execution validation, carried by ToolResult.runtime_preflight.
+        "aws_s3_source_profile_required",
+        "disallowed_secret_ref",
+        "empty_pipeline",
+        "fabricated_secret",
+        "interpretation_review_drift",
+        "llm_authored_inline_blob_content",
+        "llm_base_url_not_allowed",
+        "llm_tracing_not_allowed",
+        "missing_secret_ref",
+        "missing_sink",
+        "missing_source",
+        "state_shape_materialization",
+        "unauthorized_secret_ref",
+        "web_fetch_private_network_not_allowed",
+        "web_fetch_resource_config_invalid",
+        "web_fetch_resource_limit_exceeded",
+        "web_scrape_private_network_not_allowed",
+        # Bounded source-proof blockers (tools/generation.py
+        # _BLOCKING_DIAGNOSTIC_CODES), merged into the authoritative preflight
+        # as ValidationError codes by web/execution/service.py.
+        "aggregation_numeric_value_field_type_mismatch_against_source_schema",
+        "csv_duplicate_headers",
+        "csv_fixed_schema_omits_observed_columns",
+        "csv_source_blob_header_mismatch",
+        "csv_source_field_resolution_error",
+        "declared_input_type_mismatch_against_source_schema",
+        "gate_expression_preview_memory_exhaustion",
+        "gate_expression_type_mismatch_against_source_schema",
+        "gate_expression_unbounded_string_amplification",
+        "source_inspection_failed",
+        "text_source_url_without_web_scrape",
+        # Session-route validation (persisted runtime-preflight failure and
+        # guided replay). Not tool responses; registered so the census covers
+        # the whole web tree without a special case.
+        "guided_composition_invalid",
+        "runtime_preflight_failed",
+    }
+)
+
 REGISTERED_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         *_EMITTED_VALIDATION_ERROR_CODES,
+        *_EMITTED_POLICY_AND_EXECUTION_ERROR_CODES,
+        # Inline-blob validation builds its code from the closed category.
+        *(f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)),
         # The closed ``ToolArgumentError.code`` values, forwarded as
         # ``error_code`` by planner and discovery argument feedback.
         "DISCOVERY_ONLY",

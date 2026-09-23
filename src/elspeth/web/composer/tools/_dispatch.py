@@ -546,7 +546,10 @@ def _schema_tool_argument_error(tool_name: str, error: ValidationError) -> ToolA
 
 
 def _schema_errors(tool_name: str, arguments: object) -> list[ValidationError]:
-    validator = Draft202012Validator(_closed_root_schema(tool_name))
+    return _errors_against(Draft202012Validator(_closed_root_schema(tool_name)), arguments)
+
+
+def _errors_against(validator: Draft202012Validator, arguments: object) -> list[ValidationError]:
     return sorted(validator.iter_errors(arguments), key=lambda error: tuple(error.absolute_path))
 
 
@@ -564,6 +567,19 @@ def require_schema_valid_arguments(tool_name: str, arguments: object) -> None:
     pydantic models, so every advertised tool is admitted by the same S gate.
     """
     errors = _schema_errors(tool_name, arguments)
+    if errors:
+        raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
+
+
+def require_arguments_conform_to_schema(tool_name: str, validator: Draft202012Validator, arguments: object) -> None:
+    """Hold arguments to a caller-owned closed-root schema, or raise.
+
+    For tools declared outside the web registry (the composer MCP session
+    tools), so they are admitted by the schema they advertise with the same
+    Draft 2020-12 gate, rejection and shape/bound category as the registry
+    tools.
+    """
+    errors = _errors_against(validator, arguments)
     if errors:
         raise _schema_tool_argument_error(tool_name, _reported_schema_error(errors))
 

@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.composer_mcp.server import create_server
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.dependencies import create_catalog_service
@@ -240,7 +240,12 @@ async def test_invalid_preview_args_do_not_run_runtime_preflight_or_handler() ->
 @pytest.mark.parametrize("bad_name", [123, {"x": "y"}])
 @pytest.mark.asyncio
 async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object) -> None:
-    """new_session.name must match the advertised MCP string schema."""
+    """new_session.name must match the advertised MCP string schema.
+
+    The closed-root schema gate refuses it before the handler, so the client
+    sees the generic S-gate text (as for every composer tool), not the
+    handler's own "'name' must be a string".
+    """
     catalog = create_catalog_service()
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
@@ -250,13 +255,14 @@ async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object
         session_files = list(scratch.glob("*.json"))
 
     assert response.root.isError is True
-    assert "'name' must be a string" in response.root.content[0].text
+    assert response.root.content[0].text.endswith("got invalid_schema")
     assert session_files == []
     assert len(probe.invocations) == 1
     inv = probe.invocations[0]
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_name == "new_session"
     assert inv.error_class == "ToolArgumentError"
+    assert inv.error_category is ToolArgumentErrorCategory.SCHEMA_SHAPE
     assert inv.error_message == "ToolArgumentError"
     assert inv.version_after is None
 
@@ -310,6 +316,51 @@ async def test_reflectively_corrupted_tool_argument_error_is_safe_in_mcp_and_aud
     assert canary not in audit_text
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        pytest.param("load_session", {"session_id": "abc", "stray": True}, id="extra-key"),
+        pytest.param("delete_session", {"session_id": 5}, id="wrong-type"),
+        pytest.param("save_session", {}, id="missing-required"),
+        pytest.param("list_sessions", {"filter": "all"}, id="closed-empty-root"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_tool_arguments_are_held_to_the_closed_root_schema(tool_name: str, arguments: dict[str, object]) -> None:
+    """The six MCP session tools are admitted by their advertised closed schema, like the composer tools.
+
+    The handler is never reached: the refusal is an ARG_ERROR with the
+    ``schema_shape`` category, the same as a composer tool's S failure.
+    """
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch("elspeth.composer_mcp.server._dispatch_session_tool", side_effect=AssertionError("handler reached")) as dispatch:
+            response = await _call_handler(server.request_handlers, tool_name, arguments)
+
+    dispatch.assert_not_called()
+    assert response.root.isError is True
+    assert len(probe.invocations) == 1
+    inv = probe.invocations[0]
+    assert inv.status == ComposerToolStatus.ARG_ERROR
+    assert (inv.error_class, inv.error_category) == ("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)
+
+
+@pytest.mark.asyncio
+async def test_conforming_session_tool_arguments_reach_the_handler() -> None:
+    """Control: a conforming session-tool call is admitted and dispatched."""
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch("elspeth.composer_mcp.server._dispatch_session_tool", return_value={"success": True, "data": []}) as dispatch:
+            await _call_handler(server.request_handlers, "list_sessions", {})
+
+    dispatch.assert_called_once()
+    assert probe.invocations[0].status == ComposerToolStatus.SUCCESS
+
+
 @pytest.mark.asyncio
 async def test_argument_canonicalization_failure_records_arg_error() -> None:
     """Non-finite arguments are malformed MCP client input, not success.
@@ -343,6 +394,7 @@ async def test_argument_canonicalization_failure_records_arg_error() -> None:
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_name == "set_source"
     assert inv.error_class == "ValueError"
+    assert inv.error_category is ToolArgumentErrorCategory.CANONICALIZATION
     assert inv.error_message == "ValueError"
     assert inv.version_after is None
     assert hashlib.sha256(inv.arguments_canonical.encode("utf-8")).hexdigest() == inv.arguments_hash

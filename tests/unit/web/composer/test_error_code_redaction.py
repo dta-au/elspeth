@@ -26,7 +26,20 @@ from elspeth.web.composer.tools.generation import _VALIDATION_GUIDANCE_BY_CODE
 from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
 
 _SRC = Path(__file__).resolve().parents[4] / "src" / "elspeth"
-_COMPOSER = _SRC / "web" / "composer"
+_WEB = _SRC / "web"
+# The census covers every web module whose ``error_code`` can reach a composer
+# tool response: the composer itself, and the plugin-policy findings and
+# execution validation it embeds (``validate_composition_state`` ->
+# ``validate_authored_composition_state`` and ``ToolResult.runtime_preflight``).
+# It walks all of ``web/`` and excludes only what cannot, each with its reason.
+_CENSUS_EXCLUDED: dict[tuple[str, ...], str] = {
+    ("composer", "guided"): "guided mode is being removed; out of scope for the strict-contract campaign",
+    ("_acceptance_common",): "deployment acceptance HTTP client; its codes are probe results, never a tool response",
+    ("_aws_ecs_acceptance",): "deployment acceptance client (AWS ECS)",
+    ("_azure_container_apps_acceptance",): "deployment acceptance client (Azure Container Apps)",
+    ("aws_ecs_acceptance.py",): "deployment acceptance entry point (AWS ECS)",
+    ("azure_container_apps_acceptance.py",): "deployment acceptance entry point (Azure Container Apps)",
+}
 _REDACTED_TEXT = "<redacted-response-text>"
 
 # ---------------------------------------------------------------------------
@@ -47,46 +60,77 @@ _NOT_A_PRODUCER = frozenset({"RejectionRecord"})
 _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
     {
         # Parameter forwarding inside the rejection builders.
-        ("tools/_common.py", "_failure_result", "error_code"),
-        ("tools/_common.py", "_prepend_rejection_entry", "error_code"),
-        ("tools/_common.py", "_rejection_only_validation", "error_code"),
-        ("tools/sessions.py", "_failure_result", "error_code"),
-        ("pipeline_planner.py", "_candidate_policy_rejection", "error_code"),
-        ("state.py", "add", "code"),
+        ("composer/tools/_common.py", "_failure_result", "error_code"),
+        ("composer/tools/_common.py", "_prepend_rejection_entry", "error_code"),
+        ("composer/tools/_common.py", "_rejection_only_validation", "error_code"),
+        ("composer/tools/sessions.py", "_failure_result", "error_code"),
+        ("composer/pipeline_planner.py", "_candidate_policy_rejection", "error_code"),
+        ("composer/state.py", "add", "code"),
         # PluginUnavailableReason members; the registry holds every value.
-        ("tools/_common.py", "_plugin_policy_failure", "violation.error_code.value"),
-        ("tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.NOT_INSTALLED"),
-        ("tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING"),
-        ("tools/_common.py", "_validate_plugin_name", "reason"),
+        ("composer/tools/_common.py", "_plugin_policy_failure", "violation.error_code.value"),
+        ("composer/tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.NOT_INSTALLED"),
+        ("composer/tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING"),
+        ("composer/tools/_common.py", "_validate_plugin_name", "reason"),
         # A code read back from a state-validation entry, directly or through
         # ``_post_mutation_invariant_error`` / ``_row_union_node_contract_error``
         # (both return an entry's own ``error_code``), or a local chosen from
         # literals (``transforms.py`` / ``sessions.py`` ``"interpretation_
         # requirements_invalid" if ... else None``; ``review_contract_code``).
-        ("tools/outputs.py", "_execute_set_output", "error_code"),
-        ("tools/sessions.py", "build_set_pipeline_candidate", "error_code"),
-        ("tools/sessions.py", "build_set_pipeline_candidate", "review_contract_code"),
-        ("tools/transforms.py", "_execute_upsert_node", "error_code"),
-        ("tools/transforms.py", "_execute_upsert_edge", "error_code"),
-        ("tools/transforms.py", "_execute_patch_node_options", "error_code"),
-        ("tools/transforms.py", "_prepare_transform_candidate", "error_code"),
-        ("service.py", "_state_payload_for_compose_turn", "error.error_code"),
-        ("pipeline_planner.py", "_build_valid_pipeline_plan", "exc.error_code"),
+        ("composer/tools/outputs.py", "_execute_set_output", "error_code"),
+        ("composer/tools/sessions.py", "build_set_pipeline_candidate", "error_code"),
+        ("composer/tools/sessions.py", "build_set_pipeline_candidate", "review_contract_code"),
+        ("composer/tools/transforms.py", "_execute_upsert_node", "error_code"),
+        ("composer/tools/transforms.py", "_execute_upsert_edge", "error_code"),
+        ("composer/tools/transforms.py", "_execute_patch_node_options", "error_code"),
+        ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
+        ("composer/service.py", "_state_payload_for_compose_turn", "error.error_code"),
+        ("composer/pipeline_planner.py", "_build_valid_pipeline_plan", "exc.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
-        ("service.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
+        ("composer/service.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
         # Planner / discovery feedback that projects an already-produced code,
         # a closed ``ToolArgumentError.code`` or a closed category value.
-        ("pipeline_planner.py", "_allowlisted_candidate_feedback", "code"),
-        ("pipeline_planner.py", "_binding_rejection_feedback", "rejection.error_code"),
-        ("pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
-        ("pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
-        ("pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
-        ("pipeline_commit.py", "prepare_pipeline_proposal_commit", "exc.category.value"),
-        ("provider_discovery_response.py", "to_wire", "code"),
-        ("provider_discovery_response.py", "to_wire", "self.error_code"),
-        ("tools/generation.py", "_execute_explain_validation_error", "code"),
+        ("composer/pipeline_planner.py", "_allowlisted_candidate_feedback", "code"),
+        ("composer/pipeline_planner.py", "_binding_rejection_feedback", "rejection.error_code"),
+        ("composer/pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
+        ("composer/pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
+        ("composer/pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
+        ("composer/pipeline_commit.py", "prepare_pipeline_proposal_commit", "exc.category.value"),
+        ("composer/provider_discovery_response.py", "to_wire", "code"),
+        ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
+        ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
         # Not a producer: the redaction allowlist entry for the field itself.
-        ("redaction.py", "<module>", "REGISTERED_ERROR_CODES"),
+        ("composer/redaction.py", "<module>", "REGISTERED_ERROR_CODES"),
+        # --- Outside web/composer ---
+        # Plugin-policy findings: the finding's own (censused) code, and the
+        # PluginUnavailableReason members the registry holds.
+        ("plugin_policy/validation.py", "_validation_entry", "finding.error_code"),
+        ("plugin_policy/validation.py", "validate_plugin_policy", "reason.value"),
+        ("sessions/routes/composer/state.py", "_reject_imported_plugin_policy", "reason.value"),
+        # Execution validation: a policy finding's code, a local chosen from two
+        # registered literals, imported interpretation-state constants, the
+        # settings-reframe table, the closed inline-blob category, and the
+        # closed source-proof blocker set (each pinned below).
+        ("execution/_validation_authoring.py", "lower_plugin_policy", "item.error_code"),
+        ("execution/_validation_authoring.py", "validate_web_network_policy", "error_code"),
+        ("execution/_validation_authoring.py", "review_interpretations", "INTERPRETATION_REVIEW_PENDING_CODE"),
+        ("execution/validation.py", "_interpretation_review_drift_failure", "INTERPRETATION_REVIEW_DRIFT_CODE"),
+        ("execution/_validation_diagnostics.py", "_reframe_settings_missing_parts", "_SETTINGS_MISSING_PART_REFRAMES[part][0]"),
+        ("execution/_validation_materialization.py", "_blob_inline_validation_error", "f'{violation.category}_inline_blob_content'"),
+        ("execution/service.py", "_merge_authoritative_proof_diagnostics", "code"),
+        # Route projections and persistence of codes produced (and censused)
+        # elsewhere; none of them authors a code.
+        ("execution/routes.py", "execute_pipeline", "err.error_code"),
+        ("coordination/repository.py", "record_composition_rejection", "error_code"),
+        ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
+        ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
+        ("sessions/routes/_helpers.py", "_composer_persisted_validation", "error.error_code"),
+        ("sessions/routes/_helpers.py", "_message_response", "rejection_record.error_code"),
+        ("sessions/routes/_helpers.py", "_validation_entry_responses", "e.error_code"),
+        ("sessions/routes/workflow/approvals.py", "request_approval", "error.error_code"),
+        ("sessions/service.py", "_sync", "error.error_code"),
+        ("sessions/service.py", "_validate_patched_composition_state", "error.error_code"),
+        ("sessions/service.py", "list_composition_rejection_events", "row.error_code"),
+        ("sessions/service.py", "persist_compose_turn", "record.error_code"),
     }
 )
 
@@ -126,6 +170,23 @@ def _is_literal(expression: ast.expr, constants: dict[str, str]) -> bool:
     return False
 
 
+def _walk_outside_fstrings(expression: ast.expr) -> list[ast.AST]:
+    """``ast.walk`` that does not descend into f-strings.
+
+    An f-string's constant fragments are not codes (``f"{category}_suffix"``
+    would otherwise report ``"_suffix"``); the whole f-string is a non-literal
+    site and must be a reviewed forwarder.
+    """
+    nodes: list[ast.AST] = []
+    pending: list[ast.AST] = [expression]
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        if not isinstance(node, ast.JoinedStr):
+            pending.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
 def _code_sites(relative_path: str, source: str) -> list[_CodeSite]:
     """Every ``error_code`` value a module passes to a producer."""
     tree = ast.parse(source)
@@ -151,7 +212,7 @@ def _code_sites(relative_path: str, source: str) -> list[_CodeSite]:
         for expression in expressions:
             literals = [
                 sub.value if isinstance(sub, ast.Constant) else constants[sub.id]
-                for sub in ast.walk(expression)
+                for sub in _walk_outside_fstrings(expression)
                 if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)) or (isinstance(sub, ast.Name) and sub.id in constants)
             ]
             sites.append(
@@ -170,11 +231,15 @@ def _code_sites(relative_path: str, source: str) -> list[_CodeSite]:
     return sites
 
 
+def _is_excluded(relative: Path) -> bool:
+    return any(relative.parts[: len(prefix)] == prefix for prefix in _CENSUS_EXCLUDED)
+
+
 def _live_code_sites() -> list[_CodeSite]:
     sites: list[_CodeSite] = []
-    for path in sorted(_COMPOSER.rglob("*.py")):
-        relative = path.relative_to(_COMPOSER)
-        if "guided" in relative.parts:
+    for path in sorted(_WEB.rglob("*.py")):
+        relative = path.relative_to(_WEB)
+        if _is_excluded(relative):
             continue
         sites.extend(_code_sites(relative.as_posix(), path.read_text()))
     return sites
@@ -196,6 +261,17 @@ class TestRegistryCensus:
         assert "plugin_options_invalid" in codes
         assert "pipeline_cycle" in codes
         assert "deferred_intent_claim" in codes
+        # Producers outside ``web/composer`` whose codes reach tool responses.
+        assert "profile_alias_used_as_bucket" in codes
+        assert "fabricated_secret" in codes
+
+    def test_exclusions_skip_only_what_they_name(self) -> None:
+        paths = {site.path for site in _live_code_sites()}
+        assert not any(path.startswith(("composer/guided/", "_acceptance_common/")) for path in paths)
+        assert "plugin_policy/validation.py" in paths
+        assert "execution/_validation_authoring.py" in paths
+        assert _is_excluded(Path("composer/guided/x.py"))
+        assert not _is_excluded(Path("composer/guided_x.py"))
 
     def test_instrument_flags_a_planted_unregistered_code(self) -> None:
         planted = "def f(state):\n    return _failure_result(state, 'm', error_code='zz_planted_unregistered')\n"
@@ -238,6 +314,30 @@ class TestRegistryCensus:
 
         assert _TOOL_ARGUMENT_ERROR_CODES <= REGISTERED_ERROR_CODES
 
+    def test_forwarded_execution_code_sources_are_registered(self) -> None:
+        """The closed sources behind the execution forwarders above."""
+        from typing import get_args
+
+        from elspeth.contracts.blobs_inline import BlobInlineValidationCategory
+        from elspeth.web.execution._validation_diagnostics import _SETTINGS_MISSING_PART_REFRAMES
+        from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_DRIFT_CODE, INTERPRETATION_REVIEW_PENDING_CODE
+
+        assert {INTERPRETATION_REVIEW_PENDING_CODE, INTERPRETATION_REVIEW_DRIFT_CODE} <= REGISTERED_ERROR_CODES
+        assert {reframe[0] for reframe in _SETTINGS_MISSING_PART_REFRAMES.values()} <= REGISTERED_ERROR_CODES
+        assert {f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)} <= REGISTERED_ERROR_CODES
+        assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
+
+    def test_every_blocking_proof_diagnostic_code_is_registered(self) -> None:
+        from elspeth.web.composer.tools.generation import _BLOCKING_DIAGNOSTIC_CODES
+
+        assert _BLOCKING_DIAGNOSTIC_CODES <= REGISTERED_ERROR_CODES
+
+    def test_instrument_does_not_read_fstring_fragments_as_codes(self) -> None:
+        planted = "def f(state, c):\n    return _failure_result(state, 'm', error_code=f'{c}_zz_suffix')\n"
+        sites = _code_sites("planted.py", planted)
+        assert _unregistered_literals(sites) == set()
+        assert _unreviewed_forwarders(sites) == {("planted.py", "f", "f'{c}_zz_suffix'")}
+
     def test_every_plugin_unavailable_reason_is_registered(self) -> None:
         from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
@@ -277,6 +377,13 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_output_options", "plugin_options_invalid"),
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
+        # Plugin-policy and execution-validation codes (produced outside
+        # web/composer) on option tools.
+        ("upsert_node", "profile_alias_used_as_bucket"),
+        ("upsert_node", "required_control_unavailable"),
+        ("set_pipeline", "required_control_coverage"),
+        ("patch_node_options", "llm_base_url_not_allowed"),
+        ("set_source", "fabricated_secret"),
     ],
 )
 def test_registered_code_survives_response_redaction(tool_name: str, error_code: str) -> None:

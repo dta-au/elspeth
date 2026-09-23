@@ -32,7 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import rfc8785
 
-from elspeth.contracts.composer_audit import ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.audit import build_canonicalization_sentinel
@@ -890,7 +890,9 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     Python's ``json.loads`` accepts ``NaN``/``Infinity`` constants even
     though canonical JSON rejects them. The compose loop must record a
     corrective ARG_ERROR tool row and continue, rather than raising from
-    ``begin_dispatch`` before the recorder fires.
+    ``begin_dispatch`` before the recorder fires. The bounded decoder
+    rejects the constant (``ValueError``), so the row is
+    ``wire_json_invalid``; canonicalisation is never reached.
     """
     catalog = _mock_catalog()
     settings = _make_settings()
@@ -924,6 +926,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_call_id == "call_non_finite_object"
     assert inv.error_class == "ValueError"
+    assert inv.error_category is ToolArgumentErrorCategory.WIRE_JSON_INVALID
     assert inv.error_message == "ValueError"
     assert inv.version_after is None
 
@@ -934,7 +937,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
 
 @pytest.mark.asyncio
 async def test_compose_loop_records_arg_error_for_non_finite_non_object_arguments() -> None:
-    """Top-level Infinity must use the non-object ARG_ERROR audit path."""
+    """Top-level Infinity is rejected by the bounded decoder as ``wire_json_invalid``."""
     catalog = _mock_catalog()
     settings = _make_settings()
     service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -967,6 +970,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_call_id == "call_non_finite_scalar"
     assert inv.error_class == "ValueError"
+    assert inv.error_category is ToolArgumentErrorCategory.WIRE_JSON_INVALID
     assert inv.error_message == "ValueError"
     assert inv.version_after is None
 

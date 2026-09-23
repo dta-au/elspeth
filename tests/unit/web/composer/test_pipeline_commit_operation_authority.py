@@ -16,6 +16,7 @@ import structlog
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs import InlineCustodyRequest
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
@@ -30,6 +31,7 @@ from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, PreparedPipelineCommit, prepare_pipeline_proposal_commit
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -176,7 +178,12 @@ async def proposal(tmp_path: Path) -> AsyncIterator[_Proposal]:
         engine.dispose()
 
 
-async def _prepare(proposal: _Proposal, context: SessionOperationContext) -> PreparedPipelineCommit:
+async def _prepare(
+    proposal: _Proposal,
+    context: SessionOperationContext,
+    *,
+    recorder: BufferingRecorder | None = None,
+) -> PreparedPipelineCommit:
     result = await prepare_pipeline_proposal_commit(
         authority=proposal.authority,
         reviewed_facts={},
@@ -196,7 +203,7 @@ async def _prepare(proposal: _Proposal, context: SessionOperationContext) -> Pre
             runtime_preflight=None,
             timeout_seconds=5.0,
         ),
-        recorder=BufferingRecorder(),
+        recorder=recorder if recorder is not None else BufferingRecorder(),
         actor="user:alice",
         settlement_surface="generic",
     )
@@ -276,6 +283,50 @@ async def test_other_sessions_live_operation_cannot_prepare_this_proposal(propos
             await _prepare(proposal, context)
     finally:
         operations.release(context)
+
+
+@pytest.mark.asyncio
+async def test_executor_argument_error_persists_its_category_as_the_error_code(
+    proposal: _Proposal,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The commit dispatch's ARG_ERROR payload carries the closed category.
+
+    ``error_code`` is the ``ToolArgumentErrorCategory`` value (a registered
+    code), not the exception's own ``code`` (``SCHEMA_VALIDATION``) or a
+    generic ``argument_error``; ``error_class`` is the class raised.
+    """
+
+    def reject_schema(*_args: Any, **_kwargs: Any) -> Any:
+        raise ToolArgumentError(
+            argument="set_pipeline arguments",
+            expected="object conforming to SetPipelineArgumentsModel (arguments contains unsupported properties)",
+            actual_type="invalid_schema",
+            code="SCHEMA_VALIDATION",
+            category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        )
+
+    monkeypatch.setattr(pipeline_commit, "execute_tool", reject_schema)
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    recorder = BufferingRecorder()
+    try:
+        with pytest.raises(ToolArgumentError):
+            await _prepare(proposal, context, recorder=recorder)
+    finally:
+        operations.release(context)
+
+    assert len(recorder.invocations) == 1
+    invocation = recorder.invocations[0]
+    assert invocation.status is ComposerToolStatus.ARG_ERROR
+    assert (invocation.error_class, invocation.error_category) == ("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)
+    assert invocation.result_canonical is not None
+    assert json.loads(invocation.result_canonical) == {"error_class": "ToolArgumentError", "error_code": "schema_shape"}
 
 
 @pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted-inline", "explicit-null-inline"])

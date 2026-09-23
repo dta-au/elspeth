@@ -150,6 +150,13 @@ _RECORD_PATHS = (
 )
 
 
+def _envelope_call(call: ComposerLLMCall) -> dict[str, object]:
+    """The ``call`` projection of a persisted LLM audit envelope."""
+    payload = llm_call_audit_envelope(call)["call"]
+    assert isinstance(payload, dict)
+    return payload
+
+
 def _llm_call(**overrides: Any) -> ComposerLLMCall:
     now = datetime.now(UTC)
     values: dict[str, Any] = {
@@ -236,15 +243,15 @@ class TestContract:
 
 class TestSurvivesToThePersistedProjection:
     def test_public_audit_envelope_exposes_provider_served(self) -> None:
-        envelope = llm_call_audit_envelope(_record_from_response(_real_response(provider="DeepInfra")))
+        call_payload = _envelope_call(_record_from_response(_real_response(provider="DeepInfra")))
 
-        assert envelope["call"]["provider_served"] == "DeepInfra"  # type: ignore[index]
+        assert call_payload["provider_served"] == "DeepInfra"
 
     def test_absent_provider_served_persists_as_null_not_omitted(self) -> None:
-        call_payload = llm_call_audit_envelope(_llm_call())["call"]
+        call_payload = _envelope_call(_llm_call())
 
-        assert "provider_served" in call_payload  # type: ignore[operator]
-        assert call_payload["provider_served"] is None  # type: ignore[index]
+        assert "provider_served" in call_payload
+        assert call_payload["provider_served"] is None
 
     def test_mutation_control_dropping_the_whitelist_entry_loses_the_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The instrument above must go red when the whitelist entry is removed."""
@@ -252,9 +259,9 @@ class TestSurvivesToThePersistedProjection:
         assert len(mutated) == len(composer_audit._LLM_CALL_PUBLIC_AUDIT_FIELDS) - 1
         monkeypatch.setattr(composer_audit, "_LLM_CALL_PUBLIC_AUDIT_FIELDS", mutated)
 
-        call_payload = llm_call_audit_envelope(_llm_call(provider_served="DeepInfra"))["call"]
+        call_payload = _envelope_call(_llm_call(provider_served="DeepInfra"))
 
-        assert "provider_served" not in call_payload  # type: ignore[operator]
+        assert "provider_served" not in call_payload
 
     def test_guided_failure_row_preserves_provider_served(self) -> None:
         rows = prepare_guided_audit_rows(

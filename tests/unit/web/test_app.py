@@ -2104,12 +2104,14 @@ class TestLifespanShutdown:
         assert "approximately 90-second" in runbook
         assert app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS == 150 - 90
 
-        catalog = app_module._OPENROUTER_CATALOG_PRIME_TIMEOUT
-        assert catalog.connect is not None
-        assert catalog.read is not None
+        # The catalog prime runs first, bounded by its own total deadline
+        # (httpx's connect/read timeouts are per operation, so they do not
+        # bound a trickling response; see the slow-drip test).
+        catalog_prime = app_module._OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS
+        assert catalog_prime == 10.0
 
         def fits(deadline: float) -> bool:
-            return deadline + catalog.connect + catalog.read <= app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS
+            return deadline + catalog_prime <= app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS
 
         assert app_module._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS == 45.0
         assert app_module._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS == 5.0
@@ -4478,6 +4480,42 @@ class TestBootPrimeOpenRouterCatalogGate:
         assert prime_calls == 1
         failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
         assert failed["log_level"] == "warning"
+
+    def test_slow_drip_prime_is_bounded_by_a_total_deadline(self, tmp_path, monkeypatch) -> None:
+        """A response that never stalls long enough for httpx's per-read timeout still ends at the deadline.
+
+        httpx's read timeout bounds each wait for a chunk, not the whole
+        response, so a trickling body is bounded only by the prime's own
+        total deadline. The fake prime keeps making progress for 2 s; the
+        deadline is shrunk to 0.1 s.
+        """
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        finished: list[bool] = []
+
+        async def _dripping_prime(*, http_get: object) -> bool:
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+            finished.append(True)
+            return True
+
+        monkeypatch.setattr(app_module, "prime_openrouter_catalog_from_live", _dripping_prime)
+        monkeypatch.setattr(app_module, "_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS", 0.1)
+        started = time.monotonic()
+        with capture_logs() as logs:
+            asyncio.run(app_module._boot_prime_openrouter_catalog(settings))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert finished == []
+        failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
+        assert failed["log_level"] == "warning"
+        assert failed["failure_class"] == "PrimeDeadlineExceeded"
+        assert failed["deadline_seconds"] == 0.1
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_complete" for entry in logs)
 
 
 class TestWebInstanceMembershipWiring:

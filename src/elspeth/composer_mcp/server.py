@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+from jsonschema import Draft202012Validator
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
@@ -61,7 +62,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     validate_composer_file_sink_collision_policy,
 )
-from elspeth.web.composer.tools._dispatch import _validate_tool_arguments
+from elspeth.web.composer.tools._dispatch import _validate_tool_arguments, require_arguments_conform_to_schema
 from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
@@ -189,6 +190,20 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
 ]
 
 _SESSION_TOOL_NAMES: frozenset[str] = frozenset(d["name"] for d in _SESSION_TOOL_DEFS)
+
+
+# The closed-root schema each session tool advertises is also the one that
+# admits its calls (``_dispatch_tool``), as the registry schema does for the
+# composer tools. Checked against the metaschema once, at import.
+def _session_tool_validators() -> dict[str, Draft202012Validator]:
+    validators: dict[str, Draft202012Validator] = {}
+    for definition in _SESSION_TOOL_DEFS:
+        Draft202012Validator.check_schema(definition["parameters"])
+        validators[definition["name"]] = Draft202012Validator(definition["parameters"])
+    return validators
+
+
+_SESSION_TOOL_VALIDATOR_BY_NAME: dict[str, Draft202012Validator] = _session_tool_validators()
 
 
 def _build_tool_defs() -> list[dict[str, Any]]:
@@ -364,6 +379,7 @@ def _dispatch_tool(
     CompositionState), and may include ``data``.
     """
     if tool_name in _SESSION_TOOL_NAMES:
+        require_arguments_conform_to_schema(tool_name, _SESSION_TOOL_VALIDATOR_BY_NAME[tool_name], arguments)
         if session_manager is None or session_checkout_ref is None:
             raise RuntimeError("session dispatch requires server-owned persistence authority")
         return _dispatch_session_tool(tool_name, arguments, state, session_manager, session_checkout_ref)

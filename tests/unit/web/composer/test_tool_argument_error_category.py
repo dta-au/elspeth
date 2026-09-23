@@ -346,6 +346,28 @@ _FLAT_PIPELINE = {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": []
         pytest.param(
             "set_pipeline", json.dumps(_FLAT_PIPELINE), "ToolArgumentError", ToolArgumentErrorCategory.WIRE_ENVELOPE, id="envelope"
         ),
+        # An integer outside the I-JSON range decodes but does not
+        # canonicalise (non-finite constants never get this far: the bounded
+        # decoder rejects them). A top-level one takes the non-object gate's
+        # canonicalisation arm, a nested one the object path's. Both record
+        # the class canonical_json raised.
+        pytest.param(
+            "set_metadata",
+            "9007199254740993",
+            "IntegerDomainError",
+            ToolArgumentErrorCategory.CANONICALIZATION,
+            id="canonicalization-scalar",
+        ),
+        pytest.param(
+            "set_metadata",
+            '{"patch": {"name": 9007199254740993}}',
+            "IntegerDomainError",
+            ToolArgumentErrorCategory.CANONICALIZATION,
+            id="canonicalization-object",
+        ),
+        pytest.param(
+            "set_metadata", '{"patch": {"name": NaN}}', "ValueError", ToolArgumentErrorCategory.WIRE_JSON_INVALID, id="non-finite"
+        ),
         pytest.param(
             "set_source", json.dumps({}), "ToolArgumentError", ToolArgumentErrorCategory.MISSING_REQUIRED_PATH, id="required-paths"
         ),
