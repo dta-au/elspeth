@@ -175,6 +175,38 @@ class CallModeSession(Protocol):
         """Check a unique parent-local semantic request before nested transport."""
         ...
 
+    def preflight_verify_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> ArchivedCallRequestEvidence:
+        """Require one archived MI HTTP request before DNS or token acquisition."""
+        ...
+
+    def preflight_verify_http_request(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> ArchivedCallRequestEvidence:
+        """Require one exact archived HTTP request before current DNS resolution."""
+        ...
+
+    def admit_verify_http_managed_identity(
+        self,
+        *,
+        request_data: Mapping[str, Any],
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+        source_call_id: str,
+    ) -> str:
+        """Bind the current MI request to source identity, excluding only rotating auth."""
+        ...
+
     def verify_call(
         self,
         *,

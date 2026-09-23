@@ -128,3 +128,75 @@ def test_verify_refuses_unmatched_request_before_live_dispatch() -> None:
             current_operation_id=None,
         )
     factory.execution.record_verification_decision.assert_not_called()
+
+
+def test_managed_identity_verify_accepts_rotating_auth_after_non_auth_preflight() -> None:
+    factory, call = _factory()
+    archived = {
+        "method": "GET",
+        "url": "https://example.org/",
+        "resolved_ip": "93.184.216.34",
+        "headers": {"Host": "example.org", "Authorization": f"<fingerprint:{'0' * 64}>"},
+        "params": None,
+    }
+    current = {
+        **archived,
+        "headers": {"Host": "example.org", "Authorization": f"<fingerprint:{'1' * 64}>"},
+    }
+    call.request_hash = "unused-for-semantic-match"
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    partial = {key: value for key, value in current.items() if key != "resolved_ip"}
+    partial["headers"] = {"Host": "example.org"}
+    evidence = session.preflight_verify_http_managed_identity(
+        request_data=partial, current_state_id="current-state", current_operation_id=None
+    )
+    assert evidence.source_call_id == "source-call"
+    assert (
+        session.admit_verify_http_managed_identity(
+            request_data=current,
+            current_state_id="current-state",
+            current_operation_id=None,
+            current_call_index=0,
+            source_call_id=evidence.source_call_id,
+        )
+        == "source-call"
+    )
+    decision = session.verify_call(
+        call_type=CallType.HTTP,
+        request_data=current,
+        current_state_id="current-state",
+        current_operation_id=None,
+        current_call_index=0,
+        current_call_id="current-call",
+        live_status=CallStatus.SUCCESS,
+        live_response_data={"status_code": 200, "transport": {"body_b64": ""}},
+        live_error_data=None,
+    )
+    assert decision.is_match is True
+    session.finalize()
+    assert factory.execution.find_call_for_current_parent.call_args.kwargs["request_hash"] is None
+
+
+def test_managed_identity_verify_refuses_missing_auth_and_ambiguous_parent() -> None:
+    factory, call = _factory()
+    archived = {
+        "method": "GET",
+        "url": "https://example.org/",
+        "resolved_ip": "93.184.216.34",
+        "headers": {"Host": "example.org"},
+        "params": None,
+    }
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    session = AuditedCallModeSession(factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY)
+    partial = {key: value for key, value in archived.items() if key != "resolved_ip"}
+    with pytest.raises(AuditIntegrityError, match="fingerprinted Authorization"):
+        session.preflight_verify_http_managed_identity(request_data=partial, current_state_id="current-state", current_operation_id=None)
+
+    archived["headers"] = {"Host": "example.org", "Authorization": f"<fingerprint:{'0' * 64}>"}
+    factory.execution.get_call_request_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=archived)
+    factory.execution.list_source_calls_for_current_parent.return_value = [call, SimpleNamespace(**vars(call))]
+    with pytest.raises(AuditIntegrityError, match="missing or ambiguous"):
+        session.preflight_verify_http_managed_identity(request_data=partial, current_state_id="current-state", current_operation_id=None)
