@@ -28,11 +28,18 @@ Routes that cannot carry `strict` send the same bytes they send today. Every cal
 wire schema W it was sent under (`strict_sent`, `wire_conformant`), and every LLM call records its dialect and its
 strict-tool count. S stays the only thing that admits or rejects a call.
 
+Under the default setting (`preferred`) the wire change reaches **OpenRouter routes only**: hosted OpenAI and Azure
+resolve to `NONE` under `preferred` until a live measurement (R8) and are `ENFORCING` only under
+`forward_to_endpoint` (§7.3 ruling 7). The shipped default config (bare `gpt-5.5` planner, `anthropic/` advisor) therefore
+keeps today's bytes on both routes.
+
 ### 1.2 Adopted decisions (John's recommendations R4, R5 and R6, adopted for S1; each can be reversed by config)
 
 - **R4.** `composer_strict_tools: Literal["preferred", "forward_to_endpoint", "off"]`, default `"preferred"`.
   Under `preferred`, custom endpoints resolve to `NONE`. Setting `off` forces `NONE` on every route, which restores
-  today's bytes everywhere. That is the operator's remedy if a route rejects `strict`.
+  today's bytes everywhere. That is the operator's remedy if a route rejects `strict`. **Ruled (lead, provisional;
+  John may overrule), §7.3 item 7:** under `preferred`, hosted OpenAI and Azure also resolve to `NONE` until R8 has
+  measured them; `forward_to_endpoint` is the opt-in that makes them `ENFORCING`.
 - **R5.** The deployed OpenRouter route runs unpinned. There is no `provider.only`, no `require_parameters` on the
   planner and no endpoint pinning.
 - **R6.** There is no Anthropic-shaped dialect. Every Anthropic-family route resolves to `NONE`.
@@ -46,29 +53,30 @@ so John can overrule it.
 
 | # | Question | Decision | Why |
 |---|---|---|---|
-| D1 | Where do the compose-loop wire facts persist? The loop never writes invocation envelopes (§3, C2). | Write `strict_sent` and `wire_conformant` as sibling keys next to `function` in each redacted assistant `tool_calls` entry that P4 writes (`turn_audit.py:230-240`). Carry them there on `_ToolOutcome`. They also go on `ComposerToolInvocation` for the routes that do persist envelopes. | The facts describe the call, not the response. This keeps them out of the response redaction walker and `test_adequacy_guard.py`. Assistant `tool_calls` are never replayed to a provider: `_composer_chat_history` copies only `role`/`content` (`sessions/routes/_helpers.py:1641-1677`, R). |
+| D1 | Where do the compose-loop wire facts persist? The loop never writes invocation envelopes (§3, C2). | Write `strict_sent` and `wire_conformant` as sibling keys next to `function` in each redacted assistant `tool_calls` entry that P4 writes (`turn_audit.py:230-240`). Carry them there on `_ToolOutcome`. They also go on `ComposerToolInvocation` for the routes that do persist envelopes. **Ruled (lead, provisional; John may overrule): accepted** (§7.3 item 3). | The facts describe the call, not the response. This keeps them out of the response redaction walker and `test_adequacy_guard.py`. Assistant `tool_calls` are never replayed to a provider: `_composer_chat_history` copies only `role`/`content` (`sessions/routes/_helpers.py:1641-1677`, R). |
 | D2 | How does the resolver know the routing provider? | Call `litellm.get_llm_provider(model=…, api_base=…)` as a Tier-3 parse into a closed set. `BadRequestError` gives `NONE`. The expected-values table in `test_strict_transport.py` and a fidelity-matrix row pin the resolver's result against LiteLLM's. | This mirrors LiteLLM exactly, including its 47 known OpenAI-compatible hosts (M). A hand-written prefix table would call bare `gpt-5.5` + `api.deepseek.com` "openai" when LiteLLM calls it `deepseek`. |
 | D3 | LiteLLM also reads base URLs and versions from env. | The resolver takes an injected `env: Mapping[str, str]` (`os.environ` in production) and reads `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE` and `AZURE_API_VERSION`. An OpenAI base set in env counts as a custom endpoint. A test pins that ELSPETH never assigns `litellm.api_base` or `litellm.api_version`. | Fails closed. Refusing to boot when those variables are set would be a separate behaviour change. |
-| D4 | One setting, or one per role? | One setting covers both the planner route and the hatch route. | R4 names one setting. A per-role override can be added later without changing the wire. |
+| D4 | One setting, or one per role? | One setting covers both the planner route and the hatch route. | R4 names one setting. A per-role override can be added later without changing the wire. Ruling 8 (a non-fatal `hatch_terminal` rejection, D9) removes the case where a hatch-only 400 forces `off` on the planner route too. |
 | D5 | How precise should the Azure rule be? | Conservative. The chat api-version (env `AZURE_API_VERSION`, otherwise LiteLLM's default, pinned) supports strict when it is `preview`, `latest`, `v1` or a date of at least `2024-08-01`. LiteLLM's `is_model_gpt_5_4_plus_model` bridge prediction is not copied. | That heuristic keys on arbitrary deployment names. The known false negative (a gpt-5.4+ deployment with an old env version) resolves to `NONE`, which is today's bytes. |
-| D6 | OpenRouter detection | Use the advisor's rule: the `openrouter/` prefix, or an api_base host of `openrouter.ai` (`advisor_request.py:41`). Reasoning, branding and usage accounting keep their prefix-only detectors. | Unifying the detectors changes request kwargs outside S1. It is recorded as a follow-on. |
+| D6 | OpenRouter detection | Use the advisor's rule: the `openrouter/` prefix, or an api_base host of `openrouter.ai` (`advisor_request.py:41`). Reasoning, branding and usage accounting keep their prefix-only detectors. | Unifying the detectors changes request kwargs outside S1. It is recorded as a follow-on. **Ruled (lead, provisional; John may overrule): follow-on** (§7.3 item 5). |
 | D7 | `openrouter/auto` and other meta-models | Resolve to `FORWARDING`. | Honest: the key is forwarded, and whether it is enforced is measured per `provider_served` by `wire_conformant`. |
 | D8 | The Anthropic family | Any model for which `supports_anthropic_prompt_cache_markers(model)` is true (`llm_response_parsing.py:773`) resolves to `NONE` on every setting, before any other rule applies. | Native `anthropic/` drops `strict` (M). OpenRouter strips it for Anthropic models unless a beta header is sent. So cache markers and `strict` never share a route. That settles reader surprise 5 in `understand-tools.md`. |
-| D9 | How is the hatch-terminal probe budgeted? | New surface `hatch_terminal` with role `planner`, so it gets the 5 s per-request cap. It runs after `planner_tools` and before `advisor`, and only when the hatch resolves non-`NONE`. Its request shape is a ruling owed (§7.3, ruling 1: planner-shaped, or `max_tokens` 16). | A rejected request returns before generation, so the cap keeps the 400 signal (S0b). Cost: on a 4-surface boot the advisor's share falls from at least 35 s to at least 30 s. That is a ruling owed (§7.3). |
+| D9 | How is the hatch-terminal probe budgeted? | New surface `hatch_terminal` with role `planner`, so it gets the 5 s per-request cap. It runs after `planner_tools` and before `advisor`, and only when the hatch resolves non-`NONE`. **Ruled (lead, provisional; John may overrule), §7.3 items 1 and 8:** the request is `build_planner_request_kwargs` at candidate effort with `max_tokens` overridden to 16 (`LOOP_PROBE_MAX_TOKENS`, as `loop_tools` does at `boot_probe.py:157`), so it is a rejection check only; and a `hatch_terminal` 400 is **non-fatal** (logged as `rejected`, boot continues), while a 400 on `loop_tools`, `planner_tools` or `advisor` stays fatal as in S0. | A rejected request returns before generation, so the cap keeps the 400 signal (S0b). Cost: on a 4-surface boot the advisor's share falls from at least 35 s to at least 30 s. |
 | D10 | Tool-list builder signatures | `composer_loop_tool_definitions(dialect)`, `planner_tool_definitions(policy=None, *, dialect, terminal_contract=None)` and `planner_terminal_tool_definition(terminal_contract=None, *, dialect)` each take a **required** dialect. There is no zero-argument form. | A defaulted form would be a second path. The tests that are true only for today's bytes become honest by naming the `NONE` dialect. |
 | D11 | `ComposerLLMCall.tool_contract_dialect` and `.strict_tool_count` | Derived inside `build_llm_call_record` from the `tools` it receives. The rule: every tool carries a boolean `strict` means `openai_strict`; no tool carries the key means `none`; a mix raises `AuditIntegrityError`; no tools means `None`/`None`. | This ties the record to the same bytes as `tools_spec_hash`, keeps the single construction site, and needs no change at any of the 9 call sites (a grep shows 10 lines; `guided/chat_solver.py:4915` is a comment). |
 | D12 | Where does decode reject? | `decode_wire_arguments` raises `ToolArgumentError(category=WIRE_ENVELOPE)`. That is its only rejection in S1. Everywhere else it classifies. | Same style as the S gate (`require_schema_valid_arguments` raises). The producer census resolves `type(exc).__name__` to a caught exception. |
-| D13 | Omission guidance outside W | Leave it unchanged: `service.py:981`, `skills/pipeline_composer.md:260/440/644/812` and `planner_authoring_aids.py:934`. | "Pass null" would be wrong on `none` routes and on MCP, where the omission-only fields reject `null`. The skill file is also hashed. The description overrides inside W are what a grammar-bound model reads. This is a named risk with a measurement (§7.1, risk 4). |
-| D14 | Status disclosure | Publish `composer_tool_contract` per route on `/api/system/status`, with closed values only. | Every value is from a closed set. It does **not** follow from what the endpoint already publishes: transport also depends on the api_base, the env and the setting, and `system_status` publishes no endpoint base URL (`app.py:2268-2324`, R). So `transport: none` beside `composer_model: gpt-5.5` newly tells an unauthenticated caller that a custom endpoint is configured, and the `boot` outcomes newly disclose provider reachability at boot. Flagged for John with that disclosure (§7.3). |
+| D13 | Omission guidance outside W | Leave it unchanged: `service.py:981`, `skills/pipeline_composer.md:260/440/644/812` and `planner_authoring_aids.py:934`. | "Pass null" would be wrong on `none` routes and on MCP, where the omission-only fields reject `null`. The skill file is also hashed. The description overrides inside W are what a grammar-bound model reads. This is a named risk with a measurement (§7.1, risk 1). **Ruled (lead, provisional; John may overrule): unchanged** (§7.3 item 4). |
+| D14 | Status disclosure | **Ruled (lead, provisional; John may overrule), §7.3 item 2:** the unauthenticated `/api/system/status` publishes only closed, **route-independent** values: `composer_tool_contract = {"setting", "strict_capable_tool_count", "tool_count"}` (32 and 42, properties of the tool set computed from `_WIRE_TOOL_DEFS[OPENAI_STRICT]`, not of any route). Per-route transport and dialect, the effective (sent) strict counts, the resolver diagnostic (D24) and the per-surface boot outcomes go to operator-side structured logs only (T8, T10). A test pins identical public payloads for otherwise-identical normal-OpenRouter-host and custom-endpoint configs. | Transport and effective counts depend on the api_base, the env and the setting, and `system_status` publishes no endpoint base URL (`app.py:2269-2324`, R). Publishing a per-route transport, or the effective count (Codex finding 2: `preferred` + normal OpenRouter host gives 32, the same model + a custom endpoint gives 0), would tell an unauthenticated caller that a custom endpoint is configured; per-surface boot outcomes would disclose provider reachability. A tool-set property discloses neither. |
 | D15 | Frontend | Leave the TypeScript `SystemStatus` unchanged. | Nothing in the frontend reads the new key, and the client casts the body (`client.ts:606-609`). |
 | D16 | What does `strict_sent` mean? | It mirrors the `strict` key that was sent for that tool: `true`, `false` (an explicit `strict:false` was sent), or `None` (no key was sent: the `none` dialect, or a tool name that was not in the sent list). | With a two-valued flag, "no key" and "explicit false" both read `false`, and the P4 row does not carry the dialect, so Appendix A would mix them. |
 | D17 | Decode for a tool name that is not in the sent list | Callers decode only names in the tool list sent on that call. Any other name passes through with its arguments unchanged, `strict_sent=None` and `wire_conformant=None`. `decode_wire_arguments` itself raises `WireProjectionError` for a name it has no W for (a caller bug). The compose loop sends all 42, so its sent set is the whole W map; the planner sends a policy palette, so `_parse_response_tool_calls` receives the sent names. | The planner palette is not enforced at dispatch: `execute_discovery_tool_with_context` admits every discovery handler (`tools/_dispatch.py:916-944`, R), and no palette check sits between `_parse_response_tool_calls` (`pipeline_planner.py:1682-1745`) and `execute_one_discovery` (R). Without the sent set, decode would strip `get_pipeline_state.component: null` on a call whose W was never sent (the palettes never include that tool). |
 | D18 | `encode_semantic_arguments` scope | It ships with the `EnvelopeUnwrap` inverse only. The `openai_strict` "write `null` for an absent promoted key" branch is deferred to S2. | C5 limits encode to semantic set_pipeline arguments, and set_pipeline is non-strict on both dialects in S1, so the null branch would have no production reader. Arguments are added with their first reader (the S0b precedent). |
-| D19 | T9's reach | The S-gate violations are carried on `ToolArgumentError` on every path (they are built in the shared `_dispatch.py`), but they are rendered as `validation_errors` only by `arg_error_payload`, which is the compose loop (`tool_batch.py:2419`, `:2474`; `service.py:8005`, `:8098`). MCP text and the planner's `_ArgumentErrorResponse` stay unchanged. | MCP builds its own text (`composer_mcp/server.py:781-801`), and planner discovery deliberately projects an argument error without its message or input (`provider_discovery_response.py:186-202`). Extending either is a planner-visible or client-visible contract change outside S1 (§7.3). |
+| D19 | T9's reach | The S-gate violations are carried on `ToolArgumentError` on every path (they are built in the shared `_dispatch.py`), but they are rendered as `validation_errors` only by `arg_error_payload`, which is the compose loop (`tool_batch.py:2419`, `:2474`; `service.py:8005`, `:8098`). MCP text and the planner's `_ArgumentErrorResponse` stay unchanged. | MCP builds its own text (`composer_mcp/server.py:781-801`), and planner discovery deliberately projects an argument error without its message or input (`provider_discovery_response.py:186-202`). Extending either is a planner-visible or client-visible contract change outside S1. **Ruled (lead, provisional; John may overrule): the repair signal stays compose-loop only** (§7.3 item 9). |
 | D20 | One resolution path for the service and the probe | `strict_transport.resolve_composer_tool_contract(settings, *, env)` resolves both routes and returns an owned frozen summary. `ComposerServiceImpl.__init__` and `build_composer_probe_requests(settings, *, env=os.environ)` both call it. The helper's `env` is required; the probe's `env` defaults to `os.environ` itself (the object the service passes), never to an empty mapping. | An empty default would let the probe resolve without `OPENAI_BASE_URL` while the service resolves with it, and send `strict` to a gateway at boot. A required keyword on the probe would force an edit to `test_composer_against_gateway.py:538`, whose "only appended lines" diff is an S1 invariant (§5). The probe does not read the service object, because it runs on `composer_boot_probe_enabled` alone. A T8 test pins that probe and service resolve the same contract. |
 | D21 | `begin_dispatch*` wire-fact keywords | They keep a `None` default (25 test call sites in 11 files; `pipeline_commit.py:514` and guided honestly do not know). Every `tool_batch` site (`:891`, `:948`, `:1010`, `:1061`) and the planner site (`:5033`) passes the facts explicitly, and a pin checks that each invocation's facts equal its `_ToolOutcome`'s. | This closes the gap the default could hide, without 25 mechanical test edits. |
 | D22 | Ledger text on a node that has no description | Only one shape exists on the 32: `maxLength` on the `items` of an array property (`request_advisor_hint.recent_errors.items`, `.attempted_actions.items`; the items carry only `type` and `maxLength`, M). The sentence goes on the array property's description as "Each item has at most {n} characters." Any other description-less owner raises `WireProjectionError`. The root `examples` goes into the tool description (C9). | It keeps the text next to the array the model fills, and adds no new `description` nodes. |
 | D23 | `strict_profile`'s kind vocabulary and `title` | The closed kind set is the 12 in T1 plus `typeless_subschema`, `array_without_items` and `nested_union`, with the mapping from the design-lane checker published in T1. Allowed keywords are exactly `WIRE_KEYWORD_ALLOWLIST`, so `title` gives `keyword_not_allowlisted`. | S1 imports the S0 allowlist unchanged. The design-lane checker allowed `title` on purpose (`check_strict.py:49-60`), so its advisor negative control is ported without its 6 `title` keys, and the unmodified schema becomes a positive. |
+| D24 | A base URL the resolver cannot parse (Codex finding 1) | The resolver parses the selected base at the Tier-3 boundary. Only env-sourced bases can be malformed (settings bases pass `_validate_composer_endpoint_base_url`, `config.py:145-175`, R). If `urlsplit(base)` raises `ValueError`, or its `hostname` is `None`, the route resolves to `NONE` on every setting and the result carries a closed diagnostic naming the variable (`StrictTransportDiagnostic`: `unparseable_openrouter_api_base`, `unparseable_openai_base_url`, `unparseable_openai_api_base`). The value is never logged or published (an env URL can carry userinfo). The resolver never raises for env input. `resolve_strict_transport` therefore returns a frozen `StrictTransportResolution(transport, diagnostic)`, not a bare `StrictTransport`. | M (`$L/plan-review/env_url_probe.log`): `urlsplit('http://[')` raises `ValueError: Invalid IPv6 URL`, `'not-a-url'` gives `hostname None`, and LiteLLM's `get_llm_provider` tolerates all three malformed env variables (so the plan's own parse was the only crash site). T8 calls the resolver in `ComposerServiceImpl.__init__` regardless of probe enablement, so without this a bad env value would stop app construction. Fails closed to today's bytes. |
 
 ### 1.4 What S1 does not do
 
@@ -200,7 +208,9 @@ on). The tasks below follow the correction. Record each one in the master plan's
   The chat default is already `2025-02-01-preview` (`litellm.AZURE_DEFAULT_API_VERSION`, M). On the Responses
   bridge, the version is `preview` whatever `AZURE_API_VERSION` says (M), so `preview`, `latest` and `v1` must count
   as supporting strict. `azure/` always has a base, so the "custom api_base → NONE" rule applies only to the
-  `openai` and `openrouter` routing providers. `azure_ai/` has no row in §2.2 and resolves to `NONE`.
+  `openai` and `openrouter` routing providers. `azure_ai/` has no row in §2.2 and resolves to `NONE`. Under ruling 7
+  (§7.3), a supporting api-version makes Azure `ENFORCING` only under `forward_to_endpoint`; under `preferred` it is
+  `NONE` until R8.
 - **C12. `openrouter/` with a non-OpenRouter base** (a proxy, or `OPENROUTER_API_BASE`) is not covered by the
   custom-endpoint rule, which names only `openai/` and bare names. It resolves to `NONE` unless the setting is
   `forward_to_endpoint`.
@@ -208,9 +218,12 @@ on). The tasks below follow the correction. Record each one in the master plan's
   explicit-false tools alone would fail boot against ELSPETH's gateway.
 - **C14. The hatch probe does not fit the S0 budget shape as written.** Resolved by D9. It needs a surface name, a
   role, a cap and a place in the order.
-- **C15. `/api/system/status` needs one entry per route.** The default config's planner is `ENFORCING` and its hatch
-  is `NONE`. `boot_acceptance` has no source today: `probe_status` is a local variable of the lifespan loop
-  (`app.py:752-838`). T10 stores it.
+- **C15. `/api/system/status` cannot publish per-route facts** (superseded by ruling 2, §7.3; the first draft said it
+  "needs one entry per route" and that T10 would store `probe_status`). The two routes can resolve differently (an
+  OpenRouter planner with an `anthropic/` hatch: `FORWARDING`/`NONE`), and any per-route transport or effective strict
+  count reveals whether a custom endpoint is configured (D14). The public key carries only the setting and
+  tool-set properties; per-route facts and the per-surface `probe_status` (a local of the lifespan loop,
+  `app.py:752-838`, R) go to structured logs.
 - **C16. Gates the S1 list omits:** `composer.exception_channel` (CEC1, bare `ValueError`/`TypeError` in
   `web/composer/tools/*` other than `_dispatch.py`, M); `check_contracts` Check 2 (`dict[str, Any]`
   params/returns need `contracts-whitelist.yaml` rows); the composer wire census's AST binding of
@@ -218,10 +231,16 @@ on). The tasks below follow the correction. Record each one in the master plan's
   corpus lines from the decode boundary; `test_composer_llm_call_construction_sites.py`;
   `test_error_class_producer_census.py`. The census "is unaffected because it reads S" is true for W, but not for a
   `tool_batch` rename.
-- **C17. The default test model changes the wire in almost every compose-loop unit test.** Bare `gpt-5.5` with no
-  base resolves to `ENFORCING`, and `test_boot_probe.py`'s default advisor `openrouter/z-ai/glm-5.3` resolves to
-  `FORWARDING` (so the hatch probe fires there). Five boot-probe pins move, including a mutation control whose
-  arithmetic changes (T8).
+- **C17. Which tests change wire at the flip** (rewritten for ruling 7; the first draft said the default test model
+  changes the wire in almost every compose-loop unit test). Under ruling 7, bare `gpt-5.5` with no base resolves to
+  `NONE` under `preferred` (row 7), and `WebSettings`' defaults are `gpt-5.5` and `anthropic/claude-sonnet-4-6`
+  (`config.py:256`, `:361`, R), so tests on the defaults keep today's bytes. What changes: any test that names an
+  OpenRouter planner with no custom base (row 4), and any test whose advisor resolves non-`NONE`. `test_boot_probe.py`'s
+  fixture default advisor is `openrouter/z-ai/glm-5.3` (`:41`, R), which resolves to `FORWARDING`
+  (`supports_anthropic_prompt_cache_markers` is `False` for it, M `$L/plan-review/d8_probe.log`), so the
+  `hatch_terminal` surface appears in every test there that does not override the advisor. Its `gpt-5.5` loop and
+  planner pins (`:76`, `:79`, `:93`, `:316`) and the mutation control (`:96-106`) stay as they are (T8). Tests that
+  need the strict wire name an OpenRouter planner, or set `forward_to_endpoint`.
 - **C18. The fidelity matrix must pin the cost map.** A bare `import litellm` loads the remote model map (M). The
   matrix asserts the source is `local`, and T11 makes that hold on purpose (C24). The design-lane evidence imported LiteLLM
   first, but the relevant keys are equal today (`costmap_compare.log`), so it stands.
@@ -318,8 +337,11 @@ Rules for every task:
   Put every **new** S1 test in a new file. S1's edits inside `test_pipeline_planner.py` are the `_model()` helper
   (`:629`) and the two planner-list calls (`:823`, `:2107`), all interior lines that do not overlap the appended
   hunk; the appended tests construct no `PlannerModelConfig` (measured by the risk critic). The other existing test
-  files S1 edits mechanically (T2: the 10 loop-list callers; T6: the two `semantic=` calls; T7: the other planner-list
-  callers and the parity monkeypatch; T8: `test_boot_probe.py`, `test_app.py`) are not in the 5887 file lists.
+  files S1 edits mechanically (T2: the 10 loop-list callers; T6: the two `dialect=`/`semantic=` calls; T7: the other
+  planner-list callers and the parity monkeypatch; T8: `test_boot_probe.py`, `test_app.py`,
+  `test_boot_probe_production_parity.py` and the two conftests) are not in the 5887 file lists (re-checked after the
+  Codex round: `grep` over `$L/branch-fix_5887-*.files` finds none of them; positive control
+  `test_pipeline_planner` is found).
   Whoever lands second re-runs `check_contracts --write-census` and retakes the corpus baseline.
 
 ### T0 — Preflight (no commit)
@@ -606,33 +628,44 @@ Rules for every task:
   - `StrictToolsSetting = Literal["preferred", "forward_to_endpoint", "off"]`.
   - `StrictTransport(StrEnum)`: `ENFORCING`, `FORWARDING`, `NONE`. `dialect_for(transport) -> ToolContractDialect`
     maps `NONE` to `NONE` and the other two to `OPENAI_STRICT`.
-  - `resolve_strict_transport(*, model, api_base, setting, env: Mapping[str, str]) -> StrictTransport` applies the
-    table below. The first matching row wins.
+  - `StrictTransportDiagnostic(StrEnum)`, closed (D24): `UNPARSEABLE_OPENROUTER_API_BASE`,
+    `UNPARSEABLE_OPENAI_BASE_URL`, `UNPARSEABLE_OPENAI_API_BASE`. `StrictTransportResolution` is a frozen dataclass
+    `(transport: StrictTransport, diagnostic: StrictTransportDiagnostic | None)`; `diagnostic` is set only by row 3a.
+  - `resolve_strict_transport(*, model, api_base, setting, env: Mapping[str, str]) -> StrictTransportResolution`
+    applies the table below. The first matching row wins. It never raises for env input (D24).
 
 | # | Condition | `preferred` | `forward_to_endpoint` | `off` |
 |---|---|---|---|---|
 | 1 | setting is `off` | — | — | `NONE` |
 | 2 | `supports_anthropic_prompt_cache_markers(model)` (D8) | `NONE` | `NONE` | `NONE` |
 | 3 | `litellm.get_llm_provider(model=model, api_base=api_base)` raises `litellm.exceptions.BadRequestError`, or its provider is not an exact `str` | `NONE` | `NONE` | `NONE` |
+| 3a | provider `openrouter` or `openai`, `api_base` is `None`, and the env base the row 4/6 selection would use makes `urlsplit` raise `ValueError` or gives `hostname is None` (D24; diagnostic names the variable) | `NONE` | `NONE` | `NONE` |
 | 4 | provider `openrouter`; base = `api_base` or `env["OPENROUTER_API_BASE"]` or `https://openrouter.ai/api/v1`; host is `openrouter.ai` | `FORWARDING` | `FORWARDING` | `NONE` |
 | 5 | provider `openrouter`, any other host (C12) | `NONE` | `FORWARDING` | `NONE` |
 | 6 | provider `openai`; base = `api_base` or `env["OPENAI_BASE_URL"]` or `env["OPENAI_API_BASE"]` or `https://api.openai.com/v1`; host is `openrouter.ai` | `FORWARDING` | `FORWARDING` | `NONE` |
-| 7 | provider `openai`, host is `api.openai.com` or ends with `.api.openai.com` | `ENFORCING` | `ENFORCING` | `NONE` |
+| 7 | provider `openai`, host is `api.openai.com` or ends with `.api.openai.com` | `NONE` (ruling 7) | `ENFORCING` | `NONE` |
 | 8 | provider `openai`, any other host (ELSPETH's gateway, a proxy, an env-set base) | `NONE` | `FORWARDING` | `NONE` |
-| 9 | provider `azure`; version = `env["AZURE_API_VERSION"]` or `_LITELLM_AZURE_DEFAULT_API_VERSION` (`"2025-02-01-preview"`, pinned); version is `preview`/`latest`/`v1` or an ISO date ≥ `2024-08-01` (a `-preview` suffix allowed) (C11) | `ENFORCING` | `ENFORCING` | `NONE` |
+| 9 | provider `azure`; version = `env["AZURE_API_VERSION"]` or `_LITELLM_AZURE_DEFAULT_API_VERSION` (`"2025-02-01-preview"`, pinned); version is `preview`/`latest`/`v1` or an ISO date ≥ `2024-08-01` (a `-preview` suffix allowed) (C11) | `NONE` (ruling 7) | `ENFORCING` | `NONE` |
 | 10 | provider `azure`, older or unparseable version | `NONE` | `NONE` | `NONE` |
 | 11 | any other provider (`anthropic`, `bedrock`, `azure_ai`, `vertex_ai`, `deepseek`, `hosted_vllm`, …) | `NONE` | `NONE` | `NONE` |
 
-  - Hosts come from `urllib.parse.urlsplit(base).hostname`. Settings already reject query strings and fragments
-    (`config.py:167-168`).
+  - **Ruling 7 (lead, provisional; John may overrule), option (a):** under `preferred` nothing resolves to
+    `ENFORCING`; the only non-`NONE` rows under the default are 4 and 6, both OpenRouter hosts. Hosted OpenAI (row 7)
+    and Azure (row 9) are `ENFORCING` only under `forward_to_endpoint`, until R8 has measured them live. Reverting the
+    ruling is a two-cell table change plus the T4/T8/T10/T11 expectations that name it.
+  - Hosts come from `urllib.parse.urlsplit(base).hostname`, parsed as Tier-3 input: the `ValueError` is caught at
+    that one call and turned into row 3a. A settings base cannot reach row 3a, because settings already reject
+    malformed URLs, query strings and fragments (`config.py:145-175`, R).
   - Row 7 is deliberately narrower than LiteLLM's own hosted-OpenAI test, which accepts `openai.com` and any
     `*.openai.com` (`gpt_transformation.py:407-419`). Other `openai.com` hosts fall to row 8 and resolve to `NONE`
     under `preferred`, which is today's bytes.
   - The two-route helper `resolve_composer_tool_contract` (D20) is **not** added here; it lands in T8 with its first
     two callers.
-  - The `get_llm_provider` call is the Tier-3 site. Read only index 1 of its tuple, discard the rest (index 2 can
-    be an env-read key), and check `type(provider) is str`. Catch only `BadRequestError`. Anything else
-    propagates, because a crash in LiteLLM's resolver is a LiteLLM bug.
+  - The `get_llm_provider` call is the Tier-3 site. Put it in one private helper,
+    `_routing_provider(model, api_base) -> str | None`, which the resolver calls and nothing else duplicates. Read
+    only index 1 of its tuple, discard the rest (index 2 can be an env-read key), and check `type(provider) is str`
+    (otherwise `None`, row 3). Catch only `BadRequestError`. Anything else propagates, because a crash in LiteLLM's
+    resolver is a LiteLLM bug.
   - On a miss, LiteLLM prints a provider banner to stdout (observed). That is acceptable, because it happens only
     for unknown bare names, which availability already marks unusable (`availability.py:94-108`).
 - **Modify** `src/elspeth/web/config.py`: add `composer_strict_tools: StrictToolsSetting = "preferred"` next to
@@ -648,31 +681,42 @@ Rules for every task:
     in T8, where it is first read.
 - **Modify** `docs/reference/environment-variables.md`:
   - add an `ELSPETH_WEB__COMPOSER_STRICT_TOOLS` row or paragraph in the composer section (`:240-346`), giving the 3
-    values, the default and the resolution rules in plain words: custom endpoints `NONE` under `preferred`;
-    `forward_to_endpoint` only for operator-verified gateways, noting that ELSPETH's own gateway rejects any
-    `strict` key, `false` included; `off` as the remedy. Two more plain sentences land with the tasks that make
-    them true:
+    values, the default and the resolution rules in plain words: under `preferred` only OpenRouter routes send
+    `strict`, and custom endpoints, hosted OpenAI and Azure send today's bytes; `forward_to_endpoint` for
+    operator-verified gateways and as the opt-in for hosted OpenAI and Azure, noting that ELSPETH's own gateway
+    rejects any `strict` key, `false` included; `off` as the remedy; a malformed `OPENAI_BASE_URL`,
+    `OPENAI_API_BASE` or `OPENROUTER_API_BASE` makes that route send today's bytes (D24). Two more plain sentences land
+    with the tasks that make them true:
     - (with T9) `off` restores the tool wire and turns off decode; it does not revert the `validation_errors` in
       tool results, which are independent of the setting;
-    - (with T8) the default hosted-OpenAI route (bare `gpt-5.5` with no endpoint, the Azure Container Apps bicep default) and
-      Azure routes with an api-version of at least `2024-08-01` resolve to `enforcing`, which no live endpoint has
-      yet accepted from ELSPETH; a rejection at boot stops the app, so the first boot after upgrading is that
-      route's live acceptance test, and `off` is the remedy (the ruling on this is §7.3 item 7);
-  - rewrite the boot-probe paragraph (`:268-282`) to mention the strict counts and the conditional
-    `hatch_terminal` request (the text lands with T8; the setting row lands here).
+    - (with T8) under `forward_to_endpoint`, hosted OpenAI (bare `gpt-5.5` with no endpoint, the Azure Container Apps
+      bicep default) and Azure routes with an api-version of at least `2024-08-01` resolve to `enforcing`, which no
+      live endpoint has yet accepted from ELSPETH; a planner-route rejection at boot stops the app, so the first boot
+      after opting in is that route's live acceptance test, and `preferred` or `off` is the remedy (§7.3 item 7). A
+      rejection of the conditional `hatch_terminal` request is logged and does not stop boot (§7.3 item 8);
+  - rewrite the boot-probe paragraph (`:268-282`) to mention the strict counts and the conditional, non-fatal
+    `hatch_terminal` request (16 `max_tokens`, a rejection check only) (the text lands with T8; the setting row lands
+    here).
 - **Tests (RED):** `tests/unit/web/composer/test_strict_transport.py`.
   - Each row below also carries a **literal** expected LiteLLM provider, copied from `$L/provider_matrix.log`, and
-    the test asserts `litellm.get_llm_provider(model, api_base)[1]` equals that literal (or that it raises
-    `BadRequestError` for the unknown names). This is the drift pin: comparing the resolver's provider with
-    `get_llm_provider` itself would be a tautology, because the resolver *is* that call. The literals:
+    the test asserts `_routing_provider(model, api_base)` equals that literal (or is `None` for the unknown names,
+    where LiteLLM raises `BadRequestError`). This is the drift pin: comparing the resolver's provider with
+    `get_llm_provider` itself would be a tautology, because the resolver *is* that call; a literal is not. The literals:
     `gpt-5.5` (no base, loopback, env base) → `openai`; `openrouter/…` (every row, including `openrouter/auto` and the
     proxy base) → `openrouter`; `openai/…` + an openrouter base → `openai`; `anthropic/…` → `anthropic`; bare
     `claude-sonnet-4-6` + loopback → `anthropic`; `gpt-5.5` + `https://api.deepseek.com/v1` → `deepseek`; `azure/…` →
-    `azure`; `azure_ai/…` → `azure_ai`; `bedrock/…` → `bedrock`; `probe-model`, `m` → raises. Mutation control: edit
-    one literal and that row goes red. The Anthropic rows are resolved to `NONE` by row 2 before the provider is
-    read, so this literal column is the only place their LiteLLM provider is pinned.
-  - A parametrised expected-values table for `preferred`, covering:
-    - default planner `gpt-5.5` with no base → `ENFORCING`;
+    `azure`; `azure_ai/…` → `azure_ai`; `bedrock/…` → `bedrock`; `probe-model`, `m` → raises. The Anthropic rows are
+    resolved to `NONE` by row 2 before the provider is read, so this literal column is the only place their LiteLLM
+    provider is pinned.
+    - Mutation controls (Codex finding 6: they mutate the thing under test, never the expected literal, which would
+      only prove the assert runs): (i) mutate the routing input while keeping the literal: on the `deepseek` row,
+      swap `https://api.deepseek.com/v1` for `https://api.openai.com/v1` and that row goes red (LiteLLM then says
+      `openai`); (ii) mutate the resolution result: `monkeypatch.setattr` `litellm.get_llm_provider` with a wrapper
+      that returns `"openai"` in index 1 for `openrouter/` models, and every `openrouter` row goes red. Record both
+      logs.
+  - A parametrised expected-values table for `preferred` (each case asserts the whole `StrictTransportResolution`,
+    diagnostic included), covering:
+    - default planner `gpt-5.5` with no base → `NONE` (row 7 under ruling 7);
     - default hatch `anthropic/claude-sonnet-4-6` → `NONE`;
     - deployed `openrouter/deepseek/deepseek-v4.1-flash` → `FORWARDING`;
     - deployed hatch `openrouter/z-ai/glm-5.3` → `FORWARDING`;
@@ -683,16 +727,27 @@ Rules for every task:
     - `openai/anthropic/claude-sonnet-4-6` + an openrouter base → `NONE` (D8);
     - bare `claude-sonnet-4-6` + loopback → `NONE`;
     - `gpt-5.5` + `https://api.deepseek.com/v1` → `NONE` (C1);
-    - `azure/gpt-4.1` with env unset → `ENFORCING`;
-    - `azure/gpt-4.1` with `AZURE_API_VERSION=2024-06-01` → `NONE`;
-    - `azure/gpt-4.1` with `AZURE_API_VERSION=preview` → `ENFORCING`;
+    - `azure/gpt-4.1` with env unset → `NONE` (row 9 under ruling 7);
+    - `azure/gpt-4.1` with `AZURE_API_VERSION=2024-06-01` → `NONE` (row 10);
+    - `azure/gpt-4.1` with `AZURE_API_VERSION=preview` → `NONE` (row 9 under ruling 7);
     - `azure_ai/x` → `NONE`;
     - `bedrock/anthropic.claude-…` → `NONE`;
     - unknown bare names `probe-model` and `m` → `NONE`;
     - `openrouter/auto` → `FORWARDING` (D7);
-    - `openrouter/deepseek/…` + `https://proxy.example/v1` → `NONE`.
-  - The same table under `forward_to_endpoint`: rows 5 and 8 flip to `FORWARDING`, and nothing else moves. Control:
-    making `forward_to_endpoint` widen row 3 or row 11 turns it red.
+    - `openrouter/deepseek/…` + `https://proxy.example/v1` → `NONE`;
+    - env-selected OpenRouter proxy: `openrouter/deepseek/…` with `OPENROUTER_API_BASE=https://proxy.example/v1` →
+      `NONE` (row 5), diagnostic `None`;
+    - **malformed env bases (D24, Codex finding 1):** `openrouter/deepseek/…` with `OPENROUTER_API_BASE=http://[` →
+      `NONE`, diagnostic `UNPARSEABLE_OPENROUTER_API_BASE`; `gpt-5.5` with `OPENAI_BASE_URL=http://[` → `NONE`,
+      `UNPARSEABLE_OPENAI_BASE_URL`; `gpt-5.5` with `OPENAI_API_BASE=not-a-url` (hostname `None`) → `NONE`,
+      `UNPARSEABLE_OPENAI_API_BASE`. None of these raises. Control: remove the `ValueError` catch and the first case
+      raises `ValueError: Invalid IPv6 URL` (the plan's original parse, M `$L/plan-review/env_url_probe.log`).
+  - The same table under `forward_to_endpoint`: rows 5 and 8 flip to `FORWARDING`, rows 7 and 9 flip to `ENFORCING`
+    (so `gpt-5.5` no base, `azure/gpt-4.1` env unset and `AZURE_API_VERSION=preview` are `ENFORCING`), and nothing
+    else moves; the malformed-env cases stay `NONE` with their diagnostics. Control: making `forward_to_endpoint` widen
+    row 3, row 3a or row 11 turns it red.
+  - Under `preferred`, no case in the table resolves to `ENFORCING` (ruling 7). Control: restore the pre-ruling row 7
+    cell (`ENFORCING` under `preferred`) and the `gpt-5.5` no-base case goes red.
   - Under `off`, every row → `NONE`.
   - Pins against LiteLLM:
     - `_LITELLM_AZURE_DEFAULT_API_VERSION == litellm.AZURE_DEFAULT_API_VERSION`;
@@ -814,14 +869,23 @@ Rules for every task:
     `begin_dispatch_or_arg_error` at `:1061` (main path). Every invocation built from those `DispatchAudit`s then
     carries the same facts as the `_ToolOutcome`. On paths where P4 did not persist, the route drain stores these
     invocations (C2), so a `None` default here would store a different value from the P4 row for the same call.
-  - `_replace_llm_tool_call_arguments` (`:450`): the set_pipeline branch (`:481`) calls
-    `encode_semantic_arguments("set_pipeline", ctx.tool_contract_dialect, arguments)` **only for semantic
-    arguments**, which are the `:1069`, `:1302`, `:1404` and `:1438` callers. The sentinel callers (`:834`, `:886`,
-    `:1005`) keep today's bytes: flat for other tools, and re-enveloped for set_pipeline by the same `{"pipeline": …}`
-    wrap. Give the function a **required** keyword `semantic: bool` so this choice is explicit at each call site.
-    Update all 7 source callers and both direct test callers
-    (`tests/unit/web/composer/test_dispatch_arms_characterization.py:160`, `:189`). In S1 both branches produce
-    identical bytes for set_pipeline, because set_pipeline is non-strict on both dialects. Pin it.
+  - `_replace_llm_tool_call_arguments` (`:450`) is module-level and today takes only `llm_messages` and the
+    keyword-only `tool_call_id`/`arguments` (R); no `ctx` is in scope inside it (Codex finding 5). Give it two
+    **required** keyword-only parameters, `dialect: ToolContractDialect` and `semantic: bool`, so both choices are
+    explicit at each call site: `_replace_llm_tool_call_arguments(llm_messages, *, tool_call_id, arguments, dialect,
+    semantic)`.
+    - The set_pipeline branch (`:481`) calls `encode_semantic_arguments("set_pipeline", dialect, arguments)` **only
+      when `semantic` is true**, which is the `:1069`, `:1302`, `:1404` and `:1438` callers. The sentinel callers
+      (`:834`, `:886`, `:1005`) keep today's bytes: flat for other tools, and re-enveloped for set_pipeline by the
+      same `{"pipeline": …}` wrap.
+    - All 7 production callers sit inside `run_tool_batch` (`:686`; no other `def` between it and `:1450`, R), so
+      each passes `dialect=ctx.tool_contract_dialect`. Both direct test callers
+      (`tests/unit/web/composer/test_dispatch_arms_characterization.py:160`, `:189`) gain `dialect=` and `semantic=`.
+    - In S1 both branches produce identical bytes for set_pipeline, because set_pipeline is non-strict on both
+      dialects. Pin it for **both** dialects: for `NONE` and `OPENAI_STRICT`, the transcript bytes from
+      `semantic=True` and `semantic=False` are byte-identical for a set_pipeline call, and the sentinel bytes for
+      set_pipeline and `list_models` equal today's output (`dispatch_probe.log` item 1). Control: make the semantic
+      branch skip the envelope and the set_pipeline pin goes red on both dialects.
 - **Modify** `src/elspeth/web/composer/_compose_loop_carriers.py` `_ToolOutcome` (`:187`): add
   `strict_sent: bool | None = None` and `wire_conformant: bool | None = None`, and extend its cross-check to exact
   `bool` or `None` (no implication between them, D16). The defaults keep the 5 existing test constructions
@@ -872,8 +936,8 @@ Rules for every task:
     `tool_batch.py:2176`, `:2223`). Control: drop the explicit facts at `:948` and it goes red.
   - The envelope pins keep their assertions unchanged: `test_dispatch_arms_characterization.py:195-~250` (4 invalid
     envelopes → `ToolArgumentError`/`WIRE_ENVELOPE`, sentinel `arguments_canonical`, handler never reached) and
-    `:137-167` (transcript re-envelope). The only edit in that file is the `semantic=` keyword at the two direct
-    calls (`:160`, `:189`).
+    `:137-167` (transcript re-envelope). The only edits in that file are the `dialect=` and `semantic=` keywords at
+    the two direct calls (`:160`, `:189`); the two-dialect byte pins go in the new file.
   - The sentinel transcript bytes for set_pipeline and for `list_models` are pinned byte-for-byte to today's output
     (`dispatch_probe.log` item 1 gives the expected strings).
   - The unknown-tool and JSON-decode-failure rows give `strict_sent`/`wire_conformant` = (`None`, `None`) and
@@ -989,13 +1053,22 @@ This is one commit, because probe/production parity requires the service and the
 - **Add** to `strict_transport.py` (D20): `resolve_composer_tool_contract(settings, *, env: Mapping[str, str]) -> ComposerToolContract`.
   It calls `resolve_strict_transport` for the planner route (`composer_model`, `composer_endpoint_base_url`) and the
   hatch route (`composer_advisor_model`, `composer_advisor_endpoint_base_url`) with `composer_strict_tools`, and
-  returns an owned frozen dataclass: the setting, and per route the transport and the dialect. `env` has no
-  default.
+  returns an owned frozen dataclass: the setting, and per route the `StrictTransportResolution` (transport and D24
+  diagnostic) and the dialect. `env` has no default.
 - **Modify** `ComposerServiceImpl.__init__` (next to `service.py:2511-2515`):
   - `self._tool_contract = resolve_composer_tool_contract(settings, env=os.environ)`;
   - `self._planner_dialect` and `self._hatch_dialect` come from it, replacing T6/T7's `NONE`.
   - Expose a read-only `tool_contract_summary` property returning an owned frozen dataclass (the contract plus
-    `loop_strict_true`, `loop_tool_count`) for T10.
+    `loop_strict_true`, `loop_tool_count`). It is **not** published (D14); it feeds the structured log below and the
+    tests.
+  - Emit one structured log event through the module `slog` (`service.py:289`):
+    `slog.info("composer_tool_contract_resolved", setting=…, planner_transport=…, planner_dialect=…,
+    planner_diagnostic=…, hatch_transport=…, hatch_dialect=…, hatch_diagnostic=…, loop_strict_tool_count=…,
+    loop_tool_count=…)`. Closed values and counts only: no URL and no env value (D24). This is where
+    per-route transport and the effective strict count go under ruling 2. (Policy note for John: the
+    logging-telemetry skill routes config lifecycle events to telemetry; the web boot path's precedent is `slog`
+    beside the OTel boot counter, `app.py:742-841`, and the lead's ruling names structured logs, so S1 follows that
+    precedent. The per-call effective count is also audited on every `ComposerLLMCall`, T5.)
 - **Modify** `boot_probe.build_composer_probe_requests(settings, *, env: Mapping[str, str] = os.environ)` (`:135`,
   D20). It calls `resolve_composer_tool_contract(settings, env=env)`. `app.py:750` passes `os.environ` explicitly.
   The 6 existing test calls (`test_boot_probe.py` ×4, `test_boot_probe_production_parity.py:198`,
@@ -1003,43 +1076,83 @@ This is one commit, because probe/production parity requires the service and the
   - `loop_tools` sends `composer_loop_tool_definitions(planner dialect)`.
   - `planner_tools` sends `planner_tool_definitions(dialect=planner dialect)`.
   - **New surface `hatch_terminal`** (D9), added only when the hatch resolves non-`NONE`:
-    - role `planner`, model `composer_advisor_model`, advisor endpoint;
+    - role `planner`, model `composer_advisor_model`, advisor endpoint and key;
     - `tools=[planner_terminal_tool_definition(dialect=hatch dialect)]`;
-    - `build_planner_request_kwargs` at candidate effort with the planner token cap (mirroring `call_model` on a
-      hatch turn);
+    - `build_planner_request_kwargs` at candidate effort (as `call_model` on a hatch turn), then
+      `kwargs["max_tokens"] = LOOP_PROBE_MAX_TOKENS` (16), exactly as `loop_tools` does (`boot_probe.py:157`).
+      **Ruled (lead, provisional; John may overrule), §7.3 item 1:** a rejection check only; the token cap is the one
+      deliberate difference from a hatch turn's request;
     - no cache markers, because D8 means no Anthropic-family route is non-`NONE`.
   - Order: `loop_tools`, `planner_tools`, `hatch_terminal`, `advisor`. Extend `ComposerProbeSurface` (`:45`) with
     `"hatch_terminal"`.
 - **Modify** `app.py:742-841`: no constant changes. The existing `role == "planner"` rule gives `hatch_terminal` the
   5 s cap, and the advisor gets the remainder (at least 30 s on a 4-surface boot). The telemetry `probed_surface`
   gains the new value.
+  - **Ruled (lead, provisional; John may overrule), §7.3 item 8, option (b):** a `hatch_terminal` rejection is
+    non-fatal. The `except ComposerBootConfigError` arm (`:828-830`) gains a surface-specific branch: when
+    `probe_request.surface == "hatch_terminal"`, set `probe_status = "rejected"`, emit
+    `slog.warning("composer_boot_probe_rejected_nonfatal", model=…, probed_role=…, probed_surface=…,
+    tool_count=…, strict_true_count=…, strict_false_count=…, strict_key_omitted=…, action="booting; the escape-hatch terminal was rejected at boot; hatch turns will fail until the hatch route or composer_strict_tools is changed")`,
+    following the `composer_boot_probe_transient_failure` pattern (owned facts only; never the exception text or
+    cause chain), and `continue`. Every other surface re-raises exactly as in S0, so planner-route and advisor 400s
+    stay fatal. The `finally` block still records `probe_status = "rejected"` on the OTel counter.
 - **Test housekeeping:**
-  - replace T6/T7's `service._planner_dialect = …` assignments with settings that resolve to the dialect (default
-    `gpt-5.5` → `OPENAI_STRICT`; `composer_strict_tools="off"` → `NONE`);
+  - replace T6/T7's `service._planner_dialect = …` assignments with settings that resolve to the dialect: an
+    OpenRouter planner with no custom base (`openrouter/deepseek/deepseek-v4.1-flash`, row 4) → `OPENAI_STRICT`;
+    the default `gpt-5.5` → `NONE` under ruling 7 (C17); `composer_strict_tools="off"` on the OpenRouter planner →
+    `NONE`. Where a test needs `ENFORCING` specifically, it sets `composer_strict_tools="forward_to_endpoint"` on
+    `gpt-5.5`;
   - add `composer_strict_tools` to every structural settings double from T4's inventory;
-  - **env hermeticity.** From this commit nearly every compose-loop test's wire depends on the resolver, which
+  - **env hermeticity.** From this commit every compose-loop test's wire depends on the resolver, which
     reads `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE` and `AZURE_API_VERSION`, and pytest loads
     `.env` (§2). Add an autouse fixture that `monkeypatch.delenv`s those four (with `raising=False`) to
     `tests/unit/conftest.py` and `tests/integration/web/conftest.py`. Not the root conftest: the live provider
-    tests under `tests/integration/plugins/` read Azure settings from the environment. Control: a test that sets
-    `OPENAI_BASE_URL` through `monkeypatch.setenv` and asserts the default service resolves `NONE`, and one without
-    it that asserts `OPENAI_STRICT`.
+    tests under `tests/integration/plugins/` read Azure settings from the environment. Control (rewritten for
+    ruling 7, because `OPENAI_BASE_URL` no longer changes the default `gpt-5.5` route's dialect under `preferred`):
+    on the OpenRouter planner, a test with `OPENROUTER_API_BASE=https://proxy.example/v1` set through
+    `monkeypatch.setenv` asserts the service resolves `NONE` (row 5), and one without it asserts `OPENAI_STRICT`
+    (row 4); and on `gpt-5.5` under `forward_to_endpoint`, `OPENAI_BASE_URL=https://gw.example/v1` gives transport
+    `FORWARDING` (row 8) and its absence gives `ENFORCING` (row 7), asserted on `tool_contract_summary`'s transport.
+  - **Malformed env regression (D24, Codex finding 1).** Construct `ComposerServiceImpl` with
+    `composer_boot_probe_enabled=False`, the OpenRouter planner and advisor, and
+    `monkeypatch.setenv("OPENROUTER_API_BASE", "http://[")`: construction succeeds, both routes resolve `NONE` with
+    diagnostic `unparseable_openrouter_api_base`, the loop list carries no `strict` key, and the
+    `composer_tool_contract_resolved` event carries the diagnostic but not the value (captured with
+    `structlog.testing.capture_logs`). Do the same through `build_composer_probe_requests(settings, env=…)`: no
+    `hatch_terminal` surface and no raise. Control: remove the resolver's `ValueError` catch and construction
+    raises `ValueError`.
 - **Tests: deliberate pin moves (each one listed in the commit message):**
-  - `test_boot_probe.py`:
-    - `:76` compares against `composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)`;
-    - `:79` (0, 0, 42) → (32, 10, 0);
-    - `:93` (0, 0, 20) → (19, 1, 0);
-    - `:316`'s hard-coded `strict_true_count=0, …` becomes per-surface expected counts, and the parametrisation at
-      `:292-295` gains `("hatch_terminal", 1)` with expected counts `(0, 1, 0)`, so the new surface's
-      `ComposerBootConfigError` text is tested;
-    - `:96-106` (mutation control): rebuild it on an explicit `NONE` route (`composer_endpoint_base_url` set to a
-      loopback **and** `composer_endpoint_api_key` set, because `config.py:1308-1310` requires the pair and the
-      fixture builds a real `WebSettings`), where the arithmetic (1, 1, 40) still holds, and add a second control on
-      the stamped base (flip one `true` to `false` → (31, 11, 0)).
-    - `:61-70` keeps its 3 surfaces because the advisor is `anthropic/`. Add
-      `test_requests_include_hatch_terminal_on_a_forwarding_hatch`, using the fixture's default OpenRouter advisor:
-      surfaces `[loop_tools, planner_tools, hatch_terminal, advisor]`, the hatch tool list is exactly the stamped
-      terminal with `strict: false`, and the model and endpoint are the advisor's.
+  - `test_boot_probe.py` (rewritten for ruling 7, C17; R at `85ebf2739`):
+    - `:76`, `:79` (0, 0, 42) and `:93` (0, 0, 20) **stay unchanged**: their planner is `gpt-5.5` with no base, which
+      is `NONE` under `preferred`. The builders they compare against take `ToolContractDialect.NONE` from T2/T7.
+    - `:96-106` (mutation control) stays unchanged on the `gpt-5.5` `NONE` route, where (1, 1, 40) holds. Add a
+      second control on a stamped base: an OpenRouter planner (`openrouter/deepseek/deepseek-v4.1-flash`, no base),
+      flip one `true` to `false` → (31, 11, 0).
+    - Add stamped counterparts on that OpenRouter planner: `loop_tools` equals
+      `composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)` with counts (32, 10, 0), and `planner_tools`
+      equals `planner_tool_definitions(dialect=OPENAI_STRICT)` with counts (19, 1, 0).
+    - `:292-316`: the parametrisation gains `("hatch_terminal", 1)`. The hard-coded
+      `strict_true_count=0, strict_false_count=0, strict_key_omitted={tool_count}` at `:316` becomes per-surface
+      expected counts: `(0, 0, 42)`, `(0, 0, len(planner list))`, `(0, 1, 0)` for `hatch_terminal` (the default
+      OpenRouter advisor is `FORWARDING`), and `(0, 0, 0)` for `advisor`. So the new surface's
+      `ComposerBootConfigError` text is tested.
+    - `:61-70` keeps its 3 surfaces because its advisor is `anthropic/` (row 2). `:212` keeps its 3-tuple unpack
+      because its advisor is `gpt-5.5` + a custom advisor base (row 8). `:222` iterates every request with the
+      default OpenRouter advisor, so it now also covers `hatch_terminal`; its assertion (no `api_base`/`api_key`
+      when both endpoints are unset) holds for it unchanged. Re-check each reason when running.
+    - Add `test_requests_include_hatch_terminal_on_a_forwarding_hatch`, using the fixture's default OpenRouter
+      advisor: surfaces `[loop_tools, planner_tools, hatch_terminal, advisor]`, the hatch tool list is exactly the
+      stamped terminal with `strict: false`, `max_tokens == LOOP_PROBE_MAX_TOKENS == 16` (ruling 1), the reasoning
+      effort is the candidate effort, and the model, endpoint and key are the advisor's (set the advisor pair to
+      `https://openrouter.ai/api/v1` plus a key, `config.py:1308-1322`, which stays row 4 `FORWARDING` while
+      differing from the unset planner endpoint, so the endpoint assertion can fail; a non-OpenRouter advisor base
+      would be row 5 and drop the surface). Control: build it with the planner
+      token cap and the `max_tokens` assertion goes red.
+    - Add `test_hatch_terminal_rejection_is_nonfatal` (in `test_app.py`, beside the lifespan budget tests): a
+      scripted 400 on `hatch_terminal` → the app boots, a `composer_boot_probe_rejected_nonfatal` event is captured
+      and the counter records `rejected`; the same 400 on `planner_tools`, on `loop_tools` and on `advisor` →
+      `ComposerBootConfigError` propagates as in S0 (the surface-specific control). Control: drop the surface check
+      so every 400 is non-fatal, and the `planner_tools` case goes red.
   - `test_tool_schema_contract.py:36-57` and `test_provider_cache_markers.py:242-270`: they are true only for
     today's bytes, so they already pass `NONE` from T2. Add an `openai_strict` counterpart in a new test, not by
     editing their expectations.
@@ -1066,15 +1179,37 @@ This is one commit, because probe/production parity requires the service and the
     - Also assert that `resolve_composer_tool_contract` gives the same contract from the probe's call and from the
       service (D20).
     - Controls: stamp the probe's loop list with `NONE` and it goes red; stamp the probe's planner list with `NONE`
-      and it goes red; resolve the hatch probe with the planner's dialect and it goes red.
+      and it goes red. (Both routes here resolve to `OPENAI_STRICT`, so a hatch-dialect substitution cannot turn
+      this test red, Codex finding 3; the hatch routing control is the next test.)
+  - **Add** `test_hatch_probe_and_hatch_turn_follow_the_hatch_route_not_the_planner_route` (Codex finding 3), in
+    the same file, with asymmetric resolved routes in **both** directions. Each `NONE` side comes from the routing
+    table (row 5, via a custom base+key pair, `config.py:1308-1322`), not from D8's Anthropic short-circuit, so the
+    resolver itself is exercised:
+    - (i) planner `openrouter/deepseek/…` with no base (row 4, `FORWARDING`) + advisor `openrouter/z-ai/glm-5.3`
+      with advisor base `https://proxy.example/v1` and key (row 5, `NONE`): the probe has **no** `hatch_terminal`
+      surface; `loop_tools`/`planner_tools` are stamped; a production hatch turn goes to `https://proxy.example/v1`
+      and its transmitted `tools` carry no `strict` key, and its `ComposerLLMCall.tool_contract_dialect` is `none`;
+    - (ii) planner `openrouter/deepseek/…` with base `https://proxy.example/v1` and key (row 5, `NONE`) + advisor
+      `openrouter/z-ai/glm-5.3` with no base (row 4, `FORWARDING`): the probe **has** `hatch_terminal`, sent to the
+      advisor's effective endpoint (no `api_base`, i.e. OpenRouter's default) and not to the planner's proxy, with the
+      terminal transmitted as `strict: false`; `loop_tools`/`planner_tools` carry no `strict` key; a production hatch
+      turn transmits the terminal with `strict: false` to the same endpoint.
+    - Assert on the captured `litellm.acompletion` kwargs (the transmitted request), not on the builders' return.
+    - Control: substitute the planner's dialect for the hatch dialect (in `build_composer_probe_requests`'s
+      inclusion check and in `PlannerModelConfig.escape_hatch_tool_contract_dialect` at the service construction
+      sites) and **both** directions go red: (i) gains a `hatch_terminal` surface and a stamped hatch turn, (ii)
+      loses them. Record both logs.
 - **Tests (new):**
-  - `tests/unit/web/composer/test_compose_loop_llm_audit.py`-style: a default-settings compose turn records
-    `tool_contract_dialect="openai_strict"`, `strict_tool_count=32`. A turn with `composer_strict_tools="off"` records
-    `none`/`0` and sends tools with no `strict` key.
+  - `tests/unit/web/composer/test_compose_loop_llm_audit.py`-style: a compose turn on the OpenRouter planner
+    (`openrouter/deepseek/deepseek-v4.1-flash`, no base, default `preferred`) records
+    `tool_contract_dialect="openai_strict"`, `strict_tool_count=32`. The same planner with
+    `composer_strict_tools="off"` records `none`/`0` and sends tools with no `strict` key. A default-settings turn
+    (`gpt-5.5`, `preferred`) also records `none`/`0` and sends no `strict` key (ruling 7: the default route keeps
+    today's bytes); with `forward_to_endpoint` the same `gpt-5.5` turn records `openai_strict`/32.
   - No provider call is added to a compose transition (the composer invariant, checked behaviourally). One scripted
-    freeform compose turn and one scripted tutorial-entry turn, each run on default settings (`OPENAI_STRICT`) and
-    with `composer_strict_tools="off"` (`NONE`), make the same number of captured `litellm.acompletion` calls on both
-    dialects. The existing call-count pins in `tests/unit/web/composer` (for example in
+    freeform compose turn and one scripted tutorial-entry turn, each run on the OpenRouter planner under `preferred`
+    (`OPENAI_STRICT`) and with `composer_strict_tools="off"` (`NONE`), make the same number of captured
+    `litellm.acompletion` calls on both dialects. The existing call-count pins in `tests/unit/web/composer` (for example in
     `test_compose_loop_carriers.py`, `test_provider_telemetry.py`) must pass unchanged in the gate run below. Control:
     add a second provider call on the strict path and the test goes red.
 - **Gates:**
@@ -1087,7 +1222,8 @@ This is one commit, because probe/production parity requires the service and the
   - G-decl, G-wire, G-skill, G-tier (list any stale signed fingerprints in `service.py`/`boot_probe.py`), G-contracts,
     plus the every-task set.
   - Update the boot-probe paragraph in `docs/reference/environment-variables.md` (`:268-282`), and add the
-    "(with T8)" sentence from T4 about `enforcing` first boots.
+    "(with T8)" sentence from T4 about `enforcing` first boots under `forward_to_endpoint` and the non-fatal
+    `hatch_terminal` rejection.
 - **Commit:** `feat(composer): send strict:true on the 32 mechanical tools on forwarding routes; probe the stamped lists`.
 
 ### T9 — S-gate repair signal (closed `validation_errors`, compose loop only)
@@ -1095,12 +1231,15 @@ This is one commit, because probe/production parity requires the service and the
 Scope (D19): the violations are built in the shared S gate and carried on the exception everywhere, but only the
 compose loop renders them. MCP text (`composer_mcp/server.py:781-801`) and planner discovery's
 `_ArgumentErrorResponse` (`provider_discovery_response.py:186-202`) are unchanged, so §5 "MCP unchanged" holds.
-Whether to extend the planner is a ruling (§7.3).
+Ruled (lead, provisional; John may overrule), §7.3 item 9: it is not extended; the repair signal stays compose-loop
+only.
 
-Deploy order (master plan S1: the repair signal "lands with S1 and after the S0 baseline, not inside it"): T9 changes
-planner-visible tool results on every S-gated tool at the same moment the flip turns strict on, and `off` does not
-revert it. S1 therefore does not deploy until the S0 baseline window (S0 acceptance 5) is recorded, and the deploy
-time is recorded so later readings can be split at that boundary (§6 step 6, §7.3).
+Deploy order. **Ruled (lead, provisional; John may overrule), §7.3 item 10:** T9 ships with S1. T9 changes
+planner-visible tool results on every S-gated tool, and `off` does not revert it. If S0 and S1 deploy together, the
+S0 baseline window (S0 acceptance 5) is taken with `composer_strict_tools=off`, and the T9 repair signal is a stated
+confound of that baseline (it is live in both windows, so it cannot be separated from S0's own effect there, and
+the `off` → `preferred` comparison isolates the strict flip only). The deploy time and the setting change time are
+recorded so later readings can be split at those boundaries (§6 step 6).
 
 - **Modify** `src/elspeth/web/composer/protocol.py` `ToolArgumentError`: add a keyword-only
   `schema_violations: tuple[SchemaViolation, ...] = ()`, where `SchemaViolation(loc: tuple[str, ...], code: SchemaViolationCode)`
@@ -1157,34 +1296,49 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
 
 ### T10 — `/api/system/status` `composer_tool_contract`
 
+**Ruled (lead, provisional; John may overrule), §7.3 item 2 (D14, Codex finding 2):** the public key carries only
+closed, route-independent values. The first draft's per-route `transport`/`dialect`, effective `loop_strict_tools`
+and per-surface `boot` outcomes are **not** published, and the lifespan `app.state.composer_boot_probe_outcomes`
+store is **not** added.
+
+- **Add** to `wire_projection.py` two pure public accessors, so `app.py` does not import the private store:
+  `strict_capable_tool_count() -> int`, the number of `strict_capable` tools in
+  `_WIRE_TOOL_DEFS[ToolContractDialect.OPENAI_STRICT]` (32 at `85ebf2739`), and `loop_tool_count() -> int`
+  (`len(_WIRE_TOOL_DEFS[ToolContractDialect.NONE])`, 42). They read the tool set, not a route, a setting or a sent
+  list.
 - **Modify** `app.py`:
-  - The lifespan probe loop (`:742-841`) records each surface's final `probe_status` in
-    `app.state.composer_boot_probe_outcomes: Mapping[str, str]`. Surfaces not sent are absent. The whole map is
-    `{"status": "not_probed"}` when `composer_boot_probe_enabled` is false.
-  - `system_status` (`:2268`) adds:
+  - `system_status` (`:2269`) adds:
     ```json
-    "composer_tool_contract": {
-      "setting": "preferred",
-      "planner": {"transport": "enforcing", "dialect": "openai_strict", "loop_strict_tools": 32, "loop_tool_count": 42,
-                  "boot": {"loop_tools": "success", "planner_tools": "success"}},
-      "hatch":   {"transport": "none", "dialect": "none", "boot": {}}
-    }
+    "composer_tool_contract": {"setting": "preferred", "strict_capable_tool_count": 32, "tool_count": 42}
     ```
-    - Values come from `composer_service.tool_contract_summary` (T8) and the stored outcomes.
-    - Every value comes from a closed set, or is a count computed from the stamped list.
-    - When the composer is unavailable, the key is `null`.
+    - `setting` is `settings.composer_strict_tools` (closed `Literal`); `strict_capable_tool_count` comes from the
+      accessor above; `tool_count` from `loop_tool_count()`. None of them depends on
+      the model, the endpoint, the env or the boot outcome, so the key is published whether or not the composer is
+      available (availability is already published as `composer_available`). The name says "capable", so a reader
+      cannot take it for what a route sends.
+  - The lifespan probe loop's `finally` block (`:837-841`), beside the existing OTel counter, emits
+    `slog.info("composer_boot_probe_outcome", probed_surface=…, probed_role=…, probe_status=…, tool_count=…,
+    strict_true_count=…, strict_false_count=…, strict_key_omitted=…)` (owned facts only). With T8's
+    `composer_tool_contract_resolved` event, that is where per-route transport, effective counts and per-surface
+    boot outcomes go (policy note in T8).
 - **Tests (RED):** `tests/unit/web/test_system_status_tool_contract.py`:
-  - default settings → planner `enforcing`/`openai_strict`/32/42, hatch `none`;
-  - an OpenRouter planner and advisor → both `forwarding`, with hatch boot `hatch_terminal` present after a
-    faked-success probe;
-  - probes disabled → `not_probed`;
-  - `off` → both `none`.
-  - Control: remove the lifespan store and the `boot` assertion goes red.
+  - default settings → `{"setting": "preferred", "strict_capable_tool_count": 32, "tool_count": 42}`;
+  - `off` → the same counts, `setting: "off"`;
+  - **route independence (Codex finding 2):** an OpenRouter planner (`openrouter/deepseek/…`, no base → row 4,
+    effective 32) and the same config with `composer_endpoint_base_url=https://proxy.example/v1` plus key (row 5,
+    effective 0) give **byte-identical** `composer_tool_contract` values. The test first asserts, through
+    `composer_service.tool_contract_summary`, that the two configs' effective loop strict counts do differ (32 vs 0),
+    so the identity is not vacuous. The same pin for the advisor route (row 4 vs row 5 on the hatch).
+  - probes enabled or disabled, and a scripted `hatch_terminal` rejection, give the same `composer_tool_contract`.
+  - the boot-outcome events: with probes enabled on the OpenRouter pair, one `composer_boot_probe_outcome` event per
+    sent surface is captured (`structlog.testing.capture_logs`), and none carries a URL or key.
+  - Control: publish the effective count (`tool_contract_summary.loop_strict_true`) in place of the accessor and the
+    route-independence pin goes red.
   - No exact-key-set pin on the body exists (measured, `understand-transport.md` §6), so no existing test moves.
 - **Gates:** `tests/unit/web/test_app.py`, the ACA/ECS acceptance readers (`azure_container_apps_single_revision.py:103-107`
   ignores extra keys; `_aws_ecs_acceptance/capture.py:559-600` reads named keys): run their unit tests, plus the
   every-task set.
-- **Commit:** `feat(web): /api/system/status reports the per-route composer tool contract and boot acceptance`.
+- **Commit:** `feat(web): /api/system/status reports the strict-tools setting and strict-capable tool count; boot outcomes to structured logs`.
 
 ### T11 — Wire fidelity matrix and the gateway known-negative row
 
@@ -1207,19 +1361,31 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
     `tests/unit/test_ci_workflow_xdist.py:890`, serving canned responses per route shape.
   - Hosted rows use `respx`, which is already a dev dependency (`pyproject.toml:121`).
   - Requests are built through `build_composer_loop_request_kwargs` / `build_planner_request_kwargs`, with the list
-    for the route's **resolved** dialect. The design lane's `tool_choice`/`parallel_tool_calls`/`require_parameters`
-    shape is not used. Set `num_retries=0`, use fake keys, and give Bedrock fake `aws_*` env through `monkeypatch`.
+    for the route's **resolved** dialect under the row's **named** setting. The design lane's
+    `tool_choice`/`parallel_tool_calls`/`require_parameters` shape is not used. Set `num_retries=0`, use fake keys,
+    and give Bedrock fake `aws_*` env through `monkeypatch`.
+  - **Settings per row (Codex finding 4).** A loopback base is a custom endpoint: `openrouter/…` + loopback is row 5
+    and `openai/…` or bare `gpt-5.5` + loopback is row 8, both `NONE` under `preferred`. Under ruling 7, hosted OpenAI
+    (row 7) and Azure (row 9) are `NONE` under `preferred` too. So every row below that measures adapter forwarding
+    of a stamped list resolves with `setting="forward_to_endpoint"` **explicitly**, and asserts first that the
+    resolver gives the expected non-`NONE` transport for that setting. Each such family also has a separate
+    **`preferred` control row** on the same route: the resolver gives `NONE`, the `NONE` list is built, and the
+    transmitted tools carry no `strict` key (today's bytes).
   - Rows. Each asserts the transmitted `function.strict` (or its absence) and the schema caveat:
-    - `openrouter/deepseek/…` (loopback base): `strict` true on 32 and false on 10, verbatim; an ECMA-only
-      `pattern` in a synthetic tool is kept;
-    - `openai/…` + an openrouter-host base (loopback cannot present that host, so drive `openai/` + loopback and
-      assert forwarding, and separately assert the resolver's `FORWARDING` for the real host);
+    - `openrouter/deepseek/…` (loopback base), `forward_to_endpoint` (row 5 → `FORWARDING`): `strict` true on 32 and
+      false on 10, verbatim; an ECMA-only `pattern` in a synthetic tool is kept. `preferred` control: no `strict` key;
+    - `openai/…` + an openrouter-host base (loopback cannot present that host, so drive `openai/` + loopback under
+      `forward_to_endpoint` (row 8 → `FORWARDING`) and assert forwarding, and separately assert the resolver's
+      `FORWARDING` for the real host under `preferred`, row 6). `preferred` control on loopback: no `strict` key;
     - bare `gpt-5.5` + loopback under `preferred`: no `strict` key on any tool (today's bytes). Under
       `forward_to_endpoint`: forwarded verbatim;
-    - hosted `gpt-4.1` chat (respx `api.openai.com/v1/chat/completions`): `strict` true;
-    - hosted `gpt-5.5` with tools (respx `/v1/responses`): `strict` true;
+    - hosted `gpt-4.1` chat (respx `api.openai.com/v1/chat/completions`), `forward_to_endpoint` (row 7 →
+      `ENFORCING`): `strict` true. `preferred` control: no `strict` key (ruling 7);
+    - hosted `gpt-5.5` with tools (respx `/v1/responses`), `forward_to_endpoint`: `strict` true. `preferred` control:
+      no `strict` key;
     - known-negative: with the key omitted (the `off` list), the bridge sends `strict: null`;
-    - `azure/gpt-4.1` chat and `azure/gpt-5.5` bridge (loopback `api_base`): `strict` forwarded;
+    - `azure/gpt-4.1` chat and `azure/gpt-5.5` bridge (loopback `api_base`), `forward_to_endpoint` with env
+      `AZURE_API_VERSION` unset (row 9 → `ENFORCING`): `strict` forwarded. `preferred` control: no `strict` key;
     - known-negative: a synthetic root `oneOf` is flattened on Azure chat;
     - known-negative: `anthropic/…` (loopback) with a **forced** stamped list: `strict` absent on the wire. This
       is why D8 resolves Anthropic to `NONE`;
@@ -1244,7 +1410,7 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
   its `gateway_base_url` fixture:
   - a request whose tools carry `function.strict: true` → gateway 400;
   - `strict: false` → 400;
-  - the list `composer_loop_tool_definitions(dialect_for(resolve_strict_transport(model="gpt-5.5", api_base=<gateway>, setting="preferred", env={})))`
+  - the list `composer_loop_tool_definitions(dialect_for(resolve_strict_transport(model="gpt-5.5", api_base=<gateway>, setting="preferred", env={}).transport))`
     → accepted, and no tool carries `strict`.
 - **Docs.** `CONTRIBUTING.md` § Whole-tree gates gets one bullet: the fidelity matrix pins LiteLLM adapter behaviour
   for the strict wire, a LiteLLM bump that turns it red is fixed by re-measuring and updating the rows with evidence,
@@ -1268,7 +1434,7 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
   envelope, with type-sensitive `==`, exact key sets and no `strict` key). It is not an absolute SHA pin, so a
   legitimate later S edit does not move it; the SHA comparison above is evidence for this branch only.
 - **Master plan** (`docs/plans/2026-09-23-composer-strict-tool-contracts.md`):
-  - add "S1 as implemented: corrections and decisions", listing C1-C24 and D1-D23 briefly, with the commit ids and
+  - add "S1 as implemented: corrections and decisions", listing C1-C24, D1-D24 and the §7.3 lead rulings briefly, with the commit ids and
     the measured figures (the byte delta, the envelope bytes, the planner request headroom);
   - mark S1 status;
   - fix §5.3's "read from the invocation" wording.
@@ -1300,6 +1466,9 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
 | No provider call is added to any compose transition | (1) Behavioural, the real check: T8's scripted freeform and tutorial-entry turns make the same number of captured provider calls on `OPENAI_STRICT` and `NONE`, and the existing call-count pins in `tests/unit/web/composer` pass unchanged. (2) Static, supporting: `rg -n -e acompletion -e "completion\(" src/elspeth/web/composer` diffed against the base export shows **0 new call sites**. The `hatch_terminal` probe adds a request, not a call site: it goes through the existing `_litellm_acompletion` at `boot_probe.py:222`. A call-site regex cannot see extra invocations of an existing site, which is why (1) exists | (1) a second provider call on the strict path turns T8's test red; (2) the same `rg` finds the existing `_litellm_acompletion` (positive hit) |
 | Wire facts agree between the invocation and the P4 row | T6's parity pin over the SUCCESS, non-object, envelope, JSON-failure and unknown-tool branches | dropping the explicit facts at `tool_batch.py:948` goes red |
 | Probe and production send the same stamps | T8's forwarding-route parity test: loop flags, planner flags on the shared names, and the hatch terminal flag | stamping either probe list with `NONE` goes red |
+| The hatch probe and hatch turn follow the hatch route | T8's asymmetric-route test in both directions: `hatch_terminal` inclusion/omission, effective endpoint, transmitted flags | substituting the planner dialect for the hatch dialect goes red in both directions |
+| The public status payload is route-independent (ruling 2) | T10: normal-OpenRouter-host and custom-endpoint configs give byte-identical `composer_tool_contract`, after asserting their effective counts differ | publishing the effective count goes red |
+| A malformed env base never stops app construction (D24) | T4 resolver rows with `http://[` / `not-a-url`; T8 service construction with probes disabled | removing the `ValueError` catch raises at construction |
 | Byte delta of the strict form | `wire_tool_definitions(OPENAI_STRICT)` vs `NONE`, compact form, recorded in T2 | — |
 | MCP unchanged | `tests/unit/composer_mcp` green, MCP's advertised list equals the base (`_build_tool_defs` output hashed on tip and base), and MCP error text is unchanged by T9 (T9's unchanged-surface pin) | rendering violations into the MCP text turns T9's pin red |
 
@@ -1338,11 +1507,15 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
    Merge into local `release/0.8.1` only on John's word. Before merging, re-run `git merge-tree` against the current
    `release/0.8.1` tip, because other sessions merge concurrently. Run `scripts/branch-safety-check.sh --intent merge`.
    Push only when asked.
-6. **Deploy condition (state it in the handover).** S1 must not be deployed until the S0 baseline window (S0
-   acceptance 5) has been recorded: T9 changes the repair text on every S-gated tool in the same deploy as the
-   strict flip, so without a prior baseline no later change can be attributed to either. Record the deploy time,
-   so the §8 comparisons can be split at that boundary. Whether T9 should instead ship in a separate deploy is a
-   ruling (§7.3 item 10).
+6. **Deploy condition (state it in the handover).** **Ruled (lead, provisional; John may overrule), §7.3 item 10:**
+   T9 ships with S1. If S0 and S1 deploy together, the S0 baseline window (S0 acceptance 5) is taken with
+   `composer_strict_tools=off`, and the strict flip is then made by changing the setting to `preferred`. The T9 repair
+   signal is a stated confound: it is live in the baseline window (because `off` does not revert it), so the
+   baseline measures S0 plus T9, and the `off` → `preferred` comparison isolates the strict flip only. Record the
+   deploy time and the setting change time, so the §8 comparisons can be split at those boundaries. (This replaces
+   the first draft's "S1 does not deploy until the S0 baseline has been recorded". If S0's baseline was already
+   recorded before S1 deploys, the same `off`-first sequence still separates T9, which lands at the deploy, from the
+   strict flip, which lands at the setting change.)
 
 ---
 
@@ -1359,34 +1532,44 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
 3. **The Responses bridge with an explicit `false`** (master plan risk 3). The boot probe proves only that it is
    accepted.
 4. **The hatch probe narrows the advisor's boot share** to at least 30 s on a 4-surface boot (D9). Worst-case total
-   probe time is unchanged (the 45 s shared deadline, plus the 10 s prime = 55 s).
+   probe time is unchanged (the 45 s shared deadline, plus the 10 s prime = 55 s). With `max_tokens` 16 (ruling 1)
+   the hatch probe is far more likely to finish inside its 5 s cap than a planner-shaped request would be.
 5. **Per-call `strict_tool_count` varies on the planner route** (15, 14 or up to 18 discovery tools), so compare it
    per palette, not as a constant.
-6. **The test surface is wide** (C17). Almost every compose-loop unit test now sends strict W. The T8 gate runs the
-   whole directory to find the pins.
-7. **Default and Azure configurations reach a boot-fatal strict wire that no live endpoint has accepted.** The
-   Azure Container Apps bicep default is `composerModel = 'gpt-5.5'` with an empty endpoint
-   (`deploy/azure-container-apps/workload.bicep:159`, `:165`): row 7, `ENFORCING`, on the Responses bridge. The ACA
-   example uses `azure/…` for **both** the planner and the advisor (`application.example.json:8-9`) with
-   `AZURE_API_VERSION` from env (`:32-33`); with a version of at least `2024-08-01`, row 9 makes both routes
-   `ENFORCING`, so the first boot sends 4 probes and the hatch probe fires too. Azure deployment names are
-   arbitrary, so the model behind them is unknown, and master plan risk 4 (Azure strict with parallel calls) is
-   unmeasured. A 400 raises `ComposerBootConfigError` (`boot_probe.py:223-227`), which the lifespan re-raises
-   (`app.py:828-830`), so ACA would restart the revision until an operator sets `off`. Under the plan as written,
-   the first boot of these configurations is their live acceptance test. The env-var doc says so (T4, T8). Ruling:
-   §7.3 item 7.
-8. **The hatch probe makes a hatch-route failure boot-fatal.** Today the terminal reaches the advisor endpoint
-   only on hatch turns (`pipeline_planner.py:4255-4262`), and a rejection fails that turn. With D9, any 400 on the
-   hatch probe stops the app, including a 400 caused by the terminal schema itself rather than by `strict` (the
-   terminal carries `not`, `pattern`, `propertyNames`, `anyOf` and `oneOf`, master plan §2.4, and its acceptance
-   was measured only against ELSPETH's gateway). Because D4 gives one setting for both routes, the only remedy
-   (`off`) also removes strict from the planner route. Ruling: §7.3 item 8.
+6. **The test surface** (C17). Under ruling 7 the default test model keeps today's bytes, so the wire moves only in
+   tests that name an OpenRouter planner or advisor, or set `forward_to_endpoint`. The T8 gate still runs the whole
+   directory to find the pins, because OpenRouter models are common in the fixtures.
+7. **Hosted OpenAI and Azure reach a boot-fatal strict wire that no live endpoint has accepted — now only on
+   opt-in.** The Azure Container Apps bicep default is `composerModel = 'gpt-5.5'` with an empty endpoint
+   (`deploy/azure-container-apps/workload.bicep:159`, `:165`): row 7, on the Responses bridge. The ACA example uses
+   `azure/…` for **both** the planner and the advisor (`application.example.json:8-9`) with `AZURE_API_VERSION` from
+   env (`:32-33`): row 9. Azure deployment names are arbitrary, so the model behind them is unknown, and master plan
+   risk 4 (Azure strict with parallel calls) is unmeasured. **Ruled (lead, provisional; John may overrule), §7.3
+   item 7, option (a):** rows 7 and 9 resolve to `NONE` under `preferred`, so these configurations keep today's bytes
+   by default and first boot is unaffected. The residual risk is on opt-in: under `forward_to_endpoint` they are
+   `ENFORCING`, a planner-route 400 raises `ComposerBootConfigError` (`boot_probe.py:223-227`), which the lifespan
+   re-raises (`app.py:828-830`), so the first boot after opting in is that route's live acceptance test, and
+   `preferred` or `off` is the remedy. The env-var doc says so (T4, T8). R8 (§8 item 2) is the measurement that
+   would let the `preferred` cells move.
+8. **The hatch probe could make a hatch-route failure boot-fatal.** Today the terminal reaches the advisor endpoint
+   only on hatch turns (`pipeline_planner.py:4255-4262`), and a rejection fails that turn. A 400 on the hatch probe
+   can be caused by the terminal schema itself rather than by `strict` (the terminal carries `not`, `pattern`,
+   `propertyNames`, `anyOf` and `oneOf`, master plan §2.4, and its acceptance was measured only against ELSPETH's
+   gateway), and D4's single setting would make `off` the only remedy, removing strict from the planner route too.
+   **Ruled (lead, provisional; John may overrule), §7.3 item 8, option (b):** a `hatch_terminal` rejection is logged
+   as `rejected` and boot continues (T8); planner-route and advisor 400s stay fatal. Residual: a rejected hatch route
+   is found at boot but not blocked, so hatch turns on it fail at first use, as they would with no probe; the operator sees it only in
+   the `composer_boot_probe_rejected_nonfatal` log event and the OTel counter, not on `/api/system/status` (ruling 2).
 9. **The resolver can stop app construction.** T4 catches only `BadRequestError` from `get_llm_provider`, and T8
    calls it in `ComposerServiceImpl.__init__`. Any other exception from LiteLLM's resolver therefore fails app
    construction under `preferred` or `forward_to_endpoint`, even with `composer_boot_probe_enabled=false`. Today
    that path cannot fail this way: `warn_if_not_reasoning_capable` swallows every exception (`reasoning.py:67-82`).
-   `off` short-circuits at row 1 before LiteLLM is called, so it is the remedy.
-10. **T9 and the strict flip share a deploy** and T9 is independent of the setting. See §6 step 6.
+   `off` short-circuits at row 1 before LiteLLM is called, so it is the remedy. The plan's own URL parse was a second
+   such path (Codex finding 1: a malformed `OPENROUTER_API_BASE` such as `http://[` made `urlsplit` raise); D24 and
+   row 3a close it, and T8's regression pins it. LiteLLM itself tolerates the malformed env values (M,
+   `$L/plan-review/env_url_probe.log`).
+10. **T9 and the strict flip share a deploy** and T9 is independent of the setting. Ruled: see §6 step 6 (an `off`
+    baseline window with T9 as a stated confound).
 
 ### 7.2 Stop conditions (stop and report; do not improvise)
 
@@ -1408,10 +1591,15 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
   or a hand-edited signature.
 - The full suite shows a red that is only on the tip and cannot be attributed.
 
-### 7.3 Rulings owed to John (not blockers; list them in the handover)
+### 7.3 Rulings (lead, provisional; John may overrule) and rulings still owed
+
+Items 1-10 below were ruled by the lead on 2026-09-23 after the Codex plan review (§9); the rulings were reviewed by
+Codex. Each is recorded as **Ruled (lead, provisional; John may overrule)**, the tasks are written to the ruling, and
+all of them go in the handover for John. Item 11 is still owed.
 
 1. D9: the `hatch_terminal` probe shape. This sits next to S0's open advisor-allowance ruling (45 s shared versus
-   60 s alone). Two options; this plan does not pick between them:
+   60 s alone). **Ruled (lead, provisional; John may overrule): (b)**, `max_tokens` 16 with the 5 s cap, a
+   rejection check only (D9, T8). The options were:
    - **(a) As planned.** A planner-shaped request (candidate effort, 16,384 `max_tokens`) with the 5 s cap. It has
      full parity with a hatch turn, and the advisor's share becomes at least 30 s. But a reasoning model at candidate
      effort may often exceed 5 s, so on the deployed config the hatch route may stay "unverified at boot", and §8
@@ -1419,30 +1607,54 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
    - **(b) Acceptance-only.** `max_tokens` 16 for `hatch_terminal`, as `loop_tools` does, with the same 5 s cap. A
      400 still returns before generation, so rejection is still detected and the request is far more likely to
      finish. The cost is losing parity with the hatch turn's request shape (token cap; the effort stays).
-2. D14: publishing per-route transport and boot acceptance on the unauthenticated `/api/system/status`. What it
-   newly discloses: `transport: none` beside a hosted model name tells a caller a custom endpoint or gateway is
-   configured (the endpoint URL itself is not published), and the per-surface `boot` outcomes tell a caller whether
-   each provider was reachable at boot.
-3. D1: the compose-loop wire facts on the assistant `tool_calls` entries, not on the tool-row content.
-4. D13: omission prose outside W left unchanged; revisit it with the risk 1 measurement.
-5. D6: unify the OpenRouter detectors (reasoning, branding, usage) as a follow-on.
-6. Still open from S0 and not changed by S1: `RejectionRecord.error_code` on ARG_ERROR rows.
-7. Risk 7 (first boot of the default and Azure configs). Options:
+2. D14: what the unauthenticated `/api/system/status` publishes. The first draft published per-route transport,
+   effective strict counts and per-surface boot outcomes; that tells a caller whether a custom endpoint or gateway
+   is configured (Codex finding 2: `preferred` + a normal OpenRouter host gives 32 strict tools, the same model + a
+   custom endpoint gives 0) and whether each provider was reachable at boot. **Ruled (lead, provisional; John may
+   overrule):** publish only closed, route-independent values, the setting and a clearly named strict-**capable**
+   tool count (32 of 42, a property of the tool set, not of the route). Per-route transport, effective strict counts
+   and per-surface boot outcomes go to structured logs only. A test pins identical public payloads for
+   otherwise-identical normal-OpenRouter-host and custom-endpoint configs (T10). Policy note: the
+   logging-telemetry skill routes config-lifecycle events to telemetry; S1 follows the web boot path's `slog`
+   precedent as the ruling names (T8).
+3. D1: the compose-loop wire facts on the assistant `tool_calls` entries, not on the tool-row content. **Ruled
+   (lead, provisional; John may overrule): accepted.**
+4. D13: omission prose outside W left unchanged; revisit it with the risk 1 measurement. **Ruled (lead,
+   provisional; John may overrule): unchanged.**
+5. D6: unify the OpenRouter detectors (reasoning, branding, usage) as a follow-on. **Ruled (lead, provisional; John
+   may overrule): follow-on, not S1.**
+6. Still open from S0 and not changed by S1: `RejectionRecord.error_code` on ARG_ERROR rows. **Ruled (lead,
+   provisional; John may overrule): S1 leaves `RejectionRecord` untouched.**
+7. Risk 7 (first boot of the default and Azure configs). **Ruled (lead, provisional; John may overrule): (a)**, for
+   hosted OpenAI as well as Azure: rows 7 and 9 resolve to `NONE` under `preferred` until a live measurement (R8),
+   and to `ENFORCING` only under `forward_to_endpoint`. Under the default, S1's wire change reaches OpenRouter routes
+   only. T4's truth table and expected values, T8's default-settings fixtures, T10 and T11 are written to it, and
+   every test expectation that assumed the default test model resolves to `ENFORCING` was rewritten (C17). The
+   options were:
    - **(a)** Azure resolves to `NONE` under `preferred`, and becomes `ENFORCING` only under `forward_to_endpoint`,
      until R8 has measured it (a table change in T4, rows 9 and 10). The hosted-OpenAI default (row 7) could be
      treated the same way.
    - **(b)** Keep the table as designed (R4 as adopted), with the env-var doc sentence already planned, plus an
      `off` note in the ACA runbook's upgrade notes.
-8. Risk 8 (the hatch probe is boot-fatal and shares one remedy with the planner). Options:
+8. Risk 8 (the hatch probe is boot-fatal and shares one remedy with the planner). **Ruled (lead, provisional; John
+   may overrule): (b)**, a `hatch_terminal` probe rejection is non-fatal (logged as `rejected`, boot continues). The
+   non-fatal handling is surface-specific: planner-route and advisor 400s stay fatal as in S0 (T8). Option (b)'s
+   "show it on `/api/system/status`" clause is overridden by ruling 2: the outcome goes to the structured log and the
+   OTel counter only. The options were:
    - **(a)** Accept it as the trade.
    - **(b)** Keep D4, but make a `hatch_terminal` rejection non-fatal: log it as `rejected`, show it on
      `/api/system/status`, and keep booting.
    - **(c)** Add the per-role override that D4 defers.
 9. D19: should the repair signal also reach planner discovery (extend `_ArgumentErrorResponse` with the closed
    loc) and MCP session tools (extend the MCP error text)? Both are contract changes on surfaces S1 leaves alone.
-10. T9's deploy: ship it with S1 after the S0 baseline window (as planned, §6 step 6), or split it into its own
-    deploy so the strict flip and the repair signal can be measured apart.
-11. The review-round decisions D16-D23 (§1.3) are the plan's own choices; any of them can be overruled.
+   **Ruled (lead, provisional; John may overrule): no**, the repair signal stays compose-loop only.
+10. T9's deploy: ship it with S1, or split it into its own deploy so the strict flip and the repair signal can be
+    measured apart. **Ruled (lead, provisional; John may overrule): T9 ships with S1.** If S0 and S1 deploy
+    together, the S0 baseline window is taken with `composer_strict_tools=off`, and the T9 repair signal is a stated
+    confound (§6 step 6, which replaces the first draft's "S1 does not deploy until the S0 baseline has been
+    recorded").
+11. Still owed: the review-round decisions D16-D23 and the Codex-round decision D24 (§1.3) are the plan's own
+    choices; any of them can be overruled.
 
 ---
 
@@ -1451,18 +1663,25 @@ time is recorded so later readings can be split at that boundary (§6 step 6, §
 1. Boot on the dev deployment (OpenRouter deepseek planner, OpenRouter glm hatch):
    - `loop_tools` with 32 `strict:true` + 10 `false` is accepted;
    - `planner_tools` (19 + terminal `false`) is accepted;
-   - `hatch_terminal` (terminal `false`) is accepted on the hatch route;
-   - record `provider_served` for each, the logged total probe time, and the `hatch_terminal` latency at candidate
-     effort (this is the first measurement of it);
-   - `/api/system/status` shows both routes `forwarding` with `boot` successes.
-2. If an Azure or OpenAI deployment is available (R8): the same probe accepted on `ENFORCING`, plus one live call
-   showing whether explicit `strict:false` changes the bridge's behaviour.
-3. After a comparable window, compare against the S0 baseline, split at the recorded S1 deploy time (§6 step 6):
+   - `hatch_terminal` (terminal `false`, `max_tokens` 16) is accepted on the hatch route; a rejection would show as
+     a `composer_boot_probe_rejected_nonfatal` event, not a failed boot (ruling 8);
+   - record `provider_served` for each, the logged total probe time, and the `hatch_terminal` latency (a 16-token
+     acceptance request at candidate effort, ruling 1; it measures acceptance, not a hatch turn's latency);
+   - the `composer_tool_contract_resolved` event shows both routes `forwarding`, and one
+     `composer_boot_probe_outcome` event per surface shows `success`; `/api/system/status` shows only
+     `{setting: "preferred", strict_capable_tool_count: 32, tool_count: 42}` (ruling 2).
+2. If an Azure or OpenAI deployment is available (R8): set `composer_strict_tools=forward_to_endpoint` (under
+   ruling 7, `preferred` sends these routes today's bytes), confirm the same probe is accepted on `ENFORCING`, and
+   make one live call showing whether explicit `strict:false` changes the bridge's behaviour. This is the
+   measurement that would let ruling 7's `preferred` cells move.
+3. After a comparable window, compare against the S0 baseline, split at the recorded deploy and setting-change
+   times (§6 step 6; if S0 and S1 deployed together, the baseline is the `off` window and includes T9):
    - runtime `_BadRequestLLMError` by `provider_served`;
    - the `wire_conformant=False` rate per tool on the 32, by `provider_served`, on rows with `strict_sent` true
      (Appendix A with the T12 columns);
-   - ARG_ERROR categories on the 32 (T9 changes repair text in the same deploy, so say which of the two a change
-     could come from, or that it cannot be told apart);
+   - ARG_ERROR categories on the 32 (T9 changes repair text in the same deploy; with an `off` baseline window the
+     `off` → `preferred` split isolates the strict flip, and T9's own effect is confounded with S0's in that
+     baseline, so say so);
    - first-call latency.
    State the result plainly, even if nothing measurable changed.
 4. The risk 1 measurement: `request_interpretation_review` ARG_ERROR / `model_validation` rate on strict routes
@@ -1511,3 +1730,41 @@ What changed:
   probe, the resolver failing app construction, and T9 sharing a deploy with the flip are now in §7.1, with rulings
   in §7.3 (items 7-11) and a deploy condition in §6 step 6. D14's rationale was corrected to state what the status
   endpoint newly discloses.
+
+### Codex plan review
+
+After the three critiques, Codex reviewed the revised plan read-only at `29e1b78ee` (verdict "yes with fixes"; the
+review is in the lane, `$L/codex/codex-plan-review.md`). Codex reproduced the NONE-route baselines (loop 42 tools /
+63,872 B / `6c7f60dd…`, planner 20 tools / 29,264 B / `7e958245…`) and found the decode, audit and gate design sound.
+Each of its six findings was re-checked against the code before it was applied; all six held and were applied.
+
+| # | Severity | Finding | Checked against | Applied as |
+|---|---|---|---|---|
+| 1 | Major | T4/T8: a malformed env base (`OPENROUTER_API_BASE=http://[`) made the plan's `urlsplit(base).hostname` raise, and T8 runs the resolver in `ComposerServiceImpl.__init__` even with probes disabled, so boot would fail | M, `$L/plan-review/env_url_probe.log`: `urlsplit('http://[')` raises `ValueError: Invalid IPv6 URL`; `'not-a-url'` gives `hostname None`; LiteLLM's `get_llm_provider` tolerates all three malformed env variables. Settings bases are validated (`config.py:145-175`, R); env bases are not | D24, T4 row 3a and `StrictTransportResolution` with a closed diagnostic, T4 malformed-env rows, T8 service-construction regression with probes disabled, risk 9 |
+| 2 | Major | T10/D14: publishing the effective strict count still reveals routing (normal OpenRouter host 32, custom endpoint 0) | R: T4 rows 4-5, T10's "count computed from the stamped list" | Ruling 2: public payload is the setting plus the route-independent `strict_capable_tool_count` and `tool_count`; per-route facts and boot outcomes to structured logs; T10 pins identical payloads for the two configs |
+| 3 | Minor | T8: the hatch-routing mutation cannot go red, because the parity fixture's planner and hatch both resolve `OPENAI_STRICT` | R: `openrouter/deepseek/…` and `openrouter/z-ai/glm-5.3` are both row 4; `supports_anthropic_prompt_cache_markers` is `False` for both (M, `$L/plan-review/d8_probe.log`) | New T8 asymmetric-route test in both directions (row 4 vs row 5 on each side), asserting surface inclusion/omission, effective endpoint and transmitted flags; the planner-dialect substitution goes red in both |
+| 4 | Minor | T11: forwarding fixtures omit the setting that forwarding needs (loopback routes are rows 5 and 8, `NONE` under `preferred`); with ruling 7 hosted OpenAI and Azure rows need it too | R: T4 table | T11 rows use `forward_to_endpoint` explicitly and assert the resolved transport first; separate `preferred` controls send no `strict` key; T8 default-settings fixtures moved to an OpenRouter planner |
+| 5 | Minor | T6: `_replace_llm_tool_call_arguments` has no dialect and no `ctx` in scope | R: `tool_batch.py:450-485` takes `llm_messages`, `tool_call_id`, `arguments` only; all 7 callers are inside `run_tool_batch` (`:686`) | Required keyword-only `dialect` (and `semantic`), passed by all 7 production callers as `ctx.tool_contract_dialect` and by both test callers; byte-identical semantic/sentinel transcript pins for both dialects |
+| 6 | Minor | T4: "edit one literal" mutates the oracle, not the thing under test | R: plan text; M, `$L/plan-review/drift_mutation_probe.log` (`gpt-5.5` + `api.deepseek.com` → `deepseek`, + `api.openai.com` → `openai`) | Drift pin now reads `_routing_provider`; controls mutate the routing input (deepseek base → OpenAI base) and the resolution result (monkeypatched `get_llm_provider`), never the literal |
+
+The lead ruled on §7.3 items 1-10 in the same round (Codex reviewed the rulings and found them consistent with S1's
+scope). Each is recorded in §7.3 as **Ruled (lead, provisional; John may overrule)**, and the tasks are written to
+it:
+
+- **Item 1 (D9):** `hatch_terminal` sends `max_tokens` 16 with the 5 s cap, a rejection check only.
+- **Item 2 (D14):** `/api/system/status` publishes only the setting and the strict-capable tool count (32 of 42) and
+  the tool count; per-route transport, effective counts and boot outcomes go to structured logs (Codex finding 2).
+- **Items 3-6:** D1 accepted; D13 unchanged; D6 a follow-on; `RejectionRecord` untouched.
+- **Item 7:** option (a). Hosted OpenAI and Azure resolve to `NONE` under `preferred` until R8, and to `ENFORCING`
+  only under `forward_to_endpoint`, so the default wire change reaches OpenRouter routes only. T4's truth table and
+  expected values, T8's fixtures and pin moves, T10, T11, C17, risks 6 and 7 and §8 item 2 were rewritten.
+- **Item 8:** option (b). A `hatch_terminal` rejection is non-fatal and surface-specific; planner-route and advisor
+  400s stay fatal (T8 code and test). The option's "show it on the status endpoint" clause yields to item 2.
+- **Item 9:** the repair signal stays compose-loop only (D19, T9).
+- **Item 10:** T9 ships with S1; if S0 and S1 deploy together, the S0 baseline window is taken with
+  `composer_strict_tools=off`, and T9 is a stated confound (§6 step 6, T9, risk 10, §8 item 3).
+
+Two corrections found while applying them: D13 cited "§7.1, risk 4" for the omission-prose risk, which is risk 1;
+and the T8 hermeticity control (`OPENAI_BASE_URL` on the default `gpt-5.5`) could not discriminate under ruling 7,
+so it now uses `OPENROUTER_API_BASE` on an OpenRouter planner, plus a transport-level check under
+`forward_to_endpoint`.
