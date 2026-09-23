@@ -74,9 +74,11 @@ __all__ = [
     "build_wire_tool_defs",
     "decode_wire_arguments",
     "encode_semantic_arguments",
+    "loop_tool_count",
     "omission_instruction_matches",
     "project_tool",
     "stamp_planner_terminal",
+    "strict_capable_tool_count",
     "wire_limits_report",
     "wire_tool_definitions",
 ]
@@ -799,6 +801,20 @@ _WIRE_LIMITS_REPORTS: Final[Mapping[ToolContractDialect, WireLimitsReport]] = Ma
 def wire_limits_report(dialect: ToolContractDialect) -> WireLimitsReport:
     """Return the measured size of ``dialect``'s whole tool list."""
     return _WIRE_LIMITS_REPORTS[dialect]
+
+
+def strict_capable_tool_count() -> int:
+    """How many loop tools the ``openai_strict`` projection marks strict-capable.
+
+    A property of the tool set (32 of 42 when S1 landed), not of any route,
+    setting or sent list, so ``/api/system/status`` may publish it (D14).
+    """
+    return sum(1 for tool in _WIRE_TOOL_DEFS[ToolContractDialect.OPENAI_STRICT].values() if tool.strict_capable)
+
+
+def loop_tool_count() -> int:
+    """How many tools the compose loop's list carries (a property of the tool set)."""
+    return len(_WIRE_TOOL_DEFS[ToolContractDialect.NONE])
 
 
 def wire_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:

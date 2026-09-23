@@ -80,6 +80,7 @@ from elspeth.web.catalog.routes import catalog_router
 from elspeth.web.composer import yaml_generator as yaml_generator_module
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
@@ -856,6 +857,19 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 raise
             finally:
                 attributes["probe_status"] = probe_status
+                # One per sent surface, beside the OTel counter (ruling 2):
+                # the per-surface outcome is operator-side only. Owned request
+                # facts, never an endpoint, a key or the exception text.
+                slog.info(
+                    "composer_boot_probe_outcome",
+                    probed_surface=probe_request.surface,
+                    probed_role=role,
+                    probe_status=probe_status,
+                    tool_count=probe_request.tool_count,
+                    strict_true_count=probe_request.strict_true_count,
+                    strict_false_count=probe_request.strict_false_count,
+                    strict_key_omitted=probe_request.strict_key_omitted,
+                )
                 composer_probe_latency_ms = int((time.monotonic() - composer_probe_start) * 1000)
                 _COMPOSER_BOOT_CONFIG_COUNTER.add(1, attributes)
                 _COMPOSER_BOOT_CONFIG_PROBE_LATENCY.record(composer_probe_latency_ms, attributes)
@@ -2341,6 +2355,17 @@ def _create_app(
             # CONTAINER_APP_REPLICA_NAME); null elsewhere.
             "deployment_revision": platform_identity.revision,
             "deployment_replica": platform_identity.replica,
+            # Strict tool contracts (S1, ruling 2): only the setting and two
+            # properties of the tool set, never a route's transport, its
+            # effective strict count or a boot-probe outcome. Those reveal
+            # whether a custom endpoint is configured and whether a provider
+            # was reachable, so they go to structured logs only
+            # (composer_tool_contract_resolved, composer_boot_probe_outcome).
+            "composer_tool_contract": {
+                "setting": settings.composer_strict_tools,
+                "strict_capable_tool_count": strict_capable_tool_count(),
+                "tool_count": loop_tool_count(),
+            },
         }
 
     # --- Prometheus metrics scrape endpoint ---
