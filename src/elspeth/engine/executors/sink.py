@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 
@@ -31,7 +31,7 @@ from elspeth.contracts.declaration_contracts import (
     DeclarationContractViolation,
 )
 from elspeth.contracts.diversion import RowDiversion
-from elspeth.contracts.enums import NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import NodeStateStatus, RoutingMode, RunMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     FrameworkBugError,
@@ -68,10 +68,12 @@ from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
+from elspeth.engine.executors.replay_sink_effect import VirtualReplaySinkEffect
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
     SinkEffectExecutionSeam,
+    _SinkEffectAdapter,
 )
 from elspeth.engine.executors.sink_required_fields import _format_optional_missing_fields_context
 from elspeth.engine.spans import SpanFactory
@@ -694,6 +696,7 @@ class SinkExecutor:
         sink_name: str,
         sink_node_id: str,
         join_group_id_by_token: Mapping[str, str | None],
+        ctx: PluginContext,
     ) -> _EffectPrimaryWrite:
         """Publish one primary batch through the durable effect coordinator."""
         if self._factory is None:
@@ -787,6 +790,13 @@ class SinkExecutor:
             for member in identity.members
         )
         sink._reset_diversion_log()
+        effect_adapter: SinkProtocol | VirtualReplaySinkEffect
+        if ctx.run_mode is RunMode.LIVE:
+            effect_adapter = sink
+        else:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay sink execution requires a source run")
+            effect_adapter = VirtualReplaySinkEffect(source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -809,7 +819,7 @@ class SinkExecutor:
                 ),
                 finalization_members=finalization_members,
             ),
-            sink,  # type: ignore[arg-type]  # capability was statically admitted before execution
+            cast(_SinkEffectAdapter, effect_adapter),  # live capability was admitted; replay adapter is owned
         )
         requested_token_ids = tuple(member.token_id for member in identity.members)
         durable_members = self._execution.sink_effects.get_members_for_tokens(
@@ -1415,6 +1425,7 @@ class SinkExecutor:
             sink_name=sink_name,
             sink_node_id=sink_node_id,
             join_group_id_by_token=join_group_id_by_token,
+            ctx=primary_ctx,
         )
         diversions = effect_write.diversions
 

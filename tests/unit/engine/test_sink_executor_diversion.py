@@ -185,6 +185,7 @@ def test_write_primary_effect_ownership_and_buffered_outcome_guards(
             sink_name="legacy",
             sink_node_id="node-legacy",
             join_group_id_by_token={},
+            ctx=PluginContext(run_id="run-1", config={}),
         )
 
 

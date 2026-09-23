@@ -22,7 +22,7 @@ from pydantic import ValidationError
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.config_loading import load_settings
-from elspeth.contracts import ExecutionResult, SecretResolutionInput
+from elspeth.contracts import ExecutionResult, RunMode, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import (
     AbandonRefusedError,
@@ -4006,6 +4006,13 @@ def join(
     except SecretLoadError as e:
         typer.echo(f"Error loading secrets: {e}", err=True)
         raise typer.Exit(1) from None
+
+    # Followers have a separate context and external-call lifecycle. Until
+    # replay/verify carry a shared comparison authority across workers, a
+    # follower must not enter a run that suppresses external sink effects.
+    if settings_config.run_mode is not RunMode.LIVE:
+        typer.echo("Follower join is unavailable for replay and verify runs; use one worker.", err=True)
+        raise typer.Exit(1)
 
     try:
         plugins = _instantiate_plugins_for_runtime_preflight(
