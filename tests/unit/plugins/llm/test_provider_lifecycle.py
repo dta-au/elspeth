@@ -20,6 +20,7 @@ from elspeth.contracts.enums import RunMode
 from elspeth.plugins.transforms.llm.provider import LLMProvider
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import (
     OpenRouterConfig,
     OpenRouterLLMProvider,
@@ -127,6 +128,45 @@ def _make_bedrock_config() -> dict[str, Any]:
         "schema": DYNAMIC_SCHEMA,
         "required_input_fields": ["text"],
     }
+
+
+def _make_gateway_config() -> dict[str, Any]:
+    return {
+        "provider": "gateway",
+        "model": "summariser",
+        "endpoint": "https://gateway.example/v1",
+        "api_key": "test-key",
+        "contract_major": 1,
+        "required_capabilities": ["usage"],
+        "prompt_template": "Test: {{ row.text }}",
+        "schema": DYNAMIC_SCHEMA,
+        "required_input_fields": ["text"],
+    }
+
+
+@pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
+@pytest.mark.parametrize(
+    ("config_factory", "provider_class", "client_method"),
+    [
+        (_make_azure_config, AzureLLMProvider, "_get_underlying_client"),
+        (_make_bedrock_config, BedrockLLMProvider, "_get_underlying_client"),
+        (_make_openrouter_config, OpenRouterLLMProvider, "_get_http_client"),
+        (_make_gateway_config, GatewayLLMProvider, "_get_http_client"),
+    ],
+)
+def test_replay_verify_transform_startup_does_not_construct_sdk_or_http_client(
+    mode: RunMode,
+    config_factory: Callable[[], dict[str, Any]],
+    provider_class: type,
+    client_method: str,
+) -> None:
+    transform = LLMTransform(config_factory())
+    ctx = FakeLifecycleContext(landscape=FakeAuditRecorder(), run_mode=mode, call_mode_session=Mock(mode=mode))
+    with patch.object(provider_class, client_method, side_effect=AssertionError("client construction before request admission")) as client:
+        transform.on_start(ctx)
+    client.assert_not_called()
+    assert isinstance(transform._provider, provider_class)
+    transform.close()
 
 
 def _prepare_transform_for_provider_creation(transform: LLMTransform) -> None:

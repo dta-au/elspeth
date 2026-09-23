@@ -304,6 +304,28 @@ def _validate_provider_response_model(model: Any) -> str:
     return model
 
 
+def build_llm_call_request(
+    *,
+    model: str,
+    messages: Sequence[ChatMessage],
+    temperature: float | None,
+    provider: str,
+    max_tokens: int | None,
+    max_tokens_param: str = "max_tokens",
+    **kwargs: Any,
+) -> LLMCallRequest:
+    """Build the exact semantic request used by admission and audit."""
+    return LLMCallRequest(
+        model=model,
+        messages=audit_messages(messages),
+        temperature=temperature,
+        provider=provider,
+        max_tokens=max_tokens,
+        max_tokens_param=max_tokens_param,
+        extra_kwargs=kwargs,
+    )
+
+
 class AuditedLLMClient(AuditedClientBase):
     """LLM client that automatically records all calls to audit trail.
 
@@ -678,14 +700,14 @@ class AuditedLLMClient(AuditedClientBase):
         # Build request DTO - frozen dataclass ensures construction-time type safety;
         # to_dict() conditionally omits temperature and max_tokens when None (hash-stable).
         # DTO stays alive for typed telemetry payload; dict form used for Landscape hashing.
-        request_dto = LLMCallRequest(
+        request_dto = build_llm_call_request(
             model=model,
-            messages=audit_messages(messages),  # bytes-free audit form
+            messages=messages,
             temperature=temperature,
             provider=self._provider,
             max_tokens=max_tokens,
             max_tokens_param=self._max_tokens_param,
-            extra_kwargs=kwargs,
+            **kwargs,
         )
         request_data = request_dto.to_dict()
 
