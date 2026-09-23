@@ -1307,7 +1307,9 @@ def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity
         use_managed_identity=managed_identity,
     )
     with (
-        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient") as client_cls,
+        patch(
+            "elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")
+        ) as client_cls,
         patch("socket.getaddrinfo", side_effect=AssertionError("verify resolved DNS before admission")),
         patch("azure.identity.ManagedIdentityCredential", side_effect=AssertionError("verify acquired token before admission")),
     ):
@@ -1323,8 +1325,7 @@ def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity
                 provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
             else:
                 provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
-    client_cls.return_value.request_ssrf_safe.assert_not_called()
-    client_cls.return_value.get_ssrf_safe.assert_not_called()
+    client_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("managed_identity", [False, True])
@@ -1341,7 +1342,9 @@ def test_verify_blocked_archived_pin_refuses_before_dns_or_token(managed_identit
         use_managed_identity=managed_identity,
     )
     with (
-        patch("elspeth.plugins.infrastructure.clients.http.AuditedHTTPClient") as client_cls,
+        patch(
+            "elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("HTTP client constructed")
+        ) as client_cls,
         patch("socket.getaddrinfo", side_effect=AssertionError("verify resolved DNS after blocked archive")),
         patch("azure.identity.ManagedIdentityCredential", side_effect=AssertionError("verify acquired token after blocked archive")),
     ):
@@ -1354,7 +1357,7 @@ def test_verify_blocked_archived_pin_refuses_before_dns_or_token(managed_identit
         )
         with pytest.raises(RetrievalError, match="source DNS pin blocked"):
             provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
-    client_cls.return_value.request_ssrf_safe.assert_not_called()
+    client_cls.assert_not_called()
 
 
 def test_verify_managed_identity_search_admits_before_token_and_dispatch() -> None:
