@@ -20,7 +20,7 @@ LLM and enforces, on each turn:
    ``tools`` array passed into ``_call_llm`` are JSON-serialized and
    their cumulative byte size is asserted against a named constant.
    This is what bites: the bytes are the bytes the production
-   ``_build_messages`` / ``_get_litellm_tools`` code actually emitted,
+   ``_build_messages`` / ``composer_loop_tool_definitions`` code actually emitted,
    not whatever the test author scripted into the fake response. A
    regression that re-introduces unbounded transcript accumulation
    (or grows the system-prompt skill without compensating compaction)
@@ -100,7 +100,7 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # Cumulative byte-size envelope on the production-emitted ``messages`` +
 # ``tools`` JSON blobs across one compose() call. This IS a real production
 # gate: the bytes asserted are what ``_build_messages`` and
-# ``_get_litellm_tools`` actually serialize and what would land on the
+# ``composer_loop_tool_definitions`` actually serialize and what would land on the
 # provider wire.
 #
 # Recalibrated baseline (2026-05-18, 1-turn happy script): ~210 KB
@@ -281,7 +281,7 @@ class TestEnvelopeHarness:
 
         Captures the JSON byte size of the messages + tools that
         ``_call_llm`` was actually invoked with — i.e., what
-        ``_build_messages`` and ``_get_litellm_tools`` emitted. Asserts
+        ``_build_messages`` and ``composer_loop_tool_definitions`` emitted. Asserts
         the cumulative byte total stays under the envelope. This is the
         gate that bites a regression which re-introduces unbounded
         transcript growth or ships a system prompt that has become

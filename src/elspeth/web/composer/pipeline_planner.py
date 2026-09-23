@@ -1505,6 +1505,48 @@ def planner_terminal_tool_definition(
     }
 
 
+def build_planner_request_kwargs(
+    *,
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    max_completion_tokens: int,
+    temperature: float | None,
+    seed: int | None,
+    reasoning_effort: str | None,
+    api_base: str | None,
+    api_key: str | None,
+) -> dict[str, Any]:
+    """Build the LiteLLM kwargs of one pipeline-planner provider call.
+
+    The planner's ``call_model`` and the boot probe's planner-list request
+    both build their request here, so the token cap, the retry pins,
+    sampling, reasoning and endpoint kwargs cannot drift between them.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "max_tokens": max_completion_tokens,
+        # The planner loop is the sole retry owner. LiteLLM accepts
+        # both spellings and gives num_retries precedence; pin both
+        # to zero so every physical attempt consumes one audited
+        # ordinal and one provider-call budget unit.
+        "num_retries": 0,
+        "max_retries": 0,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if seed is not None:
+        kwargs["seed"] = seed
+    apply_reasoning_kwargs(kwargs, model=model, effort=reasoning_effort)
+    if api_base is not None:
+        kwargs["api_base"] = api_base
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    return kwargs
+
+
 def planner_tool_definitions(
     policy: PlannerDiscoveryPolicy | None = None,
     *,
@@ -3926,37 +3968,25 @@ async def _plan_pipeline_inner(
             started_at = datetime.now(UTC)
             started_ns = time.monotonic_ns()
             response: Any = None
-            kwargs: dict[str, Any] = {
-                "model": effective_model,
-                "messages": marked_messages,
-                "tools": marked_tools,
-                "max_tokens": budget_policy.max_completion_tokens,
-                # The planner loop is the sole retry owner. LiteLLM accepts
-                # both spellings and gives num_retries precedence; pin both
-                # to zero so every physical attempt consumes one audited
-                # ordinal and one provider-call budget unit.
-                "num_retries": 0,
-                "max_retries": 0,
-            }
-            if model_config.temperature is not None:
-                kwargs["temperature"] = model_config.temperature
-            if model_config.seed is not None:
-                kwargs["seed"] = model_config.seed
-            apply_reasoning_kwargs(kwargs, model=effective_model, effort=reasoning_effort)
             # Endpoint affordance: select by the SAME condition that selects
             # effective_model above (model_override set == hatch turn), so
             # the escape-hatch call never lands on the primary's endpoint —
             # the two roles are independent by design.
             if model_override is not None:
-                if model_config.escape_hatch_api_base is not None:
-                    kwargs["api_base"] = model_config.escape_hatch_api_base
-                if model_config.escape_hatch_api_key is not None:
-                    kwargs["api_key"] = model_config.escape_hatch_api_key
+                api_base, api_key = model_config.escape_hatch_api_base, model_config.escape_hatch_api_key
             else:
-                if model_config.api_base is not None:
-                    kwargs["api_base"] = model_config.api_base
-                if model_config.api_key is not None:
-                    kwargs["api_key"] = model_config.api_key
+                api_base, api_key = model_config.api_base, model_config.api_key
+            kwargs = build_planner_request_kwargs(
+                model=effective_model,
+                messages=marked_messages,
+                tools=marked_tools,
+                max_completion_tokens=budget_policy.max_completion_tokens,
+                temperature=model_config.temperature,
+                seed=model_config.seed,
+                reasoning_effort=reasoning_effort,
+                api_base=api_base,
+                api_key=api_key,
+            )
 
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)

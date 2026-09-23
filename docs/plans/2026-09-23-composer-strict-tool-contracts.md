@@ -689,6 +689,62 @@ implementing; where this differs from the bullets above, this paragraph is the c
   COMPOSE session authority whose fence names the `session_id`. The `RuntimeError` stays as an invariant, and its
   message and docstring now name the real guard.
 
+**S0b as implemented (provider_served, boot probe): corrections and decisions.** Recorded while implementing;
+where this differs from the bullets above, this paragraph is the current state.
+
+- **Verify first: the field arrives.** Loopback recorder on LiteLLM 1.102.0 (lane
+  `s0b/provider_served_probe.py`, logs `provider_served_probe.log` and `provider_served_probe_negative.log`): a
+  canned OpenRouter-shaped 200 carrying `"provider": "DeepInfraProbe"` reaches `_provider_field_map(response)` on
+  both `openrouter/deepseek/deepseek-v4.1-flash` and `openai/…` with a custom `api_base`. Negative control (the key
+  removed): absent. Positive control: `model` present in both runs. `_hidden_params.custom_llm_provider` is
+  LiteLLM's *routing* provider (`openrouter`/`openai`), not the served endpoint, so it is not used, and no header
+  fallback was built. The per-endpoint split in S1 acceptance and Risk 2 therefore stands.
+- **`provider_served`.** `ComposerLLMCall.provider_served` is admitted in both `build_llm_call_record` branches:
+  the compose loop's admitted-metadata branch (`admit_llm_provider_metadata`) and the pipeline planner's
+  `response=` branch, which would otherwise have persisted `None` on exactly the route S1 wants measured. The closed
+  shape is 1–64 characters of letters, digits, space, `.`, `_` and `-`, starting and ending alphanumeric; all 38
+  `provider_name` values in the three measured endpoint lists fit (longest 14). A present value outside the shape
+  (wrong type included) is recorded as `unrecognised`; absence and a blank string are `None`. The contract enforces
+  the same shape. The field is in `_LLM_CALL_PUBLIC_AUDIT_FIELDS`; additive JSON in the `llm_call_audit` envelope,
+  no epoch bump (its readers read by key).
+- **Tool-list builder: zero-argument in S0.** The plan named a function of `(model, api_base, settings)`. In S0
+  none of the three has a reader (the list is static until S1's transport resolution), so
+  `service.composer_loop_tool_definitions()` takes no arguments and S1 adds them with their first reader.
+  `ComposerServiceImpl._get_litellm_tools` is deleted, not kept as a delegate; the 10 test files that named it moved.
+- **Request builders.** `service.build_composer_loop_request_kwargs` is used by `_call_llm`, `_call_text_llm` and
+  the probe; `pipeline_planner.build_planner_request_kwargs` by `call_model` and the probe. The probe also mirrors
+  the Anthropic cache markers each production path applies before building its request.
+- **Surfaces.** `loop_tools` (the 42-tool loop list, `max_tokens` 16, discovery effort), `planner_tools`
+  (`planner_tool_definitions()`, the planner's `max_tokens` and retry pins, candidate effort) and `advisor`, in that
+  order, from `boot_probe.build_composer_probe_requests(settings)`. Production parity is pinned by capturing the
+  LiteLLM kwargs of two real `compose()` turns (`tests/integration/web/composer/test_boot_probe_production_parity.py`,
+  RED against the pre-S0b probe on assertion, with the reasoning-drop and token-cap mutation controls). Limit: the
+  probe sends the default terminal contract, while production sends a request-scoped discovery subset and terminal
+  contract, so tool *names* are compared there, not bytes.
+- **Anthropic/Bedrock thinking: logged, not raised.** The loop request keeps `max_tokens` 16. When it carries
+  `reasoning_effort` (only Anthropic/Bedrock-style routes get that key) and 16 ≤ LiteLLM's
+  `ANTHROPIC_MIN_THINKING_BUDGET_TOKENS` (1024, pinned against the installed LiteLLM together with the
+  `cap_thinking_budget_to_max_tokens` behaviour), a successful probe logs `composer_boot_probe_thinking_route_unproven`.
+  The `planner_tools` request (the planner's 16,384 tokens) exercises the thinking route on the same model and
+  endpoint, at candidate effort.
+- **Deadline: 45 s shared, probes stay in the lifespan.** One deadline covers all three requests; each planner
+  request is also capped at 5 s inside it; the advisor gets the remainder (at least 35 s); a request whose share is
+  spent is not sent and is logged `SharedDeadlineExhausted`. Every timeout stays nonfatal and logs that tool
+  schemas (or structured-output conformance) were unverified at boot. Worst-case probe time falls from 65 s to 45 s;
+  with the OpenRouter catalog prime (5 s connect + 5 s read) it is 55 s, inside the 60 s left by the 150 s startup
+  contract, which a test reads from the bicep and ECS runbook. Justification, from read-only census of the archived
+  session DBs (instrument controlled with a 1..20 fixture and a wrong-kind row): 23 successful advisor-model calls
+  give p95 11.0 s and max 50.8 s (the same values the advisor review reported for its 20 checkpoint-matched calls), so 35 s is about 3× p95 and the 50.8 s outlier becomes an unverified boot; compose-loop calls
+  with ≤ 200 completion tokens (11, prompts 56k–104k tokens) p50 1.6 s, max 2.75 s, under the 5 s cap. A rejected
+  request returns before generation, so the cap keeps the 400 signal. **Unmeasured:** the `planner_tools` request's
+  latency at candidate effort on a "reply ok" prompt; acceptance 4 is its measurement. SSO discovery (up to 15 s per
+  request) is outside this split, as it was before S0b.
+- **`ComposerBootConfigError`** names the role, model, surface, `tool_count`, `strict_true_count`,
+  `strict_false_count` and `strict_key_omitted` (0/0/42 on `loop_tools`, 0/0/20 on `planner_tools`, computed from the
+  sent tools) and the existing option-presence flags. Telemetry gains `probed_surface`.
+- **In-tree gateway.** Both planner requests are accepted by ELSPETH's own gateway
+  (`test_composer_against_gateway.py`, 9 passed), including the terminal schema, which no test had sent through it.
+
 ### S1 — Strict on the 32 mechanical tools (no options decision needed)
 
 Purpose: the first wire change. 32 tools are sent `strict: true` on routes that forward it. The 10 option tools and

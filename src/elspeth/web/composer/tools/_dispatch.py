@@ -314,7 +314,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
     6 mutation) + 3 secret tools (2 discovery, 1 mutation) + 1 advisor tool +
     1 session-aware interpretation-review tool.
     ``request_advisor_hint`` is always part of the LLM-visible list —
-    advisor is mandatory — see ``ComposerServiceImpl._get_litellm_tools``.
+    advisor is mandatory — see ``service.composer_loop_tool_definitions``.
 
     The tool catalogue is derived from ``_TOOL_DEFS_BY_NAME`` (every
     declared tool) plus two inline definitions for the dispatch-outside-
@@ -386,7 +386,7 @@ def get_discovery_tool_definitions(names: Iterable[str]) -> list[dict[str, Any]]
     but not sufficient. Both halves are required.
 
     Returns the same ``{"type": "function", "function": {...}}`` shape
-    ``ComposerServiceImpl._get_litellm_tools`` produces, so the solver can
+    ``service.composer_loop_tool_definitions`` produces, so the solver can
     concatenate these with its ``resolve_X`` tool and pass them straight to
     ``_litellm_acompletion``. Each def is freshly ``deep_thaw``ed from the
     immutable registry — callers get a mutually-isolated mutable copy.

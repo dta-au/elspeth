@@ -56,7 +56,7 @@ from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
-from elspeth.web.composer.boot_probe import ComposerBootConfigError
+from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.coordination.membership_lifecycle import (
@@ -1671,7 +1671,7 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _reject_probe(**_kwargs: object) -> bool:
+        async def _reject_probe(_request: ComposerProbeRequest) -> bool:
             raise ComposerBootConfigError("composer sampling rejected")
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _reject_probe)
@@ -1688,6 +1688,7 @@ class TestLifespanShutdown:
         _, attributes = counter.calls[0]
         assert attributes["probe_status"] == "rejected"
         assert attributes["probed_model"] == "gpt-5.5"
+        assert attributes["probed_surface"] == "loop_tools"
         assert len(latency.calls) == 1
         assert finalizer_calls == 1
 
@@ -1696,7 +1697,7 @@ class TestLifespanShutdown:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         called = False
 
-        async def _probe(**_kwargs: object) -> bool:
+        async def _probe(_request: ComposerProbeRequest) -> bool:
             nonlocal called
             called = True
             return True
@@ -1946,8 +1947,8 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed_models.append(str(kwargs["model"]))
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed_models.append(request.model)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -1958,13 +1959,14 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert probed_models == ["gpt-5.5", "anthropic/claude-sonnet-4-6"]
-        assert len(counter.calls) == 2
-        assert len(latency.calls) == 2
+        assert probed_models == ["gpt-5.5", "gpt-5.5", "anthropic/claude-sonnet-4-6"]
+        assert len(counter.calls) == 3
+        assert len(latency.calls) == 3
         counter_attributes = [attributes for _amount, attributes in counter.calls]
         assert [attrs["probed_model"] for attrs in counter_attributes] == probed_models
-        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "advisor"]
-        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, True]
+        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "planner", "advisor"]
+        assert [attrs["probed_surface"] for attrs in counter_attributes] == ["loop_tools", "planner_tools", "advisor"]
+        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, False, True]
         for attributes in counter_attributes:
             assert attributes["composer_model"] == "gpt-5.5"
             assert attributes["composer_temperature"] == "0.0"
@@ -1996,12 +1998,12 @@ class TestLifespanShutdown:
                 composer_advisor_reasoning_effort="low",
             )
         )
-        probed: list[dict[str, object]] = []
+        probed: list[ComposerProbeRequest] = []
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed.append(kwargs)
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed.append(request)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -2012,20 +2014,18 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert len(probed) == 2
-        primary_call, advisor_call = probed
-        assert primary_call["model"] == "gpt-5.5"
-        assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
-        assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
-        assert advisor_call["model"] == "gpt-5.5"
-        assert "role" in primary_call
-        assert "role" in advisor_call
-        assert primary_call["role"] == "planner"
-        assert advisor_call["role"] == "advisor"
-        assert advisor_call["max_tokens"] == 8192
-        assert advisor_call["reasoning_effort"] == "low"
-        assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
-        assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+        assert [request.surface for request in probed] == ["loop_tools", "planner_tools", "advisor"]
+        loop_request, planner_request, advisor_request = probed
+        for primary_request in (loop_request, planner_request):
+            assert primary_request.role == "planner"
+            assert primary_request.kwargs["model"] == "gpt-5.5"
+            assert primary_request.kwargs["api_base"] == "https://primary-gateway.example.test/v1"
+            assert primary_request.kwargs["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert advisor_request.role == "advisor"
+        assert advisor_request.kwargs["model"] == "gpt-5.5"
+        assert advisor_request.kwargs["max_tokens"] == 8192
+        assert advisor_request.kwargs["api_base"] == "https://advisor-gateway.example.test/v1"
+        assert advisor_request.kwargs["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
 
     @pytest.mark.asyncio
     async def test_lifespan_probe_omits_endpoint_kwargs_when_unset(self, monkeypatch, tmp_path) -> None:
@@ -2036,12 +2036,12 @@ class TestLifespanShutdown:
                 composer_advisor_model="anthropic/claude-sonnet-4-6",
             )
         )
-        probed: list[dict[str, object]] = []
+        probed: list[ComposerProbeRequest] = []
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed.append(kwargs)
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed.append(request)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -2052,18 +2052,18 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert len(probed) == 2
-        for call in probed:
-            assert call["api_base"] is None
-            assert call["api_key"] is None
+        assert len(probed) == 3
+        for request in probed:
+            assert "api_base" not in request.kwargs
+            assert "api_key" not in request.kwargs
 
     @pytest.mark.asyncio
-    async def test_lifespan_uses_role_specific_composer_probe_timeouts(self, monkeypatch, tmp_path) -> None:
+    async def test_lifespan_caps_planner_probes_inside_one_shared_deadline(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
-        roles: list[object] = []
+        surfaces: list[str] = []
 
-        async def _probe(**kwargs: object) -> bool:
-            roles.append(kwargs["role"])
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            surfaces.append(request.surface)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -2074,56 +2074,153 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert roles == ["planner", "advisor"]
-        assert [call.kwargs["timeout"] for call in wait_for.call_args_list] == [5.0, 60.0]
+        assert surfaces == ["loop_tools", "planner_tools", "advisor"]
+        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
+        assert timeouts[:2] == [5.0, 5.0]
+        # The advisor gets what is left of the one deadline, not a timeout of
+        # its own: every probe returned at once, so almost all of it.
+        assert 44.0 < timeouts[2] <= 45.0
+
+    def test_composer_boot_probe_deadline_fits_the_startup_contract(self) -> None:
+        """The probes run before uvicorn binds, so they spend the 150 s startup contract.
+
+        The contract is read from its sources, so a shrunken startup window
+        turns this red. The control shows the same check rejects a deadline
+        past the budget.
+        """
+        import re
+
+        import elspeth.web.app as app_module
+
+        root = Path(__file__).resolve().parents[3]
+        bicep = (root / "deploy/azure-container-apps/workload.bicep").read_text(encoding="utf-8")
+        startup = re.search(r"type: 'Startup'.*?periodSeconds: (\d+).*?failureThreshold: (\d+)", bicep, re.S)
+        assert startup is not None
+        aca_startup_seconds = int(startup.group(1)) * int(startup.group(2))
+        runbook = (root / "docs/runbooks/aws-ecs-deployment.md").read_text(encoding="utf-8")
+        ecs_start_period = re.search(r'"startPeriod": (\d+)', runbook)
+        assert ecs_start_period is not None
+        assert aca_startup_seconds == int(ecs_start_period.group(1)) == 150
+        assert "approximately 90-second" in runbook
+        assert app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS == 150 - 90
+
+        catalog = app_module._OPENROUTER_CATALOG_PRIME_TIMEOUT
+        assert catalog.connect is not None
+        assert catalog.read is not None
+
+        def fits(deadline: float) -> bool:
+            return deadline + catalog.connect + catalog.read <= app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS
+
+        assert app_module._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS == 45.0
+        assert app_module._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS == 5.0
+        assert fits(app_module._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS)
+        # Control: today's pre-S0 worst case (planner 5 s + advisor 60 s) does not fit.
+        assert not fits(5.0 + 60.0)
+        assert not fits(app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS)
 
     @pytest.mark.asyncio
     async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
+        """Hanging probes time out as nonfatal transient failures, inside one shared deadline.
+
+        Worst-case probe time is the shared deadline, not a sum of per-request
+        timeouts.
+        """
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
-        cancelled = False
+        cancelled: list[str] = []
 
-        async def _hanging_probe(**_kwargs: object) -> bool:
-            nonlocal cancelled
+        async def _hanging_probe(request: ComposerProbeRequest) -> bool:
             try:
                 await asyncio.Event().wait()
             finally:
-                cancelled = True
+                cancelled.append(request.surface)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _hanging_probe)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
-        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS", 0.01)
-        monkeypatch.setattr("elspeth.web.app._COMPOSER_ADVISOR_BOOT_PROBE_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", 0.3)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS", 0.1)
 
         async def _enter_and_exit_lifespan() -> None:
             async with lifespan(app):
                 pass
 
-        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
-            await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=1.0)
+        with (
+            capture_logs() as logs,
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
+        ):
+            await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=5.0)
 
-        # Advisor is mandatory, so both the primary and advisor models are
-        # probed. Both hang and time out as transient_failure; the loop does
-        # not break on a transient failure.
-        assert len(counter.calls) == 2
-        probed = [attributes["probed_model"] for _amount, attributes in counter.calls]
-        assert probed[0] == "gpt-5.5"
-        for _amount, attributes in counter.calls:
-            assert attributes["probe_status"] == "transient_failure"
-        assert len(latency.calls) == 2
-        assert cancelled is True
+        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list if call.kwargs["timeout"] != 5.0]
+        assert timeouts[:2] == [0.1, 0.1]
+        assert len(timeouts) == 3
+        # Every probe request fits inside the one deadline.
+        assert sum(timeouts) <= 0.3 + 0.01
+        assert 0.05 < timeouts[2] <= 0.1 + 0.01
+        assert cancelled == ["loop_tools", "planner_tools", "advisor"]
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
+        assert len(latency.calls) == 3
         warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
-        assert len(warnings) == 2
-        assert warnings[0]["probed_role"] == "planner"
-        assert warnings[0]["timeout_seconds"] == 0.01
-        assert warnings[1]["probed_role"] == "advisor"
-        assert warnings[1]["timeout_seconds"] == 0.02
-        assert "structured_output_conformance_verified" not in warnings[0]
-        assert warnings[1].get("structured_output_conformance_verified") is False
-        assert "structured-output conformance was not verified this boot" in warnings[1]["action"]
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
+        assert [warning["failure_class"] for warning in warnings] == ["TimeoutError"] * 3
+        for warning in warnings[:2]:
+            assert "structured_output_conformance_verified" not in warning
+            assert "tool schemas unverified at boot" in warning["action"]
+        assert warnings[2].get("structured_output_conformance_verified") is False
+        assert "structured-output conformance was not verified this boot" in warnings[2]["action"]
+
+    @pytest.mark.asyncio
+    async def test_lifespan_sends_nothing_once_the_shared_deadline_is_spent(self, monkeypatch, tmp_path) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+        sent: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            sent.append(request.surface)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", 0.0)
+
+        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert sent == []
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
+        assert len(latency.calls) == 3
+        warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
+        assert [warning["failure_class"] for warning in warnings] == ["SharedDeadlineExhausted"] * 3
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
+
+    @pytest.mark.asyncio
+    async def test_lifespan_logs_an_unproven_thinking_route_on_success(self, monkeypatch, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_model="anthropic/claude-opus-4-6",
+                composer_discovery_reasoning_effort="low",
+            )
+        )
+
+        async def _probe(_request: ComposerProbeRequest) -> bool:
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        unproven = [entry for entry in logs if entry["event"] == "composer_boot_probe_thinking_route_unproven"]
+        assert [entry["probed_surface"] for entry in unproven] == ["loop_tools"]
+        assert unproven[0]["max_tokens"] == 16
 
     @pytest.mark.asyncio
     async def test_lifespan_records_local_error_when_composer_probe_raises_programmer_error(self, monkeypatch, tmp_path) -> None:
@@ -2131,7 +2228,7 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _buggy_probe(**_kwargs: object) -> bool:
+        async def _buggy_probe(_request: ComposerProbeRequest) -> bool:
             raise TypeError("signature drift")
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _buggy_probe)

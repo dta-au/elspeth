@@ -1060,7 +1060,13 @@ allowed_dict_patterns:
   # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
   - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._get_litellm_tools:return (list)"
+  - "src/elspeth/web/composer/service.py:composer_loop_tool_definitions:return (list)"
+  # LiteLLM request kwargs for the compose loop and the pipeline planner,
+  # built once so the boot probe sends exactly what production sends.
+  # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
+  - "src/elspeth/web/composer/service.py:build_composer_loop_request_kwargs:return"
+  - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
+  - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:tools (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:messages (list)"

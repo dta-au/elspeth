@@ -723,6 +723,9 @@ files:
     dict[str, object]: 6
   src/elspeth/web/composer/authority_hashing.py:
     Mapping[str, Any]: 4
+  src/elspeth/web/composer/boot_probe.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 5
   src/elspeth/web/composer/capability_skill.py:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/control_messages.py:
@@ -793,8 +796,8 @@ files:
   src/elspeth/web/composer/pipeline_custody.py:
     Mapping[str, Any]: 6
   src/elspeth/web/composer/pipeline_planner.py:
-    Mapping[str, Any]: 38
-    dict[str, Any]: 20
+    Mapping[str, Any]: 40
+    dict[str, Any]: 21
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
     Mapping[str, Any]: 21
@@ -833,7 +836,7 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 23
+    Mapping[str, Any]: 25
     Mapping[str, object]: 1
     boundary: 1
     dict[str, Any]: 37
@@ -1046,10 +1049,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 876
+  Mapping[str, Any]: 881
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1141
+  dict[str, Any]: 1147
   dict[str, object]: 409
-  soft: 2745
+  soft: 2756

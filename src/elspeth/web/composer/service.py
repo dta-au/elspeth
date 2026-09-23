@@ -861,6 +861,81 @@ def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_
         kwargs["api_key"] = api_key
 
 
+def composer_loop_tool_definitions() -> list[dict[str, Any]]:
+    """Return the tool list the freeform compose loop sends, in LiteLLM function format.
+
+    The compose loop and the boot probe both call this, so the probe sends
+    exactly the list production sends.
+
+    Advisor is mandatory, so ``request_advisor_hint`` is always present
+    in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
+    affected; advisor is web-composer only by design (the tool is not
+    registered in the CLI dispatch tables).
+
+    The web-visible ``set_pipeline`` arguments alone carry a required
+    ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
+    unions nested below a property but discard root-level ``oneOf``. The
+    registry and every internal/MCP consumer remain on the flat semantic
+    argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
+    provider envelope before custody, audit, redaction, or dispatch.
+    """
+    definitions = get_tool_definitions()
+    tools: list[dict[str, Any]] = []
+    for defn in definitions:
+        parameters = defn["parameters"]
+        if defn["name"] == "set_pipeline":
+            parameters = {
+                "type": "object",
+                "properties": {"pipeline": parameters},
+                "required": ["pipeline"],
+                "additionalProperties": False,
+            }
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": defn["name"],
+                    "description": defn["description"],
+                    "parameters": parameters,
+                },
+            }
+        )
+    return tools
+
+
+def build_composer_loop_request_kwargs(
+    *,
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    settings: ComposerSettings,
+    api_base: str | None,
+    api_key: str | None,
+) -> dict[str, Any]:
+    """Build the LiteLLM kwargs of one freeform compose-loop or prose call.
+
+    ``_call_llm``, ``_call_text_llm`` and the boot probe's loop-list request
+    all build their request here, so temperature, seed, reasoning and
+    endpoint kwargs cannot drift between the probe and production. An empty
+    ``tools`` sequence omits the key (the prose call).
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    if settings.composer_temperature is not None:
+        kwargs["temperature"] = settings.composer_temperature
+    if settings.composer_seed is not None:
+        kwargs[_COMPOSER_LLM_SEED_PARAM] = settings.composer_seed
+    # Freeform tool-loop and prose calls are interactive tool
+    # choreography — discovery class (elspeth-dc459d438e).
+    apply_reasoning_kwargs(kwargs, model=model, effort=settings.composer_discovery_reasoning_effort)
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    return kwargs
+
+
 async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
 
@@ -7083,7 +7158,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
-        tools = self._get_litellm_tools()
+        tools = composer_loop_tool_definitions()
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.
@@ -7724,44 +7799,6 @@ class ComposerServiceImpl:
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
 
-    def _get_litellm_tools(self) -> list[dict[str, Any]]:
-        """Convert tool definitions to LiteLLM function format.
-
-        Advisor is mandatory, so ``request_advisor_hint`` is always present
-        in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
-        affected; advisor is web-composer only by design (the tool is not
-        registered in the CLI dispatch tables).
-
-        The web-visible ``set_pipeline`` arguments alone carry a required
-        ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
-        unions nested below a property but discard root-level ``oneOf``. The
-        registry and every internal/MCP consumer remain on the flat semantic
-        argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
-        provider envelope before custody, audit, redaction, or dispatch.
-        """
-        definitions = get_tool_definitions()
-        tools: list[dict[str, Any]] = []
-        for defn in definitions:
-            parameters = defn["parameters"]
-            if defn["name"] == "set_pipeline":
-                parameters = {
-                    "type": "object",
-                    "properties": {"pipeline": parameters},
-                    "required": ["pipeline"],
-                    "additionalProperties": False,
-                }
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": defn["name"],
-                        "description": defn["description"],
-                        "parameters": parameters,
-                    },
-                }
-            )
-        return tools
-
     async def _call_llm(
         self,
         messages: list[dict[str, Any]],
@@ -7771,20 +7808,14 @@ class ComposerServiceImpl:
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "messages": messages,
-            }
-            if tools:
-                kwargs["tools"] = tools
-            if self._settings.composer_temperature is not None:
-                kwargs["temperature"] = self._settings.composer_temperature
-            if self._settings.composer_seed is not None:
-                kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
-            # Freeform tool-loop and prose calls are interactive tool
-            # choreography — discovery class (elspeth-dc459d438e).
-            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
-            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=tools,
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -7806,18 +7837,14 @@ class ComposerServiceImpl:
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "messages": messages,
-            }
-            if self._settings.composer_temperature is not None:
-                kwargs["temperature"] = self._settings.composer_temperature
-            if self._settings.composer_seed is not None:
-                kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
-            # Freeform tool-loop and prose calls are interactive tool
-            # choreography — discovery class (elspeth-dc459d438e).
-            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
-            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=(),
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -7943,7 +7970,7 @@ class ComposerServiceImpl:
         method itself does not need to change shape.
         """
         if session_id is None:
-            # Compose-loop invariant. ``_get_litellm_tools()`` filters
+            # Compose-loop invariant. ``composer_loop_tool_definitions()`` filters
             # nothing: every compose turn advertises the session-aware
             # tools. What guarantees a session here is ``compose()``'s
             # admission, which refuses a turn without COMPOSE session

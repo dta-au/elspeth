@@ -210,26 +210,21 @@ class TestToolListOrderIsCacheKeyContract:
         )
 
     def test_litellm_tools_preserves_definition_order(self) -> None:
-        """``_get_litellm_tools`` is a list comprehension over ``get_tool_definitions``;
+        """``composer_loop_tool_definitions`` is a list comprehension over ``get_tool_definitions``;
         order must be preserved (modulo the advisor-toggle filter, which is
         allowed to drop ``request_advisor_hint`` when disabled but must never
         reorder the remaining tools).
 
         The cache-key invariant is "the relative order of tools that DO appear
-        in ``_get_litellm_tools`` matches the relative order in
+        in ``composer_loop_tool_definitions`` matches the relative order in
         ``get_tool_definitions``." Set inequality (one filtered out) is fine;
         order swap (cache-invalidating reorder) is not.
         """
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.composer.service import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
-        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
-
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
 
         defn_names = [d["name"] for d in get_tool_definitions()]
-        tool_names = [t["function"]["name"] for t in service._get_litellm_tools()]
+        tool_names = [t["function"]["name"] for t in composer_loop_tool_definitions()]
 
         # Subsequence-order invariant: every tool emitted is in the definition
         # list, and the indices form a strictly increasing sequence (i.e., no
@@ -237,7 +232,7 @@ class TestToolListOrderIsCacheKeyContract:
         defn_index = {name: i for i, name in enumerate(defn_names)}
         emitted_positions = [defn_index[name] for name in tool_names]
         assert emitted_positions == sorted(emitted_positions), (
-            f"_get_litellm_tools reordered tools relative to get_tool_definitions; "
+            f"composer_loop_tool_definitions reordered tools relative to get_tool_definitions; "
             f"emitted positions={emitted_positions}, names={tool_names}"
         )
         # Every emitted name must come from definitions (no tool fabricated
@@ -245,13 +240,11 @@ class TestToolListOrderIsCacheKeyContract:
         assert set(tool_names).issubset(set(defn_names))
 
     def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.composer.service import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
-        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 
         definitions = get_tool_definitions()
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-        tools = service._get_litellm_tools()
+        tools = composer_loop_tool_definitions()
 
         assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
         for definition, tool in zip(definitions, tools, strict=True):

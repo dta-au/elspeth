@@ -265,13 +265,20 @@ reported unavailable, with the missing variable named, through the sanitized
 `GET /api/system/status` surface, and compose requests fail until the key is
 provided.
 
-At startup the service also sends one trivial probe request to each Composer
-model (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`). A
-provider *bad request* — for example a model that rejects the configured
-`ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED` — fails
-startup, because that is a fixable operator configuration error. Transient
-provider, auth, or network failures do not block boot; the Composer is
-exercised again at first use.
+At startup the service also sends short probe requests to the Composer
+models (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`), built
+exactly as production builds them: the planner model receives the compose
+loop's full tool list and, separately, the pipeline planner's tool list, and
+the advisor model receives its structured-output request. A provider *bad
+request* — for example a model that rejects the configured
+`ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED`, or a
+tool schema — fails startup, because that is a fixable operator
+configuration error. All probe requests share one 45-second deadline, and
+each planner request is also capped at 5 seconds. Timeouts and transient
+provider, auth, or network failures do not block boot; they are logged as
+`composer_boot_probe_transient_failure` (tool schemas or structured-output
+conformance unverified at boot), and the Composer is exercised again at
+first use.
 
 ### Pointing Composer at your own OpenAI-compatible endpoint
 

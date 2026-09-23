@@ -28,7 +28,6 @@ from fastapi.responses import JSONResponse, Response
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.util.types import AttributeValue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import SecretStr
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -191,8 +190,31 @@ if TYPE_CHECKING:
 # test seams without creating instruments as an import side effect.
 _COMPOSER_BOOT_CONFIG_COUNTER: Counter
 _COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
-_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
-_COMPOSER_ADVISOR_BOOT_PROBE_TIMEOUT_SECONDS = 60.0
+# Boot-time provider probe budget (strict-tool-contracts plan, section 4
+# "Boot-time budget"). The composer probes run in the lifespan before uvicorn
+# binds, so /api/health refuses connections for their whole duration. The
+# startup contract is 150 s (ACA startup probe 15 s x 10 in
+# deploy/azure-container-apps/workload.bicep; ECS startPeriod 150 in
+# docs/runbooks/aws-ecs-deployment.md), about 90 s of which is the database
+# budget. That leaves 60 s for boot-time provider probes.
+_BOOT_PROVIDER_PROBE_BUDGET_SECONDS = 60.0
+# One deadline shared by every composer probe request (loop list, planner
+# list, advisor), so the worst case is this value, not a sum of per-request
+# timeouts. With the OpenRouter catalog prime (connect + read, see
+# _OPENROUTER_CATALOG_PRIME_TIMEOUT) it fits the 60 s budget. Measured advisor
+# checkpoint latency (23 archived calls): p95 11.0 s, max 50.8 s. With both
+# planner requests at their cap the advisor still has 35 s, about 3x its p95;
+# a call as slow as the 50.8 s outlier becomes a nonfatal, logged unverified
+# boot.
+_COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
+# Each planner request is also capped inside the shared deadline, so a slow
+# planner endpoint cannot consume the advisor's time. A provider rejects a bad
+# request before it generates, so the cap keeps the probe's main signal (a
+# 400); a slower, accepted request is logged as unverified. Measured compose
+# loop calls with at most 200 completion tokens (11 archived calls, prompts of
+# 56k-104k tokens): p50 1.6 s, max 2.75 s.
+_COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+_OPENROUTER_CATALOG_PRIME_TIMEOUT = httpx.Timeout(5.0, connect=5.0)
 _FORBIDDEN_METRICS_LABEL_PATTERN = re.compile(rb"(?:\{|,)\s*(run_id|session_id|user_id)\s*=")
 _METRICS_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 # Reserve bounded headroom inside the public five-second readiness contract
@@ -497,7 +519,7 @@ async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
         return
 
     probe_start = time.monotonic()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as _probe_client:
+    async with httpx.AsyncClient(timeout=_OPENROUTER_CATALOG_PRIME_TIMEOUT) as _probe_client:
 
         async def _probe_get(url: str) -> httpx.Response:
             # ``request("GET", ...)`` rather than ``.get(...)``: identical
@@ -685,61 +707,75 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _boot_prime_openrouter_catalog(settings)
 
     if settings.composer_boot_probe_enabled:
-        from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
+        from elspeth.web.composer.boot_probe import ComposerBootConfigError, build_composer_probe_requests, probe_composer_config
 
         # Advisor is mandatory, so the advisor model is always probed. Each
-        # role probes its own endpoint and capability even when model IDs match.
-        probe_roles: list[tuple[Literal["planner", "advisor"], str, str | None, SecretStr | None]] = [
-            ("planner", settings.composer_model, settings.composer_endpoint_base_url, settings.composer_endpoint_api_key),
-            (
-                "advisor",
-                settings.composer_advisor_model,
-                settings.composer_advisor_endpoint_base_url,
-                settings.composer_advisor_endpoint_api_key,
-            ),
-        ]
-        for role, model, endpoint_base_url, endpoint_api_key in probe_roles:
+        # surface probes its own endpoint and capability even when model IDs
+        # match. Every request shares one deadline (see
+        # _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS).
+        probe_deadline = loop.time() + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
+        for probe_request in build_composer_probe_requests(settings):
             composer_probe_start = time.monotonic()
             probe_status = "started"
-            probe_timeout = _COMPOSER_ADVISOR_BOOT_PROBE_TIMEOUT_SECONDS if role == "advisor" else _COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS
-            conformance_warning = {"structured_output_conformance_verified": False} if role == "advisor" else {}
+            role = probe_request.role
+            is_advisor = probe_request.surface == "advisor"
+            conformance_warning = {"structured_output_conformance_verified": False} if is_advisor else {}
             failure_action = (
                 "booting; structured-output conformance was not verified this boot"
-                if role == "advisor"
-                else "booting; composer LLM calls will be exercised at first use"
+                if is_advisor
+                else "booting; tool schemas unverified at boot; composer LLM calls will be exercised at first use"
             )
             attributes: dict[str, AttributeValue] = {
                 "composer_model": settings.composer_model,
                 "composer_temperature": str(settings.composer_temperature),
                 "composer_seed": str(settings.composer_seed),
                 "composer_advisor_model": settings.composer_advisor_model,
-                "probed_model": model,
+                "probed_model": probe_request.model,
                 "probed_role": role,
-                "structured_output": role == "advisor",
+                "probed_surface": probe_request.surface,
+                "structured_output": is_advisor,
                 "probe_status": probe_status,
             }
+            remaining = probe_deadline - loop.time()
+            probe_timeout = min(remaining, _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS) if role == "planner" else remaining
             try:
-                ok = await asyncio.wait_for(
-                    probe_composer_config(
-                        role=role,
-                        model=model,
-                        temperature=settings.composer_temperature,
-                        seed=settings.composer_seed,
-                        api_base=endpoint_base_url,
-                        api_key=(endpoint_api_key.get_secret_value() if endpoint_api_key is not None else None),
-                        max_tokens=settings.composer_advisor_max_completion_tokens if role == "advisor" else None,
-                        reasoning_effort=settings.composer_advisor_reasoning_effort if role == "advisor" else None,
-                    ),
-                    timeout=probe_timeout,
-                )
+                if remaining <= 0:
+                    # The shared deadline is spent: send nothing rather than a
+                    # request that cannot complete.
+                    probe_status = "transient_failure"
+                    slog.warning(
+                        "composer_boot_probe_transient_failure",
+                        model=probe_request.model,
+                        probed_role=role,
+                        probed_surface=probe_request.surface,
+                        failure_class="SharedDeadlineExhausted",
+                        deadline_seconds=_COMPOSER_BOOT_PROBE_DEADLINE_SECONDS,
+                        action=failure_action,
+                        **conformance_warning,
+                    )
+                    continue
+                ok = await asyncio.wait_for(probe_composer_config(probe_request), timeout=probe_timeout)
                 if ok:
                     probe_status = "success"
+                    if probe_request.thinking_route_unproven:
+                        slog.info(
+                            "composer_boot_probe_thinking_route_unproven",
+                            model=probe_request.model,
+                            probed_surface=probe_request.surface,
+                            max_tokens=probe_request.kwargs["max_tokens"],
+                            reason=(
+                                "the probe's max_tokens is at or below the minimum thinking budget, so LiteLLM "
+                                "sent this request without extended thinking; the planner_tools request "
+                                "exercises the thinking route on the same model and endpoint"
+                            ),
+                        )
                 if not ok:
                     probe_status = "transient_failure"
                     slog.warning(
                         "composer_boot_probe_transient_failure",
-                        model=model,
+                        model=probe_request.model,
                         probed_role=role,
+                        probed_surface=probe_request.surface,
                         failure_class="provider_or_transport_error",
                         action=failure_action,
                         **conformance_warning,
@@ -748,8 +784,9 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 probe_status = "transient_failure"
                 slog.warning(
                     "composer_boot_probe_transient_failure",
-                    model=model,
+                    model=probe_request.model,
                     probed_role=role,
+                    probed_surface=probe_request.surface,
                     failure_class="TimeoutError",
                     timeout_seconds=probe_timeout,
                     action=failure_action,

@@ -20,7 +20,7 @@ from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErr
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._dispatch import (
@@ -472,10 +472,7 @@ def test_planner_rejection_closure_still_collapses_unknown_codes() -> None:
 
 
 def test_tool_list_builder_does_not_filter_session_aware_tools() -> None:
-    from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
-
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    names = {tool["function"]["name"] for tool in service._get_litellm_tools()}
+    names = {tool["function"]["name"] for tool in composer_loop_tool_definitions()}
     assert "request_interpretation_review" in names
 
 
@@ -503,7 +500,7 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
             policy_catalog=MagicMock(),
         )
     message = str(caught.value)
-    assert "_get_litellm_tools" not in message
+    assert "composer_loop_tool_definitions" not in message
     assert "COMPOSE session authority" in message
 
 

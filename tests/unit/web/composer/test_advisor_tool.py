@@ -2,7 +2,7 @@
 escape hatch for the composer LLM.
 
 Covers:
-- Advisor is mandatory: the tool is always exposed by _get_litellm_tools().
+- Advisor is mandatory: the tool is always exposed by composer_loop_tool_definitions().
 - CLI MCP allowlist (_COMPOSER_TOOL_NAMES) excludes it by design — the
   advisor is web-composer-only because the CLI MCP server's allowlist
   is built from _DISCOVERY_TOOLS / _MUTATION_TOOLS, neither of which
@@ -35,7 +35,12 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl, _build_advisor_user_message
+from elspeth.web.composer.service import (
+    ComposerAvailability,
+    ComposerServiceImpl,
+    _build_advisor_user_message,
+    composer_loop_tool_definitions,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
@@ -218,12 +223,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_advisor_tool_exposed() -> None:
-    """Advisor is mandatory, so _get_litellm_tools() always includes
+    """Advisor is mandatory, so composer_loop_tool_definitions() always includes
     request_advisor_hint in the LiteLLM function format.
     """
-    catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
-    tools = service._get_litellm_tools()
+    tools = composer_loop_tool_definitions()
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")
