@@ -403,6 +403,41 @@ def test_nonlive_llm_noop_tracing_remains_admissible() -> None:
     assert requested == frozenset({"llm"})
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        {"sources": []},
+        {"transforms": {}},
+        {"transforms": [None]},
+        {"transforms": [{"plugin": 42}]},
+        {"transforms": [{"plugin": "llm", "options": {"tracing": []}}]},
+    ],
+)
+def test_raw_nonlive_plugin_parser_refuses_malformed_shapes(raw: object) -> None:
+    with pytest.raises((ValueError, OrchestrationInvariantError)):
+        precheck_nonlive_plugin_names_from_raw(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("replay_from", 42), ("landscape", []), ("concurrency", []), ("telemetry", [])],
+)
+def test_raw_cli_admission_refuses_malformed_authority_fields_before_loader(tmp_path: Path, field: str, value: object) -> None:
+    settings_path = _settings_path(tmp_path, mode="verify")
+    raw = yaml.safe_load(settings_path.read_text())
+    raw[field] = value
+    settings_path.write_text(yaml.safe_dump(raw))
+    with (
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("settings loaded")) as loader,
+        patch("elspeth.cli._instantiate_plugins_for_runtime_preflight", side_effect=AssertionError("constructor")) as construct,
+    ):
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+    assert result.exit_code == 1, result.output
+    loader.assert_not_called()
+    construct.assert_not_called()
+
+
 def test_parsed_nonlive_llm_tracing_refused_before_constructor() -> None:
     settings = ElspethSettings(
         sources={"primary": {"plugin": "csv", "on_success": "output"}},

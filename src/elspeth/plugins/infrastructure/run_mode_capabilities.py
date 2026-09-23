@@ -7,9 +7,11 @@ cannot gain replay authority by using a built-in name.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable
+from collections.abc import Collection
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from elspeth.contracts.errors import OrchestrationInvariantError
 
@@ -76,15 +78,49 @@ _TRANSFORM_CLASSES = {
 }
 
 
+class _NoTracingConfig(BaseModel):
+    """The only tracing shape a non-live LLM may construct."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    provider: Literal["none"] = "none"
+
+
+class _NonliveLLMOptions(BaseModel):
+    """Parse the startup-relevant part of raw LLM options."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    tracing: _NoTracingConfig | None = None
+
+
+class _RawPluginRef(BaseModel):
+    """Owned projection of a plugin entry from untrusted YAML."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    plugin: str
+    options: object = Field(default_factory=dict)
+
+
+class _RawPluginSections(BaseModel):
+    """Parse the five plugin-bearing sections before built-in imports."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    sources: dict[str, _RawPluginRef] = Field(default_factory=dict)
+    transforms: list[_RawPluginRef] = Field(default_factory=list)
+    aggregations: list[_RawPluginRef] = Field(default_factory=list)
+    collectors: list[_RawPluginRef] = Field(default_factory=list)
+    sinks: dict[str, _RawPluginRef] = Field(default_factory=dict)
+
+
 def _admit_nonlive_llm_tracing(options: object) -> None:
     """Refuse tracer construction before a non-live LLM plugin is imported."""
-    if not isinstance(options, dict):
-        raise OrchestrationInvariantError("Replay/verify LLM options must be a mapping")
-    tracing = options.get("tracing")
-    if tracing is None:
-        return
-    if not isinstance(tracing, dict) or tracing.get("provider", "none") != "none":
-        raise OrchestrationInvariantError("Replay/verify LLM tracing is unsupported")
+    try:
+        _NonliveLLMOptions.model_validate(options)
+    except ValidationError as exc:
+        raise OrchestrationInvariantError("Replay/verify LLM tracing is unsupported or options are malformed") from exc
 
 
 _SINK_CLASSES = {
@@ -162,35 +198,25 @@ def precheck_nonlive_plugin_names(settings: ElspethSettings) -> None:
 
 def precheck_nonlive_plugin_names_from_raw(raw_config: object) -> frozenset[str]:
     """Return reviewed YAML plugin names without importing the registry."""
-    if not isinstance(raw_config, dict):
-        raise ValueError("Replay/verify settings must be a YAML mapping")
+    try:
+        parsed = _RawPluginSections.model_validate(raw_config)
+    except ValidationError as exc:
+        raise ValueError("Replay/verify plugin sections have invalid shape") from exc
     sections = (
-        ("sources", _SOURCE_CLASSES, True),
-        ("transforms", _TRANSFORM_CLASSES, False),
-        ("aggregations", _TRANSFORM_CLASSES, False),
-        ("collectors", _TRANSFORM_CLASSES, False),
-        ("sinks", _SINK_CLASSES, True),
+        ("sources", parsed.sources.values(), _SOURCE_CLASSES),
+        ("transforms", parsed.transforms, _TRANSFORM_CLASSES),
+        ("aggregations", parsed.aggregations, _TRANSFORM_CLASSES),
+        ("collectors", parsed.collectors, _TRANSFORM_CLASSES),
+        ("sinks", parsed.sinks.values(), _SINK_CLASSES),
     )
     names: set[str] = set()
-    for section_name, supported, named in sections:
-        section = raw_config.get(section_name, {} if named else [])
-        entries: Iterable[object]
-        if named:
-            if not isinstance(section, dict):
-                raise ValueError(f"Replay/verify {section_name} must be a mapping")
-            entries = section.values()
-        else:
-            if not isinstance(section, list):
-                raise ValueError(f"Replay/verify {section_name} must be a list")
-            entries = section
+    for section_name, entries, supported in sections:
         for entry in entries:
-            if not isinstance(entry, dict):
-                raise ValueError(f"Replay/verify {section_name} entries must be mappings")
-            name = entry.get("plugin")
-            if not isinstance(name, str) or name not in supported:
+            name = entry.plugin
+            if name not in supported:
                 raise OrchestrationInvariantError(f"Replay/verify does not support {section_name} plugin {name!r}")
             if name == "llm":
-                _admit_nonlive_llm_tracing(entry.get("options", {}))
+                _admit_nonlive_llm_tracing(entry.options)
             names.add(name)
     return frozenset(names)
 

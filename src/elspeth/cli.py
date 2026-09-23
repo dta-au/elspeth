@@ -17,7 +17,7 @@ import typer
 import yaml
 from dynaconf.vendor.ruamel.yaml.parser import ParserError as YamlParserError
 from dynaconf.vendor.ruamel.yaml.scanner import ScannerError as YamlScannerError
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
@@ -554,24 +554,21 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     if secrets_config.source == "keyvault":
         raise ValueError("Replay/verify cannot fetch Key Vault secrets")
     requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
-    replay_from = raw_config.get("replay_from")
-    if not isinstance(replay_from, str) or not replay_from.strip():
+    try:
+        replay_from = TypeAdapter(str).validate_python(raw_config.get("replay_from"), strict=True)
+    except ValidationError as exc:
+        raise ValueError("Replay/verify requires a literal replay_from run ID") from exc
+    if not replay_from.strip():
         raise ValueError("Replay/verify requires a literal replay_from run ID")
     raw_landscape = raw_config.get("landscape", {})
-    if not isinstance(raw_landscape, dict):
-        raise ValueError("Replay/verify Landscape settings must be a mapping")
-    landscape = LandscapeSettings(**raw_landscape)
+    landscape = LandscapeSettings.model_validate(raw_landscape)
     if landscape.export.enabled:
         raise ValueError("Replay/verify with Landscape export is unsupported")
     raw_concurrency = raw_config.get("concurrency", {})
-    if not isinstance(raw_concurrency, dict):
-        raise ValueError("Replay/verify concurrency settings must be a mapping")
-    if ConcurrencySettings(**raw_concurrency).max_workers != 1:
+    if ConcurrencySettings.model_validate(raw_concurrency).max_workers != 1:
         raise ValueError("Replay/verify requires concurrency.max_workers=1")
     raw_telemetry = raw_config.get("telemetry", {})
-    if not isinstance(raw_telemetry, dict):
-        raise ValueError("Replay/verify telemetry settings must be a mapping")
-    if TelemetrySettings(**raw_telemetry).enabled:
+    if TelemetrySettings.model_validate(raw_telemetry).enabled:
         raise ValueError("Replay/verify with telemetry exporters is unsupported")
     for side_channel in ("depends_on", "collection_probes", "commencement_gates"):
         if raw_config.get(side_channel):
@@ -633,9 +630,7 @@ def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str |
     if mode is not RunMode.LIVE or os.environ.get("ELSPETH_RUN_MODE", RunMode.LIVE.value) != RunMode.LIVE.value:
         raise ValueError("Replay/verify runs cannot be resumed until mode-aware resume is implemented")
     raw_landscape = raw_config.get("landscape", {})
-    if not isinstance(raw_landscape, dict):
-        raise ValueError("Resume Landscape settings must be a mapping")
-    landscape = LandscapeSettings(**raw_landscape)
+    landscape = LandscapeSettings.model_validate(raw_landscape)
     if database is not None:
         database_path = Path(database).expanduser().resolve()
         if not database_path.exists():
