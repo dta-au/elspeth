@@ -10,6 +10,7 @@ import type {
   ReviewAttestationView,
   ReviewRequestView,
   ReviewVerdict,
+  WorkflowAuditView,
   WorkflowInspect,
   IdentityQuota,
   QuotaDimension,
@@ -37,6 +38,7 @@ export const fetchMailboxInbox = (): Promise<MailboxInbox> => get("/api/workflow
 export const fetchMailboxSent = (): Promise<MailboxSent> => get("/api/workflow/mailbox/sent");
 export const fetchApproverDirectory = (): Promise<ApproverDirectory> => get("/api/workflow/mailbox/approvers");
 export const markApprovalSeen = (id: string): Promise<ApprovalView> => post(`/api/workflow/mailbox/${segment(id)}/seen`);
+export const fetchWorkflowAuditView = (): Promise<WorkflowAuditView> => get("/api/workflow/audit-view");
 
 export function requestApproval(sessionId: string, body: { state_id: string; approver_identity_id: string; note: string | null }): Promise<ApprovalView> {
   return post(`/api/sessions/${segment(sessionId)}/approvals`, { ...body, note: noteOrNull(body.note) });

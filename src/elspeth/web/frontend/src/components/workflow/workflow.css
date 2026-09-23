@@ -86,3 +86,22 @@
   margin-top: var(--space-md);
   padding-top: var(--space-md);
 }
+
+/* The approver audit view: four read-only sections in one scrolling panel.
+   Rows are not buttons here — nothing in this view is actionable, and giving
+   them affordance would imply a decision the audit view deliberately cannot
+   make. */
+.workflow-audit-scope {
+  color: var(--color-text-muted);
+}
+
+.workflow-audit-section h3 {
+  margin: var(--space-md) 0 var(--space-xs);
+}
+
+.workflow-audit .workflow-mailbox-list li {
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-md);
+  overflow-wrap: anywhere;
+}

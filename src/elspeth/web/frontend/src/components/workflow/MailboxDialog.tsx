@@ -3,22 +3,28 @@ import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useAuthStore } from "@/stores/authStore";
 import { useMailboxStore } from "@/stores/mailboxStore";
+import { AuditViewList } from "./AuditViewList";
 import { InboxList, type InboxItem } from "./InboxList";
 import { InspectPane } from "./InspectPane";
 import { SentList } from "./SentList";
 import "./workflow.css";
 
+const FOLDERS = ["inbox", "sent", "audit"] as const;
+type Folder = (typeof FOLDERS)[number];
+
 export function MailboxDialog({ onClose }: { onClose: () => void }): JSX.Element {
   const modalRef = useRef<HTMLDivElement>(null);
   const identityId = useAuthStore((state) => state.user?.user_id ?? "");
   const governance = useMailboxStore((state) => state.summary?.governance);
-  const [folder, setFolder] = useState<"inbox" | "sent">("inbox");
+  const [folder, setFolder] = useState<Folder>("inbox");
   const [selected, setSelected] = useState<InboxItem | null>(null);
   const inbox = useMailboxStore((state) => state.inbox);
   const sent = useMailboxStore((state) => state.sent);
+  const auditView = useMailboxStore((state) => state.auditView);
   const error = useMailboxStore((state) => state.error);
   const loadInbox = useMailboxStore((state) => state.loadInbox);
   const loadSent = useMailboxStore((state) => state.loadSent);
+  const loadAuditView = useMailboxStore((state) => state.loadAuditView);
   const openSent = useMailboxStore((state) => state.openSent);
   useFocusTrap(modalRef, true);
 
@@ -29,17 +35,19 @@ export function MailboxDialog({ onClose }: { onClose: () => void }): JSX.Element
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [loadInbox, onClose]);
 
-  function chooseFolder(next: "inbox" | "sent") {
+  function chooseFolder(next: Folder) {
     setSelected(null);
     setFolder(next);
     if (next === "inbox") void loadInbox();
-    else void loadSent();
+    else if (next === "sent") void loadSent();
+    else void loadAuditView();
   }
 
   function onTabsKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    const next = event.key === "ArrowRight" || event.key === "ArrowLeft"
-      ? folder === "inbox" ? "sent" : "inbox"
-      : event.key === "Home" ? "inbox" : event.key === "End" ? "sent" : null;
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    const next: Folder | null = step !== 0
+      ? FOLDERS[(FOLDERS.indexOf(folder) + step + FOLDERS.length) % FOLDERS.length]
+      : event.key === "Home" ? FOLDERS[0] : event.key === "End" ? FOLDERS[FOLDERS.length - 1] : null;
     if (next === null) return;
     event.preventDefault();
     chooseFolder(next);
@@ -57,13 +65,16 @@ export function MailboxDialog({ onClose }: { onClose: () => void }): JSX.Element
         <div className="workflow-mailbox-tabs" role="tablist" aria-label="Mailbox folders" onKeyDown={onTabsKeyDown}>
           <Button role="tab" data-folder="inbox" tabIndex={folder === "inbox" ? 0 : -1} aria-selected={folder === "inbox"} onClick={() => chooseFolder("inbox")}>Inbox</Button>
           <Button role="tab" data-folder="sent" tabIndex={folder === "sent" ? 0 : -1} aria-selected={folder === "sent"} onClick={() => chooseFolder("sent")}>Sent</Button>
+          <Button role="tab" data-folder="audit" tabIndex={folder === "audit" ? 0 : -1} aria-selected={folder === "audit"} onClick={() => chooseFolder("audit")}>Audit</Button>
         </div>
         {governance === "off" && <p role="status">Workflow governance is off on this deployment.</p>}
         {selected !== null ? <InspectPane item={selected} onBack={() => setSelected(null)} onDone={() => setSelected(null)} />
           : folder === "inbox" ? <div role="tabpanel" aria-label="Inbox">
             {inbox === null ? <p>Loading inbox</p> : <InboxList inbox={inbox} identityId={identityId} onSelect={setSelected} />}
-          </div> : <div role="tabpanel" aria-label="Sent">
+          </div> : folder === "sent" ? <div role="tabpanel" aria-label="Sent">
             {sent === null ? <p>Loading sent requests</p> : <SentList sent={sent} identityId={identityId} onOpen={(id) => void openSent(id)} />}
+          </div> : <div role="tabpanel" aria-label="Audit">
+            {auditView === null ? <p>Loading the audit view</p> : <AuditViewList view={auditView} />}
           </div>}
         {selected === null && error !== null && <p role="alert">{error}</p>}
       </div>

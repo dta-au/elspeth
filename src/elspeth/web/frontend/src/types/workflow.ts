@@ -95,3 +95,54 @@ export interface IdentityQuota {
   tokens_used_today: number | null;
   storage_bytes_used: number;
 }
+
+/** The approver audit view. The server decides scope; an identity absent from
+ *  `identity_ids` is one this approver may not see, not one with no activity. */
+export interface AuditViewRun {
+  run_id: string;
+  initiated_by_identity_id: string;
+  recorded_at: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface AuditViewApproval {
+  approval_id: string;
+  session_id: string;
+  state_id: string;
+  requested_by_identity_id: string;
+  approver_identity_id: string;
+  requested_at: string;
+  decided_at: string | null;
+  decision: string | null;
+}
+
+export interface AuditViewAttestation {
+  attestation_id: string;
+  session_id: string;
+  state_id: string;
+  payload_digest: string;
+  reviewer_identity_id: string;
+  author_identity_id: string;
+  attested_at: string;
+  verdict: string;
+}
+
+export interface AuditViewAuthEvent {
+  event_id: string;
+  occurred_at: string;
+  event_type: string;
+  outcome: string;
+  identity_id: string;
+  metadata_json: string;
+}
+
+export interface WorkflowAuditView {
+  identity_ids: string[];
+  truncated: boolean;
+  runs: AuditViewRun[];
+  approvals: AuditViewApproval[];
+  attestations: AuditViewAttestation[];
+  auth_events: AuditViewAuthEvent[];
+}

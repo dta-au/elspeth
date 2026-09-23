@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import * as workflow from "@/api/workflow";
 import { useAuthStore } from "./authStore";
-import type { ApprovalView, MailboxInbox, MailboxSent, MailboxSummary, ReviewVerdict } from "@/types/workflow";
+import type { ApprovalView, MailboxInbox, MailboxSent, MailboxSummary, ReviewVerdict, WorkflowAuditView } from "@/types/workflow";
 
 export const MAILBOX_POLL_INTERVAL_MS = 30_000;
 
@@ -58,10 +58,12 @@ interface MailboxState {
   summary: MailboxSummary | null;
   inbox: MailboxInbox | null;
   sent: MailboxSent | null;
+  auditView: WorkflowAuditView | null;
   error: string | null;
   refreshSummary: () => Promise<void>;
   loadInbox: () => Promise<void>;
   loadSent: () => Promise<void>;
+  loadAuditView: () => Promise<void>;
   openSent: (approvalId: string) => Promise<void>;
   decide: (approvalId: string, decision: "approved" | "rejected", note: string | null) => Promise<boolean | "already_decided">;
   attest: (requestId: string, verdict: ReviewVerdict, note: string | null) => Promise<boolean>;
@@ -73,6 +75,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
   summary: null,
   inbox: null,
   sent: null,
+  auditView: null,
   error: null,
 
   async refreshSummary() {
@@ -102,6 +105,20 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
       if (generation === requestGeneration) set({ sent, error: null });
     } catch (error) {
       if (generation === requestGeneration) set({ error: workflowErrorMessage(error) });
+    }
+  },
+
+  /** The scope is the server's to decide: a 404 means this caller is not an
+   *  approver, and a 409 means governance is off. Both surface as the message
+   *  rather than as an empty view, so an unauthorised reader is never shown a
+   *  blank table that reads as "no activity". */
+  async loadAuditView() {
+    const requestGeneration = generation;
+    try {
+      const auditView = await workflow.fetchWorkflowAuditView();
+      if (generation === requestGeneration) set({ auditView, error: null });
+    } catch (error) {
+      if (generation === requestGeneration) set({ auditView: null, error: workflowErrorMessage(error) });
     }
   },
 
@@ -185,7 +202,7 @@ export const useMailboxStore = create<MailboxState>((set, get) => ({
   reset() {
     generation += 1;
     stopTimer();
-    set({ summary: null, inbox: null, sent: null, error: null });
+    set({ summary: null, inbox: null, sent: null, auditView: null, error: null });
   },
 }));
 
