@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -103,18 +104,24 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
 async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import litellm
+
     _clear_static_provider_keys(monkeypatch)
     captured: list[dict[str, Any]] = []
+    dispatches: list[bool] = []
+    reply = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None})
 
     async def fake_acompletion(**kwargs: Any) -> Any:
+        assert dispatches == [True]
         captured.append(kwargs)
         return SimpleNamespace(
             model=_BEDROCK_ADVISOR,
-            choices=[SimpleNamespace(message=SimpleNamespace(content="CLEAN"))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))],
             usage=SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13),
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", fake_acompletion)
+    # Observe actual SDK arguments after the wrapper consumes its callback.
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     service = _bedrock_service()
     recorder = BufferingRecorder()
 
@@ -126,16 +133,20 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
             "attempted_actions": [],
         },
         recorder=recorder,
+        structured_output=True,
+        on_provider_dispatch=lambda: dispatches.append(True),
     )
 
-    assert guidance == "CLEAN"
+    assert guidance == reply
     assert metadata["model"] == _BEDROCK_ADVISOR
     assert len(captured) == 1
     request = captured[0]
     assert request["model"] == _BEDROCK_ADVISOR
     # reasoning_effort: the advisor knob rides Bedrock calls too
     # (elspeth-dc459d438e).
-    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort"}
+    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format"}
+    assert request["response_format"]["type"] == "json_schema"
+    assert request["response_format"]["json_schema"]["strict"] is True
     assert request["reasoning_effort"] == "medium"
     assert "tools" not in request
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))

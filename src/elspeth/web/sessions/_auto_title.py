@@ -348,7 +348,7 @@ async def maybe_auto_title_session(
         return
     response: object | None = None
     try:
-        response = await _litellm_acompletion(**kwargs)
+        response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
         admitted = _admit_auto_title_completion(response)
     except asyncio.CancelledError as exc:
         await _charge_auto_title_response(

@@ -8,6 +8,7 @@ import itertools
 import json
 import threading
 import tracemalloc
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -110,6 +111,23 @@ from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
+
+
+def _advisor_checkpoint_reply(*, verdict: Literal["CLEAN", "FLAGGED"], findings: str, note: str | None) -> str:
+    return json.dumps({"verdict": verdict, "category": "other", "steps": [], "findings": findings, "note": note})
+
+
+def _advisor_checkpoint_responses(*replies: str) -> Callable[..., Awaitable[tuple[str, dict[str, object]]]]:
+    responses = iter(replies)
+
+    async def respond(
+        *_args: object, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object
+    ) -> tuple[str, dict[str, object]]:
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        return next(responses), {}
+
+    return respond
 
 
 @pytest.fixture
@@ -2067,7 +2085,10 @@ class TestComposerMultiTurnToolCalls:
                 service,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=[(findings, {}), ("CLEAN", {})],
+                side_effect=_advisor_checkpoint_responses(
+                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=findings, note="Review the configured source options."),
+                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
+                ),
             ),
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2147,7 +2168,10 @@ class TestComposerMultiTurnToolCalls:
                 service,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=[(prior_finding, {}), ("CLEAN", {})],
+                side_effect=_advisor_checkpoint_responses(
+                    _advisor_checkpoint_reply(verdict="FLAGGED", findings=prior_finding, note="Add the rating field to the sink output."),
+                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
+                ),
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2193,7 +2217,10 @@ class TestComposerMultiTurnToolCalls:
                 service,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=[("FLAGGED: missing output", {}), ("CLEAN", {})],
+                side_effect=_advisor_checkpoint_responses(
+                    _advisor_checkpoint_reply(verdict="FLAGGED", findings="FLAGGED: missing output", note="Configure a pipeline output."),
+                    _advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None),
+                ),
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)

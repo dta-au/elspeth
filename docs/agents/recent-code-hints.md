@@ -8,6 +8,22 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-23 — advisor blocker retry copy now follows the cause it names; the note never swaps a finding for a CLEAN
+  sub-heading** (elspeth-032ec69c41 self-review; the withheld-sentence defect from the same review landed separately as
+  1809379f6). Pinned in `tests/unit/web/composer/test_advisor_checkpoint.py`. (1) `_ADVISOR_NOTE_VERDICT_LEAD_RE`
+  matched CLEAN although a note is built only on the FLAGGED arm: a mid-line verdict let a later `**Clean:**` line win
+  the scan, and a blocked pipeline's note read "the source and sink are fine". The lead is now FLAGGED-only, and the
+  body is rejoined from `splitlines()` on every path so U+2028/U+2029 stay line breaks. (2) 41aeaeac0 made advisor
+  decisions persist on unchanged turns, which falsified two retry promises written for the old rule: the
+  ABSENT-preflight flag notice said "on your next message" (the next unchanged turn now skips), and a message
+  rejection's `detail` said "Review the pipeline; … after your next pipeline change" beside "reword … then resend" —
+  it now carries `_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER`. Retry copy is tested against
+  `advisor_block_covers_unchanged_graph` itself rather than against strings, and the `test_no_tool_policy_segments.py`
+  notice lists are grouped by cause, not by whether the turn moved the graph. Lesson: a comment that justifies copy
+  with a persistence invariant ("such a block persists nothing") is a claim a later commit can falsify silently — pin
+  the copy to the mechanism.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-23 — the advisor blocker's `detail` stopped claiming the composer's reply was withheld; the dead withheld
   notices are deleted** (operator request after the reply-withholding self-review; branch `fix/withheld-notice-cleanup`)
   Since the 2026-09-22 ruling a blocked turn publishes the composer's reply, but `_advisor_signoff_blocked_wording`

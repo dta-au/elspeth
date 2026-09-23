@@ -158,17 +158,17 @@ _ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVIS
 # stays withheld); only the wording stops claiming a preflight ran.
 #
 # Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
-# unchanged graph whose prior state row carries a blocked fact, so a block
-# that PERSISTED is re-reviewed only after the next pipeline change — the
-# GREEN/RED notices say so. A fact persists only with a new state row, which
-# only a mutating turn writes, and this ABSENT shape is produced only on an
-# unchanged turn (``_reuse_or_recompute_runtime_preflight`` returns ``None``
-# solely when the version did not move). Such a block persists nothing, so
-# for this family the review genuinely does run again on the next message.
+# unchanged graph whose prior state row carries a GRAPH REJECTION, so that
+# block is re-reviewed only after the next pipeline change — every rendered-
+# flag notice says so, this ABSENT one included. The ABSENT shape arises only
+# on an unchanged turn, but since 41aeaeac0 an advisor decision is persisted
+# even when the graph did not move, so the next unchanged message meets the
+# skip. (Unrendered verdicts and message rejections are re-reviewed on the
+# next message; they carry their own notices.)
 _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
     "Composer completion is withheld. Pipeline readiness was not re-verified this turn; "
-    "validation and the advisory review run again on your next message."
+    "validation and the advisory review run again after your next pipeline change."
 )
 _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE)
 

@@ -710,6 +710,10 @@ files:
   src/elspeth/web/composer/_validation_probe.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
+  src/elspeth/web/composer/advisor_output.py:
+    dict[str, object]: 1
+  src/elspeth/web/composer/advisor_request.py:
+    dict[str, object]: 2
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 8
     dict[str, Any]: 3
@@ -719,8 +723,6 @@ files:
     dict[str, object]: 6
   src/elspeth/web/composer/authority_hashing.py:
     Mapping[str, Any]: 4
-  src/elspeth/web/composer/boot_probe.py:
-    dict[str, object]: 1
   src/elspeth/web/composer/capability_skill.py:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/control_messages.py:
@@ -834,7 +836,7 @@ files:
     Mapping[str, Any]: 23
     Mapping[str, object]: 1
     boundary: 1
-    dict[str, Any]: 39
+    dict[str, Any]: 38
   src/elspeth/web/composer/source_demand.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 1
@@ -1048,6 +1050,6 @@ totals:
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1143
-  dict[str, object]: 407
-  soft: 2744
+  dict[str, Any]: 1142
+  dict[str, object]: 409
+  soft: 2745
