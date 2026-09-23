@@ -280,6 +280,28 @@ provider, auth, or network failures do not block boot; they are logged as
 conformance unverified at boot), and the Composer is exercised again at
 first use.
 
+### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
+
+On routes that can carry it, the Composer can send its tool list with OpenAI
+*strict* tool contracts (`"strict": true`), so the provider constrains the
+model's tool arguments to each tool's schema. Where it does, a field the tool
+treats as optional is sent as required and nullable, and the model's `null`
+is read back as "omitted" before the tool's own argument rules run. Those
+rules still decide whether a call is accepted. The setting chooses which
+routes send `strict`:
+
+| Value | Behaviour |
+| --- | --- |
+| `preferred` (default) | Only OpenRouter routes send `strict` (an `openrouter/` model on OpenRouter's own host, or an OpenAI-shaped model pointed at `https://openrouter.ai/...`). Custom endpoints, hosted OpenAI and Azure OpenAI send the same tool bytes as before this setting existed. Anthropic-family models never send `strict` on any setting. |
+| `forward_to_endpoint` | As `preferred`, and also sends `strict` to custom OpenAI-compatible endpoints and OpenRouter proxies, to hosted OpenAI, and to Azure OpenAI when its api-version (`AZURE_API_VERSION`, else LiteLLM's default) is `preview`, `latest`, `v1` or dated `2024-08-01` or later. Use it only for gateways you have verified accept the `strict` key, or as the opt-in for hosted OpenAI and Azure. ELSPETH's own LLM compatibility gateway rejects any `strict` key, `false` included. |
+| `off` | No route sends `strict`. Every route sends the tool bytes it sent before this setting existed. This is the remedy if a route rejects `strict`. |
+
+The route is decided per Composer role from its model, its configured
+endpoint, and the base-URL environment variables LiteLLM reads
+(`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE`). If one of
+those variables holds a base URL that cannot be parsed, that route sends the
+tool bytes it sent before this setting existed, whatever the setting says.
+
 ### Pointing Composer at your own OpenAI-compatible endpoint
 
 Each Composer role can be pointed at any endpoint that speaks the OpenAI

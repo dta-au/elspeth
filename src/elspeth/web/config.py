@@ -35,6 +35,7 @@ from elspeth.web.auth.urls import (
 )
 from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
+from elspeth.web.composer.strict_transport import StrictToolsSetting
 from elspeth.web.plugin_policy.profiles import (
     AWSS3SourceProfileSettings,
     AWSTextractProfileSettings,
@@ -305,6 +306,14 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    composer_strict_tools: StrictToolsSetting = Field(
+        default="preferred",
+        description=(
+            "Which composer routes send OpenAI strict tool contracts. 'preferred' sends them only on OpenRouter "
+            "hosts; 'forward_to_endpoint' also sends them to custom endpoints, hosted OpenAI and Azure; 'off' "
+            "restores the pre-strict tool bytes on every route."
+        ),
+    )
     # JSON log rendering (elspeth-cd98ea9d82 Tier 3): CloudWatch Logs
     # Insights auto-parses JSON, so `filter request_id = "..."` becomes a
     # working field query. Off by default — local journald stays the

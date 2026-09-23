@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.sessions.protocol import GuidedOperationFence
@@ -1454,6 +1455,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_seed(self) -> int | None: ...
+
+    @property
+    def composer_strict_tools(self) -> StrictToolsSetting: ...
 
     @property
     def composer_discovery_reasoning_effort(self) -> str: ...
