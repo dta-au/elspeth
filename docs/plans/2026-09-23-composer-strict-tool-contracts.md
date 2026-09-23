@@ -811,6 +811,11 @@ which fails identically at `release/0.8.1`.
   with the logged total probe time, which is also the only measurement of `planner_tools` latency at candidate
   effort) and 5 (the baseline). All three need a dev deployment. The testcontainer selection is not run: no DDL and
   no epoch bump, only additive JSON content.
+- **Operator signing owed (S0a, not this round).** Against `release/0.8.1` the trust-tier corpus is +4 from S0a: two
+  R5 `isinstance` sites whose code moved (`audit.py` `dispatch_with_audit`, `service.py`
+  `_serialize_response_via_walker`) and the two matching stale allowlist fingerprints in
+  `config/cicd/enforce_tier_model/web.yaml`. Per-commit judge-bundle hygiene: the operator fires a sign-bundle
+  before merge; agents do not stage it.
 - **Awaiting John's rulings:**
   - `RejectionRecord.error_code` on ARG_ERROR rows is the failure class (its documented meaning: "first coded
     validation entry, else failure class"), so after S0 the non-object, envelope and required-path rows read
