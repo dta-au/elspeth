@@ -441,7 +441,7 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
     for row in trans_rows:
         if row.plugin_name is None:
             msg = (
-                f"Tier-1 corruption: {row.count} transform_errors row(s) reference "
+                f"Tier-1 corruption: transform_errors for {row.count} token(s) reference "
                 f"transform_id(s) with no matching node in nodes table "
                 f"for run_id={run_id!r}"
             )

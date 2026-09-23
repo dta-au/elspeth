@@ -1658,7 +1658,8 @@ class TestErrorAnalysisCorruptionGuard:
 
         _delete_node(db, "corrupt-ea", "xform")
 
-        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption.*transform_errors"):
+        # The guard's count is COUNT(DISTINCT token_id), so it names tokens, not rows.
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
             get_error_analysis(db, factory, "corrupt-ea")
 
     def test_clean_error_analysis_still_works(self) -> None:
