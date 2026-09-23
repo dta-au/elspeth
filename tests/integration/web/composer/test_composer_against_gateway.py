@@ -694,3 +694,99 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
     assert "api_base" not in captured
     assert "api_key" not in captured
+
+
+# ---------------------------------------------------------------------------
+# S1 strict tool contracts against the gateway (T11, characterization). The
+# gateway's inbound ``ChatFunctionDef`` is ``extra="forbid"`` and has no
+# ``strict`` field, so a tool that carries ``function.strict`` -- ``true`` or
+# an explicit ``false`` -- is a 400. This is why a custom endpoint resolves to
+# the ``none`` dialect under ``composer_strict_tools="preferred"`` (resolver
+# row 8): the gateway row below is the known negative that shows the
+# ``preferred`` list is the only one this gateway accepts. Adding ``strict``
+# to the gateway's contract is a separate gateway-contract decision.
+# ---------------------------------------------------------------------------
+
+
+def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (32 true, 10 false)."""
+    from elspeth.contracts.composer_llm_audit import ToolContractDialect
+    from elspeth.web.composer.service import composer_loop_tool_definitions
+
+    tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
+    assert len(tools) == (32 if flag else 10)
+    return tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [True, False], ids=["strict_true", "strict_false"])
+async def test_gateway_rejects_tools_that_carry_function_strict(gateway_base_url: str, flag: bool) -> None:
+    """Characterization: a tool list stamped ``strict: true`` or ``strict: false`` is a gateway 400.
+
+    The list is the compose loop's own ``openai_strict`` list, split by
+    stamp, so both explicit values are shown to be rejected, not only
+    ``true``. The gateway's 400 does not name the field, so the same tools
+    with only the ``strict`` key removed are then sent and must be
+    accepted: that pair is what ties the 400 to ``strict`` rather than to
+    anything else in the request.
+    """
+    import copy
+
+    import litellm
+    from litellm.exceptions import BadRequestError
+
+    stamped = _loop_tools_stamped(flag)
+    unstamped = copy.deepcopy(stamped)
+    for tool in unstamped:
+        del tool["function"]["strict"]
+
+    with pytest.raises(BadRequestError):
+        await litellm.acompletion(
+            model=_MODEL_ALIAS,
+            api_base=f"{gateway_base_url}/v1",
+            api_key=_INBOUND_BEARER,
+            messages=[{"role": "user", "content": "hello gateway"}],
+            tools=stamped,
+            num_retries=0,
+        )
+
+    response = await litellm.acompletion(
+        model=_MODEL_ALIAS,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+        messages=[{"role": "user", "content": "hello gateway"}],
+        tools=unstamped,
+        num_retries=0,
+    )
+    assert response.choices[0].message.content == "MOCK:hello gateway"
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: str) -> None:
+    """Characterization: under ``preferred`` the gateway route resolves to ``none`` and its list is accepted.
+
+    The route is the shipped default model with the gateway as its custom
+    endpoint (resolver row 8). Its list carries no ``strict`` key on any
+    tool, and the gateway answers it.
+    """
+    import litellm
+
+    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.strict_transport import StrictTransport, dialect_for, resolve_strict_transport
+
+    resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
+    assert resolution.transport is StrictTransport.NONE
+    tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
+    assert len(tools) == 42
+    assert [tool for tool in tools if "strict" in tool["function"]] == []
+
+    response = await litellm.acompletion(
+        model=_MODEL_ALIAS,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+        messages=[{"role": "user", "content": "hello gateway"}],
+        tools=tools,
+        num_retries=0,
+    )
+    assert response.choices[0].message.content == "MOCK:hello gateway"
+    assert response.choices[0].finish_reason == "stop"

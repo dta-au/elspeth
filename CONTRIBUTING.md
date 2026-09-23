@@ -126,6 +126,17 @@ gate that catches it lives in a test file you did not run.
 - "Zero findings" from a probe that has never been shown to find anything is
   a failure to look, not a result. Run a positive control alongside every
   negative measurement.
+- The wire fidelity matrix
+  (`tests/unit/web/composer/test_wire_fidelity_matrix.py`) pins what LiteLLM's
+  adapters transmit for the composer's tool lists on each route: whether the
+  `function.strict` stamp arrives, and which schema keywords an adapter
+  rewrites. A LiteLLM upgrade that turns a row red is fixed by re-measuring
+  that route and updating the row with the evidence, never by loosening the
+  row. The matrix asserts that LiteLLM loaded its local cost map, which holds
+  only because the root `tests/conftest.py` calls
+  `configure_litellm_pricing()` before anything imports LiteLLM; a bare
+  `import elspeth` does not load it, so keep that call ahead of any import
+  that could pull in LiteLLM.
 
 ### Gate: attribute contracts (dynamic-attribute sites)
 

@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 from hypothesis import Phase, Verbosity, settings
 
+from elspeth.core.litellm_policy import configure_litellm_pricing
+
 # Belt-and-suspenders fence: the Tier-1 guards in production code are
 # explicit ``raise AuditIntegrityError`` (survives ``python -O``), but a
 # handful of existing tests still use plain ``assert`` statements in
@@ -56,6 +58,20 @@ if sys.flags.optimize != 0:
 # ``_snapshot_registry_for_tests`` / ``_restore_registry_snapshot_for_tests``
 # helpers, which are pytest-gated (issue elspeth-cc511e7234 / C3).
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+
+# LiteLLM picks its model cost map once, at its first import: the remote
+# map unless LITELLM_LOCAL_MODEL_COST_MAP is already set. This call only
+# sets that default (an explicit operator or test value wins), and it must
+# run before anything in the process imports litellm, because a later call
+# cannot undo a remote load. Production calls it from core/llm_pricing.py
+# and plugins/llm/model_catalog.py, but a bare ``import elspeth`` loads
+# neither, so without this line a test module that imports litellm first
+# gets the remote map. None of the imports above loads litellm (measured,
+# S1 T11), so this is the first point in the process where it can run
+# without breaking the import block. The wire fidelity matrix
+# (tests/unit/web/composer/test_wire_fidelity_matrix.py) asserts the map is
+# local before any row runs.
+configure_litellm_pricing()
 
 pytest_plugins = ["tests.fixtures.azurite"]
 
