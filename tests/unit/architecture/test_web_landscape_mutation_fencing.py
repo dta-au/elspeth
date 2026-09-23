@@ -826,16 +826,17 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # The barrier arm (#1) writes the recorded arrival's barrier_key and held row; the
 # queue arm (#2) keeps the claimed row. Nothing departed.
 # K056 adds seven live call sites across replay verification, readiness,
-# provider lineage, and PDF call auditing; the complete-tree scanner measured
-# 286 after combining those sites with the K063 callers above.
-_EXPECTED_CALL_COUNT = 286
+# provider lineage, and PDF call auditing. The typed PluginContext PDF
+# record_row_call forwarder adds one more. The complete-tree scanner measured
+# 287 on the combined tree; five existing PluginContext calls also moved line.
+_EXPECTED_CALL_COUNT = 287
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
 # AGG-DISCARD: d82c45a5… -> 70bb43aa…, the two callers deleted above.
 # C4: 70bb43aa… -> 6c2ff337…, the caller exchange above.
 # R4: 6c2ff337… -> the value below, the one caller added above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "ba1bb6159620dcd69bc300169be0042769f42fc3a56beb783abd4f5c5bb36fb6"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "f3b9e7200930082a8d50b90a1f293d196b4f5371c28401806cb41a0f729b6442"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
