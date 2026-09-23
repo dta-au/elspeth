@@ -10,6 +10,7 @@ import pytest
 import structlog
 
 from elspeth.web.composer import service as service_module
+from elspeth.web.composer.audit import BufferingRecorder, ComposerLLMCallStatus
 from tests.unit.web.composer import test_advisor_checkpoint as checkpoint_fixtures
 from tests.unit.web.composer.test_advisor_checkpoint import (
     _AsyncRecorder,
@@ -30,6 +31,56 @@ def _reply(**changes: object) -> str:
     }
     fields.update(changes)
     return json.dumps(fields)
+
+
+@pytest.mark.asyncio
+async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service, simple_state, monkeypatch):
+    service = make_service()
+    replies = iter(
+        [
+            (_reply(verdict="CLEAN", steps=[], findings="", note=None), [object()]),
+            (_reply(), None),
+        ]
+    )
+
+    async def complete(*, on_provider_dispatch=None, **_kwargs):
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        content, tool_calls = next(replies)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10, total_tokens=20),
+            model="test-advisor",
+        )
+
+    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    recorder = BufferingRecorder()
+    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=recorder, **_fenced_session(service))
+
+    assert verdict.ok and verdict.blocking
+    assert [call.status for call in recorder.llm_calls] == [
+        ComposerLLMCallStatus.MALFORMED_RESPONSE,
+        ComposerLLMCallStatus.SUCCESS,
+    ]
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["provider_attempts"] == 2
+    assert record["verdict"] == "flagged"
+
+
+@pytest.mark.asyncio
+async def test_excessively_nested_json_exhausts_checkpoint_retry_as_malformed(make_service, simple_state):
+    service = make_service()
+    nested_json = "[" * 10_000 + "0" + "]" * 10_000
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=(nested_json, {}))
+
+    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=None, **_fenced_session(service))
+
+    assert not verdict.ok
+    assert verdict.failure_class == "malformed"
+    record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
+    assert record["verdict"] == "malformed"
+    assert record["provider_attempts"] == 2
+    assert record["first_attempt_schema_valid"] is False
 
 
 @pytest.mark.asyncio
@@ -175,7 +226,7 @@ async def test_empty_text_is_distinct_from_absent_text_at_real_call_boundary(
         if on_provider_dispatch is not None:
             on_provider_dispatch()
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=next(replies)))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=next(replies), tool_calls=None))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10, total_tokens=20),
             model="test-advisor",
         )
@@ -319,7 +370,7 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(m
         assert "on_provider_dispatch" not in kwargs
         content = "not JSON" if scenario == "blocked-retry" else _reply(verdict="CLEAN", steps=[], findings="", note=None)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10, total_tokens=20),
             model="test-advisor",
         )

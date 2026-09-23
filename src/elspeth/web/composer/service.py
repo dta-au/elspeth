@@ -8353,15 +8353,30 @@ class ComposerServiceImpl:
             # empty-guidance. Empty success would consume budget and tell
             # the composer LLM "you got advice" while no information was
             # actually produced.
-            try:
-                raw_content = response.choices[0].message.content
-            except (AttributeError, IndexError, KeyError, TypeError):
-                raise _MalformedLLMResponseError(
-                    "Advisor response carries no message content",
-                    provider_metadata=admit_llm_provider_metadata(
-                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
-                    ),
-                ) from None
+            if structured_output:
+                message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
+                    response, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
+                )
+                if tool_calls:
+                    raise _MalformedLLMResponseError(
+                        "Advisor returned tool calls with structured output",
+                        provider_metadata=response_metadata,
+                        text_received=type(message.content) is str,
+                    )
+                raw_content = message.content
+            else:
+                try:
+                    raw_content = response.choices[0].message.content
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    raise _MalformedLLMResponseError(
+                        "Advisor response carries no message content",
+                        provider_metadata=admit_llm_provider_metadata(
+                            response,
+                            choice=None,
+                            message=None,
+                            pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
+                        ),
+                    ) from None
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
             # emptiness probe let a non-string content object (list/dict/int

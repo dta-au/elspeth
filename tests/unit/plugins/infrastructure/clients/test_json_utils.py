@@ -173,6 +173,11 @@ class TestParseJsonStrict:
         assert error is not None
         assert "Duplicate" in error
 
+    def test_excessive_nesting_returns_parse_error(self) -> None:
+        parsed, error = parse_json_strict("[" * 10_000 + "0" + "]" * 10_000)
+        assert parsed is None
+        assert error is not None
+
     def test_unique_keys_still_accepted(self) -> None:
         """Normal JSON with unique keys still parses fine (regression check)."""
         parsed, error = parse_json_strict('{"a": 1, "b": 2, "c": 3}')

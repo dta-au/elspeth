@@ -464,6 +464,16 @@ async def test_advisor_probe_rejects_malformed_provider_response(
 
 
 @pytest.mark.asyncio
+async def test_advisor_probe_rejects_excessively_nested_json(monkeypatch: pytest.MonkeyPatch, settings_factory: Any) -> None:
+    async def complete(**_kwargs: object) -> object:
+        return _ok_response(content="[" * 10_000 + "0" + "]" * 10_000)
+
+    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    with pytest.raises(bp.ComposerBootConfigError, match="JSON/schema admission"):
+        await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content",
     [

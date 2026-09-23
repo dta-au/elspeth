@@ -93,7 +93,7 @@ def parse_json_strict(text: str) -> tuple[Any, str | None]:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_non_finite,
         )
-    except (JSONDecodeError, DuplicateJSONKeyError, ValueError) as e:
+    except (JSONDecodeError, DuplicateJSONKeyError, ValueError, RecursionError) as e:
         return None, str(e)
 
     return parsed, None

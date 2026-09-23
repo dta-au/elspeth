@@ -772,7 +772,7 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
         captured.append(kwargs)
         return SimpleNamespace(
             model="advisor-test-model",
-            choices=[SimpleNamespace(message=SimpleNamespace(content=_checkpoint_reply()))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=_checkpoint_reply(), tool_calls=None))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
         )
 
