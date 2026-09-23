@@ -1,5 +1,7 @@
 """Tests for shared template infrastructure."""
 
+from types import MappingProxyType
+
 import pytest
 from jinja2 import TemplateSyntaxError
 
@@ -8,6 +10,7 @@ from elspeth.plugins.infrastructure.templates import (
     TemplateError,
     create_sandboxed_environment,
 )
+from elspeth.testing import make_pipeline_row
 
 
 def test_create_sandboxed_environment_returns_immutable_sandbox():
@@ -15,6 +18,15 @@ def test_create_sandboxed_environment_returns_immutable_sandbox():
     template = env.from_string("Hello {{ name }}")
     result = template.render(name="world")
     assert result == "Hello world"
+
+
+def test_worker_preserves_nested_pipeline_rows_and_frozen_lookups():
+    env = create_sandboxed_environment()
+    template = env.from_string("{{ row.source_row.text }} {{ lookup.labels.primary }}")
+    row = {"source_row": make_pipeline_row({"text": "hello"})}
+    lookup = MappingProxyType({"labels": MappingProxyType({"primary": "world"})})
+
+    assert template.render(row=row, lookup=lookup) == "hello world"
 
 
 def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:

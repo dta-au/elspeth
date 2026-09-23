@@ -19,6 +19,7 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
@@ -65,6 +66,37 @@ class _RowTransport:
     contract: bytes
 
 
+def _pack_context_value(value: Any, *, depth: int = 0) -> Any:
+    """Detach owned frozen row carriers before the worker's pickle boundary."""
+    from elspeth.contracts.schema_contract import PipelineRow
+
+    if depth > 64:
+        raise TemplateError("Template context nesting exceeds 64 levels")
+    if type(value) is PipelineRow:
+        return _RowTransport(pickle.dumps(value.to_dict(), protocol=5), pickle.dumps(value.contract.to_checkpoint_format(), protocol=5))
+    if type(value) in (dict, MappingProxyType):
+        return {key: _pack_context_value(item, depth=depth + 1) for key, item in value.items()}
+    if type(value) is list:
+        return [_pack_context_value(item, depth=depth + 1) for item in value]
+    if type(value) is tuple:
+        return tuple(_pack_context_value(item, depth=depth + 1) for item in value)
+    return value
+
+
+def _restore_context_value(value: Any) -> Any:
+    if type(value) is _RowTransport:
+        from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+
+        return PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
+    if type(value) is dict:
+        return {key: _restore_context_value(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_restore_context_value(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_restore_context_value(item) for item in value)
+    return value
+
+
 def _check_template_source(source: str) -> None:
     try:
         validate_jinja_source(source)
@@ -84,15 +116,7 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
         context = pickle.loads(payload)
         if type(context) is not dict or any(type(key) is not str for key in context):
             raise TemplateError("Template worker received an invalid context")
-        if any(type(value) is _RowTransport for value in context.values()):
-            from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-
-            context = {
-                key: PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
-                if type(value) is _RowTransport
-                else value
-                for key, value in context.items()
-            }
+        context = _restore_context_value(context)
         environment = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
         template = environment.from_string(source)
         pieces: list[str] = []
@@ -170,14 +194,7 @@ class _BoundedTemplate:
         self._source = source
 
     def render(self, **context: Any) -> str:
-        from elspeth.contracts.schema_contract import PipelineRow
-
-        transport = {
-            key: _RowTransport(pickle.dumps(value.to_dict(), protocol=5), pickle.dumps(value.contract.to_checkpoint_format(), protocol=5))
-            if type(value) is PipelineRow
-            else value
-            for key, value in context.items()
-        }
+        transport = _pack_context_value(context)
         return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
 
 
