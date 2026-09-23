@@ -1608,6 +1608,11 @@ def _orchestrator_context(
         transforms.append(transform)
 
     # Build PipelineConfig
+    nonlive_plugin_validator = None
+    if config.run_mode is not RunMode.LIVE:
+        from elspeth.plugins.infrastructure.run_mode_capabilities import admit_nonlive_runtime_plugin_instances
+
+        nonlive_plugin_validator = admit_nonlive_runtime_plugin_instances
     pipeline_config = _PipelineConfig(
         sources=plugins.sources,
         transforms=transforms,
@@ -1618,6 +1623,7 @@ def _orchestrator_context(
         coalesce_settings=(list(config.coalesce) if config.coalesce else []),
         sink_effect_modes=effective_sink_effect_modes,
         sink_effect_admission=sink_effect_admission,
+        nonlive_plugin_validator=nonlive_plugin_validator,
         escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 

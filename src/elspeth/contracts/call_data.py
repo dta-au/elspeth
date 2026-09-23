@@ -406,7 +406,7 @@ class HTTPResponseTransport:
         for name, value in self.headers:
             _require_non_empty_str(name, "HTTPResponseTransport.header name")
             _require_str(value, "HTTPResponseTransport.header value")
-        if type(self.redirect_hops) is not tuple or any(not isinstance(hop, HTTPRedirectReplayHop) for hop in self.redirect_hops):
+        if type(self.redirect_hops) is not tuple or any(type(hop) is not HTTPRedirectReplayHop for hop in self.redirect_hops):
             raise TypeError("HTTPResponseTransport.redirect_hops must contain HTTPRedirectReplayHop values")
 
     def to_dict(self) -> dict[str, Any]:
@@ -463,7 +463,7 @@ class HTTPCallResponse:
         }
         if self.body_size is not None:
             d["body_size"] = self.body_size
-            if isinstance(self.body, (MappingProxyType, dict, tuple)):
+            if type(self.body) in (MappingProxyType, dict, tuple):
                 d["body"] = deep_thaw(self.body)
             else:
                 d["body"] = self.body

@@ -221,7 +221,7 @@ class PluginContext:
             raise TypeError("PluginContext missing required argument: 'config'")
 
         self.run_id = run_id
-        if not isinstance(run_mode, RunMode):
+        if type(run_mode) is not RunMode:
             raise TypeError("PluginContext.run_mode must be a RunMode")
         if run_mode is not RunMode.LIVE and not replay_from:
             raise ValueError("PluginContext.replay_from is required for replay/verify mode")

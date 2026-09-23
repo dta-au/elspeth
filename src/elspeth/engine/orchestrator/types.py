@@ -22,7 +22,7 @@ Keep the public config/result/counter surface here with minimal dependencies.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -46,7 +46,7 @@ from elspeth.engine.orchestrator.value_source_validation import ValueSourceFindi
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol
-    from elspeth.core.config import AggregationSettings, CoalesceSettings, GateSettings
+    from elspeth.core.config import AggregationSettings, CoalesceSettings, ElspethSettings, GateSettings
 
 __all__ = [
     "AggNodeEntry",
@@ -91,6 +91,7 @@ class PipelineConfig:
         transforms: Transform plugin instances (processed in DAG order)
         sinks: Dict of sink_name -> sink plugin instance
         config: Additional run configuration
+        nonlive_plugin_validator: Boundary-supplied exact-class admission for replay/verify
         gates: Config-driven gates (processed AFTER transforms, BEFORE sinks)
         aggregation_settings: Dict of node_id -> AggregationSettings
         coalesce_settings: Coalesce configurations for merging fork paths
@@ -105,6 +106,10 @@ class PipelineConfig:
     coalesce_settings: Sequence[CoalesceSettings] = field(default_factory=list)
     sink_effect_modes: Mapping[str, str] = field(default_factory=dict, repr=False)
     sink_effect_admission: object | None = field(default=None, repr=False, compare=False)
+    # The plugin assembly boundary supplies this validator. Engine never
+    # imports plugin infrastructure, and a direct non-live call without one
+    # fails closed before source or transform startup.
+    nonlive_plugin_validator: Callable[[PipelineConfig, ElspethSettings], None] | None = field(default=None, repr=False, compare=False)
     # Derived at graph build from the actual bound-region depth (+ margin);
     # never a bare constant (barrier-scopes spec §6.3). leader_drain iterates
     # the EOF barrier-flush fixpoint to exactly this bound.

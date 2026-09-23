@@ -22,16 +22,16 @@ def resolve_runtime_run_mode(config: PipelineConfig, settings: ElspethSettings |
     still authoritative: ignoring its mode would turn an intended replay into
     a live execution while recording ``run_mode=replay`` in settings_json.
     """
-    raw_mode = config.config.get("run_mode", RunMode.LIVE)
-    if not isinstance(raw_mode, str):
+    raw_mode = config.config["run_mode"] if "run_mode" in config.config else RunMode.LIVE.value
+    if type(raw_mode) not in (str, RunMode):
         raise OrchestrationInvariantError("PipelineConfig.run_mode must be a string")
     try:
         mode = RunMode(raw_mode)
     except ValueError as exc:
         raise OrchestrationInvariantError(f"Unsupported PipelineConfig.run_mode: {raw_mode!r}") from exc
 
-    replay_from = config.config.get("replay_from")
-    if replay_from is not None and (not isinstance(replay_from, str) or not replay_from.strip()):
+    replay_from = config.config["replay_from"] if "replay_from" in config.config else None
+    if replay_from is not None and (type(replay_from) is not str or not replay_from.strip()):
         raise OrchestrationInvariantError("PipelineConfig.replay_from must be a non-empty run ID when set")
     if mode is not RunMode.LIVE and replay_from is None:
         raise OrchestrationInvariantError(f"PipelineConfig.replay_from is required for {mode.value} mode")
@@ -43,9 +43,9 @@ def resolve_runtime_run_mode(config: PipelineConfig, settings: ElspethSettings |
         if settings is None:
             raise OrchestrationInvariantError("Replay/verify requires full ElspethSettings for admission")
         admit_nonlive_settings(settings)
-        from elspeth.plugins.infrastructure.run_mode_capabilities import admit_nonlive_runtime_plugin_instances
-
-        admit_nonlive_runtime_plugin_instances(config, settings)
+        if config.nonlive_plugin_validator is None:
+            raise OrchestrationInvariantError("Replay/verify requires a runtime plugin admission validator")
+        config.nonlive_plugin_validator(config, settings)
 
     return RuntimeRunMode(mode=mode, replay_from=replay_from)
 

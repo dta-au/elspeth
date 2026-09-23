@@ -717,7 +717,7 @@ class SinkExecutor:
             self._validate_sink_input(sink, rows, contracts=row_contracts)
         except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             self._complete_states_failed(
-                states=[(token, state) for token, state in all_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in all_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=self._build_boundary_error(exc=violation, phase="sink_write"),
             )
@@ -1055,12 +1055,12 @@ class SinkExecutor:
             # outcomes so no diverted token is left in progress.
             boundary_error = self._build_boundary_error(exc=violation, phase="failsink_write")
             self._complete_states_failed(
-                states=[(token, state) for token, state in failsink_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in failsink_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )
             self._complete_states_failed(
-                states=[(token, state) for token, _index, state in primary_divert_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, _index, state in primary_divert_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )

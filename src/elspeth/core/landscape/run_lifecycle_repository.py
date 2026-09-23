@@ -361,7 +361,7 @@ class RunLifecycleRepository:
             raise AuditIntegrityError(
                 "begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail."
             )
-        if not isinstance(run_mode, RunMode):
+        if type(run_mode) is not RunMode:
             raise AuditIntegrityError("run_mode must be a RunMode")
         if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
             raise AuditIntegrityError("live runs have no replay source; replay/verify runs require one")

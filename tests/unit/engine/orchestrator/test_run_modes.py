@@ -12,6 +12,7 @@ from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.engine.orchestrator.run_modes import admit_source_run, resolve_runtime_run_mode
 from elspeth.engine.orchestrator.types import PipelineConfig
+from elspeth.plugins.infrastructure.run_mode_capabilities import admit_nonlive_runtime_plugin_instances
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sources.csv_source import CSVSource
 
@@ -32,6 +33,7 @@ def _pipeline(settings: ElspethSettings) -> PipelineConfig:
         transforms=[],
         sinks={"output": cast(SinkProtocol, object.__new__(CSVSink))},
         config=resolve_config(settings),
+        nonlive_plugin_validator=admit_nonlive_runtime_plugin_instances,
     )
 
 
@@ -60,8 +62,21 @@ def test_nonlive_mode_rejects_programmatic_impostor_before_runtime_work() -> Non
         transforms=[],
         sinks={"output": cast(SinkProtocol, object.__new__(CSVSink))},
         config=resolve_config(settings),
+        nonlive_plugin_validator=admit_nonlive_runtime_plugin_instances,
     )
     with pytest.raises(OrchestrationInvariantError, match="not the reviewed built-in class"):
+        resolve_runtime_run_mode(pipeline, settings)
+
+
+def test_nonlive_mode_rejects_missing_plugin_validator_before_runtime_work() -> None:
+    settings = _settings(RunMode.REPLAY)
+    pipeline = PipelineConfig(
+        sources={"primary": cast(SourceProtocol, object.__new__(CSVSource))},
+        transforms=[],
+        sinks={"output": cast(SinkProtocol, object.__new__(CSVSink))},
+        config=resolve_config(settings),
+    )
+    with pytest.raises(OrchestrationInvariantError, match="runtime plugin admission validator"):
         resolve_runtime_run_mode(pipeline, settings)
 
 

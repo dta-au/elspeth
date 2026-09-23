@@ -50,7 +50,7 @@ class VirtualReplaySinkEffect:
         )
 
     def prepare_effect(self, request: SinkEffectPrepareRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectPlan:
-        if not isinstance(request.effect_input, SinkEffectPipelineMembersInput):
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise OrchestrationInvariantError("virtual replay sink requires pipeline members")
         members = request.effect_input.members
         target = f"virtual-replay://{ctx.run_id}/{self._sink_node_id}"
