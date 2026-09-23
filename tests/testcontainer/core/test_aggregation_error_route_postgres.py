@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from tests.helpers.postgres_target import postgres_test_target
@@ -30,6 +31,10 @@ from tests.integration.pipeline.test_row_type_violation_routing import (
 
 from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
+from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from elspeth.web.execution.failure_samples import load_top_failure_categories
 
 pytestmark = pytest.mark.testcontainer
 
@@ -86,5 +91,21 @@ def test_failed_batch_disposition_on_postgres(
         assert {row.destination for row in audit["transform_errors"]} == {on_error}
         [batch] = audit["batches"]
         assert batch.status == "failed"
+
+        # The counting readers (elspeth-5887fb7928 ruling: counts derive from
+        # terminal outcomes) join transform_errors to token_outcomes with a
+        # correlated latest-row subquery and a NOT EXISTS over node_states.
+        # Only here does that SQL reach PostgreSQL.
+        discard_summaries = load_discard_summaries_from_db(db, [result.run_id])
+        if on_error == "discard":
+            assert discard_summaries[result.run_id].transform_errors == 3
+        else:
+            assert discard_summaries == {}, "a routed batch failed but discarded nothing"
+        assert [summary.count for summary in load_top_failure_categories(db, result.run_id)] == [3]
+        factory = RecorderFactory(db)
+        run_summary: Any = get_run_summary(db, factory, result.run_id)
+        assert run_summary["errors"]["transform"] == 3
+        error_analysis: Any = get_error_analysis(db, factory, result.run_id)
+        assert error_analysis["transform_errors"]["total"] == 3
     finally:
         db.close()
