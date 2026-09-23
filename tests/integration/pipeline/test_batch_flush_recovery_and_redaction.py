@@ -284,3 +284,71 @@ def test_every_reader_counts_each_failed_token_once_after_a_crash_after_the_erro
     assert "error" not in error_analysis
     assert error_analysis["transform_errors"]["total"] == 3
     assert [group["count"] for group in error_analysis["transform_errors"]["by_transform"]] == [3]
+
+
+class _FailOnceThenSumBatchTransform(_SumBatchTransform):
+    """Returns a batch error on its first flush, then sums: a transient batch failure."""
+
+    name = "fail_once_then_sum"
+    determinism = Determinism.NON_DETERMINISTIC
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._failed_once = False
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list) and not self._failed_once:
+            self._failed_once = True
+            self.batch_calls += 1
+            return TransformResult.error({"reason": "batch_failed", "error": "transient"})
+        return super().process(row, ctx)
+
+
+@pytest.mark.timeout(180)
+def test_no_reader_counts_a_failed_attempt_whose_resumed_retry_delivered_the_batch(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failure and discard counts derive from terminal outcomes (elspeth-5887fb7928 ruling, review F3).
+
+    The first flush fails and its members' transform_errors rows commit, and
+    the process dies with the batch still EXECUTING. The resumed retry
+    succeeds, so all three rows are delivered as one sum. The rows stay as
+    attempt evidence, and no reader may report a failed or discarded token.
+
+    Only this window is pinned. The ruling for a batch whose FAILED verdict was
+    already recorded (the crash before the barrier handoff) is to complete
+    that verdict on resume, so there the resumed plugin never runs.
+    """
+    transform = _FailOnceThenSumBatchTransform()
+    env = _pipeline(tmp_path, transform, error_sink=None)
+    _crash_first(
+        ErrorAuditRepository,
+        "record_batch_transform_errors_leader",
+        ErrorAuditRepository.record_batch_transform_errors_leader,
+        1,
+        after=True,
+        monkeypatch=monkeypatch,
+    )
+    with pytest.raises(RuntimeError, match="injected crash"):
+        env["orchestrator"].run(env["config"], graph=env["graph"], payload_store=env["payload_store"])
+    run_id = _run_id(env["db"])
+    result = _resume(env, run_id)
+
+    db = env["db"]
+    audit = _audit(db, run_id)
+    assert result.status == RunStatus.COMPLETED
+    assert env["output_sink"].results == [{"value": 60, "count": 3}]
+    assert transform.batch_calls == 2
+    assert audit["transform_error_count"] == 3, "control: the failed attempt's rows are attempt evidence in the audit trail"
+    assert audit["batch_statuses"] == ["completed", "failed"]
+    assert {path for _t, path, _s in audit["terminals"]} == {"batch_consumed", "default_flow"}
+
+    assert load_discard_summaries_from_db(db, [run_id]) == {}
+    assert load_top_failure_categories(db, run_id) == []
+    factory = RecorderFactory(db)
+    run_summary = get_run_summary(db, factory, run_id)
+    assert "error" not in run_summary
+    assert run_summary["errors"]["transform"] == 0
+    error_analysis = get_error_analysis(db, factory, run_id)
+    assert "error" not in error_analysis
+    assert error_analysis["transform_errors"]["total"] == 0
+    assert error_analysis["transform_errors"]["by_transform"] == []
+    assert len(error_analysis["transform_errors"]["sample_details"]) == 3, "attempt evidence stays queryable"

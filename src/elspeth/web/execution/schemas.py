@@ -751,8 +751,10 @@ class DiscardSummary(_StrictResponse):
     """Counts routed to the virtual ``discard`` sink.
 
     The backing records live in four audit surfaces:
-    ``validation_errors.destination='discard'``,
-    ``transform_errors.destination='discard'``, terminal
+    ``validation_errors.destination='discard'``, tokens whose terminal
+    outcome is a transform-error failure decided by a
+    ``transform_errors.destination='discard'`` row (one per token, at the
+    deciding node, never a failed attempt a resumed retry superseded), terminal
     ``token_outcomes.path='gate_error_discarded'`` rows attributed to their
     failed gate node states, and terminal
     ``token_outcomes.sink_name='__discard__'`` rows for sink-write

@@ -42,6 +42,9 @@ class _QueryResult:
     def scalar(self) -> Any:
         return self._scalar_value
 
+    def scalar_one(self) -> Any:
+        return self._scalar_value
+
 
 class _Connection:
     def __init__(self, results: Sequence[_QueryResult]) -> None:
@@ -359,11 +362,25 @@ def _make_db_and_factory(run_exists: bool = True) -> tuple[_Db, SimpleNamespace]
     return _Db(), _factory(run_exists=run_exists)
 
 
-def _wire_conn(db: _Db, val_rows: list[Any], trans_rows: list[Any], sample_val: list[Any], sample_trans: list[Any]) -> None:
-    """Wire connection with 4 sequential execute().fetchall() calls."""
+def _wire_conn(
+    db: _Db,
+    val_rows: list[Any],
+    trans_rows: list[Any],
+    sample_val: list[Any],
+    sample_trans: list[Any],
+    *,
+    orphaned_token_count: int = 0,
+) -> None:
+    """Wire the connection with get_error_analysis's 5 sequential queries.
+
+    In order: validation groups, the orphaned-transform-error token count
+    (the corruption guard, over every row), the deciding-error groups by
+    plugin, and the two sample listings.
+    """
     db._connection = _Connection(
         [
             _QueryResult(fetchall_rows=val_rows),
+            _QueryResult(scalar_value=orphaned_token_count),
             _QueryResult(fetchall_rows=trans_rows),
             _QueryResult(fetchall_rows=sample_val),
             _QueryResult(fetchall_rows=sample_trans),
@@ -388,32 +405,29 @@ class TestErrorAnalysisRunNotFound:
 
 
 class TestErrorAnalysisCorruptionGuard:
-    """Tier 1 corruption guard: None plugin_name in transform errors raises AuditIntegrityError."""
+    """Tier 1 corruption guard: transform errors naming no node raise AuditIntegrityError."""
 
-    def test_none_plugin_name_raises_audit_integrity_error(self) -> None:
+    def test_orphaned_transform_errors_raise_audit_integrity_error(self) -> None:
         """Transform errors referencing a non-existent node must crash, not silently pass."""
         db, factory = _make_db_and_factory()
-        corrupt_row = _mock_row(plugin_name=None, count=3)
-        _wire_conn(db, val_rows=[], trans_rows=[corrupt_row], sample_val=[], sample_trans=[])
+        _wire_conn(db, val_rows=[], trans_rows=[], sample_val=[], sample_trans=[], orphaned_token_count=3)
 
         with pytest.raises(AuditIntegrityError, match="Tier-1 corruption"):
             get_error_analysis(db, factory, "run-corrupt")
 
     def test_corruption_guard_includes_count_and_run_id(self) -> None:
-        """Error message must include the orphan count and run_id for diagnostics."""
+        """Error message must include the orphaned token count and run_id for diagnostics."""
         db, factory = _make_db_and_factory()
-        corrupt_row = _mock_row(plugin_name=None, count=7)
-        _wire_conn(db, val_rows=[], trans_rows=[corrupt_row], sample_val=[], sample_trans=[])
+        _wire_conn(db, val_rows=[], trans_rows=[], sample_val=[], sample_trans=[], orphaned_token_count=7)
 
-        with pytest.raises(AuditIntegrityError, match=r"7 transform_errors row.*run_id='run-abc'"):
+        with pytest.raises(AuditIntegrityError, match=r"transform_errors for 7 token\(s\).*run_id='run-abc'"):
             get_error_analysis(db, factory, "run-abc")
 
     def test_corruption_guard_fires_even_with_valid_rows_present(self) -> None:
-        """A single None plugin_name row triggers the guard even alongside valid rows."""
+        """One orphaned token triggers the guard even alongside valid deciding groups."""
         db, factory = _make_db_and_factory()
         valid_row = _mock_row(plugin_name="good_transform", count=10)
-        corrupt_row = _mock_row(plugin_name=None, count=1)
-        _wire_conn(db, val_rows=[], trans_rows=[valid_row, corrupt_row], sample_val=[], sample_trans=[])
+        _wire_conn(db, val_rows=[], trans_rows=[valid_row], sample_val=[], sample_trans=[], orphaned_token_count=1)
 
         with pytest.raises(AuditIntegrityError):
             get_error_analysis(db, factory, "run-mixed")

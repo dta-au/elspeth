@@ -3,9 +3,11 @@
 The composer-side run row exposes a single ``error`` text field on the runs
 table.  Bare structural facts (``rows_succeeded=0``) tell the operator *that*
 the run failed but not *why*.  This module reads the audit DB after the run
-finishes and aggregates the most common ``transform_errors`` rows so the
-run-level error string can name the dominant failure modes without forcing
-the operator to drill into the per-run diagnostics panel.
+finishes and aggregates the most common failure categories over the tokens
+that terminally failed on a transform error (one deciding ``transform_errors``
+row per failed token), so the run-level error string can name the dominant
+failure modes without forcing the operator to drill into the per-run
+diagnostics panel.
 
 Egress discipline (elspeth-30416e67cc).  Everything this module returns is
 inlined into three surfaces that live OUTSIDE the audit boundary:
@@ -35,7 +37,7 @@ This module therefore never lets free text out.  Only three things leave it:
 * an error *category* proved to be a member of the closed
   :data:`~elspeth.contracts.errors.TransformErrorCategory` vocabulary, or one
   of two fixed sentinels when it is not; and
-* a count of distinct failed tokens.
+* a count of terminally failed tokens.
 
 Per-row free text is not dropped from the system — it stays behind the
 authenticated, ownership-verified ``GET /api/runs/{run_id}/diagnostics``,
@@ -62,7 +64,7 @@ from sqlalchemy import select
 
 from elspeth.contracts.errors import TransformErrorCategory
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import transform_errors_table
+from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 
 # The closed category vocabulary, derived from the Literal itself so the two
 # can never drift.  Membership in this set is what makes an emitted category
@@ -162,14 +164,18 @@ def load_top_failure_categories(
     message and sliced before collapsing, so a category spread across many
     distinct message texts lost to a category with one repeated text, and the
     reported counts were per-message rather than per-category.  A count here
-    means "distinct tokens in this run that failed at this node with this
-    category" — not ``transform_errors`` rows: the table has no
-    ``(token_id, transform_id)`` uniqueness, and an error write that committed
-    before a crash is written again by the resumed attempt, so one token can
-    own several rows.
+    means "tokens in this run whose terminal outcome is a failure decided by
+    a transform error at this node, with this category"
+    (:func:`~elspeth.core.landscape.terminal_transform_failures.deciding_transform_errors`).
+    It is not a count of ``transform_errors`` rows, which record ATTEMPTS: a
+    crash after the error write leaves the row behind, and the resumed attempt
+    may fail again (a second row for the same token) or succeed and deliver
+    the row (a row for a token that did not fail). A routed token (on_error
+    names a sink) failed and counts here; the category is the deciding
+    attempt's.
 
-    The scan is bounded by ``scan_cap`` ROWS (not tokens) to stay safe on runs
-    with very large error counts; accuracy on the long tail is not the goal —
+    The scan is bounded by ``scan_cap`` failed tokens to stay safe on runs with
+    very large error counts; accuracy on the long tail is not the goal —
     naming the dominant failure modes for the operator is.
     """
     if limit < 1:
@@ -177,21 +183,15 @@ def load_top_failure_categories(
     if scan_cap < limit:
         raise ValueError("scan_cap must be >= limit")
 
-    # Insertion-ordered set of (node, category, token): a token's rows from
-    # several attempts collapse to one key, and first-seen order keeps the
-    # most_common tie order what it was when rows were counted.
-    failed_tokens: dict[tuple[str, str, str], None] = {}
+    counter: Counter[tuple[str, str]] = Counter()
     with db.read_only_connection() as conn:
-        stmt = (
-            select(
-                transform_errors_table.c.transform_id,
-                transform_errors_table.c.token_id,
-                transform_errors_table.c.error_details_json,
-            )
-            .where(transform_errors_table.c.run_id == landscape_run_id)
-            .limit(scan_cap)
-        )
-        for transform_id, token_id, error_details_json in conn.execute(stmt):
+        # One row per terminally failed token: the error that decided it, at
+        # the node that decided it. An earlier attempt's row (a resumed
+        # attempt failed again, or succeeded and delivered the row) is attempt
+        # evidence and never counts.
+        deciding = deciding_transform_errors((landscape_run_id,)).subquery()
+        stmt = select(deciding.c.transform_id, deciding.c.error_details_json).limit(scan_cap)
+        for transform_id, error_details_json in conn.execute(stmt):
             # No NULL guard and no ``WHERE error_details_json IS NOT NULL``:
             # the column is nominally nullable (schema.py: ``Column(..., Text)``)
             # but its sole writer — ``DataFlowRepository.
@@ -205,9 +205,8 @@ def load_top_failure_categories(
             # Aggregate on the FULL node id — bounding is a rendering concern,
             # and truncating here would collapse two distinct long ids into
             # one bucket.
-            failed_tokens[(transform_id, _client_safe_category(details), token_id)] = None
+            counter[(transform_id, _client_safe_category(details))] += 1
 
-    counter = Counter((node_id, category) for node_id, category, _token_id in failed_tokens)
     return [
         ClientSafeFailureSummary(transform_id=tid, category=category, count=count) for (tid, category), count in counter.most_common(limit)
     ]

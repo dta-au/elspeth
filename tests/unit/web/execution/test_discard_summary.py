@@ -279,6 +279,14 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                 created_at=now,
             )
         )
+    # The transform stage counts tokens whose TERMINAL outcome is that discard.
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        error_hash="a" * 16,
+    )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
 
@@ -330,6 +338,13 @@ def test_discard_summary_counts_each_token_once_when_a_resumed_attempt_rewrote_i
                 member_token=member,
                 work_item=work_item,
             )
+        setup.data_flow.record_token_outcome_leader(
+            coordination_token=setup.coordination_token,
+            ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.QUARANTINED_AT_SOURCE,
+            error_hash="a" * 16,
+        )
     with setup.db.connection() as conn:
         rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == setup.run_id)).all()
     assert len(rows) == 6, "control: both attempts' rows are in the audit trail"

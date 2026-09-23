@@ -49,6 +49,9 @@ class _ScalarResultFake:
     def scalar(self) -> int | float | None:
         return self.value
 
+    def scalar_one(self) -> int | float | None:
+        return self.value
+
 
 @dataclass(frozen=True)
 class _RowsResultFake:

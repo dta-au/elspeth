@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -77,6 +78,12 @@ def _record_error(
     token_id: str,
     row_index: int,
 ) -> None:
+    """Record one token's transform error AND its terminal discard, as the per-row discard arm does.
+
+    The summary counts tokens whose terminal outcome is a failure a transform
+    error decided, so a fixture token without its terminal would model a run
+    that never finished that token.
+    """
     factory = RecorderFactory(db)
     _row, token = factory.data_flow.create_row_with_token(
         coordination_token=leader_coordination_token(factory, run_id),
@@ -97,6 +104,13 @@ def _record_error(
         row_data={"url": f"row-{row_index}"},
         error_details=error_details,  # type: ignore[arg-type]
         destination="discard",
+    )
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        error_hash="a" * 16,
     )
 
 
