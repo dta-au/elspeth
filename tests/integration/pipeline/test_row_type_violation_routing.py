@@ -1050,6 +1050,33 @@ _BATCH_PLUGIN_CASES = [
         _wrong_type("v", _NUMERIC, "str", 0),
         id="threshold_summary-str-value",
     ),
+    pytest.param(
+        "batch_classifier_metrics",
+        "json",
+        [{"id": 1, "a": 7331.625, "p": "cat"}, {"id": 2, "a": 2.25, "p": "dog"}, {"id": 3, "a": 3.125, "p": "cat"}],
+        {"actual_field": "a", "predicted_field": "p"},
+        "7331.625",
+        _wrong_type("a", "a scalar label (str, int, or bool)", "float", 0),
+        id="classifier_metrics-float-label",
+    ),
+    pytest.param(
+        "batch_top_k",
+        "json",
+        [{"id": 1, "v": ["SENTINEL-topk-81af"]}, {"id": 2, "v": ["b"]}, {"id": 3, "v": ["c"]}],
+        {"field": "v", "k": 2},
+        "SENTINEL-topk-81af",
+        _wrong_type("v", "a scalar top-k value (str, int, float, bool, or None)", "tuple", 0),
+        id="top_k-array-value",
+    ),
+    pytest.param(
+        "report_assemble",
+        "json",
+        [{"id": 1, "t": 734129}, {"id": 2, "t": 59317}, {"id": 3, "t": 60421}],
+        {"text_field": "t"},
+        "734129",
+        _wrong_type("t", "a string", "int", 0),
+        id="report_assemble-int-text",
+    ),
 ]
 
 

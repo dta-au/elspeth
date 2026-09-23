@@ -18,6 +18,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
     append_unique_bucket_value,
@@ -165,7 +166,7 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:43952c04e45c4fed"
+    source_file_hash: str | None = "sha256:2b1992759b5ddda9"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -279,11 +280,19 @@ class BatchClassifierMetrics(BaseTransform):
 
     @staticmethod
     def _validate_label(value: object, *, field_name: str, row_index: int) -> LabelValue:
+        # A wrong-typed label fails the WHOLE batch (elspeth-d5034647f0): a
+        # confusion matrix over the surviving pairs would publish metrics over a
+        # set the operator never specified. A None label is a different fact — a
+        # missing pair, skipped and reported by the caller before this check.
+        # Raised here and converted once in `process` because this helper
+        # returns a value, not a result. No coercion: a float label is rejected,
+        # never rounded or stringified into one of the accepted types.
         if type(value) not in (str, int, bool):
-            raise TypeError(
-                f"Field '{field_name}' must be a scalar label (str, int, or bool), "
-                f"got {type(value).__name__} in row {row_index}. "
-                f"This indicates an upstream validation bug - check source schema or prior transforms."
+            raise BatchRowTypeError(
+                field=field_name,
+                row_index=row_index,
+                expected="a scalar label (str, int, or bool)",
+                found=type(value).__name__,
             )
         return cast(LabelValue, value)
 
@@ -522,7 +531,17 @@ class BatchClassifierMetrics(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
 
-        pairs, missing_indices = self._collect_pairs(rows)
+        try:
+            pairs, missing_indices = self._collect_pairs(rows)
+        except BatchRowTypeError as exc:
+            # The batch fails with a value-free reason naming the field, the
+            # expected and found types and the batch row index. The structural
+            # caller owns disposition: an aggregation applies its declared
+            # on_error (AggregationExecutor._complete_error_flush records the
+            # reason; RowProcessor.handle_timeout_flush sends every buffered row
+            # to the on_error sink, or records it discarded), while a collector
+            # turns this into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         if not pairs:
             row_errors: list[RowErrorEntry] = [{"row_index": row_index, "reason": "missing_label"} for row_index in missing_indices]
             reason: TransformErrorReason = {

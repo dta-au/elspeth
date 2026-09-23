@@ -23,6 +23,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 
 type ReportAssembleRow = dict[str, object]
 
@@ -98,7 +99,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:15e6746e7fb9cdca"
+    source_file_hash: str | None = "sha256:30f9b5007c12a6fd"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -276,9 +277,21 @@ class ReportAssemble(BaseTransform):
         for index, row in enumerate(rows):
             value = row[self._text_field]
             if type(value) is not str:
-                raise TypeError(
-                    f"Field {self._text_field!r} must be a string, got {type(value).__name__} in batch row {index}. "
-                    "This indicates an upstream validation bug — check source schema or prior transforms."
+                # A wrongly-typed row fails the WHOLE batch (ruling
+                # elspeth-d5034647f0): no report is assembled over the other
+                # rows, and the returned error routes every buffered row to the
+                # aggregation's on_error. No coercion — a number is not text.
+                # There is deliberately no None branch: None fails the batch
+                # through this same guard (found "NoneType"). The reason names
+                # the field, the batch row index and the types, never the value.
+                return TransformResult.error(
+                    BatchRowTypeError(
+                        field=self._text_field,
+                        row_index=index,
+                        expected="a string",
+                        found=type(value).__name__,
+                    ).as_reason(),
+                    retryable=False,
                 )
             lines.append(value)
 
