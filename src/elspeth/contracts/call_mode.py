@@ -76,6 +76,19 @@ class RuntimeRunMode:
     replay_from: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivedCallRequestEvidence:
+    """Exact parent/index source request for a typed semantic comparison."""
+
+    source_call_id: str
+    request_data: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not self.source_call_id:
+            raise ValueError("ArchivedCallRequestEvidence.source_call_id is required")
+        object.__setattr__(self, "request_data", deep_freeze(self.request_data))
+
+
 class CallModeSession(Protocol):
     """Per-run call lookup and durable comparison authority.
 
@@ -121,6 +134,17 @@ class CallModeSession(Protocol):
         current_operation_id: str | None,
     ) -> SourceCallParentIdentity:
         """Bind current parent to one source parent before request matching."""
+        ...
+
+    def archived_call_request(
+        self,
+        *,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> ArchivedCallRequestEvidence:
+        """Read the exact source request without matching run-scoped fields."""
         ...
 
     def verify_call(
