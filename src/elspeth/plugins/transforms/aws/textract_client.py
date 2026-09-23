@@ -15,6 +15,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
@@ -31,6 +32,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.transforms.aws.replay_sdk import require_replay_fields
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit_protocols import CallRecorder
@@ -104,23 +106,26 @@ class TextractIdempotencyInvariantError(RuntimeError):
 
 
 def _replay_attempts(evidence: ReplayCallEvidence, *, operation: str) -> tuple[RawCallPayload, int]:
-    payload = evidence.response_data
-    if payload is None or payload.get("operation") != operation:
+    retained = require_replay_fields(
+        evidence.response_data, fields=("operation", "attempts", "status"), source_call_id=evidence.source_call_id
+    )
+    payload = retained.data
+    if payload["operation"] != operation:
         raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} lacks {operation} evidence")
-    attempts = payload.get("attempts")
+    attempts = payload["attempts"]
     if type(attempts) is not int or attempts < 1:
         raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has invalid attempts")
-    return RawCallPayload(payload), attempts
+    return retained, attempts
 
 
 def _replay_error(evidence: ReplayCallEvidence, *, operation: str, inline: bool = False) -> Exception:
     retained, _attempts = _replay_attempts(evidence, operation=operation)
     payload = retained.data
-    error = evidence.error_data
-    status = payload.get("status")
-    if evidence.status is not CallStatus.ERROR or error is None or error.get("type") != status:
+    error = require_replay_fields(evidence.error_data, fields=("type", "retryable"), source_call_id=evidence.source_call_id).data
+    status = payload["status"]
+    if evidence.status is not CallStatus.ERROR or error["type"] != status:
         raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has contradictory error evidence")
-    if status in ("malformed_response", "response_too_large") and error.get("retryable") is False:
+    if status in ("malformed_response", "response_too_large") and error["retryable"] is False:
         message = (
             "Amazon Textract response exceeded the maximum response size"
             if status == "response_too_large"
@@ -128,13 +133,13 @@ def _replay_error(evidence: ReplayCallEvidence, *, operation: str, inline: bool 
         )
         return TextractResponseError(message, category=status)
     if status == "idempotency_invariant" and not inline:
-        code = error.get("code")
-        retryable = error.get("retryable")
+        code = error["code"] if "code" in error else None
+        retryable = error["retryable"]
         if type(code) is str and code == _IDEMPOTENCY_MISMATCH_CODE and retryable is False:
             return TextractIdempotencyInvariantError()
     if status == "service_error":
-        code = error.get("code")
-        retryable = error.get("retryable")
+        code = error["code"] if "code" in error else None
+        retryable = error["retryable"]
         if type(code) is str and 1 <= len(code) <= _MAX_ERROR_CODE_LENGTH and type(retryable) is bool:
             return TextractServiceError(code=code, retryable=retryable)
     raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has incomplete error evidence")
@@ -424,9 +429,6 @@ class _TextractAuditedClient(AuditedClientBase):
             current_operation_id=self._operation_id,
             current_call_index=call_index,
         )
-        payload = evidence.response_data
-        if payload is None or payload.get("operation") != operation:
-            raise AuditIntegrityError(f"Textract replay call {evidence.source_call_id} has no complete {operation} response")
         return evidence
 
     def _admit_verify_call(
@@ -703,11 +705,12 @@ class TextractClient(_TextractAuditedClient):
                     lookup_request=lookup_request,
                 )
                 raise replay_error
-            job_id = payload.get("job_id")
+            payload = require_replay_fields(payload, fields=("job_id", "request_id_present"), source_call_id=replay.source_call_id).data
+            job_id = payload["job_id"]
             if (
                 replay.status is not CallStatus.SUCCESS
-                or payload.get("status") != "success"
-                or type(payload.get("request_id_present")) is not bool
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
                 or type(job_id) is not str
                 or not 1 <= len(job_id) <= _MAX_JOB_ID_LENGTH
                 or replay.error_data is not None
@@ -833,17 +836,21 @@ class TextractClient(_TextractAuditedClient):
                     operation="get_document_analysis",
                 )
                 raise replay_error
-            token = payload.get("next_token")
-            semantic = payload.get("semantic_response")
+            payload = require_replay_fields(
+                payload,
+                fields=("next_token", "semantic_response", "request_id_present", "next_token_present", "next_token_fingerprint"),
+                source_call_id=replay.source_call_id,
+            ).data
+            token = payload["next_token"]
+            semantic = payload["semantic_response"]
             if (
                 replay.status is not CallStatus.SUCCESS
-                or payload.get("status") != "success"
-                or type(payload.get("request_id_present")) is not bool
-                or "next_token" not in payload
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
                 or (token is not None and (type(token) is not str or not 1 <= len(token) <= _MAX_NEXT_TOKEN_LENGTH))
-                or payload.get("next_token_present") is not (token is not None)
-                or payload.get("next_token_fingerprint") != (None if token is None else _fingerprint(token))
-                or not isinstance(semantic, Mapping)
+                or payload["next_token_present"] is not (token is not None)
+                or payload["next_token_fingerprint"] != (None if token is None else _fingerprint(token))
+                or type(semantic) is not MappingProxyType
                 or replay.error_data is not None
             ):
                 raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} lacks complete result page")
@@ -1045,12 +1052,15 @@ class TextractInlineClient(_TextractAuditedClient):
                     operation="analyze_document",
                 )
                 raise replay_error
-            semantic = payload.get("semantic_response")
+            payload = require_replay_fields(
+                payload, fields=("semantic_response", "request_id_present"), source_call_id=replay.source_call_id
+            ).data
+            semantic = payload["semantic_response"]
             if (
                 replay.status is not CallStatus.SUCCESS
-                or payload.get("status") != "success"
-                or type(payload.get("request_id_present")) is not bool
-                or not isinstance(semantic, Mapping)
+                or payload["status"] != "success"
+                or type(payload["request_id_present"]) is not bool
+                or type(semantic) is not MappingProxyType
                 or replay.error_data is not None
             ):
                 raise AuditIntegrityError(f"Textract replay call {replay.source_call_id} lacks complete inline result")

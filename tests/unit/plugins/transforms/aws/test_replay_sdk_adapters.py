@@ -141,7 +141,7 @@ def test_textract_replay_rejects_legacy_page_without_raw_next_token() -> None:
         max_response_bytes=100_000,
         call_mode_session=session,
     )
-    with pytest.raises(AuditIntegrityError, match="complete result page"):
+    with pytest.raises(AuditIntegrityError, match="incomplete response evidence"):
         client.get_document_analysis(job_id="job-1", next_token=None)
     assert recorder.calls == []
 
@@ -286,7 +286,7 @@ def test_guardrail_replay_refuses_legacy_response_missing_request_id() -> None:
         sdk_client=ReplayOnlySDK(),
         call_mode_session=session,
     )
-    with pytest.raises(AuditIntegrityError, match="incomplete decision"):
+    with pytest.raises(AuditIntegrityError, match="incomplete response evidence"):
         client.apply_guardrail(text="private text", source="INPUT", required_filters=("PROMPT_ATTACK",))
     assert recorder.calls == []
 

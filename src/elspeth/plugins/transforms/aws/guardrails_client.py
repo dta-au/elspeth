@@ -24,7 +24,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
-from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, require_replay_fields
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit_protocols import CallRecorder
@@ -607,38 +607,46 @@ class BedrockGuardrailsClient(AuditedClientBase):
                 current_operation_id=self._operation_id,
                 current_call_index=call_index,
             )
-            payload = evidence.response_data
-            if payload is None or payload.get("operation") != "apply_guardrail":
+            payload = require_replay_fields(
+                evidence.response_data,
+                fields=("operation", "attempts", "status"),
+                source_call_id=evidence.source_call_id,
+            ).data
+            if payload["operation"] != "apply_guardrail":
                 raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has no complete response")
-            attempts = payload.get("attempts")
+            attempts = payload["attempts"]
             if type(attempts) is not int or not 1 <= attempts <= 11:
                 raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid attempts")
             replay_error: Exception | None = None
             decision: GuardrailDecision | None = None
             if evidence.status is CallStatus.SUCCESS:
-                detected = payload.get("detected")
-                intervened = payload.get("intervened")
-                filters = payload.get("matched_filters")
-                request_id = payload.get("request_id")
+                payload = require_replay_fields(
+                    payload,
+                    fields=("detected", "intervened", "matched_filters", "request_id", "request_id_present", "usage"),
+                    source_call_id=evidence.source_call_id,
+                ).data
+                detected = payload["detected"]
+                intervened = payload["intervened"]
+                filters = payload["matched_filters"]
+                request_id = payload["request_id"]
                 if (
-                    payload.get("status") not in ("safe", "blocked")
+                    payload["status"] not in ("safe", "blocked")
                     or type(detected) is not bool
                     or type(intervened) is not bool
-                    or not isinstance(filters, tuple | list)
+                    or type(filters) is not tuple
                     or any(type(item) is not str for item in filters)
                     or not set(filters) <= set(required_filters)
                     or len(set(filters)) != len(filters)
                     or bool(filters) is not detected
                     or (intervened and not detected)
-                    or "request_id" not in payload
                     or (request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256))
-                    or payload.get("request_id_present") is not (request_id is not None)
-                    or payload.get("status") != ("blocked" if detected else "safe")
+                    or payload["request_id_present"] is not (request_id is not None)
+                    or payload["status"] != ("blocked" if detected else "safe")
                     or evidence.error_data is not None
                 ):
                     raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has incomplete decision")
                 try:
-                    usage = _parse_usage(payload.get("usage"))
+                    usage = _parse_usage(payload["usage"])
                 except GuardrailResponseError as error:
                     raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid usage") from error
                 decision = GuardrailDecision(
@@ -649,14 +657,23 @@ class BedrockGuardrailsClient(AuditedClientBase):
                     request_id=request_id,
                 )
             elif evidence.status is CallStatus.ERROR:
-                error_data = evidence.error_data
-                status = payload.get("status")
-                if error_data is None or error_data.get("type") != status or type(error_data.get("retryable")) is not bool:
+                error_data = require_replay_fields(
+                    evidence.error_data,
+                    fields=("type", "retryable"),
+                    source_call_id=evidence.source_call_id,
+                ).data
+                status = payload["status"]
+                if error_data["type"] != status or type(error_data["retryable"]) is not bool:
                     raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has contradictory error")
                 if status == "partial_coverage" and error_data["retryable"] is False:
-                    key = payload.get("coverage_key")
-                    guarded = payload.get("guarded_units")
-                    total = payload.get("total_units")
+                    payload = require_replay_fields(
+                        payload,
+                        fields=("coverage_key", "guarded_units", "total_units"),
+                        source_call_id=evidence.source_call_id,
+                    ).data
+                    key = payload["coverage_key"]
+                    guarded = payload["guarded_units"]
+                    total = payload["total_units"]
                     if key in ("textCharacters", "images") and type(guarded) is int and type(total) is int and 0 <= guarded < total:
                         replay_error = GuardrailPartialCoverageError(coverage_key=key, guarded=guarded, total=total)
                 elif status == "malformed_response" and error_data["retryable"] is False:

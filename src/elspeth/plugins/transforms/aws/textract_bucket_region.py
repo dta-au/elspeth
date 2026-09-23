@@ -22,6 +22,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.transforms.aws.replay_sdk import require_replay_fields
 from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
 
 if TYPE_CHECKING:
@@ -338,19 +339,28 @@ class HeadBucketClient(AuditedClientBase):
                 current_operation_id=self._operation_id,
                 current_call_index=call_index,
             )
-            retained = replay_evidence.response_data
-            if retained is None or retained.get("operation") != "head_bucket_region":
+            retained = require_replay_fields(
+                replay_evidence.response_data,
+                fields=("operation", "attempts", "http_status", "status"),
+                source_call_id=replay_evidence.source_call_id,
+            ).data
+            if retained["operation"] != "head_bucket_region":
                 raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has no region proof")
-            attempts = retained.get("attempts")
-            replayed_http_status = retained.get("http_status")
+            attempts = retained["attempts"]
+            replayed_http_status = retained["http_status"]
             if type(attempts) is not int or attempts < 1 or (replayed_http_status is not None and type(replayed_http_status) is not int):
                 raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has invalid response metadata")
             if replay_evidence.status is CallStatus.SUCCESS:
-                region = retained.get("observed_region")
-                source = retained.get("proof_source")
-                code = retained.get("provider_code")
+                retained = require_replay_fields(
+                    retained,
+                    fields=("observed_region", "proof_source", "provider_code"),
+                    source_call_id=replay_evidence.source_call_id,
+                ).data
+                region = retained["observed_region"]
+                source = retained["proof_source"]
+                code = retained["provider_code"]
                 if (
-                    retained.get("status") != "verified"
+                    retained["status"] != "verified"
                     or type(region) is not str
                     or not is_supported_textract_region(region)
                     or source not in ("response_field", "response_header", "error_header")
@@ -362,13 +372,16 @@ class HeadBucketClient(AuditedClientBase):
                 replayed_proof = BucketRegionProof(region=region, source=source, http_status=replayed_http_status, provider_code=code)
                 replayed_error = None
             elif replay_evidence.status is CallStatus.ERROR:
-                error = replay_evidence.error_data
+                error = require_replay_fields(
+                    replay_evidence.error_data,
+                    fields=("type", "code", "retryable"),
+                    source_call_id=replay_evidence.source_call_id,
+                ).data
                 if (
-                    retained.get("status") != "unverified"
-                    or error is None
-                    or error.get("type") != "bucket_region_unverified"
-                    or type(error.get("code")) is not str
-                    or type(error.get("retryable")) is not bool
+                    retained["status"] != "unverified"
+                    or error["type"] != "bucket_region_unverified"
+                    or type(error["code"]) is not str
+                    or type(error["retryable"]) is not bool
                 ):
                     raise AuditIntegrityError(f"S3 replay call {replay_evidence.source_call_id} has incomplete region failure")
                 replayed_proof = None

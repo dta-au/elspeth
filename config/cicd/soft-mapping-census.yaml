@@ -454,6 +454,8 @@ files:
   src/elspeth/plugins/transforms/aws/guardrails_client.py:
     Mapping[str, object]: 1
     dict[str, object]: 1
+  src/elspeth/plugins/transforms/aws/replay_sdk.py:
+    Mapping[str, Any]: 1
   src/elspeth/plugins/transforms/aws/textract_bucket_region.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 1
@@ -1061,10 +1063,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 914
+  Mapping[str, Any]: 915
   Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 65
   dict[str, Any]: 1152
   dict[str, object]: 410
-  soft: 2799
+  soft: 2800

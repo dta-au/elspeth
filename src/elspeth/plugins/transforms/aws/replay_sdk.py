@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from threading import Lock
 from typing import Any
 
+from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.errors import AuditIntegrityError
+
+
+def require_replay_fields(
+    retained: Mapping[str, Any] | None,
+    *,
+    fields: tuple[str, ...],
+    source_call_id: str,
+) -> RawCallPayload:
+    """Turn archived call data into an owned payload with explicit required keys."""
+    if retained is None or any(field not in retained for field in fields):
+        raise AuditIntegrityError(f"Replay call {source_call_id} has incomplete response evidence")
+    return RawCallPayload(retained)
 
 
 class ReplayOnlySDK:
