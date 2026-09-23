@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import respx
@@ -256,3 +257,101 @@ def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: P
     assert corrupt.exit_code != 0, corrupt.output
     assert "payload" in corrupt.output.lower() or "integrity" in corrupt.output.lower()
     assert sink_path.read_bytes() == artifact
+
+
+def test_cli_llm_replay_skips_sdk_and_verify_persists_mismatch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (tmp_path / "input.csv").write_text("value\n7\n")
+    settings["transforms"] = [
+        {
+            "name": "answer",
+            "plugin": "llm",
+            "input": "source_out",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {
+                "provider": "azure",
+                "deployment_name": "gpt-4o",
+                "endpoint": "https://test.openai.azure.com",
+                "api_key": "test-key",
+                "prompt_template": "Answer the question.",
+                "temperature": 0.0,
+                "schema": {"mode": "observed"},
+            },
+        }
+    ]
+    settings_path = tmp_path / "settings.yaml"
+    sink_path = tmp_path / "output.json"
+    runner = CliRunner()
+
+    def invoke() -> object:
+        settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+        return runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    def provider_response(content: str) -> SimpleNamespace:
+        response = {"model": "gpt-4o", "choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content))],
+            model="gpt-4o",
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+            model_dump=lambda *_args, **_kwargs: response,
+        )
+
+    from openai import AzureOpenAI
+
+    client = MagicMock(spec=AzureOpenAI)
+    client.chat.completions.create.return_value = provider_response("original answer")
+    with patch("openai.AzureOpenAI", return_value=client) as sdk:
+        live = invoke()
+    assert live.exit_code == 0, live.output
+    assert sdk.call_count == 1
+    assert client.chat.completions.create.call_count >= 1
+    live_run_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    artifact = sink_path.read_bytes()
+
+    settings["run_mode"] = "replay"
+    settings["replay_from"] = live_run_id
+    with (
+        patch("openai.AzureOpenAI", side_effect=AssertionError("replay constructed Azure SDK")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("replay published sink")),
+    ):
+        replay = invoke()
+    assert replay.exit_code == 0, replay.output
+    assert sink_path.read_bytes() == artifact
+
+    settings["run_mode"] = "verify"
+    client = MagicMock(spec=AzureOpenAI)
+    client.chat.completions.create.return_value = provider_response("original answer")
+    with patch("openai.AzureOpenAI", return_value=client):
+        verify = invoke()
+    assert verify.exit_code == 0, verify.output
+    verify_run_id = json.loads(verify.output.strip().splitlines()[-1])["run_id"]
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        decisions = (
+            connection.execute(
+                select(call_verifications_table.c.is_match).where(call_verifications_table.c.current_run_id == verify_run_id)
+            )
+            .scalars()
+            .all()
+        )
+        assert decisions and all(decisions)
+        before = set(connection.execute(select(runs_table.c.run_id)).scalars())
+
+    client = MagicMock(spec=AzureOpenAI)
+    client.chat.completions.create.return_value = provider_response("changed answer")
+    with (
+        patch("openai.AzureOpenAI", return_value=client),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("verify published sink")),
+    ):
+        mismatch = invoke()
+    assert mismatch.exit_code != 0, mismatch.output
+    assert sink_path.read_bytes() == artifact
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        after = set(connection.execute(select(runs_table.c.run_id)).scalars())
+        (failed_run_id,) = after - before
+        decisions = connection.execute(
+            select(call_verifications_table.c.is_match, call_verifications_table.c.source_call_id).where(
+                call_verifications_table.c.current_run_id == failed_run_id
+            )
+        ).all()
+        assert any(is_match is False and source_call_id is not None for is_match, source_call_id in decisions)
