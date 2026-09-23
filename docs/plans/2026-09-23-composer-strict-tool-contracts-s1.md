@@ -1042,6 +1042,10 @@ Rules for every task:
   `tests/integration/web/composer/test_freeform_pipeline_planner.py` and `tests/integration/web/composer/parity/`.
   - The planner request byte budget: measure `request_size` (`:3896`) for a default freeform request on
     `OPENAI_STRICT` against `budget_policy.max_request_bytes`, and record the headroom here.
+    **Measured at T7 (M, `$L/t7-request-bytes.log`):** the first request of an information-aware FREEFORM run
+    (16 tools, `build_system_prompt(None)`) is 198,905 B on `NONE` and 199,192 B on `OPENAI_STRICT` (+287 B),
+    against the default `composer_planner_max_request_bytes` of 2,097,152 B: 1,897,960 B of headroom on
+    `OPENAI_STRICT`.
   - `tool_bytes.py` still shows all four base hashes (it now passes `ToolContractDialect.NONE` to the planner
     builder).
 - **Commit:** `feat(planner): per-route tool-contract dialect, hoisted endpoint choice, discovery wire decode`.

@@ -29,6 +29,7 @@ from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import planner_authoring_aids
@@ -2758,7 +2759,9 @@ class TestSession891b7b1eLiveReviewEdits:
 
         for surface in PlannerSurface:
             policy = PlannerDiscoveryPolicy.initial(surface)
-            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
+            advertised_names = {
+                definition["function"]["name"] for definition in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)
+            }
             assert named_tools <= advertised_names
 
         assert "get_pipeline_state" not in proposal_rule

@@ -796,7 +796,7 @@ files:
   src/elspeth/web/composer/pipeline_custody.py:
     Mapping[str, Any]: 6
   src/elspeth/web/composer/pipeline_planner.py:
-    Mapping[str, Any]: 40
+    Mapping[str, Any]: 41
     dict[str, Any]: 21
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
@@ -1056,10 +1056,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 889
+  Mapping[str, Any]: 890
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1174
   dict[str, object]: 409
-  soft: 2791
+  soft: 2792

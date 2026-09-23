@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.guided.planning as guided_planning
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
@@ -1915,6 +1916,8 @@ async def test_guided_planner_request_carries_evidence_and_manifest_without_priv
                 api_retry_base_seconds=0.0,
                 discovery_reasoning_effort="none",
                 candidate_reasoning_effort="none",
+                tool_contract_dialect=ToolContractDialect.NONE,
+                escape_hatch_tool_contract_dialect=ToolContractDialect.NONE,
             ),
             rendered_skill=f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
             repair_budget=1,

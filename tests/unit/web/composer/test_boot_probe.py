@@ -83,7 +83,7 @@ def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: A
 def test_planner_request_sends_the_planner_tool_list_with_the_planner_token_cap(settings_factory: Any) -> None:
     settings = settings_factory(composer_model="gpt-5.5", composer_planner_max_completion_tokens=9000)
     request = _request(settings, "planner_tools")
-    planner_tools = planner_tool_definitions()
+    planner_tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
 
     assert request.to_litellm_kwargs()["tools"] == planner_tools
     assert request.to_litellm_kwargs()["max_tokens"] == 9000
@@ -131,7 +131,7 @@ def test_planner_request_is_the_planner_builder_output(settings_factory: Any) ->
     expected = build_planner_request_kwargs(
         model="openrouter/deepseek/deepseek-v4.1-flash",
         messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=planner_tool_definitions(),
+        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
         max_completion_tokens=settings.composer_planner_max_completion_tokens,
         temperature=0.3,
         seed=11,
@@ -178,7 +178,7 @@ def test_anthropic_routes_mirror_the_production_cache_markers(settings_factory: 
         [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(ToolContractDialect.NONE), mark_history_tail=True
     )
     planner_messages, planner_tools = apply_anthropic_cache_markers(
-        [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions()
+        [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions(dialect=ToolContractDialect.NONE)
     )
 
     assert "cache_control" in loop.to_litellm_kwargs()["tools"][-1]
@@ -292,7 +292,7 @@ async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.M
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("surface", "tool_count"),
-    [("loop_tools", 42), ("planner_tools", len(planner_tool_definitions())), ("advisor", 0)],
+    [("loop_tools", 42), ("planner_tools", len(planner_tool_definitions(dialect=ToolContractDialect.NONE))), ("advisor", 0)],
 )
 async def test_bad_request_names_the_surface_and_owned_request_facts(
     monkeypatch: pytest.MonkeyPatch, settings_factory: Any, surface: str, tool_count: int

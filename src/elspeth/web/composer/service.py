@@ -2470,7 +2470,10 @@ class ComposerServiceImpl:
         # single resolution point: the loop builds the list it sends and the
         # dialect decode reads from this one value. Every route stays on
         # ``none`` (today's bytes) until the strict transport resolution lands.
+        # The pipeline planner's ordinary turns share this value; its
+        # escape-hatch (advisor) route has its own.
         self._planner_dialect = ToolContractDialect.NONE
+        self._hatch_dialect = ToolContractDialect.NONE
         # Boot advisory only — the litellm registry has known gaps (see
         # elspeth.web.composer.reasoning), so a False here is a log line for
         # operators, never a gate.
@@ -4419,6 +4422,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
@@ -4831,6 +4836,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,
@@ -5338,6 +5345,8 @@ class ComposerServiceImpl:
                     api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                     discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
                     candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    tool_contract_dialect=self._planner_dialect,
+                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
                     pricing_model=self._settings.composer_pricing_model,
                     escape_hatch_model=self._settings.composer_advisor_model,
                     escape_hatch_provider=self._advisor_provider,

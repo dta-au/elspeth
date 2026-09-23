@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
@@ -51,7 +52,7 @@ def _manifest(
         surface=surface,
         profile=profile,
         messages=_messages(rendered_skill, sensitive_user_text=sensitive_user_text),
-        tools=planner_tool_definitions(),
+        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
         canonical_schema=canonical_set_pipeline_schema(),
     )
 
@@ -293,7 +294,7 @@ def test_capability_field_extraction_rejects_missing_required_schema_node() -> N
 def test_manifest_rejects_schema_and_terminal_updated_without_documented_field() -> None:
     schema = canonical_set_pipeline_schema()
     schema["properties"]["future_topology"] = {"type": "object"}
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     tools[-1]["function"]["parameters"]["properties"]["pipeline"] = schema
 
     with pytest.raises(AuditIntegrityError, match="documented capability fields drifted"):
@@ -324,7 +325,7 @@ def test_documented_field_inventory_fails_closed_on_drift(mutation: str) -> None
 
 
 def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     manifest = _manifest(build_system_prompt(None), surface=PlannerSurface.FREEFORM, profile="ordinary")
 
     assert [tool["function"]["name"] for tool in tools] == [*PLANNER_DISCOVERY_TOOL_NAMES, "emit_pipeline_proposal"]
@@ -333,7 +334,7 @@ def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
 
 
 def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     retained = {"get_plugin_assistance", "get_plugin_schema", "list_models"}
     subset = [tool for tool in tools if tool["function"]["name"] in retained or tool is tools[-1]]
 
@@ -356,7 +357,7 @@ def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None
 
 @pytest.mark.parametrize("mutation", ("reordered", "unknown"))
 def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     subset = [tool for tool in tools if tool["function"]["name"] in {"get_plugin_assistance", "get_plugin_schema"} or tool is tools[-1]]
     if mutation == "reordered":
         subset[0], subset[1] = subset[1], subset[0]
@@ -401,14 +402,14 @@ def test_every_runtime_surface_builds_the_same_capability_manifest_core(
     assert manifest.profile == profile
     assert manifest.capability_core_hash == hashlib.sha256(load_pipeline_capability_core().encode("utf-8")).hexdigest()
     assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
-    assert manifest.effective_tool_hash == stable_hash(planner_tool_definitions())
+    assert manifest.effective_tool_hash == stable_hash(planner_tool_definitions(dialect=ToolContractDialect.NONE))
 
 
 @pytest.mark.parametrize("mutation", ("missing_core", "duplicate_core", "reordered_tools", "mutated_schema"))
 def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> None:
     core = load_pipeline_capability_core()
     messages = _messages(build_system_prompt(None))
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     if mutation == "missing_core":
         messages[0]["content"] = "interaction only"
     elif mutation == "duplicate_core":
@@ -437,13 +438,13 @@ def test_manifest_rejects_message_missing_required_role() -> None:
             surface=PlannerSurface.FREEFORM,
             profile="ordinary",
             messages=messages,
-            tools=planner_tool_definitions(),
+            tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
             canonical_schema=canonical_set_pipeline_schema(),
         )
 
 
 def test_manifest_rejects_terminal_missing_required_parameters() -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     del tools[-1]["function"]["parameters"]
 
     with pytest.raises(KeyError, match="parameters"):

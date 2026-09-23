@@ -67,6 +67,7 @@ from typing import Any
 import pytest
 
 import elspeth.web.composer.pipeline_planner as planner_module
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.capability_skill import (
@@ -195,7 +196,7 @@ class TestManifestSchemaIdentityGate:
         builds a manifest whose recorded ``canonical_schema_hash`` is that shared
         digest — no ``AuditIntegrityError``.
         """
-        tools = planner_tool_definitions()
+        tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
         advertised = _advertised_pipeline(tools)
         assert stable_hash(advertised) == stable_hash(canonical_set_pipeline_schema())
 
@@ -213,7 +214,7 @@ class TestManifestSchemaIdentityGate:
         exact message proves it is the schema-identity compare that fired, not the
         tool-identity or field-contract check.
         """
-        tools = planner_tool_definitions()
+        tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
         advertised = _advertised_pipeline(tools)
 
         control.narrow(advertised)  # asserts the named field is present, then narrows it
@@ -261,8 +262,8 @@ async def test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_
     """
     real_terminal = planner_module.planner_terminal_tool_definition
 
-    def _narrowed_terminal(terminal_contract: Any = None) -> dict[str, Any]:
-        definition = real_terminal(terminal_contract)
+    def _narrowed_terminal(terminal_contract: Any = None, *, dialect: ToolContractDialect) -> dict[str, Any]:
+        definition = real_terminal(terminal_contract, dialect=dialect)
         _remove_fork_to(definition["function"]["parameters"]["properties"]["pipeline"])
         return definition
 

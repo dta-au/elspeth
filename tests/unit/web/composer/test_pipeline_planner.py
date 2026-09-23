@@ -28,7 +28,7 @@ from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
     ComposerPlannerAttemptOutcome,
@@ -641,6 +641,8 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "api_retry_base_seconds": 0.0,
         "discovery_reasoning_effort": "none",
         "candidate_reasoning_effort": "none",
+        "tool_contract_dialect": ToolContractDialect.NONE,
+        "escape_hatch_tool_contract_dialect": ToolContractDialect.NONE,
     }
     values.update(overrides)
     return PlannerModelConfig(**values)  # type: ignore[arg-type]
@@ -820,7 +822,7 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     }
     assert set(PLANNER_DISCOVERY_TOOL_NAMES) == expected_discovery
 
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery
     terminal = tools[-1]["function"]
     assert terminal["name"] == "emit_pipeline_proposal"
@@ -2104,7 +2106,7 @@ def test_restricted_policy_never_advertises_unavailable_preview_or_state_round_t
     import elspeth.web.composer.pipeline_planner as planner_module
 
     policy = planner_module.PlannerDiscoveryPolicy.initial(PlannerSurface.GUIDED_STAGED)
-    names = [tool["function"]["name"] for tool in planner_tool_definitions(policy)]
+    names = [tool["function"]["name"] for tool in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)]
 
     assert "preview_pipeline" not in names
     assert "get_pipeline_state" not in names

@@ -164,7 +164,7 @@ def build_composer_probe_requests(settings: ComposerSettings) -> tuple[ComposerP
     # the loop request above already covers the discovery effort on the same
     # model and endpoint.
     planner_messages: list[dict[str, Any]] = [{"role": "user", "content": _PLANNER_PROBE_PROMPT}]
-    planner_tools = planner_tool_definitions()
+    planner_tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     if supports_anthropic_prompt_cache_markers(model):
         planner_messages, marked_planner_tools = apply_anthropic_cache_markers(planner_messages, planner_tools)
         assert marked_planner_tools is not None
