@@ -37,7 +37,7 @@ files:
     dict[str, Any]: 7
   src/elspeth/contracts/call_data.py:
     Mapping[str, Any]: 8
-    dict[str, Any]: 12
+    dict[str, Any]: 15
   src/elspeth/contracts/call_mode.py:
     Mapping[str, Any]: 8
   src/elspeth/contracts/chat_parts.py:
@@ -1060,6 +1060,6 @@ totals:
   Mapping[str, object]: 306
   MutableMapping[str, Any]: 13
   boundary: 65
-  dict[str, Any]: 1149
+  dict[str, Any]: 1152
   dict[str, object]: 409
-  soft: 2772
+  soft: 2775

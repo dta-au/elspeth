@@ -20,8 +20,12 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallError, HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.call_mode import ReplayCallEvidence
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from tests.fixtures.mock_audit import mock_audit_authority
 
@@ -153,6 +157,162 @@ def test_post_records_call_to_landscape(http_client, mock_execution):
     assert call_args["response_data"].to_dict()["status_code"] == 200
     assert call_args["response_data"].to_dict()["body"] == {"result": "success"}
     assert call_args["latency_ms"] > 0
+
+
+@respx.mock
+def test_http_audit_keeps_exact_replay_transport(http_client, mock_execution):
+    """A parsed JSON body and flattened headers cannot rebuild httpx.Response."""
+    raw_body = b'{  "result": "success"  }\n'
+    respx.get("https://api.example.com/raw").mock(
+        return_value=httpx.Response(
+            200,
+            content=raw_body,
+            headers=[("content-type", "application/json"), ("x-item", "one"), ("x-item", "two")],
+        )
+    )
+
+    http_client.get("https://api.example.com/raw")
+
+    response_payload = mock_execution.record_call.call_args[1]["response_data"].to_dict()
+    assert response_payload["body"] == {"result": "success"}
+    assert response_payload["transport"] == {
+        "body_b64": base64.b64encode(raw_body).decode("ascii"),
+        "headers": [["content-type", "application/json"], ["x-item", "one"], ["x-item", "two"], ["content-length", "26"]],
+        "request_url": "https://api.example.com/raw",
+    }
+
+
+@respx.mock
+def test_http_audit_rejects_replay_transport_with_redacted_header(http_client, mock_execution):
+    respx.get("https://api.example.com/login").mock(
+        return_value=httpx.Response(200, text="ok", headers={"set-cookie": "session=secret123"})
+    )
+
+    http_client.get("https://api.example.com/login")
+
+    response_payload = mock_execution.record_call.call_args[1]["response_data"].to_dict()
+    assert "transport" not in response_payload
+    assert "secret123" not in str(response_payload)
+
+
+def test_http_replay_rejects_legacy_payload_without_constructing_httpx_client(mock_execution, mock_telemetry_emit):
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+        source_run_id = "source-run"
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence(
+                source_call_id="source-call",
+                status=CallStatus.SUCCESS,
+                response_data={"status_code": 200, "headers": {}, "body_size": 2, "body": "ok"},
+                error_data=None,
+                latency_ms=1.0,
+            )
+
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+        with pytest.raises(AuditIntegrityError, match="lacks exact transport"):
+            client.get("https://api.example.com/raw")
+    assert mock_execution.record_call.call_count == 0
+
+
+def test_http_replay_restores_exact_response_without_network_client(mock_execution, mock_telemetry_emit):
+    raw_body = b'{  "result": "success"  }\n'
+    payload = {
+        "status_code": 200,
+        "headers": {"content-type": "application/json"},
+        "body_size": len(raw_body),
+        "body": {"result": "success"},
+        "transport": {
+            "body_b64": base64.b64encode(raw_body).decode("ascii"),
+            "headers": [["content-type", "application/json"], ["x-item", "one"], ["x-item", "two"]],
+            "request_url": "https://api.example.com/raw",
+        },
+    }
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+        source_run_id = "source-run"
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence("source-call", CallStatus.SUCCESS, payload, None, 1.0)
+
+    captured: list[dict[str, Any]] = []
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+
+        def _record(**kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return SimpleNamespace(call_id="new-call")
+
+        client._record_call = _record
+        response = client.get("https://api.example.com/raw")
+
+    assert response.content == raw_body
+    assert response.status_code == 200
+    assert response.headers.get_list("x-item") == ["one", "two"]
+    assert str(response.request.url) == "https://api.example.com/raw"
+    assert captured[0]["source_call_id"] == "source-call"
+
+
+def test_ssrf_http_replay_uses_archived_pin_without_network_client(mock_execution, mock_telemetry_emit):
+    payload = {
+        "status_code": 200,
+        "headers": {"content-type": "text/plain"},
+        "body_size": 2,
+        "body": "ok",
+        "transport": {
+            "body_b64": base64.b64encode(b"ok").decode("ascii"),
+            "headers": [["content-type", "text/plain"]],
+            "request_url": "https://93.184.216.34/raw",
+            "logical_url": "https://api.example.com/raw",
+        },
+    }
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+        source_run_id = "source-run"
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence("source-call", CallStatus.SUCCESS, payload, None, 1.0)
+
+    safe_request = SSRFSafeRequest(
+        original_url="https://api.example.com/raw",
+        resolved_ip="93.184.216.34",
+        host_header="api.example.com",
+        port=443,
+        path="/raw",
+        scheme="https",
+        bare_hostname="api.example.com",
+    )
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+        client._record_call = lambda **_kwargs: SimpleNamespace(call_id="new-call")
+        response, final_url, _call = client.request_ssrf_safe("GET", safe_request)
+
+    assert response.content == b"ok"
+    assert final_url == "https://api.example.com/raw"
 
 
 @respx.mock

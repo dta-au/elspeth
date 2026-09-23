@@ -448,6 +448,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
                     limiter=self._limiter,
                     token_id=token_id,
                     max_response_body_bytes=self._max_response_body_bytes,
+                    call_mode_session=ctx.call_mode_session,
                 )
             return self._http_clients[state_id]
 

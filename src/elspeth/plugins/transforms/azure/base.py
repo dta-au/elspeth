@@ -568,6 +568,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                         "Content-Type": "application/json",
                     },
                     limiter=self._limiter,
+                    call_mode_session=ctx.call_mode_session,
                     token_id=token_id,
                 )
             return self._http_clients[state_id]

@@ -7,6 +7,7 @@ to prevent DNS rebinding attacks. See core/security/web.py for details.
 from __future__ import annotations
 
 import base64
+import binascii
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -19,8 +20,18 @@ import structlog
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
-from elspeth.contracts.call_data import CallPayload, HTTPCallError, HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.call_data import (
+    CallPayload,
+    HTTPCallError,
+    HTTPCallRequest,
+    HTTPCallResponse,
+    HTTPRedirectReplayHop,
+    HTTPResponseTransport,
+    RawCallPayload,
+)
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
@@ -70,6 +81,7 @@ def _sanitize_http_error_message(message: str) -> str:
 if TYPE_CHECKING:
     from elspeth.contracts import Call
     from elspeth.contracts.audit_protocols import CallRecorder
+    from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
     from elspeth.contracts.contexts import LimiterProtocol
 
 
@@ -136,6 +148,7 @@ class AuditedHTTPClient(AuditedClientBase):
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
         max_response_body_bytes: int | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         """Initialize audited HTTP client.
 
@@ -172,13 +185,15 @@ class AuditedHTTPClient(AuditedClientBase):
         self._base_url = base_url
         self._default_headers = headers or {}
         self._max_response_body_bytes = max_response_body_bytes
+        self._call_mode_session = call_mode_session
         # Shared httpx.Client for connection pooling and TCP reuse.
         # httpx.Client is thread-safe; the internal pool handles concurrency.
         # Per-request timeouts override the default via timeout= kwarg.
         # follow_redirects=False: SSRF-safe methods manage redirects manually.
-        self._client = httpx.Client(
-            timeout=self._timeout,
-            follow_redirects=False,
+        self._client = (
+            None
+            if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY
+            else httpx.Client(timeout=self._timeout, follow_redirects=False)
         )
 
     # Delegate to shared module functions. Instance methods preserved for
@@ -250,7 +265,8 @@ class AuditedHTTPClient(AuditedClientBase):
 
     def close(self) -> None:
         """Close the underlying httpx client and release connections."""
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
     def _resolve_url(self, url: str) -> str:
         """Join base_url with path, handling slash combinations."""
@@ -305,6 +321,7 @@ class AuditedHTTPClient(AuditedClientBase):
         request_payload: CallPayload,
         response_payload: CallPayload | None = None,
         token_id_override: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record call to audit trail and emit telemetry event.
 
@@ -326,6 +343,7 @@ class AuditedHTTPClient(AuditedClientBase):
             response_data=response_payload,
             error=error_data,
             latency_ms=latency_ms,
+            source_call_id=source_call_id,
         )
 
         # Telemetry emitted AFTER successful Landscape recording
@@ -341,7 +359,195 @@ class AuditedHTTPClient(AuditedClientBase):
             call_type_label="http",
         )
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=call_status,
+                live_response_data=response_data,
+                live_error_data=error_data.to_dict() if error_data is not None else None,
+            )
+
         return call
+
+    def _restore_replay_response(
+        self, evidence: ReplayCallEvidence, *, method: str, expected_url: str | None, request_headers: dict[str, str]
+    ) -> httpx.Response:
+        """Parse retained transport as untrusted audit data before any egress."""
+        payload = evidence.response_data
+        if payload is None:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has no response payload")
+        status_code = payload.get("status_code")
+        body_size = payload.get("body_size")
+        transport = payload.get("transport")
+        if type(status_code) is not int or not 100 <= status_code <= 999:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid status")
+        if (body_size is not None and (type(body_size) is not int or body_size < 0)) or not isinstance(transport, Mapping):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks exact transport")
+        encoded_body = transport.get("body_b64")
+        header_pairs = transport.get("headers")
+        recorded_url = transport.get("request_url")
+        if type(encoded_body) is not str or type(recorded_url) is not str or (expected_url is not None and recorded_url != expected_url):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has incomplete or divergent transport")
+        if not isinstance(header_pairs, tuple | list):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks ordered headers")
+        headers: list[tuple[str, str]] = []
+        for pair in header_pairs:
+            if not isinstance(pair, tuple | list) or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str:
+                raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid headers")
+            headers.append((pair[0], pair[1]))
+        try:
+            body = base64.b64decode(encoded_body, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid body encoding") from exc
+        if body_size is not None and len(body) != body_size:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has inconsistent body size")
+        if _fingerprint_url(recorded_url) != recorded_url:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has unsafe transport URL")
+        if self._filter_response_headers(dict(headers)) != dict(headers) or "content-encoding" in dict(headers):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has unsafe transport headers")
+        request = httpx.Request(method, recorded_url, headers=request_headers)
+        response = httpx.Response(status_code, headers=headers, content=body, request=request)
+        expected_status = CallStatus.SUCCESS if (200 <= status_code < 300 or 300 <= status_code < 400) else CallStatus.ERROR
+        if evidence.status is not expected_status:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has contradictory status")
+        return response
+
+    def _replay_request(
+        self,
+        *,
+        method: str,
+        full_url: str,
+        request_dto: HTTPCallRequest,
+        request_headers: dict[str, str],
+        params: dict[str, str | int | float] | None,
+        call_index: int,
+        token_id: str | None,
+    ) -> httpx.Response:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise AuditIntegrityError("HTTP replay requested without a replay session")
+        request_data = request_dto.to_dict()
+        evidence = session.replay_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        expected_url = str(httpx.Request(method, full_url, params=params).url)
+        response = self._restore_replay_response(evidence, method=method, expected_url=expected_url, request_headers=request_headers)
+        response_payload = RawCallPayload(evidence.response_data or {})
+        error_payload = RawCallPayload(evidence.error_data) if evidence.error_data is not None else None
+        self._record_and_emit(
+            call_index=call_index,
+            full_url=full_url,
+            request_data=request_data,
+            response=response,
+            response_data=evidence.response_data,
+            error_data=error_payload,
+            latency_ms=evidence.latency_ms or 0.0,
+            call_status=evidence.status,
+            request_payload=request_dto,
+            response_payload=response_payload,
+            token_id_override=token_id,
+            source_call_id=evidence.source_call_id,
+        )
+        return response
+
+    def _replay_ssrf_request(
+        self,
+        *,
+        method: str,
+        request: SSRFSafeRequest,
+        request_dto: HTTPCallRequest,
+        request_headers: dict[str, str],
+        params: dict[str, str | int | float] | None,
+        call_index: int,
+        follow_redirects: bool,
+        max_redirects: int,
+    ) -> tuple[httpx.Response, str, Call]:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise AuditIntegrityError("SSRF-safe HTTP replay requested without a replay session")
+        request_data = request_dto.to_dict()
+        evidence = session.replay_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        payload = evidence.response_data
+        transport = payload.get("transport") if payload is not None else None
+        if not isinstance(transport, Mapping):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
+        raw_hops = transport.get("redirect_hops", ())
+        redirect_count = payload.get("redirect_count", 0) if payload is not None else 0
+        if type(redirect_count) is not int or not isinstance(raw_hops, tuple | list) or redirect_count != len(raw_hops):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has incomplete redirects")
+        if (not follow_redirects and redirect_count) or redirect_count > max_redirects:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} exceeds requested redirect policy")
+        for raw_hop in raw_hops:
+            if not isinstance(raw_hop, Mapping):
+                raise AuditIntegrityError("SSRF-safe HTTP replay has malformed redirect evidence")
+            hop_request = raw_hop.get("request")
+            hop_response = raw_hop.get("response")
+            if not isinstance(hop_request, Mapping) or not isinstance(hop_response, Mapping):
+                raise AuditIntegrityError("SSRF-safe HTTP replay has missing redirect payloads")
+            hop_index = self._next_call_index()
+            hop_evidence = session.replay_call(
+                call_type=CallType.HTTP_REDIRECT,
+                request_data=hop_request,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=hop_index,
+            )
+            if hop_evidence.response_data != hop_response:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} differs from parent archive")
+            hop_method = hop_request.get("method")
+            hop_transport = hop_response.get("transport")
+            hop_url = hop_transport.get("request_url") if isinstance(hop_transport, Mapping) else None
+            if type(hop_method) is not str or type(hop_url) is not str:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks transport URL")
+            self._restore_replay_response(hop_evidence, method=hop_method, expected_url=hop_url, request_headers=request_headers)
+            self._record_call(
+                call_index=hop_index,
+                call_type=CallType.HTTP_REDIRECT,
+                status=hop_evidence.status,
+                request_data=RawCallPayload(hop_request),
+                response_data=RawCallPayload(hop_response),
+                error=RawCallPayload(hop_evidence.error_data) if hop_evidence.error_data is not None else None,
+                latency_ms=hop_evidence.latency_ms,
+                source_call_id=hop_evidence.source_call_id,
+            )
+        logical_url = transport.get("logical_url")
+        if type(logical_url) is not str:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks logical URL")
+        if redirect_count == 0 and logical_url != request.original_url:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} changed URL")
+        expected_url = str(httpx.Request(method, request.connection_url, params=params).url) if redirect_count == 0 else None
+        response = self._restore_replay_response(
+            evidence, method=method if redirect_count == 0 else "GET", expected_url=expected_url, request_headers=request_headers
+        )
+        call = self._record_and_emit(
+            call_index=call_index,
+            full_url=logical_url,
+            request_data=request_data,
+            response=response,
+            response_data=payload,
+            error_data=RawCallPayload(evidence.error_data) if evidence.error_data is not None else None,
+            latency_ms=evidence.latency_ms or 0.0,
+            call_status=evidence.status,
+            request_payload=request_dto,
+            response_payload=RawCallPayload(payload or {}),
+            source_call_id=evidence.source_call_id,
+        )
+        return response, logical_url, call
 
     def _emit_telemetry_after_audit(
         self,
@@ -395,7 +601,13 @@ class AuditedHTTPClient(AuditedClientBase):
             )
 
     def _build_response_payload(
-        self, response: httpx.Response, full_url: str, *, redirect_count: int = 0
+        self,
+        response: httpx.Response,
+        full_url: str,
+        *,
+        redirect_count: int = 0,
+        logical_url: str | None = None,
+        redirect_hops: tuple[HTTPRedirectReplayHop, ...] = (),
     ) -> tuple[HTTPCallResponse, dict[str, Any]]:
         """Build typed and dict response payloads from an HTTP response."""
         response_body = self._parse_response_body(response, full_url)
@@ -405,8 +617,43 @@ class AuditedHTTPClient(AuditedClientBase):
             body_size=len(response.content),
             body=response_body,
             redirect_count=redirect_count,
+            transport=self._build_replay_transport(response, logical_url=logical_url, redirect_hops=redirect_hops),
         )
         return response_dto, response_dto.to_dict()
+
+    def _build_replay_transport(
+        self, response: httpx.Response, *, logical_url: str | None = None, redirect_hops: tuple[HTTPRedirectReplayHop, ...] = ()
+    ) -> HTTPResponseTransport | None:
+        """Keep exact observable bytes and headers only when audit-safe.
+
+        A filtered header, fingerprinted URL or compressed wire response has
+        no exact reconstruction from the available httpx object. Such calls
+        remain valid live audit records but are ineligible for replay.
+        """
+        if type(response.headers) is not httpx.Headers:
+            return None
+        raw_headers = dict(response.headers)
+        if any(hop.response.transport is None for hop in redirect_hops):
+            return None
+        if self._filter_response_headers(raw_headers) != raw_headers:
+            return None
+        if "content-encoding" in response.headers:
+            return None
+        request_url = str(response.request.url)
+        try:
+            if _fingerprint_url(request_url) != request_url:
+                return None
+            if logical_url is not None and _fingerprint_url(logical_url) != logical_url:
+                return None
+        except (ValueError, UnicodeError, contract_errors.FrameworkBugError):
+            return None
+        return HTTPResponseTransport(
+            body_b64=base64.b64encode(response.content).decode("ascii"),
+            headers=tuple(response.headers.multi_items()),
+            request_url=request_url,
+            logical_url=logical_url,
+            redirect_hops=redirect_hops,
+        )
 
     def _build_truncated_response_payload(
         self,
@@ -554,7 +801,8 @@ class AuditedHTTPClient(AuditedClientBase):
         Raises:
             httpx.HTTPError: For network/HTTP errors
         """
-        self._acquire_rate_limit()
+        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+            self._acquire_rate_limit()
         call_index = self._next_call_index()
 
         full_url = self._resolve_url(url)
@@ -574,10 +822,23 @@ class AuditedHTTPClient(AuditedClientBase):
         )
         request_data = request_dto.to_dict()
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_request(
+                method=method,
+                full_url=full_url,
+                request_dto=request_dto,
+                request_headers=merged_headers,
+                params=params,
+                call_index=call_index,
+                token_id=token_id,
+            )
+
         start = time.perf_counter()
         response: httpx.Response | None = None
 
         try:
+            if self._client is None:
+                raise AuditIntegrityError("HTTP client absent outside replay mode")
             # Dispatch to the correct httpx method
             response = self._request_with_optional_body_cap(
                 self._client,
@@ -786,7 +1047,8 @@ class AuditedHTTPClient(AuditedClientBase):
             SSRFBlockedError: If redirect target resolves to blocked IP
         """
         method_upper = method.upper()
-        self._acquire_rate_limit()
+        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+            self._acquire_rate_limit()
 
         call_index = self._next_call_index()
 
@@ -816,8 +1078,21 @@ class AuditedHTTPClient(AuditedClientBase):
         )
         request_data = request_dto.to_dict()
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_ssrf_request(
+                method=method_upper,
+                request=request,
+                request_dto=request_dto,
+                request_headers=merged_headers,
+                params=params,
+                call_index=call_index,
+                follow_redirects=follow_redirects,
+                max_redirects=max_redirects,
+            )
+
         start = time.perf_counter()
         response: httpx.Response | None = None
+        replay_hops: list[HTTPRedirectReplayHop] = []
 
         try:
             # Ephemeral client for SSRF-safe requests: connection_url uses the
@@ -850,6 +1125,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     merged_headers,
                     original_url=request.original_url,
                     allowed_ranges=allowed_ranges,
+                    replay_hops=replay_hops,
                 )
 
             latency_ms = (time.perf_counter() - start) * 1000
@@ -857,7 +1133,13 @@ class AuditedHTTPClient(AuditedClientBase):
             is_success = 200 <= response.status_code < 300
             call_status = CallStatus.SUCCESS if is_success else CallStatus.ERROR
 
-            response_dto, response_data = self._build_response_payload(response, final_hostname_url, redirect_count=redirect_count)
+            response_dto, response_data = self._build_response_payload(
+                response,
+                final_hostname_url,
+                redirect_count=redirect_count,
+                logical_url=final_hostname_url,
+                redirect_hops=tuple(replay_hops),
+            )
 
             error_data: CallPayload | None = None
             if not is_success:
@@ -878,16 +1160,17 @@ class AuditedHTTPClient(AuditedClientBase):
             elif response is not None:
                 response_payload, error_response_data = self._build_response_payload(response, request.original_url)
 
-            _ = self._record_call(
+            error_payload = HTTPCallError(
+                type=type(e).__name__,
+                message=str(e),
+            )
+            failed_call = self._record_call(
                 call_index=call_index,
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
                 request_data=request_dto,
                 response_data=response_payload,
-                error=HTTPCallError(
-                    type=type(e).__name__,
-                    message=str(e),
-                ),
+                error=error_payload,
                 latency_ms=latency_ms,
             )
 
@@ -901,6 +1184,19 @@ class AuditedHTTPClient(AuditedClientBase):
                 response_payload=response_payload,
                 call_type_label="http_ssrf_safe",
             )
+
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+                self._call_mode_session.verify_call(
+                    call_type=CallType.HTTP,
+                    request_data=request_data,
+                    current_state_id=self._state_id,
+                    current_operation_id=self._operation_id,
+                    current_call_index=call_index,
+                    current_call_id=failed_call.call_id,
+                    live_status=CallStatus.ERROR,
+                    live_response_data=error_response_data,
+                    live_error_data=error_payload.to_dict(),
+                )
 
             raise
 
@@ -933,6 +1229,19 @@ class AuditedHTTPClient(AuditedClientBase):
             response_payload=response_dto,
             call_type_label="http_ssrf_safe",
         )
+
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=call_status,
+                live_response_data=response_data,
+                live_error_data=error_data.to_dict() if error_data is not None else None,
+            )
 
         return response, final_hostname_url, call
 
@@ -968,6 +1277,7 @@ class AuditedHTTPClient(AuditedClientBase):
         original_url: str,
         *,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        replay_hops: list[HTTPRedirectReplayHop] | None = None,
     ) -> tuple[httpx.Response, int, str]:
         """Follow HTTP redirects with SSRF validation at each hop.
 
@@ -1129,7 +1439,10 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_response_dto = HTTPCallResponse(
                 status_code=response.status_code,
                 headers=self._filter_response_headers(dict(response.headers)),
+                transport=self._build_replay_transport(response),
             )
+            if replay_hops is not None:
+                replay_hops.append(HTTPRedirectReplayHop(request=hop_request_dto, response=hop_response_dto))
 
             self._record_call(
                 call_index=hop_call_index,
