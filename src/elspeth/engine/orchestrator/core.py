@@ -45,6 +45,7 @@ from elspeth.engine.orchestrator.processor_factory import ProcessorFactory
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
 from elspeth.engine.orchestrator.run_lifecycle import RunLifecycleCoordinator
+from elspeth.engine.orchestrator.run_modes import RuntimeRunMode, resolve_runtime_run_mode
 from elspeth.engine.orchestrator.run_state import (
     _RunFailedWithPartialResultError as _RunFailedWithPartialResultError,
 )
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
         SecretResolutionInput,
     )
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
@@ -113,6 +115,7 @@ class Orchestrator:
         telemetry_manager: TelemetryManagerProtocol | None = None,
         coalesce_completed_keys_limit: int = 10000,
         llm_call_governance: LLMCallGovernance | None = None,
+        call_mode_session_factory: Callable[[RecorderFactory, RuntimeRunMode, str], CallModeSession] | None = None,
     ) -> None:
         from elspeth.core.events import NullEventBus
         from elspeth.engine.clock import DEFAULT_CLOCK
@@ -128,6 +131,7 @@ class Orchestrator:
         self._rate_limit_registry = rate_limit_registry
         self._concurrency_config = concurrency_config
         self._coalesce_completed_keys_limit = coalesce_completed_keys_limit
+        self._call_mode_session_factory = call_mode_session_factory
         self._telemetry = telemetry_manager  # Optional, disabled by default
         self._ceremony = RunCeremony(events=self._events, telemetry=self._telemetry)
         self._checkpoints = CheckpointCoordinator(checkpoint_manager=checkpoint_manager, checkpoint_config=checkpoint_config)
@@ -145,6 +149,7 @@ class Orchestrator:
             rate_limit_registry=self._rate_limit_registry,
             concurrency_config=self._concurrency_config,
             processor_factory=self._processor_factory,
+            call_mode_session_factory=call_mode_session_factory,
         )
         self._sink_flush = SinkFlushCoordinator(
             span_factory=self._span_factory,
@@ -271,6 +276,8 @@ class Orchestrator:
         Raises:
             OrchestrationInvariantError: If graph or payload_store is not provided
         """
+        resolve_runtime_run_mode(config, settings)
+
         require_sink_effect_admission(
             config.sinks,
             configured_modes=config.sink_effect_modes,
