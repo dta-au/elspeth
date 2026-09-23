@@ -1687,6 +1687,14 @@ def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[st
     return frozenset(cls.name for cls in transforms if cls.is_batch_aware and not cls.supports_row_mode_when_batch_aware)
 
 
+def _known_transform_plugins_requiring_aggregation_batch_context() -> frozenset[str]:
+    """Return transform names that read the aggregation flush window (``ctx.aggregation_batch``)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.requires_aggregation_batch_context)
+
+
 def _declared_input_fields_option(options: Mapping[str, Any]) -> object:
     """Return the raw declared-input-field option, including wrapper-shaped aggregations."""
     if _DECLARED_INPUT_FIELDS_OPTION in options:
@@ -1728,8 +1736,23 @@ def _batch_aware_placement_error(
     plugin_name: str | None,
     output_mode: str | None,
 ) -> str | None:
-    """Reject batch-only transforms from row-mode composer placement."""
-    if plugin_name is None or plugin_name not in _known_batch_aware_transform_plugins_requiring_aggregation():
+    """Reject a batch-aware transform from a node kind it cannot run in.
+
+    Mirrors runtime_factory's placement refusals, from the same plugin class
+    declarations: a batch-only plugin as a row transform, and a plugin that
+    reads the aggregation flush window as a collector.
+    """
+    if plugin_name is None:
+        return None
+
+    if node_type == "collector" and plugin_name in _known_transform_plugins_requiring_aggregation_batch_context():
+        return (
+            f"Node '{node_id}' uses '{plugin_name}' as a collector, but the plugin requires an aggregation "
+            "flush window (its trigger and row positions), which a collector's end_of_group flush does not have. "
+            "Configure this node as node_type='aggregation' with an aggregation trigger instead."
+        )
+
+    if plugin_name not in _known_batch_aware_transform_plugins_requiring_aggregation():
         return None
 
     if node_type == "transform":

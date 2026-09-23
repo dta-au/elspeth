@@ -99,7 +99,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:30f9b5007c12a6fd"
+    source_file_hash: str | None = "sha256:fb073b4482ffa0c5"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -128,6 +128,9 @@ class ReportAssemble(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("report", "aggregation", "batch", "pagination")
     is_batch_aware = True
+    # Pagination reads the flush window (flush_index, row_start/row_end,
+    # trigger), which a collector's end_of_group flush does not have.
+    requires_aggregation_batch_context = True
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

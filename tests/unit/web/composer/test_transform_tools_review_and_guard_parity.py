@@ -438,6 +438,55 @@ def test_batch_aware_plugin_placed_as_a_transform_is_rejected_the_same_way_on_ev
     _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline")
 
 
+_REPORT_OPTIONS: dict[str, Any] = {"schema": {"mode": "observed"}, "text_field": "x"}
+_COLLECTOR_FIELDS: dict[str, Any] = {
+    "node_type": "collector",
+    "on_error": None,
+    "scope_name": "document_pages",
+    "scope_opener": "t1",
+    "scope_policy": "require_all",
+}
+
+
+def _report_assemble_as_collector() -> dict[str, Any]:
+    return {
+        "id": "agg",
+        "plugin": "report_assemble",
+        "input": "mid",
+        "on_success": "out",
+        "options": dict(_REPORT_OPTIONS),
+        **_COLLECTOR_FIELDS,
+    }
+
+
+def test_a_flush_window_plugin_placed_as_a_collector_is_rejected_the_same_way_on_every_path() -> None:
+    """Input C: report_assemble reads ctx.aggregation_batch, which a collector never supplies (AC-R4).
+
+    ``splice_transform`` inserts transforms only, so it cannot author a
+    collector; the other three boundaries meet the collector arm.
+    """
+    context = _context()
+    guard_message = _batch_aware_placement_error("agg", "collector", "report_assemble", None)
+    assert guard_message is not None
+    assert "aggregation flush window" in guard_message
+    linear = _linear_state()
+    misplaced = _state_holding(_spec("agg", "mid", "out", plugin="report_assemble", options=dict(_REPORT_OPTIONS), **_COLLECTOR_FIELDS))
+
+    upsert = _dispatch("upsert_node", _report_assemble_as_collector(), linear, context)
+    patch = _dispatch("patch_node_options", {"node_id": "agg", "patch": {"text_field": "y"}}, misplaced, context)
+    set_pipeline = _dispatch("set_pipeline", _set_pipeline_arguments(_report_assemble_as_collector()), linear, context)
+
+    _assert_guard_rejection(upsert, linear, guard_message, path="upsert_node")
+    _assert_guard_rejection(patch, misplaced, guard_message, path="patch_node_options")
+    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline")
+
+
+def test_the_collector_arm_names_only_flush_window_plugins() -> None:
+    """Negative controls: a windowless batch plugin is a legal collector, and report_assemble a legal aggregation."""
+    assert _batch_aware_placement_error("agg", "collector", "batch_stats", None) is None
+    assert _batch_aware_placement_error("agg", "aggregation", "report_assemble", "transform") is None
+
+
 def test_patch_on_a_batch_aware_aggregation_still_accepts_unrelated_options() -> None:
     """Negative control: the new guards refuse only what they name."""
     context = _context()

@@ -66,6 +66,7 @@ class NonConformingTransform:
         self._on_complete_called = False
         self.is_batch_aware = is_batch_aware
         self.supports_row_mode_when_batch_aware = False
+        self.requires_aggregation_batch_context = False
         self.creates_tokens = False
         self.passes_through_input = False
         self.forwards_input_fields = False

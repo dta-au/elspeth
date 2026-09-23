@@ -176,6 +176,7 @@ class TestTransformProtocol:
             source_file_hash: str | None = None
             is_batch_aware = False  # Batch support (structural aggregation)
             supports_row_mode_when_batch_aware = False  # Batch-aware transforms only
+            requires_aggregation_batch_context = False  # Reads ctx.aggregation_batch (aggregation-only)
             requires_runtime_preflight = False  # Optional engine-time readiness check
             creates_tokens = False  # Deaggregation (multi-row output)
             passes_through_input = False  # ADR-007: pass-through contract flag

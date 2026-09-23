@@ -1916,6 +1916,12 @@ aggregations:
 
 Omit `trigger` to emit a single report covering all source rows at end-of-source.
 
+`report_assemble` is aggregation-only. Its pagination fields come from the
+aggregation flush window, and a collector's end-of-group flush has no window, so
+`elspeth validate` refuses it under `collectors:`. It also refuses any
+batch-aware plugin under `transforms:`, because a batch plugin processes a list
+of rows and cannot run one row at a time.
+
 ### Trigger Configuration
 
 Every trigger type is optional. Configure any combination for early flushes, or

@@ -451,6 +451,13 @@ class BaseTransform(ABC):
     # explicitly so composer/tool validation can reject accidental placement.
     supports_row_mode_when_batch_aware: bool = False
 
+    # True for a batch-aware plugin that reads ``ctx.aggregation_batch`` (the
+    # flush window's trigger and row positions), which only an aggregation
+    # flush supplies. runtime_factory refuses such a plugin as a collector,
+    # whose end_of_group flush has no window, instead of letting every group
+    # abort at run time.
+    requires_aggregation_batch_context: bool = False
+
     # Token creation flag for deaggregation transforms
     # When True AND process() returns success_multi(), the processor creates
     # new token_ids for each output row with parent linkage to input token.
