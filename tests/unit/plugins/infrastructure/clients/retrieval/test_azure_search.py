@@ -13,7 +13,7 @@ import httpx
 import pytest
 import respx
 
-from elspeth.contracts.call_mode import ArchivedCallRequestEvidence, ReplayCallEvidence, ReplaySSRFRequest
+from elspeth.contracts.call_mode import ArchivedCallRequestEvidence, CallModeSession, ReplayCallEvidence, ReplaySSRFRequest
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -1097,7 +1097,7 @@ class TestRuntimePreflightProbe:
 
 
 def test_replay_search_uses_archived_dns_pin_without_live_dns() -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.REPLAY
     config = AzureSearchProviderConfig(
         endpoint="https://test.search.windows.net",
@@ -1138,7 +1138,7 @@ def test_replay_search_uses_archived_dns_pin_without_live_dns() -> None:
 
 
 def test_replay_managed_identity_defers_credential_to_archived_http_identity() -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.REPLAY
     config = AzureSearchProviderConfig(
         endpoint="https://test.search.windows.net",
@@ -1162,7 +1162,7 @@ def test_replay_managed_identity_defers_credential_to_archived_http_identity() -
 
 
 def test_replay_search_restores_chunks_without_dns_or_http_client() -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.REPLAY
     config = AzureSearchProviderConfig(
         endpoint="https://test.search.windows.net",
@@ -1217,7 +1217,7 @@ def test_replay_search_restores_chunks_without_dns_or_http_client() -> None:
 
 
 def test_replay_managed_identity_uses_archived_fingerprint_without_token_or_dns() -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.REPLAY
     session.source_run_id = "source-run"
     config = AzureSearchProviderConfig(endpoint="https://test.search.windows.net", index="test-index", use_managed_identity=True)
@@ -1296,7 +1296,7 @@ def test_replay_managed_identity_uses_archived_fingerprint_without_token_or_dns(
 @pytest.mark.parametrize("managed_identity", [False, True])
 @pytest.mark.parametrize("readiness", [False, True])
 def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity: bool, readiness: bool) -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.VERIFY
     session.preflight_verify_http_request.side_effect = RuntimeError("missing source request")
     session.preflight_verify_http_managed_identity.side_effect = RuntimeError("missing source request")
@@ -1322,7 +1322,7 @@ def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity
         )
         with pytest.raises(RuntimeError, match="missing source request"):
             if readiness:
-                provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
             else:
                 provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
     client_cls.assert_not_called()
@@ -1330,7 +1330,7 @@ def test_verify_missing_source_refuses_before_dns_token_or_http(managed_identity
 
 @pytest.mark.parametrize("managed_identity", [False, True])
 def test_verify_blocked_archived_pin_refuses_before_dns_or_token(managed_identity: bool) -> None:
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.VERIFY
     source = ArchivedCallRequestEvidence(source_call_id="source-call", request_data={"resolved_ip": "127.0.0.1"})
     session.preflight_verify_http_request.return_value = source
@@ -1362,7 +1362,7 @@ def test_verify_blocked_archived_pin_refuses_before_dns_or_token(managed_identit
 
 def test_verify_managed_identity_search_admits_before_token_and_dispatch() -> None:
     events: list[str] = []
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.VERIFY
     source = ArchivedCallRequestEvidence(source_call_id="source-mi-call", request_data={"resolved_ip": "93.184.216.34"})
 
@@ -1376,7 +1376,7 @@ def test_verify_managed_identity_search_admits_before_token_and_dispatch() -> No
 
     session.preflight_verify_http_managed_identity.side_effect = preflight
     session.admit_verify_http_managed_identity.side_effect = admit
-    credential = MagicMock()
+    credential = MagicMock(spec=_FakeAzureCredential)
 
     def get_token(*_scopes: str) -> SimpleNamespace:
         events.append("token")
@@ -1411,7 +1411,7 @@ def test_verify_managed_identity_search_admits_before_token_and_dispatch() -> No
 
 def test_verify_managed_identity_readiness_admits_before_token_and_dispatch() -> None:
     events: list[str] = []
-    session = MagicMock()
+    session = MagicMock(spec=CallModeSession)
     session.mode = RunMode.VERIFY
     source = ArchivedCallRequestEvidence(source_call_id="source-readiness", request_data={"resolved_ip": "93.184.216.34"})
 
@@ -1425,7 +1425,7 @@ def test_verify_managed_identity_readiness_admits_before_token_and_dispatch() ->
 
     session.preflight_verify_http_managed_identity.side_effect = preflight
     session.admit_verify_http_managed_identity.side_effect = admit
-    credential = MagicMock()
+    credential = MagicMock(spec=_FakeAzureCredential)
 
     def get_token(*_scopes: str) -> SimpleNamespace:
         events.append("token")

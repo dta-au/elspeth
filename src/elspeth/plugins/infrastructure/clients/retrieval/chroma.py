@@ -178,8 +178,6 @@ class ChromaSearchProvider:
         self._execution = execution
         self._run_id = run_id
         self._call_mode_session = call_mode_session
-        self._operation_id: str | None = None
-        self._coordination_token: CoordinationToken | None = None
         self.last_skipped_count: int = 0
         self.last_skipped_reasons: list[dict[str, Any]] = []
 
@@ -769,18 +767,43 @@ class ChromaSearchProvider:
         if collection doesn't exist). If __init__ fails, the provider doesn't
         exist and this method is never called.
         """
+        if self._call_mode_session is not None and self._call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY):
+            raise RetrievalError("Chroma replay/verify readiness requires an audited operation parent", retryable=False)
+        return self._live_readiness()
+
+    def _live_readiness(self) -> CollectionReadinessResult:
+        collection_name = self._config.collection
+        if self._collection is None:
+            self._initialize_client()
+        try:
+            count = self._collection.count()
+            if type(count) is not int or count < 0:
+                raise ValueError(f"malformed collection count: expected a non-negative exact int, got {count!r} ({type(count).__name__})")
+            return CollectionReadinessResult(
+                collection=collection_name,
+                reachable=True,
+                count=count,
+                message=f"Collection '{collection_name}' has {count} documents"
+                if count > 0
+                else f"Collection '{collection_name}' is empty",
+            )
+        except (chromadb.errors.ChromaError, ConnectionError, OSError, ValueError, httpx.HTTPError) as exc:
+            # ValueError: chromadb 1.5.5 raises plain ValueError on unreachable HTTP server.
+            # httpx.HTTPError: transport errors do not inherit from the other classes here.
+            return CollectionReadinessResult(
+                collection=collection_name,
+                reachable=False,
+                count=None,
+                message=f"Collection '{collection_name}' unreachable: {type(exc).__name__}: {exc}",
+            )
+
+    def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
+        """Run the collection check beneath the engine's exact operation authority."""
         collection_name = self._config.collection
         request_data = {"operation": "readiness_count", "collection": collection_name}
         session = self._call_mode_session
-        operation_id = self._operation_id
-        coordination_token = self._coordination_token
-        if session is not None and (operation_id is None or coordination_token is None):
-            raise RetrievalError("Chroma replay/verify readiness requires an audited operation parent", retryable=False)
-        call_index: int | None = None
-        if operation_id is not None and coordination_token is not None:
-            call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+        call_index = self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         if session is not None and session.mode is RunMode.REPLAY:
-            assert operation_id is not None and coordination_token is not None and call_index is not None
             evidence = session.replay_call(
                 call_type=CallType.VECTOR,
                 request_data=request_data,
@@ -817,7 +840,6 @@ class ChromaSearchProvider:
                 else f"Collection '{collection_name}' is empty",
             )
         if session is not None and session.mode is RunMode.VERIFY:
-            assert operation_id is not None and call_index is not None
             session.admit_verify_call(
                 call_type=CallType.VECTOR,
                 request_data=request_data,
@@ -825,63 +847,33 @@ class ChromaSearchProvider:
                 current_operation_id=operation_id,
                 current_call_index=call_index,
             )
-        if self._collection is None:
-            self._initialize_client()
-
-        try:
-            count = self._collection.count()
-            if type(count) is not int or count < 0:
-                raise ValueError(f"malformed collection count: expected a non-negative exact int, got {count!r} ({type(count).__name__})")
-            if count > 0:
-                message = f"Collection '{collection_name}' has {count} documents"
-            else:
-                message = f"Collection '{collection_name}' is empty"
-            if operation_id is not None and coordination_token is not None:
-                assert call_index is not None
-                response_data = {"collection_count": count}
-                recorded = self._execution.record_operation_call(
-                    operation_id=operation_id,
-                    coordination_token=coordination_token,
-                    call_index=call_index,
-                    call_type=CallType.VECTOR,
-                    status=CallStatus.SUCCESS,
-                    request_data=RawCallPayload(request_data),
-                    response_data=RawCallPayload(response_data),
-                )
-                if session is not None and session.mode is RunMode.VERIFY:
-                    session.verify_call(
-                        call_type=CallType.VECTOR,
-                        request_data=request_data,
-                        current_state_id=None,
-                        current_operation_id=operation_id,
-                        current_call_index=call_index,
-                        current_call_id=recorded.call_id,
-                        live_status=CallStatus.SUCCESS,
-                        live_response_data=response_data,
-                        live_error_data=None,
-                    )
-            return CollectionReadinessResult(
-                collection=collection_name,
-                reachable=True,
-                count=count,
-                message=message,
+        readiness = self._live_readiness()
+        if not readiness.reachable:
+            return readiness
+        assert readiness.count is not None
+        response_data = {"collection_count": readiness.count}
+        recorded = self._execution.record_operation_call(
+            operation_id=operation_id,
+            coordination_token=coordination_token,
+            call_index=call_index,
+            call_type=CallType.VECTOR,
+            status=CallStatus.SUCCESS,
+            request_data=RawCallPayload(request_data),
+            response_data=RawCallPayload(response_data),
+        )
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.VECTOR,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=operation_id,
+                current_call_index=call_index,
+                current_call_id=recorded.call_id,
+                live_status=CallStatus.SUCCESS,
+                live_response_data=response_data,
+                live_error_data=None,
             )
-        except (chromadb.errors.ChromaError, ConnectionError, OSError, ValueError, httpx.HTTPError) as exc:
-            # ValueError: chromadb 1.5.5 raises plain ValueError on unreachable HTTP server.
-            # httpx.HTTPError: httpx transport errors inherit only from Exception,
-            # not from ChromaError/ConnectionError/OSError.
-            return CollectionReadinessResult(
-                collection=collection_name,
-                reachable=False,
-                count=None,
-                message=f"Collection '{collection_name}' unreachable: {type(exc).__name__}: {exc}",
-            )
-
-    def runtime_preflight(self, *, operation_id: str, coordination_token: CoordinationToken) -> CollectionReadinessResult:
-        """Run the collection check beneath the engine's preflight operation."""
-        self._operation_id = operation_id
-        self._coordination_token = coordination_token
-        return self.check_readiness()
+        return readiness
 
     def close(self) -> None:
         client = self._client

@@ -15,13 +15,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
-from tests.fixtures.mock_audit import mock_item_audit_authority
+from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
 
 chromadb = pytest.importorskip("chromadb")
 
-from elspeth.contracts.call_mode import ReplayCallEvidence  # noqa: E402
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence  # noqa: E402
 from elspeth.contracts.enums import CallStatus, CallType, RunMode  # noqa: E402
 from elspeth.core.security.web import SSRFSafeRequest  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError  # noqa: E402
@@ -44,6 +44,7 @@ class _FakeExecutionRecorder:
     call_indices: dict[str, int] = field(default_factory=dict)
     recorded_calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
+    operation_index_tokens: list[CoordinationToken] = field(default_factory=list)
 
     def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         index = self.call_indices.get(state_id, 0)
@@ -54,7 +55,8 @@ class _FakeExecutionRecorder:
         self.recorded_calls.append(kwargs)
         return _RecordedCall(call_id=f"call-{len(self.recorded_calls)}")
 
-    def allocate_operation_call_index(self, operation_id: str, **_kwargs: Any) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        self.operation_index_tokens.append(coordination_token)
         return len(self.operation_calls)
 
     def record_operation_call(self, **kwargs: Any) -> _RecordedCall:
@@ -1363,7 +1365,7 @@ class TestNegativeL2DistanceBoundary:
 
 class TestChromaCallMode:
     def test_verify_readiness_rejects_source_before_sdk_construction(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.VERIFY
         session.admit_verify_call.side_effect = RuntimeError("missing source readiness")
         with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
@@ -1374,11 +1376,11 @@ class TestChromaCallMode:
                 call_mode_session=session,
             )
             with pytest.raises(RuntimeError, match="missing source readiness"):
-                provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
             client.assert_not_called()
 
     def test_verify_search_rejects_source_before_sdk_construction(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.VERIFY
         session.admit_verify_call.side_effect = RuntimeError("ambiguous source search")
         with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
@@ -1396,7 +1398,7 @@ class TestChromaCallMode:
         collection_name = f"ready-{uuid.uuid4().hex[:12]}"
         collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
         collection.add(documents=["ready text"], ids=["doc-1"])
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.VERIFY
         execution = _fake_execution()
         provider = ChromaSearchProvider(
@@ -1405,8 +1407,11 @@ class TestChromaCallMode:
             run_id="verify-run",
             call_mode_session=session,
         )
-        readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+        token = mock_audit_authority(run_id="verify-run")["coordination_token"]
+        readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=token)
         assert readiness.count == 1
+        assert execution.operation_index_tokens == [token]
+        assert execution.operation_calls[0]["coordination_token"] is token
         assert execution.operation_calls[0]["response_data"].to_dict() == {"collection_count": 1}
         session.admit_verify_call.assert_called_once()
         session.verify_call.assert_called_once()
@@ -1416,7 +1421,7 @@ class TestChromaCallMode:
         collection_name = f"verify-{uuid.uuid4().hex[:12]}"
         collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
         collection.add(documents=["verified text"], ids=["doc-1"])
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.VERIFY
         execution = _fake_execution()
         provider = ChromaSearchProvider(
@@ -1434,7 +1439,7 @@ class TestChromaCallMode:
         assert compared["chunks"][0]["source_id"] == "doc-1"
 
     def test_replay_reconstructs_chunks_without_constructing_sdk_client(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.REPLAY
         session.replay_call.return_value = ReplayCallEvidence(
             source_call_id="source-vector",
@@ -1465,7 +1470,7 @@ class TestChromaCallMode:
         assert execution.only_recorded_call()["source_call_id"] == "source-vector"
 
     def test_replay_rejects_old_summary_only_vector_record_without_sdk_call(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.REPLAY
         session.replay_call.return_value = ReplayCallEvidence(
             source_call_id="old-vector",
@@ -1488,7 +1493,7 @@ class TestChromaCallMode:
         assert execution.recorded_calls == []
 
     def test_replay_rejects_corrupt_top_score_before_new_call(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.REPLAY
         session.replay_call.return_value = ReplayCallEvidence(
             source_call_id="corrupt-vector",
@@ -1516,7 +1521,7 @@ class TestChromaCallMode:
         assert execution.recorded_calls == []
 
     def test_replay_readiness_uses_archived_operation_count(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.REPLAY
         session.replay_call.return_value = ReplayCallEvidence(
             source_call_id="source-readiness",
@@ -1533,13 +1538,17 @@ class TestChromaCallMode:
                 run_id="replay-run",
                 call_mode_session=session,
             )
-            readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+            readiness = provider.runtime_preflight(
+                operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"]
+            )
+            with pytest.raises(RetrievalError, match="audited operation parent"):
+                provider.check_readiness()
         client.assert_not_called()
         assert readiness.count == 3
         assert execution.operation_calls[0]["source_call_id"] == "source-readiness"
 
     def test_replay_readiness_rejects_missing_count_without_sdk_access(self) -> None:
-        session = MagicMock()
+        session = MagicMock(spec=CallModeSession)
         session.mode = RunMode.REPLAY
         session.replay_call.return_value = ReplayCallEvidence(
             source_call_id="old-readiness",
@@ -1557,6 +1566,6 @@ class TestChromaCallMode:
                 call_mode_session=session,
             )
             with pytest.raises(RetrievalError, match="valid retained collection count"):
-                provider.runtime_preflight(operation_id="operation-1", coordination_token=MagicMock())
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
         client.assert_not_called()
         assert execution.operation_calls == []
