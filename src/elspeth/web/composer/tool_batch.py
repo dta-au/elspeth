@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
@@ -151,6 +152,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -452,14 +454,22 @@ def _replace_llm_tool_call_arguments(
     *,
     tool_call_id: str,
     arguments: Mapping[str, Any],
+    dialect: ToolContractDialect,
+    semantic: bool,
 ) -> None:
     """Replace the latest assistant call with custody-safe arguments.
 
     The compose loop appends the provider-authored assistant message before
     dispatch.  A subsequent provider turn must not receive raw inline bytes
     from that history after ELSPETH has intercepted them for proposal custody.
-    ``arguments`` are always the flat internal semantic shape; set_pipeline is
+    ``arguments`` are always the flat internal shape; set_pipeline is
     re-enveloped only while serializing the provider transcript.
+
+    ``semantic`` says whether ``arguments`` are the tool's semantic arguments
+    (encoded back to the wire form of ``dialect`` through
+    ``encode_semantic_arguments``) or a redaction sentinel, which keeps the
+    plain ``{"pipeline": ...}`` wrap. In S1 both give the same bytes, because
+    set_pipeline is non-strict on every dialect.
     """
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
@@ -478,7 +488,13 @@ def _replace_llm_tool_call_arguments(
             if "name" not in function or type(function["name"]) is not str:
                 raise AuditIntegrityError("Assistant tool call has malformed function envelope")
             function_name = function["name"]
-            provider_arguments: Mapping[str, Any] = {"pipeline": arguments} if function_name == "set_pipeline" else arguments
+            provider_arguments: Mapping[str, Any]
+            if function_name != "set_pipeline":
+                provider_arguments = arguments
+            elif semantic:
+                provider_arguments = encode_semantic_arguments(function_name, dialect, arguments)
+            else:
+                provider_arguments = {"pipeline": arguments}
             encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
             function["arguments"] = encoded
             return
@@ -653,6 +669,10 @@ class ToolBatchContext:
     cancellation_requested: asyncio.Event
     plugin_snapshot: PluginAvailabilitySnapshot
     policy_catalog: PolicyCatalogView
+    # The dialect the loop's tool list was sent under on this call. The
+    # service resolves it once and builds both the sent list and this context
+    # from the same value, so decode always reads the W that was sent.
+    tool_contract_dialect: ToolContractDialect
     session_operation_authority: SessionOperationAuthority | None = None
     # Driver turn counters and last persisted tool-call turn, read only when
     # the batch raises a ComposerConvergenceError (``turns_used`` and
@@ -661,6 +681,23 @@ class ToolBatchContext:
     composition_turns_used: int = 0
     discovery_turns_used: int = 0
     failed_turn: FailedTurnMetadata | None = None
+
+
+@dataclass(slots=True)
+class _CallWireFacts:
+    """One tool call's wire facts, filled in as ``run_tool_batch`` learns them.
+
+    Deliberately mutable: it is created at the top of each call's iteration
+    and captured by that iteration's ``_append_tool_outcome`` as a default
+    argument, and decode runs after the closure is defined, so a holder
+    avoids late binding through a loop variable. ``strict_sent`` follows
+    D16 (the ``strict`` key sent for the tool, ``None`` when none was sent)
+    and ``wire_conformant`` is ``None`` exactly where no arguments were
+    decoded.
+    """
+
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
 
 @dataclass(slots=True)
@@ -835,7 +872,17 @@ async def run_tool_batch(
                 llm_messages,
                 tool_call_id=tool_call.id,
                 arguments=unknown_audit_arguments,
+                dialect=ctx.tool_contract_dialect,
+                semantic=False,
             )
+        # The loop always sends every tool of the dialect's W, so the sent set
+        # is exactly its keys. A name outside it (hallucinated or unknown) is
+        # never decoded (D17): its arguments flow on as today, with no facts.
+        sent_wire_tools = _WIRE_TOOL_DEFS[ctx.tool_contract_dialect]
+        tool_was_sent = tool_name in sent_wire_tools
+        call_wire_facts = _CallWireFacts()
+        if tool_was_sent and ctx.tool_contract_dialect is ToolContractDialect.OPENAI_STRICT:
+            call_wire_facts.strict_sent = sent_wire_tools[tool_name].strict_capable
 
         def _append_tool_outcome(
             *,
@@ -847,6 +894,7 @@ async def run_tool_batch(
             _tool_outcomes: list[_ToolOutcome] = tool_outcomes,
             _tool_call: Any = tool_call,
             _pre_version: int = pre_version,
+            _wire: _CallWireFacts = call_wire_facts,
         ) -> None:
             _tool_outcomes.append(
                 _ToolOutcome(
@@ -857,6 +905,8 @@ async def run_tool_batch(
                     error_message=error_message,
                     pre_version=_pre_version,
                     post_version=post_version,
+                    strict_sent=_wire.strict_sent,
+                    wire_conformant=_wire.wire_conformant,
                 )
             )
 
@@ -887,13 +937,18 @@ async def run_tool_batch(
                     llm_messages,
                     tool_call_id=tool_call.id,
                     arguments=audit_arguments,
+                    dialect=ctx.tool_contract_dialect,
+                    semantic=False,
                 )
+            # No arguments were decoded, so wire_conformant stays None.
             audit = begin_dispatch(
                 tool_call.id,
                 tool_name,
                 audit_arguments,
                 version_before=state.version,
                 actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=call_wire_facts.wire_conformant,
             )
             error_payload = {"error": f"Invalid JSON in arguments: {exc}"}
             # JsonBoundaryError is ELSPETH's own final-in-practice class (no
@@ -945,12 +1000,16 @@ async def run_tool_batch(
             # canonicalized record wraps the (possibly scalar/list)
             # value under ``_decoded_non_object`` so the audit trail
             # captures it deterministically.
+            if tool_was_sent:
+                call_wire_facts.wire_conformant = False
             audit, canonicalization_failed = begin_dispatch_or_arg_error(
                 tool_call.id,
                 tool_name,
                 unknown_audit_arguments if unknown_audit_arguments is not None else {"_decoded_non_object": decoded_arguments},
                 version_before=state.version,
                 actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=call_wire_facts.wire_conformant,
             )
             error_category: ToolArgumentErrorCategory
             if canonicalization_failed is None:
@@ -992,11 +1051,16 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        if tool_name == "set_pipeline":
-            pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
-            if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
+        if tool_was_sent:
+            # Decode the provider arguments against the W that was sent:
+            # classify wire conformance, unwrap the set_pipeline envelope, and
+            # on openai_strict strip ``null`` at promoted positions. A
+            # malformed set_pipeline envelope is decode's only rejection.
+            try:
+                decoded = decode_wire_arguments(tool_name, ctx.tool_contract_dialect, decoded_arguments)
+            except ToolArgumentError as envelope_rejection:
+                call_wire_facts.wire_conformant = False
                 turn_has_mutation = True
-                envelope_rejection = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.WIRE_ENVELOPE)
                 audit_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                     "error_class": type(envelope_rejection).__name__,
@@ -1006,6 +1070,8 @@ async def run_tool_batch(
                     llm_messages,
                     tool_call_id=tool_call.id,
                     arguments=audit_arguments,
+                    dialect=ctx.tool_contract_dialect,
+                    semantic=False,
                 )
                 audit = begin_dispatch(
                     tool_call.id,
@@ -1013,6 +1079,8 @@ async def run_tool_batch(
                     audit_arguments,
                     version_before=state.version,
                     actor=actor,
+                    strict_sent=call_wire_facts.strict_sent,
+                    wire_conformant=call_wire_facts.wire_conformant,
                 )
                 envelope_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
                 error_payload = {"error": envelope_error}
@@ -1042,7 +1110,10 @@ async def run_tool_batch(
                 )
                 all_cache_hits = False
                 continue
-            arguments = cast(dict[str, Any], pipeline_arguments)
+            # From here on ``arguments`` is the decoded (semantic) form: S is
+            # the contract every later gate, handler and validator reads.
+            arguments = cast(dict[str, Any], deep_thaw(decoded.semantic))
+            call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
         if unknown_audit_arguments is not None:
@@ -1064,12 +1135,16 @@ async def run_tool_batch(
             audit_arguments,
             version_before=state.version,
             actor=actor,
+            strict_sent=call_wire_facts.strict_sent,
+            wire_conformant=call_wire_facts.wire_conformant,
         )
         if audit_arguments is not arguments:
             _replace_llm_tool_call_arguments(
                 llm_messages,
                 tool_call_id=tool_call.id,
                 arguments=audit_arguments,
+                dialect=ctx.tool_contract_dialect,
+                semantic=True,
             )
         if canonicalization_failed is not None:
             if is_discovery_tool(tool_name):
@@ -1303,6 +1378,8 @@ async def run_tool_batch(
                         llm_messages,
                         tool_call_id=tool_call.id,
                         arguments=audit_arguments,
+                        dialect=ctx.tool_contract_dialect,
+                        semantic=True,
                     )
                     interpretation_requirements_are_internal = True
             except BaseException as exc:
@@ -1405,6 +1482,8 @@ async def run_tool_batch(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
                                 arguments=audit_arguments,
+                                dialect=ctx.tool_contract_dialect,
+                                semantic=True,
                             )
                             interpretation_requirements_are_internal = True
                             redacted_arguments = redact_tool_call_arguments(
@@ -1439,6 +1518,8 @@ async def run_tool_batch(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
                                 arguments=arguments,
+                                dialect=ctx.tool_contract_dialect,
+                                semantic=True,
                             )
                             safe_candidate_context = replace(
                                 candidate_context,

@@ -2466,6 +2466,11 @@ class ComposerServiceImpl:
         self._catalog = catalog
         self._sessions_service = sessions_service
         self._model = settings.composer_model
+        # The tool-contract dialect of the compose loop's tool list. It is the
+        # single resolution point: the loop builds the list it sends and the
+        # dialect decode reads from this one value. Every route stays on
+        # ``none`` (today's bytes) until the strict transport resolution lands.
+        self._planner_dialect = ToolContractDialect.NONE
         # Boot advisory only — the litellm registry has known gaps (see
         # elspeth.web.composer.reasoning), so a False here is a log line for
         # operators, never a gate.
@@ -5650,6 +5655,7 @@ class ComposerServiceImpl:
             cancellation_requested=cancellation_requested,
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
+            tool_contract_dialect=self._planner_dialect,
             session_operation_authority=(turn_sessions_service.session_operation_authority if turn_sessions_service is not None else None),
             composition_turns_used=composition_turns_used,
             discovery_turns_used=discovery_turns_used,
@@ -7136,7 +7142,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
-        tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
+        tools = composer_loop_tool_definitions(self._planner_dialect)
         # Per-call audit recorder. Surfaced on ComposerResult and on
         # the three partial-state-carrier exceptions so the route handler
         # always has the per-call decision trail — including failure paths.

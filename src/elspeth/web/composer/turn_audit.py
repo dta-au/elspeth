@@ -236,6 +236,11 @@ async def persist_turn_audit(
                     "name": tc.function.name,
                     "arguments": json.dumps(persisted_arguments),
                 },
+                # The call's wire facts (D1): which strict key was sent for the
+                # tool and whether its raw arguments conformed to the W they
+                # were sent under. Always present; null when not applicable.
+                "strict_sent": tool_outcome.strict_sent,
+                "wire_conformant": tool_outcome.wire_conformant,
             },
         )
     redacted_tool_rows = tuple(

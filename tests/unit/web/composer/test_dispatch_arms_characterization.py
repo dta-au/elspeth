@@ -162,6 +162,8 @@ def test_server_rewrite_keeps_set_pipeline_wrapped_in_provider_transcript() -> N
         messages,
         tool_call_id="call_pipeline",
         arguments=semantic_arguments,
+        dialect=ToolContractDialect.NONE,
+        semantic=True,
     )
 
     encoded = messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -191,6 +193,8 @@ def test_server_rewrite_rejects_owned_function_envelope_without_name() -> None:
             messages,
             tool_call_id="call_pipeline",
             arguments={"source": {}, "nodes": [], "edges": [], "outputs": []},
+            dialect=ToolContractDialect.NONE,
+            semantic=True,
         )
 
 
