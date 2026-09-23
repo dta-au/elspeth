@@ -246,11 +246,16 @@ def test_pinned_thinking_budget_matches_the_installed_litellm() -> None:
         ("bedrock/global.anthropic.claude-sonnet-4-6", True),
         ("openrouter/anthropic/claude-sonnet-5", False),
         ("gpt-5.5", False),
+        # These routes also receive ``reasoning_effort``, but LiteLLM's
+        # Anthropic thinking-budget cap does not apply to them.
+        ("azure/gpt-5.5", False),
+        ("vertex_ai/gemini-2.5-pro", False),
     ],
 )
 def test_thinking_route_flag_follows_the_sent_request(settings_factory: Any, model: str, loop_unproven: bool) -> None:
     settings = settings_factory(composer_model=model, composer_discovery_reasoning_effort="low")
 
+    assert ("reasoning_effort" in _request(settings, "loop_tools").kwargs) is not model.startswith(("openrouter/", "gpt-"))
     assert _request(settings, "loop_tools").thinking_route_unproven is loop_unproven
     assert _request(settings, "planner_tools").thinking_route_unproven is False
 

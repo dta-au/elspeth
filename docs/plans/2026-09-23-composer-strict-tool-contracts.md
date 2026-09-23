@@ -721,8 +721,10 @@ where this differs from the bullets above, this paragraph is the current state.
   RED against the pre-S0b probe on assertion, with the reasoning-drop and token-cap mutation controls). Limit: the
   probe sends the default terminal contract, while production sends a request-scoped discovery subset and terminal
   contract, so tool *names* are compared there, not bytes.
-- **Anthropic/Bedrock thinking: logged, not raised.** The loop request keeps `max_tokens` 16. When it carries
-  `reasoning_effort` (only Anthropic/Bedrock-style routes get that key) and 16 ≤ LiteLLM's
+- **Anthropic/Bedrock thinking: logged, not raised.** The loop request keeps `max_tokens` 16. When the model is on
+  an Anthropic-family route (`supports_anthropic_prompt_cache_markers`), the request carries `reasoning_effort`
+  (`openrouter/` gets the `reasoning` object instead, and `azure/` or `vertex_ai/gemini-*` get `reasoning_effort`
+  but no thinking-budget cap), and 16 ≤ LiteLLM's
   `ANTHROPIC_MIN_THINKING_BUDGET_TOKENS` (1024, pinned against the installed LiteLLM together with the
   `cap_thinking_budget_to_max_tokens` behaviour), a successful probe logs `composer_boot_probe_thinking_route_unproven`.
   The `planner_tools` request (the planner's 16,384 tokens) exercises the thinking route on the same model and

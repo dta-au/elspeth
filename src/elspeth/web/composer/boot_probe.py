@@ -113,17 +113,20 @@ class ComposerProbeRequest:
 
     @property
     def thinking_route_unproven(self) -> bool:
-        """Whether LiteLLM would drop Anthropic/Bedrock thinking from this request.
+        """Whether LiteLLM would drop Anthropic extended thinking from this request.
 
-        Only Anthropic- and Bedrock-style routes receive the ``reasoning_effort``
-        key from ``apply_reasoning_kwargs`` (OpenRouter gets ``reasoning`` and
-        OpenAI-surface names get nothing). On those routes a ``max_tokens`` at
-        or below the minimum thinking budget makes LiteLLM send the request
-        without thinking, so the thinking route production uses (the loop sends
-        no ``max_tokens``) is not exercised by this request.
+        On Anthropic-family routes that receive ``reasoning_effort`` (native
+        ``anthropic/``, Bedrock and Vertex Claude; ``openrouter/`` gets the
+        ``reasoning`` object instead), LiteLLM sends the request without
+        thinking when ``max_tokens`` is at or below the minimum thinking
+        budget. The thinking route production uses (the loop sends no
+        ``max_tokens``) is then not exercised by this request. Other routes
+        that receive ``reasoning_effort`` (for example ``azure/`` or
+        ``vertex_ai/gemini-*``) have no such cap, so the flag is off there.
         """
         return (
-            "reasoning_effort" in self.kwargs
+            supports_anthropic_prompt_cache_markers(self.model)
+            and "reasoning_effort" in self.kwargs
             and "max_tokens" in self.kwargs
             and self.kwargs["max_tokens"] <= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
         )

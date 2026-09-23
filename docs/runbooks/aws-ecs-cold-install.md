@@ -860,7 +860,8 @@ curl --fail --silent --show-error --cacert "$CA_FILE" \
     '
 ```
 
-Readiness confirms both Composer boot probes completed through the ECS task
+Readiness confirms the Composer boot probes (the planner model's two
+tool-bearing requests and the advisor request) completed through the ECS task
 role. For release evidence, also make one authenticated Composer request and
 follow the Bedrock/guardrail lane in the
 [full acceptance runbook](aws-ecs-deployment.md).
