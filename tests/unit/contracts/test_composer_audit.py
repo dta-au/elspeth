@@ -153,6 +153,49 @@ def test_non_arg_error_to_dict_carries_null_category() -> None:
     assert _make_invocation().to_dict()["error_category"] is None
 
 
+# --- Wire facts (S1 T5, D16/C23) --------------------------------------------
+# ``strict_sent`` mirrors the ``strict`` key sent for the tool (``True``,
+# ``False`` for an explicit ``strict:false``, ``None`` when no key was sent).
+# ``wire_conformant`` is ``None`` exactly where no arguments were decoded.
+# There is no implication between them.
+
+
+def test_wire_facts_default_to_none() -> None:
+    inv = _make_invocation()
+    assert inv.strict_sent is None
+    assert inv.wire_conformant is None
+
+
+@pytest.mark.parametrize("strict_sent", [True, False, None])
+@pytest.mark.parametrize("wire_conformant", [True, False, None])
+def test_wire_facts_accept_every_exact_bool_or_none_pair(strict_sent: bool | None, wire_conformant: bool | None) -> None:
+    """Includes ``strict_sent=None`` with ``wire_conformant=False``: a decoded call on the ``none`` dialect."""
+    inv = _make_invocation(strict_sent=strict_sent, wire_conformant=wire_conformant)
+    assert inv.strict_sent is strict_sent
+    assert inv.wire_conformant is wire_conformant
+
+
+@pytest.mark.parametrize("field_name", ["strict_sent", "wire_conformant"])
+@pytest.mark.parametrize("value", [1, 0, "true", "false"], ids=["int-1", "int-0", "str-true", "str-false"])
+def test_wire_facts_must_be_exact_bool_or_none(field_name: str, value: object) -> None:
+    with pytest.raises(TypeError, match=field_name):
+        _make_invocation(**{field_name: value})
+
+
+def test_to_dict_carries_the_wire_facts() -> None:
+    d = _make_invocation(strict_sent=False, wire_conformant=True).to_dict()
+    assert d["strict_sent"] is False
+    assert d["wire_conformant"] is True
+
+
+def test_to_dict_carries_null_wire_facts_rather_than_omitting_them() -> None:
+    d = _make_invocation().to_dict()
+    assert "strict_sent" in d
+    assert d["strict_sent"] is None
+    assert "wire_conformant" in d
+    assert d["wire_conformant"] is None
+
+
 def test_plugin_crash_invocation_shape() -> None:
     """PLUGIN_CRASH must record class-name only (no message detail) and version_after=None."""
     inv = _make_invocation(

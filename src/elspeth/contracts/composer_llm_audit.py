@@ -185,6 +185,13 @@ class ComposerLLMCall:
     as the fixed :data:`PROVIDER_SERVED_UNRECOGNISED` token, and absence as
     ``None``. This contract enforces the same shape, because the persisted
     audit projection exposes the field.
+
+    ``tool_contract_dialect`` and ``strict_tool_count`` say which
+    :class:`ToolContractDialect` the transmitted tool list was sent under and
+    how many of its tools carried ``strict: true``. The capture point derives
+    both from the same ``tools`` list that ``tools_spec_hash`` covers. They are
+    both ``None`` when the call carried no tools, and a ``none`` dialect always
+    has a count of ``0``.
     """
 
     model_requested: str
@@ -221,10 +228,23 @@ class ComposerLLMCall:
     planner_call_ordinal: int | None = None
     call_id: str | None = None
     provider_served: str | None = None
+    tool_contract_dialect: ToolContractDialect | None = None
+    strict_tool_count: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
+        if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
+            raise TypeError(f"tool_contract_dialect must be ToolContractDialect or None, got {type(self.tool_contract_dialect).__name__}")
+        if self.strict_tool_count is not None:
+            if type(self.strict_tool_count) is not int:
+                raise TypeError(f"strict_tool_count must be int or None, got {type(self.strict_tool_count).__name__}")
+            if self.strict_tool_count < 0:
+                raise ValueError(f"strict_tool_count must be >= 0, got {self.strict_tool_count}")
+        if (self.tool_contract_dialect is None) != (self.strict_tool_count is None):
+            raise ValueError("tool_contract_dialect and strict_tool_count must be supplied together")
+        if self.tool_contract_dialect is ToolContractDialect.NONE and self.strict_tool_count != 0:
+            raise ValueError("a tool list sent under the none dialect carries no strict tools")
         _require_non_empty_str(self.model_requested, "model_requested")
         _require_non_empty_str(self.pricing_model, "pricing_model", optional=True)
         _require_non_empty_str(self.call_id, "call_id", optional=True)
@@ -318,6 +338,7 @@ class ComposerLLMCall:
         """JSON-friendly dict for sidecar serialization."""
         raw = {field.name: deep_thaw(getattr(self, field.name)) for field in fields(self)}
         raw["status"] = self.status.value
+        raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw

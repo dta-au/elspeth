@@ -370,6 +370,8 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "planner_policy_hash",
     "planner_call_ordinal",
     "provider_served",
+    "tool_contract_dialect",
+    "strict_tool_count",
 )
 
 
@@ -569,6 +571,11 @@ class DispatchAudit:
     ``version_before`` regardless of which path the call ultimately
     follows. The branch-specific finalizers (``finish_*``) read fields
     from here to construct the final :class:`ComposerToolInvocation`.
+
+    ``strict_sent`` and ``wire_conformant`` are the wire facts the caller
+    knew before dispatch (see :class:`ComposerToolInvocation`); every
+    finalizer copies them onto the invocation. ``None`` means unknown or not
+    applicable.
     """
 
     tool_call_id: str
@@ -581,6 +588,8 @@ class DispatchAudit:
     actor: str
     authority_arguments_canonical: str | None = None
     authority_arguments_hash: str | None = None
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     @property
     def binding_arguments_hash(self) -> str:
@@ -595,6 +604,8 @@ def begin_dispatch(
     *,
     version_before: int,
     actor: str,
+    strict_sent: bool | None = None,
+    wire_conformant: bool | None = None,
 ) -> DispatchAudit:
     """Open a per-call audit envelope.
 
@@ -604,6 +615,10 @@ def begin_dispatch(
     object so the audit trail still records what the LLM tried even
     when it wasn't valid JSON. Truncation guards against unbounded
     audit-row sizes for pathological LLM output.
+
+    ``strict_sent`` / ``wire_conformant`` are the caller's wire facts for
+    this call. Callers that sent no wire schema (MCP-shaped paths, guided,
+    commit) leave the ``None`` defaults; the compose loop passes them.
     """
     if isinstance(arguments, str):
         # 4 KiB is the same boundary as POSIX PIPE_BUF — a sane upper
@@ -632,6 +647,8 @@ def begin_dispatch(
         actor=actor,
         authority_arguments_canonical=authority_canon,
         authority_arguments_hash=authority_hash,
+        strict_sent=strict_sent,
+        wire_conformant=wire_conformant,
     )
 
 
@@ -642,6 +659,8 @@ def begin_dispatch_or_arg_error(
     *,
     version_before: int,
     actor: str,
+    strict_sent: bool | None = None,
+    wire_conformant: bool | None = None,
 ) -> tuple[DispatchAudit, BaseException | None]:
     """Open an audit envelope without letting malformed args bypass audit.
 
@@ -660,6 +679,8 @@ def begin_dispatch_or_arg_error(
                 arguments,
                 version_before=version_before,
                 actor=actor,
+                strict_sent=strict_sent,
+                wire_conformant=wire_conformant,
             ),
             None,
         )
@@ -683,6 +704,8 @@ def begin_dispatch_or_arg_error(
                 started_at=datetime.now(UTC),
                 started_ns=time.monotonic_ns(),
                 actor=actor,
+                strict_sent=strict_sent,
+                wire_conformant=wire_conformant,
             ),
             exc,
         )
@@ -785,6 +808,8 @@ def finish_success(
         cache_hit=cache_hit,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
@@ -836,6 +861,8 @@ def finish_arg_error(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
         error_category=error_category,
     )
 
@@ -873,6 +900,8 @@ def finish_cancelled(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
@@ -917,6 +946,8 @@ def finish_plugin_crash(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
