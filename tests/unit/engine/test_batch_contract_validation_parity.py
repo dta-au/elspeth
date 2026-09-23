@@ -55,13 +55,23 @@ class _StrictItemSchema(PluginSchema):
     item: int
 
 
+class _ObservedSchema(PluginSchema):
+    """An observed contract: no declared fields, any extra admitted."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
+
+
 class _FakeBatchTransform:
     """Minimal `BatchTransformProtocol` surface the validators actually read."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, input_schema: type[PluginSchema] = _StrictItemSchema, required: frozenset[str] = frozenset()) -> None:
         self.name = "fake_batch"
-        self.input_schema: type[PluginSchema] = _StrictItemSchema
+        self.input_schema: type[PluginSchema] = input_schema
         self.output_schema: type[PluginSchema] = _StrictItemSchema
+        self._required = required
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        return self._required
 
 
 # A row value that must never reach an audit message.
@@ -174,3 +184,48 @@ class TestSharedValidators:
         assert message.startswith(f"{node_kind} transform 'fake_batch' output validation failed for emitted row 0: ")
         assert "[int_type]" in message
         assert _SENTINEL not in message
+
+    def test_a_buffered_row_omitting_a_declared_field_is_rejected_without_its_content(self, node_kind: str) -> None:
+        """An observed model cannot see ``required_fields``; the presence check does (R1).
+
+        The offending row carries a sentinel in ANOTHER column. Neither that
+        value nor that column's name may reach the message: under an observed
+        source a row's keys are row content too, so only the CONFIGURED field
+        is named.
+        """
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score", "variant"}))
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_batch_inputs(
+                transform,
+                [_row({"score": 1, "variant": "a"}), _row({"variant": "b", "sentinel_column": _SENTINEL})],
+                node_kind=node_kind,
+            )
+
+        assert str(excinfo.value) == (
+            f"{node_kind} transform 'fake_batch' input validation failed for buffered row 1: "
+            "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+        )
+        assert _SENTINEL not in str(excinfo.value)
+        assert "sentinel_column" not in str(excinfo.value)
+
+    def test_presence_is_reported_before_the_model(self, node_kind: str) -> None:
+        """A row both missing a declared field and failing the model reports the absence.
+
+        Same ordering as the per-row preflight, whose declaration check runs
+        before ``model_validate`` so a missing field is not diluted into a
+        schema failure.
+        """
+        transform = _FakeBatchTransform(required=frozenset({"item"}))
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind)
+
+        assert "required input field(s) ['item'] absent" in str(excinfo.value)
+        assert "validation error" not in str(excinfo.value)
+
+    def test_a_declared_field_present_as_none_is_not_absent(self, node_kind: str) -> None:
+        """Presence, not value: a present ``None`` is the plugin's to count as missing."""
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score"}))
+
+        validate_batch_inputs(transform, [_row({"score": None})], node_kind=node_kind)

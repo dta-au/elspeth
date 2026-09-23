@@ -685,6 +685,15 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
         """
         ...
 
+    def schema_required_input_fields(self) -> frozenset[str]:
+        """Return the fields every buffered row must carry before ``process`` runs.
+
+        The transform's ``schema.required_fields``, including the columns it
+        folds in from its own options. Batch-only: the flush preflight
+        (``engine.executors.batch_contract_validation``) is its one consumer.
+        """
+        ...
+
     # Error routing configuration
     # Injected by runtime_factory.py bridge from AggregationSettings/TransformSettings.
     on_error: str | None

@@ -114,6 +114,12 @@ class _FakeCollectorTransform:
     # unaffected; a test that wants the preflight to BITE swaps in a strict one.
     input_schema: type[PluginSchema] = _EngineTestSchema
     output_schema: type[PluginSchema] = _EngineTestSchema
+    # The declared presence requirement the flush preflight enforces (R1); a
+    # test that wants the presence check to BITE sets a field name here.
+    declared_required_columns: frozenset[str] = frozenset()
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        return self.declared_required_columns
 
     def __init__(self, name: str = "recording_stitch") -> None:
         self.name = name
@@ -1141,6 +1147,36 @@ class TestFlushContractPreflight:
 
         assert outcome.held is False
         assert env.transform.call_count == 1
+
+    @pytest.mark.parametrize(("declared", "fails"), [("score", True), ("item", False)], ids=["absent", "present-control"])
+    def test_a_member_omitting_a_declared_required_field_fails_the_group(
+        self, collector_env: _CollectorEnv, declared: str, fails: bool
+    ) -> None:
+        """elspeth-5887fb7928 R1: the permissive model cannot see the declaration; the presence check does.
+
+        Before, the plugin's own ``row[field]`` raised KeyError and the run
+        ended. The control declares a field every member carries, so the check
+        must discriminate rather than fail every group.
+        """
+        env = collector_env
+        env.transform.declared_required_columns = frozenset({declared})
+        members, _group_id = env.seed_group(count=1)
+
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        if not fails:
+            assert outcome.failure_reason is None
+            assert env.transform.call_count == 1
+            return
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert env.transform.call_count == 0
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["phase"] == "collector_flush"
+        assert flush_error["exception"] == (
+            "Collector transform 'recording_stitch' input validation failed for buffered row 0: "
+            "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+        )
 
 
 def test_collector_flush_plugin_exception_autofails_with_phase(collector_env: _CollectorEnv) -> None:

@@ -1196,9 +1196,31 @@ class BaseTransform(ABC):
         in this shape is forced to declare its intent rather than lose the
         requirement quietly.
         """
+        return self.declared_input_fields | self.schema_required_input_fields() | self._config_named_input_columns()
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        """Fields every arriving row must CARRY: this transform's ``schema.required_fields``.
+
+        The authored ``required_fields`` plus whatever the transform folds in
+        itself — every batch transform that reads a configured column
+        (``value_field``, ``group_by``, ``inspect_fields`` …) injects it here on
+        its rebuilt SchemaConfig. This is the runtime presence requirement
+        ``batch_contract_validation.validate_batch_inputs`` enforces on every
+        buffered row before a batch plugin runs (elspeth-5887fb7928 R1).
+
+        Deliberately NOT ``consumed_input_fields``: that one also counts every
+        column a config option names, defaults included, because demotion must
+        fail toward requiredness. Rejecting on it would reject rows for a column
+        a transform reads only when present (``batch_replicate.copies_field``).
+
+        ``_schema_config is None`` is a transform that never validated a config
+        (see the attribute's comment): it declares no requirement, so the empty
+        set is the declaration, not a skipped check.
+        """
         schema_config = self._schema_config
-        declared_required = frozenset(schema_config.required_fields or ()) if schema_config is not None else frozenset()
-        return self.declared_input_fields | declared_required | self._config_named_input_columns()
+        if schema_config is None:
+            return frozenset()
+        return frozenset(schema_config.required_fields or ())
 
     def _config_named_input_columns(self) -> frozenset[str]:
         """Column names this transform's own config options point at for READING.

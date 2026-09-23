@@ -29,7 +29,16 @@ from unittest.mock import Mock, create_autospec, patch
 import pytest
 
 # For node registration
-from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, TokenInfo, TransformProtocol, TransformResult
+from elspeth.contracts import (
+    BatchTransformProtocol,
+    NodeType,
+    RouteDestination,
+    RowResult,
+    SourceRow,
+    TokenInfo,
+    TransformProtocol,
+    TransformResult,
+)
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
@@ -674,8 +683,8 @@ def _make_mock_transform(
     creates_tokens: bool = False,
     result: TransformResult | None = None,
 ) -> Mock:
-    """Create a mock transform satisfying TransformProtocol."""
-    transform = Mock(spec=TransformProtocol)
+    """Create a mock transform satisfying TransformProtocol, or BatchTransformProtocol when batch-aware."""
+    transform = Mock(spec=BatchTransformProtocol if is_batch_aware else TransformProtocol)
     transform.node_id = node_id
     transform.name = name
     transform.on_error = on_error
@@ -696,6 +705,9 @@ def _make_mock_transform(
     transform.output_schema = _PermissiveSchema
     transform._output_schema_config = None
     transform.effective_static_contract.return_value = frozenset()
+    if is_batch_aware:
+        # No declared required column: the flush preflight's presence check passes every row.
+        transform.schema_required_input_fields.return_value = frozenset()
     if result is not None:
         transform.process.return_value = result
     return transform

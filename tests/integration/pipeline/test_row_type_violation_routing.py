@@ -929,6 +929,262 @@ def test_a_row_failing_a_typed_collector_schema_fails_its_group_and_the_run_goes
     assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
 
 
+# ---------------------------------------------------------------------------
+# A buffered row that OMITS a field the batch transform declares required
+# (elspeth-5887fb7928 R1). The observed input model has no fields, so pydantic
+# never saw ``value_field``, and the row reached the plugin's ``row[field]`` as
+# a raw KeyError: exit 4, a traceback, every buffered token undecided. The flush
+# preflight now enforces the declared set and routes the batch like any other
+# contract violation. The omitting row carries a sentinel in ANOTHER column,
+# which must reach the on_error sink (the row, intact) and nothing in the audit
+# trail's text except the row itself.
+# ---------------------------------------------------------------------------
+
+_MISSING_FIELD_SENTINEL = "SENTINEL-R1-note-0b7e"
+_MISSING_FIELD_ROWS = (
+    {"id": 1, "v": 1.5},
+    {"id": 2, "v": 2.5},
+    {"id": 3, "v": 0.5},
+    {"id": 4, "note": _MISSING_FIELD_SENTINEL},
+)
+
+
+def _missing_field_aggregation_settings(tmp_path: Any, *, trigger: str) -> str:
+    _write_jsonl(tmp_path / "input.jsonl", _MISSING_FIELD_ROWS)
+    trigger_block = "  trigger:\n    count: 2\n" if trigger == "count" else ""
+    return f"""sources:
+  primary:
+    plugin: json
+    on_success: batch_in
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+aggregations:
+- name: thresholds
+  plugin: batch_threshold_summary
+  input: batch_in
+  on_success: output
+  on_error: quarantine
+{trigger_block}  output_mode: transform
+  options:
+    value_field: v
+    thresholds:
+    - name: hi
+      operator: '>='
+      value: 1
+    schema:
+      mode: observed
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "output.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+
+
+@pytest.mark.parametrize(
+    ("trigger", "failed_rows", "offending_index", "expected_status"),
+    [
+        # count: 2 -> batch (1, 2) succeeds, batch (3, 4) fails on its row 1.
+        pytest.param("count", _MISSING_FIELD_ROWS[2:], 1, RunStatus.COMPLETED_WITH_FAILURES, id="count"),
+        # end of source -> one batch of four fails on its row 3.
+        pytest.param("end_of_source", _MISSING_FIELD_ROWS, 3, RunStatus.FAILED, id="end_of_source"),
+    ],
+)
+def test_a_buffered_row_missing_a_declared_field_routes_the_whole_batch_to_on_error(
+    trigger: str,
+    failed_rows: tuple[dict[str, Any], ...],
+    offending_index: int,
+    expected_status: RunStatus,
+    tmp_path: Any,
+) -> None:
+    """Before R1 this aborted the run: exit 4, ``KeyError: 'v'`` from inside the plugin."""
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _missing_field_aggregation_settings(tmp_path, trigger=trigger))
+
+    assert cli.exit_code == cli_completion_for(expected_status)[1], cli.output
+    assert "Traceback" not in cli.output
+    assert "KeyError" not in cli.output
+
+    # The whole failed batch reaches on_error with its values intact.
+    assert _read_jsonl(tmp_path / "quarantine.jsonl") == list(failed_rows)
+    released = _read_jsonl(tmp_path / "output.jsonl")
+    if trigger == "count":
+        [summary] = released
+        assert (summary["batch_size"], summary["valid_count"]) == (2, 2)
+    else:
+        assert released == []
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [run_id] = conn.execute(select(token_outcomes_table.c.run_id).distinct()).scalars().all()
+    audit = _failed_flush_audit(db, run_id)
+
+    routed = [
+        outcome
+        for outcome in audit["outcomes"]
+        if (outcome.outcome, outcome.path) == (TerminalOutcome.FAILURE.value, TerminalPath.ON_ERROR_ROUTED.value)
+    ]
+    assert len(routed) == len(failed_rows)
+    assert {outcome.sink_name for outcome in routed} == {"quarantine"}
+
+    [failed_state] = audit["failed_states"]
+    reason = json.loads(failed_state.error_json)
+    assert reason == {
+        "reason": "contract_violation",
+        "error": (
+            f"Aggregation transform 'batch_threshold_summary' input validation failed for buffered row {offending_index}: "
+            "required input field(s) ['v'] absent from the row. The transform's schema declares them required."
+        ),
+    }
+    [routing] = audit["routing"]
+    assert (routing.mode, routing.label, routing.state_id) == ("divert", "__error_thresholds__", failed_state.state_id)
+    assert [batch.status for batch in audit["batches"] if batch.status == "failed"] == ["failed"]
+    assert len(audit["transform_errors"]) == len(failed_rows)
+    for error_row in audit["transform_errors"]:
+        assert error_row.destination == "quarantine"
+        assert json.loads(error_row.error_details_json) == reason
+
+    # The omitting row's own value is kept only as the row itself (positive control).
+    assert _audit_cells_containing(db, _MISSING_FIELD_SENTINEL) == [("transform_errors", "row_data_json")]
+
+
+def _missing_field_collector_settings(tmp_path: Any) -> str:
+    # The document-level ``score`` is copied onto every exploded page. DOC-2
+    # omits it and carries a sentinel note instead.
+    _write_jsonl(
+        tmp_path / "docs.jsonl",
+        (
+            {"doc_id": "DOC-1", "score": 0.9, "pages": [1, 2, 3]},
+            {"doc_id": "DOC-2", "note": _MISSING_FIELD_SENTINEL, "pages": [4, 5]},
+        ),
+    )
+    return f"""sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "docs.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+concurrency:
+  max_workers: 1
+transforms:
+- name: explode_pages
+  plugin: json_explode
+  input: rows
+  on_success: pages
+  on_error: discard
+  options:
+    array_field: pages
+    output_field: page
+    schema:
+      mode: observed
+collectors:
+- name: page_scores
+  plugin: batch_threshold_summary
+  input: pages
+  on_success: out
+  options:
+    value_field: score
+    thresholds:
+    - name: hi
+      operator: '>='
+      value: 0.5
+    schema:
+      mode: observed
+scopes:
+- name: document_pages
+  opener: explode_pages
+  closer: page_scores
+  policy: require_all
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+
+
+def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_the_run_goes_on(tmp_path: Any) -> None:
+    """Before R1 this aborted the run: exit 4, ``KeyError: "'score' not found in schema contract"``."""
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import node_states_table, nodes_table
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    cli = _run_cli(tmp_path, _missing_field_collector_settings(tmp_path))
+
+    # DOC-1's group released; DOC-2's group failed: COMPLETED_WITH_FAILURES, exit 1.
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+    assert "KeyError" not in cli.output
+
+    [released] = _read_jsonl(tmp_path / "out.jsonl")
+    assert (released["value_field"], released["batch_size"]) == ("score", 3)
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [collector_node_id] = (
+            conn.execute(select(nodes_table.c.node_id).where(nodes_table.c.plugin_name == "batch_threshold_summary")).scalars().all()
+        )
+        states = conn.execute(select(node_states_table).where(node_states_table.c.node_id == collector_node_id)).all()
+        outcomes = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.completed == 1)).all()
+
+    assert not [state for state in states if state.status == "open"], "no member hold may be left OPEN"
+    failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
+    [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
+    assert flush_error["phase"] == "collector_flush"
+    assert flush_error["exception"] == (
+        "Collector transform 'batch_threshold_summary' input validation failed for buffered row 0: "
+        "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+    )
+    member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
+    assert len(member_errors) == 2
+    assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
+    # Both DOC-2 pages are decided (failed), not left pending.
+    failed_pages = [o for o in outcomes if (o.outcome, o.path) == (TerminalOutcome.FAILURE.value, TerminalPath.UNROUTED.value)]
+    assert len(failed_pages) == 2
+
+    assert _audit_cells_containing(db, _MISSING_FIELD_SENTINEL) == []
+
+
 # Each page value is inside the JSON safe integer range (2**53 - 1 =
 # 9007199254740991), so the source and the explode hash them cleanly; the
 # collector's batch_stats keeps an int sum an int, and the two of them add up

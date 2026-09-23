@@ -431,6 +431,10 @@ class _AggregationTransformDouble:
         self.output_schema = _PermissiveSchema
         self.process = _CallRecorder()
 
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # Declares no required column, so the flush preflight's presence check passes every row.
+        return frozenset()
+
 
 def _make_aggregation_transform(name: str = "agg_transform") -> _AggregationTransformDouble:
     return _AggregationTransformDouble(name=name)
@@ -4144,6 +4148,9 @@ class TestAggregationExecutor:
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
 
+            def schema_required_input_fields(self) -> frozenset[str]:
+                return frozenset()
+
             def process(self, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
                 # ctx.aggregation_batch must be set by AggregationExecutor before process()
                 if ctx.aggregation_batch is None:
@@ -4286,6 +4293,9 @@ class TestAggregationExecutor:
             name = "capturing_agg"
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
+
+            def schema_required_input_fields(self) -> frozenset[str]:
+                return frozenset()
 
             def process(self, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
                 if ctx.aggregation_batch is None:
