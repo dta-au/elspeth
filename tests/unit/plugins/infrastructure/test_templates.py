@@ -89,10 +89,12 @@ def test_context_transport_rejects_oversized_mapping_key_before_serialization():
         template_infrastructure._pack_context_value({"x" * (9 * 1024 * 1024): "small"})
 
 
-def test_context_transport_rejects_oversized_tuple_subclass_before_serialization():
+def test_context_transport_rejects_oversized_frozen_carriers_before_serialization():
     named_values = namedtuple("NamedValues", "text")
-    with pytest.raises(TemplateError, match="parent packing limit"):
-        template_infrastructure._pack_context_value({"value": named_values("x" * (9 * 1024 * 1024))})
+    large_text = "x" * (9 * 1024 * 1024)
+    for value in (named_values(large_text), frozenset((large_text,))):
+        with pytest.raises(TemplateError, match="parent packing limit"):
+            template_infrastructure._pack_context_value({"value": value})
 
 
 def test_context_transport_rejects_large_row_before_deep_export(monkeypatch: pytest.MonkeyPatch):

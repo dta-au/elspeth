@@ -148,8 +148,8 @@ def _pack_context_value(
             packed = FrozenJsonArray(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
         elif type(value) is tuple:
             packed = tuple(_pack_context_value(item, depth=depth + 1, memo=memo, active=active, budget=budget) for item in value)
-        elif isinstance(value, tuple):
-            # deep_freeze preserves tuple subclasses when children are already
+        elif isinstance(value, (tuple, frozenset)):
+            # deep_freeze preserves these carriers when children are already
             # frozen; charge their expanded payload before pickle sees them.
             _charge_row_export(value, budget, depth=depth)
             if budget[1] > _MAX_CONTEXT_BYTES:
