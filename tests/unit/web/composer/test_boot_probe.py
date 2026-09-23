@@ -8,6 +8,7 @@ real ``compose()`` turns is pinned in
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -395,13 +396,19 @@ async def test_probe_propagates_programmer_errors(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.asyncio
 async def test_probe_sends_a_copy_and_leaves_the_request_unchanged(monkeypatch: pytest.MonkeyPatch, settings_factory: Any) -> None:
-    async def complete(**kwargs: object) -> object:
-        kwargs["extra_headers"] = {"mutated": "yes"}
+    # LiteLLM and the OpenRouter helpers mutate the request they are handed, at
+    # nested levels too. Python already gives the callee a fresh top-level dict
+    # (``**kwargs``), so only nested mutation can tell a copy from a shared
+    # object (Codex review of S0). The snapshot is an independent deep copy.
+    async def complete(**kwargs: Any) -> object:
+        kwargs["messages"][0]["content"] = "mutated"
+        kwargs["tools"][0]["function"]["description"] = "mutated"
+        kwargs["tools"].append({"type": "function", "function": {"name": "mutated"}})
         return _ok_response()
 
     monkeypatch.setattr(bp, "_litellm_acompletion", complete)
     request = _request(settings_factory(), "loop_tools")
-    before = request.to_litellm_kwargs()
+    before = copy.deepcopy(request.to_litellm_kwargs())
 
     assert await bp.probe_composer_config(request) is True
     assert request.to_litellm_kwargs() == before

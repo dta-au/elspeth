@@ -806,6 +806,15 @@ which fails identically at `release/0.8.1`.
   `other_failure:cancelled` / `other_failure:plugin_crash` (`appendix-a-fixture.log`). Negative control: an
   unregistered code in the rejection row gives `rejected:<redacted-response-text>` and the check fails
   (`appendix-a-fixture-negative.log`). The script is `s0-fix/appendix_a_fixture.py` in the lane.
+- **Codex review (gpt-6-astra, medium, read-only) of `4574ee7c9`.** It confirmed the planner tool lists are
+  byte-identical to `release/0.8.1` (42 loop tools, 63,872 bytes, same SHA-256; the lead measured 96,240 bytes for
+  the loop and planner lists together) and found no production defect. Two findings were confirmed and fixed:
+  (1) the census missed `type(X).__name__` writers, so a builtin exception built only to be named passed. The rule
+  (§5.1) now names owned rejections explicitly, and the census resolves each `X` to a caught exception, a parameter
+  or an owned rejection constructor, with two reviewed origins. Mutating `tool_batch.py`'s non-object gate to build a
+  `TypeError` is flagged; the unmutated tree is clean. (2) The boot-probe copy test mutated only the top level of
+  `kwargs`, which `**kwargs` already copies; it now mutates nested messages and tools against a deep snapshot, and a
+  shared-object `to_litellm_kwargs` fails it on the assertion.
 - **Still owed before merge:** the full-suite gate (`--stages ruff,mypy,contracts,lints,pytest`), and acceptance 2
   (a dev session persisting `plugin_options_invalid` / `prompt_template_parts_required`), 4 (a dev-deployment boot
   with the logged total probe time, which is also the only measurement of `planner_tools` latency at candidate
@@ -1125,10 +1134,16 @@ set_pipeline and upsert_node stay non-strict under these caps unless S itself ge
 
 ### 5.1 Honest labels
 
-- `error_class` records the exception class that was actually raised: `ToolArgumentError`, `JSONDecodeError`,
-  `JsonBoundaryError`, `CanonicalizationError`, and so on. No site writes a class name that was not raised. This is
-  gated by the S0 producer-census test over every string-literal `error_class` writer (S0 acceptance 1), not by a
-  grep for two names.
+- `error_class` records either the exception class actually raised and caught (`JSONDecodeError`,
+  `JsonBoundaryError`, `CanonicalizationError`, and so on), or an ELSPETH-owned rejection type (`ToolArgumentError`,
+  `PipelinePlannerError`) for a rejection the server decided without raising. It never names a builtin exception that
+  nothing raised. Several pre-dispatch gates (non-object, envelope, missing paths, advisor prompt budget) build a
+  `ToolArgumentError` and record it without raising; raising and immediately catching it would add control flow for
+  no gain, so the rule names owned rejections explicitly (ruling 2026-09-23, after the Codex review of S0).
+- This is gated by the S0 producer-census test (S0 acceptance 1), not by a grep for two names. It checks every
+  string-literal writer and, since the Codex review, every `type(X).__name__` writer: `X` must resolve to a caught
+  exception, a parameter, or an owned rejection constructor. A builtin exception built only to be named is flagged;
+  the two origins the walk cannot resolve are on a reviewed list with reasons.
 - The 6 hand-label sites in §2.3 construct a `ToolArgumentError` with a category, or return a category directly in
   the advisor's case. The other literal labels in §2.3 (`MissingRequiredPaths`, the deadline `TimeoutError`s, the
   planner feedback labels) are fixed in S0 or named on the census's out-of-scope list with a reason.

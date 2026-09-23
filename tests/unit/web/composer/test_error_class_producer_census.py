@@ -1,15 +1,21 @@
-"""No ``error_class`` writer names a class that was not raised (plan S0 acceptance 1).
+"""No ``error_class`` writer names a failure that did not happen (plan S0 acceptance 1).
 
-``error_class`` is audit evidence: it must name the exception class actually
-raised, caught or constructed at the writing site. Before S0 several sites
-wrote hand labels (``"TypeError"``, ``"ValueError"``, ``"MissingRequiredPaths"``,
-``"TimeoutError"``) for failures that raised nothing of the kind.
+``error_class`` is audit evidence. It names either the exception class
+actually raised and caught at the writing site, or an ELSPETH-owned rejection
+type (``_OWNED_REJECTION_CONSTRUCTORS``) for a rejection the server decided
+without raising. It never names a builtin exception that nothing raised.
+Before S0 several sites wrote hand labels (``"TypeError"``, ``"ValueError"``,
+``"MissingRequiredPaths"``, ``"TimeoutError"``) for failures that raised
+nothing of the kind.
 
-The census is an AST walk, not a grep: every string-literal label written
-through an ``error_class=`` keyword, an ``"error_class":`` dict key or an
-``error_class = ...`` assignment under ``src/elspeth/web/composer`` (guided
-excluded) must be backed by the enclosing function, or be on the short,
-named out-of-scope list below.
+The census is an AST walk, not a grep, over ``error_class=`` keywords,
+``"error_class":`` dict keys and ``error_class = ...`` assignments under
+``src/elspeth/web/composer`` (guided excluded). A string-literal label must be
+backed by an enclosing ``except`` clause or an annotated parameter. A
+``type(X).__name__`` label must resolve ``X`` to a caught exception, a
+parameter, or an owned rejection constructor; building a builtin exception only
+to name it is flagged (Codex review of S0). Anything else must be on one of
+the two short, reasoned lists below.
 
 A second census pins ``redaction._SAFE_ARG_ERROR_CLASSES`` to the classes the
 ARG_ERROR producers actually raise, measured by triggering each producer.
@@ -96,15 +102,102 @@ def _parameter_typed(function: ast.AST | None, label: str) -> bool:
     return any(_names_class(argument.annotation, label) for argument in arguments)
 
 
-def _error_class_labels(relative_path: str, source: str) -> list[_Label]:
-    """Every literal ``error_class`` label and whether its site backs it.
+# ELSPETH-owned rejection types a site may build and record without raising:
+# the server decided the rejection, and the class names that owned decision,
+# never a builtin failure that did not happen.
+_OWNED_REJECTION_CONSTRUCTORS: frozenset[str] = frozenset({"ToolArgumentError", "_pre_dispatch_argument_error", "PipelinePlannerError"})
 
-    A label is backed only when it sits lexically inside an ``except`` clause
-    that catches that class, or in a function whose parameter is annotated with
-    it. Function-wide evidence is deliberately not enough: ``run_tool_batch``
-    is thousands of lines long and catches ``TypeError`` for one site only.
+# ``type(X).__name__`` origins the binding walk cannot resolve on its own,
+# keyed by (file under web/composer, enclosing function, ``type(X)`` text).
+_REVIEWED_ORIGINS: dict[tuple[str, str, str], str] = {
+    ("tool_batch.py", "run_tool_batch", "type(canonicalization_failed)"): (
+        "unpacked from begin_dispatch_or_arg_error, which returns the ValueError/TypeError it caught (audit.py)"
+    ),
+    ("tool_batch.py", "run_tool_batch", "type(first_party_exc)"): (
+        "advisor_outcome.original_exc is the exception the advisor dispatch caught"
+    ),
+}
+
+
+def _bindings(function: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, list[ast.AST]]:
+    """Every node that binds each local name: parameter, handler or assignment value."""
+    bound: dict[str, list[ast.AST]] = {}
+    for argument in [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]:
+        bound.setdefault(argument.arg, []).append(argument)
+    for node in ast.walk(function):
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            bound.setdefault(node.name, []).append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bound.setdefault(target.id, []).append(node.value)
+                elif isinstance(target, ast.Tuple):
+                    for element in target.elts:
+                        if isinstance(element, ast.Name):
+                            bound.setdefault(element.id, []).append(target)  # unresolved: needs review
+    return bound
+
+
+def _owned_constructor(call: ast.Call) -> bool:
+    return ast.unparse(call.func).rsplit(".", 1)[-1] in _OWNED_REJECTION_CONSTRUCTORS
+
+
+def _backed_origin(expression: ast.expr, bindings: dict[str, list[ast.AST]], seen: frozenset[str] = frozenset()) -> bool:
+    """Whether ``type(expression)`` names a raised class or an owned rejection.
+
+    Backed: a name bound by ``except ... as``, a parameter (an exception handed
+    in by a caller), an owned rejection constructor, ``None``, or a
+    ``__cause__``/``__context__`` of a backed name. Anything else, including a
+    builtin exception built only to be named, is not.
+    """
+    if isinstance(expression, ast.Call):
+        return _owned_constructor(expression)
+    if isinstance(expression, ast.Attribute) and expression.attr in {"__cause__", "__context__"}:
+        return _backed_origin(expression.value, bindings, seen)
+    if not isinstance(expression, ast.Name) or expression.id in seen or expression.id not in bindings:
+        return False
+    for binding in bindings[expression.id]:
+        if isinstance(binding, (ast.ExceptHandler, ast.arg)):
+            continue
+        if isinstance(binding, ast.Constant) and binding.value is None:
+            continue
+        if (
+            isinstance(binding, ast.expr)
+            and not isinstance(binding, ast.Tuple)
+            and _backed_origin(binding, bindings, seen | {expression.id})
+        ):
+            continue
+        return False
+    return True
+
+
+def _type_name_origins(expression: ast.expr) -> Iterator[ast.expr]:
+    """Each ``X`` in a ``type(X).__name__`` inside an ``error_class`` expression."""
+    for node in ast.walk(expression):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__name__"
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "type"
+            and len(node.value.args) == 1
+        ):
+            yield node.value.args[0]
+
+
+def _error_class_labels(relative_path: str, source: str) -> list[_Label]:
+    """Every ``error_class`` label or ``type(X)`` origin and whether its site backs it.
+
+    A literal label is backed only when it sits lexically inside an ``except``
+    clause that catches that class, or in a function whose parameter is
+    annotated with it. Function-wide evidence is deliberately not enough:
+    ``run_tool_batch`` is thousands of lines long and catches ``TypeError`` for
+    one site only. A ``type(X).__name__`` label is backed when ``X`` resolves to
+    a caught exception or an owned rejection (``_backed_origin``).
     """
     labels: list[_Label] = []
+    bindings_by_function: dict[int, dict[str, list[ast.AST]]] = {}
 
     def visit(node: ast.AST, function: ast.AST | None, function_name: str, handlers: tuple[ast.ExceptHandler, ...]) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -130,6 +223,11 @@ def _error_class_labels(relative_path: str, source: str) -> list[_Label]:
                     continue  # a redaction sentinel, not a class name
                 backed = any(_handler_catches(handler, label) for handler in handlers) or _parameter_typed(function, label)
                 labels.append(_Label(relative_path, function_name, label, backed))
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bindings = bindings_by_function.setdefault(id(function), _bindings(function))
+                for origin in _type_name_origins(expression):
+                    text = f"type({ast.unparse(origin)})"
+                    labels.append(_Label(relative_path, function_name, text, _backed_origin(origin, bindings)))
         for child in ast.iter_child_nodes(node):
             visit(child, function, function_name, handlers)
 
@@ -148,7 +246,7 @@ def _live_labels() -> list[_Label]:
 
 
 def _dishonest(labels: list[_Label]) -> set[tuple[str, str, str]]:
-    return {(label.path, label.function, label.label) for label in labels if not label.backed} - set(_OUT_OF_SCOPE)
+    return {(label.path, label.function, label.label) for label in labels if not label.backed} - set(_OUT_OF_SCOPE) - set(_REVIEWED_ORIGINS)
 
 
 class TestErrorClassProducerCensus:
@@ -162,6 +260,35 @@ class TestErrorClassProducerCensus:
             ("planted.py", "site", "MissingRequiredPaths"),
             ("planted.py", "site", "TimeoutError"),
         }
+
+    def test_instrument_flags_a_constructed_builtin_exception(self) -> None:
+        # Codex review of S0: building a builtin exception only to name it is a
+        # hand label in disguise; nothing of that class was raised.
+        planted = (
+            "def site(audit):\n"
+            "    rejection = TypeError('arguments must be an object')\n"
+            "    record(error_class=type(rejection).__name__)\n"
+            "    record(error_class=type(ValueError()).__name__)\n"
+        )
+        assert _dishonest(_error_class_labels("planted.py", planted)) == {
+            ("planted.py", "site", "type(rejection)"),
+            ("planted.py", "site", "type(ValueError())"),
+        }
+
+    def test_instrument_accepts_caught_and_owned_rejection_origins(self) -> None:
+        honest = (
+            "def site(audit, raw):\n"
+            "    try:\n"
+            "        decode(raw)\n"
+            "    except ValueError as exc:\n"
+            "        record(error_class=type(exc).__name__)\n"
+            "        cause = exc.__cause__\n"
+            "        record(error_class=type(cause).__name__)\n"
+            "    rejection = _pre_dispatch_argument_error('t', category)\n"
+            "    record(error_class=type(rejection).__name__)\n"
+            "    record(error_class=type(ToolArgumentError(argument='a')).__name__)\n"
+        )
+        assert _dishonest(_error_class_labels("honest.py", honest)) == set()
 
     def test_instrument_accepts_a_caught_class(self) -> None:
         honest = "async def site():\n    try:\n        pass\n    except TimeoutError:\n        error_class = 'TimeoutError'\n"
@@ -186,6 +313,17 @@ class TestErrorClassProducerCensus:
     def test_out_of_scope_entries_all_still_exist(self) -> None:
         live = {(label.path, label.function, label.label) for label in _live_labels()}
         assert set(_OUT_OF_SCOPE) - live == set()
+
+    def test_reviewed_origins_are_all_live_and_unresolved(self) -> None:
+        # A reviewed entry the walk now resolves (or that no longer exists) is stale.
+        unresolved = {(label.path, label.function, label.label) for label in _live_labels() if not label.backed}
+        assert set(_REVIEWED_ORIGINS) - unresolved == set()
+
+    def test_instrument_sees_type_name_origins_in_the_live_tree(self) -> None:
+        # Known positives: the owned pre-dispatch rejection and a caught exception.
+        labels = _live_labels()
+        assert any(label.label == "type(not_object)" and label.backed for label in labels)
+        assert any(label.path == "pipeline_commit.py" and label.label == "type(exc)" and label.backed for label in labels)
 
 
 # ---------------------------------------------------------------------------
