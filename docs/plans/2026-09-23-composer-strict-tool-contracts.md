@@ -2,7 +2,8 @@
 
 - **Date:** 2026-09-23
 - **Goal (John):** "ultimately we want a strict contract for every tool call" made by the Web Composer planner.
-- **Status:** plan only. Nothing here is implemented, committed or merged.
+- **Status:** S0 implemented on `design/strict-tool-contracts` (not merged; the full-suite gate and S0 acceptance
+  items 2, 4 and 5 are owed, see "S0 review fixes" below). S1 onward is plan only.
 - **Code base the citations use:** `path:line` citations were measured at `6d8f7f729`. The branch
   `design/strict-tool-contracts` was then fast-forwarded to `release/0.8.1` at `c6e12fc44`. **Python `src` changes**
   in `6d8f7f729..c6e12fc44` are limited to `control_messages.py`, `sessions/models.py` and `sessions/schema.py`, so
@@ -747,6 +748,83 @@ where this differs from the bullets above, this paragraph is the current state.
 - **In-tree gateway.** Both planner requests are accepted by ELSPETH's own gateway
   (`test_composer_against_gateway.py`, 9 passed), including the terminal schema, which no test had sent through it.
 
+**S0 review fixes (second review round): corrections, decisions and what is still owed.** Recorded after the S0
+correctness and gates reviews; where this differs from the two paragraphs above, this paragraph is the current state.
+Code in `0be896c48`. Evidence is in the lane under `s0-fix/`. After the fixes the trust-tier corpus is unchanged
+against `8ca98eaaf` (2290 findings, 0 added, 0 removed), the soft-mapping census and masquerade baseline are
+unchanged, and the affected test set (`tests/unit/web/composer`, `tests/unit/composer_mcp`, `tests/unit/web/test_app.py`
+and 4 more files) has one failure, `test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion`,
+which fails identically at `release/0.8.1`.
+
+- **Interpretation-review carve-out, planner-visible change.** Behind the S gate, `request_interpretation_review`
+  answers an extra key, a `null` draft or `kind="llm_prompt_template"` with the generic "…, got invalid_schema". At
+  `release/0.8.1` the pydantic model answered: an extra key got `validation_errors[].loc`, and the backend-only kind
+  got the teaching "surfaced automatically by the backend at turn finalization; do not request it". The generic text
+  is what all 40 other S-gated tools already returned at `release/0.8.1` (measured, `f1-parity.log`,
+  `f1-parity-base.log`), and the tool description still says "Prompt-template reviews are surfaced automatically by
+  the backend; never request one through this tool". The model's `_kind_must_be_requestable` stays: it is the
+  model half of S, like every other constraint the flat schema duplicates (lengths, `extra="forbid"`), and two tests
+  call the model directly. Restoring a field-level repair signal for every S-gated tool is an S1 item (see S1 files).
+- **Dispatch-path pin for that gate.** A compose-loop test sends `request_interpretation_review` an extra key and
+  asserts `ToolArgumentError` / `schema_shape` with the handler never awaited. Removing the
+  `require_schema_valid_arguments` call turns it red (`model_validation`), `mut-f2-drop-interp-sgate.log`.
+- **Canonicalisation reachability.** In the compose loop a non-finite number never reaches canonicalisation: the
+  bounded decoder rejects it (`ValueError`, `wire_json_invalid`). The `canonicalization` category is reached only by
+  an integer outside the I-JSON range (`IntegerDomainError`), top-level or nested; both arms are now pinned, and
+  setting all three sites (or the outcome site alone) to another category turns the pins red. On the MCP sidecar a
+  non-finite float does reach `canonical_json` (`ValueError`, `canonicalization`), also pinned. §5.2 is corrected.
+- **MCP session tools are now held to their closed roots at dispatch** (`_dispatch_tool`, before the session
+  handler), with the same Draft 2020-12 gate, `ToolArgumentError` and shape/bound category as the registry tools
+  (`require_arguments_conform_to_schema`, fed a validator compiled and metaschema-checked at import). This closes the
+  gap the S0a paragraph recorded ("advertise, not enforce"), as §1.1 requires. Client-visible change: `new_session`
+  with a non-string `name` now gets the generic S-gate text instead of the handler's "'name' must be a string";
+  the handler's own check stays as the handler boundary.
+- **Error-code registry scope.** The census walked only `web/composer`, but plugin-policy findings
+  (`validate_composition_state`) and execution validation (`ToolResult.runtime_preflight`) put their codes into
+  option-tool responses, and they were still redacted (for example `profile_alias_used_as_bucket` on
+  `upsert_node`). The census now walks all of `web/` except named exclusions with reasons (`composer/guided/`, the
+  deployment acceptance clients). The registry grows from 200 to 239 codes: 4 plugin-policy codes, 17 execution
+  validation codes, the 11 bounded source-proof blockers merged into the authoritative preflight, 2 session-route
+  codes, and the 5 inline-blob `<category>_inline_blob_content` codes (from the closed category). 22 new reviewed
+  forwarder rows; f-string fragments are no longer read
+  as codes. Producers keep their literal codes and are held to the registry by the AST census, not by importing it;
+  only `redaction.py` imports `error_codes.py` (the S0 bullet said the producers and `generation.py` would too).
+- **Pipeline-commit ARG_ERROR payload** is pinned behaviourally: the persisted `error_code` is the category value and
+  `error_class` the raised class. Reverting to `exc.code or "argument_error"` or to the literal `"argument_error"`
+  turns it red.
+- **Catalog prime deadline.** httpx's connect/read timeouts are per operation, so the OpenRouter catalog prime could
+  trickle past the "5 s + 5 s" the S0b budget assumed (reviewer's loopback measurement: 12 s at 1 byte/s, no
+  timeout). The prime now runs under a total 10 s deadline (`asyncio.wait_for`; a timeout is a failed prime, logged
+  `PrimeDeadlineExceeded`, nonfatal). Measured end to end against a loopback server trickling 1 byte/s for 30 s: the
+  boot prime ends at 10.0 s; a fast server still primes (`f3-loopback-drip.log`). The boot-budget test now adds the
+  prime's total deadline, not its per-operation timeouts, so the 55 s worst case (10 + 45) is enforced, not assumed.
+- **Test-only cleanup.** The four `# type: ignore` comments added in S0b's provider_served test are replaced by a
+  typed helper (mypy clean on the file).
+- **Acceptance 3 done.** The Appendix A query, read verbatim from this plan, was run read-only against a fixture DB
+  written by `persist_compose_turn` with production-redacted rows: exactly one row each for
+  `arg_error:schema_shape`, `rejected:plugin_options_invalid`, `ok`, and the two controls under
+  `other_failure:cancelled` / `other_failure:plugin_crash` (`appendix-a-fixture.log`). Negative control: an
+  unregistered code in the rejection row gives `rejected:<redacted-response-text>` and the check fails
+  (`appendix-a-fixture-negative.log`). The script is `s0-fix/appendix_a_fixture.py` in the lane.
+- **Still owed before merge:** the full-suite gate (`--stages ruff,mypy,contracts,lints,pytest`), and acceptance 2
+  (a dev session persisting `plugin_options_invalid` / `prompt_template_parts_required`), 4 (a dev-deployment boot
+  with the logged total probe time, which is also the only measurement of `planner_tools` latency at candidate
+  effort) and 5 (the baseline). All three need a dev deployment. The testcontainer selection is not run: no DDL and
+  no epoch bump, only additive JSON content.
+- **Awaiting John's rulings:**
+  - `RejectionRecord.error_code` on ARG_ERROR rows is the failure class (its documented meaning: "first coded
+    validation entry, else failure class"), so after S0 the non-object, envelope and required-path rows read
+    `ToolArgumentError` where they read `TypeError` / `MissingRequiredPaths`, and the opt-in
+    `include_rejection_reasons` messages API loses that distinction. No frontend code reads it (measured: no
+    `rejection_reasons` consumer under `web/frontend/src`). Suggested ruling: record `error_category.value` there
+    for ARG_ERROR rows (a registered code, like the other rows' codes) and keep the class in `planner_payload`.
+  - The advisor's boot allowance drops from 60 s alone to at most 45 s shared, so a call as slow as the observed
+    50.8 s outlier becomes a nonfatal, logged "structured-output conformance not verified" boot.
+- **No change needed:** the `@trust_boundary` invariant on `redact_arg_error_response` describes the Tier-3 `result`
+  parameter; `error_category` is an owned enum argument, not part of that boundary.
+- **Soft-mapping census:** S0 moved the pin from 2745 to 2756 (+11: `boot_probe.py` +6, `pipeline_planner.py` +3,
+  `service.py` +1, `_dispatch.py` +1). This round adds none (the MCP gate takes a compiled validator, not a mapping).
+
 ### S1 — Strict on the 32 mechanical tools (no options decision needed)
 
 Purpose: the first wire change. 32 tools are sent `strict: true` on routes that forward it. The 10 option tools and
@@ -795,6 +873,14 @@ Files:
   - `_replace_llm_tool_call_arguments` (`:433`) calls `encode_semantic_arguments`;
   - `ComposerToolInvocation` gains `strict_sent: bool | None` and `wire_conformant: bool | None`, with honest
     `None` where no arguments were decoded.
+- **S-gate repair signal (carried from the S0 review).** Every S-gate rejection reaches the planner as the bare
+  "must be object conforming to …, got invalid_schema", with no `validation_errors`: the `ToolArgumentError`
+  projection drops the jsonschema summary, so the planner is not told which field failed. This was true of all 40
+  S-gated tools at `release/0.8.1` (measured, lane `s0-fix/f1-parity-base.log`), and S0 put the two carve-outs and
+  the 6 MCP session tools behind the same gate. Give the S-gate error a closed loc (the failing `absolute_path`
+  projected through the tool schema's own property names, and the offending key for `additionalProperties`) and emit
+  it as `validation_errors`, as `arg_error_payload` does for pydantic causes. This changes planner-visible tool
+  results on every tool, so it lands with S1 and after the S0 baseline, not inside it.
 - `pipeline_planner.py:1504` `planner_tool_definitions`: the discovery subset comes from `_WIRE_TOOL_DEFS`; the
   terminal (`:1481`) is sent `strict:false` where the dialect carries the key. Decode also runs for planner
   discovery calls.
@@ -1049,12 +1135,12 @@ It is value-free, and it is persisted on every ARG_ERROR alongside `field_count`
 
 | category | stage | produced at |
 |---|---|---|
-| `wire_json_invalid` | wire | `bounded_json_loads` JSONDecodeError / TypeError / ValueError |
+| `wire_json_invalid` | wire | `bounded_json_loads` JSONDecodeError, or ValueError for a non-finite constant (`NaN`, `Infinity`, an overflowing float) |
 | `wire_json_bounds` | wire | `JsonBoundaryError` |
 | `wire_not_object` | wire | `tool_batch.py:929` (was `"TypeError"`) |
 | `wire_envelope` | wire | `tool_batch.py:967/987/994` in S0 (was `"TypeError"`); from S1, decode's `ENVELOPE_UNWRAP` node |
 | `wire_decode` | wire | S2 and later only: duplicate pair key, or carrier text that is not JSON or not an object |
-| `canonicalization` | semantic | Canonicalization / FloatDomain / IntegerDomain errors |
+| `canonicalization` | semantic | compose loop: `IntegerDomainError`, an integer outside the I-JSON range (non-finite numbers never get past the decoder); MCP sidecar: `canonical_json`'s `ValueError` on a non-finite float, which the MCP SDK's decoder admits |
 | `missing_required_path` | semantic | required-paths walker (was `MissingRequiredPaths`) |
 | `schema_shape` | semantic | S Draft 2020-12 failure whose `validator` keyword **is** in `WIRE_KEYWORD_ALLOWLIST`, so a grammar should have prevented it |
 | `schema_bound` | semantic | S failure whose keyword is **not** on the allowlist (`minLength`, `maxLength`, `not`, `oneOf`, `uniqueItems`, …), i.e. a ledgered constraint |
