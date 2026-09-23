@@ -50,7 +50,7 @@ class _NoFoldCodeGenerator(CodeGenerator):
     """Never evaluate an authored expression while compiling a template."""
 
     def _output_child_to_const(self, node: nodes.Expr, frame: Any, finalize: Any) -> str:
-        if isinstance(node, nodes.TemplateData):
+        if type(node) is nodes.TemplateData:
             return super()._output_child_to_const(node, frame, finalize)
         raise nodes.Impossible()
 
@@ -82,14 +82,14 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
         cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
         context = pickle.loads(payload)
-        if type(context) is not dict or any(not isinstance(key, str) for key in context):
+        if type(context) is not dict or any(type(key) is not str for key in context):
             raise TemplateError("Template worker received an invalid context")
-        if any(isinstance(value, _RowTransport) for value in context.values()):
+        if any(type(value) is _RowTransport for value in context.values()):
             from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 
             context = {
                 key: PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
-                if isinstance(value, _RowTransport)
+                if type(value) is _RowTransport
                 else value
                 for key, value in context.items()
             }
@@ -103,9 +103,20 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
                 raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
             pieces.append(piece)
         connection.send(("ok", "".join(pieces)))
-    except BaseException as exc:
+    except (
+        TemplateError,
+        TemplateSyntaxError,
+        TemplateRuntimeError,
+        UndefinedError,
+        SecurityError,
+        MemoryError,
+        ArithmeticError,
+        TypeError,
+        ValueError,
+    ) as exc:
         # Keep the protocol bounded and do not pickle a third-party exception.
         connection.send((type(exc).__name__, str(exc)[:1024]))
+        raise SystemExit(1) from exc
     finally:
         connection.close()
 
@@ -130,7 +141,7 @@ def _run_template_worker(source: str, payload: bytes) -> str:
         except EOFError as exc:
             raise TemplateError("Template worker stopped before completing") from exc
         if status == "ok":
-            if not isinstance(value, str):
+            if type(value) is not str:
                 raise TemplateError("Template worker returned a non-string result")
             return value
         if status == "TemplateSyntaxError":
@@ -163,7 +174,7 @@ class _BoundedTemplate:
 
         transport = {
             key: _RowTransport(pickle.dumps(value.to_dict(), protocol=5), pickle.dumps(value.contract.to_checkpoint_format(), protocol=5))
-            if isinstance(value, PipelineRow)
+            if type(value) is PipelineRow
             else value
             for key, value in context.items()
         }
@@ -183,7 +194,7 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
     ) -> Template:
         if globals is not None or template_class is not None:
             raise TemplateError("Custom template globals and classes are unsupported")
-        if not isinstance(source, str):
+        if type(source) is not str:
             raise TemplateError("Pre-parsed Jinja templates are unsupported")
         _check_template_source(source)
         ast = super().parse(source)
@@ -197,7 +208,7 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
         compiled = super().from_string(ast)
         # Static text has a fixed output no larger than its bounded source.
         # Keep it in-process so ordinary blob paths need no worker startup.
-        if all(isinstance(node, nodes.Output) and all(isinstance(child, nodes.TemplateData) for child in node.nodes) for node in ast.body):
+        if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):
             return compiled
         return cast("Template", _BoundedTemplate(source))
 
