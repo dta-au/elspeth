@@ -100,6 +100,7 @@ class _AdmittedLLMProviderMetadata:
     reasoning_content: str | None
     reasoning_details: Any | None
     thinking_blocks: Any | None
+    provider_served: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "reasoning_details", "thinking_blocks")

@@ -13,10 +13,11 @@ Layer: L0 (contracts). Imports nothing above contracts.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
@@ -37,6 +38,23 @@ _VALID_PROVIDER_COST_SOURCES = {
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
     PROVIDER_COST_SOURCE_COST_PER_TOKEN,
 }
+
+# Recorded in place of a served-endpoint name that is present but outside the
+# closed provider-name shape. Fixed and value-free: provider bytes that fail
+# the shape never reach the audit row.
+PROVIDER_SERVED_UNRECOGNISED: Final[str] = "unrecognised"
+
+# The closed shape of an OpenRouter served-endpoint name (the response's
+# top-level ``provider`` field): 1-64 characters, letters, digits, space, dot,
+# underscore and hyphen, starting and ending with a letter or digit. Every
+# ``provider_name`` the OpenRouter endpoints API listed for the measured
+# planner, advisor and default models on 2026-09-23 fits it (longest: 14).
+_PROVIDER_SERVED_SHAPE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,62}[A-Za-z0-9])?")
+
+
+def is_provider_served_name(value: str) -> bool:
+    """Return whether ``value`` has the closed served-endpoint-name shape."""
+    return _PROVIDER_SERVED_SHAPE.fullmatch(value) is not None
 
 
 class ComposerLLMCallStatus(StrEnum):
@@ -143,6 +161,15 @@ class ComposerLLMCall:
     sent: the configured value when set, or ``None`` when the operator left it
     unset and it was omitted from the request. The audit row mirrors the request
     so a reviewer can correlate failures with the precise sampling regime.
+
+    ``provider_served`` is the endpoint that served the call, as OpenRouter
+    names it in the response's top-level ``provider`` field (one model id is
+    routed across many endpoints). It is provider-authored, so unlike the
+    strings above it is persisted only in a closed, public-safe shape: the
+    capture point records a conforming name verbatim, any other present value
+    as the fixed :data:`PROVIDER_SERVED_UNRECOGNISED` token, and absence as
+    ``None``. This contract enforces the same shape, because the persisted
+    audit projection exposes the field.
     """
 
     model_requested: str
@@ -178,6 +205,7 @@ class ComposerLLMCall:
     planner_policy_hash: str | None = None
     planner_call_ordinal: int | None = None
     call_id: str | None = None
+    provider_served: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not ComposerLLMCallStatus:
@@ -187,6 +215,9 @@ class ComposerLLMCall:
         _require_non_empty_str(self.call_id, "call_id", optional=True)
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
+        _require_non_empty_str(self.provider_served, "provider_served", optional=True)
+        if self.provider_served is not None and not is_provider_served_name(self.provider_served):
+            raise ValueError("provider_served must match the closed served-endpoint-name shape")
         # An empty/whitespace finish_reason is not "the provider said nothing"
         # — absence is ``None``. A blank string reaching here is a defect in
         # the extraction site, not provider data worth recording.

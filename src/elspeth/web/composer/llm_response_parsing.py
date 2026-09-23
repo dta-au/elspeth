@@ -38,8 +38,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
+    PROVIDER_SERVED_UNRECOGNISED,
     ComposerLLMCall,
     ComposerLLMCallStatus,
+    is_provider_served_name,
 )
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -296,6 +298,29 @@ def _safe_provider_request_id(response: Any | None) -> str | None:
 
 def _response_field(value: Any, field: str) -> Any:
     return _provider_field(value, field)
+
+
+def _admit_provider_served(value: Any) -> str | None:
+    """Bound OpenRouter's served-endpoint name to a public-safe token.
+
+    ``value`` is the response's top-level ``provider`` field, as read from the
+    provider object. It is provider-authored and reaches the persisted audit
+    projection, so only a name in the closed shape
+    (:func:`~elspeth.contracts.composer_llm_audit.is_provider_served_name`) is
+    recorded verbatim. Any other present value (the wrong type, oversized, an
+    unexpected character) is recorded as the fixed
+    :data:`~elspeth.contracts.composer_llm_audit.PROVIDER_SERVED_UNRECOGNISED`
+    token, never as provider bytes, so the anomaly stays visible without
+    copying what the endpoint sent. Absence, including a blank string, is
+    ``None``, matching the other provider identifiers.
+    """
+    if value is None:
+        return None
+    if type(value) is not str:
+        return PROVIDER_SERVED_UNRECOGNISED
+    if not value.strip():
+        return None
+    return value if is_provider_served_name(value) else PROVIDER_SERVED_UNRECOGNISED
 
 
 @observation_boundary(
@@ -576,6 +601,7 @@ def admit_llm_provider_metadata(
         reasoning_content=reasoning_metadata["reasoning_content"],
         reasoning_details=reasoning_metadata["reasoning_details"],
         thinking_blocks=reasoning_metadata["thinking_blocks"],
+        provider_served=_admit_provider_served(_captured_field(response_fields, "provider")),
     )
 
 
@@ -652,6 +678,7 @@ def build_llm_call_record(
         model_returned = safe_response_model(response)
         finish_reason = _finish_reason_from_response(response)
         provider_request_id = _safe_provider_request_id(response)
+        provider_served = None if response is None else _admit_provider_served(_provider_field(response, "provider"))
     else:
         usage = response_metadata.usage
         provider_cost = response_metadata.provider_cost
@@ -664,6 +691,7 @@ def build_llm_call_record(
         model_returned = response_metadata.model_returned
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
+        provider_served = response_metadata.provider_served
     call = ComposerLLMCall(
         model_requested=model_requested,
         pricing_model=pricing_model if pricing_model is not None else model_requested,
@@ -696,6 +724,7 @@ def build_llm_call_record(
         max_completion_tokens_requested=max_completion_tokens_requested,
         planner_policy_hash=planner_policy_hash,
         planner_call_ordinal=planner_call_ordinal,
+        provider_served=provider_served,
     )
     return bind_provider_attempt(call)
 
