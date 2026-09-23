@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.enums import RunMode
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
@@ -94,6 +95,9 @@ class SourceContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
     def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
@@ -152,6 +156,9 @@ class TransformContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
     def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
@@ -202,6 +209,9 @@ class SinkContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
     def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
@@ -240,6 +250,9 @@ class LifecycleContext(Protocol):
 
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def run_mode(self) -> RunMode: ...
 
     @property
     def call_mode_session(self) -> CallModeSession | None: ...

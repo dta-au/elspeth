@@ -57,6 +57,25 @@ class ReplaySSRFRequest:
     bare_hostname: str
 
 
+@dataclass(frozen=True, slots=True)
+class SourceCallParentIdentity:
+    """Uniquely matched source audit parent for run-scoped request fields."""
+
+    source_run_id: str
+    source_node_id: str
+    source_state_id: str | None
+    source_operation_id: str | None
+    source_token_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRunMode:
+    """Validated run mode and source run selected at admission."""
+
+    mode: RunMode
+    replay_from: str | None
+
+
 class CallModeSession(Protocol):
     """Per-run call lookup and durable comparison authority.
 
@@ -92,6 +111,16 @@ class CallModeSession(Protocol):
         current_operation_id: str | None,
     ) -> ReplaySSRFRequest:
         """Recover a recorded DNS pin without doing current DNS resolution."""
+        ...
+
+    def source_parent_identity(
+        self,
+        *,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+    ) -> SourceCallParentIdentity:
+        """Bind current parent to one source parent before request matching."""
         ...
 
     def verify_call(
