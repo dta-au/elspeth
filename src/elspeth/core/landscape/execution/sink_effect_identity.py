@@ -148,9 +148,14 @@ class _LineageQueryCache:
         fetched = self._query.get_tokens_by_ids(missing) if missing else []
         for token in fetched:
             self._tokens[token.token_id] = token
-        return [cached_token for token_id in token_ids if (cached_token := self._tokens.get(token_id)) is not None] + [
-            token for token in fetched if token.token_id not in token_ids
-        ]
+        resolved: list[_Token] = []
+        for token_id in token_ids:
+            if token_id in self._tokens:
+                cached_token = self._tokens[token_id]
+                if cached_token is not None:
+                    resolved.append(cached_token)
+        resolved.extend(token for token in fetched if token.token_id not in token_ids)
+        return resolved
 
     def get_token_parents(self, token_id: str) -> list[_Parent]:
         if token_id not in self._parents:
