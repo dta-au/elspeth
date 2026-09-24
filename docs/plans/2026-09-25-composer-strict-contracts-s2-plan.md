@@ -30,31 +30,35 @@
 
 ### 1.1 Status
 
-S2 was withdrawn on 2026-09-24, when John ruled R1 no (master plan §1, §6.3). That ruling stands. This plan does not
-lift it. It says how S2 would proceed if it goes ahead, in small steps, and which of those steps are worth shipping
-while R1 stays no.
+**R1 is yes, deferred** (John, 2026-09-25; master plan §1, §6.3). On 2026-09-24 John ruled R1 no and withdrew S2 and
+S3. On 2026-09-25 he reversed that: "lets prepare this package on the assumption that the answer is yet (because it
+has to be) because the answer is going to be no until its yes (i.e. we do want this, but the codebase is very
+volatile right now because we just landed a dozen massive fixes across different subsystems)". S2 and S3 are
+reinstated as planned work, done in the small steps below. This plan is the S2 rollout.
 
-- **Useful whatever R1 says, and shippable now** (no ruling on R1 needed):
-  - **Tier M, measurement (M1a, M1b, M2 to M6).** This is the instrument the R1 reopen trigger needs (master plan
-    §5.4). Without it no reopen can ever be read. M1a, M1b and M5 together close ticket `elspeth-a1864430a1`; they need
-    rulings first (§7.2, R-I and R-J).
-  - **Tier A, wire-neutral surface cleanups (A1 to A5, A7, A8; A6 is withdrawn, §8).** Each rewrites one teaching or
-    diagnostic surface so it is true on both wire forms, or adds a gate. The wire bytes do not change. Under R1 = no
-    the text steps are optional hygiene: the object form is the only form, so today's text is not wrong, and the value
-    is small. Their real value is to come before a flip. A7 (the W-side teaching census) is a test gate over W, not
-    production text; it carries one closed exemption (the `set_pipeline` envelope) and has teeth from F1. A8 is the
-    exception in value: it fixes a live defect (a false "byte-identical arguments" hint after repeated wire-stage
-    rejections) that exists today on `set_pipeline` and on over-bound JSON, whatever R1 says.
-- **Not useful while R1 stays no:** Tier P and Tier F. That includes the R2 pair codec. R2 was ruled yes, but a
-  pair decoder with no tool using it is machinery with no producer, which S0 refused for exactly this class
-  (`wire_decode` was left out of the enum for that reason). The pair codec therefore lands inside the first flip that
-  uses it (F4, `upsert_node`), never ahead of it.
-- **Starting any flip (Tier F) needs one of:**
-  - John reopens R1 for that tool, on the §6.3 trigger or by a new ruling; or
-  - John rules a narrower scope, for example "the `patch_*` family only" or "`upsert_node` and `set_pipeline` only".
-
-  Either way the ruling is written into master plan §6.3 before the first flip, because §6.3 currently says no. The
-  flip steps also need the Tier R rulings in §7.2.
+- **Start condition.** Codebase stability, which is John's call. It is not the data-driven reopen trigger of
+  2026-09-24, which is no longer a precondition (§7.2, R-G). Two further preconditions come from the S1 live
+  regression (§2, principle 9): the S1 zero-property fix has landed, and a live window shows the 22 remaining strict
+  tools healthy.
+- **Tier M, measurement (M1a, M1b, M2 to M6), and Tier A, wire-neutral surface cleanups (A1 to A5, A7, A8; A6 is
+  withdrawn, §8), can proceed as soon as John says the codebase is stable enough.** Tier M is the instrument every
+  flip's acceptance reads (master plan §5.4). M1a, M1b and M5 together close ticket `elspeth-a1864430a1`; they need
+  rulings first (§7.2, R-I and R-J). Each Tier A step rewrites one teaching or diagnostic surface so it is true on both
+  wire forms, or adds a gate. The wire bytes do not change. The text steps have their value in coming before the flip
+  that would otherwise contradict them. A7 (the W-side teaching census) is a test gate over W, not production text; it
+  carries one closed exemption (the `set_pipeline` envelope) and has teeth from F1. A8 fixes a live defect (a false
+  "byte-identical arguments" hint after repeated wire-stage rejections) that exists today on `set_pipeline` and on
+  over-bound JSON, so it can land at any time.
+- **Tier P and Tier F proceed in the order of §3.1, without a per-tool reopen ruling.** Each flip needs its live
+  canary (principle 9) before and after, and the Tier R rulings in §7.2 that gate it are still open. A flip that shows
+  no benefit or a regression is reverted (principle 7, §5.3). The R2 pair codec (R2 was ruled yes) still lands inside
+  the first flip that uses it (F4, `upsert_node`), never ahead of it: a pair decoder with no tool using it is
+  machinery with no producer, which S0 refused for exactly this class (`wire_decode` was left out of the enum for that
+  reason).
+- **The 2026-09-24 evidence stays recorded** (master plan §1.2, §6.3): 30 historical option-tool failures, 10 shape, 18
+  content and 2 ambiguous; `strict` on a carrier string constrains nothing inside it; options-as-string has swung twice
+  on this seam (`a5d9e5414`, `e50604428`). It is context and per-step acceptance and measurement input (§5), not a
+  gate.
 - **Three steps cannot be made small.** Under R-F (no machinery ahead of its first producer), F1 (L), F4 (L) and F5
   (XL) are the irreducible large steps: each carries machinery whose only producer is that flip. Everything that can
   run today with identical output has been pulled out of them (P3, P4), and so has the live-defect fix A8. If John
@@ -94,8 +98,10 @@ is cleaned up one surface per step, before the flip that would otherwise contrad
   `encode_semantic_arguments`, the ledger, `wire_conformant`, `strict_transport.py`, `strict_profile.py`, the
   `composer_strict_tools` setting and the repair signal. S1's owed dev deployment acceptance is a prerequisite for the
   baseline round (M6).
-- **S3** (the planner terminal) stays withdrawn. It is independent of every step here as long as each step changes W
-  only. §6 says what an S3 reopen would need after F5.
+- **S1's live regression** (found 2026-09-25; master plan §4 S1): the 10 zero-property tools S1 sends `strict:true`
+  fail on every call on the deployed route. Its fix is a precondition for this plan (§1.1, §2 principle 9).
+- **S3** (the planner terminal) is reinstated with S2 and follows F5. It is independent of every step here as long as
+  each step changes W only. §6 says what S3 needs after F5.
 
 ### 1.5 Which design this plan uses
 
@@ -149,6 +155,22 @@ its "family alternative".
    re-asserts, in its own test module, the neutral-text pins of the surfaces it depends on, so reverting an A step
    under a landed flip turns the flip's module red instead of passing silently.
 8. **Pre-register each live gate** before its first round (§5.3).
+9. **Every wire flip needs a live tool-calling canary on the deployed route.** For each schema shape the flip
+   changes (zero-property, carrier string, pair array, nested), the canary makes real tool calls against the stamped
+   list, measured per `provider_served` endpoint, before and after the flip. Offline byte proofs (the fidelity matrix,
+   SHA pins, the boot probe) are necessary but not sufficient. This comes from S1's live regression (found 2026-09-25,
+   session `ed3c015b-a2f7-4322-9f39-1716541c5796`; master plan §4 S1): the 10 zero-property tools S1 sends `strict:true`
+   (`list_blobs`, `list_composer_blobs`, `list_sources`, `get_expression_grammar`, `get_audit_info`,
+   `preview_pipeline`, `diff_pipeline`, `list_transforms`, `list_sinks`, `list_secret_refs`) fail on every call on the
+   deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together). `preview_pipeline` went from 36 of 36
+   OK before S1 to 0 of 9 after it, and `list_blobs` from 19 of 19 to 0 of 1. Each rejected call carries exactly one
+   stray key (`field_count` 1), and the planner looped 10 times on the bare "got invalid_schema" because S1's repair
+   signal was absent. S1's offline gates (the loopback fidelity matrix, and a 16-token boot probe that makes no tool
+   call) could not see it.
+   **S2 does not start until that regression's fix has landed** (defect 0 in
+   `docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md`, in the main checkout and untracked when this was
+   written: stamp the zero-property tools `strict:false`, partition 32/10 → 22/20) **and a live window shows the 22
+   remaining strict tools healthy.** Until then the mitigation is `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
 
 ---
 
@@ -156,7 +178,7 @@ its "family alternative".
 
 ### 3.1 Order at a glance
 
-| # | Step | Tier | Size | Model-visible | Needs R1 reopen |
+| # | Step | Tier | Size | Model-visible | Wire flip (needs the live canary, principle 9) |
 |---|---|---|---|---|---|
 | 1 | M1a ARG_ERROR `planner_payload` = what the planner saw | M | S | no | no |
 | 2 | M1b persist `(loc, code, sent_type)` on a side field, uncapped | M | M | no | no |
@@ -174,17 +196,19 @@ its "family alternative".
 | 13 | A7 W-side teaching census (one closed exemption) | A | S | no (a gate) | no |
 | 14 | A8 anti-anchor key for wire-stage rejections (fixes a live defect) | A | S | yes (hint choice) | no |
 | 15 | P1 reject duplicate keys in the compose loop (only if R-B says reject) | P | S | yes | no, but only useful before F1 |
-| 16 | P3 generalised wire-stage rejection branch (envelope its only producer) | P | S | no (identical bytes) | only useful before F1 |
+| 16 | P3 generalised wire-stage rejection branch (envelope its only producer) | P | S | no (identical bytes) | no; only useful before F1 |
 | 17 | F1 `patch_node_options` (pilot; carries the one-off machinery) | F | L | yes | yes |
 | 18 | F2 `patch_source_options` | F | S | yes | yes |
 | 19 | F3 `patch_output_options` (closes the `patch_*` family) | F | S | yes | yes |
-| 20 | P4 graph-repair suggestions rendered through `encode` per route (if R-L says encode) | P | M | no (identical output) | only useful before F4 |
+| 20 | P4 graph-repair suggestions rendered through `encode` per route (if R-L says encode) | P | M | no (identical output) | no; only useful before F4 |
 | 21 | F4 `upsert_node` (first pair maps; first null-writing encode) | F | L | yes | yes |
-| 22 | P2 exemplars rendered through `encode` per consumer | P | M | no (identical output) | only useful before F5 |
+| 22 | P2 exemplars rendered through `encode` per consumer | P | M | no (identical output) | no; only useful before F5 |
 | 23 | F5 `set_pipeline` | F | XL | yes | yes |
-| 24-28 | F6 `set_output`, F7 `set_source_from_blob`, F8 `splice_transform`, F9 `set_source`, F10 `set_source_from_blobs` | F | S each | yes | yes (family ruling, R-G) |
+| 24-28 | F6 `set_output`, F7 `set_source_from_blob`, F8 `splice_transform`, F9 `set_source`, F10 `set_source_from_blobs` | F | S each | yes | yes (no traffic to measure; acceptance basis per R-G) |
 
-Tier M and Tier A can proceed in parallel. The ordering constraints that matter:
+Nothing starts before the start condition in §1.1: John's call that the codebase is stable enough, the S1
+zero-property fix landed, and a healthy live window on the 22 remaining strict tools (principle 9). R1 no longer gates
+any row. Tier M and Tier A can then proceed in parallel. The ordering constraints that matter:
 
 - M1b needs M1a only as a merge convenience (both touch `turn_audit.py`); M5 needs M1b and M2. M3 is independent of
   M2 (each adds its own key to the persisted tool-call entry); land them in either order and move the key-set pin
@@ -195,7 +219,7 @@ Tier M and Tier A can proceed in parallel. The ordering constraints that matter:
 - Before any flip: A2, A4 (both lines), A7, A8 and P3 before F1; P1 before F1 if R-B says reject; A1c before F2;
   A1a, A1b, A3 and A5 before F4 and F5; P4 before F4 (if R-L says encode); P2 before F5.
 
-### 3.2 Tier M: measurement (ships now)
+### 3.2 Tier M: measurement (first, once the start condition holds)
 
 M1 was one step in the first draft. The review split it (§8): the planner payload and the violation pairs are
 different data with different visibility.
@@ -214,7 +238,7 @@ different data with different visibility.
 - *Revert:* one commit. *Size:* S.
 
 **M1b. Persist the violation pairs `(loc, code, sent_type)` on a side field.**
-- *Goal:* make the option-tool split in master plan §5.4 measurable, so the R1 reopen trigger can be read at all.
+- *Goal:* make the option-tool split in master plan §5.4 measurable, so each flip's acceptance read (§5.3) can be made at all.
 - *Why not through the planner payload:* `validation_errors` in the planner's body comes from
   `canonicalize_schema_violations` (`audit.py:1403-1430`), which renders only `loc`, `msg` and `type`, and returns a
   **single** `{"loc": [], "type": "truncated"}` entry when there are more than 8 violations (`audit.py:1413-1421`;
@@ -307,7 +331,7 @@ different data with different visibility.
   `wire_conformant = false` per `provider_served` on the 32 tools that are already strict (non-enforcing endpoints
   ignoring a strict W they were sent). F1's legacy-form rejection rate is pre-registered as the first real reading.
 
-### 3.3 Tier A: wire-neutral surface cleanups (ship now; one surface per step)
+### 3.3 Tier A: wire-neutral surface cleanups (alongside Tier M; one surface per step)
 
 Rules for every Tier A step:
 - Wire bytes are frozen (principle 4).
@@ -415,7 +439,7 @@ replacement options object").
   fire the identical hint (control); the persisted audit row still holds the sentinel hash.
 - *Revert:* one commit. *Size:* S. *Must precede:* F1 (and should precede M6).
 
-### 3.4 Tier P: flip preparation (only once a flip is authorised)
+### 3.4 Tier P: flip preparation (in order, ahead of the flip each step serves)
 
 **P1. Reject duplicate object keys in the compose loop** (only if R-B rules "reject").
 - *Change:* the rejecting `object_pairs_hook` at the compose loop's outer decode (`tool_batch.py:918`), replacing M3's
@@ -426,7 +450,7 @@ replacement options object").
     planner tool call, the terminal `emit_pipeline_proposal` included (`:1793`, before the terminal split at `:1796`),
     and a failure there raises `PipelinePlannerError(code="MALFORMED_RESPONSE")`, which aborts the whole planner
     response rather than one call. Changing it touches the terminal, which is S3 (§1.3). After P1 the planner stays
-    last-wins; the asymmetry is recorded under R-B and belongs to an S3 reopen.
+    last-wins; the asymmetry is recorded under R-B and belongs to S3.
   - MCP decodes in its SDK and is out of scope.
   - `turn_audit.py:164` re-parses rejected calls for persistence with no hook. That is harmless (it only reads a call
     already rejected or admitted) and stays.
@@ -448,7 +472,7 @@ replacement options object").
   - the aids store **semantic** exemplars, and the memo stays keyed on semantic content (`:2731`, no dialect in the
     key); each consumer encodes;
   - the compose-loop consumer passes the planner route's dialect;
-  - **the pipeline-planner consumer passes the terminal's form, which is S plus the envelope until an S3 reopen, never
+  - **the pipeline-planner consumer passes the terminal's form, which is S plus the envelope until S3 lands, never
     the route dialect.** Otherwise F5 would teach `options_json` to a terminal that rejects it;
   - `dialect` is keyword-required on `build_messages` / `build_catalog_context_string` (about 44 test call sites),
     following S1 D10;
@@ -610,6 +634,9 @@ grammar and is not a step.
       `patch`);
     - the tool's scripted-provider compose tests under `openai_strict`.
 
+    The counts of 32 above are the S1 figures measured at `1f500c6ae`. After the S1 zero-property fix (a precondition,
+    principle 9) they read 22, and the line numbers move with that fix; re-anchor with `grep -n` before F1.
+
     `test_error_code_redaction.py:398` (`_OPTION_TOOLS`) is S-scoped and stays.
 
     **Pins that must not move:** `test_tool_declarations.py`; Check 7 (`test_none_w_is_s_plus_the_envelope`);
@@ -621,6 +648,12 @@ grammar and is not a step.
 12. **Gates.** Principle 5 and 6; `elspeth-lints` corpus before and after (expect judge-bundle churn on
     `decode_wire_arguments`, whose `@trust_boundary` invariant text moves; per-commit hygiene, nothing staged); the
     boot probe accepts the stamped list on each deployed route; a paired battery round (§5).
+13. **Live tool-calling canary (principle 9).** Before the flip and again after it, on the deployed route, real tool
+    calls against the stamped list for every schema shape the flip changes (carrier string from F1, pair array from F4,
+    nested carrier inside a pair element in F5; zero-property if a flip ever touches one), recorded per
+    `provider_served` endpoint. The boot probe's acceptance of the list is not this check: S1's 16-token probe accepted
+    a list whose zero-property tools then failed every call. Pre-register the canary's pass rule with the step's other
+    gates (§5.3). A canary failure on any endpoint is a zero-tolerance tripwire.
 
 **Why a flip is one consistent state.** On `openai_strict` the tool accepts only the carrier form (R-A). On `none` and
 MCP it accepts only the object form. The dialect is resolved once per route from settings (`strict_transport.py:190,
@@ -670,8 +703,8 @@ revert it before any A or P step it depends on (principle 7); the flip's own mod
   carrier.
 - *Owed before F1:* check whether any length cap applies to the raw `function.arguments` string upstream of
   `bounded_json_loads` (master plan S2, envelope-first O6). No lane measured it.
-- *Depends on:* M1a to M6, A2, A4, A7, A8, P3, P1 (if ruled), R-A, R-B, R-E, R-H, and R1 reopened for this tool or
-  family.
+- *Depends on:* M1a to M6, A2, A4, A7, A8, P3, P1 (if ruled), R-A, R-B, R-E, R-H, the start condition (§1.1), and
+  the live canary for the carrier-string shape run before the flip (principle 9).
 - *Tickets:* none. A search of open `composer` tickets on 2026-09-25 found no other S2 ticket besides
   `elspeth-a1864430a1`.
 
@@ -736,10 +769,11 @@ revert it before any A or P step it depends on (principle 7); the flip's own mod
 - *Measurability:* none from organic or battery traffic today. `set_source` and `set_source_from_blobs` have never been
   called in any store. Gate: deterministic tests, the boot probe and one M4 scenario each. **A regression here will be
   found only by use.** Each step's plan says so.
-- *Why they are a group:* the per-tool reopen trigger can never fire for them (R-G). If John rules them in, do all five
-  in consecutive steps so the strict route ends with one spelling for `options`. If he does not, stop after F5 and
-  accept that the strict route spells `options` two ways (objects on these five, `options_json` on `upsert_node` and
-  `set_pipeline`). That is not dual acceptance, but it is a lasting teaching inconsistency.
+- *Why they are a group:* they carry little or no traffic, so no per-tool measurement can show a benefit or a
+  regression for them; their acceptance rests on the live canary, the deterministic gates and one M4 scenario each
+  (R-G). Do all five in consecutive steps so the strict route ends with one spelling for `options`. If John stops the
+  programme after F5, the strict route spells `options` two ways (objects on these five, `options_json` on
+  `upsert_node` and `set_pipeline`). That is not dual acceptance, but it is a lasting teaching inconsistency.
 - *Alternative order:* F6 to F10 before F4, so that `set_pipeline` reuses the `examples` arm from F7 and the `options`
   family ends its mixed window with `set_pipeline`. The cost is five measurement-blind steps before the measurable ones.
 
@@ -856,11 +890,12 @@ the design effect M6 measures, before it is pre-registered.
   5) get a qualitative gate. F3 and F6 to F10 get deterministic gates and seeded scenarios only.
 - **The limit, stated once:** a round can show that a step did not break its tool. It cannot show that a step helped.
   The benefit direction needs 170 or more calls per arm for `set_pipeline` alone.
-- The reopen trigger (about 50 failures per tool) is further still. At the battery's roughly 20% option-tool failure
-  rate that is about 250 calls of one tool. At 4.9 option calls a day in total, 250 calls of any one tool takes at
-  least 51 days even if every option call were that tool; in practice it is months, and never for a tool nobody calls.
-  That is the organic horizon. If battery traffic counts toward the trigger, `patch_node_options` (about 9 failures
-  per round) reaches about 50 in about 6 rounds. Master plan §6.3 does not say which; R-M asks.
+- The former R1 reopen trigger (about 50 failures per tool; master plan §6.3, no longer a precondition since
+  2026-09-25) is further still, and is now the size of a per-tool benefit read. At the battery's roughly 20%
+  option-tool failure rate that is about 250 calls of one tool. At 4.9 option calls a day in total, 250 calls of any
+  one tool takes at least 51 days even if every option call were that tool; in practice it is months, and never for a
+  tool nobody calls. That is the organic horizon. If battery traffic counts as acceptance evidence,
+  `patch_node_options` (about 9 failures per round) reaches about 50 in about 6 rounds. R-M asks which.
 
 ### 5.3 Gates per step
 
@@ -879,6 +914,7 @@ the design effect M6 measures, before it is pre-registered.
 - **Tier F, zero-tolerance tripwires (revert on one occurrence, any n):**
   - a `wire_decode` caused by a server encode/decode asymmetry (the round trip fails on a captured argument);
   - a `_BadRequestLLMError` or boot-probe rejection naming the new schema;
+  - a live canary failure for a changed schema shape on any `provider_served` endpoint (principle 9; §3.5 item 13);
   - carrier text in any persisted audit row.
 - **Tier F, regression bound** for rate-gateable tools (F1, F5): the tool's non-ok rate on strict-route rows within the
   bound for the arm size, against the paired control.
@@ -889,6 +925,12 @@ the design effect M6 measures, before it is pre-registered.
   (errors may move rather than vanish); burst-first turn cost; drift hints; the mixed-window signatures (§4).
 - **Windows are tagged by flip commit,** because `strict_sent` and `wire_conformant` change meaning per tool per window.
 - **Deferred organic read:** the same measures on dev-session data over the following weeks, reported, not gating.
+- **Per-flip benefit read (the former R1 reopen trigger, now a measurement).** Per flipped tool, the master plan §5.4
+  split (shape against content), turn cost and the enforcing-endpoint share, read against the pre-flip window and the
+  2026-09-24 evidence (10 shape, 18 content, 2 ambiguous; the stringification signature of `a5d9e5414` /
+  `e50604428`). A flip that shows a regression is reverted at once (the tripwires and bound above). A flip whose read,
+  once it has enough failures to say anything (§5.2), shows no benefit is reverted too (principle 7). This is an
+  acceptance read, not a gate on starting the flip.
 
 ---
 
@@ -901,10 +943,10 @@ the design effect M6 measures, before it is pre-registered.
   (intersection measured empty, with a control).
 - **The one coupling is the exemplars.** After F5, the pipeline planner must keep receiving S-form exemplars (P2),
   otherwise it is taught carrier text its terminal rejects.
-- **An S3 reopen is possible only after F5** and reuses F5's `set_pipeline` rules. It would rebind the manifest check
-  to `project_tool(canonical)` for the sent dialect (master plan §4 S3), switch the planner consumer's exemplar form in
-  the same commit, and send a strict terminal only to a hatch route the boot probe has exercised. It stays withdrawn
-  until its own reopen.
+- **S3 is reinstated with S2 (R1 yes, deferred) and starts only after F5.** It reuses F5's `set_pipeline` rules. It
+  rebinds the manifest check to `project_tool(canonical)` for the sent dialect (master plan §4 S3), switches the planner
+  consumer's exemplar form in the same commit, and sends a strict terminal only to a hatch route that the boot probe
+  and a live canary (principle 9) have exercised with it.
 - **Tripwire:** any step that moves `test_tool_declarations.py` or Check 7 has changed S and pulled S3 in. Stop and
   re-plan.
 
@@ -933,20 +975,20 @@ the design effect M6 measures, before it is pre-registered.
 
 | # | Decision | Gates | Recommendation |
 |---|---|---|---|
-| R1 | Reopen R1, per tool or per family, or rule a narrower scope. Write the result into master plan §6.3 | all of Tier P and F | John's call. Tier M and A proceed either way |
+| R1 | **Ruled yes, deferred (John, 2026-09-25; master plan §6.3).** No per-tool or per-family reopen is needed. What remains is the start condition (§1.1): John's call that the codebase is stable enough, plus the S1 zero-property fix and a healthy live window (principle 9) | when Tier M and A start; every flip needs its live canary | Nothing to decide beyond the start call |
 | R-A | On a flipped tool on `openai_strict`, the S-form key (alone or with the carrier) is rejected as `wire_decode`, as is a non-string at a required carrier and carrier text that is not a JSON object. **Overturns S1 D12**; the `@trust_boundary` invariant text changes | F1 and every flip | Yes. It is the only form of a flip that meets "no dual acceptance". It rejects calls accepted today on non-enforcing endpoints; M6 sizes that, and the rate is a pre-registered tripwire |
 | R-B | Duplicate JSON object keys: reject in the compose loop on every route (P1), or accept and document last-wins in carriers. Either way two asymmetries are recorded: the pipeline planner's parse stays last-wins (changing it touches the terminal and its `MALFORMED_RESPONSE` whole-response abort, which is S3); and if "accept", a repeated route label is rejected on `openai_strict` (a duplicate pair) but last-wins on `none` (a duplicate JSON key) | F1 | Decide on M3's count. Preferred: P1, compose loop only (`tool_batch.py:918`) |
 | R-C | Accept the permanent split: web `openai_strict` sends `*_json`, MCP and `none` send objects | F1 | Accept. The alternative is a carrier in S, which breaks "`none` = today's bytes" and pulls S3 into every step |
 | R-D | R1's "The 'not strings containing JSON' guidance stands" needs no amendment at carrier positions: an S type fault can never occur there on `openai_strict`. Open: for a type fault at another position of a flipped tool on `openai_strict`, keep the sentence, or append a fixed per-(dialect, flipped tool) variant that names the carrier exception | after the F1 round | Keep the sentence unchanged in F1 and pin the carrier position unreachable. Build the variant only if the F1 round shows the sentence confusing the model; it needs the allowlist (`protocol.py:993-997`) and strip (`:1392-1393`) changes plus a redaction review |
 | R-E | A bounds overrun inside a carrier stays `wire_json_bounds`. Sub-decision on the shared per-call budget: (a) the outer traversal skips declared carrier strings and charges their decoded content once, or (b) accept a roughly halved effective limit for carrier tools | F1 | Yes, and (a): it is what "accepted, as the object form is today" in the carrier table already promises. The raw 1 MiB preflight still charges escapes; state that residual |
 | R-F | No machinery lands ahead of its first producer | step sizes | Confirm (S0 precedent). This is why F1 (L), F4 (L) and F5 (XL) cannot be made smaller, and why the pair codec waits for F4. Everything with a live producer today has been pulled out (P3, P4, and the defect fix A8). Relaxing R-F is the only way to shrink the three further; that is the direct trade against "small steps" |
-| R-G | The basis for each reopen: the §6.3 trigger, or a ruling. For F6 to F10, a family ruling, because the per-tool trigger can never fire for tools nobody calls | Tier F timing; F6 to F10 | John's call. Without a family ruling, stop after F5 |
+| R-G | The per-flip acceptance rule, replacing "the basis for each reopen" now that R1 is yes: a flip is kept when its live canary passes on every `provider_served` endpoint, no zero-tolerance tripwire fires, and its non-ok rate stays within the §5.2 bound against the paired control; it is reverted on a regression, or when its benefit read (§5.3) shows no benefit once it has the data. For F6 to F10, which have no traffic to measure, acceptance is the live canary, the deterministic gates and one M4 scenario each | every flip; F6 to F10 | Adopt as stated. For F6 to F10, John may still choose to stop after F5 (§3.5) |
 | R-H | "No dual acceptance, no old wire form alongside the new one" (master plan §4) is read per (tool, route); the mixed window across tools is what "one at a time" entails | every flip | State it explicitly, so it is not relitigated |
 | R-I | M1a changes the ARG_ERROR `planner_payload` in `RejectionRecord`, which S1 lead ruling 6 left untouched (the ticket records this as needing a lead decision) | M1a (and M1b, which shares the rejection path) | Allow it: the payload becomes what the planner saw, which is what the table comment already promises |
 | R-J | Adopt the planner-turn-cost definition (`understand-measure.md` §5; 09-24 plan §1.4 item 9) | M5 | Adopt burst-first round trips, censored failures reported apart |
 | R-K | Full-suite gate on every one-string text step (A3 to A5), or grouped: focused tests plus the affected whole-tree gates per commit, one full-suite gate for the group. AGENTS.md says "choose tests by the reach of the change"; the master plan requires the full gate per slice | Tier A cost | The plan follows the stricter rule until John rules. The gate time exceeds the diff time for these steps |
 | R-L | Graph-repair `tool_sequence` suggestions (a surface the first draft missed): (a) render them through `encode` per route at the point that knows the dialect (P4), or (b) classify them as a semantic mirror explained once in W | F4 | (a). The surface exists to be copied verbatim (`tools/_common.py:855-863`), so a mirror the model must transcode by hand defeats it; (a) follows §4 layer 2. It costs dialect plumbing that `ToolResult.to_dict` lacks today (P4, size M) |
-| R-M | Does battery traffic count toward the §6.3 reopen trigger, or only organic traffic? | the reopen horizon | John's call. Organic only: months per tool, never for uncalled tools. Battery counted: about 6 rounds for `patch_node_options`. Master plan §6.3 is silent |
+| R-M | Does battery traffic count as acceptance evidence for a flip (the §5.3 benefit read and the R-G rule), or only organic traffic? (Before 2026-09-25 this asked whether it counts toward the R1 reopen trigger.) | how soon a flip's benefit read can be made | John's call. Organic only: months per tool, never for uncalled tools. Battery counted: about 6 rounds for `patch_node_options` |
 
 ### 7.3 Stop conditions (stop and report; do not improvise)
 
@@ -956,6 +998,7 @@ the design effect M6 measures, before it is pre-registered.
 - Carrier text appears in any persisted audit row, redaction output or persisted `arguments_canonical` (the
   in-memory 4 KiB raw prefix for invalid outer JSON is the named exception, §3.5 item 8).
 - A `_BadRequestLLMError` or boot-probe rejection names a new schema.
+- A live canary (principle 9) fails for a changed schema shape on any `provider_served` endpoint.
 - A round-trip failure on a captured argument.
 - A fix would need the server to insert, choose or repair a value (composer invariant 1), or a tutorial-only path
   (invariant 2).
@@ -1030,6 +1073,19 @@ lane (`$L/revise-dispositions.md`), which is lost with the worktree; this sectio
 - **Not taken:** building the per-tool type-guidance variant inside F1 (no evidence yet that it is needed; R-D), and
   pulling the `bounded_json_loads` budget parameter out as its own step (nothing would call it before F1).
 - **New rulings:** R-L (graph-repair rendering) and R-M (does battery traffic count toward the reopen trigger).
+
+**Reframe 2026-09-25.** The plan was first written as contingent on R1, which John had ruled no on 2026-09-24. On
+2026-09-25 he reversed that ruling to yes, deferred (§1.1 quotes him; master plan §6.3). This revision:
+- rewrites §1.1: S2 and S3 are reinstated, in small steps; the start condition is codebase stability (John's call),
+  not the data-driven reopen trigger;
+- turns the 2026-09-24 evidence (10 shape, 18 content, 2 ambiguous; `strict` on a carrier string constrains nothing
+  inside it; the options-as-string swings `a5d9e5414` / `e50604428`) into per-step acceptance and measurement input
+  (§5.3 benefit read) instead of a gate, and the former per-tool reopen trigger into a measurement read at each flip;
+- adds principle 9 and Tier F item 13, the live tool-calling canary per schema shape and per `provider_served`
+  endpoint, from S1's zero-property regression (session `ed3c015b-a2f7-4322-9f39-1716541c5796`), and makes that
+  regression's fix plus a healthy live window on the 22 remaining strict tools a precondition for starting;
+- rewords R1, R-G and R-M in §7.2 (R1 ruled; R-G becomes the per-flip acceptance rule; R-M asks about acceptance
+  evidence), renames the §3.1 gating column, and reinstates S3 after F5 (§1.4, §6).
 
 ---
 
