@@ -67,6 +67,52 @@ def _settings_path(tmp_path: Path, *, mode: str, source_plugin: str = "csv", key
 
 
 @pytest.mark.parametrize("mode", ["replay", "verify"])
+@pytest.mark.parametrize("command", ["run", "validate"])
+@pytest.mark.parametrize("database_exists", [True, False])
+def test_missing_source_admission_matches_for_run_and_validate(tmp_path: Path, mode: str, command: str, database_exists: bool) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode)
+    landscape_path = tmp_path / "landscape.db"
+    if not database_exists:
+        landscape_path.unlink()
+    args = ["--no-dotenv", command, "--settings", str(settings_path)]
+    if command == "run":
+        args.append("--execute")
+    with (
+        patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets,
+        patch("elspeth.cli.load_settings", side_effect=AssertionError("plugin imports during settings load")) as loader,
+    ):
+        result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 1, result.output
+    assert "Replay/verify source run 'run-does-not-exist' does not exist" in result.output
+    secrets.assert_not_called()
+    loader.assert_not_called()
+    assert landscape_path.exists() is database_exists
+    assert not (tmp_path / "output.json").exists()
+    assert not (tmp_path / "payloads").exists()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
+def test_validate_accepts_completed_source_without_writing_output(tmp_path: Path, mode: str) -> None:
+    settings_path = _settings_path(tmp_path, mode=mode)
+    raw = yaml.safe_load(settings_path.read_text())
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}")
+    try:
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config=raw, canonical_version="v1", run_id="run-does-not-exist")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-does-not-exist"))
+    finally:
+        db.close()
+
+    result = CliRunner().invoke(app, ["--no-dotenv", "validate", "--settings", str(settings_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Pipeline configuration valid" in result.output
+    assert not (tmp_path / "output.json").exists()
+    assert not (tmp_path / "payloads").exists()
+
+
+@pytest.mark.parametrize("mode", ["replay", "verify"])
 @pytest.mark.parametrize("run_flag", ["--execute", "--dry-run"])
 def test_missing_source_run_refused_before_secrets_loader_plugin_import_or_constructor(tmp_path: Path, mode: str, run_flag: str) -> None:
     settings_path = _settings_path(tmp_path, mode=mode)

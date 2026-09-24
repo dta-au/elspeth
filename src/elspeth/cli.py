@@ -512,6 +512,8 @@ def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
 
 def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str], object | None]:
     """Check source-run authority before secrets, file templates, or plugins."""
+    from sqlalchemy.engine.url import make_url
+
     from elspeth.cli_helpers import resolve_audit_passphrase
     from elspeth.contracts.call_mode import RuntimeRunMode
     from elspeth.core.config import ConcurrencySettings, LandscapeSettings, TelemetrySettings
@@ -567,6 +569,15 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     for side_channel in ("depends_on", "collection_probes", "commencement_gates"):
         if raw_config.get(side_channel):
             raise ValueError(f"Replay/verify with {side_channel} is unsupported")
+    parsed_url = make_url(landscape.url)
+    if (
+        parsed_url.get_backend_name() == "sqlite"
+        and parsed_url.database is not None
+        and parsed_url.database != ":memory:"
+        and not parsed_url.database.startswith("file:")
+        and not Path(parsed_url.database).exists()
+    ):
+        raise contract_errors.OrchestrationInvariantError(f"Replay/verify source run {replay_from!r} does not exist")
     db = LandscapeDB.from_url(
         landscape.url,
         passphrase=resolve_audit_passphrase(landscape),
@@ -1982,10 +1993,12 @@ def validate(
 
     settings_path = Path(settings).expanduser()
 
-    # Load and validate config with Key Vault secrets (same flow as 'run' command)
-    # This ensures ${VAR} placeholders are resolved correctly for keyvault-backed configs
+    # Share run's admission before secrets, file templates, or plugin imports.
     try:
-        config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
+        config, _secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+        _admit_cli_nonlive_run(config)
     except (YamlParserError, YamlScannerError) as e:
         # YAML syntax errors from Dynaconf/ruamel (malformed YAML) - show helpful message
         _format_validation_error(
@@ -2032,7 +2045,7 @@ def validate(
             hint="Check field names, types, and required values.",
         )
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
         # Environment variable expansion errors (must be AFTER ValidationError!)
         error_msg = str(e)
         if "environment variable" in error_msg.lower():
@@ -5031,9 +5044,9 @@ def web(
 
     # An explicit CLI choice takes precedence; otherwise preserve the provider
     # supplied to the app factory through its normal environment settings.
-    selected_auth = auth if auth is not None else os.environ.get("ELSPETH_WEB__AUTH_PROVIDER", "local")
+    selected_auth = auth if auth is not None else os.environ.get("ELSPETH_WEB__AUTH_PROVIDER")
     selectable = registered_provider_names()
-    if selected_auth not in selectable:
+    if selected_auth is not None and selected_auth not in selectable:
         typer.echo(f"Error: unknown auth provider {selected_auth!r}. Choose one of: {', '.join(selectable)}", err=True)
         raise typer.Exit(1)
 
@@ -5042,7 +5055,8 @@ def web(
     # so we set ELSPETH_WEB__* env vars that settings_from_env() reads.
     os.environ["ELSPETH_WEB__HOST"] = host
     os.environ["ELSPETH_WEB__PORT"] = str(port)
-    os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
+    if selected_auth is not None:
+        os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
 
     uvicorn.run(
         "elspeth.web.app:create_app",
