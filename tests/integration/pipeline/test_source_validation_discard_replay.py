@@ -90,8 +90,9 @@ def _run_id(result: Result) -> str:
         ([7], [7, "bad"]),
         ([7, "bad"], [7, "different"]),
         ([7, "bad", "bad"], [7, "bad"]),
+        ([7, "bad"], [7, "bad", "bad"]),
     ],
-    ids=["removed", "added", "changed", "duplicate-removed"],
+    ids=["removed", "added", "changed", "duplicate-removed", "duplicate-added"],
 )
 def test_verify_rejects_changed_validation_discards_before_transform_start(
     tmp_path: Path,
