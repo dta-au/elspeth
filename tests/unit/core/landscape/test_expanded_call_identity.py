@@ -15,7 +15,19 @@ from tests.fixtures.landscape import claim_test_work_item, leader_coordination_t
 from tests.unit.core.landscape.test_call_mode_persistence import _two_runs
 
 
-@pytest.mark.parametrize("corruption", [None, "duplicate_member", "missing_parent", "cycle", "cross_row"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        None,
+        "duplicate_member",
+        "duplicate_member_distinct_request",
+        "duplicate_member_distinct_type",
+        "duplicate_member_no_calls",
+        "missing_parent",
+        "cycle",
+        "cross_row",
+    ],
+)
 @pytest.mark.parametrize("kind", ["expand", "fork"])
 def test_expanded_call_identity_is_order_independent_and_rejects_corruption(corruption: str | None, kind: str) -> None:
     factory, _source_operation, _current_operation = _two_runs()
@@ -67,8 +79,23 @@ def test_expanded_call_identity_is_order_independent_and_rejects_corruption(corr
                 )
             )
         second = children_by_run["source"][1]
-        if corruption == "duplicate_member":
+        if corruption in (
+            "duplicate_member",
+            "duplicate_member_distinct_request",
+            "duplicate_member_distinct_type",
+            "duplicate_member_no_calls",
+        ):
             conn.execute(update(token_parents_table).where(token_parents_table.c.token_id == second.token_id).values(ordinal=0))
+            if corruption == "duplicate_member_distinct_request":
+                conn.execute(
+                    update(calls_table)
+                    .where(calls_table.c.call_id == "recorded-0")
+                    .values(request_hash=stable_hash({"url": "https://example.test/b"}))
+                )
+            elif corruption == "duplicate_member_distinct_type":
+                conn.execute(update(calls_table).where(calls_table.c.call_id == "recorded-0").values(call_type=CallType.LLM.value))
+            elif corruption == "duplicate_member_no_calls":
+                conn.execute(delete(calls_table).where(calls_table.c.call_id == "recorded-0"))
         elif corruption == "missing_parent":
             conn.execute(delete(token_parents_table).where(token_parents_table.c.token_id == second.token_id))
         elif corruption == "cycle":
