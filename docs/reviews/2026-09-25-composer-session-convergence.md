@@ -572,3 +572,12 @@ epoch 68 and the rebuilt frontend remain deployment consequences. Refresh surviv
 stays parked for the streaming UI rewrite. The original-header write-target and
 numeric-admission limitations documented above remain open; the ten passing
 workflows are not an exhaustive claim over all plugin combinations.
+
+
+Local integration completed at `8191240beddfc08d7a44859b64d3e107691a3060`
+on `release/0.8.1`. Post-transition checks confirmed the target index, absence of
+conflicts, exact tested executable-content hash, and preservation of all 138
+unrelated user files (seven modified tracked files and 131 untracked files).
+All five task worktrees and the merged task branch were removed with the canonical
+cleanup script after preserving and verifying the unique frontend build archive.
+No push or production service restart was performed.
