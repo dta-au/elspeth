@@ -1050,7 +1050,7 @@ def test_read_only_root_filesystem_matches_the_container_contract() -> None:
 def test_gateway_sidecar_supplies_every_required_runtime_environment_name() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     gateway = ecs[ecs.index("gateway_container = {") : ecs.index("candidate_web_container = {")]
-    supplied = re.findall(r'\{ name = "(ELSPETH_LLM_GATEWAY_[^"]+)", (?:value|valueFrom) = ', gateway)
+    supplied = re.findall(r'\{ name = "(ELSPETH_LLM_GATEWAY_[^"]*)", (?:value|valueFrom) = ', gateway)
 
     # Ask the gateway's actual loader which names it requires and accepts. This keeps the
     # deployment test tied to the runtime contract as that contract evolves.
