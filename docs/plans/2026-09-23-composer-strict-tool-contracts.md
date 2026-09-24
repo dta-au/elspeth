@@ -3,9 +3,21 @@
 - **Date:** 2026-09-23
 - **Goal (John):** "ultimately we want a strict contract for every tool call" made by the Web Composer planner.
 - **Status:** S0 implemented and merged into local `release/0.8.1` (`85ebf2739`); S0 acceptance items 2, 4 and 5
-  are owed (see "S0 review fixes" below). **S1 implemented** on `feat/strict-tool-contracts-s1` (one commit per task on
-  `85ebf2739`, see "S1 as implemented" at the end of §4 S1); its full-suite gate, merge, CHANGELOG line and dev
-  deployment acceptance are owed. S2 onward is plan only.
+  are owed (see "S0 review fixes" below). **S1 implemented and merged** into `release/0.8.1` as `c4c52c110`, which is
+  also on `origin/release/0.8.1` (see "S1 as implemented" at the end of §4 S1). The S1 branch is rooted on
+  `e69498f6c` (`c4c52c110^1`, the parent of S1's root commit `34f0fed73`): the S0 merge `85ebf2739` plus `e69498f6c`
+  "fix(composer): reject malformed advisor checkpoint envelopes". Its full-suite gate at `d5f8c5aac` recorded
+  `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, and none is
+  attributable to S1:
+  - six are epoch-66 doc, website and receipt drift (the docs still say 65);
+  - two are the line-pinned `test_session_db_mutation_authority` checks;
+  - `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`, so it came in with `e69498f6c`, not with
+    S1;
+  - the `p5_budget_exhaustion` advisor-gate test already fails at the S0 merge `85ebf2739`, so it predates S1.
+
+  Still owed for S1: the CHANGELOG line and dev deployment acceptance. **R1 and R2 were ruled on 2026-09-24 (§1,
+  §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional.** The branch-order defects the R1/R2 panel found are handled
+  in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`.
 - **Code base the citations use:** `path:line` citations were measured at `6d8f7f729`. The branch
   `design/strict-tool-contracts` was then fast-forwarded to `release/0.8.1` at `c6e12fc44`. **Python `src` changes**
   in `6d8f7f729..c6e12fc44` are limited to `control_messages.py`, `sessions/models.py` and `sessions/schema.py`, so
@@ -25,6 +37,16 @@
 ---
 
 ## 1. Decision summary
+
+**Rulings of 2026-09-24 (John: "lets lock it in").**
+
+- **R1 no.** The 10 option-bearing tools and the pipeline-planner terminal stay `strict:false` permanently, with S as
+  their contract. S2 and S3 are withdrawn; S4 and S5 stay optional. R1 reopens only per tool, on the trigger in
+  §6.3.
+- **R2 yes**, under the five conditions in §6.3. It has no immediate use and is recorded for future per-tool use.
+- **The goal, as adopted:** "a strict contract for every tool call" means that every call is admitted only by the
+  closed server contract S and classified against the wire form it was sent in; grammar-enforced strict is used
+  where it measurably pays.
 
 ### 1.1 What "strict" means here
 
@@ -49,12 +71,13 @@ There are two layers, and only one of them decides admission.
    **Tier-3 promise**. We record it and measure it (`strict_sent` and `wire_conformant` on every invocation), and
    we never rely on it for admission.
 
-"A strict contract for every tool call" is therefore delivered as:
+"A strict contract for every tool call" is therefore delivered as follows (the reading adopted on 2026-09-24, above):
 
 - every call is admitted only by a closed S;
 - every call is classified against the W it was sent under;
-- every tool that a route can grammar-constrain is sent `strict: true`. That is 32 tools from S1, and the other 10
-  after ruling R1.
+- grammar-enforced `strict: true` is sent where it measurably pays: the 32 mechanical tools, from S1. The 10
+  option-bearing tools and the pipeline-planner terminal stay `strict: false` permanently (R1, §6.3). For them the
+  strict contract is S, which the server enforces on every route.
 
 ### 1.2 Options strategy
 
@@ -64,13 +87,21 @@ The 10 option-bearing tools are `set_source`, `patch_source_options`, `set_sourc
 mode both require `additionalProperties:false` on every object, so these 10 tools **cannot be strict in any
 dialect as they are shaped today**. The pipeline-planner terminal `emit_pipeline_proposal` has the same problem.
 
-- **Until R1 is ruled**, all 11 are sent with an explicit `strict: false` on routes that recognise the key. Their
-  contract is S, which is already closed on the server.
-- **R1 is decided on data from S0**, not now. S0 makes shape errors and value errors distinguishable, including the
-  plugin-option rejections that are recorded today as SUCCESS. If shape errors dominate on these tools, the candidate
-  carrier is `options_json`/`patch_json` JSON text plus pair-encoded structure maps. It ships only if a
-  tutorial-canary regression check passes (S2). If value errors dominate, no grammar would have prevented them, and
-  these tools stay `strict:false` with S as their contract.
+- All 11 are sent with an explicit `strict: false` on routes that recognise the key, **permanently** (R1 ruled no
+  on 2026-09-24, §6.3). Their contract is S, which is closed and enforced on the server.
+- **Why there is no carrier.** The candidate carrier was `options_json`/`patch_json` JSON text plus pair-encoded
+  structure maps (S2, now withdrawn). It was refused on the historical data rather than on a new window, for three
+  reasons:
+  - The unredacted rejection store (`composition_rejection_events`, §2.3) holds 30 unique option-tool failures:
+    10 shape, 18 content and 2 ambiguous. That is a shape share of 0.33, Wilson 95% [0.19, 0.51]. Content errors are
+    the majority, and no grammar reaches them.
+  - `strict` on an `options_json` string constrains nothing inside the string, and the string is where those content
+    errors sit.
+  - Options-as-string has already swung twice on this seam. `a5d9e5414` (2026-05-29) tolerated it with a boundary
+    coercion, after 24 of 84 calls on the then-deployed `gpt-5.4-mini` stringified options. `e50604428`
+    (2026-09-12) rejected it at admission. A carrier would be a third swing.
+- **Reopen trigger.** R1 reopens per tool only, on the trigger in §6.3. Its inputs are defined in §5.4, and none of
+  them is measurable yet.
 
 ### 1.3 Why this shape
 
@@ -287,7 +318,9 @@ OpenAI strict rules (official docs, as quoted by the providers lane):
 | **Plugin-option rejections are SUCCESS rows, and their `error_code` is redacted** | scratch probe: `_failure_result(state, "Invalid option 'secretvalue'", error_code="plugin_options_invalid")` → `redact_tool_call_response("upsert_node", …)` | raw entry `error_code: 'plugin_options_invalid'`; **persisted `error_code: '<redacted-response-text>'`**. Positive control: `severity: 'high'` survives. `success: False` survives. Negative control (`error_code=None`): the key is **absent in raw and `null` in persisted** (the redactor writes `error_code`, `contract`, `row_union_schema`, `coalesce_union_type` and `rejected_component` as `null`); Appendix A's `coalesce(…, 'uncoded')` already handles the null. So "rejected" can be counted today, but *why* cannot |
 | Rejection sites with a code | `grep -n 'error_code="' src/elspeth/web/composer/tools/*.py` | `plugin_options_invalid` at `transforms.py:745,1768,1963`, `sources.py:977,1160,1422,2031`, `outputs.py:171,272` (set_output, patch_output_options) and `tools/sessions.py:1162,1346,1492,1592,1650,1677` (set_pipeline; `:1650` conditional); `interpretation_requirements_invalid` at 8 sources sites (`sources.py:960,1072,1088,1252,1406,1471,1951,1993`). Many `_failure_result` calls carry no code (e.g. `transforms.py:738`) |
 | Emitted codes outside the guidance catalogue | live membership test against `tools/generation.py` `_VALIDATION_GUIDANCE_BY_CODE` (positive control `plugin_options_invalid` → True; negative `zzz` → False) | **not in the catalogue**: `edge_not_lowerable` (`transforms.py:1421`, `state.py:3463`), `edge_route_conflict` (`transforms.py:1440`, `state.py:3485,3495`), `interpretation_review_pending` (`service.py:2733`), `output_name_invalid` (`state.py:507`, state validation `_routing_label_errors`, so it can surface on any mutating tool), `prompt_template_parts_required` (`transforms.py:1669`, inside `_execute_patch_node_options`, an option tool), `round_trip_unavailable` (`tools/sessions.py:2290`), `runtime_preflight_not_run` (`generation.py:4034`). Probe: `prompt_template_parts_required` and `output_name_invalid` persist as `<redacted-response-text>` exactly like `plugin_options_invalid`. The list comes from a literal scan, so it is a lower bound: codes passed through a variable (e.g. `transforms.py` `_post_mutation_invariant_error` → `error_code=error_code`) are not in it |
-| Archived dev sessions | **lead-measured, not re-verified here** | 14 sessions, 151 planner tool calls, 4 ARG_ERRORs (get_plugin_schema, set_pipeline ×2 including the envelope rejection, request_interpretation_review). Stored text is redacted, so shape and value cannot be told apart. The sample is too small to judge any slice on. Appendix A has the census query for accruing new data |
+| Archived dev sessions | re-measured 2026-09-24 on read-only copies of the four `data/sessions.db.pre-*` archives (R1/R2 panel, `census.py`) | 14 sessions, 151 planner tool calls, 4 ARG_ERRORs (get_plugin_schema, set_pipeline ×2 including the envelope rejection, request_interpretation_review), **plus 6 SUCCESS-status rejections on option tools** that the first count left out. The redacted `chat_messages` rows cannot tell shape from value, but the store in the next row can |
+| **Unredacted rejection store** | `composition_rejection_events` (`sessions/models.py:1668-1716`; elspeth-3e28029d2f, session schema epoch 49). `turn_audit.build_rejection_records` builds its rows, and `persist_compose_turn` (`sessions/service.py:6650`; the `record_composition_rejection` call is at `:6862`) writes them in the same transaction as the redacted tool row | One row per refused call (ARG_ERROR or SUCCESS-status rejection), keyed `(session_id, tool_call_id)`, with `error_code`, `message` and `planner_payload` stored **unredacted**. In the 7 September DB copies that hold rejections, it covers every unique non-ok tool row; the only 2 rows without an event are a forked session's copies (join control, with a mutated-id negative). **So the earlier statement that "stored text is redacted, so shape and value cannot be told apart" was wrong for every DB written since epoch 49.** Limits: (1) for an ARG_ERROR, `planner_payload` is `{error_class, error_message}`, not the payload the planner saw, so the S1 T9 `validation_errors` loc is persisted nowhere (§5.4); (2) its `error_code` column holds the exception class for ARG_ERRORs; (3) before S0, the `invalid_schema` message does not say whether the failing keyword was shape or bound |
+| Option-tool failures (R1 evidence) | the store above plus the July DBs' `data.error` text, fork copies excluded (R1/R2 panel, evidence lens) | 30 unique failures. **10 shape**: envelope ×3, outer `JSONDecodeError` ×2, `invalid_schema` ×5. **18 content**: `plugin_options_invalid` ×10; `review_reconciliation_failed` ×3; `prompt_template_parts_required`, `interpretation_requirements_invalid` and `aggregation_expected_output_count_mode_invalid` 1 each; 2 uncoded. 15 of the 18 are measured, and 3 July rows are inferred from their message. **2 ambiguous.** Shape share 0.33, Wilson 95% [0.19, 0.51]; 0.40 [0.25, 0.58] if both ambiguous rows count as shape. 5 of the 10 shape errors are in one session. This is the R1 evidence (§6.3) |
 
 ### 2.4 Other baseline facts
 
@@ -379,7 +412,7 @@ Anthropic-shaped dialect is S5.
    pass null)"), `get_pipeline_state.component` ("omit component"), `request_interpretation_review.llm_draft` ("OMIT
    this when…"). S2 positions with the same problem include `upsert_node` `trigger`/`on_success`/`on_error`/
    `output_mode`/`policy`/`merge`/`expected_output_count` (and its tool description) and `set_pipeline`
-   `nodes[].on_success`/`on_error`/`expected_output_count` (regex hits; confirm each by reading before S2). The
+   `nodes[].on_success`/`on_error`/`expected_output_count` (regex hits; S2 is withdrawn (§6.3)). The
    projection rewrites "omit X" into "pass null for X"
    (or appends that sentence where a rewrite is ambiguous), pinned per dialect; `none` keeps today's text.
 4. **Keyword allowlist, fail-closed.** Kept: `type, properties, required, additionalProperties(false), items, enum,
@@ -653,8 +686,8 @@ implementing; where this differs from the bullets above, this paragraph is the c
   `ToolArgumentError` (`tool_batch._pre_dispatch_argument_error`) and record its class and category; the text sent
   to the planner is unchanged. The advisor prompt-budget cap does the same. The advisor validator now returns an
   owned `AdvisorArgumentRejection` (error, class, category) instead of a `dict[str, Any]`.
-- **`wire_decode` is not defined in S0.** It has no producer until S2; adding the member then keeps S0 free of a
-  category nothing emits.
+- **`wire_decode` is not defined in S0.** It has no producer: S2 is withdrawn (§6.3). Leaving the member out keeps S0
+  free of a category nothing emits.
 - **`ToolArgumentError.category`.** Keyword-only. When omitted it is derived: `semantic_rule` with no code, or the
   1:1 category of `DISCOVERY_ONLY` / `DUPLICATE_RESOLVED_INTERPRETATION` / the two rate caps. `SCHEMA_VALIDATION`
   must name `schema_shape` or `schema_bound`. A category that disagrees with its code raises. The 14 pydantic-wrap
@@ -1005,14 +1038,20 @@ bullets above, this paragraph is the current state. The task-level plan is
 `docs/plans/2026-09-23-composer-strict-tool-contracts-s1.md` (`29e1b78ee`, revised `da4af9142`); its §3 (C1-C24),
 §1.3 (D1-D24) and §7.3 (lead rulings) hold the evidence for each item below.
 
-- **Status.** Implemented on `feat/strict-tool-contracts-s1`, based on `85ebf2739`, one commit per task: T1
+- **Status.** Implemented on `feat/strict-tool-contracts-s1`, based on `e69498f6c` (`c4c52c110^1`: the S0 merge
+  `85ebf2739` plus the advisor checkpoint envelope fix), one commit per task: T1
   `2198ba34a` (`strict_profile`), T2 `c0f54f09d` (`wire_projection` W, ledger, limits, faithfulness gate), T3
   `1718dc3ca` (decode/encode), T4 `be1bd209e` (`strict_transport`, `composer_strict_tools`), T5 `faa8f6224` (audit
   fields), T6 `da6b5b2dc` (compose-loop decode, every route still `none`), T7 `2cbf36b98` (planner dialect plumbing),
   T8 `14e4a6ce5` (**the only wire flip**), T9 `f2fae72de` (S-gate repair signal), T10 `4c41ee4ca` (status endpoint),
-  T11 `e8d35e83d` (wire fidelity matrix), T12 (this record and Appendix A). Owed: the full-suite gate (S1 plan §6),
-  the merge on John's word, the CHANGELOG line (the release it belongs to is John's call and was not inferred), the
-  operator's sign-bundle, and the dev-deployment acceptance items (S1 plan §8).
+  T11 `e8d35e83d` (wire fidelity matrix), T12 (this record and Appendix A). Merged into `release/0.8.1` as
+  `c4c52c110`, which is also on `origin/release/0.8.1`. The hashes above are the pre-merge branch commits. On
+  `release/0.8.1` they are T1 `94e8234ef`, T2 `f66eaa1c6`, T3 `83b42e11c`, T4 `50a2b67cd`, T5 `ffe461394`,
+  T6 `aba49cf55`, T7 `513dcf808`, T8 `6cb9403c6`, T9 `bada9873d`, T10 `1c4cd049e`, T11 `483c3a6cb`, T12 `2589991e6`,
+  then `c6d940d51` (D20) and `d5f8c5aac` (D10). The full-suite gate (S1 plan §6) ran at `d5f8c5aac`: `RESULT=FAIL`
+  with 10 reds, none attributable to S1 (see the status line at the top of this plan). Owed: the CHANGELOG line (the
+  release it belongs to is John's call and was not inferred), the operator's sign-bundle, and the dev-deployment
+  acceptance items (S1 plan §8).
 - **Corrections to this section (S1 plan §3).** C1: a bare model plus an api_base is not always provider `openai`
   (LiteLLM checks 47 known hosts first), so the resolver asks `litellm.get_llm_provider`. C2: the compose loop
   persists no `ComposerToolInvocation`; its wire facts live on the P4 assistant `tool_calls` entries (D1), which is
@@ -1079,9 +1118,12 @@ bullets above, this paragraph is the current state. The task-level plan is
   `parallel_tool_calls`, no gateway change, no DDL and no epoch bump; the only new provider call is the boot-time
   `hatch_terminal` probe request.
 
-### S2 — Options carrier and structure maps (blocked on R1 and R2)
+### S2 — Options carrier and structure maps (WITHDRAWN 2026-09-24: R1 ruled no)
 
-Starts only if John rules R1 in, using the S0/S1 data. Content:
+**Withdrawn.** John ruled R1 no on 2026-09-24 (§6.3), so nothing in this section is to be implemented. It stays as
+the design of record in case R1 reopens. A reopen happens per tool only, on the trigger in §6.3, and would re-derive
+this content for that one tool rather than take the section whole. R2 was ruled yes, but its only carrier was this
+slice, so it has no use until a reopen. The content as originally planned:
 
 - The 13 option/patch positions become `options_json`/`patch_json` strings, nullable where the flat field is
   optional.
@@ -1140,7 +1182,11 @@ Gates: as S1, plus the deliberate pin moves in the blast-radius list above, and 
 --check` if any teaching surface changes. Run the full-suite gate before merge: this changes the teaching and
 planner-facing surface.
 
-### S3 — Pipeline-planner terminal (after S2)
+### S3 — Pipeline-planner terminal (WITHDRAWN 2026-09-24: R1 ruled no)
+
+**Withdrawn with S2.** The terminal carries the same open option objects, so it stays `strict:false` permanently
+(§1.2, §6.3). The `capability_skill.py` manifest-hash change below is therefore not needed. The content as
+originally planned:
 
 `emit_pipeline_proposal` is projected by the same compiler: the set_pipeline W plus `claimed_deferred_intent_ids`,
 promoted and nullable, with `uniqueItems` moved to the ledger.
@@ -1179,7 +1225,7 @@ Gates: as S2.
 Acceptance: compare the planner `rejection_codes` distribution and the first-turn success rate on an empty state
 with the S1 window.
 
-If R1 is refused, the terminal stays `strict:false` permanently. That is stated in §6.
+R1 was refused on 2026-09-24, so the terminal stays `strict:false` permanently (§6.3).
 
 ### S4 — Enforcement proof on the deployed route (optional; blocked on a measurement and on R5)
 
@@ -1246,7 +1292,7 @@ It is value-free, and it is persisted on every ARG_ERROR alongside `field_count`
 | `wire_json_bounds` | wire | `JsonBoundaryError` |
 | `wire_not_object` | wire | `tool_batch.py:929` (was `"TypeError"`) |
 | `wire_envelope` | wire | `tool_batch.py:967/987/994` in S0 (was `"TypeError"`); from S1, decode's `ENVELOPE_UNWRAP` node |
-| `wire_decode` | wire | S2 and later only: duplicate pair key, or carrier text that is not JSON or not an object |
+| `wire_decode` | wire | no producer: it belonged to S2, which is withdrawn, and it is not a member of the enum. It would return only with a per-tool R1 reopen (duplicate pair key, or carrier text that is not JSON or not an object) |
 | `canonicalization` | semantic | compose loop: `IntegerDomainError`, an integer outside the I-JSON range (non-finite numbers never get past the decoder); MCP sidecar: `canonical_json`'s `ValueError` on a non-finite float, which the MCP SDK's decoder admits |
 | `missing_required_path` | semantic | required-paths walker (was `MissingRequiredPaths`) |
 | `schema_shape` | semantic | S Draft 2020-12 failure whose `validator` keyword **is** in `WIRE_KEYWORD_ALLOWLIST`, so a grammar should have prevented it |
@@ -1275,12 +1321,43 @@ per-`provider_served` split in the table below needs that join first.
 
 | When | What to read | Decision it feeds |
 |---|---|---|
-| After S0 | Per option tool: `schema_shape` + `model_validation` + `wire_*`, which a grammar or carrier could affect, versus `schema_bound` + `semantic_rule` + `plugin_options_invalid` + uncoded rejections, which it could not | R1 |
+| After S0 | Per option tool, the §5.4 split: wrong-type options/patch + other-field shape (`wire_*`, `missing_required_path`, `schema_shape`, `model_validation`), which a grammar or carrier could affect, versus inside-options content (`plugin_options_invalid`) + other rules (`schema_bound`, `semantic_rule`, other codes, uncoded), which it could not | R1 reopen trigger (§6.3); R1 itself was ruled on the historical store (§2.3) |
 | After S1 | On the 32: the `wire_conformant=False` rate per `provider_served` (a high rate on endpoints that advertise structured outputs means strict is being ignored); change in `schema_shape`; first-call latency | S4 worth building; R5 |
-| After S2 | The acceptance gate in §4 S2 | Keep or revert the carrier |
+| After S2 | Withdrawn with S2 (§6.3) | — |
 
-Sample size: 151 calls with 4 errors is not enough to call any direction. Name the window by calls per option tool,
-not by days. My suggestion is at least 200 calls per option tool, or John sets a number.
+Sample size. R1 did not need a new window: content errors are already a majority of the 30 unique historical
+option-tool failures (§2.3). The reopen trigger is counted in **failures per tool**, not calls: at least about 50.
+52 failures separate a true shape share of 0.33 from 0.5 at one-sided α=.05 and power .8 (R1/R2 panel, `power.py`).
+At the measured organic rate, about 4.9 option calls a day on the dev deployment over 2026-09-07..21, that is months
+per tool. `set_source` and `set_source_from_blobs` have never been called. The earlier "at least 200 calls per option
+tool" is withdrawn as unreachable.
+
+### 5.4 Option-tool split (inputs to the R1 reopen trigger)
+
+Each non-ok call to an option tool falls in exactly one class. Only the first two count as "shape" for the trigger.
+
+| Class | Rule | Read from |
+|---|---|---|
+| Wrong-type options/patch | ARG_ERROR `schema_shape` with a violation whose last loc segment is `options` or `patch` and whose code is `invalid_type`. Measured locs: `('options',)`, `('patch',)`, `('source','options')`, `('sources','item','options')`, `('nodes','index','options')`, `('outputs','index','options')`. The S gate maps every JSON-schema `type` failure to `invalid_type` (`web/composer/tools/_dispatch.py:560-561`), so a string, an integer, a list and `null` in `options` all give the same `(('options',), 'invalid_type')` pair. The `a5d9e5414` options-as-string signature is a subset of this class; telling it apart needs a value-free observed-type discriminator (the JSON type that was sent) persisted beside the `(loc, code)` pairs, which the pairs alone cannot provide | S1 T9 `validation_errors` |
+| Other-field shape | Any other ARG_ERROR in `wire_not_object`, `wire_envelope`, `wire_json_invalid`, `wire_json_bounds`, `missing_required_path`, `schema_shape` or `model_validation`. `wire_json_invalid` has no loc, so it counts as shape without being attributed to a field (one of the three historical `JSONDecodeError`s was inside the options) | `error_category` on the tool row (S0); loc from T9 |
+| Inside options (content) | SUCCESS-status rejection with `error_code = plugin_options_invalid`. The S gate never reports a loc inside the options, because their interior is open in S | the tool row's `error_code` (S0); the message is in `composition_rejection_events` |
+| Other rule | `schema_bound`, `semantic_rule` and the value categories; every other SUCCESS-status `error_code`; uncoded rejections | as above |
+
+**Not measurable yet.** The first two classes need the S-gate loc, and no store keeps it:
+- the redacted ARG_ERROR tool row keeps only `validation_error_count` (`redaction.redact_arg_error_response`);
+- `turn_audit.build_rejection_records` writes `{error_class, error_message}` as the ARG_ERROR `planner_payload`. It
+  does not write the `arg_error_payload` the planner saw (`tool_batch.py:2555-2569`).
+
+Until one of the two persists the closed `(loc, code)` pairs, the wrong-type options/patch class, the
+options-versus-other-fields split and the reopen trigger cannot be read. Persisting the pairs is redaction-safe: they
+are value-free by construction (S1 C10: a model-authored key becomes `field`/`item`, and the codes are a closed enum).
+Separating options sent as a string from other wrong types also needs the sent JSON type, which is value-free too.
+This is owed before any reopen read, and it is not scheduled in this plan.
+
+Two further limits:
+- `validation_errors` is capped at eight entries plus one `truncated` entry, so a signature past the cap is lost.
+- The trigger's other two inputs have no instrument yet: planner-turn cost, and the enforcement fraction, which needs
+  the `provider_served` join that Appendix A does not make.
 
 ---
 
@@ -1289,7 +1366,7 @@ not by days. My suggestion is at least 200 calls per option tool, or John sets a
 ### 6.1 Risks
 
 1. **S1 may change nothing measurable.** The 32 tools rarely fail, and 2 of the 4 archived errors were on
-   set_pipeline, which stays non-strict until R1. Mitigation: S0 comes first, and §5.3 says what to read.
+   set_pipeline, which stays non-strict (R1 ruled no, §6.3). Mitigation: S0 comes first, and §5.3 says what to read.
 2. **Silent non-enforcement on the deployed route.** 10 of the 24 deepseek endpoints do not advertise structured
    outputs, including the first-party one, and `require_parameters` does not select on tool-level strict. The boot
    probe detects rejection, not ignoring. `wire_conformant` split by `provider_served` is the detector. Claiming
@@ -1329,19 +1406,37 @@ not by days. My suggestion is at least 200 calls per option tool, or John sets a
   any non-OpenRouter api_base, with an `openai/` or a bare model name, resolves to `NONE` (today's bytes) unless the
   operator sets `forward_to_endpoint`, and then the boot probe decides.
 - **Escape hatch:** the pipeline planner's hatch route (advisor model + advisor endpoint) is resolved on its own
-  (S1), and it gets a strict terminal only after a tools-bearing probe of that route (S3).
+  (S1). Its terminal stays `strict:false` permanently (R1, §6.3).
 
 ### 6.3 Open decisions for John
 
-1. **R1 — options carrier.** Should the 13 option/patch positions become `options_json`/`patch_json` JSON text,
-   together with pair maps? This reverses the "not strings containing JSON" guidance for those named fields only.
-   - *Recommendation:* decide after the S0 baseline. Take the carrier only if shape errors dominate on the option
-     tools, and only behind the S2 canary gate.
-   - If it is refused, the 10 tools and the terminal stay `strict:false` permanently, with S as their contract. Say
-     so plainly in the release notes: "every tool strict" is then met server-side for those 10, not by grammar.
-2. **R2 — map transcoding.** Is pair-array ↔ map transcoding at the web wire boundary representation, not server
-   authoring, under the composer invariants?
-   - *Recommendation:* yes. It is lossless and 1:1, it rejects duplicates, and it chooses nothing.
+1. **R1 — options carrier. RULED NO (John, 2026-09-24, "lets lock it in").** The 10 option-bearing tools and the
+   pipeline-planner terminal stay `strict:false` permanently, with S as their contract. S2 and S3 are withdrawn; S4
+   and S5 stay optional. The "not strings containing JSON" guidance stands.
+   - Evidence:
+     - the unredacted store (§2.3) holds 30 unique option-tool failures: 10 shape, 18 content and 2 ambiguous
+       (shape share 0.33, Wilson 95% [0.19, 0.51]);
+     - `strict` on an `options_json` string constrains nothing inside it;
+     - options-as-string has already swung twice on this seam (`a5d9e5414`, `e50604428`).
+   - **Reopen trigger (per tool).** R1 reopens for one specific tool only when both of these hold:
+     - its shape errors, weighted by planner-turn cost, exceed 50% of its failures over at least about 50 failures;
+     - enough of that tool's traffic reaches endpoints that enforce strict.
+
+     "Shape" means the first two classes of §5.4. None of the trigger's inputs is measurable yet (§5.4).
+   - Release notes: "a strict contract for every tool call" is met for these 11 by the server contract S, not by
+     grammar.
+2. **R2 — map transcoding. RULED YES (John, 2026-09-24).** Pair-array ↔ map transcoding at the web wire boundary
+   is representation, not server authoring, under five conditions:
+   1. the round trip is lossless;
+   2. order is preserved both ways (map insertion order ⇄ array order);
+   3. duplicate keys are rejected. That is a documented change from today: the compose loop decodes a repeated JSON
+      object key silently, keeping the last value (`bounded_json_loads` with no `object_pairs_hook`,
+      `tool_batch.py:914`);
+   4. no default is inserted and no choice is made between alternatives;
+   5. `branches` (`list[str] | dict[str,str]`) is decoded by element type (string or pair object), and an empty
+      `[]` is rejected.
+
+   R2 has no immediate use, because its only carrier was S2. It is recorded for future per-tool use.
 3. **R3 — `error_class` and the epoch.**
    - Option (a): keep `error_class` as the honest exception class and add `error_category`. The keys are additive
      JSON, so no DDL is needed, provided S0 confirms no reader rejects unknown keys.
@@ -1408,7 +1503,8 @@ against the served deployment's live file.
 
 ```sql
 WITH calls AS (
-  SELECT json_extract(tc.value, '$.id')              AS call_id,
+  SELECT m.session_id                                AS session_id,
+         json_extract(tc.value, '$.id')              AS call_id,
          json_extract(tc.value, '$.function.name')   AS tool,
          json_extract(tc.value, '$.strict_sent')     AS strict_sent,
          json_extract(tc.value, '$.wire_conformant') AS wire_conformant
@@ -1429,7 +1525,7 @@ SELECT c.tool,
        c.wire_conformant,
        count(*) AS n
 FROM chat_messages t
-JOIN calls c ON c.call_id = t.tool_call_id
+JOIN calls c ON c.session_id = t.session_id AND c.call_id = t.tool_call_id
 WHERE t.role = 'tool' AND json_valid(t.content)
 GROUP BY 1, 2, 3, 4
 ORDER BY 1, 2, 3, 4;
@@ -1459,4 +1555,19 @@ ORDER BY 1, 2, 3, 4;
   Two negative controls on the query:
   - making `strict_sent` two-valued (`coalesce(…, 0)`) merges the two option-tool rows;
   - dropping the `wire_conformant` column merges the `none`-route row with the pre-S1 one.
+- **Session-scoped join (corrected 2026-09-24).** A forked session copies its parent's chat rows and keeps their
+  `tool_call_id`s (`fork_session` in `sessions/service.py` copies `tool_call_id=msg.tool_call_id`). A join on
+  `call_id` alone therefore matched each copied tool row against the assistant entries of both sessions. The query
+  now joins on `(session_id, call_id)`. The tighter alternative carries the assistant row id into `calls`
+  (`m.id AS msg_id`) and joins `c.msg_id = t.parent_assistant_id AND c.call_id = t.tool_call_id`, which binds each
+  tool row to its own assistant row. It gives the same counts today.
+  - Measured on read-only copies of the 13 dev and lane DBs that have tool rows (R1/R2 panel): the corrected total
+    equals the tool-row count in every DB. The old join over-counted only in the DB with a fork (26 against 14 tool
+    rows). The corrected per-(tool, outcome) totals equal an independent Python classifier's (496 = 496).
+  - Controls on the T12 fixture plus a hand-built fork session that reuses two call ids:
+    - the 8 T12 groups and both negative controls above are unchanged;
+    - on the fork, the corrected query counts each copied row once per session (n=2), and the old join n=4;
+    - removing the session condition brings the over-count back.
+  - The query counts tool rows, so a fork's copies are counted once, in the fork session. To count unique events,
+    filter separately on `sessions.forked_from_session_id`.
 - Before S0, the `rejected:` arm returns `<redacted-response-text>` (§2.3).
