@@ -25,16 +25,31 @@ from tests.integration.pipeline.test_run_mode_end_to_end import _settings
 
 @pytest.mark.parametrize("mode", ["replay", "verify"])
 @pytest.mark.parametrize("destination", ["quarantine", "discard"])
-def test_cli_retained_sink_diversion_preserves_dispositions_and_handoff(tmp_path: Path, mode: str, destination: str) -> None:
+@pytest.mark.parametrize("failure", ["encoding", "extra-column"])
+def test_cli_retained_sink_diversion_preserves_dispositions_and_handoff(tmp_path: Path, mode: str, destination: str, failure: str) -> None:
     settings = _settings(tmp_path)
     (tmp_path / "input.csv").write_text("value\nascii\ncafé\n", encoding="utf-8")
+    if failure == "extra-column":
+        source_path = tmp_path / "input.json"
+        source_path.write_text('[{"value":"ascii"},{"value":"café","extra":"unconfigured"}]', encoding="utf-8")
+        settings["sources"] = {
+            "primary": {
+                "plugin": "json",
+                "on_success": "source_out",
+                "options": {"path": str(source_path), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+            }
+        }
     primary_path = tmp_path / "output.csv"
     quarantine_path = tmp_path / "quarantine.jsonl"
     sinks = {
         "output": {
             "plugin": "csv",
             "on_write_failure": destination,
-            "options": {"path": str(primary_path), "encoding": "ascii", "schema": {"mode": "observed"}},
+            "options": {
+                "path": str(primary_path),
+                "encoding": "ascii" if failure == "encoding" else "utf-8",
+                "schema": {"mode": "observed"},
+            },
         }
     }
     if destination == "quarantine":
@@ -52,6 +67,7 @@ def test_cli_retained_sink_diversion_preserves_dispositions_and_handoff(tmp_path
     assert live.exit_code == expected_exit, live.output
     live_run_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
     published = {primary_path: primary_path.read_bytes()}
+    assert primary_path.read_text(encoding="utf-8").splitlines() == ["value", "ascii"]
     if destination == "quarantine":
         published[quarantine_path] = quarantine_path.read_bytes()
         assert json.loads(published[quarantine_path])["value"] == "café"
@@ -60,10 +76,18 @@ def test_cli_retained_sink_diversion_preserves_dispositions_and_handoff(tmp_path
     settings["replay_from"] = live_run_id
     settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
     with (
+        patch.object(CSVSink, "on_start", side_effect=AssertionError("non-live primary startup")),
+        patch.object(CSVSink, "inspect_effect", side_effect=AssertionError("non-live primary inspect")),
         patch.object(CSVSink, "prepare_effect", side_effect=AssertionError("non-live primary prepare")),
         patch.object(CSVSink, "commit_effect", side_effect=AssertionError("non-live primary publish")),
+        patch.object(CSVSink, "write", side_effect=AssertionError("non-live primary write")),
+        patch.object(CSVSink, "close", side_effect=AssertionError("non-live primary close")),
+        patch.object(JSONSink, "on_start", side_effect=AssertionError("non-live failsink startup")),
+        patch.object(JSONSink, "inspect_effect", side_effect=AssertionError("non-live failsink inspect")),
         patch.object(JSONSink, "prepare_effect", side_effect=AssertionError("non-live failsink prepare")),
         patch.object(JSONSink, "commit_effect", side_effect=AssertionError("non-live failsink publish")),
+        patch.object(JSONSink, "write", side_effect=AssertionError("non-live failsink write")),
+        patch.object(JSONSink, "close", side_effect=AssertionError("non-live failsink close")),
     ):
         non_live = runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
     assert non_live.exit_code == expected_exit, non_live.output
@@ -80,6 +104,10 @@ def test_cli_retained_sink_diversion_preserves_dispositions_and_handoff(tmp_path
         assert {(member.role, member.ingest_sequence, member.reason_hash) for member in source_members} == {
             (member.role, member.ingest_sequence, member.reason_hash) for member in replay_members
         }
+        sink_node_id = next(member.sink_node_id for member in source_members if member.role is SinkEffectRole.PRIMARY)
+        source = VirtualReplaySinkEffect(factory=factory, source_run_id=live_run_id, sink_node_id=sink_node_id)
+        current = VirtualReplaySinkEffect(factory=factory, source_run_id=current_run_id, sink_node_id=sink_node_id)
+        assert source._source_dispositions() == current._source_dispositions()
         assert all(effect.publication_performed is False for effect in factory.execution.sink_effects.get_effects_for_run(current_run_id))
 
     # A virtual run is itself retained evidence; its diversion timestamp still

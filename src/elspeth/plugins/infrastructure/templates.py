@@ -308,6 +308,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
     index = _AVAILABLE_WORKERS.get_nowait()
+    response_received = False
     try:
         entry = _WORKERS[index]
         if entry is None or not entry[0].is_alive():
@@ -329,11 +330,10 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         try:
             parent.send((source, payload, value_free))
             if not parent.poll(_WORKER_TIMEOUT_SECONDS):
-                _retire_worker(index)
                 raise TemplateError("Template exceeded the execution time limit")
             status, value = parent.recv()
+            response_received = True
         except (EOFError, BrokenPipeError) as exc:
-            _retire_worker(index)
             raise TemplateError("Template worker stopped before completing") from exc
         if status == "ok":
             if type(value) is not str:
@@ -369,7 +369,13 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
             raise TemplateError("Template worker exceeded the memory limit")
         raise TemplateRuntimeError(value)
     finally:
-        _AVAILABLE_WORKERS.put(index)
+        try:
+            # An interrupted exchange may leave a response (or partial frame)
+            # in the pipe. Reusing it would attribute that output to another row.
+            if not response_received:
+                _retire_worker(index)
+        finally:
+            _AVAILABLE_WORKERS.put(index)
 
 
 class _BoundedTemplate:
@@ -640,6 +646,9 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
 
     def __init__(self, candidates: frozenset[str]) -> None:
         self._candidates = candidates
+        # Root assignments update the render context. Local frames do not;
+        # retain their enclosing context separately from their lexical locals.
+        self._context_bound: frozenset[str] | None = None
         self.unbound: set[str] = set()
         self.seen: set[str] = set()
 
@@ -648,6 +657,23 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         for statement in statements:
             current = self.visit(statement, current)
         return current
+
+    def _block_context(self, bound: frozenset[str]) -> frozenset[str]:
+        return bound if self._context_bound is None else self._context_bound
+
+    def _analyze_scope(
+        self,
+        statements: Iterable[nodes.Node],
+        bound: frozenset[str],
+        *,
+        context_bound: frozenset[str],
+    ) -> None:
+        enclosing_context = self._context_bound
+        self._context_bound = context_bound
+        try:
+            self.analyze(statements, bound)
+        finally:
+            self._context_bound = enclosing_context
 
     def generic_visit(self, node: nodes.Node, bound: frozenset[str]) -> frozenset[str]:
         self._scan_children(node, bound)
@@ -668,7 +694,7 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
     def visit_AssignBlock(self, node: nodes.AssignBlock, bound: frozenset[str]) -> frozenset[str]:
         if node.filter is not None:
             self._scan(node.filter, bound)
-        self.analyze(node.body, bound)
+        self._analyze_scope(node.body, bound, context_bound=self._block_context(bound))
         self._scan_assignment_target(node.target, bound)
         return bound | _stored_names(node.target)
 
@@ -686,8 +712,8 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         loop_bound = bound | _stored_names(node.target) | {"loop"}
         if node.test is not None:
             self._scan(node.test, loop_bound)
-        self.analyze(node.body, loop_bound)
-        self.analyze(node.else_, bound)
+        self._analyze_scope(node.body, loop_bound, context_bound=self._block_context(bound))
+        self._analyze_scope(node.else_, bound, context_bound=self._block_context(bound))
         return bound
 
     def visit_With(self, node: nodes.With, bound: frozenset[str]) -> frozenset[str]:
@@ -696,14 +722,18 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         local_bound = bound
         for target in node.targets:
             local_bound |= _stored_names(target)
-        self.analyze(node.body, local_bound)
+        self._analyze_scope(node.body, local_bound, context_bound=self._block_context(bound))
         return bound
 
     def visit_Macro(self, node: nodes.Macro, bound: frozenset[str]) -> frozenset[str]:
         for default in node.defaults:
             self._scan(default, bound)
         argument_names = frozenset(argument.name for argument in node.args)
-        self.analyze(node.body, bound | argument_names | {"caller", "kwargs", "varargs"})
+        self._analyze_scope(
+            node.body,
+            bound | argument_names | {"caller", "kwargs", "varargs"},
+            context_bound=self._block_context(bound),
+        )
         return bound | {node.name}
 
     def visit_CallBlock(self, node: nodes.CallBlock, bound: frozenset[str]) -> frozenset[str]:
@@ -711,7 +741,7 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         for default in node.defaults:
             self._scan(default, bound)
         argument_names = frozenset(argument.name for argument in node.args)
-        self.analyze(node.body, bound | argument_names)
+        self._analyze_scope(node.body, bound | argument_names, context_bound=self._block_context(bound))
         return bound
 
     def visit_Import(self, node: nodes.Import, bound: frozenset[str]) -> frozenset[str]:
@@ -748,12 +778,12 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
 
     def visit_FilterBlock(self, node: nodes.FilterBlock, bound: frozenset[str]) -> frozenset[str]:
         self._scan(node.filter, bound)
-        self.analyze(node.body, bound)
+        self._analyze_scope(node.body, bound, context_bound=self._block_context(bound))
         return bound
 
     def visit_OverlayScope(self, node: nodes.OverlayScope, bound: frozenset[str]) -> frozenset[str]:
         self._scan(node.context, bound)
-        self.analyze(node.body, bound)
+        self._analyze_scope(node.body, bound, context_bound=bound)
         return bound
 
     def visit_ScopedEvalContextModifier(self, node: nodes.ScopedEvalContextModifier, bound: frozenset[str]) -> frozenset[str]:
@@ -763,11 +793,14 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         return bound
 
     def visit_Block(self, node: nodes.Block, bound: frozenset[str]) -> frozenset[str]:
-        self.analyze(node.body, bound)
+        # Jinja passes only the render context to an unscoped block. A scoped
+        # block derives a context that also contains the caller's local names.
+        block_bound = bound if node.scoped else self._block_context(bound)
+        self._analyze_scope(node.body, block_bound, context_bound=block_bound)
         return bound
 
     def visit_Scope(self, node: nodes.Scope, bound: frozenset[str]) -> frozenset[str]:
-        self.analyze(node.body, bound)
+        self._analyze_scope(node.body, bound, context_bound=self._block_context(bound))
         return bound
 
     def _scan(self, node: nodes.Node, bound: frozenset[str]) -> None:

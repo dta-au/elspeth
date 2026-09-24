@@ -34,6 +34,7 @@ from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
+from elspeth.core.landscape.execution.sink_effect_identity import MAX_LINEAGE_DEPTH, MAX_LINEAGE_NODES_PER_MEMBER, MAX_LINEAGE_PARENTS
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
@@ -45,6 +46,8 @@ from elspeth.core.landscape.schema import (
     operations_table,
     rows_table,
     runs_table,
+    token_lineage_frames_table,
+    token_parents_table,
     tokens_table,
 )
 
@@ -980,6 +983,59 @@ class CallAuditRepository:
             return None
         return self._call_loader.load(row)
 
+    def _token_lineage_hash(self, token_id: str, run_id: str, row_id: str) -> str:
+        """Normalize durable parent ordinals, never run-local token/group IDs.
+
+        A fork/expansion's sole parent relation carries its member ordinal;
+        joins carry ordered parent slots. Recursing preserves nested member
+        identity even after a collector removes its open lineage frames.
+        Unlike sink membership's retained lineage JSON, call matching only
+        needs equality: hashing each level bounds shared-parent DAG evidence.
+        """
+        memo: dict[str, str] = {}
+        visiting: set[str] = set()
+
+        def walk(current_id: str, depth: int) -> str:
+            if current_id in visiting:
+                raise AuditIntegrityError("cycle in call parent token lineage")
+            if depth > MAX_LINEAGE_DEPTH:
+                raise AuditIntegrityError("call parent token lineage exceeds depth bound")
+            if current_id in memo:
+                return memo[current_id]
+            if len(memo) + len(visiting) >= MAX_LINEAGE_NODES_PER_MEMBER:
+                raise AuditIntegrityError("call parent token lineage exceeds node bound")
+            token = self._ops.execute_fetchone(select(tokens_table).where(tokens_table.c.token_id == current_id))
+            if token is None or token.run_id != run_id or token.row_id != row_id:
+                raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
+            parents = self._ops.execute_fetchall(
+                select(token_parents_table)
+                .where(token_parents_table.c.token_id == current_id)
+                .order_by(token_parents_table.c.ordinal)
+                .limit(MAX_LINEAGE_PARENTS + 1)
+            )
+            if len(parents) > MAX_LINEAGE_PARENTS:
+                raise AuditIntegrityError("call parent token lineage exceeds parent bound")
+            ordinals = [parent.ordinal for parent in parents]
+            if any(parent.run_id != run_id for parent in parents) or any(type(ordinal) is not int or ordinal < 0 for ordinal in ordinals):
+                raise AuditIntegrityError("call parent token lineage has invalid parent relation")
+            if len(parents) > 1 and ordinals != list(range(len(parents))):
+                raise AuditIntegrityError("call parent token lineage has non-dense parent ordinals")
+            if len({parent.parent_token_id for parent in parents}) != len(parents):
+                raise AuditIntegrityError("call parent token lineage repeats a parent")
+            if not parents:
+                frame = self._ops.execute_fetchone(
+                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.token_id == current_id).limit(1)
+                )
+                if token.join_group_id is not None or frame is not None:
+                    raise AuditIntegrityError("call parent token claims lineage without parent relations")
+            visiting.add(current_id)
+            identity = stable_hash([(parent.ordinal, walk(parent.parent_token_id, depth + 1)) for parent in parents])
+            visiting.remove(current_id)
+            memo[current_id] = identity
+            return identity
+
+        return walk(token_id, 0)
+
     def list_source_calls_for_current_parent(
         self,
         *,
@@ -990,7 +1046,7 @@ class CallAuditRepository:
     ) -> list[Call]:
         """List source calls bound to the current parent identity.
 
-        State calls bind to the node and the source row's declared identity,
+        State calls bind to the node, source row, stable token lineage,
         step and attempt. Operation calls bind to node and operation type.
         A repeated operation with identical request/index is ambiguous and
         must be refused rather than selected by timestamp order.
@@ -1000,11 +1056,15 @@ class CallAuditRepository:
         if current_state_id is not None:
             current = self._ops.execute_fetchone(
                 select(
+                    node_states_table.c.token_id,
+                    node_states_table.c.run_id,
+                    tokens_table.c.row_id,
                     node_states_table.c.node_id,
                     node_states_table.c.step_index,
                     node_states_table.c.attempt,
                     rows_table.c.source_node_id,
                     rows_table.c.source_row_index,
+                    rows_table.c.run_id.label("row_run_id"),
                 )
                 .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
                 .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
@@ -1012,9 +1072,11 @@ class CallAuditRepository:
             )
             if current is None:
                 raise AuditIntegrityError("current state is missing for call replay lookup")
-            query = (
-                select(calls_table)
-                .join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+            if current.row_run_id != current.run_id:
+                raise AuditIntegrityError("current call parent has a cross-run source row")
+            current_lineage = self._token_lineage_hash(current.token_id, current.run_id, current.row_id)
+            parent_query = (
+                select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
                 .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
                 .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
                 .where(
@@ -1024,8 +1086,22 @@ class CallAuditRepository:
                     node_states_table.c.attempt == current.attempt,
                     rows_table.c.source_node_id == current.source_node_id,
                     rows_table.c.source_row_index == current.source_row_index,
+                    rows_table.c.run_id == source_run_id,
                 )
             )
+            source_parents = self._ops.execute_fetchall(parent_query)
+            source_lineages = {
+                parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id)
+                for parent in {parent.token_id: parent for parent in source_parents}.values()
+            }
+            matching_parents = [parent for parent in source_parents if source_lineages[parent.token_id] == current_lineage]
+            # Identity is a property of the parent, independent of whether its
+            # calls have the requested type, request hash or local index.
+            if len(matching_parents) > 1:
+                raise AuditIntegrityError("ambiguous source call parent token lineage")
+            if not matching_parents:
+                return []
+            query = select(calls_table).where(calls_table.c.state_id == matching_parents[0].state_id)
         else:
             current = self._ops.execute_fetchone(
                 select(

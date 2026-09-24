@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -132,18 +133,22 @@ _MODEL_TARGET = "composer-gw-e2e-target"
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
 _UPSTREAM_HOST = "upstream.composer-gw-e2e.mock"
 
-# Bounds sized for real Composer traffic. The rendered system message reached
-# 100638 characters with the campaign teaching, exceeding the previous 100000
-# fixture limit before these tests could exercise their intended round trips.
-# Allow 128 Ki characters here; production gateway bounds remain independent.
-# The Phase 2 e2e suite's bounds (10 tools / 20000
-# chars) are sized for the low-level GatewayLLMProvider's synthetic
-# messages and are far too small for a real Composer request.
-_MAX_MESSAGES = "50"
-_MAX_TOOLS = "60"
-_MAX_STRING_CHARS = "131072"
-_MAX_SCHEMA_BYTES = "65536"
-_MAX_SCHEMA_DEPTH = "15"
+
+def _scenario_c_request_bounds() -> dict[str, str]:
+    """Exercise the shipped deployment bounds with real boot and session traffic.
+
+    Independent fixture limits previously hid an example configuration that
+    rejected Composer's tool count, nested schemas, and rendered system prompt.
+    Require one literal numeric assignment per bound so a missing or changed
+    example shape cannot silently fall back to more permissive fixture values.
+    """
+    example = (_REPO_ROOT / "deploy/aws-ecs/terraform/examples/scenario-c.tfvars.example").read_text(encoding="utf-8")
+    bounds: dict[str, str] = {}
+    for name in ("messages", "tools", "string_chars", "schema_bytes", "schema_depth"):
+        values = re.findall(rf"^gateway_max_{name}\s*=\s*([0-9]+)\s*$", example, flags=re.MULTILINE)
+        assert len(values) == 1, f"expected one numeric gateway_max_{name} in Scenario C example"
+        bounds[f"ELSPETH_LLM_GATEWAY_MAX_{name.upper()}"] = values[0]
+    return bounds
 
 
 class _HostRoutedTransport(httpx.AsyncBaseTransport):
@@ -186,11 +191,7 @@ def _build_gateway_app() -> Any:
         "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID": _OAUTH_CLIENT_ID,
         "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET": _OAUTH_CLIENT_SECRET,
         "ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD": "client_secret_basic",
-        "ELSPETH_LLM_GATEWAY_MAX_MESSAGES": _MAX_MESSAGES,
-        "ELSPETH_LLM_GATEWAY_MAX_TOOLS": _MAX_TOOLS,
-        "ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS": _MAX_STRING_CHARS,
-        "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES": _MAX_SCHEMA_BYTES,
-        "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH": _MAX_SCHEMA_DEPTH,
+        **_scenario_c_request_bounds(),
         "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps(
             {_MODEL_ALIAS: {"target": _MODEL_TARGET}, _SAMPLING_MODEL_ALIAS: {"target": _MODEL_TARGET}}
         ),
