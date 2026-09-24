@@ -164,11 +164,11 @@ class TestLocalReports:
             "detail": "Evidence retained for operator triage.",
         }
         output = "```json\n" + json.dumps({"findings": [finding]}) + "\n```"
-        process = Mock(returncode=0)
+        process = Mock(spec=trigger.subprocess.Popen, returncode=0)
         process.communicate.return_value = (json.dumps({"result": output}), "")
-        popen = Mock(return_value=process)
+        popen = Mock(spec=trigger.subprocess.Popen, return_value=process)
         monkeypatch.setattr(trigger.subprocess, "Popen", popen)
-        publish = Mock(side_effect=AssertionError("Unexpected external command"))
+        publish = Mock(spec=trigger.subprocess.run, side_effect=AssertionError("Unexpected external command"))
         monkeypatch.setattr(trigger.subprocess, "run", publish)
 
         assert trigger.run_red_team("HEAD", tmp_path, dry_run=False) == 0
