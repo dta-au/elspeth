@@ -2975,6 +2975,12 @@ class TestDelegationSignatureAlignment:
             id="get_verification_decisions_for_run",
         ),
         pytest.param(
+            "iter_verification_decisions_for_run",
+            lambda execution: execution.iter_verification_decisions_for_run,
+            ExecutionRepository.iter_verification_decisions_for_run,
+            id="iter_verification_decisions_for_run",
+        ),
+        pytest.param(
             "get_all_calls_for_run",
             lambda execution: execution.get_all_calls_for_run,
             ExecutionRepository.get_all_calls_for_run,

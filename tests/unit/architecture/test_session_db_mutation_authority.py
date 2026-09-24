@@ -5524,11 +5524,11 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ffdb0616b1c68213",
         1,
         None,
-        line=533,
+        line=539,
         connection_escape=True,
     ),
-    # open_export_read_transaction acquires twice: engine.connect() at :466
-    # (yielded, so an escape) and the REPEATABLE READ rebinding at :471.
+    # open_export_read_transaction acquires twice: engine.connect()
+    # (yielded, so an escape) and the REPEATABLE READ rebinding.
     WriterIdentity(
         "src/elspeth/core/landscape/export_read_model.py",
         "open_export_read_transaction",
@@ -5537,7 +5537,42 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9d39978e72854dca",
         1,
         None,
-        line=538,
+        line=544,
+    ),
+    # F10 verdict reads acquire only the repository's Landscape connection.
+    # The forwarded helpers in verification_reads execute joined SELECTs;
+    # the run-list wrapper conservatively retains the scanner's escape flag.
+    # These exact identities grant no Sessions mutation authority.
+    WriterIdentity(
+        "src/elspeth/core/landscape/execution/calls.py",
+        "CallAuditRepository.get_verification_decision",
+        "<non-session-write-connection>",
+        "write_connection",
+        "1c6421f624ce29f0",
+        1,
+        None,
+        line=903,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/execution/calls.py",
+        "CallAuditRepository.get_verification_decisions_for_run",
+        "<non-session-write-connection>",
+        "write_connection",
+        "11b88ebda65aecee",
+        1,
+        None,
+        line=907,
+        connection_escape=True,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/execution/calls.py",
+        "CallAuditRepository.iter_verification_decisions_for_run",
+        "<non-session-write-connection>",
+        "write_connection",
+        "d33078db9d910df0",
+        1,
+        None,
+        line=911,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/leases.py",
@@ -18749,10 +18784,10 @@ def test_live_connection_domain_classification_is_exact() -> None:
         "ffdb0616b1c68213",
         1,
         None,
-        line=533,
+        line=539,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 59
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,

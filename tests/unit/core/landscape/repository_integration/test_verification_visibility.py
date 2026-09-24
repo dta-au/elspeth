@@ -1,4 +1,4 @@
-"""Persisted verification decisions are visible through CLI and read-only MCP."""
+"""Repository-recorded verification decisions reach CLI, TUI, and read-only MCP."""
 
 from __future__ import annotations
 
@@ -7,6 +7,13 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import update
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    leader_member_token,
+    make_recorder_with_run,
+    register_test_node,
+)
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -20,13 +27,6 @@ from elspeth.core.landscape.schema import call_verifications_table
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.server import _TOOLS, _validate_tool_args
 from elspeth.tui.screens.explain_screen import ExplainScreen
-from tests.fixtures.landscape import (
-    claim_test_work_item,
-    leader_coordination_token,
-    leader_member_token,
-    make_recorder_with_run,
-    register_test_node,
-)
 
 
 def _persist_verdict(db_path: Path, *, is_match: bool, operation_parent: bool = False) -> tuple[str, CallVerification]:
