@@ -443,7 +443,12 @@ _TOOLS: dict[str, _ToolDef] = {
         },
     ),
     "get_error_analysis": _ToolDef(
-        description="Analyze errors: grouped by type, by node, with sample data for pattern matching",
+        description=(
+            "Analyze errors: grouped by type, by node, with sample data for pattern matching. "
+            "transform_errors.total and by_transform count terminally failed tokens; "
+            "transform_errors.sample_details are raw transform-error ATTEMPT records, which include "
+            "attempts a later retry recovered, so they are never a failure count"
+        ),
         args=_ArgSpec(required_str=("run_id",)),
         handler=lambda a, args: a.get_error_analysis(args["run_id"]),
         schema_properties={
@@ -479,7 +484,11 @@ _TOOLS: dict[str, _ToolDef] = {
         schema_properties={},
     ),
     "get_failure_context": _ToolDef(
-        description="\U0001f50d Deep dive: Get comprehensive context about failures in a run (failed states, errors, patterns)",
+        description=(
+            "\U0001f50d Deep dive: Get comprehensive context about failures in a run (failed states, errors, patterns). "
+            "transform_errors lists transform-error ATTEMPT records, which include attempts a later retry recovered; "
+            "the patterns counts are the lengths of these limited listings, never failed-token counts"
+        ),
         args=_ArgSpec(
             required_str=("run_id",),
             optional_int=(("limit", 10),),
