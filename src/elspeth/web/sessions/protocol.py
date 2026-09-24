@@ -123,11 +123,17 @@ _GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
 #   advisory_chat        an ordinary guided chat turn advanced the head
 #   guided_full_declined the guided-full escape hatch declined and settled
 #                        its checkpoint over the observed head
+#   compose_checkpoint   an ordinary COMPOSE save preserved the reviewed
+#                        composition and guided session on a fresh checkpoint
+#   ordinary_proposal_checkpoint an approved ordinary tool proposal preserved
+#                        a pending guided review on a fresh checkpoint
 GuidedProposalRebaseReason = Literal[
     "revision_declined",
     "wire_review_entry",
     "advisory_chat",
     "guided_full_declined",
+    "compose_checkpoint",
+    "ordinary_proposal_checkpoint",
 ]
 GUIDED_PROPOSAL_REBASE_REASONS = frozenset(
     {
@@ -135,6 +141,8 @@ GUIDED_PROPOSAL_REBASE_REASONS = frozenset(
         "wire_review_entry",
         "advisory_chat",
         "guided_full_declined",
+        "compose_checkpoint",
+        "ordinary_proposal_checkpoint",
     }
 )
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]

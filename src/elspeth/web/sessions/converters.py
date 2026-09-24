@@ -19,11 +19,38 @@ GuidedSession persistence:
 
 from __future__ import annotations
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument, generate_pipeline_dict
 from elspeth.web.sessions.protocol import CompositionStateRecord
+
+
+def pending_guided_checkpoint(composer_meta: object) -> GuidedSession | None:
+    """Restore a checkpoint only when it carries a pending guided proposal.
+
+    Absent and null guided metadata make no pending-proposal claim. A present
+    active reference must parse as the complete owned guided state before a
+    writer may decide whether to carry it onto another checkpoint.
+    """
+    metadata = deep_thaw(composer_meta)
+    if metadata is None:
+        return None
+    if type(metadata) is not dict:
+        raise AuditIntegrityError("guided checkpoint metadata is malformed")
+    if "guided_session" not in metadata or metadata["guided_session"] is None:
+        return None
+    guided = metadata["guided_session"]
+    if type(guided) is not dict:
+        raise AuditIntegrityError("guided checkpoint is malformed")
+    if "active_proposal" not in guided or guided["active_proposal"] is None:
+        return None
+    try:
+        return GuidedSession.from_dict(guided)
+    except (InvariantError, KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError("pending guided checkpoint is malformed") from exc
 
 
 def state_from_record(record: CompositionStateRecord) -> CompositionState:

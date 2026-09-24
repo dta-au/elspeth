@@ -148,7 +148,7 @@ from elspeth.web.sessions.archive_quarantine import (
     stage_archive_quarantine,
 )
 from elspeth.web.sessions.audit_checkpoint import uncheckpointed_envelopes
-from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.converters import pending_guided_checkpoint, state_from_record
 from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
 from elspeth.web.sessions.guided_audit import (
     bind_guided_failure_audit_rows,
@@ -2974,12 +2974,37 @@ def _rebind_guided_pending_proposal(
     So the fence can never fire on the settling operation itself.
     """
 
+    mutation.guided.require_no_active_confirmation(proposal_id=authority.row.id, now=created_at)
+    _append_verified_guided_proposal_rebase(
+        conn,
+        authority=authority,
+        reason=reason,
+        actor=actor,
+        created_at=created_at,
+        to_state_id=to_state_id,
+    )
+
+
+def _append_verified_guided_proposal_rebase(
+    conn: Connection,
+    *,
+    authority: AuthoritativePipelineProposal,
+    reason: GuidedProposalRebaseReason,
+    actor: str,
+    created_at: datetime,
+    to_state_id: UUID,
+) -> None:
+    """Append the verified hop under the caller's exact mutation authority.
+
+    The guided settlement and ordinary checkpoint callers independently prove
+    their operation fence and absence of live confirmation admission before
+    entering this shared event/anchor write.
+    """
     session_id = str(authority.row.session_id)
     proposal_id = str(authority.row.id)
-    if type(authority.current_base) is not PresentBase:  # pragma: no cover - the rebase verifier owns this
+    if type(authority.current_base) is not PresentBase:
         raise AuditIntegrityError("guided proposal rebase lost its persisted anchor")
     from_state_id = authority.current_base.state_id
-    mutation.guided.require_no_active_confirmation(proposal_id=authority.row.id, now=created_at)
     event_id = str(uuid.uuid4())
     conn.execute(
         insert(proposal_events_table).values(
@@ -3692,13 +3717,13 @@ class _SessionComposerMutations:
                 raise ValueError("ordinary proposal acceptance requires an existing state or a new state snapshot")
             committed_state_id = str(actual_current_state_id)
         else:
-            committed_state_id = service._insert_composition_state(
+            committed_state_id = service._insert_checkpoint_preserving_guided_proposal(
                 connection,
                 session_id=session_id,
-                payload=StatePayload(
-                    data=state,
-                    derived_from_state_id=str(actual_current_state_id) if actual_current_state_id is not None else None,
-                ),
+                state=state,
+                derived_from_state_id=str(actual_current_state_id) if actual_current_state_id is not None else None,
+                operation_kind=SessionOperationKind.PROPOSAL,
+                actor=actor,
                 provenance="tool_call",
                 created_at=transaction_time,
                 session_operation_context=session_context,
@@ -6822,10 +6847,11 @@ class SessionServiceImpl:
                                 # inserted revision of this turn
                                 # (elspeth-7536e5d919).
                                 payload = replace(payload, derived_from_state_id=current_state_id)
-                            state_id = self._insert_composition_state(
+                            state_id = self._insert_checkpoint_preserving_guided_proposal(
                                 conn,
                                 session_id=session_id,
-                                payload=payload,
+                                state=payload.data,
+                                derived_from_state_id=payload.derived_from_state_id,
                                 provenance="tool_call",
                                 created_at=now,
                                 session_operation_context=session_operation_context,
@@ -9944,6 +9970,112 @@ class SessionServiceImpl:
             for row in rows
         ]
 
+    def _insert_checkpoint_preserving_guided_proposal(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        state: CompositionStateData,
+        provenance: CompositionStateProvenance,
+        created_at: datetime,
+        session_operation_context: SessionOperationContext,
+        state_id: UUID | None = None,
+        derived_from_state_id: str | None = None,
+        operation_kind: Literal[SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL] = SessionOperationKind.COMPOSE,
+        actor: str = "compose_loop",
+    ) -> str:
+        """Insert an ordinary checkpoint and carry its pending proposal atomically.
+
+        A checkpoint-only save may move lifecycle currency, never the reviewed
+        proposal identity or composition. The locked prior row supplies every
+        rebase assertion; the ordinary transition verifier re-derives authority.
+        """
+        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+
+        self._assert_session_write_lock_held(conn, session_id, caller="_insert_checkpoint_preserving_guided_proposal")
+        database_now = self._guided_database_now(conn)
+        self._require_session_operation_context_on_connection(
+            conn,
+            session_operation_context,
+            session_id=session_id,
+            expected_kind=operation_kind,
+            now=database_now,
+        )
+        current_row = conn.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .order_by(desc(composition_states_table.c.version))
+            .limit(1)
+        ).one_or_none()
+        prior = pending_guided_checkpoint(unwrap_state_column(current_row.composer_meta)) if current_row is not None else None
+        candidate = pending_guided_checkpoint(state.composer_meta)
+        checkpoint_id = state_id if state_id is not None else uuid.uuid4()
+        rebase_plan: _GuidedPendingProposalRebasePlan | None = None
+        if prior is not None or candidate is not None:
+            current_record = self._row_to_state_record(current_row) if current_row is not None else None
+            if prior is None or candidate != prior or current_record is None:
+                raise AuditIntegrityError("an ordinary checkpoint cannot change a pending guided review")
+            active = prior.active_proposal
+            if active is None:  # pragma: no cover - pending_guided_checkpoint owns this
+                raise AuditIntegrityError("pending guided checkpoint lost its proposal")
+            current_content_hash = composition_content_hash(state_from_record(current_record))
+            verified = _verify_guided_pending_proposal_transition(
+                conn,
+                context=_GuidedPendingProposalTransitionContext(
+                    service=self,
+                    session_id=session_id,
+                    current_record=current_record,
+                    prior_guided=prior,
+                    candidate_guided=candidate,
+                    expected_current_content_hash=current_content_hash,
+                    checkpoint_state_id=checkpoint_id,
+                    candidate_content_hash=_composition_state_data_content_hash(state),
+                    settlement_origin=f"{operation_kind.value} checkpoint",
+                ),
+                invalidation=None,
+                rebase=GuidedPendingProposalRebase(
+                    proposal_id=active.proposal_id,
+                    draft_hash=active.draft_hash,
+                    reviewed_facts=guided_private_reviewed_facts(prior),
+                    from_state_id=current_record.id,
+                    composition_content_hash=current_content_hash,
+                    reason=("ordinary_proposal_checkpoint" if operation_kind is SessionOperationKind.PROPOSAL else "compose_checkpoint"),
+                ),
+            )
+            rebase_plan = verified.rebased
+            live_confirmation = conn.execute(
+                select(guided_operations_table.c.operation_id)
+                .where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.proposal_id == str(active.proposal_id),
+                    guided_operations_table.c.status == "in_progress",
+                    guided_operations_table.c.lease_expires_at > database_now,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if live_confirmation is not None:
+                raise StaleComposeStateError("a live guided confirmation owns this proposal checkpoint")
+
+        inserted_id = self._insert_composition_state(
+            conn,
+            session_id=session_id,
+            payload=StatePayload(data=state, derived_from_state_id=derived_from_state_id),
+            provenance=provenance,
+            created_at=created_at,
+            state_id=str(checkpoint_id),
+            session_operation_context=session_operation_context,
+        )
+        if rebase_plan is not None:
+            _append_verified_guided_proposal_rebase(
+                conn,
+                authority=rebase_plan.authority,
+                reason=rebase_plan.reason,
+                actor=actor,
+                created_at=created_at,
+                to_state_id=checkpoint_id,
+            )
+        return inserted_id
+
     async def save_composition_state(
         self,
         session_id: UUID,
@@ -9982,6 +10114,23 @@ class SessionServiceImpl:
         # this row; refuse it before it becomes the tip, exactly as
         # ``_insert_composition_state`` does under the session write lock.
         assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
+        if pending_guided_checkpoint(state.composer_meta) is not None:
+
+            def _sync_guided_checkpoint() -> CompositionStateRecord:
+                with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                    inserted_id = self._insert_checkpoint_preserving_guided_proposal(
+                        conn,
+                        session_id=sid,
+                        state=state,
+                        provenance=provenance,
+                        created_at=now,
+                        state_id=state_id,
+                        session_operation_context=session_operation_context,
+                    )
+                    row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == inserted_id)).one()
+                    return self._row_to_state_record(row)
+
+            return cast(CompositionStateRecord, await self._run_sync(_sync_guided_checkpoint))
         creation = SessionCompositionStateCreation(
             id=state_id,
             data=state,
@@ -10064,13 +10213,13 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                     now=database_now,
                 )
-                self._insert_composition_state(
+                self._insert_checkpoint_preserving_guided_proposal(
                     conn,
                     session_id=sid,
-                    payload=StatePayload(data=state),
+                    state=state,
                     provenance=provenance,
                     created_at=now,
-                    state_id=str(state_id),
+                    state_id=state_id,
                     session_operation_context=session_operation_context,
                 )
                 # The prepared packages are executed by the SAME reviewed
@@ -10171,10 +10320,10 @@ class SessionServiceImpl:
                         f"actual={current_state_id!r}"
                     )
 
-                state_id = self._insert_composition_state(
+                state_id = self._insert_checkpoint_preserving_guided_proposal(
                     conn,
                     session_id=sid,
-                    payload=StatePayload(data=state),
+                    state=state,
                     provenance="post_compose",
                     created_at=now,
                     session_operation_context=session_operation_context,
