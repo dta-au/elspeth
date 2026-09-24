@@ -189,6 +189,20 @@ def test_shared_read_cache_does_not_waive_later_member_cycle() -> None:
         resolve_sink_effect_members(source, (_candidate("shared"), _candidate("bad")))
 
 
+def test_shared_read_cache_rejects_unrequested_parent_token() -> None:
+    class UnexpectedParentSource(_LineageSource):
+        def get_tokens_by_ids(self, token_ids: tuple[str, ...]) -> list[_Token]:
+            return [*super().get_tokens_by_ids(token_ids), _Token("unexpected", "row-0", "run-1")]
+
+    source = UnexpectedParentSource(
+        tokens=(_Token("child", "row-0", "run-1"), _Token("parent", "row-0", "run-1")),
+        rows=(_Row("row-0", "run-1", 0),),
+        parents=(_Parent("child", "parent", 0),),
+    )
+    with pytest.raises(AuditIntegrityError, match="references missing parents"):
+        resolve_sink_effect_members(source, (_candidate("child"),))
+
+
 @pytest.mark.parametrize(
     "corruption", ["cycle", "missing_parent", "duplicate_ordinal", "non_dense_ordinal", "cross_run", "repeated_parent"]
 )
