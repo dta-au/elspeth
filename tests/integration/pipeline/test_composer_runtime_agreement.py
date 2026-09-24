@@ -5512,6 +5512,7 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
         output_path: Path,
         label_schema: dict[str, Any],
         price_schema: dict[str, Any],
+        label_plugin: str = "passthrough",
     ) -> CompositionState:
         state = self._empty_state()
         state = state.with_source(
@@ -5542,22 +5543,22 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
                 merge=None,
             )
         )
-        for node_id, branch_connection, done_connection, schema in (
-            ("t_label", "branch_label", "label_done", label_schema),
-            ("t_price", "branch_price", "price_done", price_schema),
+        for node_id, branch_connection, done_connection, schema, plugin in (
+            ("t_label", "branch_label", "label_done", label_schema, label_plugin),
+            ("t_price", "branch_price", "price_done", price_schema, "passthrough"),
         ):
+            options: dict[str, Any] = {"schema": schema}
+            if plugin == "value_transform":
+                options["operations"] = [{"target": "price", "expression": "row['price']"}]
             state = state.with_node(
                 NodeSpec(
                     id=node_id,
                     node_type="transform",
-                    plugin="value_transform",
+                    plugin=plugin,
                     input=branch_connection,
                     on_success=done_connection,
                     on_error="discard",
-                    options={
-                        "schema": schema,
-                        "operations": [{"target": "price", "expression": "row['price']"}],
-                    },
+                    options=options,
                     condition=None,
                     routes=None,
                     fork_to=None,
@@ -5616,7 +5617,11 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
         output_path: Path,
         label_schema: dict[str, Any],
         price_schema: dict[str, Any],
+        label_plugin: str = "passthrough",
     ) -> ElspethSettings:
+        label_options: dict[str, Any] = {"schema": label_schema}
+        if label_plugin == "value_transform":
+            label_options["operations"] = [{"target": "price", "expression": "row['price']"}]
         return ElspethSettings(
             sources={
                 "primary": SourceSettings(
@@ -5632,25 +5637,19 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
             transforms=[
                 TransformSettings(
                     name="t_label",
-                    plugin="value_transform",
+                    plugin=label_plugin,
                     input="branch_label",
                     on_success="label_done",
                     on_error="discard",
-                    options={
-                        "schema": label_schema,
-                        "operations": [{"target": "price", "expression": "row['price']"}],
-                    },
+                    options=label_options,
                 ),
                 TransformSettings(
                     name="t_price",
-                    plugin="value_transform",
+                    plugin="passthrough",
                     input="branch_price",
                     on_success="price_done",
                     on_error="discard",
-                    options={
-                        "schema": price_schema,
-                        "operations": [{"target": "price", "expression": "row['price']"}],
-                    },
+                    options={"schema": price_schema},
                 ),
             ],
             gates=[
@@ -5780,6 +5779,36 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
                     output_path=output_path,
                     label_schema=label_schema,
                     price_schema=price_schema,
+                )
+            )
+            graph.validate_edge_compatibility()
+
+    def test_both_reject_computed_unknown_against_a_concrete_type(self, tmp_path: Path) -> None:
+        """A computed target has no concrete output proof even with a typed input."""
+        csv_path, output_path = self._paths(tmp_path)
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=schema,
+            price_schema=schema,
+            label_plugin="value_transform",
+        ).validate()
+
+        assert not result.is_valid
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == "price"
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+
+        with pytest.raises(GraphValidationError, match="price"):
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    label_schema=schema,
+                    price_schema=schema,
+                    label_plugin="value_transform",
                 )
             )
             graph.validate_edge_compatibility()

@@ -483,5 +483,5 @@ export function InlineRunResults({
  */
 function NarrativeResultsBranch({ runId }: { runId: string }): JSX.Element {
   const { narrativeMode } = useNarrativeMode();
-  return narrativeMode ? <NarrativeResults /> : <RunOutputsPanel runId={runId} />;
+  return narrativeMode ? <NarrativeResults runId={runId} /> : <RunOutputsPanel runId={runId} />;
 }

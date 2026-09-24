@@ -380,8 +380,8 @@ def validate_graph_structure(
     Edge compatibility is checked inside the graph BUILD, so a type-mismatch
     edge failure raises here — phase 3's dedicated handler requires a built
     graph and can never see it. This phase owns the same rich edge-contract
-    diagnostics; the graph does not exist when the BUILD raises, so
-    patch-target resolution degrades to the DAG node id by design — but a
+    diagnostics; a BUILD failure carries the authored endpoint names so
+    patch-target resolution still works before the graph returns. A
     failure from ``graph.validate()`` fires AFTER a successful build, and the
     real graph is then threaded through so diagnostics resolve composer ids
     (elspeth-9f21f3c57d).
@@ -396,7 +396,7 @@ def validate_graph_structure(
         )
     except EdgeContractError as exc:
         consumer_target = edge_patch_target_for_node_id(
-            exc.to_node_id,
+            exc.to_config_name if exc.to_config_name is not None else exc.to_node_id,
             state=policy_state,
             graph=graph,
             component_type=exc.component_type,

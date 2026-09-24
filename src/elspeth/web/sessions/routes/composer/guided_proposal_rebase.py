@@ -29,12 +29,11 @@ otherwise identical across all four modulo ids: two of them settle the same
 ``guided_respond`` operation kind, so the settlement's own identity cannot
 tell them apart.
 
-This closes the guided SETTLEMENT paths, not every checkpoint writer. A
-writer that inserts a ``composition_states`` row carrying a live
-``active_proposal`` forward without going through a guided settlement still
-strands the anchor exactly as before, and that is still measured on
-``POST /api/sessions/{id}/messages`` and ``POST /api/sessions/{id}/compose``
-(elspeth-f561d651c8, pre-existing).
+Generic COMPOSE checkpoint writers use the service's locked checkpoint
+settlement instead. That path derives the same rebase assertion from the
+current stored checkpoint, verifies unchanged composition and guided review,
+then writes the checkpoint and anchor hop atomically. A raw repository append
+refuses a pending guided proposal so it cannot bypass lifecycle settlement.
 
 The guided-full STAGING outcome is the third such writer and is handled
 differently, because a rebase is the wrong remedy there: staging mints a

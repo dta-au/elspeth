@@ -196,8 +196,8 @@ export function formatElapsed(totalSeconds: number): string {
 /**
  * Elapsed-time readout for the in-flight compose card (elspeth-b189b5b3b8
  * part a): a slow turn must not read identically to a stalled request.
- * Counts from the moment the indicator becomes active (non-terminal) and
- * stops when a terminal phase lands.
+ * Model calls count from the server's progress timestamp, including after
+ * reload. Other work counts from mount. Terminal phases unmount the readout.
  *
  * The ticking readout is aria-hidden: the indicator sits in a role="status"
  * live region and a once-per-second text mutation would spam screen readers
@@ -205,11 +205,13 @@ export function formatElapsed(totalSeconds: number): string {
  * headline changes, which already convey progress.
  *
  * Exported for the guided pending strip (GuidedPendingStrip.tsx), which
- * shares the same aria-hidden/mount-reset semantics.
+ * uses the mount-based timer when no server start timestamp is supplied.
  */
-export function ElapsedReadout() {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const startRef = useRef<number>(Date.now());
+export function ElapsedReadout({ startedAt }: { startedAt?: string } = {}) {
+  const startRef = useRef<number>(startedAt === undefined ? Date.now() : Date.parse(startedAt));
+  const [elapsedSeconds, setElapsedSeconds] = useState(
+    () => Math.floor((Date.now() - startRef.current) / 1000),
+  );
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -280,11 +282,17 @@ export function ComposingIndicator({
                 "Last composer update"
               ) : (
                 <>
-                  Working on...
-                  {/* Mount lifecycle doubles as the reset: the readout only
-                      renders while non-terminal, so a terminal phase unmounts
-                      it and the next compose remounts it from 00:00. */}
-                  <ElapsedReadout />
+                  {composerProgress?.phase === "calling_model"
+                    ? "Waiting for model response"
+                    : "Working on..."}
+                  <ElapsedReadout
+                    key={composerProgress?.phase === "calling_model"
+                      ? `${composerProgress.request_id}:${composerProgress.updated_at}`
+                      : progressKey}
+                    startedAt={composerProgress?.phase === "calling_model"
+                      ? composerProgress.updated_at
+                      : undefined}
+                  />
                 </>
               )}
             </div>

@@ -216,7 +216,7 @@ async def _claim(
     return outcome.fence
 
 
-async def _attach_pending_guided_pipeline_proposal(
+async def _create_pending_guided_pipeline_proposal(
     service: SessionServiceImpl,
     *,
     session_id: UUID,
@@ -225,6 +225,7 @@ async def _attach_pending_guided_pipeline_proposal(
     proposal_base_state: CompositionStateRecord | None = None,
     surface: PlannerSurface = PlannerSurface.GUIDED_STAGED,
 ):
+    """Create proposal authority while its base is still the current head."""
     base_state = proposal_base_state or state
     reviewed_facts = guided_private_reviewed_facts(guided)
     proposal = PipelineProposal.create(
@@ -290,6 +291,23 @@ async def _attach_pending_guided_pipeline_proposal(
         ),
         active_edit_target=ComponentTarget(kind="node", stable_id=str(uuid4())),
     )
+    return row, active
+
+
+async def _inject_pending_guided_checkpoint(
+    service: SessionServiceImpl,
+    *,
+    session_id: UUID,
+    state: CompositionStateRecord,
+    active: GuidedSession,
+) -> CompositionStateRecord:
+    """Inject historical authority for revert integrity/recovery probes.
+
+    Historical pending refs behind a newer head (or two independently pending
+    refs) cannot be authored through the current atomic lifecycle. Create the
+    proposal against its valid head, build the ordinary timeline, then inject
+    these deliberately invalid historical refs without bypassing writer guards.
+    """
     with service._engine.begin() as conn:
         conn.execute(
             update(composition_states_table)
@@ -306,6 +324,27 @@ async def _attach_pending_guided_pipeline_proposal(
         )
     refreshed = await service.get_state_in_session(state.id, session_id)
     assert refreshed is not None
+    return refreshed
+
+
+async def _attach_pending_guided_pipeline_proposal(
+    service: SessionServiceImpl,
+    *,
+    session_id: UUID,
+    state: CompositionStateRecord,
+    guided: GuidedSession,
+    proposal_base_state: CompositionStateRecord | None = None,
+    surface: PlannerSurface = PlannerSurface.GUIDED_STAGED,
+):
+    row, active = await _create_pending_guided_pipeline_proposal(
+        service,
+        session_id=session_id,
+        state=state,
+        guided=guided,
+        proposal_base_state=proposal_base_state,
+        surface=surface,
+    )
+    refreshed = await _inject_pending_guided_checkpoint(service, session_id=session_id, state=state, active=active)
     return row, refreshed
 
 
@@ -583,7 +622,7 @@ async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrub
         ),
         provenance="session_seed",
     )
-    proposal, target = await _attach_pending_guided_pipeline_proposal(
+    proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
@@ -599,6 +638,7 @@ async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrub
         ),
         provenance="session_seed",
     )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
     fence = await _claim(service, session.id)
 
     reverted = await _revert_at_current(
@@ -647,7 +687,7 @@ async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_rejec
         ),
         provenance="session_seed",
     )
-    proposal, target = await _attach_pending_guided_pipeline_proposal(
+    proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
@@ -663,6 +703,7 @@ async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_rejec
         ),
         provenance="session_seed",
     )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
     confirmation = await service.reserve_guided_operation(
         session_id=session.id,
         operation_id="live-confirmation",
@@ -723,12 +764,23 @@ async def test_revert_terminal_target_reference_rolls_back_every_surface(service
         ),
         provenance="session_seed",
     )
-    proposal, target = await _attach_pending_guided_pipeline_proposal(
+    proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
         guided=guided,
     )
+    await _save_composition_state(
+        service,
+        session.id,
+        CompositionStateData(
+            composer_meta={"guided_session": None},
+            metadata_={"name": "Current freeform", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
     bound = state_from_record(target).guided_session
     assert bound is not None and bound.active_proposal is not None
     async with _compose_context(service, session.id) as context:
@@ -742,16 +794,6 @@ async def test_revert_terminal_target_reference_rolls_back_every_surface(service
             actor="test",
             session_operation_context=context,
         )
-    await _save_composition_state(
-        service,
-        session.id,
-        CompositionStateData(
-            composer_meta={"guided_session": None},
-            metadata_={"name": "Current freeform", "description": ""},
-            is_valid=True,
-        ),
-        provenance="session_seed",
-    )
     fence = await _claim(service, session.id)
 
     await _assert_revert_integrity_failure_is_atomic(
@@ -984,7 +1026,7 @@ async def test_revert_rejects_distinct_current_and_target_pending_refs_once_each
         ),
         provenance="session_seed",
     )
-    target_proposal, target = await _attach_pending_guided_pipeline_proposal(
+    target_proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
@@ -1000,6 +1042,7 @@ async def test_revert_rejects_distinct_current_and_target_pending_refs_once_each
         ),
         provenance="session_seed",
     )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
     current_proposal, _ = await _attach_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
@@ -1046,20 +1089,12 @@ async def test_revert_reference_mismatch_rolls_back_proposals_state_message_and_
         ),
         provenance="session_seed",
     )
-    proposal, target = await _attach_pending_guided_pipeline_proposal(
+    proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
         guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
     )
-    tampered_meta = deep_thaw(target.composer_meta)
-    tampered_meta["guided_session"]["active_proposal"]["draft_hash"] = "e" * 64
-    with engine.begin() as conn:
-        conn.execute(
-            update(composition_states_table)
-            .where(composition_states_table.c.id == str(target.id))
-            .values(composer_meta={"_version": 1, "data": tampered_meta})
-        )
     await _save_composition_state(
         service,
         session.id,
@@ -1070,6 +1105,15 @@ async def test_revert_reference_mismatch_rolls_back_proposals_state_message_and_
         ),
         provenance="session_seed",
     )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
+    tampered_meta = deep_thaw(target.composer_meta)
+    tampered_meta["guided_session"]["active_proposal"]["draft_hash"] = "e" * 64
+    with engine.begin() as conn:
+        conn.execute(
+            update(composition_states_table)
+            .where(composition_states_table.c.id == str(target.id))
+            .values(composer_meta={"_version": 1, "data": tampered_meta})
+        )
     fence = await _claim(service, session.id)
 
     with pytest.raises(AuditIntegrityError, match="reference differs"):
@@ -1418,7 +1462,7 @@ async def test_revert_fault_rolls_back_every_settlement_surface(service, engine,
         ),
         provenance="session_seed",
     )
-    proposal, target = await _attach_pending_guided_pipeline_proposal(
+    proposal, active = await _create_pending_guided_pipeline_proposal(
         service,
         session_id=session.id,
         state=target,
@@ -1434,6 +1478,7 @@ async def test_revert_fault_rolls_back_every_settlement_surface(service, engine,
         ),
         provenance="session_seed",
     )
+    target = await _inject_pending_guided_checkpoint(service, session_id=session.id, state=target, active=active)
     fence = await _claim(service, session.id)
 
     def inject(_conn, _cursor, _statement, _parameters, context, _executemany):

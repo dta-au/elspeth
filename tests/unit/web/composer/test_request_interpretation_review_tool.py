@@ -1787,6 +1787,17 @@ async def test_request_interpretation_review_rejects_prompt_template_kind() -> N
     assert "backend" in message.lower()
     assert "finalization" in message.lower()
 
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    assistance = LLMTransform.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "backend automatically stages and surfaces llm_prompt_template" in hints
+    assert "do not author or request that review" in hints
+    assert "stage an llm_prompt_template review" not in hints
+    assert "put both interpretation_requirements" not in hints
+    assert "carry forward existing pending LLM interpretation requirements" in hints
+
 
 @pytest.mark.asyncio
 async def test_request_interpretation_review_vague_term_still_rejects_jinja_metacharacters(
@@ -3585,6 +3596,15 @@ async def test_omitted_draft_resolves_staged_invented_source_draft(
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
     assert rows[0].llm_draft == draft
+
+    from elspeth.plugins.sources.csv_source import CSVSource
+
+    assistance = CSVSource.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "omit llm_draft" in hints
+    assert "server uses the exact staged source draft" in hints
+    assert "llm_draft equal to the exact CSV text" not in hints
 
 
 @pytest.mark.asyncio

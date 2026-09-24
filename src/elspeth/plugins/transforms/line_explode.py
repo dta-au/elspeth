@@ -301,7 +301,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3e0da1a937815a93"
+    source_file_hash: str | None = "sha256:24045dad35ac4d72"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -394,7 +394,7 @@ class LineExplode(BaseTransform):
             return PluginAssistance(
                 plugin_name="line_explode",
                 issue_code=None,
-                summary="Deaggregate a string field by splitting on newlines — emits one row per non-empty line.",
+                summary="Deaggregate a string field by splitting on line boundaries — emits one row per line; blank lines are retained.",
                 composer_hints=(
                     "source_field must contain newline-framed, line-compatible, or unconstrained free text — compact text yields a single row with the whole content.",
                     "Producer compatibility: web_scrape with format: 'markdown' or text_separator: '\\n' works; format: 'text' with whitespace separator does NOT.",

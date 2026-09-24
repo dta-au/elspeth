@@ -942,78 +942,60 @@ def test_invalid_live_response_never_reserves_an_operation(
 def test_step3_rejects_mismatched_proposal_binding_before_stage_dispatch_or_reservation(
     composer_test_client: TestClient,
 ) -> None:
-    session_id = _create_session(composer_test_client)
-    proposal_id = uuid4()
-    draft_hash = "b" * 64
-    initial = _initial_composition_state_with_guided_session().guided_session
-    assert initial is not None
-    active = GuidedProposalRef(
-        proposal_id=proposal_id,
-        draft_hash=draft_hash,
-        base=AbsentBase(),
-        reviewed_anchor_hash=guided_reviewed_anchor_hash(
-            source_order=(),
-            reviewed_sources={},
-            output_order=(),
-            reviewed_outputs={},
-        ),
-        covered_deferred_intent_ids=(),
-        creation_event_schema="pipeline_proposal_created.v1",
-    )
-    guided = _with_active_step3(initial, active)
-    _persist_guided(composer_test_client, session_id, guided)
+    session_id, staged = _stage_proposal(composer_test_client, filename="mismatched-binding.jsonl")
+    turn = staged["next_turn"]
+    payload = turn["payload"]
+    wrong_hash = ("0" if payload["draft_hash"][0] != "0" else "1") + payload["draft_hash"][1:]
+    operation_count_before = _respond_operation_count(composer_test_client, session_id)
     versions_before = asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id)))
 
     response = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
-        json={
-            "operation_id": str(uuid4()),
-            "turn_token": "a" * 64,
-            "chosen": ["accept"],
-            "proposal_id": str(proposal_id),
-            "draft_hash": "c" * 64,
-        },
+        json=_live_body(turn, chosen=["accept"], proposal_id=payload["proposal_id"], draft_hash=wrong_hash),
     )
 
     assert response.status_code == 409
     assert response.json()["detail"] == "proposal_id and draft_hash do not identify the active guided proposal"
-    assert _respond_operation_count(composer_test_client, session_id) == 0
+    assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
 
 
 def test_step3_matching_proposal_binding_requires_durable_payload_before_reservation(
     composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session_id = _create_session(composer_test_client)
-    proposal_id = uuid4()
-    draft_hash = "b" * 64
-    initial = _initial_composition_state_with_guided_session().guided_session
-    assert initial is not None
-    active = GuidedProposalRef(
-        proposal_id=proposal_id,
-        draft_hash=draft_hash,
-        base=AbsentBase(),
-        reviewed_anchor_hash=guided_reviewed_anchor_hash(
-            source_order=(),
-            reviewed_sources={},
-            output_order=(),
-            reviewed_outputs={},
-        ),
-        covered_deferred_intent_ids=(),
-        creation_event_schema="pipeline_proposal_created.v1",
+    session_id, staged = _stage_proposal(composer_test_client, filename="missing-turn-payload.jsonl")
+    turn = staged["next_turn"]
+    payload = turn["payload"]
+    service = composer_test_client.app.state.session_service
+    state = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert state is not None
+    guided = guided_route._state_from_record(state).guided_session
+    assert guided is not None
+    missing_payload_hash = guided.history[-1].payload_hash
+    store = composer_test_client.app.state.payload_store
+    original_retrieve = type(store).retrieve
+
+    def missing_current_turn(store_instance: object, content_hash: str) -> bytes:
+        if content_hash == missing_payload_hash:
+            raise PayloadNotFoundError(content_hash)
+        return original_retrieve(store_instance, content_hash)
+
+    monkeypatch.setattr(type(store), "retrieve", missing_current_turn)
+    operation_count_before = _respond_operation_count(composer_test_client, session_id)
+    versions_before = asyncio.run(service.get_state_versions(UUID(session_id)))
+
+    # Binding rejection must precede reading even a missing durable turn.
+    unbound = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=["review_wiring"]),
     )
-    guided = _with_active_step3(initial, active)
-    _persist_guided(composer_test_client, session_id, guided)
+    assert unbound.status_code == 409
+    assert unbound.json()["detail"] == "the active guided proposal requires proposal_id and draft_hash"
 
     response = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
-        json={
-            "operation_id": str(uuid4()),
-            "turn_token": "a" * 64,
-            "chosen": ["review_wiring"],
-            "proposal_id": str(proposal_id),
-            "draft_hash": draft_hash,
-        },
+        json=_live_body(turn, chosen=["review_wiring"], proposal_id=payload["proposal_id"], draft_hash=payload["draft_hash"]),
     )
 
     assert response.status_code == 500
@@ -1021,43 +1003,26 @@ def test_step3_matching_proposal_binding_requires_durable_payload_before_reserva
         "error_type": "server_invariant_violated",
         "detail": "Server invariant violated. See application audit log for diagnostic detail.",
     }
-    assert _respond_operation_count(composer_test_client, session_id) == 0
+    assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
+    assert asyncio.run(service.get_state_versions(UUID(session_id))) == versions_before
 
 
 def test_step3_active_proposal_requires_binding_for_every_non_exit_action(
     composer_test_client: TestClient,
 ) -> None:
-    session_id = _create_session(composer_test_client)
-    initial = _initial_composition_state_with_guided_session().guided_session
-    assert initial is not None
-    active = GuidedProposalRef(
-        proposal_id=uuid4(),
-        draft_hash="b" * 64,
-        base=AbsentBase(),
-        reviewed_anchor_hash=guided_reviewed_anchor_hash(
-            source_order=(),
-            reviewed_sources={},
-            output_order=(),
-            reviewed_outputs={},
-        ),
-        covered_deferred_intent_ids=(),
-        creation_event_schema="pipeline_proposal_created.v1",
-    )
-    guided = _with_active_step3(initial, active)
-    _persist_guided(composer_test_client, session_id, guided)
+    session_id, staged = _stage_proposal(composer_test_client, filename="absent-binding.jsonl")
+    operation_count_before = _respond_operation_count(composer_test_client, session_id)
+    versions_before = asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id)))
 
     response = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
-        json={
-            "operation_id": str(uuid4()),
-            "turn_token": "a" * 64,
-            "chosen": ["accept"],
-        },
+        json=_live_body(staged["next_turn"], chosen=["accept"]),
     )
 
     assert response.status_code == 409
     assert response.json()["detail"] == "the active guided proposal requires proposal_id and draft_hash"
-    assert _respond_operation_count(composer_test_client, session_id) == 0
+    assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
+    assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
 
 
 def test_active_proposal_binding_gate_preserves_unbound_exit() -> None:

@@ -38,6 +38,7 @@ from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerO
 from elspeth.web.composer.pipeline_proposal import PresentBase
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import GuidedOperationFence
 from tests.helpers.session_fences import fenced_operation_context
@@ -125,15 +126,19 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=_text()) as completion:
         result = await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
 
-    sent = completion.call_args.kwargs["tools"]
-    assert len(sent) == 42
-    if dialect is _STRICT:
-        assert _strict_flags(sent).count(True) == 32
-        assert _strict_flags(sent).count(False) == 10
-    else:
-        assert set(_strict_flags(sent)) == {"omitted"}
-    [call] = result.llm_calls
-    assert (call.tool_contract_dialect, call.strict_tool_count) == (dialect, strict_count)
+    # The rootless build request receives one neutral retry; the resolved
+    # dialect must remain consistent on the original call and the repair.
+    assert completion.call_count == len(result.llm_calls) == 2
+    assert result.repair_turns_used == 1
+    for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
+        sent = request.kwargs["tools"]
+        assert len(sent) == 42
+        if dialect is _STRICT:
+            assert _strict_flags(sent).count(True) == 32
+            assert _strict_flags(sent).count(False) == 10
+        else:
+            assert set(_strict_flags(sent)) == {"omitted"}
+        assert (call.tool_contract_dialect, call.strict_tool_count) == (dialect, strict_count)
 
 
 # ---------------------------------------------------------------- no provider call added (composer invariant)
@@ -222,9 +227,14 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
         )
         requests: list[dict[str, Any]] = []
 
-        async def completion(*, _requests: list[dict[str, Any]] = requests, **kwargs: Any) -> Any:
+        async def completion(
+            *,
+            _requests: list[dict[str, Any]] = requests,
+            _dialect: ToolContractDialect = service._planner_dialect,
+            **kwargs: Any,
+        ) -> Any:
             _requests.append(kwargs)
-            return _response(("list_sources", {}))
+            return _response(("list_sources", encode_semantic_arguments("list_sources", _dialect, {})))
 
         monkeypatch.setattr("litellm.acompletion", completion)
         with pytest.raises(PipelinePlannerError):

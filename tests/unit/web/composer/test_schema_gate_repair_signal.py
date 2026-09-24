@@ -26,6 +26,7 @@ from jsonschema import Draft202012Validator
 
 from elspeth.composer_mcp.server import create_server
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
@@ -117,6 +118,7 @@ async def test_out_of_bounds_limit_names_the_declared_field(fake_composer_servic
     audited, _ = await _compose_arg_error(fake_composer_service, result_session_id, name="list_models", arguments={"limit": 0})
 
     assert audited["validation_errors"] == [{"loc": ["limit"], "msg": _MSG_BOUNDS, "type": "out_of_bounds"}]
+    assert "repair_instruction" not in audited
     # The existing error text is unchanged; the signal is additive.
     assert audited["error"] == (
         "Tool 'list_models' failed: 'tool arguments' must be an object conforming to the declared argument schema, got invalid_schema"
@@ -134,6 +136,81 @@ async def test_extra_key_is_unexpected_at_its_parent_and_never_echoed(
     assert audited["validation_errors"] == [{"loc": [], "msg": _MSG_UNEXPECTED, "type": "unexpected"}]
     assert _KEY_CANARY not in content
     assert "stray_key_canary" not in json.dumps(audited)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unexpected_key", ["x", _KEY_CANARY])
+async def test_zero_argument_tool_rejection_tells_planner_to_send_empty_object(
+    fake_composer_service: ComposerServiceImpl, result_session_id: str, unexpected_key: str
+) -> None:
+    audited, content = await _compose_arg_error(
+        fake_composer_service, result_session_id, name="preview_pipeline", arguments={unexpected_key: 1}
+    )
+
+    assert audited["validation_errors"] == [{"loc": [], "msg": _MSG_UNEXPECTED, "type": "unexpected"}]
+    assert audited["repair_instruction"] == "This tool takes no arguments. Call it with {}."
+    assert json.dumps(unexpected_key) not in content
+
+
+@pytest.mark.asyncio
+async def test_root_extra_property_repair_names_only_declared_properties(
+    fake_composer_service: ComposerServiceImpl, result_session_id: str
+) -> None:
+    audited, content = await _compose_arg_error(
+        fake_composer_service, result_session_id, name="list_models", arguments={"limit": 5, _KEY_CANARY: 1}
+    )
+
+    assert audited["repair_instruction"] == "Remove unsupported root properties. Allowed properties: limit, provider."
+    assert _KEY_CANARY not in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"_elspeth_no_arguments": False},
+        {"_elspeth_no_arguments": "true"},
+        {"_elspeth_no_arguments": True, _KEY_CANARY: 1},
+        {_KEY_CANARY: 1},
+    ],
+    ids=["missing", "false", "string", "extra", "unknown"],
+)
+async def test_strict_zero_argument_rejection_names_wire_marker(
+    fake_composer_service: ComposerServiceImpl, result_session_id: str, arguments: dict[str, Any]
+) -> None:
+    fake_composer_service._planner_dialect = ToolContractDialect.OPENAI_STRICT
+    audited, content = await _compose_arg_error(fake_composer_service, result_session_id, name="preview_pipeline", arguments=arguments)
+
+    assert audited["error"] == (
+        "Tool 'preview_pipeline' takes no semantic arguments. Call it with {\"_elspeth_no_arguments\": true} exactly."
+    )
+    assert "{}" not in content
+    assert "set_pipeline" not in content
+    assert _KEY_CANARY not in content
+
+
+@pytest.mark.asyncio
+async def test_strict_marker_rejection_allows_repaired_tool_call_with_composition_budget_one(
+    fake_composer_service: ComposerServiceImpl, result_session_id: str
+) -> None:
+    fake_composer_service._planner_dialect = ToolContractDialect.OPENAI_STRICT
+    fake_composer_service._max_composition_turns = 1
+    fake_composer_service._max_discovery_turns = 3
+    llm = _RecordingComposeLLM(
+        (
+            _fake_llm_response(tool_calls=({"id": "bad", "name": "preview_pipeline", "arguments": {}},)),
+            _fake_llm_response(tool_calls=({"id": "repaired", "name": "preview_pipeline", "arguments": {"_elspeth_no_arguments": True}},)),
+            _fake_llm_response(content="Done."),
+        )
+    )
+
+    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+
+    assert [(call.tool_call_id, call.status) for call in result.tool_invocations] == [
+        ("bad", ComposerToolStatus.ARG_ERROR),
+        ("repaired", ComposerToolStatus.SUCCESS),
+    ]
 
 
 # A nested ``required`` failure cannot reach the S gate through the compose
@@ -157,6 +234,20 @@ def test_missing_nested_required_names_the_declared_property() -> None:
     assert json.loads(_rendered("splice_transform", arguments))["validation_errors"] == [
         {"loc": ["node", "id"], "msg": _MSG_MISSING, "type": "missing"}
     ]
+
+
+def test_nested_extra_property_does_not_receive_root_repair_guidance() -> None:
+    arguments = {
+        "predecessor_id": "source",
+        "successor_id": "sink",
+        "node": {"id": "map", "plugin": "passthrough", "options": {}, _KEY_CANARY: 1},
+    }
+    rendered = _rendered("splice_transform", arguments)
+    payload = json.loads(rendered)
+
+    assert payload["validation_errors"] == [{"loc": ["node"], "msg": _MSG_UNEXPECTED, "type": "unexpected"}]
+    assert "repair_instruction" not in payload
+    assert _KEY_CANARY not in rendered
 
 
 @pytest.mark.parametrize(

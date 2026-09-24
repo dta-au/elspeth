@@ -9,6 +9,7 @@ If the source outputs wrong types, the transform crashes immediately.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -18,6 +19,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.type_normalization import classify_runtime_type, require_supported_contract_type
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
@@ -28,6 +30,7 @@ from elspeth.core.expression_parser import (
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
 
 
@@ -65,7 +68,7 @@ def _retype_contract_field(
         python_type=require_supported_contract_type(value),
         required=field.required,
         source=field.source,
-        nullable=field.nullable,
+        nullable=field.nullable or value is None,
     )
     new_fields = tuple(retyped if f.normalized_name == field.normalized_name else f for f in contract.fields)
     return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
@@ -335,7 +338,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4ed72ea4f0d4fe69"
+    source_file_hash: str | None = "sha256:281e1dce4c33c4f4"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -379,10 +382,15 @@ class ValueTransform(BaseTransform):
 
         self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
 
-        self.input_schema, self.output_schema = self._create_schemas(
+        self.input_schema = create_schema_from_config(
             cfg.schema_config,
-            "ValueTransform",
-            adds_fields=True,
+            "ValueTransformInput",
+            allow_coercion=False,
+        )
+        self.output_schema = create_schema_from_config(
+            self._output_schema_config,
+            "ValueTransformOutput",
+            allow_coercion=False,
         )
 
     @property
@@ -424,17 +432,45 @@ class ValueTransform(BaseTransform):
         else:
             guaranteed_fields_result = None
 
+        declared_fields = declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result)
+        if declared_fields is not None:
+            # Expressions may overwrite an input with any supported value,
+            # including None. Presence is guaranteed; the input type is not
+            # an output proof and expression result types are not inferred.
+            declared_fields = tuple(
+                replace(field, field_type="any", required=True, nullable=True) if field.name in self._configured_targets else field
+                for field in declared_fields
+            )
+
         return SchemaConfig(
             mode=cfg.schema_config.mode,
             # Configured targets are guaranteed on output but may be absent
             # from the authored input fields; declare them so the config
             # satisfies the guaranteed-fields-are-declared invariant
             # (elspeth-97487736ca).
-            fields=declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result),
+            fields=declared_fields,
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=cfg.schema_config.audit_fields,
             required_fields=cfg.schema_config.required_fields,
         )
+
+    def _reconcile_forwarded_contract(self, contract: SchemaContract) -> SchemaContract:
+        """Apply validated input declarations only to unchanged output fields."""
+        assert self._output_schema_config is not None
+        declared = {field.normalized_name: field for field in create_contract_from_config(self._output_schema_config).fields}
+        fields = tuple(
+            replace(
+                field,
+                required=declared[field.normalized_name].required,
+                nullable=declared[field.normalized_name].nullable,
+            )
+            if field.normalized_name in declared
+            and field.normalized_name not in self._configured_targets
+            and declared[field.normalized_name].python_type is not object
+            else field
+            for field in contract.fields
+        )
+        return replace(contract, fields=fields) if fields != contract.fields else contract
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         """Apply expression operations to row.
@@ -485,7 +521,9 @@ class ValueTransform(BaseTransform):
             existing_field = working_contract.find_field(target)
             if existing_field is None:
                 working_contract = working_contract.with_field(target, target, result)
-            elif existing_field.python_type is not object and classify_runtime_type(result) is not existing_field.python_type:
+            elif (existing_field.python_type is not object and classify_runtime_type(result) is not existing_field.python_type) or (
+                result is None and not existing_field.nullable
+            ):
                 # Overwriting a typed field with a different-typed result: retype the
                 # field so the emitted row satisfies its OWN contract. Keeping the stale
                 # python_type produces a self-contradictory audit record (the row fails
@@ -494,7 +532,7 @@ class ValueTransform(BaseTransform):
                 # they never need retyping.
                 working_contract = _retype_contract_field(working_contract, existing_field, result)
 
-        output_contract = self._align_output_contract(working_contract)
+        output_contract = self._align_output_contract(self._reconcile_forwarded_contract(working_contract))
         return TransformResult.success(
             PipelineRow(working_data, output_contract),
             success_reason={
@@ -533,6 +571,8 @@ class ValueTransform(BaseTransform):
                     "A value_transform node's schema: block declares what ARRIVES at the node (its pre-transform input), "
                     "never an expression's computed result — declaring the output type on the node's own schema authors an "
                     "unsatisfiable input contract that is rejected at the edge.",
+                    "Computed targets guarantee presence, but their output types are not inferred. Before a typed consumer, "
+                    "use type_coerce to validate or normalize the computed fields to the required types.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
                     "Expressions are sandboxed — file I/O, imports, and external calls are rejected at parse time.",

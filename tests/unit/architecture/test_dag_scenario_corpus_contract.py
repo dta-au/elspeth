@@ -713,7 +713,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # through the corpus canonical projection helpers; changing only the export
 # serialization version back to v2 reproduces every prior digest. No runtime
 # rows, routes, outcomes, audit record counts, or semantic-runtime pins changed.
-EXPECTED_CASE_REGISTRY_SHA256 = "68216169612c67f782f03140f39658fa2fdc0a280946103f045db88288c80281"
+# CSV source teaching now names the required raw validation-failure route:
+# its source hash rotates d8a9c799bf5895c0 -> 5d131927c2baea3a in 15 node
+# records. Combined with v3 settings, the production reopen-resume harness
+# measures full-history pin 9cc4101e...; v2 settings reproduce bd33669a...,
+# while the prior CSV hash reproduces 4ec1e1ab.... Runtime semantics stay fixed.
+# ValueTransform metadata/output declaration repair changes only its three
+# source_file_hash tokens in union-collision-fail audit node records. The
+# token-normalized manifest is byte-identical; runtime oracle data is unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

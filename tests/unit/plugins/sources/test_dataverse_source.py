@@ -166,6 +166,27 @@ def _fetchxml_config(**overrides: Any) -> dict[str, Any]:
     return config
 
 
+def test_discovery_query_guidance_matches_accepted_configuration() -> None:
+    from elspeth.plugins.sources.dataverse import DataverseSource, DataverseSourceConfig
+
+    assert DataverseSourceConfig.from_dict(_base_config()).entity == "contact"
+    assert DataverseSourceConfig.from_dict(_fetchxml_config()).fetch_xml is not None
+    with pytest.raises(PluginConfigError, match="query_mode"):
+        DataverseSourceConfig.from_dict(_base_config(query_mode="odata"))
+    with pytest.raises(PluginConfigError, match="exactly one"):
+        DataverseSourceConfig.from_dict(_fetchxml_config(entity="contact"))
+    for option, value in (("select", ["fullname"]), ("filter", "statecode eq 0"), ("orderby", "fullname"), ("top", 1)):
+        with pytest.raises(PluginConfigError, match="require entity"):
+            DataverseSourceConfig.from_dict(_fetchxml_config(**{option: value}))
+
+    assistance = DataverseSource.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "query_mode" not in hints
+    assert "exactly one of entity (structured OData) or fetch_xml (FetchXML)" in hints
+    assert "select/filter/orderby/top require entity" in hints
+
+
 def _make_page(
     rows: list[dict[str, Any]],
     *,

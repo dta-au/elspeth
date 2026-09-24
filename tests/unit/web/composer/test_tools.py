@@ -12610,7 +12610,8 @@ class TestGetPluginAssistance:
         assert "stage invented_source on source.options.interpretation_requirements" in hints
         assert "request_interpretation_review" in hints
         assert "affected_node_id='source'" in hints
-        assert "llm_draft equal to the exact CSV text" in hints
+        assert "omit llm_draft" in hints
+        assert "server uses the exact staged source draft" in hints
         assert "source is not a transform node" in hints
         assert "do not search nodes[] for source" in hints
 
@@ -12789,14 +12790,15 @@ class TestGetPluginAssistance:
         assert "whenever no authorized shield is upstream (State B/C)" in hints
         assert "recommendation is not permission to add a node" in hints
         assert "do not add passthrough, placeholder, no-op, or renamed utility nodes" in hints
-        assert "copying it verbatim" in hints
+        assert "backend automatically stages and surfaces llm_prompt_template" in hints
+        assert "do not author or request that review" in hints
         assert "llm_prompt_template" in hints
         assert "scoring scale" in hints
         assert "Measurable adjectives are not exempt" in hints
         assert "over 6 ft" in hints
         assert "top quartile" in hints
         assert "Prompt-template review is not enough" in hints
-        assert "put both interpretation_requirements in the LLM node options before set_pipeline" in hints
+        assert "put the vague_term requirement in interpretation_requirements before set_pipeline" in hints
         assert "When repairing or upserting an LLM node, repeat the review preflight" in hints
         assert (
             "carry forward existing pending LLM interpretation requirements and add missing vague_term or prompt shield requirements"
@@ -12814,7 +12816,9 @@ class TestGetPluginAssistance:
         assert "guarantee the response_field by name" in hints
         assert "also guarantee pass-through fields" in hints
         assert "Single-query LLM output is written to response_field" in hints
-        assert "Prompt-requested JSON keys are not separate pipeline fields unless another transform parses them" in hints
+        assert "Prompt wording alone does not create separate JSON fields" in hints
+        assert "Configure single-query output_fields" in hints
+        assert "no downstream parser is needed" in hints
         assert "preserve response_field through cleanup" in hints
         assert "preserves upstream row fields while adding response_field" in hints
         assert "does not remove raw scrape fields" in hints

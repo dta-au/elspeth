@@ -91,6 +91,10 @@ def test_line_explode_preserves_empty_lines(ctx: PluginContext) -> None:
 
     assert result.rows is not None
     assert [row.to_dict()["html_line"] for row in result.rows] == ["a", "", "b"]
+    assistance = LineExplode.get_agent_assistance()
+    assert assistance is not None
+    assert "blank lines are retained" in assistance.summary
+    assert "non-empty line" not in assistance.summary
 
 
 def test_line_explode_rejects_more_than_default_max_lines(ctx: PluginContext) -> None:

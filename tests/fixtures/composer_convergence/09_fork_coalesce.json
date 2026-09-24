@@ -1,0 +1,84 @@
+{
+  "id": "09_fork_coalesce",
+  "title": "Parallel derivations merged by original identity",
+  "inputs": [
+    {
+      "filename": "numbers.csv",
+      "media_type": "text/csv",
+      "content": "id,x\np1,2\np2,5\np3,8\n"
+    }
+  ],
+  "turns": [
+    "Coerce x from numbers.csv to integer with type_coerce. Fork each row into two parallel branches. One branch uses value_transform to add doubled=x*2; the other adds squared=x*x. Join both results by original row identity with require-all coalesce and flat union merge. Shared id and x agree; first_wins is acceptable for these equal shared values. Preserve both computed fields. Use field_mapper to write exactly id,x,doubled,squared to combined.jsonl. Do not serialize both calculations into one branch. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "type_coerce",
+      "value_transform",
+      "field_mapper"
+    ],
+    "sink": [
+      "json"
+    ]
+  },
+  "required_node_kinds": [
+    "gate",
+    "coalesce"
+  ],
+  "outputs": [
+    {
+      "filename": "combined.jsonl",
+      "format": "jsonl",
+      "columns": [
+        "id",
+        "x",
+        "doubled",
+        "squared"
+      ],
+      "rows": [
+        {
+          "id": "p1",
+          "x": 2,
+          "doubled": 4,
+          "squared": 4
+        },
+        {
+          "id": "p2",
+          "x": 5,
+          "doubled": 10,
+          "squared": 25
+        },
+        {
+          "id": "p3",
+          "x": 8,
+          "doubled": 16,
+          "squared": 64
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 3,
+    "success_output_rows": 3,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "fork_join",
+    "succeeded_tokens": 9,
+    "structural_tokens": 3
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -448,8 +449,13 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     )
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
+    requests: list[dict[str, Any]] = []
 
-    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
+    async def complete(**kwargs: Any) -> _FakeLLMResponse:
+        requests.append(deepcopy(kwargs))
+        return llm_response
+
+    with patch("litellm.acompletion", new_callable=AsyncMock, side_effect=complete) as mock_acomp:
         result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     # New contract (post elspeth-861b0c58f5): model prose preserved verbatim,
@@ -458,21 +464,24 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     assert result.message.startswith("Done.")
     assert "[ELSPETH-SYSTEM]" in result.message
     assert result.raw_assistant_content == "Done."
-    assert len(result.llm_calls) == 1
-    call = result.llm_calls[0]
-    request_kwargs = mock_acomp.call_args.kwargs
-    assert call.status is ComposerLLMCallStatus.SUCCESS
-    assert call.model_requested == "openrouter/openai/gpt-5.5"
-    assert call.model_returned == "provider/model-returned"
-    assert call.prompt_tokens == 11
-    assert call.completion_tokens == 7
-    assert call.total_tokens == 18
-    assert call.pricing_model == "openai/gpt-4o-2024-08-06"
-    assert call.provider_cost == pytest.approx(0.0000975)
-    assert call.provider_cost_source == "litellm.cost_per_token"
-    assert call.provider_request_id == "chatcmpl-123"
-    assert call.messages_hash == stable_hash(request_kwargs["messages"])
-    assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
+    # Empty build-related prose gets one neutral repair turn. Both physical
+    # calls must retain their own request hashes and provider metadata.
+    assert mock_acomp.call_count == len(result.llm_calls) == 2
+    assert result.repair_turns_used == 1
+    assert result.llm_calls[0].messages_hash != result.llm_calls[1].messages_hash
+    for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
+        assert call.status is ComposerLLMCallStatus.SUCCESS
+        assert call.model_requested == "openrouter/openai/gpt-5.5"
+        assert call.model_returned == "provider/model-returned"
+        assert call.prompt_tokens == 11
+        assert call.completion_tokens == 7
+        assert call.total_tokens == 18
+        assert call.pricing_model == "openai/gpt-4o-2024-08-06"
+        assert call.provider_cost == pytest.approx(0.0000975)
+        assert call.provider_cost_source == "litellm.cost_per_token"
+        assert call.provider_request_id == "chatcmpl-123"
+        assert call.messages_hash == stable_hash(request_kwargs["messages"])
+        assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
 
 
 @pytest.mark.asyncio

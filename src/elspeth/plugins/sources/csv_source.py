@@ -99,7 +99,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d8a9c799bf5895c0"
+    source_file_hash: str | None = "sha256:5d131927c2baea3a"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -673,8 +673,8 @@ class CSVSource(BaseSource):
                     "schemas coerce declared fields at the Tier-3 boundary. Malformed rows can be quarantined."
                 ),
                 composer_hints=(
-                    "Default schema.mode to 'observed' unless the user explicitly asked to project to a smaller schema.",
-                    "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode silently drops rows that don't match.",
+                    "Default schema.mode to 'observed'; use 'fixed' only for an explicitly required closed schema. To keep fewer columns, use a field_mapper downstream — a fixed source schema rejects extras rather than projecting them away.",
+                    "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode rejects rows that don't match, including unexpected columns; on_validation_failure routes them to quarantine or discards them with audit.",
                     "Decide whether the CSV is headered: without columns CSVSource treats the first non-skipped row as headers; for headerless data set columns=[...] so the first data row stays data. Do not copy a header row into inline source data unless it is real headered CSV.",
                     "If you have been asked to generate CSV rows yourself (the invented_source path): always emit a header row as the first non-skipped line of the generated CSV, and always leave the `columns` option unset so CSVSource treats your first row as headers.",
                     "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id). Declare the normalized form, or keep an original name via field_mapping: {normalized: Original}; other declared names are rejected at config time.",
@@ -683,10 +683,10 @@ class CSVSource(BaseSource):
                     "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a schema guarantee. If transforms consume a CSV column, declare it in schema.guaranteed_fields or explicit schema fields.",
                     "CSV source options do not have url_field; if a downstream web_scrape needs URLs, keep the URL column in the CSV schema and set url_field on the web_scrape node.",
                     "If you authored CSV rows or chose source values for this CSV, bind the exact artifact as a blob-backed source, stage invented_source on source.options.interpretation_requirements.",
-                    "Then call request_interpretation_review with affected_node_id='source' and llm_draft equal to the exact CSV text.",
+                    "Then call request_interpretation_review with affected_node_id='source' and omit llm_draft; the server uses the exact staged source draft, avoiding newline or escaping drift.",
                     "For source-level interpretation reviews, source is not a transform node; do not search nodes[] for source before calling the review tool.",
                     "Excel-exported CSVs are often cp1252 or have a UTF-16 BOM — verify encoding before pinning schema.",
-                    "Set on_validation_failure to a sink name for quarantine/review, or 'discard' to drop with audit. Default is 'discard'.",
+                    "Set on_validation_failure deliberately: a sink name quarantines invalid rows; 'discard' drops them with audit. Raw CSV config requires it; set_pipeline and set_source_from_blob default to discard when it is omitted.",
                 ),
             )
         return None
@@ -710,6 +710,7 @@ class CSVSource(BaseSource):
         if "mode" in schema and schema["mode"] == "fixed":
             return (
                 "You declared schema.mode: 'fixed'. Did you call inspect_source first? "
-                "Fixed mode drops every row whose columns don't exactly match the declared fields.",
+                "Fixed mode rejects nonconforming rows, including unexpected columns; "
+                "on_validation_failure selects quarantine or audited discard. It does not project columns away.",
             )
         return ()

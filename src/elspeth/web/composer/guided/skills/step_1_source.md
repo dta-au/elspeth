@@ -44,6 +44,7 @@ Your obligation is to **surface an unmet requirement and record a proven one**:
   panel — "the scrape step needs a URL column; confirm your source provides one
   and name it" — and let the operator's confirmation become the proof.
 
-Keep `mode: observed`, never `fixed`: observed honours `guaranteed_fields` while
-passing the other columns through; `fixed` silently *drops* every unlisted
-column — a quiet all-rows hazard.
+Keep `mode: observed` as the default: observed honours `guaranteed_fields` while
+passing the other columns through. `fixed` rejects rows with unexpected fields;
+the source's required `on_validation_failure` routes each invalid row to a
+quarantine sink or discards it with audit. It does not project away unlisted columns.

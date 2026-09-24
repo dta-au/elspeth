@@ -59,7 +59,8 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    assert SESSION_SCHEMA_EPOCH == 67
+    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    assert SESSION_SCHEMA_EPOCH == 68
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every Landscape digest column a shape CHECK; pairs with session 63.

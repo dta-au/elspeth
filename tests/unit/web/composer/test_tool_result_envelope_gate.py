@@ -92,6 +92,9 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
         "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
     ),
     ("tool_batch.py", "run_tool_batch"): "two _FAILURE_DATA_HELPERS rows: the proposal payload and the rejection payload",
+    ("service.py", "_dispatch_session_aware_tool"): (
+        "review-blocked payload walked by _tool_data_sites over service.py in shipped_keys; attributed to request_interpretation_review"
+    ),
     ("discovery_cache.py", "result_from_cached_discovery_payload"): (
         "re-envelopes a cached discovery result's own data under the current state; adds no key, and every key it "
         "carries was censused at the tool that produced it"
@@ -263,6 +266,7 @@ _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
     "_execute_delete_blob_locked": "delete_blob",
     "_finalize_journaled_blob_deletion": "delete_blob",
     "_check_duplicate_interpretation": "request_interpretation_review",
+    "_dispatch_session_aware_tool": "request_interpretation_review",
 }
 
 
@@ -2224,8 +2228,8 @@ def _tools_calling(helper: str) -> frozenset[str]:
 def _tools_setting(field: str) -> frozenset[str]:
     """Tools whose handler constructs a ToolResult with ``field=`` set explicitly."""
     tools: set[str] = set()
-    for name in _TOOL_DATA_FILES:
-        path = TOOLS_DIR / name
+    service_path = COMPOSER / "service.py"
+    for path in [*(TOOLS_DIR / name for name in _TOOL_DATA_FILES), service_path]:
         tree = _parse(path)
         for node in ast.walk(tree):
             if (
@@ -2234,6 +2238,8 @@ def _tools_setting(field: str) -> frozenset[str]:
                 and any(kw.arg == field for kw in node.keywords)
             ):
                 fn_name = _enclosing_function(tree, node.lineno)
+                if path == service_path and fn_name != "_dispatch_session_aware_tool":
+                    continue  # Other service helpers return compose results or shared wrappers.
                 if fn_name is not None:
                     tools.add(_tool_name_for(fn_name, f"{_display(path)}:{node.lineno}"))
     return frozenset(tools)
@@ -2264,6 +2270,7 @@ def shipped_keys() -> list[ShippedKey]:
         *_plugin_schema_sites(),
         *_failure_data_sites(),
         *_tool_data_sites(),
+        *_tool_data_sites(files=[COMPOSER / "service.py"]),
     ]
 
 
@@ -2558,6 +2565,51 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
             continue
         missing = can_ship(tool) - keys - {"data"}  # data admission is per tool by design
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
+
+
+def test_review_blocked_payload_and_preflight_are_censused() -> None:
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(COMPOSER / 'service.py')}:")]
+    assert {(row.tool, row.key) for row in rows} == {
+        ("request_interpretation_review", "data._kind"),
+        ("request_interpretation_review", "data.message"),
+    }
+    assert "runtime_preflight" in can_ship("request_interpretation_review")
+    assert "runtime_preflight" in admitted_keys()["request_interpretation_review"]
+
+
+def test_review_blocked_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_review_blocked_payload_and_preflight_are_censused()
+    service_path = COMPOSER / "service.py"
+    original_parse = _parse
+
+    def with_extra_key(path: Path) -> ast.Module:
+        tree = original_parse(path)
+        if path == service_path:
+            fn = _function(tree, "_dispatch_session_aware_tool", in_class="ComposerServiceImpl")
+            payloads = [
+                _data_expr(node)
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Call) and _call_name(node) == "ToolResult" and isinstance(_data_expr(node), ast.Dict)
+            ]
+            assert len(payloads) == 1
+            payload = payloads[0]
+            assert isinstance(payload, ast.Dict)
+            payload.keys.append(ast.Constant(value="unexplained_review_probe"))
+            payload.values.append(ast.Constant(value=True))
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+    with pytest.raises(AssertionError, match="unexplained_review_probe"):
+        test_every_shipped_envelope_key_is_taught_or_fenced()
+
+
+def test_review_blocked_census_rejects_unadmitted_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_review_blocked_payload_and_preflight_are_censused()
+    original = admitted_keys()
+    original["request_interpretation_review"] -= {"runtime_preflight"}
+    monkeypatch.setattr(importlib.import_module(__name__), "admitted_keys", lambda: original)
+    with pytest.raises(AssertionError, match=r"request_interpretation_review.*runtime_preflight"):
+        test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool()
 
 
 def _assert_unique_container_producers() -> None:

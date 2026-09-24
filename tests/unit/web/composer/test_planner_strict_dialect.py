@@ -46,7 +46,7 @@ from elspeth.web.composer.pipeline_planner import (
 from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
-from elspeth.web.composer.tools.wire_projection import stamp_planner_terminal
+from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments, stamp_planner_terminal
 from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
 
 _STRICT = ToolContractDialect.OPENAI_STRICT
@@ -380,8 +380,8 @@ async def test_hatch_turn_uses_the_hatch_dialect_and_endpoint(
     endpoint assertion goes red.
     """
     completion = _ScriptedCompletion(
-        _response(("list_sources", {})),
-        _response(("list_sinks", {})),
+        _response(("list_sources", encode_semantic_arguments("list_sources", planner, {}))),
+        _response(("list_sinks", encode_semantic_arguments("list_sinks", planner, {}))),
         _response((_TERMINAL, {"pipeline": _pipeline(tmp_path)})),
     )
     recorder = BufferingRecorder()

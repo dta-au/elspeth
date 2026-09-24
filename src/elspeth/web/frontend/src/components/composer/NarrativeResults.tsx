@@ -19,7 +19,7 @@
  * the `interpretationEventsStore` projection has resolved events for the
  * active session, render them as "How user-supplied terms were
  * interpreted." The overlay must NOT surface session-aggregate history;
- * it filters to the active run's wall-clock window so that resolutions
+ * it filters to the selected run's wall-clock window so that resolutions
  * from prior runs in the same session do not over-count. Pre-Phase-5b
  * (or no events yet) the overlay short-circuits.
  *
@@ -27,7 +27,7 @@
  * `interpretationEventsStore` keys events by `session_id` only and the
  * `interpretation_events_table` has no `run_id` column. To prevent the
  * overlay from over-counting stale resolutions from earlier runs in the
- * same session, the component filters by the active run's wall-clock
+ * same session, the component filters by the selected run's wall-clock
  * window:
  *
  *   - `runStart = new Date(run.started_at).getTime()`
@@ -59,7 +59,8 @@
  *
  * **Download affordance (plan 19b:342).** Alongside the narrative
  * summary, the panel exposes a "Download full output" affordance against
- * the active run's first downloadable file artifact. The backend
+ * the selected run's first downloadable file artifact whose preview
+ * passed the backend's content verification. The backend
  * `/content` endpoint requires `Authorization: Bearer` (api/client.ts
  * lines 877-883) so the affordance is a button that invokes
  * `downloadRunOutputContent` and triggers a synthetic anchor — not a
@@ -86,27 +87,13 @@ import { useSessionStore } from "@/stores/sessionStore";
 import type { RunOutputArtifact } from "@/types/index";
 
 interface NarrativeResultsProps {
+  /** Run selected by the parent results view, including completed history. */
+  runId: string | null;
   /** If supplied, narrative pulls the summary from this run output rather
    *  than the live execution store. Used by the read-only inspect view
    *  in Task 8 where the run results live in a frozen blob. ``null`` means
    *  "explicitly no summary"; ``undefined`` means "fall back to live mode." */
   summaryOverride?: string | null;
-}
-
-/** Pick the first file artifact whose `downloadable` flag is not
- *  explicitly false. ``downloadable === undefined`` means a pre-rollout
- *  backend; api/client docstring at types/index.ts:715-720 documents the
- *  "missing → caller treats as optimistic show-the-button" semantic.
- *  Returns null when no candidate exists. */
-function pickDownloadableFileArtifact(
-  artifacts: ReadonlyArray<RunOutputArtifact>,
-): RunOutputArtifact | null {
-  for (const a of artifacts) {
-    if (a.artifact_type !== "file") continue;
-    if (a.downloadable === false) continue;
-    return a;
-  }
-  return null;
 }
 
 /** Walk every row in a JSONL or JSON preview, return the rows whose
@@ -167,7 +154,8 @@ function extractSummariesFromPreviewText(
 }
 
 interface LiveOutputsState {
-  /** First downloadable file artifact (for the Download affordance). */
+  runId: string;
+  /** First downloadable file whose preview passed backend verification. */
   downloadArtifact: RunOutputArtifact | null;
   /** Concatenated non-empty `summary` strings extracted from the previews
    *  of every file artifact in the manifest. ``null`` until the fetch
@@ -189,15 +177,14 @@ function triggerBrowserDownload(data: Blob, filename: string): void {
   URL.revokeObjectURL(url);
 }
 
-export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}): JSX.Element {
+export function NarrativeResults({ runId, summaryOverride }: NarrativeResultsProps): JSX.Element {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const optedOutBySession = useInterpretationEventsStore((s) => s.optedOutBySession);
   const resolvedBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
-  const activeRunId = useExecutionStore((s) => s.activeRunId);
   const runs = useExecutionStore((s) => s.runs);
 
   // Live-mode outputs: fetched only when summaryOverride is undefined AND
-  // an activeRunId is set. The fetch loads the manifest, then for each
+  // a runId is set. The fetch loads the manifest, then for each
   // file artifact the bounded-preview endpoint, then walks rows looking
   // for a `summary` field per plan 19b:349.
   const [liveOutputs, setLiveOutputs] = useState<LiveOutputsState | null>(null);
@@ -208,12 +195,11 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
     // fetch would only introduce a race the AC4-precedence test guards
     // against.
     if (summaryOverride !== undefined) return;
-    if (activeRunId === null) {
+    if (runId === null) {
       setLiveOutputs(null);
       return;
     }
 
-    const runId = activeRunId;
     let cancelled = false;
 
     (async () => {
@@ -227,17 +213,23 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
         artifacts = manifest.artifacts;
       } catch {
         if (cancelled) return;
-        setLiveOutputs({ downloadArtifact: null, extractedSummary: "" });
+        setLiveOutputs({ runId, downloadArtifact: null, extractedSummary: "" });
         return;
       }
 
-      const downloadArtifact = pickDownloadableFileArtifact(artifacts);
+      let downloadArtifact: RunOutputArtifact | null = null;
 
       const summaries: string[] = [];
       for (const artifact of artifacts) {
         if (artifact.artifact_type !== "file") continue;
         try {
           const preview = await fetchRunOutputPreview(runId, artifact.artifact_id);
+          // A cumulative sink may overwrite an earlier publication's URI.
+          // The manifest preserves both descriptors; successful preview
+          // verifies these exact bytes before we offer that artifact.
+          if (downloadArtifact === null && artifact.downloadable) {
+            downloadArtifact = artifact;
+          }
           summaries.push(
             ...extractSummariesFromPreviewText(
               preview.preview_text,
@@ -253,6 +245,7 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
 
       if (cancelled) return;
       setLiveOutputs({
+        runId,
         downloadArtifact,
         extractedSummary: summaries.join("\n\n"),
       });
@@ -261,7 +254,11 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
     return () => {
       cancelled = true;
     };
-  }, [summaryOverride, activeRunId]);
+  }, [summaryOverride, runId]);
+
+  // A new selection renders before its fetch settles. Keep both text and
+  // download evidence bound to their producing run during that interval.
+  const selectedOutputs = liveOutputs?.runId === runId ? liveOutputs : null;
 
   // Layer 1: locate the summary string. Precedence: explicit override
   // (frozen-blob inspect view) → live-extracted concatenation → null.
@@ -270,8 +267,8 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
   const summary: string | null =
     summaryOverride !== undefined
       ? summaryOverride
-      : liveOutputs !== null && liveOutputs.extractedSummary !== ""
-        ? liveOutputs.extractedSummary
+      : selectedOutputs !== null && selectedOutputs.extractedSummary !== ""
+        ? selectedOutputs.extractedSummary
         : null;
 
   // Layer 2: opt-out indicator from the interpretation events store.
@@ -289,8 +286,8 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
   // clock for the in-flight test case.
   const resolvedEventsInWindow = useMemo(() => {
     if (activeSessionId === null) return [];
-    if (activeRunId === null) return [];
-    const run = runs.find((r) => r.id === activeRunId);
+    if (runId === null) return [];
+    const run = runs.find((r) => r.id === runId);
     if (run === undefined) return [];
     const runStart = new Date(run.started_at).getTime();
     const runEnd =
@@ -313,23 +310,23 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
       const eventTime = new Date(eventTimeIso).getTime();
       return eventTime >= runStart && eventTime <= runEnd;
     });
-  }, [activeSessionId, activeRunId, runs, resolvedBySession]);
+  }, [activeSessionId, runId, runs, resolvedBySession]);
 
   // Download affordance source: when the frozen-blob inspect view (Task 8)
   // mounts NarrativeResults, there is no live executionStore run to fetch
   // outputs from — the affordance is suppressed. Live mode surfaces the
-  // first downloadable file artifact from the just-fetched manifest.
+  // first downloadable file artifact with a verified preview.
   const downloadArtifact: RunOutputArtifact | null =
     summaryOverride !== undefined
       ? null
-      : (liveOutputs?.downloadArtifact ?? null);
+      : (selectedOutputs?.downloadArtifact ?? null);
 
   const handleDownload = async (): Promise<void> => {
     if (downloadArtifact === null) return;
-    if (activeRunId === null) return;
+    if (runId === null) return;
     try {
       const { data, filename } = await downloadRunOutputContent(
-        activeRunId,
+        runId,
         downloadArtifact.artifact_id,
       );
       triggerBrowserDownload(data, filename);

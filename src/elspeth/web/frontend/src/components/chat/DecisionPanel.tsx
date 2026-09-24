@@ -31,6 +31,8 @@
 //     Product decision 2026-09-23: an advisor note travels with the draft as
 //     labelled, untrusted evidence so the composer can explain that finding.
 //     It is not a fix button: a blocker has no server-vetted remedy text;
+//   * graph_structure blockers additionally offer `Ask composer to repair`,
+//     starting a normal planner turn with the current validation diagnostics;
 //   * `Open checks` always renders. The workspace handles the view intent by
 //     revealing Pipeline on narrow screens, then selecting and focusing Checks.
 //   * no tool or API vocabulary in visible copy (F-3).
@@ -77,6 +79,9 @@ export interface DecisionPanelProps {
   /** Draft a question about a blocker into the chat input. Undefined where
    *  there is no freeform input to draft into: the button is not rendered. */
   onAskAboutBlocker?: (detail: string, componentId: string | null, note: string | null) => void;
+  /** Start an ordinary planner turn for a graph error, including errors that
+   *  first become visible after an interpretation review is resolved. */
+  onRepairGraph?: () => void;
   /** Visible reason Ask is held closed (the input already holds a draft the
    *  click would replace), or null while it is open. */
   askDisabledReason?: string | null;
@@ -158,6 +163,7 @@ export function DecisionPanel({
   stepLabelFor,
   onApplySuggestion,
   onAskAboutBlocker,
+  onRepairGraph,
   askDisabledReason = null,
   onOpenChecks,
   interpretationContent,
@@ -250,6 +256,18 @@ export function DecisionPanel({
                       onClick={() => onAskAboutBlocker(row.detail, row.componentId, row.note)}
                     >
                       Ask the composer about this
+                    </Button>
+                  )}
+                  {row.code === "graph_structure" && onRepairGraph !== undefined && (
+                    <Button
+                      compact
+                      variant="primary"
+                      disabled={applyDisabled}
+                      onClick={() => {
+                        if (!applyDisabled) onRepairGraph();
+                      }}
+                    >
+                      Ask composer to repair
                     </Button>
                   )}
                 </>

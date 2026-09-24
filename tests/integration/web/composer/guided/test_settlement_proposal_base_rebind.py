@@ -33,15 +33,10 @@ Two guards downstream do notice, and each one is a different amputation:
 These tests state each invariant positively, and are RED until the settlement
 re-anchors the carried proposal.
 
-SCOPE, so this file is not mistaken for a completeness proof. These tests
-cover the settlements that go through ``settle_guided_state_operation`` plus
-``decline_guided_full_pipeline_proposal``. They do NOT cover every writer
-that inserts a ``composition_states`` row carrying a live ``active_proposal``
-forward. Two such writers are measured and still open:
-``POST /api/sessions/{id}/messages`` and ``POST /api/sessions/{id}/compose``
-re-inject ``guided_session`` and call ``save_composition_state``, stranding
-the anchor with no transition guard at all (elspeth-f561d651c8, pre-existing
-and unaffected by this fix).
+These tests cover guided settlements. Generic COMPOSE checkpoints through
+messages, recompose, and shared persistence writers are covered separately
+by ``test_compose_checkpoint_anchor.py``: those saves also rebase a carried
+proposal atomically, and refuse changes to its reviewed content or identity.
 
 The third, ``stage_guided_full_pipeline_proposal``, is covered here but by a
 REFUSAL rather than a rebase: staging mints a second pending proposal
@@ -470,8 +465,8 @@ def test_every_carrying_settlement_names_its_own_gesture_in_the_rebase_event(
         "declined revision": "revision_declined",
         "guided-full decline": "guided_full_declined",
     }
-    assert set(observed.values()) == GUIDED_PROPOSAL_REBASE_REASONS, (
-        "every declared rebase reason must be emitted by one of the carrying settlements"
+    assert set(observed.values()) == GUIDED_PROPOSAL_REBASE_REASONS - {"compose_checkpoint", "ordinary_proposal_checkpoint"}, (
+        "every guided settlement reason must be emitted here; generic COMPOSE checkpoint emission has its own integration test"
     )
 
 

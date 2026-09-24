@@ -1426,6 +1426,16 @@ async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_tur
                 tool_name="patch_output_options",
                 arguments={"sink_name": "scored_rows", "patch": {"path": str(sink_dir / "output2.csv")}},
             ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review_after_repair",
+                tool_name="request_interpretation_review",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
             _fake_text_response("Fixed the contract violation — review still pending."),
         ]
     )
@@ -1437,18 +1447,19 @@ async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_tur
         message="create a workflow that rates how cool pages are",
     )
 
-    # The loop must have continued past the staged review with a repair turn:
-    # four model calls, and the third one carries the injected repair message.
-    assert len(llm.messages) == 4, [len(m) for m in llm.messages]
+    # The mutation reports the failure immediately, and the premature review
+    # request is refused. The model repairs before retrying the review.
+    assert len(llm.messages) == 5, [len(m) for m in llm.messages]
     repair_message = llm.messages[2][-1]
-    assert repair_message["role"] == "user"
-    assert "Pre-finalisation runtime preflight" in repair_message["content"]
+    assert repair_message["role"] == "tool"
+    assert "interpretation_review_blocked" in repair_message["content"]
     assert "producer emits 'Any'" in repair_message["content"]
 
     assert [inv.tool_name for inv in result.tool_invocations] == [
         "set_pipeline",
         "request_interpretation_review",
         "patch_output_options",
+        "request_interpretation_review",
     ]
 
     # The handoff completes VERIFIED: bare notice, no outstanding-findings
@@ -1522,17 +1533,12 @@ async def test_staged_review_over_unwired_draft_adds_only_reply_turn(
 
 
 @pytest.mark.asyncio
-async def test_staged_review_with_spent_budget_completes_with_qualified_disclosure(
+async def test_staged_review_with_spent_budget_withholds_cards_for_invalid_graph(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no repair budget the handoff still completes — never silently.
-
-    The fallback is exactly the round-8 observed shape: the handoff notice
-    qualified with the outstanding validator objection, so the user is told
-    the review cards are NOT all that remains.
-    """
+    """A spent repair budget cannot turn a broken graph into review cards."""
     from elspeth.web.composer import service as service_module
 
     composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
@@ -1551,10 +1557,9 @@ async def test_staged_review_with_spent_budget_completes_with_qualified_disclosu
         message="create a workflow that rates how cool pages are",
     )
 
-    assert len(llm.messages) == 3, [len(m) for m in llm.messages]
-    assert _HANDOFF_SUFFIX in result.assistant_message
-    assert "must be fixed before this pipeline can run" in result.assistant_message
+    assert _HANDOFF_SUFFIX not in result.assistant_message
     assert "producer emits 'Any'" in result.assistant_message
+    assert await sessions_service.list_interpretation_events(session_id, status="pending") == []
 
 
 @pytest.mark.asyncio
@@ -4222,6 +4227,7 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     narration: str | None,
 ) -> None:
     """A staged review gets a fresh visible answer without repeating tool narration."""
+    from elspeth.web.composer.progress import ComposerProgressRegistry
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.models import chat_messages_table
     from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
@@ -4229,8 +4235,11 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     composer = _build_composer(tmp_path, sessions_service)
     completed_results: list[ComposerResult] = []
     original_loop = composer._compose_loop
+    progress_registry = ComposerProgressRegistry()
+    progress_sink = progress_registry.bind_request(session_id="reply-progress", request_id="request-1", user_id="alice")
 
     async def capture_result(*args: Any, **kwargs: Any) -> ComposerResult:
+        kwargs["progress"] = progress_sink
         completed = await original_loop(*args, **kwargs)
         completed_results.append(completed)
         return completed
@@ -4271,8 +4280,15 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         ]
     )
 
+    async def observed_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        if not tools:
+            snapshot = await progress_registry.get_latest("reply-progress")
+            assert snapshot.phase == "calling_model"
+            assert "reply" in snapshot.headline
+        return await llm(messages, tools)
+
     result = await composer._run_one_turn_for_test(
-        llm=llm,
+        llm=observed_llm,
         session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",

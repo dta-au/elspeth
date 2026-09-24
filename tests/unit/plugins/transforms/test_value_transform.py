@@ -312,7 +312,9 @@ class TestValueTransformBehavior:
         # the mode to make the build pass.
         consumer = ValueTransform(
             {
-                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: float"]},
+                # Presence is the producer's guarantee; its expression result
+                # type is unknown until explicit normalization or runtime use.
+                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: any"]},
                 "required_input_fields": ["subtotal"],
                 "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
             }
@@ -341,7 +343,7 @@ class TestValueTransformBehavior:
         )
         consumer = ValueTransform(
             {
-                "schema": {"mode": "fixed", "fields": ["subtotal: float"]},
+                "schema": {"mode": "fixed", "fields": ["subtotal: any"]},
                 "required_input_fields": ["subtotal"],
                 "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
             }
@@ -349,8 +351,8 @@ class TestValueTransformBehavior:
 
         with pytest.raises(EdgeContractError) as exc_info:
             build_linear_pipeline([{"price": 100, "quantity": 2}], transforms=[producer, consumer])
-        message = str(exc_info.value)
-        assert "Extra fields rejected by consumer input contract: ['price', 'quantity']" in message
+        assert exc_info.value.compatibility_result is not None
+        assert exc_info.value.compatibility_result.extra_fields == ("price", "quantity")
 
     def test_unexpected_evaluator_exceptions_propagate(self, ctx: "PluginContext", monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform

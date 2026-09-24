@@ -34,10 +34,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 
 # Coupled cut: sparse proposal display, structured stored validation errors,
 # timestamp-leading quota scan indexes, and durable fork failure diagnostics.
-# Epoch 67 binds coalesce mapping-branch order and multi-source ``sources``
-# order in the composer authority hashes and the advisor fingerprint. Stored
-# epoch-66 hash preimages cannot be re-verified, so the store is recreated.
-_COORDINATION_HARD_CUT_EPOCH = 67
+# Epoch 68 admits compose_checkpoint and ordinary_proposal_checkpoint reasons
+# in persisted proposal.rebased events. Earlier readers reject these closed
+# vocabulary additions, so this semantic JSON cut requires store recreation.
+_COORDINATION_HARD_CUT_EPOCH = 68
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",

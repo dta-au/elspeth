@@ -107,6 +107,10 @@ class EdgeContractError(GraphValidationError):
         self.consumer_schema_name: str = consumer_schema_name
         self.compatibility_result: CompatibilityResult = compatibility_result
         self.from_component_type: str | None = from_component_type
+        # Captured from the graph's exact config-name maps before a failing
+        # build unwinds. Keep identities, not the graph or plugin instances.
+        self.from_config_name: str | None = None
+        self.to_config_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

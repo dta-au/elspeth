@@ -5330,10 +5330,10 @@ class TestSchemaContractValidation:
         merge: str | None = "union",
         policy: str | None = "require_all",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
-        branch_plugin: str = "value_transform",
+        branch_plugin: str = "passthrough",
         timeout_seconds: float | None = None,
     ) -> CompositionState:
-        """Build a legal transformed fork/coalesce shape for schema-mode parity tests."""
+        """Build a schema boundary without introducing an unproven expression result type."""
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -7119,6 +7119,22 @@ class TestSchemaContractValidation:
         result = state.validate()
 
         assert result.is_valid, result.errors
+
+    def test_union_coalesce_rejects_unproven_expression_output_type(self) -> None:
+        """An expression target's input declaration is not proof of its output type."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            branch_plugin="value_transform",
+        )
+
+        result = state.validate()
+
+        assert not result.is_valid
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == "value"
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"int", "any"}
 
     def test_union_coalesce_type_check_abstains_on_unresolved_branch(self) -> None:
         """One resolvable branch is not enough to prove a conflict."""

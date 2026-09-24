@@ -1248,6 +1248,41 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
     return handoff_seen
 
 
+def _tool_batch_ends_with_valid_current_preview(tool_outcomes: tuple[_ToolOutcome, ...], state: CompositionState) -> bool:
+    """Admit terminal verification from this batch's actual current-state result."""
+    if not tool_outcomes:
+        return False
+    for outcome in tool_outcomes:
+        if outcome.error_class is not None or not isinstance(outcome.response, ToolResult) or not outcome.response.success:
+            return False
+    terminal = tool_outcomes[-1]
+    response = terminal.response
+    return (
+        terminal.call.function.name == "preview_pipeline"
+        and isinstance(response, ToolResult)
+        and response.updated_state == state
+        and response.validation.is_valid
+        and response.runtime_preflight is not None
+        and response.runtime_preflight.is_valid
+    )
+
+
+def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain historical tool evidence as quoted data when no tools are advertised."""
+    return [
+        (
+            {
+                "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
+                "content": "Historical tool protocol record (quoted data):\n"
+                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True),
+            }
+            if historical_message["role"] == "tool" or "tool_calls" in historical_message
+            else historical_message
+        )
+        for historical_message in llm_messages
+    ]
+
+
 def _outstanding_findings_detail(outstanding_findings: ValidationResult | None) -> str | None:
     """Leading objection from a red masked re-validation, or ``None`` for a pure handoff.
 
@@ -1558,6 +1593,22 @@ def _replace_advisor_repair_public_result(
             branch="repair_signoff_pending", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _CrossTurnRepairKey:
+    """Campaign identity independent of bookkeeping checkpoint versions.
+
+    Authored content includes interpretation and secret controls. This key
+    bounds repair nudges only; runtime verdicts retain their full preflight
+    identity and are recomputed before the ledger is consulted.
+    """
+
+    user_id: str
+    session_scope: str
+    state_content_hash: str
+    settings_hash: str
+    interpretation_tolerant: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -2563,11 +2614,11 @@ class ComposerServiceImpl:
         self._runtime_preflight_timeout_seconds = settings.composer_runtime_preflight_timeout_seconds
         self._runtime_preflight_coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
         # Cross-turn repair ledger: broken-state identities (user scope +
-        # preflight key) whose cross-turn repair campaign has already been
+        # preflight content/context) whose cross-turn repair campaign has already been
         # injected. Process-local and best-effort by design — suppression is a
         # cost/UX bound, not a correctness gate; the finalize suffix stays
         # honest either way. See ``_attempt_preflight_repair``.
-        self._cross_turn_repair_ledger: dict[tuple[str, RuntimePreflightKey], None] = {}
+        self._cross_turn_repair_ledger: dict[_CrossTurnRepairKey, None] = {}
         self._availability = self._compute_availability()
         from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -3272,10 +3323,10 @@ class ComposerServiceImpl:
     ) -> RuntimePreflightKey:
         """Build the canonical preflight identity key for ``state``.
 
-        Single source for both the per-compose-call result cache and the
-        cross-turn repair ledger, so "same broken state" means the same thing
-        to both consumers: content identity plus the settings/plugin context
-        the preflight actually ran under.
+        The per-compose-call result cache retains checkpoint version as well
+        as content and settings/plugin context. The cross-turn repair ledger
+        projects the same context without version: bookkeeping saves must not
+        replenish a repair campaign over identical authored content.
         """
         settings_hash = runtime_preflight_settings_hash(self._settings)
         if plugin_snapshot is not None:
@@ -3982,9 +4033,13 @@ class ComposerServiceImpl:
             # unledgered. If the state is later broken again in an identical
             # way (same content hash), the claimed key suppresses a second
             # campaign — accepted: the red suffix still names the objection.
-            ledger_key = (
-                user_id or "",
-                self._runtime_preflight_key(state, session_scope=session_scope, plugin_snapshot=plugin_snapshot),
+            preflight_key = self._runtime_preflight_key(state, session_scope=session_scope, plugin_snapshot=plugin_snapshot)
+            ledger_key = _CrossTurnRepairKey(
+                user_id=user_id or "",
+                session_scope=preflight_key.session_scope,
+                state_content_hash=preflight_key.state_content_hash,
+                settings_hash=preflight_key.settings_hash,
+                interpretation_tolerant=preflight_key.interpretation_tolerant,
             )
             if repair_turns_used == 0 and ledger_key in self._cross_turn_repair_ledger:
                 return False
@@ -5766,10 +5821,10 @@ class ComposerServiceImpl:
            ``chat_messages`` path.
         2. **Cache-hit short-circuit.** When every tool call this turn
            was a discovery cache hit, no budget charge: continue.
-        3. **Budget classify.** Charge the composition counter (with
-           the B-4D-3 last-chance LLM call on exhaustion) or the
-           discovery counter (no bonus call). Advisor-only turns are
-           neither — return to the driver without charging.
+        3. **Budget classify.** Charge the composition or discovery counter.
+           Composition exhaustion gets the B-4D-3 last-chance call; discovery
+           exhaustion gets a reply-only call only after a valid current preview.
+           Advisor-only turns return to the driver without charging.
 
         Returns:
             ``_ClassifyOutcome(action="continue", composition_turns_delta=...,
@@ -5848,19 +5903,7 @@ class ComposerServiceImpl:
             # The branch is intentionally narrower than "any review tool
             # succeeded": a review followed by another tool call or a mixed
             # success/error batch is not a terminal user-action boundary.
-            # Surfacing runs BEFORE the repair gate below: it creates the
-            # backend-obligation events (model-choice, auto-staged prompt
-            # template, ...) the downstream orphan gate assumes exist, it is
-            # idempotent, and events match sites by (node, term, kind) — so a
-            # repair turn after it composes fine.
-            if session_operation_context is None:
-                raise RuntimeError("pending interpretation surfacing requires the compose operation context")
-            await self.surface_pending_interpretation_reviews(
-                state,
-                session_id=session_id,
-                current_state_id=persist.current_state_id,
-                session_operation_context=session_operation_context,
-            )
+            # Verify the graph before creating any further review cards.
             runtime_result: ValidationResult | None = last_runtime_preflight
             if state.version > initial_version:
                 runtime_result = await self._cached_runtime_preflight(
@@ -5919,25 +5962,38 @@ class ComposerServiceImpl:
                     repair_turns_delta=1,
                 )
 
+            if state.sources and state.outputs and runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
+                findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                    deadline=deadline,
+                )
+                if findings is not None:
+                    runtime_result = findings
+
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
+                if session_operation_context is None:
+                    raise RuntimeError("pending interpretation surfacing requires the compose operation context")
+                await self.surface_pending_interpretation_reviews(
+                    state,
+                    session_id=session_id,
+                    current_state_id=persist.current_state_id,
+                    session_operation_context=session_operation_context,
+                )
                 reply: _AdmittedAssistantMessage | None = None
                 remaining = deadline - asyncio.get_event_loop().time()
                 # A reply with no advertised tools cannot carry protocol tool
                 # blocks on providers such as Bedrock Converse. Preserve each
                 # complete historical record as attributed text instead; the
                 # planning/audit history stays unchanged and no tool is enabled.
-                reply_messages = [
-                    (
-                        {
-                            "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                            "content": "Historical tool protocol record (quoted data):\n"
-                            + json.dumps(historical_message, ensure_ascii=False, sort_keys=True),
-                        }
-                        if historical_message["role"] == "tool" or "tool_calls" in historical_message
-                        else historical_message
-                    )
-                    for historical_message in llm_messages
-                ]
+                reply_messages = _reply_only_messages(llm_messages)
                 reply_messages.append(
                     {
                         "role": "system",
@@ -5952,6 +6008,15 @@ class ComposerServiceImpl:
                 )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
                 if remaining > 0:
+                    await emit_progress(
+                        progress,
+                        ComposerProgressEvent(
+                            phase="calling_model",
+                            headline="I'm asking the model to prepare your reply.",
+                            evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
+                            likely_next="ELSPETH will save the reply and show the current review and validation status.",
+                        ),
+                    )
                     try:
                         completion = await self._call_llm_with_audit(reply_messages, [], timeout=remaining, recorder=recorder)
                     except provider_failures:
@@ -5977,6 +6042,7 @@ class ComposerServiceImpl:
                     mutation_success_seen=mutation_success_seen,
                     repair_turns_used=repair_turns_used,
                     plugin_snapshot=plugin_snapshot,
+                    deadline=deadline,
                 )
                 # ``_surface_and_finalize_no_tools`` now owns the announcement
                 # (with its outstanding-findings qualification) for the
@@ -6031,27 +6097,50 @@ class ComposerServiceImpl:
         # The current turn has already been executed (tool results
         # are in the message history). We increment first, then
         # check whether the budget is now exhausted. If so, we give
-        # the LLM one last chance (B-4D-3) for composition, or
-        # raise immediately for discovery (discovery exhaustion
-        # doesn't benefit from a bonus call — no state was mutated).
-        if turn_has_mutation:
-            new_composition_turns_used = composition_turns_used + 1
-            if new_composition_turns_used >= self._max_composition_turns:
+        # the LLM one last chance (B-4D-3) for composition. A final valid
+        # preview can also exhaust discovery after earlier repairs completed:
+        # let the model consume that verification in one reply-only call.
+        final_preview_at_discovery_cap = (
+            not turn_has_mutation
+            and turn_has_discovery
+            and discovery_turns_used + 1 >= self._max_discovery_turns
+            and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
+        )
+        if turn_has_mutation or final_preview_at_discovery_cap:
+            new_composition_turns_used = composition_turns_used + int(turn_has_mutation)
+            new_discovery_turns_used = discovery_turns_used + int(final_preview_at_discovery_cap)
+            exhausted_budget: Literal["composition", "discovery"] = "discovery" if final_preview_at_discovery_cap else "composition"
+            if new_composition_turns_used >= self._max_composition_turns or final_preview_at_discovery_cap:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
+                final_messages = llm_messages
+                final_tools = tools
+                if final_preview_at_discovery_cap:
+                    final_messages = _reply_only_messages(llm_messages)
+                    final_messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The current pipeline's final preview passed validation and the discovery budget is spent. "
+                                "This is a reply-only turn: tools are unavailable and the pipeline must not change. "
+                                "Answer the user's request using the accepted tool results above. Report what was validated "
+                                "without claiming that the pipeline was executed. Remaining completion checks still apply."
+                            ),
+                        }
+                    )
+                    final_tools = []
                 await emit_progress(progress, model_call_progress_event(message))
                 returned = await self._call_llm_before_deadline(
-                    llm_messages,
-                    tools,
+                    final_messages,
+                    final_tools,
                     state,
                     initial_version,
                     deadline,
                     recorder=recorder,
-                    # The composition counter has already been charged for
-                    # this turn (``new_composition_turns_used``); a timeout on
-                    # the B-4D-3 bonus call must report that same total.
+                    # The relevant counter has already been charged; a timeout
+                    # on the terminal call must report that same total.
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=discovery_turns_used,
+                    discovery_turns_used=new_discovery_turns_used,
                     failed_turn=failed_turn,
                 )
                 completion = (
@@ -6066,7 +6155,7 @@ class ComposerServiceImpl:
                     state=state,
                     initial_version=initial_version,
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=discovery_turns_used,
+                    discovery_turns_used=new_discovery_turns_used,
                     recorder=recorder,
                     failed_turn=failed_turn,
                     persisted_tool_call_turn=persisted_tool_call_turn,
@@ -6121,7 +6210,7 @@ class ComposerServiceImpl:
                             session_operation_context=session_operation_context,
                         )
                         raise ComposerConvergenceError.capture(
-                            max_turns=new_composition_turns_used + discovery_turns_used,
+                            max_turns=new_composition_turns_used + new_discovery_turns_used,
                             budget_exhausted="timeout",
                             state=state,
                             initial_version=initial_version,
@@ -6133,16 +6222,17 @@ class ComposerServiceImpl:
                         return _ClassifyOutcome(
                             action="return",
                             result=advisor_gate.result,
-                            composition_turns_delta=1,
+                            composition_turns_delta=int(turn_has_mutation),
+                            discovery_turns_delta=int(final_preview_at_discovery_cap),
                             advisor_passes_delta=advisor_gate.advisor_passes_delta,
                         )
                     # B-4D-3 budget-exhaustion last-chance finalize is a SECOND
                     # no-tool finalize path. Route it through the SHARED
                     # ``_surface_and_finalize_no_tools`` (Task 7 HIGH-1) so the
                     # backend PT auto-surface AND the fail-closed orphan gate are
-                    # UNIVERSAL — this path always carries ``turn_has_mutation``,
-                    # so it can otherwise orphan a required PT review (the LLM can
-                    # no longer surface PT). The loop persists the mutation BEFORE
+                    # UNIVERSAL — a prior mutation can leave a required PT review
+                    # orphaned, and this reply can no longer surface it through
+                    # tools. The loop persists any mutation BEFORE
                     # classify (dispatch -> persist -> ``current_state_id =
                     # persist.current_state_id`` -> classify), so ``state`` matches
                     # ``persist.current_state_id`` and the create_pending gate
@@ -6165,6 +6255,7 @@ class ComposerServiceImpl:
                         mutation_success_seen=mutation_success_seen,
                         repair_turns_used=repair_turns_used,
                         plugin_snapshot=plugin_snapshot,
+                        deadline=deadline,
                     )
                     result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
                     threaded = replace(
@@ -6177,11 +6268,12 @@ class ComposerServiceImpl:
                     return _ClassifyOutcome(
                         action="return",
                         result=threaded,
-                        composition_turns_delta=1,
+                        composition_turns_delta=int(turn_has_mutation),
+                        discovery_turns_delta=int(final_preview_at_discovery_cap),
                     )
                 raise ComposerConvergenceError.capture(
-                    max_turns=new_composition_turns_used + discovery_turns_used,
-                    budget_exhausted="composition",
+                    max_turns=new_composition_turns_used + new_discovery_turns_used,
+                    budget_exhausted=exhausted_budget,
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
@@ -6323,6 +6415,36 @@ class ComposerServiceImpl:
             session_id=session_id,
             repair_turns_used=repair_turns_used,
         ):
+            return _TerminateOutcome(action="continue", repair_turns_delta=1)
+
+        if (
+            repair_turns_used == 0
+            and repair_turns_used < _MAX_REPAIR_TURNS
+            and not mutation_success_seen
+            and not recorder.invocations
+            and _state_is_structurally_empty(state)
+            and _no_tool_policy.carries_build_action(message)
+            and (deadline is None or deadline > asyncio.get_running_loop().time())
+        ):
+            # Keep the more specific uploaded-source recovery above. The
+            # disclosure predicate includes questions and revocations; it must
+            # not authorize construction. Give the provider one neutral chance
+            # to reconcile its reply with actual state and the original request.
+            # The shared repair counter bounds this to one extra call, and the
+            # normal call path retains the deadline.
+            llm_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
+                        "Re-check the user's request against that state. If the user requested construction or generated "
+                        "source data, carry out that authorized work using the declared tools before claiming it is complete. "
+                        "If a required product fact is missing, ask the concrete question. If the user asked only for "
+                        "explanation or revoked construction, answer that request without building. Do not describe data "
+                        "as saved, bound, or reviewed until tool results establish it."
+                    ),
+                }
+            )
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
         # Forced-repair gate: when the model claims completion but the proof
@@ -6517,6 +6639,7 @@ class ComposerServiceImpl:
             mutation_success_seen=mutation_success_seen,
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
         )
         result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
         # Thread repair_turns_used through to the result so the route handler can
@@ -6544,6 +6667,7 @@ class ComposerServiceImpl:
         assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
+        runtime_findings: ValidationResult | None = None,
     ) -> ComposerResult | None:
         """Auto-surface backend-derived reviews + run the UNFILTERED orphan gate.
 
@@ -6571,6 +6695,17 @@ class ComposerServiceImpl:
         unfiltered gate keeps it fail-closed. Likewise a genuine bare-token
         vague-term orphan (non-PT) is left fail-closed by the gate.
         """
+
+        if runtime_findings is not None:
+            content = assistant_message.content or ""
+            return ComposerResult(
+                message=_no_tool_policy.compose_preflight_failure_message(content, runtime_result=runtime_findings),
+                state=state,
+                runtime_preflight=runtime_findings,
+                raw_assistant_content=content,
+                tool_invocations=recorder.invocations,
+                llm_calls=recorder.llm_calls,
+            )
 
         # Backend-derived surfacing (elspeth-e51216d305 Case B): surface every
         # review whose writer-boundary precondition holds against the FINAL
@@ -6669,6 +6804,7 @@ class ComposerServiceImpl:
         repair_turns_used: int,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        deadline: float | None = None,
     ) -> ComposerResult:
         """Auto-surface backend-derived reviews, gate orphans, and finalize.
 
@@ -6685,6 +6821,20 @@ class ComposerServiceImpl:
         and in the comments around ``_missing_pending_interpretation_review_sites``.
         """
 
+        runtime_findings = None
+        if state.sources and state.outputs and interpretation_sites(state):
+            runtime_findings = await self._pending_handoff_outstanding_findings(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
+                deadline=deadline,
+            )
         orphan_result = await self._surface_pt_and_gate_orphans_or_none(
             state=state,
             session_operation_context=session_operation_context,
@@ -6693,6 +6843,7 @@ class ComposerServiceImpl:
             assistant_message=assistant_message,
             recorder=recorder,
             progress=progress,
+            runtime_findings=runtime_findings,
         )
         if orphan_result is not None:
             return orphan_result
@@ -6951,15 +7102,37 @@ class ComposerServiceImpl:
             is_last_pass or not allow_repair_continue or stalled_repair or verdict.repair_unactionable
         )
         if terminal_block:
-            orphan_result = await self._surface_pt_and_gate_orphans_or_none(
-                state=state,
-                session_operation_context=session_operation_context,
-                session_id=session_id,
-                current_state_id=current_state_id,
-                assistant_message=assistant_message,
-                recorder=recorder,
-                progress=progress,
-            )
+            runtime_findings = None
+            if state.sources and state.outputs and interpretation_sites(state):
+                if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0:
+                    raise _AdvisorCheckpointComposeDeadlineExpired
+                runtime_findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                    deadline=deadline,
+                )
+            orphan_result = None
+            if runtime_findings is not None:
+                # Keep the fresh advisor verdict and its publication below;
+                # graph repair takes precedence over surfacing new cards.
+                runtime_preflight = runtime_findings
+            else:
+                orphan_result = await self._surface_pt_and_gate_orphans_or_none(
+                    state=state,
+                    session_operation_context=session_operation_context,
+                    session_id=session_id,
+                    current_state_id=current_state_id,
+                    assistant_message=assistant_message,
+                    recorder=recorder,
+                    progress=progress,
+                )
             if orphan_result is not None:
                 orphan_result = _with_advisor_gate_decision(orphan_result, completion_gates, None)
                 return _TerminalNoToolAdvisorGateOutcome(
@@ -7965,6 +8138,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         anti_anchor: AntiAnchorTracker,
         policy_catalog: PolicyCatalogView,
+        review_preflight: ValidationResult | None = None,
     ) -> _SessionAwareDispatchOutcome:
         """Dispatch a session-aware async composer tool.
 
@@ -8082,7 +8256,20 @@ class ComposerServiceImpl:
             # Hold the arguments to the tool's closed-root flat schema S before
             # the handler's pydantic model, like every execute_tool dispatch.
             require_schema_valid_arguments(tool_name, arguments)
-            result = await handler(**kwargs)
+            if review_preflight is not None:
+                result = ToolResult(
+                    success=False,
+                    updated_state=state,
+                    validation=policy_catalog.validate_composition_state(state).validation,
+                    affected_nodes=(),
+                    runtime_preflight=review_preflight,
+                    data={
+                        "_kind": "interpretation_review_blocked",
+                        "message": "Repair the runtime validation errors before requesting interpretation review cards.",
+                    },
+                )
+            else:
+                result = await handler(**kwargs)
         except ToolArgumentError as exc:
             # Two sub-paths: rate-cap (write F-6 row + emit F-15 telemetry
             # BEFORE raising the LLM-facing ARG_ERROR) vs. generic

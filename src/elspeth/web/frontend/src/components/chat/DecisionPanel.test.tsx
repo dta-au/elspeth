@@ -77,6 +77,27 @@ const phraseFor = (componentId: string | null): string =>
   componentId === "pipeline" ? "Pipeline" : (componentId ?? "Pipeline");
 const stepLabelFor = (): string | null => null;
 
+describe("graph repair action", () => {
+  it.each([false, true])("respects compose availability (disabled=%s)", (applyDisabled) => {
+    const onRepairGraph = vi.fn();
+    renderPanel({ rows: [{ ...blockerRow, code: "graph_structure" }], count: 1, applyDisabled, onRepairGraph });
+    const repair = screen.getByRole("button", { name: "Ask composer to repair" });
+    expect(repair).toHaveProperty("disabled", applyDisabled);
+    fireEvent.click(repair);
+    expect(onRepairGraph).toHaveBeenCalledTimes(applyDisabled ? 0 : 1);
+  });
+
+  it("does not offer a pipeline repair for an advisor or policy blocker", () => {
+    renderPanel({ onRepairGraph: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Ask composer to repair" })).toBeNull();
+  });
+
+  it("does not offer repair without a planner callback", () => {
+    renderPanel({ rows: [{ ...blockerRow, code: "graph_structure" }], count: 1 });
+    expect(screen.queryByRole("button", { name: "Ask composer to repair" })).toBeNull();
+  });
+});
+
 function renderPanel(
   overrides: Partial<Parameters<typeof DecisionPanel>[0]> = {},
 ): ReturnType<typeof render> & { handlers: ReturnType<typeof makeHandlers> } {

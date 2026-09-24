@@ -89,7 +89,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 )
 from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
-from elspeth.web.sessions.converters import pipeline_dict_from_record
+from elspeth.web.sessions.converters import pending_guided_checkpoint, pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
     approvals_table,
@@ -843,6 +843,17 @@ class _RepositoryCompositionStateMutations:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
 
         connection = _resolve_mutation_connection(state._connection_token)
+        current_metadata = connection.execute(
+            select(composition_states_table.c.composer_meta)
+            .where(composition_states_table.c.session_id == state._session_id)
+            .order_by(composition_states_table.c.version.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if (
+            pending_guided_checkpoint(unwrap_state_column(current_metadata)) is not None
+            or pending_guided_checkpoint(creation.data.composer_meta) is not None
+        ):
+            raise AuditIntegrityError("a pending guided proposal checkpoint requires an atomic lifecycle settlement")
         derived_from_state_id = creation.derived_from_state_id
         if derived_from_state_id is not None:
             predecessor = connection.execute(

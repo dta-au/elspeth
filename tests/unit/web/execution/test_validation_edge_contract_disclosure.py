@@ -154,9 +154,11 @@ def test_build_raised_edge_failure_discloses_consumer_patch_suggestion(
     assert "consumer requires 'float', producer emits 'str'" in error.message
     assert error.suggestion is not None
     assert "Change the declared field type(s) to match what the producer emits" in error.suggestion
-    # The consumer-side patch call survives even though the graph never built
-    # (patch-target resolution degrades to the DAG node id by design).
-    assert "patch_node_options(node_id='transform_coerce_score_" in error.suggestion
+    # Build failures still retain the exact config identity the author can patch.
+    assert error.component_id == "coerce_score"
+    assert "patch_node_options(node_id='coerce_score'" in error.suggestion
+    assert "producer node 'source'" in error.message
+    assert "consumer node 'coerce_score'" in error.message
 
 
 def test_build_raised_edge_failure_stays_owned_by_graph_structure_check(

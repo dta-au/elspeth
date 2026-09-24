@@ -23,7 +23,8 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    assert SESSION_SCHEMA_EPOCH == 67
+    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    assert SESSION_SCHEMA_EPOCH == 68
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

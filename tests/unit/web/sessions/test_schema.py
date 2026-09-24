@@ -365,7 +365,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # must be rejected at startup rather than during conversation replay.
     # Epoch 67 binds coalesce branch order and sources order in the composer
     # authority hashes; stored epoch-66 preimages cannot be re-verified.
-    assert SESSION_SCHEMA_EPOCH == 67
+    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    assert SESSION_SCHEMA_EPOCH == 68
     expected_tables = frozenset(
         {
             "web_instances",

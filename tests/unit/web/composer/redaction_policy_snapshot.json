@@ -140,8 +140,8 @@
     "shape": "declarative"
   },
   "request_interpretation_review": {
-    "hash": "aaa8e463881afe2463ba97b64567e8ebe6bd640309844624aa1360c6e9bf483e",
-    "sensitive_path_count": 6,
+    "hash": "c5e3315313191a17e2cd6ac479dc19e478dd25fc025509d2d75d06f81c21e987",
+    "sensitive_path_count": 7,
     "shape": "type_driven"
   },
   "set_metadata": {

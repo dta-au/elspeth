@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { NarrativeResults } from "./NarrativeResults";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -131,14 +131,14 @@ describe("NarrativeResults", () => {
   });
 
   it("renders the no-summary placeholder when summaryOverride is undefined (live mode without an aggregated summary)", () => {
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
     expect(screen.getByTestId("narrative-results")).toBeInTheDocument();
     expect(screen.getByTestId("narrative-results-no-summary")).toBeInTheDocument();
     expect(screen.queryByTestId("narrative-results-summary")).toBeNull();
   });
 
   it("renders the supplied summary when summaryOverride is provided", () => {
-    render(<NarrativeResults summaryOverride="The pipeline achieved an F1 of 0.87." />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="The pipeline achieved an F1 of 0.87." />);
     expect(screen.getByTestId("narrative-results-summary")).toHaveTextContent(
       "The pipeline achieved an F1 of 0.87.",
     );
@@ -146,17 +146,17 @@ describe("NarrativeResults", () => {
   });
 
   it("renders the no-summary placeholder when summaryOverride is explicitly null", () => {
-    render(<NarrativeResults summaryOverride={null} />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride={null} />);
     expect(screen.getByTestId("narrative-results-no-summary")).toBeInTheDocument();
   });
 
   it("renders the no-summary placeholder when summaryOverride is the empty string", () => {
-    render(<NarrativeResults summaryOverride="" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="" />);
     expect(screen.getByTestId("narrative-results-no-summary")).toBeInTheDocument();
   });
 
   it("does not render the interpretation overlay when no session is active", () => {
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
     expect(screen.queryByTestId("narrative-results-interpretations")).toBeNull();
   });
 
@@ -165,7 +165,7 @@ describe("NarrativeResults", () => {
     useInterpretationEventsStore.setState({
       optedOutBySession: { "sess-1": false },
     } as never);
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
     expect(screen.queryByTestId("narrative-results-interpretations")).toBeNull();
   });
 
@@ -174,7 +174,7 @@ describe("NarrativeResults", () => {
     useInterpretationEventsStore.setState({
       optedOutBySession: { "sess-1": true },
     } as never);
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
     expect(screen.getByTestId("narrative-results-interpretations")).toBeInTheDocument();
     expect(screen.getByTestId("narrative-results-interpretations")).toHaveTextContent(
       /opt-out/i,
@@ -203,7 +203,7 @@ describe("NarrativeResults", () => {
       },
     } as never);
 
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
 
     const overlay = screen.getByTestId("narrative-results-interpretation-overlay");
     expect(overlay).toBeInTheDocument();
@@ -236,7 +236,7 @@ describe("NarrativeResults", () => {
       },
     } as never);
 
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
 
     // The overlay container is rendered only when the filtered list is
     // non-empty — so the absence of the testid is the load-bearing assertion.
@@ -290,7 +290,7 @@ describe("NarrativeResults", () => {
       },
     } as never);
 
-    render(<NarrativeResults summaryOverride="anything" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="anything" />);
 
     // In-window event (resolved 30s ago, run started 60s ago, "now" is now)
     // renders.
@@ -308,7 +308,7 @@ describe("NarrativeResults", () => {
   // link), 349 (find-last-output-row-with-summary live extraction).
 
   it("AC1: renders the summary string as Markdown when supplied as summaryOverride", () => {
-    render(<NarrativeResults summaryOverride="The pipeline produced **bold** results and reached _F1=0.87_." />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="The pipeline produced **bold** results and reached _F1=0.87_." />);
     // MarkdownRenderer surfaces inline emphasis as <strong>/<em>. We assert
     // structural Markdown rendering (not raw text) — matching the
     // MarkdownRenderer.test.tsx convention of asserting on element tagName.
@@ -319,7 +319,7 @@ describe("NarrativeResults", () => {
   });
 
   it("AC1: renders Markdown headings and code in the summary", () => {
-    render(<NarrativeResults summaryOverride={"## Verdict\n\nUse `set_source` to retry."} />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride={"## Verdict\n\nUse `set_source` to retry."} />);
     const heading = screen.getByRole("heading", { level: 2 });
     expect(heading).toHaveTextContent("Verdict");
     const code = screen.getByText("set_source");
@@ -339,7 +339,7 @@ describe("NarrativeResults", () => {
       jsonlPreview([{ score: 0.87 }]),
     );
 
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
 
     const link = await screen.findByTestId("narrative-results-download-link");
     expect(link).toBeInTheDocument();
@@ -370,7 +370,7 @@ describe("NarrativeResults", () => {
     const createSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock");
     const revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
 
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
 
     const link = await screen.findByTestId("narrative-results-download-link");
     fireEvent.click(link);
@@ -384,9 +384,64 @@ describe("NarrativeResults", () => {
     revokeSpy.mockRestore();
   });
 
+  it("downloads the verified publication when an earlier cumulative artifact has drifted", async () => {
+    // Measured battery shape: one URI had a historical 24-byte descriptor
+    // and a current 34-byte publication. Existence and allowlist eligibility
+    // marked both downloadable, but only the latter passed the hash guard.
+    const historical = fileArtifact({ artifact_id: "historical", size_bytes: 24 });
+    const current = fileArtifact({ artifact_id: "current", size_bytes: 34 });
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([historical, current]));
+    vi.mocked(fetchRunOutputPreview).mockImplementation(async (_runId, artifactId) => {
+      if (artifactId === "historical") {
+        throw { status: 409, error_type: "artifact_content_drift" };
+      }
+      return jsonlPreview([{ summary: "Current publication summary." }], { artifact_id: "current" });
+    });
+    vi.mocked(downloadRunOutputContent).mockRejectedValue(new Error("download probe"));
+
+    render(<NarrativeResults runId="run-1" />);
+    await screen.findByText("Current publication summary.");
+    fireEvent.click(screen.getByTestId("narrative-results-download-link"));
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(downloadRunOutputContent).toHaveBeenCalledWith("run-1", "current");
+  });
+
+  it("offers no download when every artifact preview fails integrity verification", async () => {
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([
+      fileArtifact({ artifact_id: "historical", size_bytes: 24 }),
+      fileArtifact({ artifact_id: "current", size_bytes: 34 }),
+    ]));
+    vi.mocked(fetchRunOutputPreview).mockRejectedValue({ status: 409, error_type: "artifact_content_drift" });
+
+    await act(async () => { render(<NarrativeResults runId="run-1" />); });
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId("narrative-results-download-link")).toBeNull();
+    expect(downloadRunOutputContent).not.toHaveBeenCalled();
+  });
+
+  it("keeps the first verified downloadable file when independent outputs both verify", async () => {
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([
+      fileArtifact({ artifact_id: "first", path_or_uri: "file:///data/outputs/first.jsonl" }),
+      fileArtifact({ artifact_id: "second", path_or_uri: "file:///data/outputs/second.jsonl" }),
+    ]));
+    vi.mocked(fetchRunOutputPreview).mockImplementation(async (_runId, artifactId) =>
+      jsonlPreview([{ summary: `${artifactId} summary.` }], { artifact_id: artifactId }),
+    );
+    vi.mocked(downloadRunOutputContent).mockRejectedValue(new Error("download probe"));
+
+    render(<NarrativeResults runId="run-1" />);
+    await screen.findByText("second summary.");
+    fireEvent.click(screen.getByTestId("narrative-results-download-link"));
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(downloadRunOutputContent).toHaveBeenCalledWith("run-1", "first");
+  });
+
   it("AC3: hides the download affordance when no terminal run is active (no activeRunId)", () => {
     // No activeRunId — store remains at default (null).
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
     expect(screen.queryByTestId("narrative-results-download-link")).toBeNull();
   });
 
@@ -400,7 +455,7 @@ describe("NarrativeResults", () => {
       outputsResponse([]),
     );
 
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
 
     // Wait for the manifest fetch to settle, then assert absence.
     await waitFor(() => expect(fetchRunOutputs).toHaveBeenCalledWith("run-1"));
@@ -424,7 +479,7 @@ describe("NarrativeResults", () => {
       ]),
     );
 
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
 
     // Plan 19b:349 — "find the last output row that has a `summary` field;
     // if multiple, concatenate with blank lines." With two `summary`-bearing
@@ -450,7 +505,7 @@ describe("NarrativeResults", () => {
       jsonlPreview([{ score: 0.65 }, { score: 0.87 }]),
     );
 
-    render(<NarrativeResults />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} />);
 
     await waitFor(() =>
       expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-1", "art-1"),
@@ -480,7 +535,7 @@ describe("NarrativeResults", () => {
       jsonlPreview([{ summary: "live-extracted summary" }]),
     );
 
-    render(<NarrativeResults summaryOverride="frozen-blob summary" />);
+    render(<NarrativeResults runId={useExecutionStore.getState().activeRunId} summaryOverride="frozen-blob summary" />);
 
     expect(
       screen.getByTestId("narrative-results-summary"),

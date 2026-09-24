@@ -1,5 +1,16 @@
 # Composer strict tool contracts — S1 implementation plan
 
+**2026-09-25 parameterless wire correction:** retain the original **32/10**
+strict/non-strict loop partition and **19/1** unfiltered planner partition.
+For the ten parameterless tools, strict wire framing is now exactly
+`{"_elspeth_no_arguments": true}`. `EmptyArgumentsMarker` validates that
+framing before decoding to `{}`, and the encoder reconstructs it from empty
+semantic arguments. Reject all other marker shapes; do not drop arbitrary
+properties. NONE and MCP schemas stay unchanged. The strict-false and mixed
+stamp-omission alternatives failed live; a full-list marker control succeeded
+on the deployed route. This correction supersedes the original envelope-only
+codec description below without rewriting historical S1 measurements.
+
 - **Date:** 2026-09-23
 - **Master plan:** `docs/plans/2026-09-23-composer-strict-tool-contracts.md`. It holds the design; this file holds the
   steps. This plan does not change the design. Where the live code disagrees with the master plan, §3 lists the

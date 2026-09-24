@@ -37,10 +37,12 @@ from elspeth.web.composer.tools.wire_projection import (
     _STRICT_DESCRIPTION_OVERRIDES,
     _WIRE_TOOL_DEFS,
     OPENAI_STRICT_LIMITS,
+    EmptyArgumentsMarker,
     EnvelopeUnwrap,
     LedgerEntry,
     StripNull,
     WireProjectionError,
+    assert_wire_projection_faithful,
     build_wire_tool_defs,
     omission_instruction_matches,
     stamp_planner_terminal,
@@ -50,6 +52,45 @@ from elspeth.web.composer.tools.wire_projection import (
 
 NONE = ToolContractDialect.NONE
 STRICT = ToolContractDialect.OPENAI_STRICT
+
+
+def test_strict_parameterless_marker_has_one_canonical_shape() -> None:
+    definitions = get_tool_definitions()
+    names = {definition["name"] for definition in definitions if definition["parameters"]["properties"] == {}}
+    assert names == {
+        "list_blobs",
+        "list_composer_blobs",
+        "list_sources",
+        "get_expression_grammar",
+        "get_audit_info",
+        "preview_pipeline",
+        "diff_pipeline",
+        "list_transforms",
+        "list_sinks",
+        "list_secret_refs",
+    }
+    for name in sorted(names):
+        tool = _WIRE_TOOL_DEFS[STRICT][name]
+        assert tool.strict_capable is True
+        assert tool.decode_plan == (EmptyArgumentsMarker(),)
+        schema = tool.thawed_function()["parameters"]
+        assert schema == {
+            "type": "object",
+            "properties": {"_elspeth_no_arguments": {"type": "boolean", "enum": [True]}},
+            "required": ["_elspeth_no_arguments"],
+            "additionalProperties": False,
+        }
+        assert not _WIRE_TOOL_DEFS[NONE][name].decode_plan
+        assert _WIRE_TOOL_DEFS[NONE][name].thawed_function()["parameters"]["properties"] == {}
+
+
+def test_parameterless_faithfulness_rejects_a_missing_decode_marker() -> None:
+    definitions = get_tool_definitions()
+    defs = {dialect: dict(tools) for dialect, tools in _WIRE_TOOL_DEFS.items()}
+    defs[STRICT]["preview_pipeline"] = replace(defs[STRICT]["preview_pipeline"], decode_plan=())
+    with pytest.raises(WireProjectionError, match="empty-argument marker"):
+        assert_wire_projection_faithful(defs, definitions)
+
 
 _STRICT_CAPABLE: frozenset[str] = frozenset(
     {

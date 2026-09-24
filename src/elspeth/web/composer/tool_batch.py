@@ -129,6 +129,7 @@ from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
+    wire_argument_repair_message,
 )
 from elspeth.web.composer.tool_error_payloads import (
     arg_error_payload as _arg_error_payload,
@@ -154,6 +155,7 @@ from elspeth.web.composer.tools._registry import resolve_tool_effects, response_
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
@@ -1059,12 +1061,15 @@ async def run_tool_batch(
             # Decode the provider arguments against the W that was sent:
             # classify wire conformance, unwrap the set_pipeline envelope, and
             # on openai_strict strip ``null`` at promoted positions. A
-            # malformed set_pipeline envelope is decode's only rejection.
+            # malformed envelope or no-argument marker rejects before S.
             try:
                 decoded = decode_wire_arguments(tool_name, ctx.tool_contract_dialect, decoded_arguments)
             except ToolArgumentError as envelope_rejection:
                 call_wire_facts.wire_conformant = False
-                turn_has_mutation = True
+                if is_discovery_tool(tool_name):
+                    turn_has_discovery = True
+                else:
+                    turn_has_mutation = True
                 audit_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                     "error_class": type(envelope_rejection).__name__,
@@ -1086,7 +1091,7 @@ async def run_tool_batch(
                     strict_sent=call_wire_facts.strict_sent,
                     wire_conformant=call_wire_facts.wire_conformant,
                 )
-                envelope_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
+                envelope_error = wire_argument_repair_message(sent_wire_tools[tool_name])
                 error_payload = {"error": envelope_error}
                 recorder.record(
                     finish_arg_error(
@@ -2213,6 +2218,19 @@ async def run_tool_batch(
         # ``_SESSION_AWARE_TOOL_HANDLERS`` and the per-tool
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
+            # Preflight is infrastructure work, before the session-aware
+            # handler. Its failure/deadline carriers must reach the phase
+            # owner without being recategorized as a handler crash.
+            try:
+                review_preflight = await _pending_review_runtime_findings(state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn,
+                ) from preflight_exc.original_exc
             try:
                 session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
                     tool_name=tool_name,
@@ -2228,6 +2246,7 @@ async def run_tool_batch(
                     llm_messages=llm_messages,
                     anti_anchor=anti_anchor,
                     policy_catalog=ctx.policy_catalog,
+                    review_preflight=review_preflight,
                 )
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Same narrow-class discipline as the sync execute_tool
@@ -2619,6 +2638,16 @@ async def run_tool_batch(
             # ``type(exc).__name__`` — no poisoned memory work.
             # Closes blocker B2 from the panel review (2026-05-04).
             raise
+        except ComposerRuntimePreflightError as preflight_exc:
+            # A successful mutation may precede its structural preflight.
+            # Preserve that new state instead of recapturing the old loop state.
+            raise ComposerRuntimePreflightError(
+                original_exc=preflight_exc.original_exc,
+                partial_state=preflight_exc.partial_state,
+                tool_invocations=recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=preflight_exc.failed_turn,
+            ) from preflight_exc.original_exc
         except AuditIntegrityError:
             # Tier-1 audit invariant. Do not let the plugin-bug
             # catch-all below launder it into ComposerPluginCrashError.
@@ -2691,6 +2720,28 @@ async def run_tool_batch(
         version_before_tool = state.version
         admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None
         result = admitted_result.result if admitted_result is not None else outcome.result
+        if (
+            prevalidated_unapplied_result is None
+            and is_mutation_tool(tool_name)
+            and result.success
+            and result.updated_state.version > state.version
+            and result.validation.is_valid
+        ):
+            # The mutation has succeeded and its applied version is already
+            # audited. A separate preflight failure cannot relabel that tool
+            # as a crash or erase the version the route must persist.
+            try:
+                findings = await _pending_review_runtime_findings(result.updated_state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn or ctx.failed_turn,
+                ) from preflight_exc.original_exc
+            if findings is not None:
+                result = replace(result, runtime_preflight=findings)
         if prevalidated_unapplied_result is None:
             state = result.updated_state
             last_validation = result.validation
@@ -2796,6 +2847,31 @@ async def run_tool_batch(
         pre_state_id=pre_state_id,
     )
     return dispatch, advisor_calls_used
+
+
+async def _pending_review_runtime_findings(state: CompositionState, ctx: ToolBatchContext) -> ValidationResult | None:
+    """Check a wired pending-review draft before feedback or card creation.
+
+    Stage 1 does not build the graph, and strict preflight stops at pending
+    reviews. Only publish failures from the masked pass: its green verdict
+    does not authorize execution while the real reviews remain unresolved.
+    """
+    if not state.sources or not state.outputs or not interpretation_sites(state):
+        return None
+    result = await ctx.service._cached_runtime_preflight(
+        state,
+        user_id=ctx.user_id,
+        session_id=ctx.session_id,
+        cache=ctx.runtime_preflight_cache,
+        initial_version=ctx.initial_version,
+        session_scope=ctx.session_scope,
+        llm_calls=ctx.recorder.llm_calls,
+        plugin_snapshot=ctx.plugin_snapshot,
+        session_operation_context=ctx.session_operation_context,
+        interpretation_tolerant=True,
+        deadline=ctx.deadline,
+    )
+    return None if result.is_valid else result
 
 
 _MIN_USEFUL_ADVISOR_SECONDS: Final[float] = 5.0

@@ -4175,23 +4175,18 @@ class TestStep2IntraStep:
 
         older_head = asyncio.run(service.get_current_state(session_uuid))
         assert older_head is not None
-        later_head = asyncio.run(
-            _save_composition_state_with_compose_authority(
-                service,
-                session_uuid,
-                CompositionStateData(
-                    sources=older_head.sources,
-                    nodes=older_head.nodes,
-                    edges=older_head.edges,
-                    outputs=older_head.outputs,
-                    metadata_=older_head.metadata_,
-                    is_valid=older_head.is_valid,
-                    validation_errors=older_head.validation_errors,
-                    composer_meta=older_head.composer_meta,
-                ),
-                provenance="convergence_persist",
+        # Current ordinary saves atomically advance the pending proposal anchor.
+        # Inject the historical missing-rebase defect explicitly so this negative
+        # test still exercises back-edit refusal of an older effective base.
+        later_id = uuid4()
+        with composer_test_client.app.state.session_engine.begin() as conn:
+            historical_row = dict(
+                conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(older_head.id))).mappings().one()
             )
-        )
+            historical_row.update(id=str(later_id), version=older_head.version + 1, provenance="convergence_persist")
+            conn.execute(composition_states_table.insert().values(**historical_row))
+        later_head = asyncio.run(service.get_state_in_session(later_id, session_uuid))
+        assert later_head is not None
         later_state = state_from_record(later_head)
         assert later_state.guided_session is not None
         assert later_state.guided_session.active_proposal is not None

@@ -85,7 +85,10 @@ class ReferenceJoinConfig(TransformDataConfig):
     )
     reference_format: Literal["csv", "json"] = Field(
         ...,
-        description="How to parse reference_content. Never inferred — a blob carries no reliable type.",
+        description=(
+            "How to parse reference_content. Never inferred — a blob carries no reliable type. "
+            "CSV cells remain strings, including numeric-looking cells; JSON numbers retain numeric types."
+        ),
     )
     key_field: str = Field(..., description="Input field whose value is matched against the reference table key.")
     reference_key_name: str = Field(
@@ -540,7 +543,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ec54198096d3007d"
+    source_file_hash: str | None = "sha256:635f74127f9bc7af"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -615,6 +618,13 @@ class ReferenceJoin(BaseTransform):
                     "Wire it with wire_blob_inline_ref at 'node:<node_id>.options.reference_content'.",
                     "Use create_blob only for table bytes you create. Set reference_format explicitly to csv or json; "
                     "the blob filename does not infer it.",
+                    "CSV cells remain strings, including numeric-looking cells such as 24. JSON numbers retain numeric types. "
+                    "A field_mapper or sink schema does not convert these values.",
+                    "Keep downstream fields as str when acceptable, or insert type_coerce after the join before a numeric consumer. "
+                    "For example, conversions: [{field: amount, to: int}] converts a joined amount field; "
+                    "its schema declares the arriving str, not the converted int.",
+                    "Never replace a supplied CSV with JSON to repair types. Use a typed JSON table only when the user's data "
+                    "requirements permit that format; otherwise preserve the table and explicitly convert the joined fields.",
                     "Pasting a table as a literal option value hits the inline byte cap.",
                     "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
                     "at config load, and a bare column name is not an expression — write ref['description'].",

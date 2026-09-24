@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_67(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_68(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -67,9 +67,10 @@ def test_blob_inline_resolutions_schema_epoch_is_67(engine) -> None:
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    assert SESSION_SCHEMA_EPOCH == 67
+    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    assert SESSION_SCHEMA_EPOCH == 68
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 67
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 68
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

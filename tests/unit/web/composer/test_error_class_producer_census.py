@@ -56,6 +56,9 @@ _OUT_OF_SCOPE: dict[tuple[str, str, str], str] = {
     ("provider_discovery_response.py", "to_wire", "ToolArgumentError"): (
         "_ArgumentErrorResponse is built only from a ToolArgumentError (_argument_error_response); planner-facing projection"
     ),
+    ("pipeline_planner.py", "_assistant_tool_calls_message", "ToolArgumentError"): (
+        "closed provider replay placeholder for a call with a retained wire_error; redacts rejected arguments, never an audit field"
+    ),
     ("redaction.py", "redact_failure_response", "CancelledError"): (
         "echoes the input only when it already equals CancelledError; otherwise a fixed sentinel"
     ),
