@@ -1036,8 +1036,9 @@ class CallAuditRepository:
                 return memo[current_id]
             if len(memo) + len(visiting) >= MAX_LINEAGE_NODES_PER_MEMBER:
                 raise AuditIntegrityError("call parent token lineage exceeds node bound")
-            evidence = evidence_cache.get(current_id)
-            if evidence is None:
+            if current_id in evidence_cache:
+                evidence = evidence_cache[current_id]
+            else:
                 token = self._ops.execute_fetchone(select(tokens_table).where(tokens_table.c.token_id == current_id))
                 if token is None:
                     raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
@@ -1120,16 +1121,15 @@ class CallAuditRepository:
         build_here = True
         if completed:
             with self._source_parent_index_lock:
-                cached = self._source_parent_indices.get(key)
-                if cached is not None:
+                if key in self._source_parent_indices:
                     self._source_parent_indices.move_to_end(key)
-                    return cached
-                pending = self._source_parent_builds.get(key)
-                if pending is None:
+                    return self._source_parent_indices[key]
+                if key in self._source_parent_builds:
+                    pending = self._source_parent_builds[key]
+                    build_here = False
+                else:
                     pending = Future()
                     self._source_parent_builds[key] = pending
-                else:
-                    build_here = False
             if not build_here:
                 return pending.result()
 
@@ -1223,7 +1223,7 @@ class CallAuditRepository:
                 source_node_id=current.source_node_id,
                 source_row_index=current.source_row_index,
             )
-            matching_parents = source_index.get(current_lineage, ())
+            matching_parents = source_index[current_lineage] if current_lineage in source_index else ()
             # Identity is a property of the parent, independent of whether its
             # calls have the requested type, request hash or local index.
             if len(matching_parents) > 1:
