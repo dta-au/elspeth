@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -171,7 +171,7 @@ def test_adr_031_live_control_references_exist() -> None:
         ("Evidence: commit `deadbeef`.", ("deadbeef",)),
         ("Evidence: commits `deadbeef`, `cafebabe` and `0123456789`.", ("deadbeef", "cafebabe", "0123456789")),
         ("The content hash is `deadbeef`.", ()),
-        ("Filigree issue `elspeth-deadbeef` records the decision.", ()),
+        ("Archived issue `elspeth-deadbeef` records the decision.", ()),
         ("The word commit appears after unrelated hash `deadbeef`.", ()),
     ],
 )
@@ -183,7 +183,7 @@ def test_public_commit_citation_boundary_cases(text: str, expected: tuple[str, .
     ("text", "expected"),
     [
         ("**Review evidence:**\n  `/tmp/review.json`", True),
-        ("**Reference:** `/home/john`", True),
+        (f"**Reference:** `{PurePosixPath('/home') / 'example-user'}`", True),
         ("**Reference:** `/Users/alice`", True),
         ("**Decision evidence:** `MEMORY.md::project_db_migration_policy`", True),
         ("**Decision evidence:** project memory `project_db_migration_policy`", True),

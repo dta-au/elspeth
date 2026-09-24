@@ -18,7 +18,7 @@ between the map commit and assessment HEAD.
 
 ## Structural-index posture
 
-Loomweave reported an index at `31a06b16d` while HEAD was `0dcd61aca`. Its diff
+retired code index reported an index at `31a06b16d` while HEAD was `0dcd61aca`. Its diff
 reported only the commit mismatch: no dirty, missing, modified, or untracked
 indexed source files. Git independently showed the committed drift was the
 Wave 1 architecture-document update. The indexed production/source graph was
@@ -32,7 +32,7 @@ Three read-only Wave 2 evidence packages independently traced:
 - barrier completion and crash seams;
 - fencing, maintenance ordering, and read models.
 
-The root pass reconciled their caller chains, test inventories, live Filigree
+The root pass reconciled their caller chains, test inventories, live legacy issue tracker
 ownership, and smallest-first edit recommendations. No worker edited files or
 tracker state during reconnaissance.
 

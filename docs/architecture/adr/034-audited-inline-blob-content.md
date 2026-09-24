@@ -165,4 +165,4 @@ YAML brittle.
 
 - Historical widened-`blob_ref` design and blob inline content cap evidence:
   preserved in git history or maintainer-local archives
-- Filigree: `elspeth-fdebcaa79a`
+- legacy-tracker: `elspeth-fdebcaa79a`

@@ -5531,7 +5531,7 @@ class TestPluginCrashSessionPersistence:
     Given the current sessions_table schema (no status / crashed_at /
     last_exc_class columns), the breadcrumb is a bump of updated_at.
     This test asserts that bump, plus the invariant that NO exception
-    message leaks into any column. The follow-up filigree issue tracks
+    message leaks into any column. The follow-up archived issue tracks
     the schema migration that adds richer crash markers.
     """
 

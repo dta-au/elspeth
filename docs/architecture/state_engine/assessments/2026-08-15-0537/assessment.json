@@ -86,12 +86,12 @@
   "sensitive_environment_captured": false
  },
  "structure_snapshot": {
-  "provider": "Loomweave index at the frozen commit plus direct source inspection during coverage mapping",
+  "provider": "retired code index index at the frozen commit plus direct source inspection during coverage mapping",
   "captured_at": "2026-08-15T09:00:40.134138+10:00",
   "limitation": "No live AWS composition or provider deployment is claimed; structure facts are local-checkout only."
  },
  "tracker_snapshot": {
-  "provider": "Filigree issue tracker (local database) at evidence-capture time",
+  "provider": "legacy issue tracker issue tracker (local database) at evidence-capture time",
   "captured_at": "2026-08-15T09:00:40.134138+10:00",
   "limitation": "Live-lane gap owners remain open by design until the operator restores AWS and fires the protected workflow."
  },

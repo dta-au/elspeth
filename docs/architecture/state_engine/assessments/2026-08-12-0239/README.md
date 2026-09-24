@@ -1,5 +1,10 @@
 # State Engine Assessment — 2026-08-12 02:39 AEST
 
+> Tool-retirement note (2026-09-25): Tool names and references in this retained
+> package have been generalized. Original records and original digest evidence
+> are preserved in the local tool-retirement archive. Sanitized tracker and
+> code-index records are historical context, not byte-identical captures.
+
 This full v2 assessment pins the durable state-engine contract at
 `af79b34040f5ce5fd989aa0d42a1b80ad8366829` (tree
 `c4abd284a970783be8a19cb70dccc3e59072ec87`). Evidence ran in a clean detached
@@ -29,10 +34,10 @@ scheduling remains unsupported.
 - `artifacts/observation-index.json` plus `EV-OBS-*` JUnit/stdout/stderr/exit
   files — exact non-promoting focused observations and artifact hashes; raw
   outputs containing captured trailing whitespace use deterministic gzip.
-- `artifacts/loomweave-analysis.json` and `artifacts/warpline-*.json` — the
+- `artifacts/retired-code-index-analysis.json` and `artifacts/warpline-*.json` — the
   exact-commit structural run and explicitly partial temporal result.
-- `artifacts/filigree-*.json` — complete `has_more=false` state-engine, ready,
-  and blocked snapshots; `artifacts/filigree-show-records.ndjson` retains exact
+- `artifacts/legacy-tracker-*.json` — complete `has_more=false` state-engine, ready,
+  and blocked snapshots; `artifacts/legacy-tracker-show-records.ndjson` retains exact
   `show --json` records for the hierarchy, linked dependencies, and Python 3.14
   blocker.
 - [review.md](review.md) — architecture, evidence, and reproducibility review.
@@ -41,7 +46,7 @@ scheduling remains unsupported.
 
 ## Live work tree
 
-Filigree milestone `elspeth-4b3d734e3a` owns the v2 program. Its five
+legacy issue tracker milestone `elspeth-4b3d734e3a` owns the v2 program. Its five
 implementation/proof cohort steps are `elspeth-d262ace360`,
 `elspeth-eefd990b46`, `elspeth-cc0b256aca`, `elspeth-f227dd8d2f`, and
 `elspeth-67be892457`; final assessment/gates are `elspeth-f89d82e925`. Six

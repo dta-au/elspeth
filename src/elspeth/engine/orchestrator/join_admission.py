@@ -1,7 +1,7 @@
 """JoinAdmissionService: §B.1 atomic follower admission (ADR-030).
 
 Extracted from ``Orchestrator.join_run`` / ``Orchestrator._join_preflight``
-(filigree elspeth-9e71ae82a4). ``Orchestrator.join_run`` remains the public
+(archived issue elspeth-9e71ae82a4). ``Orchestrator.join_run`` remains the public
 entry point and delegates here verbatim.
 
 Behaviour-preserving: preflight ordering (filesystem checks BEFORE touching

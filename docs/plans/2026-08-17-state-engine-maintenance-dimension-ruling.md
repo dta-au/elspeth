@@ -15,7 +15,7 @@ candidate node first. Nothing here changes `completeness-criteria.md` yet.
 
 > `maintenance` — exact evidence locators remain collected and run in the
 > maintained verification selection, with coherent actionable gap themes either
-> live-owned in Filigree or explicitly unowned.
+> live-owned in legacy issue tracker or explicitly unowned.
 
 and line 135:
 
@@ -69,10 +69,10 @@ the "promotion by convenience" the review cycle demoted (RM `production_entry`)?
   `test_state_engine_ci_selection.py`) checks only that selector *files* exist
   in current mode and declared test *names* only when the verdict is `complete`
   (`package.py:683-688`).
-- **What is not guarded anywhere.** "Live-owned in Filigree" is checked by
+- **What is not guarded anywhere.** "Live-owned in legacy issue tracker" is checked by
   nothing: `tracker_snapshot` is exactly `{provider, captured_at, limitation}`
   (`package.py:533-541`), and `_validate_unresolved_metadata` only requires
-  `owner_issue` be null or a non-empty string (`package.py:1411-1421`). Filigree
+  `owner_issue` be null or a non-empty string (`package.py:1411-1421`). legacy issue tracker
   is not in the repository. Today every unresolved leg names
   `elspeth-82592e3aa1` (71) or `elspeth-efb47cb5fd` (2); nothing would notice
   if either closed.
@@ -90,7 +90,7 @@ the maintained pointer (`proof-matrix.md` → current `assessment.json`) and ass
 (a) the record's bound locators for that subject collect **exactly** under the
 lane marker via `_collect_pytest_node_ids` (real subprocess collection, nothing
 executed); (b) every unresolved cell of the subject, and the leg when
-unresolved, names a Filigree issue id.
+unresolved, names a legacy issue tracker issue id.
 
 Measured: 173 passed, 36 s wall / 7 CPU-min (`-n 12`) — one subprocess collection
 per node. Mutations run against it:
@@ -101,7 +101,7 @@ per node. Mutations run against it:
 | B | lane marker no longer selects the locators | **FAILS** — collection drift |
 | C | unresolved leg `owner_issue → null` | **FAILS** |
 | D | unresolved cell `owner_issue → "not-an-issue"` | **FAILS** |
-| E | owner is a **closed** Filigree issue (`elspeth-2ed41f0a4a`) | **PASSES** — cannot see the tracker |
+| E | owner is a **closed** legacy issue tracker issue (`elspeth-2ed41f0a4a`) | **PASSES** — cannot see the tracker |
 
 Also cannot see: a `skip`/`xfail` mark added to a bound test (`--collect-only -q`
 shows no marks; the lane's reporter refuses those *outcomes* at evidence time).
@@ -130,7 +130,7 @@ cell of the subject — and the leg when unresolved — either names an owner is
 that a **captured tracker snapshot** records as *open at capture time*, or is
 `unowned` in a new closed vocabulary. Tooling change: `tracker_snapshot` gains
 `owner_issues: [{id, status, captured_at}]` captured on the evidence host (where
-Filigree lives), the validator requires every cited owner to appear open, the
+legacy issue tracker lives), the validator requires every cited owner to appear open, the
 derived cell status is emitted alongside overrides (overrides may not name
 `maintenance` — a NEW validator restriction: `assessment.schema.json` line 162
 leaves override `dimension` an unconstrained string today), the schema bumps. No pytest nodes; no rename deadlock (derived

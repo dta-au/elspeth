@@ -46,7 +46,7 @@ Use this order when documents disagree:
    dimension, case, and hard-gate universe.
 5. The current dated `assessment.json` binds evidence and findings to one code
    baseline.
-6. Filigree owns live work status, assignment, priority, and dependencies.
+6. GitHub Issues owns live work status, assignment, priority, and dependencies.
 7. Older dated assessments preserve only their baseline-bound conclusions.
 
 No other document is canonical for current state-engine status. In particular,
@@ -101,7 +101,7 @@ docs/architecture/state_engine/
 
 Future assessments stay small. Add raw artifacts only when they preserve a
 material fact that Git, a command vector, or an output digest cannot recover.
-Do not add remediation checklists; create or update Filigree issues instead.
+Do not add remediation checklists; create or update GitHub Issues issues instead.
 
 ## When to reassess
 

@@ -136,7 +136,7 @@ READY → LEASED → (BLOCKED | PENDING_SINK) → TERMINAL | FAILED
   and the identical order in `claim_pending_sink`). The fourth key is
   a stable last-resort tiebreaker for cross-source same-tick
   collisions where the first three keys are not jointly
-  disambiguating (filigree elspeth-6cb89db535, G3
+  disambiguating (legacy issue tracker elspeth-6cb89db535, G3
   determinism-reviewer M1). This is the determinism-of-claim
   contract: no two work items can ever tie.
 
@@ -947,7 +947,7 @@ for the move.
     - *Claim order* updated from the three-key
       `ingest_sequence, step_index, created_at` to the four-key
       order ending in the `work_item_id` last-resort tiebreaker
-      (filigree elspeth-6cb89db535) — the fix had landed in
+      (legacy issue tracker elspeth-6cb89db535) — the fix had landed in
       `claim_ready` / `claim_pending_sink` /
       `recover_expired_leases` but the ADR text was one
       tiebreaker stale.

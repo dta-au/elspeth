@@ -6,7 +6,7 @@ scheduler events, read models, and the pure payload codec. The
 ``TokenSchedulerRepository`` facade in
 ``elspeth.core.landscape.scheduler_repository`` composes them and remains
 the compatibility surface for existing call sites
-(filigree elspeth-ef9c36d767).
+(archived issue elspeth-ef9c36d767).
 """
 
 from elspeth.core.landscape.scheduler.barrier import BarrierAdoptionResult, BarrierJournalRepository

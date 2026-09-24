@@ -88,18 +88,8 @@ docs-archive/
 output/playwright/
 # Codex CLI drops a routine ./error.log in its working dir.
 error.log
-# Filigree issue tracker.
-.filigree/
-# Loomweave (installer-written instance state and generated skill copies).
-.loomweave/loomweave.lock
-.loomweave/.gitignore
-.loomweave/config.json
-.loomweave/instance_id
-loomweave.yaml
-.agents/skills/loomweave-workflow/.fingerprint
-.agents/skills/loomweave-workflow/SKILL.md
-.claude/skills/loomweave-workflow/.fingerprint
-.claude/skills/loomweave-workflow/SKILL.md
+# Private local archives; never publish exported project state.
+/.archives/
 # Retired tooling residue (ADR-043).
 .weft/
 

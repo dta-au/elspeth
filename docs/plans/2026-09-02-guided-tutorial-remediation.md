@@ -5,7 +5,7 @@
 NEEDS WORK — Critical 5 · Major 11 · Minor 6)
 **Tracker:** bug `elspeth-1dc2f92c35` (the issue), blocked by milestone
 `elspeth-7578b41719` (this plan, 6 phases, 24 steps). Every step below is a
-filigree step under that milestone; claim with `work_start` before touching
+legacy issue tracker step under that milestone; claim with `work_start` before touching
 code.
 **Base:** `release/0.8.0` @ `947a3b2c7`
 

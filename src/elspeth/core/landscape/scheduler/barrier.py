@@ -4,7 +4,7 @@ The F1 atomic barrier completion (consume BLOCKED inputs, emit
 pending-sink/ready outputs in ONE journal transaction), its legacy
 partial-release wrappers, the SE.2 fenced journal-first adoption verbs,
 and the barrier-hold read surface. Extracted from
-``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
+``TokenSchedulerRepository`` (archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

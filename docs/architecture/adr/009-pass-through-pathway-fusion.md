@@ -80,13 +80,13 @@ Invoked from two sites:
 
 **Track 2 SLA trigger.** The carve-out is not semantically airtight: a filter that always emits zero rows can carry the annotation without ever being checked. Track 2 will introduce a separate `can_drop_rows: bool = False` declaration; transforms with `can_drop_rows=False` emitting zero rows will raise a new `UnexpectedEmptyEmission` violation. Track 1 does not ship `can_drop_rows` — the declaration is part of a wider framework pattern that deserves its own ADR with multiple concrete declarations to inform its shape.
 
-**Hard trigger:** Track 2's `can_drop_rows` declaration MUST land within 90 days of Track 1 merge, OR upon registration of a second `passes_through_input=True` transform with external-call dependencies (LLM, HTTP, DB), whichever is sooner. File the trigger as a filigree dependency on the Track 2 epic; the Eroding Goals risk is real and the SLA is the safeguard.
+**Hard trigger:** Track 2's `can_drop_rows` declaration MUST land within 90 days of Track 1 merge, OR upon registration of a second `passes_through_input=True` transform with external-call dependencies (LLM, HTTP, DB), whichever is sooner. File the trigger as a legacy issue tracker dependency on the Track 2 epic; the Eroding Goals risk is real and the SLA is the safeguard.
 
 ### Clause 4 — Invariant harness (delivers ADR-007 §Neutral Consequences line 83)
 
 `tests/invariants/` is the governance home for declarative-annotation tests. Forward invariant (`test_annotated_transforms_preserve_input_fields`) discovers every registered `passes_through_input=True` transform and asserts on Hypothesis-generated probe rows that every emitted row preserves every input field. Backward invariant (`test_non_pass_through_transforms_do_drop_fields`) fails CI when a non-annotated transform that opted into probing (i.e., implements `probe_config()`) preserves every input field across 15 scalar probes — remediation is either adding the annotation or teaching `probe_config()` to return a shape that exercises the drop path. Non-annotated transforms without `probe_config()` are skipped: the backward invariant only gates transforms that explicitly opted into probing.
 
-Side-effectful governance channels (e.g., firing filigree observations from pytest) are rejected: pytest's contract is pass/fail, and a shell-out to a best-effort CLI suppresses errors behind `check=False` — the "diagnostic, does not fail CI" design documented in an earlier draft of this ADR was governance theatre the harness would never actually exercise. Converting the backward invariant to a hard failure gives it real teeth without creating false positives on the currently-registered plugin set (no non-annotated transform implements `probe_config()` today, so the failure fires only on deliberate future declarations).
+Side-effectful governance channels (e.g., firing legacy issue tracker observations from pytest) are rejected: pytest's contract is pass/fail, and a shell-out to a best-effort CLI suppresses errors behind `check=False` — the "diagnostic, does not fail CI" design documented in an earlier draft of this ADR was governance theatre the harness would never actually exercise. Converting the backward invariant to a hard failure gives it real teeth without creating false positives on the currently-registered plugin set (no non-annotated transform implements `probe_config()` today, so the failure fires only on deliberate future declarations).
 
 Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every `passes_through_input=True` transform MUST implement `probe_config()` to declare how it should be instantiated in isolation. A companion `test_harness_skip_rate_budget` asserts `skip_rate ≤ 25%` across the annotated plugin set; Track 2 additions that slip the budget must implement `probe_config()` rather than raising the threshold.
 
@@ -108,7 +108,7 @@ Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every
 
 **Neutral:**
 
-- Filigree observations with 14-day TTL are the governance channel for backward-invariant signals. Named owner must be specified in the filigree issue when an observation is promoted.
+- legacy issue tracker observations with 14-day TTL are the governance channel for backward-invariant signals. Named owner must be specified in the legacy issue tracker issue when an observation is promoted.
 - `pytest.skip` for unprobeable transforms is bounded by the skip-rate budget test; coverage gaps surface loudly.
 
 ## Alternatives Considered

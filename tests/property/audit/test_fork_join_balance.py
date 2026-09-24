@@ -2820,7 +2820,7 @@ class TestForkRecoveryInvariant:
         mid-stream, and the live accumulator and derive() then DISAGREE on
         rows_buffered (live counts N-1, derive counts N from the persisted
         BATCH_CONSUMED→BUFFERED records — a separate divergence, out of scope for
-        THIS reconciliation cell but now tracked (filigree elspeth-e1dd5e1303) and
+        THIS reconciliation cell but now tracked (archived issue elspeth-e1dd5e1303) and
         pinned by test_count_equals_n_rows_buffered_divergence_is_pinned).  The
         end-of-source-flush path (count > N) is the CANONICAL buffered path on which
         live == derive == N for every field, so it is the honest topology for a

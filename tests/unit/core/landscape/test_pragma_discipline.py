@@ -9,7 +9,7 @@ invariants for correctness: ``journal_mode=WAL`` (writer/reader concurrency),
 applies them per-connection and ``_verify_sqlite_pragmas`` probe-and-asserts
 at engine open; ``TokenSchedulerRepository.__init__`` re-probes as defence in
 depth.  These tests pin the discipline on the exact connection shapes the
-scheduler uses (filigree elspeth-8536552dcb, elspeth-97f8509b35,
+scheduler uses (archived issue elspeth-8536552dcb, elspeth-97f8509b35,
 elspeth-addd3dc41f):
 
 1. Every pooled connection — including concurrent ones and the
@@ -291,7 +291,7 @@ class _RivalInterposingRepository(TokenSchedulerRepository):
     """Facade wired with the rival-interposing lease component.
 
     The claim seam lives on :class:`SchedulerLeaseRepository` since the god
-    -repository split (filigree elspeth-ef9c36d767); the queue component is
+    -repository split (archived issue elspeth-ef9c36d767); the queue component is
     re-wired too because it composes the same lease CAS.
     """
 

@@ -1,6 +1,6 @@
 """LeaderFollowerDrain: bounded peer-lease wait + follower pending-sink drain.
 
-Extracted from ``Orchestrator._execute_run`` (filigree elspeth-6630fb3e31). The
+Extracted from ``Orchestrator._execute_run`` (archived issue elspeth-6630fb3e31). The
 fresh-run method used to inline two near-duplicate bespoke poll / latch / reap /
 timeout / sleep loops:
 

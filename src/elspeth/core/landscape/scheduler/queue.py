@@ -3,7 +3,7 @@
 Persisting READY continuations (plain, claimed-in-transaction, and the
 composed fenced leader INGEST). Depends on the lease repository for the
 in-transaction claim CAS. Extracted from ``TokenSchedulerRepository``
-(filigree elspeth-ef9c36d767).
+(archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

@@ -210,6 +210,6 @@ These findings were refuted. Do not re-raise them without new evidence.
   - Line numbers are at `74c0ce0db`. `release/0.8.1` has moved since: `origin` is at `9fce3b2c6`, pushed 09-23 05:46.
 - **Guided lane.** Only the diff hunks were reviewed (issues G1–G6).
 - **Refuted reasons (§4).** These are summarised from verifier output that the synthesis received cut at about 400 characters. The full, untruncated verifier reasons for every source finding, refuted ones included, are in `findings.json` (`verdicts[].reason`). Treat the §4 reasons as abstracts.
-- **Loomweave.** Its index was not trusted for the pinned commit. Callers and definitions came from grep and git over the worktree.
+- **retired-code-index.** Its index was not trusted for the pinned commit. Callers and definitions came from grep and git over the worktree.
 - **Severity.** Every severity is the verifiers' adjusted value. Merged root causes take the highest severity among their sources, and the disagreements are noted in each entry.
 - **Counts.** All counts in §1 were computed from `.claude/lanes/web-review-20260923/synthesis-map.tsv`: 110 rows, 110 unique ids and 79 clusters.

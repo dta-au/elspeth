@@ -2,7 +2,7 @@
 
 These tests pin the CURRENT behavior of ``TokenSchedulerRepository.
 recover_expired_leases`` against a real Tier-1 SQLite engine when the sweep
-faces a POPULATION of leases rather than a single item (filigree
+faces a POPULATION of leases rather than a single item (archived issue
 elspeth-0bae6d8a52):
 
 1. A sweep by a fresh ``lease_owner`` recovers every expired lease in one
@@ -11,7 +11,7 @@ elspeth-0bae6d8a52):
 2. Recovery order is the deterministic 3-key ORDER BY
    ``(ingest_sequence, step_index, work_item_id)`` — including the
    ``work_item_id`` last-resort tiebreaker for exact same-key collisions
-   (the same determinism contract as ``claim_ready``, filigree
+   (the same determinism contract as ``claim_ready``, archived issue
    elspeth-6cb89db535).
 3. The G1 self-steal guard extends PAST lease expiry: an expired lease is
    invisible to its own holder's sweep, even while that same sweep recovers

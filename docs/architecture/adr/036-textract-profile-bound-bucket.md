@@ -3,7 +3,7 @@
 **Date:** 2026-08-04
 **Status:** Accepted
 **Deciders:** ELSPETH maintainer
-**Review evidence:** Advisory systems-thinking, solution-architecture, and Python-engineering review recorded on Filigree `elspeth-cd0f6a6cd9`
+**Review evidence:** Advisory systems-thinking, solution-architecture, and Python-engineering review recorded on legacy issue tracker `elspeth-cd0f6a6cd9`
 **Tags:** operator-profiles, custody, aws, textract, web-composer, audit
 
 ## Context
@@ -132,7 +132,7 @@ lowering — and out of the web-authorable surface entirely:
 
 ## References
 
-- Filigree `elspeth-cd0f6a6cd9` (battery evidence run `e41d0e6b`)
+- legacy issue tracker `elspeth-cd0f6a6cd9` (battery evidence run `e41d0e6b`)
 - Implementation plan:
   the 2026-08-04 textract-profile-bound-bucket implementation plan (implemented; in git history)
 - ADR-032 (validate by trust domain); the kind-qualified profile identity

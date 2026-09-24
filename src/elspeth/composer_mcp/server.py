@@ -1077,7 +1077,7 @@ async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path)
 
 # ---------------------------------------------------------------------------
 # WORKAROUND — Linux-only kernel guard against orphan busy-spin.
-# Tracked by filigree issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
+# Tracked by archived issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
 # docstring for full diagnosis and deletion criteria.
 # ---------------------------------------------------------------------------
 def _install_parent_death_signal_workaround() -> None:
@@ -1103,7 +1103,7 @@ def _install_parent_death_signal_workaround() -> None:
     platforms (macOS, Windows, BSD) remain vulnerable and need either an
     SDK upgrade or a portable watchdog (e.g. periodic ``getppid()`` poll).
 
-    REVIEW SCHEDULE — filigree issue ``elspeth-7f99eba6ef`` tracks the
+    REVIEW SCHEDULE — archived issue ``elspeth-7f99eba6ef`` tracks the
     deletion criteria. Re-evaluate at every MCP SDK upgrade. Delete this
     function and its caller in ``main()`` when:
 
@@ -1112,7 +1112,7 @@ def _install_parent_death_signal_workaround() -> None:
     2. A behavioural test confirms unclean parent-kill produces clean
        child exit *without* this workaround.
 
-    Sibling vulnerability: ``filigree-mcp`` (separate codebase, same SDK)
+    Sibling vulnerability: the retired issue tracker MCP server (same SDK)
     has the identical bug and needs its own fix; this workaround does not
     cover it.
     """
@@ -1157,7 +1157,7 @@ def _install_parent_death_signal_workaround() -> None:
 def main() -> None:
     """CLI entry point for elspeth-composer MCP server."""
     # WORKAROUND first — see _install_parent_death_signal_workaround
-    # docstring and filigree issue elspeth-7f99eba6ef.
+    # docstring and archived issue elspeth-7f99eba6ef.
     _install_parent_death_signal_workaround()
 
     parser = argparse.ArgumentParser(

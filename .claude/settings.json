@@ -2,45 +2,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__filigree__.*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "filigree ensure-dashboard",
-            "timeout": 5
-          }
-        ]
-      },
-      {
         "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "jq -r \".tool_input.command // empty\" | grep -Eq \"commit --amend|pkill -f|checkout -- \" && { echo \"BLOCKED: dangerous git/proc command (commit --amend, pkill -f, checkout --) \u2014 refused by the PreToolUse guard in .claude/settings.json\" >&2; exit 2; } || exit 0"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "filigree session-context",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "filigree ensure-dashboard",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "loomweave hook session-start --path \"${CLAUDE_PROJECT_DIR}\""
           }
         ]
       }

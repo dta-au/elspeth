@@ -13,7 +13,7 @@ between competing dated reports.
 | How is the bar assessed? | [Assessment framework](assessment-framework.md) |
 | What scenarios, evidence, gaps, and verdict are current? | [Scenario manifest](scenario-corpus/v1/manifest.yaml) |
 | What enforces that inventory and evidence contract? | [Scenario corpus contract test](../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py) |
-| What delivery work is open and who owns it? | [Live scenario corpus and Filigree references](scenario-corpus/README.md#active-filigree-work) |
+| What delivery work is open and who owns it? | [Live scenario corpus and archived issue references](scenario-corpus/README.md#archived-issue-references) |
 
 The manifest and its contract test are the **authoritative live** assessment
 record. Read the manifest for its current schema version, scenario and
@@ -49,7 +49,7 @@ other.
 3. Update the contract test when the closed inventory or schema changes.
 4. Run the focused contract and production-path suites documented by the
    [scenario corpus](scenario-corpus/README.md#run-the-focused-checks).
-5. Reconcile delivery status, dependencies, and ownership in Filigree. Do not
+5. Reconcile delivery status, dependencies, and ownership in GitHub Issues. Do not
    copy tracker case counts into this page.
 
 ## History
@@ -73,7 +73,7 @@ history.
   completeness claim.
 - [`scenario-corpus/v1/manifest.yaml`](scenario-corpus/v1/manifest.yaml) owns
   the live corpus inventory, evidence inputs, cell states, and derived verdict.
-- Filigree owns delivery status, dependencies, and work ownership.
+- GitHub Issues owns delivery status, dependencies, and work ownership.
 
 When these surfaces disagree, record and resolve the contradiction. Do not
 quietly select the most convenient source.

@@ -553,7 +553,7 @@ class RowResult:
             audited error hash. The outcome accumulator prefers this over
             recomputing from the synthetic replay FailureInfo, so the replayed
             audit record correlates with the pre-crash one
-            (filigree elspeth-d74d19f901). None for live results.
+            (archived issue elspeth-d74d19f901). None for live results.
         join_group_id: For COALESCED results, the merge-event identity of the
             coalesce that produced this token. None for all other paths.
     """

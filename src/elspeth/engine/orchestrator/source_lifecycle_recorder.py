@@ -1,6 +1,6 @@
 """SourceLifecycleRecorder: record source lifecycle / field-resolution evidence.
 
-Extracted from ``SourceIterationDriver`` (filigree elspeth-27d7bfc14b). These
+Extracted from ``SourceIterationDriver`` (archived issue elspeth-27d7bfc14b). These
 two methods are the driver's "write source metadata to Landscape" concern:
 the field-resolution mapping (provisional on first row, authoritative at EOF —
 elspeth-fb108a77c9) and the run_source lifecycle record with the latest schema

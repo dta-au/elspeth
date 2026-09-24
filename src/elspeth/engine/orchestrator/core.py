@@ -1,7 +1,7 @@
 """Core Orchestrator facade for pipeline execution.
 
 The Orchestrator is the main entry point for running ELSPETH pipelines. Since
-filigree elspeth-9e71ae82a4 it is a composition facade: ``__init__`` wires the
+archived issue elspeth-9e71ae82a4 it is a composition facade: ``__init__`` wires the
 collaborating services and every public entry point delegates to exactly one
 of them.
 

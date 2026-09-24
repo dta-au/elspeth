@@ -4,7 +4,7 @@ Serialization/deserialization of the token row payload, the scrubbed
 payload retained after terminalization, and the journal-item ->
 ``TokenInfo`` mapping that rides on the payload round-trip. Every function
 here is a pure transformation with no engine access. Extracted from the
-``TokenSchedulerRepository`` god class (filigree elspeth-ef9c36d767).
+``TokenSchedulerRepository`` god class (archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

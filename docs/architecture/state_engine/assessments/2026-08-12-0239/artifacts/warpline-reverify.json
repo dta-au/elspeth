@@ -59,7 +59,7 @@
     "items": [],
     "grouped": null,
     "next_actions": {
-      "filigree": []
+      "legacy issue tracker": []
     },
     "overflow": {
       "total": 0,
@@ -75,7 +75,7 @@
     },
     "federation": {
       "members": {
-        "filigree": {
+        "legacy issue tracker": {
           "weft_reason": {
             "reason_class": "clean"
           },
@@ -108,7 +108,7 @@
     "NO_SNAPSHOT: downstream traversal unavailable; changed set only"
   ],
   "next_actions": {
-    "filigree": []
+    "legacy issue tracker": []
   },
   "enrichment": {
     "sei": "absent",

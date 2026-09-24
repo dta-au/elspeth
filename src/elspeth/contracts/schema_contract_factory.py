@@ -58,7 +58,7 @@ def expected_runtime_output_contract(
     Both the producer alignment (``BaseTransform._align_output_contract``) and
     the engine verifier (``verify_schema_config_mode``) derive their
     expectation from here so mode/lock-policy changes cannot drift apart
-    (filigree elspeth-986cfb43e5).
+    (archived issue elspeth-986cfb43e5).
     """
     return map_schema_mode(config.mode), True
 

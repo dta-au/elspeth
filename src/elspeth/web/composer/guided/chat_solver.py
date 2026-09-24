@@ -991,7 +991,7 @@ def _deferred_intent_teaching_block() -> str:
     Three of them decide whether a retain is accepted and were stated nowhere
     in the assembled payload, while the surrounding prose pushes hard toward
     retention: the per-reply cap, the responsible-stage rule, and the
-    message-level stated-fact requirement (filigree elspeth-1ebf08f8ec).
+    message-level stated-fact requirement (archived issue elspeth-1ebf08f8ec).
     A fourth was added by elspeth-6155f11add (Option 2, brief-side, ruled
     2026-09-06): the stated fact is proven from the USER's message, and only
     when it spells the condition as a comparison literal in the closed

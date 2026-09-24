@@ -6,7 +6,7 @@ source rows: ready work, active leases, delayed retry availability, queue or
 barrier blocking keys, and terminal/failed states.
 
 The behaviour lives in the cohesive components under
-:mod:`elspeth.core.landscape.scheduler` (filigree elspeth-ef9c36d767):
+:mod:`elspeth.core.landscape.scheduler` (archived issue elspeth-ef9c36d767):
 queueing (:class:`SchedulerQueueRepository`), leasing
 (:class:`SchedulerLeaseRepository`), dispositions
 (:class:`SchedulerDispositionRepository`), the barrier journal

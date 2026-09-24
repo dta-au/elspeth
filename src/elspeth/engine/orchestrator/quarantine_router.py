@@ -1,6 +1,6 @@
 """QuarantineRouter: route a validation-failed source row to its sink.
 
-Extracted from ``SourceIterationDriver.handle_quarantine_row`` (filigree
+Extracted from ``SourceIterationDriver.handle_quarantine_row`` (archived issue
 elspeth-27d7bfc14b). Source quarantine is a self-contained workflow — validate
 the destination, sanitize the row at the Tier-3 boundary, create a quarantine
 token, record the FAILED source node_state, record the DIVERT routing_event,

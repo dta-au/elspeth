@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -11,7 +12,7 @@ PUBLIC_RELEASE_DOCS = (
     REPO_ROOT / "docs" / "release" / "platform-architecture.md",
     REPO_ROOT / "docs" / "release" / "guarantees.md",
 )
-INTERNAL_TRACKER_TERMS = ("Filigree", "filigree", "session-context")
+INTERNAL_TRACKER_REFERENCE = re.compile(r"\bsession-context\b|\belspeth-[0-9a-f]{10}\b", re.IGNORECASE)
 
 
 def test_public_release_docs_do_not_route_readers_to_internal_tracker() -> None:
@@ -20,8 +21,7 @@ def test_public_release_docs_do_not_route_readers_to_internal_tracker() -> None:
     for path in PUBLIC_RELEASE_DOCS:
         text = path.read_text(encoding="utf-8")
         rel_path = path.relative_to(REPO_ROOT).as_posix()
-        for term in INTERNAL_TRACKER_TERMS:
-            if term in text:
-                offenders.append(f"{rel_path}: {term}")
+        for match in INTERNAL_TRACKER_REFERENCE.finditer(text):
+            offenders.append(f"{rel_path}: {match.group()}")
 
     assert offenders == []

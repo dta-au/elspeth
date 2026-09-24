@@ -1,7 +1,7 @@
 """Execution recording repository — compatibility facade.
 
 The behaviour lives in the cohesive components under
-:mod:`elspeth.core.landscape.execution` (filigree elspeth-c227effc89):
+:mod:`elspeth.core.landscape.execution` (archived issue elspeth-c227effc89):
 node states and routing events (:class:`NodeStateRepository`), the external
 call audit trail with thread-safe call index allocation
 (:class:`CallAuditRepository`), source/sink operation lifecycle

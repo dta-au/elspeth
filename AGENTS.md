@@ -364,40 +364,12 @@ wait on `static-analysis`, so the suites run and report while that job is red;
 
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
-<!-- filigree:instructions:v3.1.0:c1c023c3 -->
-<!-- filigree:last-writer:filigree install -->
-## Filigree Issue Tracker
+## Shared issue tracking
 
-`filigree` tracks this project's work. Use it to find, claim, update and close
-issues: `filigree session-context` at session start, then
-`filigree start-next-work --assignee <name>`.
+GitHub Issues is the project's shared system of record. Use the repository's
+issues and pull requests to coordinate work; confirm the repository and issue
+number before updating a record. Local archives and legacy `elspeth-*`
+identifiers are historical evidence, not GitHub issue numbers.
 
-Full reference: the **filigree-workflow** skill (patterns, priorities,
-observations, error codes), `filigree --help`, and the `mcp__filigree__*` tool
-schemas. Prefer the MCP tools when available; fall back to the CLI.
-
-Two rules `--help` will not tell you:
-
-1. Claim atomically: `work_start` / `work_start_next` (MCP) or `start-work` /
-   `start-next-work` (CLI). Never chain a claim with a separate status update;
-   that two-step form races other agents.
-2. On `SCHEMA_MISMATCH` the installed filigree is older than the project
-   database. Surface it to the user; do not retry.
-<!-- /filigree:instructions -->
-
-<!-- loomweave:instructions:v1.6.0:39edbf6d -->
-<!-- loomweave:last-writer:loomweave install -->
-## Loomweave (code structure + SEI identity)
-
-Loomweave pre-extracts this repo into a queryable map — entities, their
-call/reference/import/relation edges, and subsystems — each carrying a Stable
-Entity Identity (SEI). Ask its `mcp__loomweave__*` tools, not grep, for "what
-calls X", "what subclasses X", "where is X defined", "find the thing that
-does Y".
-
-- Never hand-construct an entity id: take it from `entity_find` / `entity_at` /
-  `entity_resolve`, and bind cross-tool records on the `sei`, not the `id`.
-- If `project_status_get` reports stale, re-index before answering.
-
-Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
-<!-- /loomweave:instructions -->
+The maintainer is triaging the archived backlog and will upload it separately.
+Do not automatically import, publish, or close those records during tool cleanup.

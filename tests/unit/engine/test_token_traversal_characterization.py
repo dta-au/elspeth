@@ -3,7 +3,7 @@
 
 Pins the CURRENT observable behavior of ``_process_single_token`` and its
 ``_handle_*`` handler family at the RowProcessor surface BEFORE the
-TokenTraversalEngine extraction (filigree elspeth-c49f33d6e4, component 4).
+TokenTraversalEngine extraction (archived issue elspeth-c49f33d6e4, component 4).
 Every test here must pass unchanged against both the pre-move and post-move
 trees.
 

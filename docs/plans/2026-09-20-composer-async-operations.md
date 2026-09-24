@@ -292,7 +292,7 @@ No optimistic item is duplicated and no pending indicator clears on 202 alone.
    operator-controlled deployment step.
 4. Recheck the exact release tip, schema epoch, existing users' session-store
    reset requirement, and `bootstrap-admin` procedure before deployment.
-   Update user-facing API documentation and the Filigree ticket from measured
+   Update user-facing API documentation and the legacy issue tracker ticket from measured
    implementation results. Do not claim the proxy problem fixed merely
    because a unit suite passed.
 

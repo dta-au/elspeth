@@ -8,7 +8,7 @@
 ## Context
 
 A user asked the Composer to generate an announcement and write it to a text
-file. That request had **no correct answer** (Filigree `elspeth-afdf55a17c`,
+file. That request had **no correct answer** (legacy issue tracker `elspeth-afdf55a17c`,
 "g11"):
 
 1. `llm -> text` diverts every multiline value and publishes nothing. `TextSink`
@@ -312,7 +312,7 @@ markdown-constraining consumer, which is the more dangerous way to be wrong.
 - ADR-014 (Schema Config Mode Contract) — declaration-lie framing used in §2.
 - ADR-010 (Declaration Trust Framework) — the runtime `boundary_check` route
   named as the alternative for uniform, both-surface coverage (§6).
-- Filigree `elspeth-afdf55a17c` (g11), `elspeth-b6d9f04827` (the refused
+- legacy issue tracker `elspeth-afdf55a17c` (g11), `elspeth-b6d9f04827` (the refused
   repair), `elspeth-9595abb7b0` (diversion-reason disclosure, fixed).
 
 ## Implementation Notes

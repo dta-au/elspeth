@@ -66,7 +66,7 @@ the same row.
 Two independent SME reviews (a solution-design reviewer and a
 systems-thinking pattern-recognizer) traced the call paths and reached
 the same conclusion, recorded here. Their full verdicts are attached to
-Filigree issue `elspeth-a90f68e076`.
+legacy issue tracker issue `elspeth-a90f68e076`.
 
 ### What the call-path trace established
 
@@ -236,7 +236,7 @@ Consequences). Removing them would crash the audit write on the first
 - Related: ADR-010 (declaration-trust framework) and ADR-021 (sources and
   sinks uniformly boundary) — the trust-tier classification machinery that
   defines the Tier-3 boundary this ADR's hashes straddle.
-- Follow-up: Filigree `elspeth-a90f68e076` — durable hash-algorithm
+- Follow-up: legacy issue tracker `elspeth-a90f68e076` — durable hash-algorithm
   discriminator column (closes the post-purge ambiguity), a shared
   `audit_hash` primitive, and a cross-site lint (closes the proliferation
   loop). Both SME verdicts are attached there.

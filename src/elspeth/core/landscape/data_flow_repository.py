@@ -1,7 +1,7 @@
 """Data-flow recording repository — compatibility facade.
 
 The behaviour lives in the cohesive components under
-:mod:`elspeth.core.landscape.data_flow` (filigree elspeth-b194136580):
+:mod:`elspeth.core.landscape.data_flow` (archived issue elspeth-b194136580):
 row/token lifecycle with the atomic fork/coalesce/expand lineage writes
 (:class:`RowTokenRepository`), token (outcome, path) terminals with the
 ADR-019 policy (:class:`TokenOutcomeRepository`), execution-graph

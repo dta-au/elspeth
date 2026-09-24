@@ -1,7 +1,7 @@
 {
-  "schema": "state-engine-loomweave-observation.v1",
+  "schema": "state-engine-retired-code-index-observation.v1",
   "command": [
-    "loomweave",
+    "retired code index",
     "worktree",
     "analyze",
     "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
