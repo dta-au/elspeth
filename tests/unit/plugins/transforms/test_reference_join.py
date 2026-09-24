@@ -364,6 +364,23 @@ class TestLoadTimeRejection:
 
         assert "desc" in str(exc.value)
 
+    @pytest.mark.parametrize(
+        "expression",
+        ["{ref['description'], ref['sku']}", "ref['description'] or {1}", "[{ref['sku']}]"],
+    )
+    def test_an_expression_that_can_store_a_set_is_refused(self, expression: str) -> None:
+        """A set has no canonical order: the joined value would differ between processes (elspeth-5887fb7928)."""
+        with pytest.raises(PluginConfigError) as exc:
+            build(output={"tags": expression})
+
+        assert "output field 'tags'" in str(exc.value)
+        assert "can produce a set, which has no canonical order" in str(exc.value)
+
+    def test_a_set_literal_consumed_by_a_membership_test_builds(self) -> None:
+        transform = build(output={"is_hat": "ref['sku'] in {'hats', 'caps'}"})
+
+        assert transform is not None
+
     def test_an_expression_addressing_row_is_refused(self) -> None:
         """Only the matched entry is in scope; 'row' is not a second grammar."""
         with pytest.raises(PluginConfigError):

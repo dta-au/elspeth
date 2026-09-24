@@ -278,6 +278,12 @@ def _compile_output_expressions(cfg: ReferenceJoinConfig) -> dict[str, Expressio
                 f"output field {field_name!r} has an invalid expression {expression!r}: {exc}. "
                 f"Address the matched entry as {REFERENCE_ENTRY_NAME!r}, e.g. \"{REFERENCE_ENTRY_NAME}['description']\"."
             ) from exc
+        if compiled[field_name].result_can_be_set():
+            raise ReferenceTableError(
+                f"output field {field_name!r} has an expression {expression!r} that can produce a set, which has no "
+                "canonical order: the joined value, and the row's output hash, would differ between runs of identical "
+                "input. Use a list [...] or tuple (...) literal; a set literal belongs only in a membership test or len()."
+            )
     return compiled
 
 
@@ -543,7 +549,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:635f74127f9bc7af"
+    source_file_hash: str | None = "sha256:a864826e20d79d4a"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

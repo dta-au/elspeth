@@ -1031,8 +1031,8 @@ class ExpressionParser:
 
         A set has no canonical order. Evaluated as a gate condition that is
         harmless (a set only feeds a comparison or a truth test), but a
-        consumer that STORES the value — value_transform writes it into the
-        row — would emit an unordered container: the row freezes it and
+        consumer that STORES the value — value_transform and reference_join
+        write it into the row — would emit an unordered container: the row freezes it and
         thaws it back into a list in hash-seed order, so the emitted value
         and the row's output hash differ between processes for identical
         input. A set literal is the grammar's only set constructor, so
@@ -1041,7 +1041,7 @@ class ExpressionParser:
         A set literal is CONSUMED, and cannot reach the value, when it sits
         under a comparison (``row['x'] in {'a', 'b'}`` is a bool), a function
         call (every callable returns a scalar: ``len({...})`` is an int), a
-        unary operator (``not`` is a bool; ``-``/``+``/``~`` reject a set), or
+        unary operator (``not`` is a bool; ``-``/``+`` reject a set), or
         a ternary's TEST. Everywhere else it may pass through: a ternary
         branch, either operand of ``or``/``and`` (a boolean operator returns
         an operand), an arithmetic operand (``{1} - {2}`` is a set), or a
