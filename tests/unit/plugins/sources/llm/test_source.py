@@ -1329,6 +1329,11 @@ def test_schema_validation_failure_applies_configured_policy(
         assert rows[0].source_row_index == 0
         assert rows[0].quarantine_destination == destination
         assert source_context.pop_pending_quarantine_validation_error_id(rows[0].row) is not None
+        # The declared field keeps its name; the undeclared response keys and every value never appear.
+        assert rows[0].quarantine_error == (
+            "4 validation errors: request_id: [missing]; [undeclared]: [extra_forbidden]; "
+            "[undeclared]: [extra_forbidden]; [undeclared]: [extra_forbidden]"
+        )
 
 
 @pytest.mark.parametrize("destination", ["quarantine", "discard"])

@@ -287,10 +287,18 @@ def test_collector_flush_violation_is_recorded_without_row_content(
     assert outcome.failure_reason == "collector_contract_violation"
     with env.db.read_only_connection() as conn:
         errors = [error for error in conn.execute(select(node_states_table.c.error_json)).scalars() if error is not None]
+        routed = list(conn.execute(select(routing_events_table.c.event_id)).scalars())
     violation = [error for error in errors if "PluginContractViolation" in error]
     assert len(violation) == 1, "positive control: the flush state recorded the violation"
     assert f"input validation failed for buffered row 0: 1 validation error: {location}: [" in violation[0]
-    assert not [error for error in errors if SENTINEL in error]
+    # A collector group failure routes nothing (no DIVERT, so no payload-stored
+    # reason to scan) and writes no transform_errors row: the row itself lives
+    # only in the payload store, so no Landscape cell may hold the sentinel.
+    assert routed == []
+    assert ("node_states", "error_json") in _audit_cells_containing(env.db, "PluginContractViolation"), (
+        "positive control: the scan reads that cell"
+    )
+    assert _audit_cells_containing(env.db, SENTINEL) == set()
 
 
 # ---------------------------------------------------------------------------

@@ -1071,6 +1071,8 @@ class TestAWSS3SourceRegistrationAndParsing:
         rows = list(source.load(ctx))
         assert len(rows) == 1 and rows[0].is_quarantined
         assert sentinel not in rows[0].quarantine_error
+        # The declared field keeps its name; the value and pydantic's msg never appear.
+        assert rows[0].quarantine_error == "1 validation error: id: [int_parsing]"
 
     def test_lazy_missing_ijson_is_actionable_and_download_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import builtins

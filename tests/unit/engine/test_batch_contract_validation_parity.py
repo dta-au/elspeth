@@ -181,8 +181,11 @@ class TestSharedValidators:
             validate_success_outputs(_FakeBatchTransform(), result, node_kind=node_kind)
 
         message = str(excinfo.value)
-        assert message.startswith(f"{node_kind} transform 'fake_batch' output validation failed for emitted row 0: ")
-        assert "[int_type]" in message
+        # Rendered against the OUTPUT schema, so the declared field keeps its name.
+        assert message == (
+            f"{node_kind} transform 'fake_batch' output validation failed for emitted row 0: "
+            "1 validation error: item: [int_type]. This indicates a transform schema bug."
+        )
         assert _SENTINEL not in message
 
     def test_a_buffered_row_omitting_a_declared_field_is_rejected_without_its_content(self, node_kind: str) -> None:

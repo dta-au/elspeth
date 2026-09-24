@@ -888,6 +888,8 @@ class TestAzureBlobSourceSchemaValidation:
 
         assert len(rows) == 1
         assert rows[0].is_quarantined is True
+        # The declared field keeps its name; the value and pydantic's msg never appear.
+        assert rows[0].quarantine_error == "1 validation error: id: [int_parsing]"
 
     def test_flexible_schema_locks_on_first_row(self, ctx: PluginContext) -> None:
         """Flexible schema locks contract after first valid row."""
