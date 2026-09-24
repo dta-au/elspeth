@@ -55,6 +55,73 @@ def ctx() -> "PluginContext":
 
 
 class TestJoinSemantics:
+    @pytest.mark.parametrize(
+        ("reference_format", "reference_content", "expected_value", "expected_type"),
+        [
+            ("csv", "category,response_sla_hours\nbilling,24\n", "24", "str"),
+            ("json", '[{"category":"billing","response_sla_hours":24}]', 24, "int"),
+        ],
+    )
+    def test_numeric_reference_cells_require_truthful_consumer_and_repair_guidance(
+        self,
+        ctx: "PluginContext",
+        tmp_path: Path,
+        reference_format: str,
+        reference_content: str,
+        expected_value: str | int,
+        expected_type: str,
+    ) -> None:
+        from elspeth.plugins.sinks.csv_sink import CSVSink
+        from elspeth.plugins.transforms.type_coerce import TypeCoerce
+        from elspeth.web.composer.skills import load_skill
+
+        transform = build(
+            reference_format=reference_format,
+            reference_content=reference_content,
+            key_field="category",
+            reference_key_name="category",
+            output={"response_sla_hours": "ref['response_sla_hours']"},
+        )
+        result = transform.process(make_pipeline_row({"category": "billing"}), ctx)
+        assert result.row is not None
+        assert result.row["response_sla_hours"] == expected_value
+        assert _declared_output_field(transform, "response_sla_hours").field_type == expected_type
+        sink = CSVSink(
+            {
+                "path": str(tmp_path / "output.csv"),
+                "schema": {"mode": "fixed", "fields": ["category: str", "response_sla_hours: int"]},
+            }
+        )
+        if reference_format == "csv":
+            with pytest.raises(ValidationError, match="int_type"):
+                sink.input_schema.model_validate(result.row.to_dict())
+            conversion = TypeCoerce(
+                {
+                    "schema": {"mode": "flexible", "fields": ["response_sla_hours: str"]},
+                    "conversions": [{"field": "response_sla_hours", "to": "int"}],
+                }
+            )
+            converted = conversion.process(result.row, ctx)
+            assert converted.row is not None
+            assert converted.row["response_sla_hours"] == 24
+            sink.input_schema.model_validate(converted.row.to_dict())
+        else:
+            sink.input_schema.model_validate(result.row.to_dict())
+
+        assistance = ReferenceJoin.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "CSV cells remain strings" in hints
+        assert "JSON numbers retain numeric types" in hints
+        assert "type_coerce" in hints
+        assert "Never replace a supplied CSV" in hints
+        skill = load_skill("pipeline_composer")
+        repair = next(line for line in skill.splitlines() if line.startswith("| CSV `reference_join` output"))
+        assert "type_coerce" in repair
+        assert "field_mapper" in repair
+        assert "arriving `str`" in repair
+        assert "Never replace supplied CSV" in repair
+
     def test_composer_assistance_wires_an_existing_upload(self) -> None:
         assistance = ReferenceJoin.get_agent_assistance()
         assert assistance is not None

@@ -42,7 +42,7 @@
         "tier": "common"
       },
       {
-        "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type.",
+        "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type. CSV cells remain strings, including numeric-looking cells; JSON numbers retain numeric types.",
         "enum": [
           "csv",
           "json"
