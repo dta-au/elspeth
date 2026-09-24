@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from elspeth.contracts import Run, SecretResolution
+    from elspeth.contracts.audit import CallVerification
     from elspeth.contracts.identity import LineageFrame
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.run_lifecycle_repository import (
@@ -176,6 +177,9 @@ class ExecutionReadRepository:
 
     def get_operation_calls(self, operation_id: str) -> list[Any]:
         return self._repo.get_operation_calls(operation_id)
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        return self._repo.get_verification_decisions_for_run(current_run_id)
 
     def get_operations_for_run(self, run_id: str) -> list[Any]:
         return self._repo.get_operations_for_run(run_id)

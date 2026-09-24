@@ -43,6 +43,7 @@ from elspeth.mcp.types import (
     SinkEffectHistoryReport,
     TokenChildRecord,
     TokenRecord,
+    VerificationDecisionRecord,
 )
 
 _serialize_datetime = serialize_datetime
@@ -512,6 +513,22 @@ def get_operation_calls(db: LandscapeDB, factory: AnalyzerRepositories, operatio
     ]
 
 
+def list_verification_decisions(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str) -> list[VerificationDecisionRecord]:
+    """Read persisted comparisons for state and operation calls in a verify run."""
+    return [
+        {
+            "current_call_id": decision.current_call_id,
+            "current_run_id": decision.current_run_id,
+            "source_run_id": decision.source_run_id,
+            "source_call_id": decision.source_call_id,
+            "is_match": decision.is_match,
+            "differences_json": decision.differences_json,
+            "recorded_at": decision.recorded_at.isoformat(),
+        }
+        for decision in factory.execution.get_verification_decisions_for_run(run_id)
+    ]
+
+
 def explain_token(
     db: LandscapeDB,
     factory: AnalyzerRepositories,
@@ -540,6 +557,10 @@ def explain_token(
     if result is None:
         return None
     result_dict = cast(dict[str, Any], _dataclass_to_dict(result))
+    call_ids = {call.call_id for call in result.calls}
+    result_dict["verification_decisions"] = [
+        decision for decision in list_verification_decisions(db, factory, run_id) if decision["current_call_id"] in call_ids
+    ]
 
     # Annotate routing_events with flow_type convenience field
     for event in result_dict["routing_events"]:

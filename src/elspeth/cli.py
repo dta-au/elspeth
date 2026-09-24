@@ -1455,14 +1455,32 @@ def explain(
                     typer.echo("Token or row not found, or no terminal tokens exist yet.", err=True)
                 raise typer.Exit(1) from None
 
+            call_ids = {call.call_id for call in lineage_result.calls}
+            verification_decisions = [
+                decision
+                for decision in factory.execution.get_verification_decisions_for_run(resolved_run_id)
+                if decision.current_call_id in call_ids
+            ]
+
             # Output based on mode
             if json_output:
-                typer.echo(json_module.dumps(dataclass_to_dict(lineage_result), indent=2))
+                lineage_data = dataclass_to_dict(lineage_result)
+                lineage_data["verification_decisions"] = [dataclass_to_dict(decision) for decision in verification_decisions]
+                typer.echo(json_module.dumps(lineage_data, indent=2))
                 raise typer.Exit(0)
 
             if no_tui:
                 formatter = LineageTextFormatter()
                 typer.echo(formatter.format(lineage_result))
+                if verification_decisions:
+                    typer.echo("--- Verification decisions ---")
+                    for decision in verification_decisions:
+                        verdict = "UNAVAILABLE" if decision.is_match is None else "MATCH" if decision.is_match else "MISMATCH"
+                        typer.echo(
+                            f"  {decision.current_call_id}: {verdict}; "
+                            f"source run={decision.source_run_id} call={decision.source_call_id}; "
+                            f"differences={decision.differences_json}"
+                        )
                 raise typer.Exit(0)
 
         # TUI mode

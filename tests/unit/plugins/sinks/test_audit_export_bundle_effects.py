@@ -57,7 +57,7 @@ def _snapshot(
         export_format="csv",
         exporter_version="landscape-exporter-auth-v2",
         compartment_id="test-compartment",
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="complete-frame-v1",
         include_raw_error_rows=False,
         per_chunk_byte_limit=1024 * 1024,
@@ -102,7 +102,7 @@ def _snapshot(
         signer_key_id="audit-key-v1" if signed else "UNSIGNED",
         record_count=len(bundle.record_frames),
         total_bytes=sum(len(frame) for frame in bundle.record_frames),
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at=COMPLETED_AT,
         source_completed_at=COMPLETED_AT,
         source_status="completed",
@@ -121,7 +121,7 @@ def _snapshot(
             registry_key_hash=bundle.registry_key_hash,
             manifest_hash=bundle.manifest_hash,
             snapshot_hash=bundle.snapshot_hash,
-            serialization_version="audit-export-v2",
+            serialization_version="audit-export-v3",
             export_format=AuditExportFormat.CSV,
             signing_mode=AuditExportSigningMode.HMAC_SHA256 if signed else AuditExportSigningMode.UNSIGNED,
             signer_key_id="audit-key-v1" if signed else "UNSIGNED",
@@ -191,7 +191,7 @@ def _forged_snapshot(record: dict[str, object]) -> tuple[SinkEffectAuditExportSn
         signer_key_id="UNSIGNED",
         record_count=1,
         total_bytes=len(chunk_bytes),
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at=COMPLETED_AT,
         source_completed_at=COMPLETED_AT,
         source_status="completed",
@@ -210,7 +210,7 @@ def _forged_snapshot(record: dict[str, object]) -> tuple[SinkEffectAuditExportSn
             registry_key_hash="2" * 64,
             manifest_hash="3" * 64,
             snapshot_hash="4" * 64,
-            serialization_version="audit-export-v2",
+            serialization_version="audit-export-v3",
             export_format=AuditExportFormat.CSV,
             signing_mode=AuditExportSigningMode.UNSIGNED,
             signer_key_id="UNSIGNED",
@@ -247,6 +247,32 @@ def _stage(plan) -> Path:
 
 def _target(plan) -> Path:
     return Path(str(plan.safe_evidence["target_path"]))
+
+
+def test_verification_records_have_a_dedicated_csv_with_exact_difference_evidence(tmp_path: Path) -> None:
+    records = tuple(
+        {
+            "record_type": "call_verification",
+            "run_id": "run-1",
+            "current_call_id": f"current-{index}",
+            "source_run_id": "source-run",
+            "source_call_id": f"source-{index}" if is_match is not None else None,
+            "is_match": is_match,
+            "differences_json": differences,
+            "recorded_at": COMPLETED_AT,
+        }
+        for index, (is_match, differences) in enumerate(
+            ((True, "{}"), (False, '{"response_hash":{"expected":"a","actual":"b"}}'), (None, '{"reason":"missing_source_call"}'))
+        )
+    )
+    snapshot, _manifest_bytes = _snapshot(records=records)
+    plan = _prepare(tmp_path / "audit", snapshot)
+    with (_stage(plan) / "call_verification.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["current_call_id"] for row in rows] == [record["current_call_id"] for record in records]
+    assert [row["differences_json"] for row in rows] == [record["differences_json"] for record in records]
+    assert [row["is_match"] for row in rows] == ["True", "False", ""]
+    assert [row["source_call_id"] for row in rows] == ["source-0", "source-1", ""]
 
 
 @pytest.mark.parametrize("signed", [False, True])

@@ -16,7 +16,7 @@ delegators.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
@@ -748,6 +748,9 @@ class ExecutionRepository:
 
     def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
         return self.calls.get_verification_decisions_for_run(current_run_id)
+
+    def iter_verification_decisions_for_run(self, current_run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self.calls.iter_verification_decisions_for_run(current_run_id, batch_size=batch_size)
 
     def get_all_calls_for_run(self, run_id: str) -> list[Call]:
         """Return both state-parented and operation-parented calls for finalization."""

@@ -198,6 +198,19 @@ class TransformErrorExportRecord(TypedDict):
     created_at: str
 
 
+class CallVerificationExportRecord(TypedDict):
+    """Persisted comparison evidence, including unmatched source calls."""
+
+    record_type: Literal["call_verification"]
+    run_id: str
+    current_call_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
 class CallExportRecord(TypedDict):
     """External call record — parented by either a node_state or an operation.
 
@@ -531,6 +544,7 @@ ExportRecord = (
     | ValidationErrorExportRecord
     | TransformErrorExportRecord
     | CallExportRecord
+    | CallVerificationExportRecord
     | RowExportRecord
     | TokenExportRecord
     | TokenParentExportRecord

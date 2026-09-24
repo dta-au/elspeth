@@ -29,6 +29,7 @@ from elspeth.contracts import (
     TokenOutcome,
     TokenParent,
 )
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNKS,
@@ -50,6 +51,7 @@ from elspeth.contracts.export_records import (
     BatchExportRecord,
     BatchMemberExportRecord,
     CallExportRecord,
+    CallVerificationExportRecord,
     CollectorGroupFailureExportRecord,
     EdgeExportRecord,
     ExportRecord,
@@ -105,6 +107,8 @@ class ExportReadModel(Protocol):
     def get_operations_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]: ...
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]: ...
 
     def get_validation_errors_for_run(self, run_id: str) -> list[Any]: ...
 
@@ -181,6 +185,9 @@ class RecorderFactoryExportReadModel:
 
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self._factory.execution.get_all_operation_calls_for_run(run_id)
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self._factory.execution.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
 
     def get_validation_errors_for_run(self, run_id: str) -> list[Any]:
         return self._factory.data_flow.get_validation_errors_for_run(run_id)
@@ -294,6 +301,7 @@ class LandscapeExporter:
     - node_state: Processing records
     - routing_event: Routing decisions
     - call: External calls (may have state_id OR operation_id)
+    - call_verification: Persisted verify verdicts and source-call comparison evidence
     - batch: Aggregation batches
     - batch_member: Batch membership
     - artifact: Sink outputs
@@ -514,7 +522,7 @@ class LandscapeExporter:
         sign: bool = False,
         derivation_config: AuditExportDerivationConfig | None = None,
     ) -> AuditExportDerivedBundle:
-        """Return the exact v2 byte graph for one immutable terminal run."""
+        """Return the current serialization byte graph for one immutable terminal run."""
         if sign and self._signing_key is None:
             raise ValueError("Signing requested but no signing_key provided")
         with self._public_export_scope(run_id) as (exporter, terminal_witness):
@@ -970,6 +978,21 @@ class LandscapeExporter:
             yield failure_record
 
         yield from self._iter_batch_and_artifact_records(run_id)
+
+        # Verdicts refer to both state-parented and operation-parented calls.
+        # Read them through the same snapshot as the rest of the export.
+        for decision in self._read_model.iter_verification_decisions_for_run(run_id, batch_size=self._row_batch_size):
+            verification_record: CallVerificationExportRecord = {
+                "record_type": "call_verification",
+                "run_id": decision.current_run_id,
+                "current_call_id": decision.current_call_id,
+                "source_run_id": decision.source_run_id,
+                "source_call_id": decision.source_call_id,
+                "is_match": decision.is_match,
+                "differences_json": decision.differences_json,
+                "recorded_at": decision.recorded_at.isoformat(),
+            }
+            yield verification_record
 
     def _iter_sink_effect_records(self, run_id: str) -> Iterator[ExportRecord]:
         """Yield complete safe recovery history in deterministic family order."""
