@@ -20,14 +20,25 @@ import pytest
 from sqlalchemy import Table, func, select, update
 from sqlalchemy.sql import Executable
 
-from elspeth.contracts import Batch, BatchStatus, NodeStateFailed, NodeStateStatus, NodeType, RoutingMode, TriggerType
+from elspeth.contracts import (
+    Batch,
+    BatchStatus,
+    NodeStateFailed,
+    NodeStateStatus,
+    NodeType,
+    RoutingMode,
+    TerminalOutcome,
+    TerminalPath,
+    TriggerType,
+)
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import AuditIntegrityError, TransformErrorReason
 from elspeth.core.canonical import canonical_json
+from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.schema import routing_events_table, transform_errors_table
+from elspeth.core.landscape.schema import batch_members_table, node_states_table, routing_events_table, transform_errors_table
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
 
@@ -211,6 +222,24 @@ class TestTheVerdictIsOneTransaction:
         assert _count(setup, transform_errors_table) == 0
         assert _batch(setup, "batch-1").status is BatchStatus.DRAFT
 
+    def test_a_member_that_is_already_terminal_is_refused(self) -> None:
+        """A member already given a terminal outcome cannot be failed a second time by the verdict."""
+        setup = _setup()
+        _buffered_batch(setup)
+        state_id = _flush_state(setup, "batch-1", "state-1")
+        setup.data_flow.record_token_outcome_leader(
+            TokenRef(token_id="tok-1", run_id=setup.run_id),
+            TerminalOutcome.TRANSIENT,
+            TerminalPath.BATCH_CONSUMED,
+            coordination_token=setup.coordination_token,
+            batch_id="batch-1",
+        )
+
+        with pytest.raises(AuditIntegrityError, match=r"aggregation failure verdict members already have terminal outcomes: \['tok-1'\]"):
+            _record_verdict(setup, "batch-1", state_id, destination="discard", divert_edge_id=None)
+
+        _nothing_recorded(setup, "batch-1", state_id)
+
     def test_a_second_verdict_for_the_same_flush_is_refused(self) -> None:
         setup = _setup()
         _buffered_batch(setup)
@@ -250,6 +279,46 @@ class TestTheVerdictIsFinal:
         assert [batch.batch_id for batch in setup.execution.get_incomplete_batches(setup.run_id)] == ["batch-1"]
         retry = setup.execution.retry_batch("batch-1", coordination_token=setup.coordination_token)
         assert retry.retry_of_batch_id == "batch-1"
+
+    def test_a_members_transform_error_at_another_node_is_not_this_batchs_verdict(self) -> None:
+        """A FAILED flush with no verdict stays retryable when its members carry errors elsewhere.
+
+        ``transform_errors`` is attempt evidence as well as verdicts: a
+        per-row transform upstream records an attempt that a retry then
+        recovers, and that token goes on to the aggregation. The verdict
+        predicate only counts rows at the batch's OWN node, so a crashed flush
+        of such members is still retried, and the restore reader hands nothing
+        to resume as a recorded verdict.
+        """
+        setup = _setup()
+        register_test_node(setup.data_flow, setup.run_id, "xform-0", node_type=NodeType.TRANSFORM, plugin_name="upstream")
+        with fenced_leader_transaction(setup.db.engine, token=setup.coordination_token, window_seconds=300, verb="test_attempt") as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id=setup.run_id,
+                members=tuple((TokenRef(token_id=token_id, run_id=setup.run_id), make_pipeline_row({"value": 1})) for token_id in _TOKENS),
+                transform_id="xform-0",
+                error_details=_REASON,
+                destination="discard",
+            )
+        _buffered_batch(setup)
+        state_id = _flush_state(setup, "batch-1", "state-1")
+        setup.execution.complete_batch(
+            "batch-1",
+            BatchStatus.FAILED,
+            trigger_type=TriggerType.END_OF_SOURCE,
+            state_id=state_id,
+            coordination_token=setup.coordination_token,
+        )
+
+        assert [batch.batch_id for batch in setup.execution.get_incomplete_batches(setup.run_id)] == ["batch-1"]
+        assert (
+            setup.factory.barrier_restore.list_recorded_aggregation_failures(
+                setup.run_id, aggregation_node_id="agg-1", blocked_token_ids=list(_TOKENS)
+            )
+            == ()
+        )
+        assert setup.execution.retry_batch("batch-1", coordination_token=setup.coordination_token).retry_of_batch_id == "batch-1"
 
     def test_the_verdict_belongs_to_the_end_of_the_retry_chain(self) -> None:
         """A crashed attempt A was retried as B; B recorded the verdict.
@@ -355,6 +424,21 @@ class TestTheRestoreReaderProvesTheVerdictWhole:
                 routing_events_table.delete(),
                 "has flush routing",
                 id="named-verdict-without-its-divert",
+            ),
+            pytest.param(
+                update(node_states_table).where(node_states_table.c.state_id == "state-1").values(node_id="sink-q"),
+                "lacks its FAILED flush node_state and reason",
+                id="flush-state-at-another-node",
+            ),
+            pytest.param(
+                update(node_states_table).where(node_states_table.c.state_id == "state-1").values(error_json=None),
+                "lacks its FAILED flush node_state and reason",
+                id="flush-state-without-its-reason",
+            ),
+            pytest.param(
+                update(batch_members_table).where(batch_members_table.c.token_id == "tok-1").values(ordinal=5),
+                "has invalid batch membership",
+                id="membership-ordinal-gap",
             ),
         ],
     )

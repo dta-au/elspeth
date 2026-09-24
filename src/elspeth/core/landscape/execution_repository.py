@@ -1483,8 +1483,11 @@ class ExecutionRepository:
         before this commits recorded no verdict and is re-run on resume; once
         it commits, the verdict is final — resume completes its disposition
         from these rows and never re-invokes the plugin (operator ruling,
-        2026-09-23). ``BatchRepository.recorded_failure_verdict`` is the one
-        reader of that fact.
+        2026-09-23). ``batch_lineage.recorded_failure_verdict_condition`` is
+        the one predicate for that fact; ``BatchRepository.get_incomplete_batches``
+        excludes such a batch and
+        ``BarrierRestoreReadModel.list_recorded_aggregation_failures`` reads it
+        back for resume.
 
         Raises:
             AuditIntegrityError: The members are empty, repeated or cross the

@@ -29,6 +29,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import Determinism, PipelineRow, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape import execution_repository
@@ -597,3 +598,44 @@ def test_a_verdict_whose_acknowledgement_is_lost_reports_the_original_error_not_
     assert audit["batch_statuses"] == ["failed"]
     assert audit["work_statuses"] == {"terminal"}
     assert len(audit["terminals"]) == 3
+
+
+@pytest.mark.timeout(180)
+def test_a_recorded_verdict_whose_members_are_held_twice_in_the_journal_is_refused(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resume completes a recorded verdict only against its EXACT BLOCKED membership.
+
+    The restore reader proves the verdict's members are a subset of the
+    journal's BLOCKED tokens; it cannot see a token held by TWO BLOCKED rows
+    (the schema admits two at different attempts), since it reads token ids.
+    The disposition's prepare step compares the held items with the members
+    one for one, as the committed residual and output-receipt arms do inline,
+    and refuses while restore is still deriving. The barrier completion would
+    refuse the duplicate too, but only in restore's mutate phase, after the
+    §E.3a reconcile releases have already been written for other holds.
+    """
+    transform = _FailOnceThenSumBatchTransform()
+    env = _pipeline(tmp_path, transform, error_sink=CollectSink("quarantine"))
+    _crash_sequence([(AggregationExecutor, "execute_flush", AggregationExecutor.execute_flush, True)], 1, monkeypatch)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        env["orchestrator"].run(env["config"], graph=env["graph"], payload_store=env["payload_store"])
+    run_id = _run_id(env["db"])
+    with env["db"].write_connection() as conn:
+        held = conn.execute(
+            select(token_work_items_table)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.status == "blocked")
+            .order_by(token_work_items_table.c.ingest_sequence)
+        ).all()
+        assert len(held) == 3, "precondition: the verdict's members are still BLOCKED behind it"
+        duplicate = dict(held[1]._mapping)
+        duplicate["work_item_id"] = f"{duplicate['work_item_id']}-dup"
+        # The schema admits it: work items are unique per (token, cursor node, attempt), not per hold.
+        duplicate["attempt"] = duplicate["attempt"] + 1
+        conn.execute(token_work_items_table.insert().values(**duplicate))
+
+    with pytest.raises(AuditIntegrityError, match=r"Recorded FAILED verdict of batch '[^']+' does not match its exact BLOCKED membership"):
+        _resume(env, run_id)
+    assert transform.batch_calls == 1, "the plugin is not re-invoked"
+    audit = _audit(env["db"], run_id)
+    assert audit["work_statuses"] == {"blocked"}, "refused before the disposition: every hold is still BLOCKED"
+    assert audit["terminals"] == [], "and no member was handed on or given a terminal"
