@@ -162,6 +162,9 @@ No commit between T3 and T6 may be merged or deployed on its own.
 
 ## 2. Measured starting point
 
+Everything in this section was measured at the base `c4c52c110`. The `release/0.8.1` tip has since moved, and the
+base-red set below does not hold there; §6.1 records what changes at the merge.
+
 Environment for every command:
 
 ```bash
@@ -701,7 +704,9 @@ number.
     - The target version is 0.8.1. The base is `release/0.8.1`, and the test pins the clause to the 0.8.1 section.
 
 **Do not touch** the 6 base-red doc, website and receipt pins (§2). After T6 they fail against 67 instead of 66. That
-is the same ids, with a new expected value.
+is the same ids, with a new expected value. **This holds on the branch only.** `release/0.8.1` has since moved and
+made those pins green at 66; at the merge they become this branch's reds and must be fixed in the merge commit
+(§6.1).
 
 **Tests:**
 - the 6 pin files from items 3 to 8;
@@ -799,7 +804,8 @@ Consumers that are **not** reasons for the epoch:
   live in the session DB, so a rename leaves local accounts pending (401).
 - No Landscape epoch change, and no frontend rebuild (T4 changes a test fixture only).
 - **Merge-conflict risk:** at the start of this session, the main checkout had an uncommitted `CHANGELOG.md` edit made
-  by another session. The lead's merge in the main checkout must reconcile it.
+  by another session. The lead's merge in the main checkout must reconcile it. The tip has also moved Landscape to
+  epoch 45, which conflicts with T6 in `CHANGELOG.md` and the staging runbook (§6.1).
 - If another lane lands an epoch bump on `release/0.8.1` first, T6 is redone at the next free number, with its history
   line folded in. It is never merged over.
 
@@ -816,8 +822,10 @@ Consumers that are **not** reasons for the epoch:
      and the `session`/`schema_epoch` case of
      `tests/testcontainer/web/test_schema_probe_postgres.py::test_postgres_schema_identity_drift_is_stale_and_not_repaired`.
 2. **Attribute every red.** Re-run each failing id with `-n 0`.
-   - Diff the failure set against the 10-id base-red set (§2) and its messages (`$L/t0-base-red.log`).
-   - The p5 test and the 6 doc pins are expected, with new hash or epoch values.
+   - On the branch as it stands (base `c4c52c110`): diff the failure set against the 10-id base-red set (§2) and its
+     messages (`$L/t0-base-red.log`). The p5 test and the 6 doc pins are expected, with new hash or epoch values.
+   - **On the merged tree, that rule no longer applies (§6.1).** At the tip `ffd704d1a` all 10 of those ids pass, so
+     a red among them after the merge is this branch's, not a base red. With §6.1 applied, none is expected.
    - Anything else belongs to this branch. So does a known flaky family whose failures differ from a base run.
 3. `lints`: diff as a multiset against `lints-base.norm`, and list every addition for the operator's sign-bundle.
    Stage nothing.
@@ -833,6 +841,64 @@ Consumers that are **not** reasons for the epoch:
 
    Merge only on John's word, after running `git merge-tree` against the current `release/0.8.1` tip and
    `scripts/branch-safety-check.sh --intent merge`. Push only when asked.
+
+### 6.1 Merging into the moved tip (added after the branch review)
+
+The branch review (`$L/review.md`, F1 and F2) found that `release/0.8.1` moved from `c4c52c110` to `ffd704d1a` while
+the branch was built. The tip is still at session epoch 66 (`git show release/0.8.1:src/elspeth/web/sessions/models.py`
+gives `SESSION_SCHEMA_EPOCH = 66`), so T6's number stands. But the tip moved Landscape from 43 to 45, brought the
+epoch docs up to session 66, and re-pinned the architecture line pins. As a result (M):
+
+- At the tip, all 10 ids of the §2 base-red set pass, including p5 and bedrock.
+- `git merge-tree --write-tree release/0.8.1 HEAD` conflicts in `CHANGELOG.md` and
+  `docs/runbooks/staging-session-db-recreation.md`.
+- After the conflicts are resolved, 6 doc pins and 2 line pins are red on the merged tree, and all of them are this
+  branch's: the docs name session 66 and the `schema.py` comment in T6 shifts the pinned lines by one
+  (`$L/fix/f1-merged-before.log`: 8 failed, 323 passed).
+
+The implementer may not merge or rebase, and the tip keeps moving, so this work goes into the merge commit. It is part
+of T6 in substance (§1.5): the merge commit must carry all of it, and no merge without it may be deployed.
+
+**Conflicts (additive).** Every present-tense literal takes both new numbers, session 67 and Landscape 45:
+- `CHANGELOG.md`: keep the branch's "Session epoch 67 binds the order ..." paragraph, followed by the tip's
+  "Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 45 ..." line. Then "Session databases below epoch 67 (including
+  epoch 66) and Landscape databases below epoch 45" and "(session 67, Landscape 45)". Keep the
+  `` `SESSION_SCHEMA_EPOCH` advances from 53\nto 67 `` line break that `test_replica_schema_cutover_belongs_to_0_8_1`
+  asserts.
+- Staging runbook: the tip's heading with the branch's number, "... prompt provenance and call mode audit (session
+  epoch 67 and Landscape epoch 45)"; "from 53 to 67 and Landscape `SQLITE_SCHEMA_EPOCH` from 38 to 45";
+  "session-epoch-67/Landscape-epoch-45 record"; and the `PRAGMA user_version` expectations 67 and 45.
+
+**Epoch sweep (the tip's session-66 literals that the constant now makes stale):**
+
+| File | Literal at the tip | Becomes | Pinned by |
+|---|---|---|---|
+| `README.md` (0.8.1 section) | "session epoch 53\nto 66 and Landscape epoch 38 to 45" | `to 67` | `test_readme_operational_cutover_states_the_live_schema_epochs` |
+| `website/get-started.html` | "changes 53 → 66 and Landscape" | `53 → 67` | `test_get_started_has_runnable_cli_and_complete_composer_paths` |
+| `docs/guides/sharing-pipelines.md` | `` `SESSION_SCHEMA_EPOCH=66` `` | `=67` | `test_operator_schema_version_examples_match_live_constants` |
+| `docs/runbooks/azure-container-apps-deployment.md` | "The epoch-66 image (session epoch 66, ...", "at session epoch 66" (2), `"candidate": {"session_epoch": 66, ...` | 67 in each | `test_every_epoch_literal_matches_the_live_constants`, `test_compatibility_record_is_byte_bound_to_the_live_derivation` |
+| `docs/runbooks/azure-container-apps-cold-install.md` | "session epoch 66 and Landscape epoch 45 initialized;" | 67 | `test_every_epoch_literal_matches_the_live_constants` |
+| `docs/runbooks/aws-ecs-deployment.md` (scenario-B record) | `"candidate": {"session_epoch": 66, ...`, `"session_epoch_35_to_66_landscape_epoch_29_to_45_..."`, "session epoch 66, Landscape epoch 45 and `run_web_plugin_policy` presence" | 67 in each | `test_scenario_b_runbook_record_matches_live_release_derivation` |
+
+**Line re-pin** (re-pin; do not reshape the comment to avoid the churn). In
+`tests/unit/architecture/test_session_db_mutation_authority.py`, every `WriterIdentity` on
+`src/elspeth/web/sessions/schema.py` moves down by one line: `stamp_sentinels` 274 → 275 (two places), `_stamp_on`
+`stamp_sqlite_sentinel` 292 → 293 and 293 → 294, `_stamp_on` `insert` 296 → 297, `assert_sentinels` 309 → 310 (two
+places) and `validate_required_triggers` 422 → 423 (two places). That is 9 literals, and they make
+`test_live_connection_domain_classification_is_exact` and
+`test_session_schema_authority_is_exact_contained_and_bidirectional` green.
+
+**Measured on the resolved merge tree** (a `git archive` export of `git merge-tree --write-tree release/0.8.1
+faf2395d7`, with the resolution above applied): the pins above, `tests/unit/docs`, `tests/unit/website`, the ACA
+runbook contract, the p5 and bedrock ids, `tests/unit/web/sessions/test_schema.py` and `test_engine.py`, and the
+branch's order and fingerprint tests give 737 passed and 1 failed (`$L/fix/f1-merged-after.log`). The one failure,
+`test_adr_public_integrity.py::test_audited_adr_commit_citations_resolve_to_reachable_history`, is a property of the
+export, which has no git history; it passes in the worktree (`$L/fix/adr-worktree.log`). The resolution is saved as
+`$L/fix/merge-resolution-full.patch` (against the conflicted merge tree), `$L/fix/merge-epoch67-sweep.patch` (the
+non-conflict edits only) and the two resolved files under `$L/fix/merge-resolution/`. This is a focused set, not the
+full suite: §6 step 1 still runs on the merged tree, with the testcontainer stage. If the tip moves again before the
+merge, repeat the `merge-tree` and the grep for `session epoch 66`, `"session_epoch": 66` and `53 → 66` rather than
+trusting the table.
 
 ## 7. Risks and stop conditions
 
