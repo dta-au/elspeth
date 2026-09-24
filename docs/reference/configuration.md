@@ -2366,7 +2366,7 @@ compatibility record rather than relying on a structural probe alone.
 | `signer_rotation_policy` | string | `multi_version` | `multi_version` allows a new signer identity for a new snapshot; `single_export` refuses a different signer identity for the same export lineage |
 | `exporter_version` | string | `landscape-exporter-auth-v2` | The only supported closed export format |
 | `compartment_id` | string | required when enabled | Deployment marking matching `[a-z0-9][a-z0-9-]{0,62}`, required for every enabled export, signed or unsigned, including resume. Web execution uses the operator's `WebSettings.compartment_id`, overriding pipeline-authored values; CLI export settings must supply it explicitly |
-| `serialization_version` | string | `audit-export-v2` | Canonical record serialization identity |
+| `serialization_version` | string | `audit-export-v3` | Canonical record serialization identity |
 | `chunking_algorithm_version` | string | `record-framing-v1` | Chunk-boundary algorithm identity |
 | `include_raw_error_rows` | bool | `false` | Include bounded raw error rows when policy permits |
 | `total_record_limit` | int | required when enabled | Maximum records derived for one snapshot |
