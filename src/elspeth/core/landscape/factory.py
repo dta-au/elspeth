@@ -5,10 +5,13 @@ Single place that wires up loaders, database operations, and repository instance
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.sink_effects import SinkEffectRole
 from elspeth.core.landscape._database_ops import DatabaseOps, ReadOnlyDatabaseOps
 from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -416,6 +419,12 @@ class RecorderFactory:
         # Validated source-run snapshot passed from run admission to the
         # executor. It is per-factory and never a persisted audit authority.
         self.audited_sources: Mapping[str, object] | None = None
+        # Replay adapters are recreated for every sink effect. Keep validated
+        # source dispositions at the factory's run lifetime, not on an adapter.
+        self._replay_sink_dispositions: OrderedDict[
+            str, Mapping[tuple[str, SinkEffectRole], Mapping[tuple[int, str, str], tuple[str, str | None, str | None]]]
+        ] = OrderedDict()
+        self._replay_sink_dispositions_lock = Lock()
 
         # Database operations helper for reduced boilerplate
         ops = DatabaseOps(db)
