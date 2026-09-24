@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from jinja2.meta import find_undeclared_variables
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.identifiers import validate_field_name
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
@@ -119,7 +118,7 @@ class LLMSourceConfig(DataPluginConfig):
             raise ValueError(f"Invalid Jinja2 template: {exc}") from exc
 
         environment = create_sandboxed_environment()
-        names = find_undeclared_variables(environment.parse(value))
+        names = find_runtime_unbound_variables(environment.parse(value))
         unsupported = sorted(names - _SOURCE_PROMPT_CONTEXT_NAMES - _SOURCE_PROMPT_GLOBAL_NAMES)
         if unsupported:
             raise ValueError(
