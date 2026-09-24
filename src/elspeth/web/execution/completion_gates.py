@@ -31,6 +31,7 @@ from elspeth.web.composer.advisor_decision import (
     AdvisorGatePassed,
     AdvisorSignoffGateFact,
 )
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
@@ -170,16 +171,26 @@ def completion_gate_fingerprint(state: CompositionState) -> str:
     description alongside sources/nodes/edges/outputs. Only ``version`` is
     excluded from serialized pipeline content: a save alone does not change
     the evidence the advisor reviewed.
+
+    The pipeline content goes through the Composer authority projection, so
+    the order of the ``sources`` map and of mapping-form row_union and
+    coalesce branches is bound: a verdict on one order is never carried onto
+    a graph whose ingest or merge order changed.
     """
     state_d = state.to_dict()
-    return stable_hash(
+    projected = project_composer_authority_payload(
         {
-            "schema": _FINGERPRINT_SCHEMA,
-            "metadata": state_d["metadata"],
             "sources": state_d["sources"],
             "nodes": state_d["nodes"],
             "edges": state_d["edges"],
             "outputs": state_d["outputs"],
+        }
+    )
+    return stable_hash(
+        {
+            "schema": _FINGERPRINT_SCHEMA,
+            "metadata": state_d["metadata"],
+            **projected,
         }
     )
 

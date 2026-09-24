@@ -22,6 +22,7 @@ from elspeth.web.composer.advisor_decision import (
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.state import (
     CompositionState,
+    EdgeSpec,
     NodeSpec,
     OutputSpec,
     PipelineMetadata,
@@ -892,3 +893,98 @@ def test_advisor_recovery_changes_compare_effective_facts() -> None:
     assert completion_gate_decision_changes(prior, AdvisorGateBlocked(different), state)
     with pytest.raises(ValueError, match="fingerprint"):
         completion_gate_decision_changes(prior, AdvisorGatePassed("different"), state)
+
+
+# ── Order-semantic maps bind the advisor fingerprint ─────────────────────
+#
+# Mapping-form coalesce and row_union branches and the multi-source
+# ``sources`` map are order-semantic at runtime, so an advisor verdict on one
+# order must not be carried onto another.
+
+
+def _structural_node(node_type: str, branch_order: tuple[str, ...]) -> NodeSpec:
+    return NodeSpec(
+        id="merge",
+        node_type=node_type,
+        plugin=None,
+        input="a_in",
+        on_success="merge_out",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={alias: f"{alias}_in" for alias in branch_order},
+        policy="require_all" if node_type == "coalesce" else None,
+        merge="union" if node_type == "coalesce" else None,
+        timeout_seconds=30.0,
+    )
+
+
+def _source_spec(name: str) -> SourceSpec:
+    return SourceSpec(plugin="csv", on_success=f"{name}_rows", options={"path": f"{name}.csv"}, on_validation_failure="discard")
+
+
+def _ordered_state(kind: str, order: tuple[str, ...], *, version: int = 1) -> CompositionState:
+    if kind == "sources":
+        return CompositionState(
+            sources={name: _source_spec(name) for name in order},
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=version,
+        )
+    return CompositionState(
+        sources={},
+        nodes=(_structural_node(kind, order),),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=version,
+    )
+
+
+_ORDERED_KINDS = ("coalesce", "row_union", "sources")
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_fingerprint_binds_order_semantic_map_order(kind: str) -> None:
+    assert completion_gate_fingerprint(_ordered_state(kind, ("a", "b", "c"))) != completion_gate_fingerprint(
+        _ordered_state(kind, ("a", "c", "b"))
+    )
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_block_does_not_cover_a_reordered_graph(kind: str) -> None:
+    reviewed = _ordered_state(kind, ("a", "b", "c"), version=3)
+    reordered = _ordered_state(kind, ("a", "c", "b"), version=3)
+    facts = _blocked_facts_for(reviewed)
+    assert advisor_block_covers_unchanged_graph(facts, reviewed, initial_version=3) is True
+    assert advisor_block_covers_unchanged_graph(facts, reordered, initial_version=3) is False
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_merge_downgrades_a_carried_fact_when_only_the_order_changed(kind: str) -> None:
+    reviewed = _ordered_state(kind, ("a", "b", "c"))
+    reordered = _ordered_state(kind, ("a", "c", "b"))
+    facts = _blocked_facts_for(reviewed, note="reviewer note")
+    assert merge_completion_gates(_green_result(), facts, reviewed).readiness.blockers[0].detail == _BLOCKED_DETAIL
+    downgraded = merge_completion_gates(_green_result(), facts, reordered).readiness.blockers[0]
+    assert downgraded.detail == ADVISOR_SIGNOFF_PENDING_DETAIL
+    assert downgraded.note is None
+
+
+def test_fingerprint_binds_output_and_edge_list_order() -> None:
+    """Characterization: list-valued parts were already ordered and still are."""
+    outputs = (
+        OutputSpec(name="first", plugin="json", options={}, on_write_failure="discard"),
+        OutputSpec(name="second", plugin="json", options={}, on_write_failure="discard"),
+    )
+    edges = (
+        EdgeSpec(id="e1", from_node="source", to_node="first", edge_type="on_success", label=None),
+        EdgeSpec(id="e2", from_node="source", to_node="second", edge_type="on_success", label=None),
+    )
+    base = _make_state()
+    assert completion_gate_fingerprint(replace(base, outputs=outputs)) != completion_gate_fingerprint(replace(base, outputs=outputs[::-1]))
+    assert completion_gate_fingerprint(replace(base, edges=edges)) != completion_gate_fingerprint(replace(base, edges=edges[::-1]))
