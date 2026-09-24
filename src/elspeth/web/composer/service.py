@@ -1561,6 +1561,22 @@ def _replace_advisor_repair_public_result(
 
 
 @dataclass(frozen=True, slots=True)
+class _CrossTurnRepairKey:
+    """Campaign identity independent of bookkeeping checkpoint versions.
+
+    Authored content includes interpretation and secret controls. This key
+    bounds repair nudges only; runtime verdicts retain their full preflight
+    identity and are recomputed before the ledger is consulted.
+    """
+
+    user_id: str
+    session_scope: str
+    state_content_hash: str
+    settings_hash: str
+    interpretation_tolerant: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _SessionAwareDispatchOutcome:
     """Return value of ``_dispatch_session_aware_tool``.
 
@@ -2563,11 +2579,11 @@ class ComposerServiceImpl:
         self._runtime_preflight_timeout_seconds = settings.composer_runtime_preflight_timeout_seconds
         self._runtime_preflight_coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
         # Cross-turn repair ledger: broken-state identities (user scope +
-        # preflight key) whose cross-turn repair campaign has already been
+        # preflight content/context) whose cross-turn repair campaign has already been
         # injected. Process-local and best-effort by design — suppression is a
         # cost/UX bound, not a correctness gate; the finalize suffix stays
         # honest either way. See ``_attempt_preflight_repair``.
-        self._cross_turn_repair_ledger: dict[tuple[str, RuntimePreflightKey], None] = {}
+        self._cross_turn_repair_ledger: dict[_CrossTurnRepairKey, None] = {}
         self._availability = self._compute_availability()
         from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -3272,10 +3288,10 @@ class ComposerServiceImpl:
     ) -> RuntimePreflightKey:
         """Build the canonical preflight identity key for ``state``.
 
-        Single source for both the per-compose-call result cache and the
-        cross-turn repair ledger, so "same broken state" means the same thing
-        to both consumers: content identity plus the settings/plugin context
-        the preflight actually ran under.
+        The per-compose-call result cache retains checkpoint version as well
+        as content and settings/plugin context. The cross-turn repair ledger
+        projects the same context without version: bookkeeping saves must not
+        replenish a repair campaign over identical authored content.
         """
         settings_hash = runtime_preflight_settings_hash(self._settings)
         if plugin_snapshot is not None:
@@ -3982,9 +3998,13 @@ class ComposerServiceImpl:
             # unledgered. If the state is later broken again in an identical
             # way (same content hash), the claimed key suppresses a second
             # campaign — accepted: the red suffix still names the objection.
-            ledger_key = (
-                user_id or "",
-                self._runtime_preflight_key(state, session_scope=session_scope, plugin_snapshot=plugin_snapshot),
+            preflight_key = self._runtime_preflight_key(state, session_scope=session_scope, plugin_snapshot=plugin_snapshot)
+            ledger_key = _CrossTurnRepairKey(
+                user_id=user_id or "",
+                session_scope=preflight_key.session_scope,
+                state_content_hash=preflight_key.state_content_hash,
+                settings_hash=preflight_key.settings_hash,
+                interpretation_tolerant=preflight_key.interpretation_tolerant,
             )
             if repair_turns_used == 0 and ledger_key in self._cross_turn_repair_ledger:
                 return False
