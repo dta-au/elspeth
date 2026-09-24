@@ -168,3 +168,15 @@ an illustrative `amount` field. Runtime-backed teaching controls, independent
 old-guidance mutations and the canonical catalog golden passed. This is a ninth
 confirmed teaching correction following the original snapshot, not a claim that
 the earlier audit found it or proved exhaustive semantic parity.
+
+
+### Shared-prompt placement correction
+
+The integrated gate subsequently caught plugin-specific wording in the new shared
+repair row. The plugin's dynamically discovered assistance retains the concrete
+CSV/string, JSON/numeric and explicit-conversion facts. The shared row instead
+instructs the planner to consult plugin schema and assistance, preserve supplied
+data, and establish conversion explicitly when required. Both pre-existing
+shared-prompt boundary tests stay unchanged; restoring the offending row makes
+both fail. The restored affected run passed 217 tests. This correction preserves
+the distinction between generic Composer rules and installed-plugin facts.

@@ -460,3 +460,59 @@ The service stopped with exit 0 and unchanged source hash
 The cumulative ledger reached 513 completed requests, zero active requests,
 $3.0967919306 reported cost and one historical unpriced timeout. Nine passing
 workflows do not establish final acceptance; the graph repair needs a fresh run.
+
+
+## Complete live acceptance at 72170c2
+
+The fresh ten-workflow battery at `72170c2cf8cafcf9ea76230c61fdbacf6157a9fa`
+passed every case. The final reviewed runner exited 0, and the isolated service
+exited 0 with unchanged source content
+`a1e60288273c7d053fbcbdba74a9c245e645b838d900b9e455af4d467ce82b68`.
+No ordinary repair turns were needed. The two prompt-review cards were individually
+checked against the requested semantics, source bindings and approved Sonnet
+profile before exact-ID resolution. Independent audit found all 86 workflow planner
+calls served by Together, all 108 strict calls conformant, and all 38 parameterless
+calls successful. One semantic field-guarantee rejection was corrected by the next
+planner call; it was not a wire decode failure.
+
+Complaint/SLA completed six successful rows and six successful runtime LLM calls.
+The planner kept the supplied reference CSV and its string-valued SLA contract
+through the projection and fixed CSV sink. The output has exactly the requested
+four columns and billing=24, outage=4, other=48 values. Structured extraction
+completed all three rows with native string/integer/boolean fields and correct
+urgent/normal routing. Fork/coalesce passed exact output and lineage checks with
+its actual flexible source and observed expression transforms; the separate
+observed-source regression remains covered by the focused real-runtime test.
+
+The ledger reached 643 completed provider dispatches and $3.6376092598 known
+cumulative cost, retaining one historical unpriced advisor timeout. These totals
+include earlier preserved failed attempts. No deployed service was changed.
+
+The broader suite exposed additional stale fixtures and inventories, plus a
+shared-guidance placement error. Concrete ReferenceJoin CSV/type-conversion facts
+belong in runtime plugin discovery; the shared prompt now gives generic discovery,
+conversion and supplied-data-preservation instructions. Its two existing boundary
+guards remain unchanged and fail when the offending static row is restored.
+Other repairs preserve test intent: schema-only coalesce fixtures use a preserving
+plugin, proposal-binding positives use genuine staging, corruption tests inject
+explicit invalid historical state, and writer inventories update only measured
+line locations while retaining fingerprints and admitted authorities. Final
+integrated results after those repairs are pending.
+
+
+The completed default suite at this snapshot reported 54 failures, 58,075 passes,
+100 skips and two expected failures. Every failing ID was assigned to a measured
+repair: 28 guided lifecycle fixtures, 15 authority inventories, two static-prompt
+checks and nine schema/coalesce fixtures. Clean-release comparisons distinguish
+these candidate regressions from the standing lint state. The authority repair
+changes 135 measured line pins only; normalized inventory AST and every writer
+fingerprint, operation and authority remain unchanged.
+
+Restored checks passed: atomic routes 69; fork and affected guided step 172;
+revert 30 plus 20 structural checks (two PostgreSQL-specific skips in the serial
+selection); full authority module 266 with one existing expected failure; Composer
+state and structural checks 611; runtime agreement and structural checks 115; and
+static guidance/assistance checks 217. Negative controls reproduced the stale
+fixtures, invalid binding behavior, stale inventory locations, and misplaced
+plugin teaching. Independent review approved each scoped correction. These are
+focused repair results, not a replacement for the final canonical gate.
