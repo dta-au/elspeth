@@ -407,3 +407,56 @@ the integer payload and integer contract and confirm the verifier still refuses
 that contradiction; real float input passes and string input rejects. The repair
 does not falsely stamp float metadata onto an integer, coerce pass-through values,
 or broaden shared validation. This admission/declaration mismatch remains open.
+
+## Selected-field type proof and CSV reference teaching
+
+The next complete attempt at `e0ea1c8735aba09f4face3ab3ab29e5a78208b88`
+passed nine workflows, including fork/coalesce. Complaint/SLA failed at the CSV
+sink: all six native LLM responses were valid JSON with the correct categories,
+but `response_sla_hours` arrived as a string while the sink required an integer.
+The raw CSV lookup expression produced strings, and the observed, select-only
+`field_mapper` preserved them. Strict preflight had reported all schemas compatible.
+The original failed checkpoint and run remain intact.
+
+The validator already checks sink edges, and `reference_join` already declares
+the CSV lookup field as `str`. A direct edge to the integer sink correctly fails.
+The intervening projection erased that proof because type resolution followed
+whole-row forwarding but not a selected field. The narrow repair reuses existing
+declarations: the transform preserves values, requires this same input field,
+guarantees it on output, and neither creates nor removes it. Own declarations,
+including explicit `Any`, retain precedence. Unknown, conflicting, diverted,
+renamed and ambiguous paths retain their previous treatment. No plugin capability,
+runtime coercion, pipeline authoring or general unknown-type policy was added.
+Independent review approved the repair. The final restored run passed 312 checks;
+removing the repair failed two controls and removing its input-field guard failed
+three. Ruff, formatting, mypy, contracts and the masquerade baseline passed.
+
+The report-only guidance audit also confirmed an omission: ReferenceJoin teaching
+did not explain that numeric-looking CSV cells remain strings. Parent-reviewed
+assistance and shared repair teaching now distinguish CSV strings from typed JSON
+values, explain explicit conversion when required, and preserve supplied CSV data.
+Behavior-backed controls exercise both formats and the actual strict sink check;
+removing either teaching correction fails its controls.
+The guidance correction passed 439 affected/structural checks, 192 final
+wording/catalog checks and 96 direct catalog checks. Canonical regeneration changed
+only the ReferenceJoin option description in its catalog golden. No scenario
+manifest entry referenced this plugin, verified with positive and injected controls.
+An optional HTTP test timed out inside the sandbox; the exact test passed outside
+it. A minimal AnyIO-only control reproduced the sandbox's stalled worker wakeup
+and passed outside it, isolating the environment cause without changing the test.
+
+This attempt exercised the original failing provider route in full workflows:
+all 94 planner calls were served by Together, all 114 strict calls were wire
+conformant, and all 42 parameterless calls succeeded. The keyword workflow needed
+one ordinary repair after its review claimed unmatched categories reached
+quarantine unchanged while truncation preceded routing. That draft was not
+approved. Composer repaired the graph, its exact replacement card was inspected,
+and the original planned password edit and execution passed within three user
+turns. Both LLM prompt cards were inspected individually; extraction passed all
+three rows without an invented urgency interpretation.
+
+The service stopped with exit 0 and unchanged source hash
+`22020b8b38b36bc789398a5bc4f346d5a064fc9ecfc16edac0ccd14194948166`.
+The cumulative ledger reached 513 completed requests, zero active requests,
+$3.0967919306 reported cost and one historical unpriced timeout. Nine passing
+workflows do not establish final acceptance; the graph repair needs a fresh run.

@@ -148,3 +148,23 @@ An AST walk of each registered class's `get_agent_assistance` method found six l
 The audit agent was report-only and made no product changes. The parent reviewed the eight confirmed findings and assigned a separate implementation lane. All eight teaching corrections passed independent review, runtime/parser-backed controls, registered-plugin metadata checks, and old-guidance mutation controls. The CSV post-call copy was also corrected during review. Integrated suite and fresh live acceptance remain pending; focused checks alone do not establish release acceptance.
 
 The low-severity `list_models` follow-up above remains a documented wording ambiguity. Its tool is exposed and its advice yields a valid model selection; it was not included in the eight confirmed contract/behavior corrections.
+
+## Live-battery follow-up: CSV reference value types
+
+The parent requested a further report-only Sol audit after live case05 at
+`e0ea1c873` produced six valid LLM classifications but failed at an integer sink.
+The audit confirmed a separate teaching omission: ReferenceJoin did not explain
+that numeric-looking CSV lookup cells remain strings. Controlled CSV and JSON
+tables produced `str` and `int` respectively; the actual strict CSV sink rejected
+the former for an integer field and accepted the latter. FieldMapper's existing
+no-coercion guidance was correct. A separate graph-validation defect lost this
+known type through an observed selection; that is not attributed to guidance.
+
+The audit agent made no product changes. The parent assigned a different lane to
+correct ReferenceJoin assistance, its format-option description and the shared
+repair table. These now explain retaining strings or explicitly converting joined
+values, without replacing user-supplied CSV. The generic conversion example names
+an illustrative `amount` field. Runtime-backed teaching controls, independent
+old-guidance mutations and the canonical catalog golden passed. This is a ninth
+confirmed teaching correction following the original snapshot, not a claim that
+the earlier audit found it or proved exhaustive semantic parity.
