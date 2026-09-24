@@ -6,6 +6,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ class ScenarioApi(ApiClient):
         super().__init__("http://127.0.0.1:18473")
         self.case = case
         self.state, self.run, self.outputs = _positive(case)
+        self.state.update(session_id="session-test", version=1, edges=[])
         self.sent: list[tuple[str, dict | None]] = []
         self.pending = False
         self.approved = False
@@ -65,6 +67,8 @@ class ScenarioApi(ApiClient):
             ]
         if path.endswith("/state"):
             return self.state
+        if "/state/versions?" in path:
+            return [self.state]
         if path.endswith("/validate"):
             return {"is_valid": True, "errors": []}
         if path.endswith("/execute"):
@@ -84,7 +88,9 @@ class ScenarioApi(ApiClient):
 @pytest.fixture(autouse=True)
 def isolated_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner, "assert_frozen", lambda output: "frozen-test-source")
-    monkeypatch.setattr(runner, "runtime_evidence", lambda output, out, case, state, run: _evidence(case, state, run))
+    monkeypatch.setattr(
+        runner, "runtime_evidence", lambda output, out, case, state, run: {**_evidence(case, state, run), "sink_effects": []}
+    )
 
 
 def _session_store(tmp_path: Path) -> None:
@@ -123,21 +129,141 @@ def test_review_requires_exact_explicit_acceptance_and_resume_preserves_turns(tm
         ("current", "completed", False, False),
     ],
 )
-def test_preview_requires_current_state_success(state_id: str, outcome: str, conformant: bool, expected: bool) -> None:
+def test_preview_requires_bound_state_success(state_id: str, outcome: str, conformant: bool, expected: bool) -> None:
     messages = [
         {
             "composition_state_id": state_id,
             "tool_calls": [{"function": {"name": "preview_pipeline"}, "outcome": outcome, "wire_conformant": conformant}],
         }
     ]
-    assert _preview_seen(messages, "current") is expected
+    state = _preview_state("current", 1)
+    assert _preview_seen(messages, state, [state]) is expected
+
+
+def _preview_state(state_id: str, version: int) -> dict:
+    return {
+        "id": state_id,
+        "version": version,
+        "session_id": "session-test",
+        "sources": {"input": {"plugin": "csv", "options": {"blob_ref": "source-blob"}}},
+        "nodes": [{"id": "trim", "node_type": "transform", "plugin": "truncate", "options": {"fields": {"note": 3}}}],
+        "edges": [],
+        "outputs": [{"name": "cleaned", "plugin": "csv", "options": {"path": "cleaned.csv"}}],
+        "metadata": {"name": "cleanup"},
+    }
 
 
 def test_preview_before_mutation_in_same_message_is_stale() -> None:
     preview = {"function": {"name": "preview_pipeline"}, "outcome": "completed", "wire_conformant": True}
-    edit = {"function": {"name": "patch_node_options"}, "outcome": "applied"}
-    assert not _preview_seen([{"composition_state_id": "current", "tool_calls": [preview, edit]}], "current")
-    assert _preview_seen([{"composition_state_id": "current", "tool_calls": [edit, preview]}], "current")
+    edit = {"function": {"name": "patch_node_options"}, "outcome": "applied", "applied_state_version": 2}
+    old = _preview_state("old", 1)
+    state = _preview_state("current", 2)
+    old["nodes"][0]["options"]["fields"]["note"] = 5
+    versions = [old, state]
+    assert not _preview_seen([{"composition_state_id": "old", "tool_calls": [preview, edit]}], state, versions)
+    assert _preview_seen([{"composition_state_id": "old", "tool_calls": [edit, preview]}], state, versions)
+    assert not _preview_seen(
+        [{"composition_state_id": "old", "tool_calls": [{**edit, "applied_state_version": None}, preview]}], state, versions
+    )
+
+
+def test_preview_survives_post_compose_and_metadata_only_saves() -> None:
+    # Captured live ordering: preview(v4), post_compose(v5), metadata(v6),
+    # post_compose(v7). The executable pipeline did not change after preview.
+    messages = [
+        {
+            "composition_state_id": "v4",
+            "tool_calls": [{"function": {"name": "preview_pipeline"}, "outcome": "completed", "wire_conformant": True}],
+        },
+        {
+            "composition_state_id": "v5",
+            "tool_calls": [{"function": {"name": "set_metadata"}, "outcome": "applied", "applied_state_version": 6}],
+        },
+    ]
+    versions = [_preview_state(f"v{i}", i) for i in range(4, 8)]
+    versions[2]["metadata"]["description"] = "Three characters"
+    versions[3]["metadata"] = versions[2]["metadata"]
+    assert _preview_seen(messages, versions[-1], versions)
+
+
+@pytest.mark.parametrize("changed", ["nodes", "sources", "edges", "outputs", "source_order", "branch_order"])
+def test_preview_cannot_cover_changed_executable_content(changed: str) -> None:
+    before = _preview_state("previewed", 1)
+    before["sources"]["second"] = {"plugin": "csv", "options": {"blob_ref": "second-blob"}}
+    before["nodes"].append({"id": "join", "node_type": "coalesce", "branches": {"left": "left_done", "right": "right_done"}})
+    final = deepcopy(before)
+    final.update(id="final", version=2)
+    if changed == "nodes":
+        final["nodes"][0]["options"]["fields"]["note"] = 4
+    elif changed == "sources":
+        final["sources"]["input"]["options"]["blob_ref"] = "different-blob"
+    elif changed == "edges":
+        final["edges"] = [{"from_node": "trim", "to_node": "cleaned", "edge_type": "on_error"}]
+    elif changed == "outputs":
+        final["outputs"][0]["options"]["path"] = "other.csv"
+    elif changed == "source_order":
+        final["sources"] = dict(reversed(list(final["sources"].items())))
+    else:
+        final["nodes"][1]["branches"] = {"right": "right_done", "left": "left_done"}
+    messages = [
+        {
+            "composition_state_id": "previewed",
+            "tool_calls": [{"function": {"name": "preview_pipeline"}, "outcome": "completed", "wire_conformant": True}],
+        }
+    ]
+    assert not _preview_seen(messages, final, [before, final])
+
+
+def test_preview_rejects_missing_or_foreign_history() -> None:
+    state = _preview_state("current", 1)
+    messages = [
+        {
+            "composition_state_id": "current",
+            "tool_calls": [{"function": {"name": "preview_pipeline"}, "outcome": "completed", "wire_conformant": True}],
+        }
+    ]
+    assert not _preview_seen(messages, state, [])
+    with pytest.raises(ValueError, match="another session"):
+        _preview_seen(messages, state, [{**state, "session_id": "other"}])
+    with pytest.raises(ValueError, match="duplicate identities"):
+        _preview_seen(messages, state, [state, state])
+
+
+def test_preview_option_dictionary_key_order_is_not_executable_order() -> None:
+    before = _preview_state("old", 1)
+    before["nodes"][0]["options"]["suffix"] = ""
+    final = deepcopy(before)
+    final.update(id="final", version=2)
+    final["nodes"][0]["options"] = dict(reversed(list(final["nodes"][0]["options"].items())))
+    messages = [
+        {
+            "composition_state_id": "old",
+            "tool_calls": [{"function": {"name": "preview_pipeline"}, "outcome": "completed", "wire_conformant": True}],
+        }
+    ]
+    assert _preview_seen(messages, final, [before, final])
+
+
+class HistoryApi(ApiClient):
+    def __init__(self) -> None:
+        super().__init__("http://127.0.0.1:18473")
+        self.paths: list[str] = []
+
+    def json(self, path: str, body: dict | None = None):
+        self.paths.append(path)
+        assert body is None
+        if path.endswith("offset=0"):
+            return [_preview_state(f"v{i}", i) for i in range(200)]
+        assert path.endswith("offset=200")
+        return [_preview_state("last", 200)]
+
+
+def test_preview_history_fetches_all_version_pages() -> None:
+    api = HistoryApi()
+    versions = runner._state_versions(api, "/api/sessions/session-test")
+    assert len(versions) == 201
+    assert versions[-1]["id"] == "last"
+    assert len(api.paths) == 2
 
 
 class TimeoutApi(ApiClient):
@@ -245,7 +371,7 @@ def test_custom_fixture_mutation_during_execution_cannot_pass(tmp_path: Path, mo
 
     def changed_fixture_evidence(output, out, scenario, state, run):
         runner.save(fixture, {**case, "title": "changed while running"})
-        return _evidence(scenario, state, run)
+        return {**_evidence(scenario, state, run), "sink_effects": []}
 
     monkeypatch.setattr(runner, "runtime_evidence", changed_fixture_evidence)
     result = run_case(api, case, tmp_path, set(), fixture)
@@ -293,6 +419,9 @@ def test_collector_reads_only_run_bound_runtime_calls_and_physical_blobs(tmp_pat
     request_ref = store.store(json.dumps({"model": "actual-model", "messages": ["not copied into capture"]}).encode())
     with sqlite3.connect(data / "runs" / "audit.db") as db:
         db.executescript("""
+            CREATE TABLE sink_effects(effect_id TEXT,artifact_id TEXT,sink_node_id TEXT,stream_id TEXT,stream_sequence INTEGER,predecessor_effect_id TEXT,state TEXT,run_id TEXT);
+            INSERT INTO sink_effects VALUES ('effect','artifact','sink','stream',0,NULL,'finalized','landscape');
+            INSERT INTO sink_effects VALUES ('foreign-effect','foreign-artifact','sink','stream',1,'effect','finalized','foreign');
             CREATE TABLE rows(row_id TEXT,row_index INTEGER,run_id TEXT);
             CREATE TABLE tokens(token_id TEXT,row_id TEXT,run_id TEXT,join_group_id TEXT);
             CREATE TABLE token_parents(token_id TEXT,parent_token_id TEXT,run_id TEXT,ordinal INTEGER);
@@ -312,6 +441,7 @@ def test_collector_reads_only_run_bound_runtime_calls_and_physical_blobs(tmp_pat
     scenario = {"inputs": [{"filename": "input.csv", "content": content}]}
     run = {"run_id": "run", "landscape_run_id": "landscape", "session_id": "session"}
     evidence = measured_runtime_evidence(tmp_path, out, scenario, state, run)
+    assert [effect["effect_id"] for effect in evidence["sink_effects"]] == ["effect"]
     assert [call["call_id"] for call in evidence["runtime_calls"]] == ["runtime"]
     assert evidence["composition_state_id"] == "executed-state"
     assert evidence["composition_state_id"] != state["id"]

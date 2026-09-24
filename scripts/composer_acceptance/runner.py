@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any
 
+from scripts.composer_acceptance.artifacts import current_artifacts
 from scripts.composer_acceptance.checks import check_case
 from scripts.composer_acceptance.serve import fingerprint
 
@@ -108,19 +109,51 @@ def _pending_reviews(api: ApiClient, prefix: str, out: Path, scenario: dict[str,
     return remaining
 
 
-def _preview_seen(messages: list[dict[str, Any]], state_id: str) -> bool:
-    for message in reversed(messages):
-        for call in reversed(message.get("tool_calls") or []):
+def _preview_seen(messages: list[dict[str, Any]], state: dict[str, Any], versions: list[dict[str, Any]]) -> bool:
+    """Bind successful previews to executable content, including ordered maps.
+
+    Turn settlement and metadata updates create new state IDs without changing
+    the executable graph. Assistant messages bind the start of a tool batch;
+    an applied tool's version advances that binding for subsequent calls.
+    """
+    from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+
+    def executable(snapshot: dict[str, Any]) -> str:
+        return composer_authority_canonical_json({key: snapshot[key] for key in ("sources", "nodes", "edges", "outputs")})
+
+    by_id = {snapshot["id"]: snapshot for snapshot in versions}
+    by_version = {snapshot["version"]: snapshot for snapshot in versions}
+    if len(by_id) != len(versions) or len(by_version) != len(versions):
+        raise ValueError("Composition history contains duplicate identities")
+    if any(snapshot["session_id"] != state["session_id"] for snapshot in versions):
+        raise ValueError("Composition history belongs to another session")
+    current = by_id.get(state["id"])
+    if current is None or executable(current) != executable(state):
+        return False
+    expected = executable(state)
+    for message in messages:
+        bound = by_id.get(message.get("composition_state_id"))
+        for call in message.get("tool_calls") or []:
             if call.get("outcome") == "applied":
-                return False
+                bound = by_version.get(call.get("applied_state_version"))
             if (
-                message.get("composition_state_id") == state_id
+                bound is not None
                 and call.get("function", {}).get("name") == "preview_pipeline"
                 and call.get("outcome") == "completed"
                 and call.get("wire_conformant") is True
+                and executable(bound) == expected
             ):
                 return True
     return False
+
+
+def _state_versions(api: ApiClient, prefix: str) -> list[dict[str, Any]]:
+    versions: list[dict[str, Any]] = []
+    while True:
+        page = api.json(prefix + f"/state/versions?limit=200&offset={len(versions)}")
+        versions.extend(page)
+        if len(page) < 200:
+            return versions
 
 
 def assert_frozen(output: Path) -> str:
@@ -176,6 +209,10 @@ def runtime_evidence(output: Path, out: Path, scenario: dict[str, Any], state: d
 
     try:
         evidence: dict[str, Any] = {
+            "sink_effects": rows(
+                "SELECT effect_id,artifact_id,sink_node_id,stream_id,stream_sequence,predecessor_effect_id,state "
+                "FROM sink_effects WHERE run_id=?"
+            ),
             "source_rows": rows("SELECT row_id,row_index FROM rows WHERE run_id=?"),
             "tokens": rows("SELECT token_id,row_id,run_id,join_group_id FROM tokens WHERE run_id=?"),
             "token_parents": rows("SELECT token_id,parent_token_id,run_id,ordinal FROM token_parents WHERE run_id=?"),
@@ -345,11 +382,14 @@ def run_case(
                 continue
             messages = api.json(prefix + "/messages?include_raw_content=true")
             save(out / "messages.json", messages)
-            if not _preview_seen(messages, state["id"]) and not checkpoint["preview_requested"]:
+            versions = _state_versions(api, prefix)
+            save(out / "state-versions.json", versions)
+            preview_seen = _preview_seen(messages, state, versions)
+            if not preview_seen and not checkpoint["preview_requested"]:
                 checkpoint["preview_requested"] = True
                 send("Call preview_pipeline to verify this finished pipeline. Do not change its structure or options.")
                 continue
-            if not _preview_seen(messages, state["id"]):
+            if not preview_seen:
                 return publish("failed", failures=["No successful preview of the final pipeline state"])
             publish("execute_requested")
             execution = api.json(prefix + "/execute", {})
@@ -367,8 +407,11 @@ def run_case(
             return publish("runtime_failed", failures=["Execution did not finish within 600 seconds"])
         manifest = api.json("/api/runs/" + run_id + "/outputs")
         save(out / "outputs.json", manifest)
+        state = api.json(prefix + "/state")
+        save(out / "state.json", state)
+        evidence = runtime_evidence(output, out, scenario, state, run)
         outputs = {}
-        for artifact in manifest["artifacts"]:
+        for artifact in current_artifacts(manifest["artifacts"], evidence["sink_effects"]):
             filename = Path(artifact["path_or_uri"]).name
             if filename in outputs:
                 raise ValueError("Duplicate artifact basenames cannot be matched to the scenario")
@@ -376,9 +419,6 @@ def run_case(
             outputs[filename] = content
             (out / "artifacts").mkdir(exist_ok=True)
             (out / "artifacts" / filename).write_bytes(content)
-        state = api.json(prefix + "/state")
-        save(out / "state.json", state)
-        evidence = runtime_evidence(output, out, scenario, state, run)
         failures = check_case(scenario, state=state, run=run, outputs=outputs, evidence=evidence)
         return publish(
             "failed" if failures else "passed",
