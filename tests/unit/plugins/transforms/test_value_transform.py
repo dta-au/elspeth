@@ -12,6 +12,8 @@ from tests.fixtures.pipeline import build_linear_pipeline
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.plugins.transforms.value_transform import ValueTransform
 
 OBSERVED_SCHEMA_CONFIG = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -903,9 +905,10 @@ class TestComposerHintsMatchSandboxReality:
 class TestValueTransformNestedResults:
     """A nested result is a value the output contract types ``any`` (elspeth-5887fb7928 AC-R3).
 
-    Every operation target is already declared ``any`` by the output schema
-    (``declare_missing_guaranteed_fields``), and a source types a nested JSON
-    value ``object``. The per-row contract used to refuse such a value with a
+    Every operation target the node's schema does not type is declared ``any``
+    by the output schema (``declare_missing_guaranteed_fields``), and a source
+    types a nested JSON value ``object``. A target the schema DOES type is
+    pinned to that type: see ``TestValueTransformPinsDeclaredTargets``. The per-row contract used to refuse such a value with a
     raw ``TypeError`` from ``SchemaContract.with_field``, which aborted the run
     (exit 4) on the ordinary copy of a JSON array or object.
     """
@@ -991,6 +994,191 @@ class TestValueTransformNestedResults:
         assert out_field is not None
         assert (out_field.python_type, out_field.nullable, out_field.required) == (object, True, True)
         assert result.row.contract.validate(result.row.to_dict()) == []
+
+
+class TestValueTransformPinsDeclaredTargets:
+    """A target the node's schema types is pinned to that type on output (elspeth-5887fb7928 AC-R3).
+
+    The authored declaration is carried into the output schema config
+    (``declare_missing_guaranteed_fields`` never modifies it), graph
+    validation resolves the target's type from it, and the ADR-014 output
+    check compares every emitted row against it. A computed value that did
+    not satisfy it used to reach that check and abort the run (exit 4,
+    ``SchemaConfigModeViolation``), in fixed and flexible mode alike. It is
+    now that row's ``type_mismatch`` error, naming the target and the two type
+    names only; a value that satisfies the pin is emitted carrying the
+    declared metadata, which the ADR-014 check accepts.
+    """
+
+    ARRIVING_FIELDS: ClassVar[list[str]] = ["id: int", "a: int", "b: int"]
+
+    @pytest.fixture
+    def ctx(self) -> "PluginContext":
+        return make_source_context()
+
+    @staticmethod
+    def _row() -> "PipelineRow":
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.testing import make_field
+
+        fields = (
+            make_field("id", int, required=True, source="declared"),
+            make_field("a", int, original_name="A", required=True, source="declared"),
+            make_field("b", int, required=True, source="declared"),
+        )
+        return make_row({"id": 1, "a": 10, "b": 20}, contract=SchemaContract(mode="FIXED", fields=fields, locked=True))
+
+    @staticmethod
+    def _assert_adr014_accepts(transform: "ValueTransform", emitted: "PipelineRow") -> None:
+        from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+        assert transform._output_schema_config is not None
+        verify_schema_config_mode(
+            output_schema_config=transform._output_schema_config,
+            emitted_rows=[emitted],
+            plugin_name=transform.name,
+            node_id="node",
+            run_id="run",
+            row_id="row",
+            token_id="token",
+        )
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    @pytest.mark.parametrize(
+        ("expression", "actual"),
+        [
+            ("[row['a']]", "list"),
+            ("{'v': row['a']}", "dict"),
+            ("(row['a'], row['b'])", "tuple"),
+            ("'x'", "str"),
+            ("None", "NoneType"),
+            ("row['a'] / 3", "float"),
+        ],
+    )
+    def test_a_value_that_breaks_the_pin_is_a_value_free_row_error(
+        self, ctx: "PluginContext", mode: str, expression: str, actual: str
+    ) -> None:
+        import json
+
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": mode, "fields": self.ARRIVING_FIELDS}, "operations": [{"target": "a", "expression": expression}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "type_mismatch",
+            "field": "a",
+            "expected": "int",
+            "actual": actual,
+            "message": (
+                f"Operation target 'a' computed a value of type {actual}, but this node's schema declares it int. "
+                "Declare the target 'any' (or the scalar type it computes) to store it."
+            ),
+        }
+        # The row's values (a=10, b=20) never reach the audit reason.
+        rendered = json.dumps(result.reason)
+        assert "10" not in rendered
+        assert "20" not in rendered
+
+    def test_an_optional_pin_admits_none_and_names_it_when_broken(self, ctx: "PluginContext") -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        schema = {"mode": "fixed", "fields": ["id: int", "a: int?", "b: int"]}
+        admits = ValueTransform({"schema": schema, "operations": [{"target": "a", "expression": "None"}]})
+        result = admits.process(self._row(), ctx)
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["a"] is None
+        self._assert_adr014_accepts(admits, result.row)
+
+        breaks = ValueTransform({"schema": schema, "operations": [{"target": "a", "expression": "[row['a']]"}]})
+        broken = breaks.process(self._row(), ctx)
+        assert broken.status == "error"
+        assert broken.reason is not None
+        assert broken.reason["message"] == (
+            "Operation target 'a' computed a value of type list, but this node's schema declares it int (or None). "
+            "Declare the target 'any' (or the scalar type it computes) to store it."
+        )
+
+    @pytest.mark.parametrize(
+        ("fields", "operations", "target", "expected"),
+        [
+            # Same-type overwrite: the arriving int is replaced by an int.
+            (["id: int", "a: int", "b: int"], [{"target": "a", "expression": "row['a'] + 1"}], "a", 11),
+            # A declared CREATED target whose value satisfies its declaration
+            # (previously aborted too: the inferred field was not required).
+            (["id: int", "a: int", "b: int", "total: float"], [{"target": "total", "expression": "row['a'] / 4"}], "total", 2.5),
+            # The pin binds the EMITTED value: a later operation may restore it.
+            (
+                ["id: int", "a: int", "b: int"],
+                [{"target": "a", "expression": "[row['a']]"}, {"target": "a", "expression": "len(row['a'])"}],
+                "a",
+                1,
+            ),
+            # An undeclared target pins nothing, even under mode: fixed.
+            (["id: int", "a: int", "b: int"], [{"target": "pair", "expression": "[row['a'], row['b']]"}], "pair", [10, 20]),
+            # Declared 'any' pins nothing.
+            (["id: int", "a: any", "b: int"], [{"target": "a", "expression": "[row['a']]"}], "a", [10]),
+        ],
+    )
+    def test_a_value_that_satisfies_the_pin_is_emitted_and_passes_the_output_check(
+        self,
+        ctx: "PluginContext",
+        fields: list[str],
+        operations: list[dict[str, str]],
+        target: str,
+        expected: object,
+    ) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform({"schema": {"mode": "fixed", "fields": fields}, "operations": operations})
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert result.row.to_dict()[target] == expected
+        self._assert_adr014_accepts(transform, result.row)
+
+    @pytest.mark.parametrize("fields", [["id: int", "a: int", "b: int"], ["id: int", "a: int", "b: int", "maybe: any"]])
+    def test_an_any_target_keeps_its_inferred_nullability(self, ctx: "PluginContext", fields: list[str]) -> None:
+        """An 'any' declaration (authored, or added for an undeclared target) pins nothing.
+
+        Its emitted field keeps the inferred metadata, so a None result stays
+        nullable rather than being stamped with the declaration's defaults.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": "fixed", "fields": fields}, "operations": [{"target": "maybe", "expression": "None"}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        field = result.row.contract.find_field("maybe")
+        assert field is not None
+        assert (field.python_type, field.nullable) == (object, True)
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_the_pinned_field_keeps_its_original_name(self, ctx: "PluginContext") -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": "fixed", "fields": self.ARRIVING_FIELDS}, "operations": [{"target": "a", "expression": "row['a'] * 2"}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.row is not None
+        field = result.row.contract.find_field("a")
+        assert field is not None
+        assert (field.python_type, field.required, field.nullable, field.original_name) == (int, True, False, "A")
 
 
 class TestValueTransformRejectsSetResults:

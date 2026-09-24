@@ -2,13 +2,17 @@
 
 Applies expressions to compute new or modified field values.
 
-A computed value is written as evaluated, never coerced. Its contract type is
-inferred by the one inference rule (``infer_field_type``): a scalar keeps its
-type, and a nested object or array (a field copy such as ``row['meta']``, or a
-list/tuple/dict literal) is typed ``any``, as the declared output schema already
-declares every operation target. An expression whose value can be a set is
-rejected at construction: a set has no canonical order to emit. An expression
-that fails to evaluate on a row returns that row as an error.
+A computed value is written as evaluated, never coerced. A target the node's
+schema does not type is inferred by the one inference rule
+(``infer_field_type``): a scalar keeps its type, and a nested object or array (a
+field copy such as ``row['meta']``, or a list/tuple/dict literal) is typed
+``any``, as the declared output schema declares every such target. A target the
+schema DOES type (``fields: ["a: int"]`` with ``target: a``) is pinned to that
+type on output: a row whose computed value does not satisfy it is returned as a
+``type_mismatch`` error naming the target and both type names, never the value.
+An expression whose value can be a set is rejected at construction: a set has
+no canonical order to emit. An expression that fails to evaluate on a row
+returns that row as an error.
 """
 
 from __future__ import annotations
@@ -80,6 +84,30 @@ def _retype_contract_field(
         nullable=field.nullable or nullable,
     )
     new_fields = tuple(retyped if f.normalized_name == field.normalized_name else f for f in contract.fields)
+    return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
+
+
+def _pin_contract_field(contract: SchemaContract, pinned: FieldContract) -> SchemaContract:
+    """Return a contract whose ``pinned.normalized_name`` field carries the declared metadata.
+
+    The emitted field keeps its original name and provenance, and takes its
+    type, requiredness and nullability from the node's declaration: the
+    metadata the ADR-014 output check compares a declared field against.
+    Called only after the value has satisfied ``pinned``.
+    """
+    new_fields = tuple(
+        FieldContract(
+            normalized_name=f.normalized_name,
+            original_name=f.original_name,
+            python_type=pinned.python_type,
+            required=pinned.required,
+            source=f.source,
+            nullable=pinned.nullable,
+        )
+        if f.normalized_name == pinned.normalized_name
+        else f
+        for f in contract.fields
+    )
     return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
 
 
@@ -355,7 +383,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b044c849faeb8da8"
+    source_file_hash: str | None = "sha256:e45fbb4c22b9900f"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -398,6 +426,18 @@ class ValueTransform(BaseTransform):
         self._self_created_input_fields = cfg.created_before_read_targets()
 
         self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
+
+        # Targets the authored schema TYPES are pinned to that type on output.
+        # The declaration is read from the output config through the same
+        # builder the ADR-014 output check uses, so the pin and the check
+        # cannot disagree; an undeclared target is declared 'any' there and
+        # pins nothing.
+        pinned_fields = tuple(
+            field
+            for field in create_contract_from_config(self._output_schema_config).fields
+            if field.normalized_name in self._configured_targets and field.python_type is not object
+        )
+        self._pinned_targets = SchemaContract(mode="FLEXIBLE", fields=pinned_fields, locked=True)
 
         self.input_schema = create_schema_from_config(
             cfg.schema_config,
@@ -451,11 +491,16 @@ class ValueTransform(BaseTransform):
 
         declared_fields = declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result)
         if declared_fields is not None:
-            # Expressions may overwrite an input with any supported value,
-            # including None. Presence is guaranteed; the input type is not
-            # an output proof and expression result types are not inferred.
+            # Every target is written, so its presence is guaranteed. A target
+            # the operator TYPED keeps that declaration: it is the output type
+            # the pin below enforces on the computed value (ADR-050, operator >
+            # plugin > any). Every other target is 'any' and nullable: an
+            # expression's result type is not knowable from its text, and an
+            # expression may compute None.
             declared_fields = tuple(
-                replace(field, field_type="any", required=True, nullable=True) if field.name in self._configured_targets else field
+                replace(field, field_type="any", required=True, nullable=True)
+                if field.name in self._configured_targets and field.field_type == "any"
+                else field
                 for field in declared_fields
             )
 
@@ -549,6 +594,33 @@ class ValueTransform(BaseTransform):
                 # they never need retyping.
                 working_contract = _retype_contract_field(working_contract, existing_field, result)
 
+        # A target the node's schema types is pinned to that type: the emitted
+        # row must satisfy the declaration downstream validation relies on. A
+        # computed value that does not is this row's error, routed to on_error
+        # — never coerced, and never an abort of the run. The reason names the
+        # target and the two type names only.
+        pinned_values = {field.normalized_name: working_data[field.normalized_name] for field in self._pinned_targets.fields}
+        violations = self._pinned_targets.validate(pinned_values)
+        if violations:
+            pinned = self._pinned_targets.get_field(violations[0].normalized_name)
+            expected_name = pinned.python_type.__name__
+            actual_name = classify_runtime_type(pinned_values[pinned.normalized_name]).__name__
+            return TransformResult.error(
+                {
+                    "reason": "type_mismatch",
+                    "field": pinned.normalized_name,
+                    "expected": expected_name,
+                    "actual": actual_name,
+                    "message": (
+                        f"Operation target '{pinned.normalized_name}' computed a value of type {actual_name}, "
+                        f"but this node's schema declares it {expected_name}{'' if pinned.required and not pinned.nullable else ' (or None)'}. "
+                        f"Declare the target 'any' (or the scalar type it computes) to store it."
+                    ),
+                }
+            )
+        for pinned in self._pinned_targets.fields:
+            working_contract = _pin_contract_field(working_contract, pinned)
+
         output_contract = self._align_output_contract(self._reconcile_forwarded_contract(working_contract))
         return TransformResult.success(
             PipelineRow(working_data, output_contract),
@@ -585,11 +657,11 @@ class ValueTransform(BaseTransform):
                     "NOT achievable here: regex (pattern extraction, splitting), title-casing, and method-call syntax "
                     "(row['x'].lower() is rejected; use lower(row['x'])). Only len, abs, lower, upper, strip, casefold "
                     "are callable. Route text rewriting beyond case folding through an llm transform.",
-                    "A value_transform node's schema: block declares what ARRIVES at the node (its pre-transform input), "
-                    "never an expression's computed result — declaring the output type on the node's own schema authors an "
-                    "unsatisfiable input contract that is rejected at the edge.",
-                    "Computed targets guarantee presence, but their output types are not inferred. Before a typed consumer, "
-                    "use type_coerce to validate or normalize the computed fields to the required types.",
+                    "A value_transform node's schema: block declares what ARRIVES at the node, and a target it types is "
+                    "pinned to that type on output: a row whose computed value is another type goes to on_error. To change a "
+                    "declared field's type, declare it 'any' there.",
+                    "A target the schema does not type guarantees presence, but its output type is 'any' (never inferred from "
+                    "a row). Before a typed consumer, use type_coerce to validate or normalize the computed field.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
                     "A result may be nested (row['meta'], or a list, tuple or dict literal); its field is typed 'any'. A set "
