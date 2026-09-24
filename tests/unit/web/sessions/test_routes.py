@@ -8239,7 +8239,7 @@ transforms:
   on_error: discard
   options:
     model: anthropic/claude-haiku-4.5
-    prompt_template: '{{ (3**(3**15)) % 7 }}'
+    prompt_template: '{{ (3**(3**16)) % 7 }}'
 sinks:
   main:
     plugin: csv
@@ -8249,21 +8249,41 @@ sinks:
 """
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            loop = asyncio.get_running_loop()
+            loop_gaps: list[float] = []
+            watching = True
+
+            async def watch_loop() -> None:
+                previous = loop.time()
+                while watching:
+                    await asyncio.sleep(0.02)
+                    now = loop.time()
+                    loop_gaps.append(now - previous)
+                    previous = now
+
+            watcher = asyncio.create_task(watch_loop())
+            await asyncio.sleep(0)
             import_task = asyncio.create_task(client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text}))
             try:
-                for _ in range(200):
-                    if entered.is_set():
-                        break
-                    await asyncio.sleep(0.01)
-                assert entered.is_set()
-                assert not import_task.done()
-                started = asyncio.get_running_loop().time()
-                response = await client.get("/api/health")
-                assert asyncio.get_running_loop().time() - started < 0.5
-                assert response.json() == {"status": "ok"}
+                try:
+                    for _ in range(200):
+                        if entered.is_set():
+                            break
+                        await asyncio.sleep(0.01)
+                    assert entered.is_set()
+                    assert not import_task.done()
+                    started = asyncio.get_running_loop().time()
+                    response = await client.get("/api/health")
+                    assert asyncio.get_running_loop().time() - started < 0.5
+                    assert response.json() == {"status": "ok"}
+                finally:
+                    release.set()
+                imported = await import_task
             finally:
+                watching = False
                 release.set()
-            imported = await import_task
+                await watcher
+            assert max(loop_gaps, default=0.0) < 1.0
         assert imported.status_code < 500
 
     @pytest.mark.asyncio

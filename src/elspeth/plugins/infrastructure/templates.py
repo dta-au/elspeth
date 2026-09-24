@@ -14,9 +14,11 @@ import math
 import multiprocessing
 import os
 import pickle
+import queue
 import resource
 import sys
 import threading
+from atexit import register as register_exit
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,7 @@ from typing import Any, cast
 from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
 from jinja2.compiler import CodeGenerator
 from jinja2.exceptions import SecurityError, TemplateRuntimeError, UndefinedError
-from jinja2.meta import find_undeclared_variables
+from jinja2.meta import TrackingCodeGenerator
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.utils import missing, object_type_repr
 from jinja2.visitor import NodeVisitor
@@ -48,11 +50,13 @@ _MAX_CONTEXT_NODES = 65536
 # address size that depends on which web/test modules Python imported.
 _MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
 _WORKER_TIMEOUT_SECONDS = 5.0
-# The two workers bound CPU and memory use. Ordinary concurrent rows may queue
-# behind one another, so their bounded admission wait is longer than a single
-# worker's execution deadline.
-_WORKER_QUEUE_TIMEOUT_SECONDS = 30.0
+# Two reusable workers bound CPU and memory use. An ordinary row waits for a
+# slot instead of becoming a template error when the host is busy.
 _WORKER_SLOTS = threading.BoundedSemaphore(2)
+_AVAILABLE_WORKERS: queue.SimpleQueue[int] = queue.SimpleQueue()
+for _worker_index in range(2):
+    _AVAILABLE_WORKERS.put(_worker_index)
+_WORKERS: list[tuple[multiprocessing.Process, Any] | None] = [None, None]
 
 
 def _charge_row_export(value: Any, budget: list[int], *, depth: int = 0) -> None:
@@ -79,6 +83,25 @@ class _NoFoldCodeGenerator(CodeGenerator):
         if type(node) is nodes.TemplateData:
             return super()._output_child_to_const(node, frame, finalize)
         raise nodes.Impossible()
+
+    def visit_EvalContextModifier(self, node: nodes.EvalContextModifier, frame: Any) -> None:
+        for keyword in node.options:
+            self.writeline(f"context.eval_ctx.{keyword.key} = ")
+            self.visit(keyword.value, frame)
+            if type(keyword.value) is nodes.Const:
+                setattr(frame.eval_ctx, keyword.key, keyword.value.value)
+            else:
+                frame.eval_ctx.volatile = True
+
+
+class _NoFoldTrackingCodeGenerator(_NoFoldCodeGenerator, TrackingCodeGenerator):
+    """Use Jinja's symbol analysis without its constant-folding compiler."""
+
+    def __init__(self, environment: ImmutableSandboxedEnvironment) -> None:
+        super().__init__(environment)
+        # TrackingCodeGenerator hard-codes optimized=True even when its
+        # environment has optimized=False. Disable that second folding path.
+        self.optimizer = None
 
 
 class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
@@ -197,15 +220,30 @@ def _check_template_source(source: str) -> None:
         raise TemplateError(str(exc)) from exc
 
 
-def _template_worker(connection: Any, source: str, payload: bytes, value_free: bool) -> None:
-    """Render in a process with an OS memory/CPU ceiling."""
+def _template_worker(connection: Any) -> None:
+    """Serve bounded renders until the parent closes the pipe or retires us."""
     try:
         baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
         max_address_space = baseline_pages * os.sysconf("SC_PAGE_SIZE") + _MAX_WORKER_ADDRESS_GROWTH
         resource.setrlimit(resource.RLIMIT_AS, (max_address_space, max_address_space))
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+        while True:
+            try:
+                source, payload, value_free = connection.recv()
+            except EOFError:
+                raise SystemExit(0) from None
+            # RLIMIT_CPU is cumulative over a process lifetime. Give each
+            # request two more CPU seconds, keeping the inherited hard bound.
+            _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
+            connection.send(_render_in_worker(source, payload, value_free))
+    finally:
+        connection.close()
+
+
+def _render_in_worker(source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
+    try:
         context = pickle.loads(payload)
         if type(context) is not dict or any(type(key) is not str for key in context):
             raise TemplateError("Template worker received an invalid context")
@@ -223,16 +261,13 @@ def _template_worker(connection: Any, source: str, payload: bytes, value_free: b
             if size > _MAX_RENDER_BYTES:
                 raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
             pieces.append(piece)
-        connection.send(("ok", "".join(pieces)))
+        return "ok", "".join(pieces)
     except _ValueFreeUndefinedError as exc:
-        connection.send(("safe_undefined", str(exc)[:1024]))
-        raise SystemExit(1) from exc
+        return "safe_undefined", str(exc)[:1024]
     except _ValueFreeUnsafeAccessError as exc:
-        connection.send(("safe_security", str(exc)[:1024]))
-        raise SystemExit(1) from exc
+        return "safe_security", str(exc)[:1024]
     except _UndefinedContractError as exc:
-        connection.send(("undefined_contract", str(exc)[:1024]))
-        raise SystemExit(1) from exc
+        return "undefined_contract", str(exc)[:1024]
     except (
         TemplateError,
         TemplateSyntaxError,
@@ -245,27 +280,60 @@ def _template_worker(connection: Any, source: str, payload: bytes, value_free: b
         ValueError,
     ) as exc:
         # Keep the protocol bounded and do not pickle a third-party exception.
-        connection.send((type(exc).__name__, type(exc).__name__ if value_free else str(exc)[:1024]))
-        raise SystemExit(1) from exc
-    finally:
-        connection.close()
+        return type(exc).__name__, type(exc).__name__ if value_free else str(exc)[:1024]
+
+
+def _retire_worker(index: int) -> None:
+    entry = _WORKERS[index]
+    _WORKERS[index] = None
+    if entry is None:
+        return
+    process, connection = entry
+    connection.close()
+    if process.is_alive():
+        process.kill()
+    if process.pid is not None:
+        process.join()
+
+
+def _stop_template_workers() -> None:
+    for index in range(len(_WORKERS)):
+        _retire_worker(index)
+
+
+register_exit(_stop_template_workers)
 
 
 def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
-    process_context = multiprocessing.get_context("spawn")
-    parent, child = process_context.Pipe(duplex=False)
-    process: Any = None
+    index = _AVAILABLE_WORKERS.get_nowait()
     try:
-        process = cast("Any", process_context).Process(target=_template_worker, args=(child, source, payload, value_free))
-        process.start()
-        child.close()
-        if not parent.poll(_WORKER_TIMEOUT_SECONDS):
-            raise TemplateError("Template exceeded the execution time limit")
+        entry = _WORKERS[index]
+        if entry is None or not entry[0].is_alive():
+            _retire_worker(index)
+            process_context = multiprocessing.get_context("spawn")
+            parent, child = process_context.Pipe(duplex=True)
+            process = cast("Any", process_context).Process(target=_template_worker, args=(child,))
+            process.daemon = True
+            try:
+                process.start()
+            except BaseException:
+                parent.close()
+                child.close()
+                raise
+            child.close()
+            _WORKERS[index] = (process, parent)
+            entry = (process, parent)
+        process, parent = entry
         try:
+            parent.send((source, payload, value_free))
+            if not parent.poll(_WORKER_TIMEOUT_SECONDS):
+                _retire_worker(index)
+                raise TemplateError("Template exceeded the execution time limit")
             status, value = parent.recv()
-        except EOFError as exc:
+        except (EOFError, BrokenPipeError) as exc:
+            _retire_worker(index)
             raise TemplateError("Template worker stopped before completing") from exc
         if status == "ok":
             if type(value) is not str:
@@ -285,6 +353,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
             if status == "TemplateError":
                 raise TemplateError("Template rendering failed: TemplateError (message withheld: it can quote row data)")
             if status == "MemoryError":
+                _retire_worker(index)
                 raise TemplateError("Template worker exceeded the memory limit")
             raise TemplateError(f"Template rendering failed: {value} (message withheld: it can quote row data)")
         if status == "TemplateSyntaxError":
@@ -296,15 +365,11 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         if status == "TemplateError":
             raise TemplateError(value)
         if status == "MemoryError":
+            _retire_worker(index)
             raise TemplateError("Template worker exceeded the memory limit")
         raise TemplateRuntimeError(value)
     finally:
-        parent.close()
-        child.close()
-        if process is not None and process.is_alive():
-            process.kill()
-        if process is not None and process.pid is not None:
-            process.join()
+        _AVAILABLE_WORKERS.put(index)
 
 
 class _BoundedTemplate:
@@ -314,8 +379,7 @@ class _BoundedTemplate:
 
     def render(self, **context: Any) -> str:
         _check_template_source(self._source)
-        if not _WORKER_SLOTS.acquire(timeout=_WORKER_QUEUE_TIMEOUT_SECONDS):
-            raise TemplateError("Too many concurrent template workers")
+        _WORKER_SLOTS.acquire()
         try:
             transport = _pack_context_value(context)
             return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=self._value_free)
@@ -330,7 +394,9 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
 
     def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
         _check_template_source(source)
-        return super().parse(source, name=name, filename=filename)
+        ast = super().parse(source, name=name, filename=filename)
+        _check_template_ast(ast)
+        return ast
 
     def from_string(
         self,
@@ -342,12 +408,7 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
             raise TemplateError("Custom template globals and classes are unsupported")
         if type(source) is not str:
             raise TemplateError("Pre-parsed Jinja templates are unsupported")
-        _check_template_source(source)
-        ast = super().parse(source)
-        if sum(1 for _ in ast.find_all(nodes.Node)) > 2048:
-            raise TemplateError("Template AST exceeds 2048 nodes")
-        if next(ast.find_all(nodes.Pow), None) is not None:
-            raise TemplateError("Power expressions are not supported in pipeline templates")
+        ast = self.parse(source)
         # Jinja's stock compiler folds authored constants here. This
         # environment disables that path, so syntax validation is bounded by
         # the source/AST limits and does not wait for a child on the web loop.
@@ -357,6 +418,16 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
         if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):
             return compiled
         return cast("Template", _BoundedTemplate(source, value_free=self._value_free))
+
+
+def _check_template_ast(ast: nodes.Template) -> None:
+    if sum(1 for _ in ast.find_all(nodes.Node)) > 2048:
+        raise TemplateError("Template AST exceeds 2048 nodes")
+    if next(ast.find_all(nodes.Pow), None) is not None:
+        raise TemplateError("Power expressions are not supported in pipeline templates")
+    for modifier in ast.find_all(nodes.EvalContextModifier):
+        if any(type(option.value) is not nodes.Const or type(option.value.value) is not bool for option in modifier.options):
+            raise TemplateError("Template autoescape requires a literal boolean")
 
 
 def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:
@@ -547,7 +618,12 @@ def find_runtime_unbound_variables(ast: nodes.Template) -> frozenset[str]:
     runs. Keep Jinja's conservative candidate set, then remove a candidate only
     when a path- and order-sensitive walk proves it bound at every load.
     """
-    candidates = frozenset(find_undeclared_variables(ast))
+    if type(ast.environment) is not _BoundedEnvironment:
+        raise TemplateError("Template name discovery requires a bounded environment")
+    _check_template_ast(ast)
+    tracker = _NoFoldTrackingCodeGenerator(ast.environment)
+    tracker.visit(ast)
+    candidates = frozenset(tracker.undeclared_identifiers)
     analyzer = _DefiniteBindingAnalyzer(candidates)
     analyzer.analyze(ast.body, frozenset())
     return frozenset(analyzer.unbound | (candidates - analyzer.seen))

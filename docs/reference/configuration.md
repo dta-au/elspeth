@@ -1090,6 +1090,10 @@ Options common to all providers:
 | `recovery_step_ms` | int | No | `50` | Delay reduction applied after a success |
 | `max_capacity_retry_seconds` | int | No | `3600` | Per-row ceiling on retrying capacity errors |
 
+Pipeline Jinja templates reject power expressions (`**`). An `{% autoescape %}`
+block accepts only a literal `true` or `false`; an expression in that position
+is rejected during configuration validation.
+
 `provider: azure` adds:
 
 | Option | Type | Required | Default | Description |

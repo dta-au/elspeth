@@ -60,7 +60,7 @@ from elspeth.core.config import (
 from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
-from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
     describe_undeclared_row_fields,
     undeclared_row_fields,
@@ -4047,7 +4047,7 @@ def _parse_template_names(template: str) -> tuple[PromptTemplateNames | None, st
     try:
         ast = create_sandboxed_environment().parse(masked)
         usage = extract_jinja2_field_usage(masked)
-    except TemplateSyntaxError as exc:
+    except (TemplateError, TemplateSyntaxError) as exc:
         return None, str(exc)
     return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=usage.fields), None
 

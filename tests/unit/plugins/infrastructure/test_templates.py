@@ -2,11 +2,12 @@
 
 import pickle
 import threading
+import time
 from collections import namedtuple
 from types import MappingProxyType
 
 import pytest
-from jinja2 import TemplateSyntaxError
+from jinja2 import TemplateSyntaxError, nodes
 
 from elspeth.contracts.freeze import FrozenJsonArray
 from elspeth.plugins.infrastructure import templates as template_infrastructure
@@ -70,18 +71,32 @@ def test_context_transport_limits_unique_parent_work(monkeypatch: pytest.MonkeyP
         template_infrastructure._pack_context_value({"items": [{"value": i} for i in range(9)]})
 
 
-def test_saturated_template_workers_refuse_after_bounded_queue_wait(monkeypatch: pytest.MonkeyPatch):
+def test_saturated_template_workers_wait_without_classifying_a_good_row_as_bad(monkeypatch: pytest.MonkeyPatch):
     slot = threading.BoundedSemaphore(1)
     monkeypatch.setattr(template_infrastructure, "_WORKER_SLOTS", slot)
-    monkeypatch.setattr(template_infrastructure, "_WORKER_QUEUE_TIMEOUT_SECONDS", 0.01)
     template = create_sandboxed_environment().from_string("{{ row.text }}")
+    slot.acquire()
 
-    def packing_must_not_run(_context: object) -> object:
-        raise AssertionError("saturated render packed its context")
+    def release_slot() -> None:
+        time.sleep(0.05)
+        slot.release()
 
-    monkeypatch.setattr(template_infrastructure, "_pack_context_value", packing_must_not_run)
-    with slot, pytest.raises(TemplateError, match="Too many concurrent template workers"):
-        template.render(row={"text": "hello"})
+    releaser = threading.Thread(target=release_slot)
+    releaser.start()
+    try:
+        assert template.render(row={"text": "hello"}) == "hello"
+    finally:
+        releaser.join()
+
+
+def test_render_workers_are_reused_between_rows() -> None:
+    template = create_sandboxed_environment().from_string("{{ row.text }}")
+    for _ in range(2):
+        assert template.render(row={"text": "hello"}) == "hello"
+    initial_pids = {entry[0].pid for entry in template_infrastructure._WORKERS if entry is not None}
+    for _ in range(6):
+        assert template.render(row={"text": "hello"}) == "hello"
+    assert {entry[0].pid for entry in template_infrastructure._WORKERS if entry is not None} == initial_pids
 
 
 def test_context_transport_rejects_oversized_mapping_key_before_serialization():
@@ -154,10 +169,46 @@ def test_template_source_limits_apply_before_parse_and_compile():
         env.from_string(oversized)
 
 
+def test_name_discovery_and_compilation_never_fold_authored_expressions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.infrastructure.templates import find_runtime_unbound_variables
+
+    calls = 0
+    original = nodes.BinExpr.as_const
+
+    def count_fold(node: nodes.BinExpr, eval_ctx: object = None) -> object:
+        nonlocal calls
+        calls += 1
+        return original(node, eval_ctx)
+
+    monkeypatch.setattr(nodes.BinExpr, "as_const", count_fold)
+    env = create_sandboxed_environment()
+    source = "{{ ('x' * 100)|length }}{{ row.name }}"
+    ast = env.parse(source)
+    assert find_runtime_unbound_variables(ast) == frozenset({"row"})
+    env.from_string(source)
+    assert calls == 0
+
+
+def test_parse_rejects_power_and_dynamic_autoescape_before_name_discovery() -> None:
+    env = create_sandboxed_environment()
+    with pytest.raises(TemplateError, match="Power expressions"):
+        env.parse("{{ (3**(3**15)) % 7 }}")
+    with pytest.raises(TemplateError, match="autoescape requires a literal boolean"):
+        env.parse("{% autoescape ('x' * 1000000000)|length > 0 %}{{ row.name }}{% endautoescape %}")
+    template = env.from_string("{% autoescape true %}{{ row.name }}{% endautoescape %}")
+    assert template.render(row={"name": "<unsafe>"}) == "&lt;unsafe&gt;"
+
+
 def test_render_output_is_bounded():
     env = create_sandboxed_environment()
     template = env.from_string("{{ row.text * 5000000 }}")
     with pytest.raises(TemplateError, match="Rendered template exceeds"):
+        template.render(row={"text": "x"})
+
+
+def test_worker_memory_limit_catches_allocation_without_large_output() -> None:
+    template = create_sandboxed_environment().from_string("{{ (row.text * 320000000)|length }}")
+    with pytest.raises(TemplateError, match="memory limit"):
         template.render(row={"text": "x"})
 
 
