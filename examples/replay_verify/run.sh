@@ -15,7 +15,7 @@
 #
 #   a. replay_from names a run that does not exist        -> refused, exit 1
 #   b. an execution setting differs from the recorded run  -> refused, exit 4
-#   c. a page changes after the recording, then verify     -> mismatch, exit 4
+#   c. a page changes after the recording, then verify     -> mismatch, exit 2
 #
 # The script exits 0 only when every step behaved as described. Replay and
 # verify never write the configured sinks, so output/pages.jsonl must still be
@@ -113,7 +113,7 @@ fatal_reason() {  # label
     "$PYTHON" - "$RUNS/$1.err" <<'PY'
 import json, sys
 for line in open(sys.argv[1], encoding="utf-8"):
-    if line.startswith('{"event": "fatal"'):
+    if line.startswith('{"event": "fatal"') or line.startswith('{"event": "verification_mismatch"'):
         event = json.loads(line)
         print(f"{event['error_type']}: {event['error']}")
         break
@@ -227,7 +227,7 @@ grep -q 'timeout: 20$' "$RUNS/settings_drifted.yaml" || fail "could not introduc
 run_pipeline "$RUNS/settings_drifted.yaml" refuse_drift
 [ "$RC" -ne 0 ] || fail "replay with drifted settings exited 0"
 DRIFT_REASON="$(fatal_reason refuse_drift)"
-[ "$DRIFT_REASON" = "AuditIntegrityError: Replay execution settings differ from the source run" ] \
+[ "$DRIFT_REASON" = "AuditIntegrityError: Replay execution settings differ from the source run at settings.transforms" ] \
     || fail "drift refusal gave an unexpected reason: '$DRIFT_REASON' (see $RUNS/refuse_drift.err)"
 echo "  $DRIFT_REASON"
 echo ""
@@ -242,7 +242,7 @@ grep -q "three-year warranty" "$RUNS/pages_changed/warranty.html" || fail "could
 start_server "$RUNS/pages_changed"
 run_pipeline "$RUNS/settings_verify.yaml" verify_changed_page
 CHANGED_RUN="$RUN_ID"
-[ "$RC" -ne 0 ] || fail "verify against a changed page exited 0"
+[ "$RC" -eq 2 ] || fail "verify against a changed page exited $RC, expected 2 (verification mismatch)"
 [ -n "$CHANGED_RUN" ] || fail "verify against a changed page recorded no run"
 [ "$(sha256sum "$OUTPUT" | cut -d' ' -f1)" = "$LIVE_SHA" ] || fail "failed verify changed $OUTPUT"
 MISMATCHES="$(scalar "SELECT COUNT(*) FROM call_verifications
@@ -250,7 +250,7 @@ MISMATCHES="$(scalar "SELECT COUNT(*) FROM call_verifications
 [ "$MISMATCHES" -ge 1 ] || fail "verify against a changed page recorded no mismatch verdict"
 CHANGED_REASON="$(fatal_reason verify_changed_page)"
 case "$CHANGED_REASON" in
-    *"differs from the source run"*) echo "  $CHANGED_REASON" ;;
+    "VerificationMismatchError: "*"differs from the source run"*) echo "  $CHANGED_REASON" ;;
     *) fail "changed-page verify gave an unexpected reason: '$CHANGED_REASON'" ;;
 esac
 [ "$(scalar "SELECT status FROM runs WHERE run_id = ?" "$CHANGED_RUN")" = "failed" ] \

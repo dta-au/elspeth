@@ -163,12 +163,12 @@ current hashes.
 | Case | Result | Real message |
 |------|--------|--------------|
 | `replay_from` names a run that does not exist | exit 1, before any run is recorded | `Configuration error: Replay/verify source run 'no-such-run' does not exist` |
-| Any execution setting differs from the recorded run (here `http.timeout: 10` changed to `20`) | exit 4, before any plugin starts | `AuditIntegrityError: Replay execution settings differ from the source run` |
-| Verify after a page changed (`two-year` changed to `three-year` in a copy of `warranty.html`) | exit 4, run recorded as `failed`, a `call_verifications` row with `is_match = 0` | `OrchestrationInvariantError: replay sink output differs from the source run` |
+| Any execution setting differs from the recorded run (here `http.timeout: 10` changed to `20`) | exit 4, before any plugin starts | `AuditIntegrityError: Replay execution settings differ from the source run at settings.transforms` |
+| Verify after a page changed (`two-year` changed to `three-year` in a copy of `warranty.html`) | **exit 2** (a verification verdict, not an integrity failure), run recorded as `failed`, a `call_verifications` row with `is_match = 0` | `VerificationMismatchError: Verify sink output differs from the source run` |
 
 The code also refuses the following. `run.sh` does not exercise these:
 
-- `concurrency.max_workers` other than 1 (`Replay/verify requires concurrency.max_workers=1`).
+- A replay or verify run with `concurrency.max_workers` other than 1 (`Replay/verify requires concurrency.max_workers=1`). The *recorded* live run may use any worker count: the worker count is ignored when the settings are compared.
 - `depends_on`, `collection_probes`, `commencement_gates`, Landscape export,
   telemetry exporters and Key Vault secrets.
 - A source run that did not complete, or a changed graph, plugin version or
@@ -184,45 +184,26 @@ The code also refuses the following. `run.sh` does not exercise these:
 `replay_from` that names a missing run. Source-run admission happens at
 `elspeth run`.
 
-## Why the fixture server strips the `Date` header
+## Why the fixture server is byte-deterministic
 
-Verify compares each response **exactly**, headers included. `serve_pages.py`
-sends only `Content-Type` and `Content-Length`, so an unchanged page returns
-an identical response every time. **This example verifies cleanly only because
-the fixture is byte-deterministic by construction.** An ordinary web server,
-ChaosLLM or a real LLM provider changes something on every response (`Date`,
-a response `id`, a `created` timestamp). Verify records every call against
-them as a mismatch. See limitation 2 below.
+Verify compares each response with the recording, but ignores fields that change on every response by design:
+
+- for any HTTP call, the `Date` header;
+- for OpenAI-shaped chat-completion calls, the response `id` and `created`, `Content-Length` and the raw body size and encoding.
+
+Everything else must match exactly. That list is a fixed set of named fields, so a server that varies any *other* field on every response, such as a request-id header, `Set-Cookie`, a CDN trace header or a rate-limit counter, is still recorded as a mismatch. `serve_pages.py` sends only `Content-Type` and `Content-Length`, so an unchanged page verifies cleanly and a changed page is the only way to get `is_match = 0`.
 
 ## Known limitations (0.8.1)
 
-These describe how the code behaves today. They are not workarounds for this
-example to paper over.
+These describe how the code behaves today.
 
-1. **Replay through the OpenRouter LLM provider always refuses.** The run
-   fails with `AuditIntegrityError: Replayed semantic LLM response differs from
-   its source call`, even against a clean recording. The recorded evidence is
-   deep-frozen (tuples and mappingproxies), and the freshly rebuilt response is
-   plain lists and dicts. `provider.py` compares the two directly, so any
-   response containing a list (`choices` always does) never compares equal.
-   The gateway provider probably has the same problem. The Azure provider path
-   (SDK-based) is the one covered by the end-to-end test. This is why this
-   example uses `web_scrape` rather than an LLM.
-2. **Verify never matches a real LLM or HTTP server.** The comparison is exact
-   and includes per-response fields such as the OpenAI-shaped `id` and
-   `created`, and the HTTP `Date` header. Against ChaosLLM, OpenRouter or any
-   origin that sends `Date`, every call is recorded as `is_match = 0`, and
-   verify exits 4.
-3. **The live run must already use `concurrency.max_workers: 1`.** Replay and
-   verify require one worker, and every setting other than `run_mode` and
-   `replay_from` must equal the recorded run's. A live run made with the
-   default worker count can therefore never be replayed. `settings.yaml` sets
-   `max_workers: 1` for this reason.
-4. **A verify mismatch is a fatal error, not a report.** It exits 4 and prints
-   a traceback (`OrchestrationInvariantError` or `AuditIntegrityError`). With
-   `--format json`, the `run_completed` event reports `"exit_code": 2` while
-   the process exits 4. The verdict rows are still written before the failure.
-   The fatal message for a verify run says "replay sink output differs".
+1. **`elspeth validate` does not check `replay_from`.** It checks only the shape of the settings and exits 0 for a `replay_from` that names no run. The refusal comes at `elspeth run` (refusal a above).
+2. **The verdicts are reachable only by SQL.** Neither `elspeth explain`, the TUI nor the Landscape MCP tools read `call_verifications`, and the audit export does not include it. `run.sh` queries the table directly.
+3. **Replay and verify runs record a `sink_write` operation** even though they never write the configured sinks (the sink payload is compared, not written). `output/pages.jsonl` is unchanged by them, which `run.sh` checks by hash.
+4. **Verify's list of ignored fields is fixed** (see the section above). Against a real web origin or LLM provider that varies other response fields, verify reports mismatches even when the content is the same.
+5. An all-digit run ID must be quoted in YAML (`replay_from: "12345"`); unquoted it is read as a number and refused with `Replay/verify requires a literal replay_from run ID`.
+
+Earlier drafts of this example listed four more limitations. They were fixed in `release/0.8.1`, and this example asserts the fixed behaviour: OpenRouter/gateway LLM replay now matches its recording; verify ignores `Date`, `id` and `created`; a live run made with the default worker count can be replayed; and a verify mismatch exits 2 with `VerificationMismatchError` instead of a FATAL exit 4.
 
 ## Files
 
