@@ -1375,12 +1375,16 @@ def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
     Scope is TRANSFORM nodes only, and the honest reason is narrower than
     "aggregations cannot hit this". ``AggregationExecutor.execute_flush``
     indeed runs no centralized collision check — but two aggregation-eligible
-    plugins HAND-ROLL the identical one in their own bodies and raise the same
-    message: ``batch_replicate`` (batch_replicate.py:273-279, and it ships
-    wired under ``aggregations:`` in examples/deaggregation/settings.yaml) and
-    ``batch_outlier_annotator`` (batch_outlier_annotator.py:278-286). So an
-    aggregation-wired instance of those DOES have a runtime failure, and this
-    check does not pre-empt it.
+    plugins that write onto their input rows check it themselves:
+    ``batch_replicate`` (``copy_index``; it ships wired under
+    ``aggregations:`` in examples/deaggregation/settings.yaml) and
+    ``batch_outlier_annotator`` (its annotation fields). Each refuses an
+    explicit schema declaring one of its output fields at construction, and a
+    buffered row that already carries one fails the WHOLE batch with a
+    ``field_collision`` batch error (``BatchRowFieldCollisionError``), routed
+    through the aggregation's ``on_error`` like any failed batch. So an
+    aggregation-wired instance of those DOES have a runtime failure path, and
+    this check does not pre-empt it.
 
     Widening is deliberately left out of elspeth-cfcd333f83 because it needs a
     soundness argument this one does not have, not because the failure is

@@ -853,7 +853,6 @@ class TransformErrorReason(TypedDict):
     operation: NotRequired[str]
     batch_size: NotRequired[int]  # Total rows in batch
     group_by: NotRequired[str]  # Grouping field for grouped batch errors
-    group_value: NotRequired[Any]  # Group value for grouped batch errors
     valid_count: NotRequired[int]  # Rows that passed validation within batch
     queries_completed: NotRequired[int]
     row_errors: NotRequired[list[RowErrorEntry]]
@@ -862,7 +861,6 @@ class TransformErrorReason(TypedDict):
     errors: NotRequired[list[str | ErrorDetail]]  # Error messages or structured errors
     skipped_non_finite: NotRequired[int]  # Count of NaN/Inf values skipped
     skipped_non_finite_indices: NotRequired[list[int]]  # Row indices with non-finite values
-    duplicate_pair_ids: NotRequired[list[str]]  # Pair IDs with duplicate variant entries (B4.5-e)
 
 
 class SourceQuarantineReason(TypedDict):

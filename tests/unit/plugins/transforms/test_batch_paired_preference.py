@@ -210,6 +210,30 @@ class TestBatchPairedPreference:
         assert "control_arm_q7" not in rendered
         assert "treatment_arm_q7" not in rendered
 
+    def test_overflowed_aggregate_returns_a_value_free_transform_error(self, ctx: PluginContext) -> None:
+        """Every pair's delta is finite but a mean over them is not: the reason names no variant.
+
+        The reason carries the operation and the configured field only. The
+        variant labels (row content) are neither ``group_value`` nor ``value``.
+        """
+        from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
+
+        transform = BatchPairedPreference(
+            {"schema": DYNAMIC_SCHEMA, "pair_field": "case_id", "variant_field": "variant", "score_field": "score"}
+        )
+
+        rows = [
+            _make_row({"case_id": case_id, "variant": variant, "score": 1e308})
+            for case_id in ("case_r1", "case_r2")
+            for variant in ("control_arm_r1", "treatment_arm_r1")
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason == {"reason": "float_overflow", "operation": "baseline_mean", "field": "score"}
+
     def test_non_numeric_score_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
         """A wrong-typed score fails the BATCH with a value-free reason (elspeth-d5034647f0).
 
