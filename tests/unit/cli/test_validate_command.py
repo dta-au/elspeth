@@ -109,8 +109,14 @@ class TestValidateCommand:
             f"Expected 'Pipeline configuration valid' in output, got: {result.stdout}"
         )
 
-    def test_validate_allows_export_enabled_post_run_sink(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Export sink should be excluded from execution-graph validation."""
+    @pytest.mark.parametrize(
+        ("serialization_version", "expected_exit"),
+        [(None, 0), ("audit-export-v3", 0), ("audit-export-v2", 1), ("audit-export-v4", 1)],
+    )
+    def test_validate_export_enabled_post_run_sink(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serialization_version: str | None, expected_exit: int
+    ) -> None:
+        """Export config must be executable, without adding its sink to the graph."""
         # The export spool/content-store roots are code-owned and CWD-relative
         # by contract (absolute paths are rejected), so run from tmp_path to
         # keep .elspeth/audit-export-* out of the checkout.
@@ -175,13 +181,23 @@ class TestValidateCommand:
                 },
             },
         }
+        if serialization_version is not None:
+            config["landscape"]["export"]["serialization_version"] = serialization_version
         config_file = tmp_path / "export_enabled.yaml"
         config_file.write_text(yaml.dump(config))
 
         result = runner.invoke(app, ["validate", "-s", str(config_file)])
 
-        assert result.exit_code == 0, result.output
-        assert "pipeline configuration valid" in result.stdout.lower()
+        assert result.exit_code == expected_exit, result.output
+        if expected_exit == 0:
+            assert "pipeline configuration valid" in result.stdout.lower()
+        else:
+            assert "serialization_version" in result.output
+            assert "audit-export-v3" in result.output
+            assert "pipeline configuration valid" not in result.stdout.lower()
+            assert not (tmp_path / "audit.db").exists()
+            assert not (tmp_path / "output.json").exists()
+            assert not (tmp_path / "audit_export.json").exists()
 
     def test_validate_allows_null_secrets_section(self, tmp_path: Path) -> None:
         """A null secrets section should behave like an omitted section."""

@@ -531,6 +531,20 @@ class TestLandscapeExportSettings:
         assert settings.export.enabled is False
         assert settings.export.format == "csv"
         assert settings.export.sign is False
+        assert settings.export.serialization_version == "audit-export-v3"
+
+    @pytest.mark.parametrize("version", ["audit-export-v2", "audit-export-v4"])
+    def test_landscape_export_rejects_unsupported_serialization(self, version: str) -> None:
+        from elspeth.core.config import LandscapeExportSettings
+
+        with pytest.raises(ValidationError, match="serialization_version"):
+            LandscapeExportSettings(serialization_version=version)
+
+    def test_landscape_export_accepts_current_serialization(self) -> None:
+        from elspeth.core.config import LandscapeExportSettings
+
+        settings = LandscapeExportSettings(serialization_version="audit-export-v3")
+        assert settings.serialization_version == "audit-export-v3"
 
     def test_landscape_export_config_with_sink(self) -> None:
         """Export config should accept sink reference."""

@@ -1630,7 +1630,7 @@ class LandscapeExportSettings(BaseModel):
     exporter_version: Literal["landscape-exporter-auth-v2"] = "landscape-exporter-auth-v2"
     auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
     compartment_id: str | None = None
-    serialization_version: str = Field(default="audit-export-v3", min_length=1, max_length=64)
+    serialization_version: Literal["audit-export-v3"] = "audit-export-v3"
     chunking_algorithm_version: str = Field(default="record-framing-v1", min_length=1, max_length=64)
     include_raw_error_rows: bool = False
     total_record_limit: int | None = Field(default=None, gt=0, le=AUDIT_EXPORT_MAX_TOTAL_RECORDS)
