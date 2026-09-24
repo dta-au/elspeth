@@ -385,6 +385,24 @@ class TestValueTransformAsATypedConsumer:
         assert SENTINEL not in json.dumps(reason)
 
 
+def test_a_field_mapper_rename_of_a_declared_field_is_not_re_adjudicated(tmp_path: Path) -> None:
+    """A rename target carries the input value the strict input check admitted: ``int`` under ``float`` is delivered.
+
+    ``carried_output_fields()`` names are never produced (``declared_output_types``):
+    the projected ``total: float`` declaration and the exact-type value check
+    would otherwise route a valid row as a transform fault (measured on
+    ad01df079: exit 2, both rows quarantined; pre-ADR-050 2c41e123e: exit 0).
+    """
+    _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "amount": 5}, {"id": 2, "amount": 7}])
+    transform = _fm(schema={"mode": "flexible", "fields": ["id: int", "amount: float"]}, mapping={"amount": "total"})
+    result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "total": 5}, {"id": 2, "total": 7}]
+    assert _transform_error_reasons(tmp_path) == []
+    assert _outcomes(tmp_path) == {("success", "default_flow"): 2}
+
+
 class TestNulls:
     """T6: None is presence, not a type — the declaration decides."""
 

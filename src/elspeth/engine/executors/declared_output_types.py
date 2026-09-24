@@ -13,7 +13,10 @@ Two seams call it, and they differ ONLY in which fields count as produced:
   it under pydantic's rules, which accept an ``int`` or a ``Decimal`` for a
   ``float`` field where ``SchemaContract.validate`` compares exact types, and
   a resumed row legitimately carries a type-faithful ``Decimal`` under its
-  ``float`` declaration.
+  ``float`` declaration. For the same reason a ``carried_output_fields()``
+  name is never produced: its value is an input field's value copied under a
+  new name (a field_mapper rename), already admitted by the input check, and
+  the completeness contract exempts the same names.
 * ``verify_created_output_types`` — the batch-flush seam
   (``batch_contract_validation.validate_success_outputs``, shared by the
   aggregation and collector executors). A reductive output row (a statistics
@@ -70,7 +73,7 @@ def verify_produced_output_types(
     _verify_declared_types(
         transform,
         emitted_rows,
-        produced=lambda created, emitted, name: value_produced(input_row, emitted, name),
+        produced=lambda created, carried, emitted, name: name not in carried and value_produced(input_row, emitted, name),
     )
 
 
@@ -80,20 +83,21 @@ def verify_created_output_types(
     emitted_rows: Sequence[PipelineRow],
 ) -> None:
     """Batch-flush seam: check every declared concrete-typed field the transform creates."""
-    _verify_declared_types(transform, emitted_rows, produced=lambda created, emitted, name: name in created)
+    _verify_declared_types(transform, emitted_rows, produced=lambda created, carried, emitted, name: name in created)
 
 
 def _verify_declared_types(
     transform: TransformProtocol | BatchTransformProtocol,
     emitted_rows: Sequence[PipelineRow],
     *,
-    produced: Callable[[frozenset[str], PipelineRow, str], bool],
+    produced: Callable[[frozenset[str], frozenset[str], PipelineRow, str], bool],
 ) -> None:
-    """The one check; ``produced`` decides, given the transform's created set, which emitted fields it produced."""
+    """The one check; ``produced`` decides, given the created and carried sets, which emitted fields the transform produced."""
     if transform._output_schema_config is None:
         return
     declaring = require_output_declaring_plugin(transform)
     created = declaring.declared_output_fields | frozenset(definition.name for definition in declaring.created_output_fields())
+    carried = declaring.carried_output_fields()
 
     for emitted_index, emitted in enumerate(emitted_rows):
         emitted_values = emitted.to_dict()
@@ -103,7 +107,7 @@ def _verify_declared_types(
             if fc.source == "declared"
             and fc.python_type is not object
             and fc.normalized_name in emitted_values
-            and produced(created, emitted, fc.normalized_name)
+            and produced(created, carried, emitted, fc.normalized_name)
         )
         if not produced_fields:
             continue

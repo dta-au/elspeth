@@ -104,7 +104,10 @@ rows meet.**
    check admitted it under pydantic's rules (which accept an `int` or a
    `Decimal` for `float`, where `SchemaContract.validate` compares exact
    types), and a resumed row legitimately carries a type-faithful `Decimal`
-   under its `float` declaration. A violation raises
+   under its `float` declaration. For the same reason a
+   `carried_output_fields()` name (a field_mapper rename target) is never
+   produced: its value is the input field's value under a new name, and the
+   completeness contract exempts the same names. A violation raises
    `DeclaredOutputTypeViolation(PluginContractViolation)`, routed through
    `on_error` like every Tier-2 violation, with a reason that carries the
    field, both type names, the emitted index and an **authorship bit** —
