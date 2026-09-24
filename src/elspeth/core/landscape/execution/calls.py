@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -23,7 +24,7 @@ from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
 from elspeth.contracts.audit import CallVerification, validate_approved_prompt_artifact_hash
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.enums import RunMode
+from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -75,6 +76,20 @@ class _PreparedCallData(NamedTuple):
     response_bytes: bytes | None
 
 
+class _LineageParent(NamedTuple):
+    parent_token_id: str
+    ordinal: int
+    run_id: str
+
+
+class _LineageEvidence(NamedTuple):
+    run_id: str
+    row_id: str
+    join_group_id: str | None
+    parents: tuple[_LineageParent, ...]
+    has_frame: bool
+
+
 def _reject_non_finite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value!r}")
 
@@ -101,6 +116,12 @@ class CallAuditRepository:
         self._operation_call_indices: dict[str, int] = {}
         self._pending_call_indices: set[tuple[str, int]] = set()
         self._pending_operation_call_indices: set[tuple[str, int]] = set()
+        # Source runs are immutable once completed. Retain a small number of
+        # validated source-row indexes across sibling call lookups; live runs
+        # are never cached. The limit bounds repository lifetime memory.
+        self._source_parent_indices: OrderedDict[tuple[str, str, int, int, str, int], dict[str, tuple[str, ...]]] = OrderedDict()
+        self._source_parent_index_lock = Lock()
+        self._source_parent_index_limit = 16
 
     def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         """Allocate a proposal only for this worker's current claimed state."""
@@ -983,7 +1004,14 @@ class CallAuditRepository:
             return None
         return self._call_loader.load(row)
 
-    def _token_lineage_hash(self, token_id: str, run_id: str, row_id: str) -> str:
+    def _token_lineage_hash(
+        self,
+        token_id: str,
+        run_id: str,
+        row_id: str,
+        *,
+        evidence_cache: dict[str, _LineageEvidence] | None = None,
+    ) -> str:
         """Normalize durable parent ordinals, never run-local token/group IDs.
 
         A fork/expansion's sole parent relation carries its member ordinal;
@@ -994,6 +1022,8 @@ class CallAuditRepository:
         """
         memo: dict[str, str] = {}
         visiting: set[str] = set()
+        if evidence_cache is None:
+            evidence_cache = {}
 
         def walk(current_id: str, depth: int) -> str:
             if current_id in visiting:
@@ -1004,15 +1034,38 @@ class CallAuditRepository:
                 return memo[current_id]
             if len(memo) + len(visiting) >= MAX_LINEAGE_NODES_PER_MEMBER:
                 raise AuditIntegrityError("call parent token lineage exceeds node bound")
-            token = self._ops.execute_fetchone(select(tokens_table).where(tokens_table.c.token_id == current_id))
-            if token is None or token.run_id != run_id or token.row_id != row_id:
+            evidence = evidence_cache.get(current_id)
+            if evidence is None:
+                token = self._ops.execute_fetchone(select(tokens_table).where(tokens_table.c.token_id == current_id))
+                if token is None:
+                    raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
+                raw_parents = self._ops.execute_fetchall(
+                    select(token_parents_table)
+                    .where(token_parents_table.c.token_id == current_id)
+                    .order_by(token_parents_table.c.ordinal)
+                    .limit(MAX_LINEAGE_PARENTS + 1)
+                )
+                has_frame = False
+                if not raw_parents:
+                    has_frame = (
+                        self._ops.execute_fetchone(
+                            select(token_lineage_frames_table.c.token_id)
+                            .where(token_lineage_frames_table.c.token_id == current_id)
+                            .limit(1)
+                        )
+                        is not None
+                    )
+                evidence = _LineageEvidence(
+                    run_id=token.run_id,
+                    row_id=token.row_id,
+                    join_group_id=token.join_group_id,
+                    parents=tuple(_LineageParent(parent.parent_token_id, parent.ordinal, parent.run_id) for parent in raw_parents),
+                    has_frame=has_frame,
+                )
+                evidence_cache[current_id] = evidence
+            if evidence.run_id != run_id or evidence.row_id != row_id:
                 raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
-            parents = self._ops.execute_fetchall(
-                select(token_parents_table)
-                .where(token_parents_table.c.token_id == current_id)
-                .order_by(token_parents_table.c.ordinal)
-                .limit(MAX_LINEAGE_PARENTS + 1)
-            )
+            parents = evidence.parents
             if len(parents) > MAX_LINEAGE_PARENTS:
                 raise AuditIntegrityError("call parent token lineage exceeds parent bound")
             ordinals = [parent.ordinal for parent in parents]
@@ -1022,12 +1075,8 @@ class CallAuditRepository:
                 raise AuditIntegrityError("call parent token lineage has non-dense parent ordinals")
             if len({parent.parent_token_id for parent in parents}) != len(parents):
                 raise AuditIntegrityError("call parent token lineage repeats a parent")
-            if not parents:
-                frame = self._ops.execute_fetchone(
-                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.token_id == current_id).limit(1)
-                )
-                if token.join_group_id is not None or frame is not None:
-                    raise AuditIntegrityError("call parent token claims lineage without parent relations")
+            if not parents and (evidence.join_group_id is not None or evidence.has_frame):
+                raise AuditIntegrityError("call parent token claims lineage without parent relations")
             visiting.add(current_id)
             identity = stable_hash([(parent.ordinal, walk(parent.parent_token_id, depth + 1)) for parent in parents])
             visiting.remove(current_id)
@@ -1036,6 +1085,77 @@ class CallAuditRepository:
 
         return walk(token_id, 0)
 
+    def _source_parent_index(
+        self,
+        *,
+        source_run_id: str,
+        node_id: str,
+        step_index: int,
+        attempt: int,
+        source_node_id: str,
+        source_row_index: int,
+    ) -> dict[str, tuple[str, ...]]:
+        """Index every matching source parent before considering call fields.
+
+        A completed run's audit rows cannot change through repository writes.
+        For a still-running source (used by direct repository callers), build
+        afresh so subsequent writes remain visible. The small LRU also keeps
+        unrelated source rows from accumulating for the repository's lifetime.
+        """
+        key = (source_run_id, node_id, step_index, attempt, source_node_id, source_row_index)
+        run = self._ops.execute_fetchone(select(runs_table.c.status, runs_table.c.completed_at).where(runs_table.c.run_id == source_run_id))
+        completed = (
+            run is not None
+            and run.status
+            in {
+                RunStatus.COMPLETED.value,
+                RunStatus.COMPLETED_WITH_FAILURES.value,
+                RunStatus.EMPTY.value,
+            }
+            and run.completed_at is not None
+        )
+        if completed:
+            with self._source_parent_index_lock:
+                cached = self._source_parent_indices.get(key)
+                if cached is not None:
+                    self._source_parent_indices.move_to_end(key)
+                    return cached
+
+        parent_query = (
+            select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
+            .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+            .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+            .where(
+                node_states_table.c.run_id == source_run_id,
+                node_states_table.c.node_id == node_id,
+                node_states_table.c.step_index == step_index,
+                node_states_table.c.attempt == attempt,
+                rows_table.c.source_node_id == source_node_id,
+                rows_table.c.source_row_index == source_row_index,
+                rows_table.c.run_id == source_run_id,
+            )
+        )
+        source_parents = self._ops.execute_fetchall(parent_query)
+        evidence_cache: dict[str, _LineageEvidence] = {}
+        token_hashes = {
+            parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id, evidence_cache=evidence_cache)
+            for parent in {parent.token_id: parent for parent in source_parents}.values()
+        }
+        grouped: dict[str, list[str]] = {}
+        for parent in source_parents:
+            grouped.setdefault(token_hashes[parent.token_id], []).append(parent.state_id)
+        index = {lineage: tuple(state_ids) for lineage, state_ids in grouped.items()}
+        if completed:
+            with self._source_parent_index_lock:
+                existing = self._source_parent_indices.get(key)
+                if existing is not None:
+                    self._source_parent_indices.move_to_end(key)
+                    return existing
+                self._source_parent_indices[key] = index
+                if len(self._source_parent_indices) > self._source_parent_index_limit:
+                    self._source_parent_indices.popitem(last=False)
+        return index
+
     def list_source_calls_for_current_parent(
         self,
         *,
@@ -1043,6 +1163,7 @@ class CallAuditRepository:
         call_type: CallType,
         current_state_id: str | None,
         current_operation_id: str | None,
+        call_index: int | None = None,
     ) -> list[Call]:
         """List source calls bound to the current parent identity.
 
@@ -1075,33 +1196,22 @@ class CallAuditRepository:
             if current.row_run_id != current.run_id:
                 raise AuditIntegrityError("current call parent has a cross-run source row")
             current_lineage = self._token_lineage_hash(current.token_id, current.run_id, current.row_id)
-            parent_query = (
-                select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
-                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
-                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
-                .where(
-                    node_states_table.c.run_id == source_run_id,
-                    node_states_table.c.node_id == current.node_id,
-                    node_states_table.c.step_index == current.step_index,
-                    node_states_table.c.attempt == current.attempt,
-                    rows_table.c.source_node_id == current.source_node_id,
-                    rows_table.c.source_row_index == current.source_row_index,
-                    rows_table.c.run_id == source_run_id,
-                )
+            source_index = self._source_parent_index(
+                source_run_id=source_run_id,
+                node_id=current.node_id,
+                step_index=current.step_index,
+                attempt=current.attempt,
+                source_node_id=current.source_node_id,
+                source_row_index=current.source_row_index,
             )
-            source_parents = self._ops.execute_fetchall(parent_query)
-            source_lineages = {
-                parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id)
-                for parent in {parent.token_id: parent for parent in source_parents}.values()
-            }
-            matching_parents = [parent for parent in source_parents if source_lineages[parent.token_id] == current_lineage]
+            matching_parents = source_index.get(current_lineage, ())
             # Identity is a property of the parent, independent of whether its
             # calls have the requested type, request hash or local index.
             if len(matching_parents) > 1:
                 raise AuditIntegrityError("ambiguous source call parent token lineage")
             if not matching_parents:
                 return []
-            query = select(calls_table).where(calls_table.c.state_id == matching_parents[0].state_id)
+            query = select(calls_table).where(calls_table.c.state_id == matching_parents[0])
         else:
             current = self._ops.execute_fetchone(
                 select(
@@ -1125,9 +1235,10 @@ class CallAuditRepository:
             )
             if current.operation_type in ("source_load", "runtime_preflight") and current.occurrence_index is not None:
                 query = query.where(operations_table.c.occurrence_index == current.occurrence_index)
-        candidates = self._ops.execute_fetchall(
-            query.where(calls_table.c.call_type == call_type).order_by(calls_table.c.call_index, calls_table.c.call_id)
-        )
+        query = query.where(calls_table.c.call_type == call_type)
+        if call_index is not None:
+            query = query.where(calls_table.c.call_index == call_index)
+        candidates = self._ops.execute_fetchall(query.order_by(calls_table.c.call_index, calls_table.c.call_id))
         return [self._call_loader.load(row) for row in candidates]
 
     def find_call_for_current_parent(
@@ -1150,6 +1261,7 @@ class CallAuditRepository:
                 call_type=call_type,
                 current_state_id=current_state_id,
                 current_operation_id=current_operation_id,
+                call_index=current_call_index,
             )
             if call.call_index == current_call_index and (request_hash is None or call.request_hash == request_hash)
         ]
