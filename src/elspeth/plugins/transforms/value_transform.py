@@ -2,8 +2,13 @@
 
 Applies expressions to compute new or modified field values.
 
-IMPORTANT: Transforms use allow_coercion=False to catch upstream bugs.
-If the source outputs wrong types, the transform crashes immediately.
+A computed value is written as evaluated, never coerced. Its contract type is
+inferred by the one inference rule (``infer_field_type``): a scalar keeps its
+type, and a nested object or array (a field copy such as ``row['meta']``, or a
+list/tuple/dict literal) is typed ``any``, as the declared output schema already
+declares every operation target. An expression whose value can be a set is
+rejected at construction: a set has no canonical order to emit. An expression
+that fails to evaluate on a row returns that row as an error.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
-from elspeth.contracts.type_normalization import classify_runtime_type, require_supported_contract_type
+from elspeth.contracts.type_normalization import classify_runtime_type, infer_field_type
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
     ExpressionParser,
@@ -61,14 +66,18 @@ def _retype_contract_field(
 
     Used when an operation overwrites an existing typed field with a value of a
     different type, so the emitted row continues to satisfy its own contract.
+    The type comes from the one inference rule, so a nested value retypes the
+    field ``any`` and a null makes it nullable; the field keeps its
+    requiredness and provenance.
     """
+    python_type, nullable = infer_field_type(value)
     retyped = FieldContract(
         normalized_name=field.normalized_name,
         original_name=field.original_name,
-        python_type=require_supported_contract_type(value),
+        python_type=python_type,
         required=field.required,
         source=field.source,
-        nullable=field.nullable or value is None,
+        nullable=field.nullable or nullable,
     )
     new_fields = tuple(retyped if f.normalized_name == field.normalized_name else f for f in contract.fields)
     return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
@@ -109,6 +118,14 @@ class OperationSpec(BaseModel):
             raise ValueError(f"Expression syntax error: {e}") from e
         except ExpressionSecurityError as e:
             raise ValueError(f"Expression contains forbidden constructs: {e}") from e
+        if parser.result_can_be_set():
+            raise ValueError(
+                f"The expression for target {self.target!r} can produce a set, which has no canonical "
+                f"order: the value written to the row, and the row's output hash, would differ between "
+                f"runs of identical input. Use a list [...] or tuple (...) literal. A set literal is "
+                f"allowed only where it is consumed, such as a membership test (row['x'] in {{'a', 'b'}}) "
+                f"or a function call (len({{row['a'], row['b']}}))."
+            )
         return self
 
     def get_parser(self) -> ExpressionParser:
@@ -338,7 +355,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:281e1dce4c33c4f4"
+    source_file_hash: str | None = "sha256:b044c849faeb8da8"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -575,6 +592,8 @@ class ValueTransform(BaseTransform):
                     "use type_coerce to validate or normalize the computed fields to the required types.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
+                    "A result may be nested (row['meta'], or a list, tuple or dict literal); its field is typed 'any'. A set "
+                    "cannot be stored (no canonical order): use a list; keep set literals to membership tests or len().",
                     "Expressions are sandboxed — file I/O, imports, and external calls are rejected at parse time.",
                 ),
             )

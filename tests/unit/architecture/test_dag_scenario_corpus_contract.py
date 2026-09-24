@@ -738,6 +738,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # scripts/cicd/plugin_hash.py::compute_source_file_hash on the tree rebased
 # onto release/0.8.1 @ e991b35fb. The reopen-resume projection digest and this
 # digest are re-derived once, on the final rebased tree (see the latest entry).
+# Rotated 2026-09-24 (elspeth-5887fb7928, R3): a PLUGIN PROVENANCE rotation, not
+# a semantic one. value_transform now types a nested result 'any' through the
+# shared contract inference rule and rejects an expression that can store a
+# set, so its source_file_hash moved (281e1dce4c33c4f4 -> b044c849faeb8da8 on
+# the rebased tree, 3 manifest pins, all in
+# fork-coalesce-policies/union-collision-fail), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 3
+# literals reproduces the prior manifest byte for byte. No resume digest moved
+# and no oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

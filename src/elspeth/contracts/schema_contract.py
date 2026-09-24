@@ -26,7 +26,7 @@ from elspeth.contracts.type_normalization import (
     ALLOWED_CONTRACT_TYPES,
     CONTRACT_TYPE_MAP,
     classify_runtime_type,
-    require_supported_contract_type,
+    infer_field_type,
 )
 
 
@@ -63,6 +63,27 @@ class FieldContract:
                 f"Invalid python_type '{self.python_type.__name__}' for FieldContract. "
                 f"Valid types: {', '.join(sorted(t.__name__ for t in ALLOWED_CONTRACT_TYPES))}."
             )
+
+    @classmethod
+    def inferred(cls, normalized_name: str, original_name: str, value: Any) -> FieldContract:
+        """Build the contract of a field observed from one value (never required).
+
+        The one builder for every inferred field: a source's first row, a
+        transform's propagated/narrowed output, and a field added by
+        ``SchemaContract.with_field``. The type comes from ``infer_field_type``.
+
+        Raises:
+            ValueError: If value is NaN or Infinity
+        """
+        python_type, nullable = infer_field_type(value)
+        return cls(
+            normalized_name=normalized_name,
+            original_name=original_name,
+            python_type=python_type,
+            required=False,
+            source="inferred",
+            nullable=nullable,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,13 +248,7 @@ class SchemaContract:
         if normalized in self._by_normalized:
             raise TypeError(f"Field '{original}' ({normalized}) already exists in contract")
 
-        new_field = FieldContract(
-            normalized_name=normalized,
-            original_name=original,
-            python_type=require_supported_contract_type(value),
-            required=False,  # Inferred fields are never required
-            source="inferred",
-        )
+        new_field = FieldContract.inferred(normalized, original, value)
         return SchemaContract(
             mode=self.mode,
             fields=(*self.fields, new_field),

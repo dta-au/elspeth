@@ -2018,3 +2018,42 @@ class TestStaticFieldReads:
         reads = parser.static_field_reads("row")
         assert reads.fields == frozenset()
         assert reads.complete is True
+
+
+class TestResultCanBeSet:
+    """Whether a set literal can reach the expression's value (elspeth-5887fb7928 AC-R3)."""
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "{1, 2}",
+            "row['a'] or {1}",
+            "row['a'] and {1}",
+            "{1} if row['a'] else 2",
+            "2 if row['a'] else {1}",
+            "[{1}]",
+            "({1},)",
+            "{'k': {1}}",
+            "{1} - {2}",
+        ],
+    )
+    def test_set_in_value_position(self, expression: str) -> None:
+        assert ExpressionParser(expression).result_can_be_set() is True
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['a'] in {1, 2}",
+            "row['a'] not in {1, 2}",
+            "{1} == {1}",
+            "len({row['a'], row['b']})",
+            "not {1}",
+            "1 if {1} else 2",
+            "[1, 2]",
+            "{'k': [1]}",
+            "(1, 2)",
+            "row['a']",
+        ],
+    )
+    def test_set_consumed_or_absent(self, expression: str) -> None:
+        assert ExpressionParser(expression).result_can_be_set() is False

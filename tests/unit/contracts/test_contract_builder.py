@@ -464,13 +464,13 @@ class TestContractBuilderEdgeCases:
 
     def test_normalizer_typeerror_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Programmer TypeError from the normalizer is not mapped to object."""
-        from elspeth.contracts import contract_builder as contract_builder_module
+        from elspeth.contracts import type_normalization as type_normalization_module
         from elspeth.contracts.contract_builder import ContractBuilder
 
         def broken_normalizer(value: object) -> type:
             raise TypeError("programmer bug in type normalization")
 
-        monkeypatch.setattr(contract_builder_module, "normalize_type_for_contract", broken_normalizer)
+        monkeypatch.setattr(type_normalization_module, "normalize_type_for_contract", broken_normalizer)
 
         contract = SchemaContract(mode="OBSERVED", fields=(), locked=False)
         builder = ContractBuilder(contract)

@@ -898,3 +898,143 @@ class TestComposerHintsMatchSandboxReality:
         assert "regex" not in hint, "regex extraction has no sandbox-accepted spelling (elspeth-18bcf7dd09)"
         not_achievable_hints = [hint for hint in assistance.composer_hints if hint.startswith("NOT achievable here:")]
         assert len(not_achievable_hints) == 1, "composer_hints must state what the sandbox rejects"
+
+
+class TestValueTransformNestedResults:
+    """A nested result is a value the output contract types ``any`` (elspeth-5887fb7928 AC-R3).
+
+    Every operation target is already declared ``any`` by the output schema
+    (``declare_missing_guaranteed_fields``), and a source types a nested JSON
+    value ``object``. The per-row contract used to refuse such a value with a
+    raw ``TypeError`` from ``SchemaContract.with_field``, which aborted the run
+    (exit 4) on the ordinary copy of a JSON array or object.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> "PluginContext":
+        return make_source_context()
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("[row['a'], row['b']]", [10, 20]),
+            ("(row['a'], row['b'])", [10, 20]),
+            ("{'k': row['a']}", {"k": 10}),
+            ("row['meta']", {"copies": 2}),
+            ("row['tags']", [1, 2]),
+            ("row['tags'] if row['a'] > 5 else []", [1, 2]),
+        ],
+    )
+    def test_new_target_carries_the_nested_value_typed_any(self, ctx: "PluginContext", expression: str, expected: object) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "out", "expression": expression}]})
+        row = make_pipeline_row({"a": 10, "b": 20, "meta": {"copies": 2}, "tags": [1, 2]})
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["out"] == expected
+        out_field = result.row.contract.find_field("out")
+        assert out_field is not None
+        assert out_field.python_type is object
+        assert out_field.nullable is False
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_tuple_and_list_results_hash_identically(self, ctx: "PluginContext") -> None:
+        """A tuple is a JSON array: its emitted row hashes as the list spelling does."""
+        from elspeth.core.canonical import stable_hash
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        row = make_pipeline_row({"a": 10, "b": 20})
+        hashes = set()
+        for expression in ("[row['a'], row['b']]", "(row['a'], row['b'])"):
+            transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "out", "expression": expression}]})
+            result = transform.process(row, ctx)
+            assert result.row is not None
+            hashes.add(stable_hash(result.row))
+        assert len(hashes) == 1
+
+    def test_overwriting_a_typed_field_with_a_nested_value_retypes_it_any(self, ctx: "PluginContext") -> None:
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+        from elspeth.testing import make_field, make_row
+
+        fields = (make_field("a", int, original_name="A", required=True, source="declared"),)
+        row = make_row({"a": 10}, contract=SchemaContract(mode="OBSERVED", fields=fields, locked=True))
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "a", "expression": "[row['a']]"}]})
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["a"] == [10]
+        out_field = result.row.contract.find_field("a")
+        assert out_field is not None
+        assert (out_field.python_type, out_field.required, out_field.source, out_field.original_name) == (object, True, "declared", "A")
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_overwriting_a_typed_field_with_null_makes_it_nullable(self, ctx: "PluginContext") -> None:
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+        from elspeth.testing import make_field, make_row
+
+        fields = (make_field("a", int, original_name="a", required=True, source="declared"),)
+        row = make_row({"a": 10}, contract=SchemaContract(mode="OBSERVED", fields=fields, locked=True))
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "a", "expression": "None"}]})
+
+        result = transform.process(row, ctx)
+
+        assert result.row is not None
+        out_field = result.row.contract.find_field("a")
+        assert out_field is not None
+        assert (out_field.python_type, out_field.nullable, out_field.required) == (object, True, True)
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+
+class TestValueTransformRejectsSetResults:
+    """A set has no canonical order, so an expression that can store one is refused at construction.
+
+    Measured: a set result frozen into the row thaws back into a list in
+    hash-seed order, so the emitted value and the row's ``stable_hash``
+    differ between processes for identical input.
+    """
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "{row['a'], row['b']}",
+            "row['a'] or {1}",
+            "{1} if row['a'] else 2",
+            "[{row['a']}]",
+            "{'k': {row['a']}}",
+            "{row['a']} - {row['b']}",
+        ],
+    )
+    def test_expression_that_can_store_a_set_is_rejected(self, expression: str) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransformConfig
+
+        with pytest.raises(ValidationError, match=r"target 'out' can produce a set, which has no canonical order"):
+            ValueTransformConfig(
+                operations=[{"target": "out", "expression": expression}],
+                schema_config=OBSERVED_SCHEMA_CONFIG,
+            )
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['a'] in {1, 2}",
+            "len({row['a'], row['b']})",
+            "1 if row['a'] not in {1, 2} else 0",
+            "not {row['a']}",
+        ],
+    )
+    def test_consumed_set_literal_is_accepted(self, expression: str) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransformConfig
+
+        cfg = ValueTransformConfig(
+            operations=[{"target": "out", "expression": expression}],
+            schema_config=OBSERVED_SCHEMA_CONFIG,
+        )
+        assert cfg.operations[0].expression == expression

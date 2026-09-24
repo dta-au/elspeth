@@ -10,10 +10,9 @@ Handles the "infer-and-lock" pattern for OBSERVED and FLEXIBLE modes:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.type_normalization import UNSUPPORTED_CONTRACT_TYPE, normalize_type_for_contract
 
 _MAX_INFERRED_CONTRACT_FIELDS = 1024
 
@@ -65,35 +64,6 @@ class ContractBuilder:
             normalized_to_original[norm] = orig
         return normalized_to_original
 
-    @staticmethod
-    def _inferred_field(normalized_name: str, original_name: str, value: Any) -> FieldContract:
-        """Infer one field contract from an observed row value."""
-        normalized_type = normalize_type_for_contract(value)
-        python_type: type
-        if normalized_type is UNSUPPORTED_CONTRACT_TYPE:
-            python_type = object
-        else:
-            python_type = cast(type, normalized_type)
-
-        # Null-like values (None, pd.NA, pd.NaT) normalize to type(None), but
-        # for inference that means "type unknown, field is nullable" — not
-        # "field is always NoneType". Use object+nullable to avoid locking the
-        # field to NoneType and causing false violations on subsequent rows
-        # with real values.
-        nullable = False
-        if python_type is type(None):
-            python_type = object
-            nullable = True
-
-        return FieldContract(
-            normalized_name=normalized_name,
-            original_name=original_name,
-            python_type=python_type,
-            required=False,
-            source="inferred",
-            nullable=nullable,
-        )
-
     def _infer_missing_fields(
         self,
         row: dict[str, Any],
@@ -129,7 +99,7 @@ class ContractBuilder:
             # system code (see docs/guides/data-trust-and-error-handling.md
             # §Plugin Ownership). KeyError is correct.
             original_name = normalized_to_original[normalized_name]
-            new_field = self._inferred_field(normalized_name, original_name, value)
+            new_field = FieldContract.inferred(normalized_name, original_name, value)
             updated = SchemaContract(
                 mode=updated.mode,
                 fields=(*updated.fields, new_field),

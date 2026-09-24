@@ -366,7 +366,6 @@ from elspeth.contracts.type_normalization import (
     UNSUPPORTED_CONTRACT_TYPE,
     classify_runtime_type,
     normalize_type_for_contract,
-    require_supported_contract_type,
 )
 from elspeth.contracts.types import (
     NODE_ID_MAX_LENGTH,
@@ -704,7 +703,6 @@ __all__ = [  # Grouped by category for readability
     "map_schema_mode",
     "classify_runtime_type",
     "normalize_type_for_contract",
-    "require_supported_contract_type",
     "UNSUPPORTED_CONTRACT_TYPE",
     "PipelineRow",
     "PipelineRunner",

@@ -1026,6 +1026,39 @@ class ExpressionParser:
                 return True
         return False
 
+    def result_can_be_set(self) -> bool:
+        """Check whether a set literal can reach the expression's VALUE.
+
+        A set has no canonical order. Evaluated as a gate condition that is
+        harmless (a set only feeds a comparison or a truth test), but a
+        consumer that STORES the value — value_transform writes it into the
+        row — would emit an unordered container: the row freezes it and
+        thaws it back into a list in hash-seed order, so the emitted value
+        and the row's output hash differ between processes for identical
+        input. A set literal is the grammar's only set constructor, so
+        whether one can be stored is decidable before any row runs.
+
+        A set literal is CONSUMED, and cannot reach the value, when it sits
+        under a comparison (``row['x'] in {'a', 'b'}`` is a bool), a function
+        call (every callable returns a scalar: ``len({...})`` is an int), a
+        unary operator (``not`` is a bool; ``-``/``+``/``~`` reject a set), or
+        a ternary's TEST. Everywhere else it may pass through: a ternary
+        branch, either operand of ``or``/``and`` (a boolean operator returns
+        an operand), an arithmetic operand (``{1} - {2}`` is a set), or a
+        list, tuple or dict element. Conservative by construction: any node
+        shape not listed as consuming is searched.
+        """
+        return self._set_reaches_value(self._ast.body)
+
+    def _set_reaches_value(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Set):
+            return True
+        if isinstance(node, (ast.Compare, ast.Call, ast.UnaryOp)):
+            return False
+        if isinstance(node, ast.IfExp):
+            return self._set_reaches_value(node.body) or self._set_reaches_value(node.orelse)
+        return any(self._set_reaches_value(child) for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr))
+
     def static_field_reads(self, name: str = "row") -> StaticFieldReads:
         """Statically enumerate the top-level fields the expression reads from ``name``.
 
