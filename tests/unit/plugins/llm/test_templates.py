@@ -135,6 +135,16 @@ Analyze these entries:
         assert result.prompt == "Analyze: sample"
         assert result.variables_hash is not None
 
+    def test_variables_hash_failure_names_no_row_value(self) -> None:
+        """The canonicalizer quotes the offending value; only its type is kept (RAG-F1).
+
+        Its message is ``1152921504606859321 exceeds safe integer domain``.
+        """
+        template = PromptTemplate("{{ row.n }}")
+        with pytest.raises(TemplateError) as caught:
+            template.render_with_metadata({"n": 1152921504606859321})
+        assert str(caught.value) == "Cannot compute variables hash: IntegerDomainError (message withheld: it can quote row data)"
+
     def test_undefined_variable_raises_error(self) -> None:
         """Missing required variable raises TemplateError."""
         template = PromptTemplate("Hello, {{ row.name }}!")

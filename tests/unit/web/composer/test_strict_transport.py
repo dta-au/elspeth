@@ -361,6 +361,7 @@ def test_the_setting_defaults_to_preferred() -> None:
 def test_the_setting_loads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in _REQUIRED_WEB_ENV.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ELSPETH_WEB__AUTH_PROVIDER", "local")
     monkeypatch.setenv("ELSPETH_WEB__COMPOSER_STRICT_TOOLS", "off")
 
     assert web_config.settings_from_env().composer_strict_tools == "off"

@@ -120,9 +120,9 @@ def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytes
     calls: list[str] = []
     original = template_infrastructure._run_template_worker
 
-    def record_worker(source: str, payload: bytes) -> str:
+    def record_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
         calls.append(source)
-        return original(source, payload)
+        return original(source, payload, value_free=value_free)
 
     monkeypatch.setattr(template_infrastructure, "_run_template_worker", record_worker)
     env = create_sandboxed_environment()
@@ -235,3 +235,185 @@ def test_from_import_binding_rejects_malformed_names(malformed_entry: object) ->
     node = nodes.FromImport(nodes.Const("x"), [malformed_entry], False)
     with pytest.raises(TemplateError):
         analyzer.visit_FromImport(node, frozenset())
+
+
+# ---------------------------------------------------------------------------
+# SandboxedTemplate: the ONE value-free render-error renderer (elspeth-5887fb7928
+# RAG-F1). Jinja's messages quote a lookup key the template may compute from the
+# row, and Python errors inside a template quote operands. Every assertion is on
+# the WHOLE message: a ``sentinel not in`` check passes on a codec error that
+# leaks one character of the row and its offset.
+# ---------------------------------------------------------------------------
+
+_SENTINEL = "SENTINEL-R5-7c1e"
+_UNSPELLED = "<a key the template does not spell out>"
+_WITHHELD = "(message withheld: it can quote row data)"
+
+
+def _render_error(source: str, **context: object) -> str:
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate
+
+    with pytest.raises(TemplateError) as caught:
+        SandboxedTemplate(source).render(**context)
+    return str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("source", "row", "expected"),
+    [
+        pytest.param(
+            "{{ row[row.k] }}",
+            {"k": _SENTINEL},
+            f"Undefined variable: 'dict object' has no attribute {_UNSPELLED}",
+            id="item-key-computed-from-the-row",
+        ),
+        pytest.param(
+            "{{ row | attr(row.k) }}",
+            {"k": _SENTINEL},
+            f"Undefined variable: 'dict object' has no attribute {_UNSPELLED}",
+            id="attr-filter-key-from-the-row",
+        ),
+        pytest.param(
+            "{{ row.lst[row.i] }}",
+            {"lst": [1], "i": 739184265},
+            f"Undefined variable: list object has no element {_UNSPELLED}",
+            id="element-index-from-the-row",
+        ),
+        pytest.param(
+            "{{ row.q[row.k] }}",
+            {"q": "x", "k": "__class__"},
+            f"Sandbox violation: access to attribute {_UNSPELLED} of str object is unsafe",
+            id="unsafe-attribute-named-by-the-row",
+        ),
+        pytest.param(
+            "{{ row.q | wordwrap(row.w) }}",
+            {"q": "a b", "w": -739184265},
+            f"Template rendering failed: ValueError {_WITHHELD}",
+            id="python-error-quoting-an-operand",
+        ),
+        pytest.param(
+            "{{ row.q.encode('ascii') }}",
+            {"q": "abé" + _SENTINEL},
+            f"Template rendering failed: UnicodeEncodeError {_WITHHELD}",
+            id="codec-error-quoting-a-character-and-offset",
+        ),
+        pytest.param(
+            "{{ (row.lst | first).x }}",
+            {"lst": []},
+            "Undefined variable: a value is undefined",
+            id="jinja-hint-withheld",
+        ),
+    ],
+)
+def test_a_render_failure_names_no_row_value(source: str, row: dict[str, object], expected: str) -> None:
+    assert _render_error(source, row=row) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "row", "expected"),
+    [
+        pytest.param("{{ nosuchvar }}", {}, "Undefined variable: 'nosuchvar' is undefined", id="top-level-name"),
+        pytest.param(
+            "{{ row.missing_field }}",
+            {"q": "x"},
+            "Undefined variable: 'dict object' has no attribute 'missing_field'",
+            id="attribute-written-in-the-template",
+        ),
+        pytest.param(
+            "{{ row['Amount USD'] }}",
+            {"q": "x"},
+            "Undefined variable: 'dict object' has no attribute 'Amount USD'",
+            id="subscript-written-in-the-template",
+        ),
+        pytest.param("{{ row.lst[5] }}", {"lst": [1]}, "Undefined variable: list object has no element 5", id="index-literal"),
+        pytest.param("{{ row.lst[-4] }}", {"lst": [1]}, "Undefined variable: list object has no element -4", id="negative-index"),
+        pytest.param(
+            "{{ row | map(attribute='a.b') | list }}",
+            {"k": {"a": {}}},
+            "Undefined variable: 'str object' has no attribute 'a'",
+            id="dotted-attribute-literal",
+        ),
+        pytest.param(
+            "{{ row.missing + 1 }}",
+            {"q": "x"},
+            "Undefined variable: 'dict object' has no attribute 'missing'",
+            id="operator-dunder-path",
+        ),
+        pytest.param(
+            "{{ row.q.__class__ }}",
+            {"q": "x"},
+            "Sandbox violation: access to attribute '__class__' of str object is unsafe",
+            id="unsafe-attribute-written-in-the-template",
+        ),
+    ],
+)
+def test_a_render_failure_keeps_the_names_the_template_spells_out(source: str, row: dict[str, object], expected: str) -> None:
+    """The operator's own names are config text and stay in the diagnostic."""
+    assert _render_error(source, row=row) == expected
+
+
+def test_a_row_value_equal_to_a_template_literal_prints_as_that_literal() -> None:
+    """The printable set is the template's text, so a coinciding row value prints as config.
+
+    The same rule as ``safe_validation_error_text`` printing a key its schema
+    declares; recorded here so a change to it is deliberate.
+    """
+    assert _render_error("{{ row.spelled }}{{ row[row.k] }}", row={"spelled": "", "k": "spelled_too"}) == (
+        f"Undefined variable: 'dict object' has no attribute {_UNSPELLED}"
+    )
+    assert _render_error("{{ row.q }}{{ row[row.k] }}{{ 'present' }}", row={"q": "", "k": "present"}) == (
+        "Undefined variable: 'dict object' has no attribute 'present'"
+    )
+
+
+def test_a_pipeline_row_lookup_is_rendered_value_free() -> None:
+    """Production renders a PipelineRow, whose type repr is its qualified class name."""
+    from elspeth.testing import make_pipeline_row
+
+    row = make_pipeline_row({"q": "x", "k": _SENTINEL})
+    assert _render_error("{{ row[row.k] }}", row=row) == (
+        f"Undefined variable: 'elspeth.contracts.schema_contract.PipelineRow object' has no attribute {_UNSPELLED}"
+    )
+
+
+def test_withheld_error_detail_keeps_only_the_class() -> None:
+    from jinja2 import UndefinedError
+
+    from elspeth.plugins.infrastructure.templates import withheld_error_detail
+
+    # An UndefinedError that SandboxedTemplate's undefined type did not raise is
+    # not trusted to be value-free, so render() gives it this treatment too.
+    assert withheld_error_detail(UndefinedError(f"'dict object' has no attribute '{_SENTINEL}'")) == f"UndefinedError {_WITHHELD}"
+    assert withheld_error_detail(ValueError(f"Got: {_SENTINEL!r}")) == f"ValueError {_WITHHELD}"
+
+
+def test_the_value_free_undefined_refuses_an_exception_type_jinja_never_passes() -> None:
+    from jinja2 import TemplateRuntimeError
+
+    from elspeth.plugins.infrastructure.templates import _value_free_undefined
+
+    undefined_type = _value_free_undefined(frozenset())
+    with pytest.raises(RuntimeError, match="unexpected exception type TemplateRuntimeError"):
+        undefined_type(name="x", exc=TemplateRuntimeError)
+
+
+def test_a_broken_jinja_undefined_contract_escapes_render_unrouted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker reporting a broken Jinja contract cannot become a row error."""
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate, _UndefinedContractError
+
+    def broken_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
+        raise _UndefinedContractError("jinja2 built an Undefined with an unexpected exception type TemplateRuntimeError")
+
+    monkeypatch.setattr(template_infrastructure, "_run_template_worker", broken_worker)
+    template = SandboxedTemplate("{{ row.missing }}")
+    with pytest.raises(RuntimeError, match="unexpected exception type TemplateRuntimeError"):
+        template.render(row={})
+
+
+def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None:
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate
+
+    with pytest.raises(TemplateSyntaxError):
+        SandboxedTemplate("{% if unclosed")
+    with pytest.raises(TemplateSyntaxError):
+        SandboxedTemplate("{{ x | no_such_filter }}")

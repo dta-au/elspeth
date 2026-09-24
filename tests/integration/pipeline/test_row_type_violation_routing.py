@@ -231,6 +231,159 @@ def test_wrong_typed_row_value_is_reported_with_its_type_and_never_its_value(
     assert repr(row[bad_field]) not in rendered
 
 
+# RAG's ``query_field`` is the per-row sibling of the batch sites: before the
+# fix a non-str query raised a bare ``TypeError`` from ``QueryBuilder`` and the
+# run aborted with the token abandoned, although the same ``build()`` already
+# RETURNED errors for a missing or ``None`` query. A distinctive int, so the
+# audit scan below can tell the row's own copy from a leak into a reason.
+_RAG_QUERY_SENTINEL = 739184265
+
+
+@pytest.mark.parametrize("query_pattern", [None, r"(\d+)"], ids=["field_only", "regex"])
+def test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value(query_pattern: str | None, tmp_path: Any) -> None:
+    """A wrong-typed ``query_field`` is a row failure routed to on_error, not a run abort.
+
+    Both modes that consume the value as a str are covered: field-only, and
+    regex, where the check must run before the value reaches the regex worker
+    (whose ``TypeError`` would otherwise be the only signal). The regex pattern
+    would MATCH the digits if the int were stringified, so a coercing fix
+    cannot pass this test by accident.
+    """
+    import json
+    import uuid
+
+    import chromadb
+
+    from elspeth.core.landscape.schema import transform_errors_table
+    from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+
+    # on_start resolves the collection, so it must exist before the run. The
+    # ephemeral backend is process-global, hence a name unique to this test.
+    collection = f"row-type-routing-{uuid.uuid4().hex[:12]}"
+    chromadb.Client().get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"}).add(
+        documents=["Refunds are processed within 30 days."], ids=["doc-1"]
+    )
+    options: dict[str, Any] = {
+        "output_prefix": "kb",
+        "query_field": "question",
+        "provider": "chroma",
+        "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
+        "schema_config": {"mode": "observed"},
+    }
+    if query_pattern is not None:
+        options["query_pattern"] = query_pattern
+    transform = RAGRetrievalTransform(options)
+
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    row = {"id": 1, "question": _RAG_QUERY_SENTINEL}
+    sinks, graph, settings, config = _build_pipeline(transform, row, on_error="quarantine")
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.rows_processed == 1
+    assert result.rows_failed == 1
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == [row]
+
+    with db.engine.connect() as conn:
+        outcomes = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+    [outcome] = outcomes
+    assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+        TerminalOutcome.FAILURE.value,
+        TerminalPath.ON_ERROR_ROUTED.value,
+        "quarantine",
+        1,
+    )
+
+    assert json.loads(transform_error.error_details_json) == {
+        "reason": "invalid_input",
+        "error_type": "wrong_type",
+        "field": "question",
+        "expected": "str",
+        "actual_type": "int",
+        "error": "must be str, got int",
+    }
+    # The value is kept only as the failed row itself; no reason carries it.
+    assert _audit_cells_containing(db, str(_RAG_QUERY_SENTINEL)) == [("transform_errors", "row_data_json")]
+
+
+_TEMPLATE_KEY_SENTINEL = "SENTINEL-R5-rowkey-5d2a"
+
+
+def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp_path: Any) -> None:
+    """A template that computes a lookup key from the row fails the row, not the audit trail (RAG-F1).
+
+    Jinja's own message quotes the key (``'dict object' has no attribute
+    '<the value>'``); before the shared renderer that text was the reason in
+    transform_errors, the FAILED node state and the pending error message.
+    The scan's one permitted hit, the row itself, is its positive control.
+    """
+    import json
+    import uuid
+
+    import chromadb
+
+    from elspeth.core.landscape.schema import transform_errors_table
+    from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+
+    collection = f"template-key-routing-{uuid.uuid4().hex[:12]}"
+    chromadb.Client().get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"}).add(
+        documents=["Refunds are processed within 30 days."], ids=["doc-1"]
+    )
+    transform = RAGRetrievalTransform(
+        {
+            "output_prefix": "kb",
+            "query_field": "question",
+            "query_template": "{{ query }} {{ row[row.k] }}",
+            "provider": "chroma",
+            "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
+            "schema_config": {"mode": "observed"},
+        }
+    )
+
+    db = make_landscape_db()
+    row = {"id": 1, "question": "refunds", "k": _TEMPLATE_KEY_SENTINEL}
+    sinks, graph, settings, config = _build_pipeline(transform, row, on_error="quarantine")
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert (result.rows_processed, result.rows_failed) == (1, 1)
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == [row]
+    with db.engine.connect() as conn:
+        [outcome] = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+    assert (outcome.outcome, outcome.path, outcome.sink_name) == (
+        TerminalOutcome.FAILURE.value,
+        TerminalPath.ON_ERROR_ROUTED.value,
+        "quarantine",
+    )
+    assert json.loads(transform_error.error_details_json) == {
+        "reason": "template_rendering_failed",
+        "error": "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>",
+        "field": "question",
+    }
+    assert _audit_cells_containing(db, _TEMPLATE_KEY_SENTINEL) == [("transform_errors", "row_data_json")]
+
+
 # ---------------------------------------------------------------------------
 # The batch half: a wrongly-typed row at an AGGREGATION fails the whole batch,
 # and the batch goes to the aggregation's on_error (elspeth-d2e3f29d10).

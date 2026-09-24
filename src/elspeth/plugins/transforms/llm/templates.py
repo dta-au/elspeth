@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from jinja2 import TemplateSyntaxError, UndefinedError
-from jinja2.exceptions import SecurityError, TemplateRuntimeError
+from jinja2 import TemplateSyntaxError
 
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError, withheld_error_detail
 
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import SchemaContract
@@ -106,11 +104,8 @@ class PromptTemplate:
         self._lookup_source = lookup_source
         self._lookup_hash = _sha256(canonical_json(lookup_snapshot)) if lookup_snapshot is not None else None
 
-        # Use sandboxed environment for security
-        self._env = create_sandboxed_environment()
-
         try:
-            self._template = self._env.from_string(template_string)
+            self._template = SandboxedTemplate(template_string)
         except TemplateSyntaxError as e:
             raise TemplateError(f"Invalid template syntax: {e}") from e
 
@@ -170,24 +165,11 @@ class PromptTemplate:
             "lookup": self._lookup_data if self._lookup_data is not None else {},
         }
 
-        return self._render_context(context)
-
-    def _render_context(self, context: Mapping[str, Any]) -> str:
-        """Render an explicit template context through the shared sandbox."""
-        try:
-            return self._template.render(**context)
-        except UndefinedError as e:
-            raise TemplateError(f"Undefined variable: {e}") from e
-        except SecurityError as e:
-            raise TemplateError(f"Sandbox violation: {e}") from e
-        except (TemplateSyntaxError, TemplateRuntimeError, ArithmeticError, TypeError, ValueError) as e:
-            raise TemplateError(f"Template rendering failed: {e}") from e
+        return self._template.render(**context)
 
     def render_static_with_metadata(self) -> RenderedPrompt:
         """Render a source prompt with lookup data and no row binding."""
-        prompt = self._render_context(
-            {"lookup": self._lookup_data if self._lookup_data is not None else {}},
-        )
+        prompt = self._template.render(lookup=self._lookup_data if self._lookup_data is not None else {})
         return RenderedPrompt(
             prompt=prompt,
             template_hash=self._template_hash,
@@ -226,11 +208,12 @@ class PromptTemplate:
         # Always hash the raw row data (normalized keys) for determinism
         row_for_hash = row.to_dict() if isinstance(row, PipelineRow) else row
         # Wrap ValueError/TypeError from canonical_json (NaN/Infinity rejection, non-serializable types)
-        # This ensures row-scoped failures don't crash the entire run (Tier 2 trust model)
+        # This ensures row-scoped failures don't crash the entire run (Tier 2 trust model).
+        # The canonicalizer's own message quotes the offending value, so only its type is kept.
         try:
             variables_hash = _sha256(canonical_json(row_for_hash))
         except (ValueError, TypeError) as e:
-            raise TemplateError(f"Cannot compute variables hash: {e}") from e
+            raise TemplateError(f"Cannot compute variables hash: {withheld_error_detail(e)}") from e
 
         # Compute rendered prompt hash
         rendered_hash = _sha256(prompt)

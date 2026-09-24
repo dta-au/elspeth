@@ -553,7 +553,6 @@ files:
   src/elspeth/plugins/transforms/llm/providers/openrouter.py:
     dict[str, Any]: 7
   src/elspeth/plugins/transforms/llm/templates.py:
-    Mapping[str, Any]: 1
     dict[str, Any]: 4
   src/elspeth/plugins/transforms/llm/tracing.py:
     dict[str, Any]: 1
@@ -1070,10 +1069,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 929
+  Mapping[str, Any]: 928
   Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1180
   dict[str, object]: 409
-  soft: 2841
+  soft: 2840

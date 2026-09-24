@@ -28,6 +28,7 @@ from jinja2.compiler import CodeGenerator
 from jinja2.exceptions import SecurityError, TemplateRuntimeError, UndefinedError
 from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from jinja2.utils import missing, object_type_repr
 from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -196,7 +197,7 @@ def _check_template_source(source: str) -> None:
         raise TemplateError(str(exc)) from exc
 
 
-def _template_worker(connection: Any, source: str, payload: bytes) -> None:
+def _template_worker(connection: Any, source: str, payload: bytes, value_free: bool) -> None:
     """Render in a process with an OS memory/CPU ceiling."""
     try:
         baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
@@ -209,7 +210,11 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
         if type(context) is not dict or any(type(key) is not str for key in context):
             raise TemplateError("Template worker received an invalid context")
         context = _restore_context_value(context)
-        environment = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
+        undefined = StrictUndefined
+        if value_free:
+            parser = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
+            undefined = _value_free_undefined(_template_literals(parser.parse(source)))
+        environment = _LocalSandboxedEnvironment(undefined=undefined, autoescape=False, optimized=False)
         template = environment.from_string(source)
         pieces: list[str] = []
         size = 0
@@ -219,6 +224,15 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
                 raise TemplateError(f"Rendered template exceeds {_MAX_RENDER_BYTES} UTF-8 bytes")
             pieces.append(piece)
         connection.send(("ok", "".join(pieces)))
+    except _ValueFreeUndefinedError as exc:
+        connection.send(("safe_undefined", str(exc)[:1024]))
+        raise SystemExit(1) from exc
+    except _ValueFreeUnsafeAccessError as exc:
+        connection.send(("safe_security", str(exc)[:1024]))
+        raise SystemExit(1) from exc
+    except _UndefinedContractError as exc:
+        connection.send(("undefined_contract", str(exc)[:1024]))
+        raise SystemExit(1) from exc
     except (
         TemplateError,
         TemplateSyntaxError,
@@ -231,20 +245,20 @@ def _template_worker(connection: Any, source: str, payload: bytes) -> None:
         ValueError,
     ) as exc:
         # Keep the protocol bounded and do not pickle a third-party exception.
-        connection.send((type(exc).__name__, str(exc)[:1024]))
+        connection.send((type(exc).__name__, type(exc).__name__ if value_free else str(exc)[:1024]))
         raise SystemExit(1) from exc
     finally:
         connection.close()
 
 
-def _run_template_worker(source: str, payload: bytes) -> str:
+def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
     process_context = multiprocessing.get_context("spawn")
     parent, child = process_context.Pipe(duplex=False)
     process: Any = None
     try:
-        process = cast("Any", process_context).Process(target=_template_worker, args=(child, source, payload))
+        process = cast("Any", process_context).Process(target=_template_worker, args=(child, source, payload, value_free))
         process.start()
         child.close()
         if not parent.poll(_WORKER_TIMEOUT_SECONDS):
@@ -257,6 +271,22 @@ def _run_template_worker(source: str, payload: bytes) -> str:
             if type(value) is not str:
                 raise TemplateError("Template worker returned a non-string result")
             return value
+        if value_free:
+            if status == "safe_undefined":
+                raise TemplateError(f"Undefined variable: {value}")
+            if status == "safe_security":
+                raise TemplateError(f"Sandbox violation: {value}")
+            if status == "undefined_contract":
+                raise _UndefinedContractError(value)
+            if status == "UndefinedError":
+                raise TemplateError(f"Undefined variable: {value} (message withheld: it can quote row data)")
+            if status == "SecurityError":
+                raise TemplateError(f"Sandbox violation: {value} (message withheld: it can quote row data)")
+            if status == "TemplateError":
+                raise TemplateError("Template rendering failed: TemplateError (message withheld: it can quote row data)")
+            if status == "MemoryError":
+                raise TemplateError("Template worker exceeded the memory limit")
+            raise TemplateError(f"Template rendering failed: {value} (message withheld: it can quote row data)")
         if status == "TemplateSyntaxError":
             raise TemplateSyntaxError(value, 1)
         if status == "UndefinedError":
@@ -278,8 +308,9 @@ def _run_template_worker(source: str, payload: bytes) -> str:
 
 
 class _BoundedTemplate:
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, *, value_free: bool = False) -> None:
         self._source = source
+        self._value_free = value_free
 
     def render(self, **context: Any) -> str:
         _check_template_source(self._source)
@@ -287,12 +318,16 @@ class _BoundedTemplate:
             raise TemplateError("Too many concurrent template workers")
         try:
             transport = _pack_context_value(context)
-            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5))
+            return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=self._value_free)
         finally:
             _WORKER_SLOTS.release()
 
 
 class _BoundedEnvironment(_LocalSandboxedEnvironment):
+    def __init__(self, *, value_free: bool = False, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._value_free = value_free
+
     def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
         _check_template_source(source)
         return super().parse(source, name=name, filename=filename)
@@ -321,11 +356,14 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
         # Keep it in-process so ordinary blob paths need no worker startup.
         if all(type(node) is nodes.Output and all(type(child) is nodes.TemplateData for child in node.nodes) for node in ast.body):
             return compiled
-        return cast("Template", _BoundedTemplate(source))
+        return cast("Template", _BoundedTemplate(source, value_free=self._value_free))
 
 
-def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
+def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:
     """Create an ImmutableSandboxedEnvironment with StrictUndefined.
+
+    Args:
+        value_free: Render failures use only operator-authored keys and types.
 
     Returns:
         A sandboxed Jinja2 environment that:
@@ -338,7 +376,165 @@ def create_sandboxed_environment() -> ImmutableSandboxedEnvironment:
         undefined=StrictUndefined,
         autoescape=False,
         optimized=False,
+        value_free=value_free,
     )
+
+
+# Exceptions a render of an operator's template over row data may raise as a
+# per-row operational failure (tier-model-deep-dive: "Pipeline Templates as
+# Tier 2 Data"). UndefinedError and SecurityError are TemplateRuntimeErrors;
+# OverflowError and ZeroDivisionError are ArithmeticErrors.
+_RENDER_FAILURES = (TemplateSyntaxError, TemplateRuntimeError, ArithmeticError, TypeError, ValueError)
+
+# Stands in for a lookup key the template does not spell out, i.e. one computed
+# at render time (``row[row.k]``, ``attr(row.k)``, ``row.items[row.i]``).
+_UNSPELLED_KEY = "<a key the template does not spell out>"
+
+
+class _ValueFreeUndefinedError(UndefinedError):
+    """An undefined lookup whose message ELSPETH built, naming no row value."""
+
+
+class _ValueFreeUnsafeAccessError(SecurityError):
+    """A sandbox-refused attribute lookup whose message ELSPETH built, naming no row value."""
+
+
+class _UndefinedContractError(RuntimeError):
+    """The installed Jinja2 no longer uses its documented undefined contract."""
+
+
+def withheld_error_detail(exc: BaseException) -> str:
+    """The value-free text of a failure whose own message may quote row data: its class only.
+
+    Jinja's messages are not value-free. An undefined or sandbox-refused
+    lookup quotes its KEY, and a template may compute that key from the row
+    (``{{ row[row.k] }}`` renders ``'dict object' has no attribute '<the value
+    of k>'``). A Python error inside the template quotes operands
+    (``wordwrap`` renders ``invalid width -5``, a codec error quotes the
+    offending character and its offset), and the canonicalizer quotes an
+    out-of-range integer. The row itself stays attributable through the token
+    (``transform_errors`` stores it), so the failing input can be recovered
+    without copying it into the reason.
+    """
+    return f"{type(exc).__name__} (message withheld: it can quote row data)"
+
+
+def _template_literals(ast: nodes.Template) -> frozenset[str | int]:
+    """Every name and constant the operator wrote into the template.
+
+    A lookup key found here is printable: it is config text, not row text.
+    A row value that happens to equal one of these prints as that config text,
+    the same rule as ``safe_validation_error_text`` printing a field its schema
+    declares.
+    """
+    literals: set[str | int] = set()
+    for name_node in ast.find_all(nodes.Name):
+        literals.add(name_node.name)
+    for getattr_node in ast.find_all(nodes.Getattr):
+        literals.add(getattr_node.attr)
+    for keyword in ast.find_all(nodes.Keyword):
+        literals.add(keyword.key)
+    for const in ast.find_all(nodes.Const):
+        value = const.value
+        if type(value) is str:
+            # A dotted literal (``map(attribute='a.b')``) is looked up part by part.
+            literals.add(value)
+            literals.update(value.split("."))
+        elif type(value) is int:
+            # ``items[-1]`` parses as Neg(Const(1)).
+            literals.update((value, -value))
+    return frozenset(literals)
+
+
+def _value_free_undefined(literals: frozenset[str | int]) -> type[StrictUndefined]:
+    """A StrictUndefined whose error message names only what the template spells out.
+
+    Every failing operation on an Undefined (``__str__``, ``__add__``,
+    ``__getattr__`` ...) raises ``self._undefined_exception(self._undefined_message)``,
+    so these two hooks cover them all. Jinja's hint text is never used: the
+    sandbox's unsafe-attribute hint quotes the (possibly row-derived) key.
+    """
+
+    class _ValueFreeUndefined(StrictUndefined):
+        __slots__ = ()
+
+        def __init__(
+            self,
+            hint: str | None = None,
+            obj: Any = missing,
+            name: str | None = None,
+            exc: type[TemplateRuntimeError] = UndefinedError,
+        ) -> None:
+            if exc is UndefinedError:
+                value_free_exc: type[TemplateRuntimeError] = _ValueFreeUndefinedError
+            elif exc is SecurityError:
+                value_free_exc = _ValueFreeUnsafeAccessError
+            else:
+                raise _UndefinedContractError(f"jinja2 built an Undefined with an unexpected exception type {exc.__name__}")
+            super().__init__(hint, obj, name, value_free_exc)
+
+        @property
+        def _undefined_message(self) -> str:
+            name: object = self._undefined_name
+            if (type(name) is str or type(name) is int) and name in literals:
+                key = repr(name)
+            else:
+                key = _UNSPELLED_KEY
+            if self._undefined_exception is _ValueFreeUnsafeAccessError:
+                return f"access to attribute {key} of {object_type_repr(self._undefined_obj)} is unsafe"
+            if self._undefined_obj is missing:
+                return "a value is undefined" if name is None else f"{key} is undefined"
+            if type(name) is str:
+                return f"{object_type_repr(self._undefined_obj)!r} has no attribute {key}"
+            return f"{object_type_repr(self._undefined_obj)} has no element {key}"
+
+    return _ValueFreeUndefined
+
+
+class SandboxedTemplate:
+    """An operator-authored template validated before bounded, value-free rendering.
+
+    Rendering is where a template meets row data, so a render failure raises
+    ``TemplateError`` whose message names no row value (see ``render``). Each caller keeps its own config-time handling of
+    ``TemplateSyntaxError`` from the constructor.
+    """
+
+    __slots__ = ("_template",)
+
+    def __init__(self, source: str) -> None:
+        """Validate and compile ``source`` without evaluating row expressions.
+
+        Raises:
+            TemplateSyntaxError: The template is malformed (including an
+                unknown filter or test, a ``TemplateAssertionError``).
+        """
+        self._template = create_sandboxed_environment(value_free=True).from_string(source)
+
+    def render(self, **context: Any) -> str:
+        """Render with ``context``: the ONE place a render failure becomes text.
+
+        Only two texts are ever emitted: a lookup failure raised by this
+        template's own undefined type, whose message names the owner's TYPE and
+        the key only when the operator's template spells that key out; and, for
+        anything else, the exception's class name (``withheld_error_detail``).
+
+        Raises:
+            TemplateError: A per-row operational failure, prefixed by its kind
+                (``Undefined variable``, ``Sandbox violation``, ``Template
+                rendering failed``) with a value-free detail.
+        """
+        try:
+            return self._template.render(**context)
+        except _ValueFreeUndefinedError as exc:
+            raise TemplateError(f"Undefined variable: {exc}") from exc
+        except _ValueFreeUnsafeAccessError as exc:
+            raise TemplateError(f"Sandbox violation: {exc}") from exc
+        except UndefinedError as exc:
+            raise TemplateError(f"Undefined variable: {withheld_error_detail(exc)}") from exc
+        except SecurityError as exc:
+            raise TemplateError(f"Sandbox violation: {withheld_error_detail(exc)}") from exc
+        except _RENDER_FAILURES as exc:
+            raise TemplateError(f"Template rendering failed: {withheld_error_detail(exc)}") from exc
 
 
 def find_runtime_unbound_variables(ast: nodes.Template) -> frozenset[str]:

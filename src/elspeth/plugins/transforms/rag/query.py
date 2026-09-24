@@ -13,20 +13,13 @@ import re
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from jinja2 import Template
-
-from jinja2 import TemplateSyntaxError, UndefinedError
-from jinja2.exceptions import SecurityError, TemplateRuntimeError
+from jinja2 import TemplateSyntaxError
 
 from elspeth.contracts.errors import TransformErrorReason
 from elspeth.core.regex_worker import run_regex_worker
-from elspeth.plugins.infrastructure.templates import (
-    TemplateError,
-    create_sandboxed_environment,
-)
+from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError
 
 
 @dataclass(frozen=True)
@@ -61,14 +54,13 @@ class QueryBuilder:
     ) -> None:
         self._query_field = query_field
         self._regex_timeout = regex_timeout
-        self._compiled_template: Template | None = None
+        self._compiled_template: SandboxedTemplate | None = None
         self._compiled_pattern: re.Pattern[str] | None = None
         self._regex_pool: ProcessPoolExecutor | None = None
 
         if query_template is not None:
-            env = create_sandboxed_environment()
             try:
-                self._compiled_template = env.from_string(query_template)
+                self._compiled_template = SandboxedTemplate(query_template)
             except TemplateSyntaxError as e:
                 raise TemplateError(f"Invalid query template syntax: {e}") from e
 
@@ -98,6 +90,19 @@ class QueryBuilder:
                 )
             )
 
+        if self._compiled_template is None and not isinstance(extracted, str):
+            actual_type = type(extracted).__name__
+            return QueryResult(
+                error=TransformErrorReason(
+                    reason="invalid_input",
+                    error_type="wrong_type",
+                    field=self._query_field,
+                    expected="str",
+                    actual_type=actual_type,
+                    error=f"must be str, got {actual_type}",
+                )
+            )
+
         if self._compiled_template is not None:
             return self._build_template(extracted, row_data)
         elif self._compiled_pattern is not None:
@@ -106,14 +111,8 @@ class QueryBuilder:
             return self._build_field_only(extracted)
 
     def _build_field_only(self, extracted: Any) -> QueryResult:
-        # Offensive isinstance guard — not defensive suppression. The `extracted`
-        # seam is typed Any because row_data is dict[str, Any] and observed-mode
-        # schemas do not enforce value types. Without this guard, a bytes value
-        # would silently PASS _validate_non_empty (bytes.strip() and bool(b"x")
-        # both succeed), producing QueryResult(query=b"...") — wrong type, no
-        # crash, corrupted audit trail. The guard makes the upstream plugin bug
-        # loud rather than letting it persist silently. Do not delete without
-        # verifying that every schema mode guarantees str at this seam.
+        # build() routes observed wrong types before dispatch. Keep this guard
+        # for direct private calls so bytes cannot become a successful query.
         if not isinstance(extracted, str):
             raise TypeError(
                 f"query_field '{self._query_field}' expected str, got {type(extracted).__name__} "
@@ -125,17 +124,10 @@ class QueryBuilder:
         assert self._compiled_template is not None  # guaranteed by build() guard
         try:
             query = self._compiled_template.render(query=extracted, row=row_data)
-        except (
-            TemplateError,
-            TemplateRuntimeError,
-            UndefinedError,
-            SecurityError,
-            OverflowError,
-            ZeroDivisionError,
-            ArithmeticError,
-            TypeError,
-            ValueError,
-        ) as e:
+        except TemplateError as e:
+            # SandboxedTemplate's message is value-free by construction: a
+            # template may compute a lookup key from the row, and Jinja's own
+            # message would quote it.
             return QueryResult(
                 error=TransformErrorReason(
                     reason="template_rendering_failed",
