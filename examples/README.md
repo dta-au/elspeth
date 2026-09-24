@@ -27,6 +27,7 @@ Some examples need setup or use multiple configurations:
 | `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
 | `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
 | `join_refused` | `./examples/join_refused/run.sh` |
+| `replay_verify` | `./examples/replay_verify/run.sh` |
 | `multi_worker` | `./examples/multi_worker/run.sh` |
 | `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
 | `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
@@ -151,6 +152,12 @@ shown in the individual READMEs.
 | [`chaosweb`](chaosweb/) | Web scraping resilience with ChaosWeb fault injection |
 | [`chaosllm`](chaosllm/) | Response data used by ChaosLLM server (not a runnable pipeline) |
 
+### Replay and Verify (local fixture server, no credentials)
+
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`replay_verify`](replay_verify/) | `run_mode: live` → `replay` → `verify` against one recorded run. `web_scrape` fetches pages from a deterministic local server, then replay answers from the audit trail with the server stopped, and verify re-fetches and records a verdict per call in `call_verifications`. `run.sh` also asserts three negative cases: a missing `replay_from` run, drifted settings, and a changed page. The README lists the 0.8.1 limitations, including OpenRouter replay and verify against real servers |
+
 ### Expected Non-Complete Demonstrations
 
 Some examples deliberately exercise failure accounting:
@@ -215,6 +222,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Jinja2 templates** | [`template_lookups`](template_lookups/) — field extraction and template-driven prompts |
 | **Web scraping** | [`chaosweb`](chaosweb/) — fault-injected scraping with content gates |
 | **Database output** | [`database_sink`](database_sink/) — write to SQLite or PostgreSQL |
+| **Replaying or re-verifying a recorded run** | [`replay_verify`](replay_verify/) — `run_mode: replay` / `verify` with `replay_from`, verdicts in `call_verifications` |
 | **Crash recovery / resume** | [`checkpoint_resume`](checkpoint_resume/) — checkpoint + Ctrl-C + `elspeth resume` |
 | **Graceful shutdown** | [`checkpoint_resume`](checkpoint_resume/) — covers Ctrl-C shutdown behaviour |
 | **Payload retention / blob refs** | [`retention_purge`](retention_purge/) — payload lifecycle and `elspeth purge`; [`blob_transforms`](blob_transforms/) — fetch/store blobs and expand CSV blobs |

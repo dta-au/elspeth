@@ -1,0 +1,56 @@
+run_mode: live
+sources:
+  primary:
+    plugin: csv
+    on_success: urls
+    options:
+      path: examples/replay_verify/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'topic: str'
+        - 'url: str'
+      on_validation_failure: discard
+transforms:
+- name: fetch_page
+  plugin: web_scrape
+  input: urls
+  on_success: output
+  on_error: fetch_failures
+  options:
+    url_field: url
+    content_field: page_text
+    fingerprint_field: page_fingerprint
+    format: text
+    http:
+      abuse_contact: examples@example.com
+      scraping_reason: ELSPETH replay/verify example against a local fixture server
+      timeout: 10
+      allowed_hosts:
+      - 127.0.0.0/8
+    schema:
+      mode: observed
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/replay_verify/output/pages.jsonl
+      schema:
+        mode: observed
+      format: jsonl
+  fetch_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/replay_verify/output/fetch_failures.jsonl
+      schema:
+        mode: observed
+      format: jsonl
+landscape:
+  url: sqlite:///examples/replay_verify/runs/audit.db
+payload_store:
+  base_path: examples/replay_verify/runs/payloads
+concurrency:
+  max_workers: 1
