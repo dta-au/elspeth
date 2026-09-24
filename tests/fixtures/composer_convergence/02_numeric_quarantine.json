@@ -1,0 +1,116 @@
+{
+  "id": "02_numeric_quarantine",
+  "title": "Strict conversion, calculation and boundary routing",
+  "inputs": [
+    {
+      "filename": "orders.csv",
+      "media_type": "text/csv",
+      "content": "id,qty,price\no1,2,10\no2,bad,5\no3,3,4\no4,1,20\no5,4.5,2\n"
+    }
+  ],
+  "turns": [
+    "Read orders.csv as strings. Coerce qty to integer and price to integer with type_coerce; these prices are whole currency units. Send rows with failed conversion unchanged to quarantine.csv; do not drop them or invent defaults. For valid rows use value_transform to calculate total=qty*price. Route totals at least 20 to large.csv and the rest to small.csv. Use field_mapper to output only id,qty,price,total in that order on success; retain exactly id,qty,price on quarantine. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "type_coerce",
+      "value_transform",
+      "field_mapper"
+    ],
+    "sink": [
+      "csv"
+    ]
+  },
+  "required_node_kinds": [
+    "gate"
+  ],
+  "outputs": [
+    {
+      "filename": "large.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "qty",
+        "price",
+        "total"
+      ],
+      "rows": [
+        {
+          "id": "o1",
+          "qty": "2",
+          "price": "10",
+          "total": "20"
+        },
+        {
+          "id": "o4",
+          "qty": "1",
+          "price": "20",
+          "total": "20"
+        }
+      ]
+    },
+    {
+      "filename": "small.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "qty",
+        "price",
+        "total"
+      ],
+      "rows": [
+        {
+          "id": "o3",
+          "qty": "3",
+          "price": "4",
+          "total": "12"
+        }
+      ]
+    },
+    {
+      "filename": "quarantine.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "qty",
+        "price"
+      ],
+      "rows": [
+        {
+          "id": "o2",
+          "qty": "bad",
+          "price": "5"
+        },
+        {
+          "id": "o5",
+          "qty": "4.5",
+          "price": "2"
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 5,
+    "success_output_rows": 3,
+    "routed_error_rows": 2,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 3,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

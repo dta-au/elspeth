@@ -1,0 +1,81 @@
+{
+  "id": "04_reference_default_edit",
+  "title": "Reference enrichment and missing-key policy edit",
+  "inputs": [
+    {
+      "filename": "stock.csv",
+      "media_type": "text/csv",
+      "content": "id,sku,qty\ns1,A,2\ns2,B,1\ns3,X,4\n"
+    }
+  ],
+  "turns": [
+    "Enrich stock.csv with unit_price using reference_join and this reference CSV:\nsku,unit_price\nA,10\nB,7\nA missing SKU must receive unit_price 0; never lose the row. Write priced.csv using field_mapper with exactly id,sku,qty,unit_price in that order.",
+    "Change only the missing-SKU unit_price default to -1. Preserve matched prices, every input value and the four output columns. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "reference_join",
+      "field_mapper"
+    ],
+    "sink": [
+      "csv"
+    ]
+  },
+  "required_node_kinds": [],
+  "outputs": [
+    {
+      "filename": "priced.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "sku",
+        "qty",
+        "unit_price"
+      ],
+      "rows": [
+        {
+          "id": "s1",
+          "sku": "A",
+          "qty": "2",
+          "unit_price": "10"
+        },
+        {
+          "id": "s2",
+          "sku": "B",
+          "qty": "1",
+          "unit_price": "7"
+        },
+        {
+          "id": "s3",
+          "sku": "X",
+          "qty": "4",
+          "unit_price": "-1"
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 3,
+    "success_output_rows": 3,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 3,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

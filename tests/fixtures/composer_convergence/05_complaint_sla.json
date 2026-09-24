@@ -1,0 +1,100 @@
+{
+  "id": "05_complaint_sla",
+  "title": "LLM classification followed by reference enrichment",
+  "inputs": [
+    {
+      "filename": "complaints.csv",
+      "media_type": "text/csv",
+      "content": "id,complaint\nb1,My invoice was charged twice.\nb2,Please refund an incorrect bill.\no1,The internet service is completely down.\no2,There is no network connection across our office.\nx1,Please update my mailing address.\nx2,How do I change my profile photo?\n"
+    }
+  ],
+  "turns": [
+    "Use the approved sonnet LLM profile to classify each complaint into exactly billing, outage or other. Billing means a bill, charge or refund problem; outage means loss of service or connectivity; other means everything else. Preserve id and complaint. Use an LLM for classification, not rules or lookup tables. Present any required interpretation reviews.",
+    "Add reference_join using this reference CSV:\ncategory,response_sla_hours\nbilling,24\noutage,4\nother,48\nUse field_mapper to output triage.csv with exactly id,complaint,category,response_sla_hours in that order. Preserve all six rows. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "llm",
+      "reference_join",
+      "field_mapper"
+    ],
+    "sink": [
+      "csv"
+    ]
+  },
+  "required_node_kinds": [],
+  "outputs": [
+    {
+      "filename": "triage.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "complaint",
+        "category",
+        "response_sla_hours"
+      ],
+      "rows": [
+        {
+          "id": "b1",
+          "complaint": "My invoice was charged twice.",
+          "category": "billing",
+          "response_sla_hours": "24"
+        },
+        {
+          "id": "b2",
+          "complaint": "Please refund an incorrect bill.",
+          "category": "billing",
+          "response_sla_hours": "24"
+        },
+        {
+          "id": "o1",
+          "complaint": "The internet service is completely down.",
+          "category": "outage",
+          "response_sla_hours": "4"
+        },
+        {
+          "id": "o2",
+          "complaint": "There is no network connection across our office.",
+          "category": "outage",
+          "response_sla_hours": "4"
+        },
+        {
+          "id": "x1",
+          "complaint": "Please update my mailing address.",
+          "category": "other",
+          "response_sla_hours": "48"
+        },
+        {
+          "id": "x2",
+          "complaint": "How do I change my profile photo?",
+          "category": "other",
+          "response_sla_hours": "48"
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 6,
+    "success_output_rows": 6,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 6,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

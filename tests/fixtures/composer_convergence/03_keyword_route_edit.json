@@ -1,0 +1,111 @@
+{
+  "id": "03_keyword_route_edit",
+  "title": "Amend filtering while preserving routing",
+  "inputs": [
+    {
+      "filename": "tickets.csv",
+      "media_type": "text/csv",
+      "content": "id,category,note\nt1,premium,routine\nt2,basic,SECRET token\nt3,premium,password leaked\nt4,basic,abcdefgh\nt5,premium,all clear\n"
+    }
+  ],
+  "turns": [
+    "Use keyword_filter to block the whole word secret in note, case-insensitively, and send blocked rows unchanged to quarantine.csv. Truncate accepted notes to four characters without a suffix. Route category premium to priority.csv and basic to standard.csv. Each output must contain exactly id,category,note in that order. Keep every row accounted for.",
+    "Also block the whole word password, case-insensitively. Preserve the secret rule, both success routes, unchanged quarantine rows and four-character truncation. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "keyword_filter",
+      "truncate"
+    ],
+    "sink": [
+      "csv"
+    ]
+  },
+  "required_node_kinds": [
+    "gate"
+  ],
+  "outputs": [
+    {
+      "filename": "priority.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "category",
+        "note"
+      ],
+      "rows": [
+        {
+          "id": "t1",
+          "category": "premium",
+          "note": "rout"
+        },
+        {
+          "id": "t5",
+          "category": "premium",
+          "note": "all "
+        }
+      ]
+    },
+    {
+      "filename": "standard.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "category",
+        "note"
+      ],
+      "rows": [
+        {
+          "id": "t4",
+          "category": "basic",
+          "note": "abcd"
+        }
+      ]
+    },
+    {
+      "filename": "quarantine.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "category",
+        "note"
+      ],
+      "rows": [
+        {
+          "id": "t2",
+          "category": "basic",
+          "note": "SECRET token"
+        },
+        {
+          "id": "t3",
+          "category": "premium",
+          "note": "password leaked"
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 5,
+    "success_output_rows": 3,
+    "routed_error_rows": 2,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 3,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}
