@@ -309,3 +309,101 @@ probe results are under `.claude/lanes/session-ed3c015b/` in the main checkout.
 These local diagnostic artifacts are intentionally not committed and may contain
 session data. Final suite, broader live battery and release-containment results
 will be added after they finish.
+
+## Final production-tree acceptance
+
+The epoch-68 attempt at `261e23f2967b36237df388912d5af7d4e088f52a` executed all
+ten workflows. Nine passed the complete battery; fork/coalesce produced the
+expected output but exposed another incorrect lineage assertion in the harness.
+The original failed checkpoint remains intact. Production, dependencies and
+scenario fixtures are unchanged by its correction in `7d2ae7cbe`.
+
+The incorrect predicate required joined sink tokens to have path `coalesced`.
+After downstream transforms, the runtime legitimately records `default_flow`;
+the durable join identity and two same-row fork parents remain intact. The
+checker now follows that identity and requires exactly one known outcome for
+every emitted token before checking row coverage and parent pairing. Both
+terminal and downstream joins pass; missing, duplicate, unknown and mismatched
+lineage fails. Independent review approved 156 affected checks, 28 restored
+controls and two caught source mutations. The complete corrected checker also
+accepts the unchanged captured run, whose 12 tokens all have terminal outcomes.
+A fresh fork-only retry at `7d2ae7cbe` then exposed a separate runtime defect:
+an observed CSV source feeding `type_coerce` with explicit flexible fields
+passed all 24 preflight checks, but its first row raised
+`SchemaConfigModeViolation` for `id` and `x` field metadata. It failed before
+forking, so the lineage correction is not the cause. The earlier successful
+graph used a source with explicit fields. Runtime repair and final acceptance
+remain outstanding; this failed run is preserved separately as `live-fork-final`.
+
+The nine passing workflows required no runner-triggered repair turns. The
+numeric quarantine output now has the exact required column order. All nine
+row-bound Sonnet calls succeeded: six complaint classifications with SLA
+enrichment and three typed extractions with boolean routing. The extraction
+case exercised an actual amendment: the operator replaced an invented urgency
+criterion with extraction of the notes' explicit urgent/not-urgent assertions,
+then inspected and accepted the unchanged prompt structure. The executable
+prompt contained the exact approved definition, with no placeholder. A separate
+control confirms genuine prompt-structure edits still invalidate old approval.
+
+All 37 parameterless workflow tool calls succeeded and were wire conformant.
+The final wire-only Together canary passed all ten tools with the full 42-tool
+palette. The workflow planner calls were served by Novita; those two forms of
+evidence are distinct. One GLM advisor request timed out at 60 seconds and the
+bounded retry recovered, so this is not a claim that every provider attempt
+succeeded.
+
+The service stopped cleanly with unchanged before/after source hash
+`e631eb5d43b1071539c1c0b5dfc1a92134502c5fff10d5b05a1285f622ff8755`.
+Its cumulative ledger records 353 completed requests, no active requests,
+$2.2561200860 in reported cost, and one unpriced timed-out request. That ledger
+was carried unchanged into the fork retry. That retry stopped cleanly with
+371 completed cumulative requests, $2.3622366774 reported cost, one historical
+unpriced request, and unchanged source hash
+`59d8660802acb77230f045a7f93e059800149725854017fdaf51d296ed7e9620`.
+These are measured acceptance samples, not a statistical guarantee of convergence.
+
+## Runtime producer contracts found by the expanded battery
+
+The fresh fork retry isolated a producer defect in `TypeCoerce._build_output_contract`:
+an observed source's optional field metadata survived a transform whose validated
+explicit schema guaranteed those fields. The emitted values and converted types
+were correct, but the output metadata contradicted the plugin's own declaration.
+The engine correctly rejected it. The producer now reconciles declared presence
+and nullability while preserving converted types, original-header aliases, and
+undeclared fields. No engine validator or shared transform behavior was relaxed.
+The real CSV-to-Orchestrator regression and controls passed as part of 155 checks;
+removing the repair restored four failures. An observed source with explicit
+`required_input_fields` still fails its independent static-presence check.
+
+The sibling investigation found that `value_transform` could retain the same
+incorrect presence metadata and could advertise an input type after an expression
+changed that type. Computed fields now declare presence without an inferred type;
+both its declaration and generated output model expose that fact to graph checks.
+Forwarded fields retain their actual types and aliases while adopting validated
+presence/nullability declarations. Null expression results retain truthful runtime
+contracts. A typed downstream consumer must establish the computed type, for
+example with an explicit `type_coerce`. The input schema and engine checks are
+unchanged. Independent review approved 193 final focused checks and three exact
+scenario/oracle checks, after 664 earlier affected checks. Four source mutations
+proved the regression controls. All 56 registered plugin hashes match; only three
+ValueTransform source-hash records changed in the scenario manifest, with runtime
+oracle data unchanged. Final integrated tests and all ten live workflows must run
+after these shared runtime changes; the earlier nine passing cases are historical
+controls.
+
+The review also reproduced separate, pre-existing limitations when configuration
+uses original CSV header aliases as write targets. `type_coerce` can declare a
+literal original header while updating its canonical field, and `value_transform`
+can create a duplicate original-name mapping. Canonical write targets and original
+header reads are covered by the current repairs. Original-header write targets
+remain unresolved: configuration-time normalization cannot safely infer upstream
+field mappings or whether an authored target names a new field. No alias rewrite
+or declaration-check bypass is included, and these cases are not claimed fixed.
+
+A second existing limitation is numeric admission: Pydantic accepts an integer
+for a float input schema, while the executor preserves the original payload and
+the output declaration verifier requires exact metadata. The new controls retain
+the integer payload and integer contract and confirm the verifier still refuses
+that contradiction; real float input passes and string input rejects. The repair
+does not falsely stamp float metadata onto an integer, coerce pass-through values,
+or broaden shared validation. This admission/declaration mismatch remains open.
