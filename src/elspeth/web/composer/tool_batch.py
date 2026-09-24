@@ -2507,15 +2507,6 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
-            if (
-                is_mutation_tool(_tool_name)
-                and dispatched_result.success
-                and dispatched_result.updated_state.version > _state.version
-                and dispatched_result.validation.is_valid
-            ):
-                findings = await _pending_review_runtime_findings(dispatched_result.updated_state, ctx)
-                if findings is not None:
-                    dispatched_result = replace(dispatched_result, runtime_preflight=findings)
             if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
                 return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
@@ -2729,6 +2720,28 @@ async def run_tool_batch(
         version_before_tool = state.version
         admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None
         result = admitted_result.result if admitted_result is not None else outcome.result
+        if (
+            prevalidated_unapplied_result is None
+            and is_mutation_tool(tool_name)
+            and result.success
+            and result.updated_state.version > state.version
+            and result.validation.is_valid
+        ):
+            # The mutation has succeeded and its applied version is already
+            # audited. A separate preflight failure cannot relabel that tool
+            # as a crash or erase the version the route must persist.
+            try:
+                findings = await _pending_review_runtime_findings(result.updated_state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn or ctx.failed_turn,
+                ) from preflight_exc.original_exc
+            if findings is not None:
+                result = replace(result, runtime_preflight=findings)
         if prevalidated_unapplied_result is None:
             state = result.updated_state
             last_validation = result.validation
