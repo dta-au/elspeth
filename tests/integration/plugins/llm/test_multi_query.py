@@ -434,6 +434,7 @@ class TestMultiQueryIntegration:
                 transform=transform,
                 token=token,
                 ctx=_claim_context(factory, run_id, node_id, token),
+                attempt=0,
             )
 
             # Should succeed
@@ -550,6 +551,7 @@ class TestMultiQueryIntegration:
                     transform=transform,
                     token=token,
                     ctx=_claim_context(factory, run_id, node_id, token, ingest_sequence=i),
+                    attempt=0,
                 )
                 results.append(result)
 

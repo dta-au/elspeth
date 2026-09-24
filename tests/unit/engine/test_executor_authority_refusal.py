@@ -26,7 +26,7 @@ def test_transform_invocation_refusal_does_not_record_failed(refusal: Exception)
     transform.process.side_effect = refusal
 
     with pytest.raises(type(refusal)) as propagated:
-        executor.execute_transform(transform, _make_token(), make_context())
+        executor.execute_transform(transform, _make_token(), make_context(), attempt=0)
 
     assert propagated.value is refusal
     factory.execution.complete_node_state.assert_not_called()

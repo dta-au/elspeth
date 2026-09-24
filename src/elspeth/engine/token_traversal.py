@@ -125,7 +125,8 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
-        attempt_offset: int = 0,
+        *,
+        attempt_offset: int,
         row_union_name: RowUnionName | None = None,
     ) -> _TransformOutcome:
         """Handle a single transform node: execute with retry, route errors, handle multi-row.
@@ -519,7 +520,8 @@ class TokenTraversalEngine:
         current_on_success_sink: str,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
-        attempt_offset: int = 0,
+        *,
+        attempt_offset: int,
     ) -> _GateOutcome:
         """Handle a gate node: evaluate, then fork/route/divert/continue.
 
@@ -1072,10 +1074,11 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None = None,
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
-        attempt_offset: int = 0,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
         collector_name: CollectorName | None = None,
+        *,
+        attempt_offset: int,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         """Process a single token through processing nodes starting at node_id.
 
@@ -1207,7 +1210,7 @@ class TokenTraversalEngine:
                     last_on_success_sink,
                     row_union_node_id,
                     row_union_name,
-                    attempt_offset,
+                    attempt_offset=attempt_offset,
                 )
                 if isinstance(gate_outcome, _GateTerminal):
                     return gate_outcome.result, child_items
@@ -1274,7 +1277,7 @@ class TokenTraversalEngine:
                     coalesce_node_id,
                     coalesce_name,
                     last_on_success_sink,
-                    attempt_offset,
+                    attempt_offset=attempt_offset,
                     row_union_name=row_union_name,
                 )
                 if isinstance(transform_outcome, _TransformTerminal):

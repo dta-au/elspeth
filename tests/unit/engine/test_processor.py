@@ -2838,6 +2838,7 @@ class TestProcessRowNoTransforms:
                 coalesce_node_id=None,
                 coalesce_name=None,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
         assert isinstance(exc_info.value.__cause__, LandscapeRecordError)
@@ -4458,6 +4459,7 @@ class TestProcessRowMultiRowOutput:
                 current_node_id=transform_node,
                 row_union_node_id=union_node,
                 row_union_name=RowUnionName("variant_union"),
+                attempt_offset=0,
             )
 
         # Parent is EXPANDED (transient — the real outcome rides expand_token()).
@@ -7148,6 +7150,7 @@ class TestInnerTraversalCycleGuard:
                 token=token,
                 ctx=ctx,
                 current_node_id=s1,
+                attempt_offset=0,
             )
 
 
@@ -7188,6 +7191,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
             mock_exec.assert_called_once()
             assert result.status == "success"
@@ -7210,6 +7214,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7237,6 +7242,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7260,6 +7266,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7284,6 +7291,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7308,6 +7316,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7329,6 +7338,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7350,6 +7360,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7377,6 +7388,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7405,6 +7417,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7480,6 +7493,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7694,6 +7708,7 @@ class TestExecuteTransformNoRetry:
             transform=transform,
             token=token,
             ctx=ctx,
+            attempt_offset=0,
         )
 
         assert result.status == "error"
@@ -7784,6 +7799,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
     def test_named_sink_divert_attributes_to_failed_state_not_ctx(self) -> None:
@@ -7811,6 +7827,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7844,6 +7861,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7871,6 +7889,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -7904,6 +7923,7 @@ class TestExecuteTransformNoRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
 
@@ -7956,6 +7976,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert seen_attempts == [0, 1]
@@ -8006,6 +8027,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.reason == {
@@ -8031,6 +8053,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=make_token_info(data={"value": 42}),
                 ctx=make_context(),
+                attempt_offset=0,
             )
 
     def test_exhaustion_does_not_misattribute_unstamped_final_attempt(self) -> None:
@@ -8068,6 +8091,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=make_token_info(data={"value": 42}),
                 ctx=make_context(),
+                attempt_offset=0,
             )
 
     def test_exhaustion_with_named_sink_and_missing_edge_fails_closed(self) -> None:
@@ -8101,6 +8125,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=make_token_info(data={"value": 42}),
                 ctx=make_context(),
+                attempt_offset=0,
             )
 
     @pytest.mark.parametrize(
@@ -8178,6 +8203,7 @@ class TestExecuteTransformWithRetry:
                 coalesce_node_id=NodeID("coalesce::merge"),
                 coalesce_name=coalesce_name,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -8245,6 +8271,7 @@ class TestExecuteTransformWithRetry:
                     coalesce_node_id=None,
                     coalesce_name=None,
                     current_on_success_sink="default",
+                    attempt_offset=0,
                 )
             assert isinstance(outcome, _TransformTerminal)
             assert isinstance(outcome.result, RowResult)
@@ -8288,6 +8315,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=make_token_info(data={"value": 42}),
                 ctx=make_context(),
+                attempt_offset=0,
             )
 
         assert exc_info.value is non_retryable
@@ -8317,6 +8345,7 @@ class TestExecuteTransformWithRetry:
             transform=transform,
             token=token,
             ctx=ctx,
+            attempt_offset=0,
         )
 
         retry_manager.execute_with_retry.assert_called_once()
@@ -8347,6 +8376,7 @@ class TestExecuteTransformWithRetry:
             transform=transform,
             token=token,
             ctx=ctx,
+            attempt_offset=0,
         )
 
         # Extract the is_retryable callback from the call
@@ -8402,6 +8432,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert result.status == "error"
@@ -8460,6 +8491,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         execute_transform.assert_not_called()
@@ -8554,6 +8586,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
         assert attempts == [0], "a deterministic contract violation must not be retried"
@@ -8594,6 +8627,7 @@ class TestExecuteTransformWithRetry:
                 transform=transform,
                 token=token,
                 ctx=ctx,
+                attempt_offset=0,
             )
 
 
@@ -10302,6 +10336,7 @@ class TestCoalesceTraversalInvariant:
                 current_node_id=downstream_node,  # step 3 > coalesce step 2
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+                attempt_offset=0,
             )
 
     def test_work_item_at_coalesce_does_not_raise(self) -> None:
@@ -10351,6 +10386,7 @@ class TestCoalesceTraversalInvariant:
             current_node_id=coalesce_node,
             coalesce_node_id=coalesce_node,
             coalesce_name=CoalesceName("merge"),
+            attempt_offset=0,
         )
         # Follower coalesce barrier: (None, []) → mark_blocked, not a completion.
         assert result is None
@@ -10390,6 +10426,7 @@ class TestRowUnionTraversalInvariant:
                 current_node_id=downstream_node,
                 row_union_node_id=row_union_node,
                 row_union_name=RowUnionName("variant_union"),
+                attempt_offset=0,
             )
 
 
@@ -10411,6 +10448,7 @@ class TestTerminalWorkItemInvariant:
                 token=token,
                 ctx=ctx,
                 current_node_id=None,
+                attempt_offset=0,
             )
 
     def test_none_current_node_with_inherited_sink_is_allowed(self) -> None:
@@ -10428,6 +10466,7 @@ class TestTerminalWorkItemInvariant:
             ctx=ctx,
             current_node_id=None,
             on_success_sink="terminal_sink",
+            attempt_offset=0,
         )
 
         assert result is not None
@@ -10526,6 +10565,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
                 current_node_id=gate_node,
                 coalesce_node_id=NodeID("coalesce::merge"),
                 coalesce_name=CoalesceName("merge"),
+                attempt_offset=0,
             )
 
         # Gate should produce ROUTED result
@@ -10637,6 +10677,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
                 current_node_id=gate_node,
                 coalesce_node_id=NodeID("coalesce::merge"),
                 coalesce_name=CoalesceName("merge"),
+                attempt_offset=0,
             )
 
         # Result must be a list: ROUTED (current) + FAILED (sibling)
@@ -10716,6 +10757,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
                 token=token,
                 ctx=ctx,
                 current_node_id=gate_node,
+                attempt_offset=0,
             )
 
         # Should still route correctly
@@ -10907,6 +10949,7 @@ class TestGateJumpPastCoalesceInvariant:
                 current_node_id=gate_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+                attempt_offset=0,
             )
 
     def test_gate_jump_past_row_union_raises_invariant_error(self) -> None:
@@ -10966,6 +11009,7 @@ class TestGateJumpPastCoalesceInvariant:
                 current_node_id=gate_node,
                 row_union_node_id=row_union_node,
                 row_union_name=RowUnionName("variant_union"),
+                attempt_offset=0,
             )
 
     def test_gate_jump_before_coalesce_is_allowed(self) -> None:
@@ -11078,6 +11122,7 @@ class TestGateJumpPastCoalesceInvariant:
                 current_node_id=gate_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+                attempt_offset=0,
             )
 
         # Token should be held at the coalesce node without emitting a terminal result.

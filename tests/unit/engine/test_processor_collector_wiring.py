@@ -365,6 +365,7 @@ class TestOpenerChildrenCarryTheCollectorCursor:
                 coalesce_node_id=None,
                 coalesce_name=None,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -735,7 +736,9 @@ class TestCollectorCursorLookup:
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
             processor.route_collector_release(collector_name=CollectorName("ghost"), released_tokens=(token,))
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
-            processor._process_single_token(token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
+            processor._process_single_token(
+                token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"), attempt_offset=0
+            )
 
 
 class TestDepthTwoReleaseHoldsAtTheCollector:

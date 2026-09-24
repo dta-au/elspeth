@@ -254,10 +254,11 @@ class SchedulerDrainHost(Protocol):
         coalesce_node_id: NodeID | None = None,
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
-        attempt_offset: int = 0,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
         collector_name: CollectorName | None = None,
+        *,
+        attempt_offset: int,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]: ...
 
     def _run_barrier_intake_pass(self, ctx: PluginContext) -> tuple[list[RowResult], list[WorkItem]]: ...

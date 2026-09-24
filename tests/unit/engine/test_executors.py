@@ -616,7 +616,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(OrchestrationInvariantError, match="without node_id"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_ownership_loss_after_plugin_return_leaves_attempt_open(self) -> None:
         """A stale worker cannot terminalize node audit after its plugin returns."""
@@ -643,7 +643,7 @@ class TestTransformExecutor:
         )
 
         with pytest.raises(SchedulerLeaseLostError):
-            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"), attempt=0)
 
         before_terminal_audit.assert_called_once_with()
         factory.execution.begin_node_state.assert_called_once()
@@ -671,7 +671,7 @@ class TestTransformExecutor:
             spans.trace_scope("run_1", datetime.now(UTC)),
             pytest.raises(PluginContractViolation, match="output validation failed"),
         ):
-            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"), attempt=0)
 
         assert len(events) == 1
         assert events[0].name is EngineSpanName.TRANSFORM
@@ -692,6 +692,7 @@ class TestTransformExecutor:
                 transform,
                 _make_token(),
                 make_context(run_id="run_1"),
+                attempt=0,
             )
 
         assert result.status == "error"
@@ -718,7 +719,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="input validation failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_not_called()
 
@@ -741,7 +742,7 @@ class TestTransformExecutor:
         token = _make_token(data={"count": sentinel})
 
         with pytest.raises(PluginContractViolation) as excinfo:
-            executor.execute_transform(transform, token, make_context())
+            executor.execute_transform(transform, token, make_context(), attempt=0)
 
         message = str(excinfo.value)
         assert message.startswith(f"Transform '{transform.name}' input validation failed: 1 validation error: count: ")
@@ -768,7 +769,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="input validation failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_not_called()
 
@@ -800,7 +801,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="input validation failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.data_flow.record_token_outcome.assert_not_called()
 
@@ -824,7 +825,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(DeclaredRequiredInputFieldsViolation, match=r"missing \['customer_id'\]"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_not_called()
         factory.data_flow.record_token_outcome.assert_called_once()
@@ -876,7 +877,7 @@ class TestTransformExecutor:
             patch.object(FieldMapper, "process", autospec=True) as process,
             pytest.raises(DeclaredRequiredInputFieldsViolation, match=r"missing \['complementary_colour'\]"),
         ):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         process.assert_not_called()
         factory.data_flow.record_token_outcome.assert_called_once()
@@ -918,7 +919,7 @@ class TestTransformExecutor:
         ctx = make_context()
         transform.on_start(ctx)
 
-        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         assert error_sink is None
@@ -944,6 +945,7 @@ class TestTransformExecutor:
             transform,
             token,
             ctx,
+            attempt=0,
         )
 
         assert result.status == "success"
@@ -989,7 +991,7 @@ class TestTransformExecutor:
         )
         ctx = make_context()
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
@@ -1014,6 +1016,7 @@ class TestTransformExecutor:
             transform,
             token,
             ctx,
+            attempt=0,
         )
 
         assert_stable_hash(result.input_hash, token.row_data.to_dict())
@@ -1038,6 +1041,7 @@ class TestTransformExecutor:
             transform,
             token,
             ctx,
+            attempt=0,
         )
 
         assert updated_token.row_data["value"] == "modified"
@@ -1068,7 +1072,7 @@ class TestTransformExecutor:
         transform.process = capturing_process
         ctx = make_context()
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert captured_state_id == "state_001"
         assert captured_node_id == "node_1"
@@ -1094,7 +1098,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="output validation failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args.kwargs
@@ -1128,7 +1132,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="output validation failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args.kwargs
@@ -1156,7 +1160,7 @@ class TestTransformExecutor:
         )
 
         with pytest.raises(PluginContractViolation) as excinfo:
-            executor.execute_transform(transform, token, make_context())
+            executor.execute_transform(transform, token, make_context(), attempt=0)
 
         message = str(excinfo.value)
         assert message.startswith(f"Transform '{transform.name}' output validation failed for emitted row 0: 1 validation error: count: ")
@@ -1186,6 +1190,7 @@ class TestTransformExecutor:
             transform,
             token,
             ctx,
+            attempt=0,
         )
 
         assert result.status == "error"
@@ -1209,6 +1214,7 @@ class TestTransformExecutor:
             transform,
             token,
             ctx,
+            attempt=0,
         )
 
         assert error_sink == "discard"
@@ -1225,7 +1231,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
@@ -1243,7 +1249,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.record_transform_error = _CallRecorder()  # type: ignore[method-assign]
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         ctx.record_transform_error.assert_called_once()
 
@@ -1262,7 +1268,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.record_routing_event.assert_called_once()
         kwargs = factory.execution.record_routing_event.call_args[1]
@@ -1283,7 +1289,7 @@ class TestTransformExecutor:
         ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="DIVERT edge"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_error_path_records_audit_before_terminal_completion(self) -> None:
         """transform_error + DIVERT routing_event persist BEFORE the FAILED
@@ -1307,7 +1313,7 @@ class TestTransformExecutor:
         factory.execution.record_routing_event.side_effect = lambda **kwargs: order.append("routing_event")
         factory.execution.complete_node_state.side_effect = lambda **kwargs: order.append("complete_node_state")
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert order == ["transform_error", "routing_event", "complete_node_state"], (
             f"audit side-effects must precede terminal completion, got: {order}"
@@ -1334,7 +1340,7 @@ class TestTransformExecutor:
         ctx.record_transform_error = _boom  # type: ignore[method-assign]
 
         with pytest.raises(LandscapeRecordError):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
@@ -1353,7 +1359,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(ValueError, match="plugin bug"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
@@ -1371,7 +1377,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(RuntimeError) as exc_info:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert secret in str(exc_info.value)
         factory.execution.complete_node_state.assert_called_once()
@@ -1391,7 +1397,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(RuntimeError):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["duration_ms"] >= 0
@@ -1414,7 +1420,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.record_routing_event.assert_not_called()
 
@@ -1429,7 +1435,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["error"] == error_reason
@@ -1454,7 +1460,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.record_transform_error = _CallRecorder()  # type: ignore[method-assign]
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         # Both must be recorded
         ctx.record_transform_error.assert_called_once()
@@ -1489,7 +1495,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_not_called()
         factory.data_flow.record_token_outcome.assert_not_called()
@@ -1527,7 +1533,7 @@ class TestTransformExecutor:
         token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_fresh_row", contract=contract)
         ctx = make_context()
 
-        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         assert error_sink is None
@@ -1554,7 +1560,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_not_called()
 
@@ -1595,7 +1601,7 @@ class TestTransformExecutor:
         ctx = make_context()
         transform.on_start(ctx)
 
-        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         assert error_sink is None
@@ -1638,7 +1644,7 @@ class TestTransformExecutor:
         transform.on_start(ctx)
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_open_branch_field_mapper_required_fields_rename_also_collides(self) -> None:
         """Third declaration channel (adversarial review of a7c783423): required_fields.
@@ -1674,7 +1680,7 @@ class TestTransformExecutor:
         transform.on_start(ctx)
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_open_branch_field_mapper_guaranteed_rename_still_collides(self) -> None:
         """Control: the explicit-``guaranteed_fields`` channel keeps its true positive.
@@ -1708,7 +1714,7 @@ class TestTransformExecutor:
         transform.on_start(ctx)
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_open_branch_unresolved_original_header_collision_still_raises(self) -> None:
         """Removal-name abstention must not disarm the independent write gate.
@@ -1750,7 +1756,7 @@ class TestTransformExecutor:
 
         assert transform.forwards_input_fields is False
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_field_mapper_mapping_source_is_dispatched_as_a_required_input(self) -> None:
         """The executor enforces d4's derived source before non-strict process()."""
@@ -1799,6 +1805,7 @@ class TestTransformExecutor:
                     contract=missing_contract,
                 ),
                 ctx,
+                attempt=0,
             )
 
         result, updated_token, error_sink = executor.execute_transform(
@@ -1809,6 +1816,7 @@ class TestTransformExecutor:
                 contract=present_contract,
             ),
             ctx,
+            attempt=0,
         )
 
         assert result.status == "success"
@@ -1832,7 +1840,7 @@ class TestTransformExecutor:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx)
+        result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         assert updated_token.row_data["value"] == "processed"
@@ -1853,7 +1861,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         # process() must NOT have been called
         transform.process.assert_not_called()
@@ -1884,7 +1892,7 @@ class TestTransformExecutor:
         token = _make_token(contract=_make_contract())
         ctx = make_context()
 
-        result, _, _ = executor.execute_transform(transform, token, ctx)
+        result, _, _ = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         transform.process.assert_called_once()
@@ -1904,7 +1912,7 @@ class TestTransformExecutor:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_called_once()
         passed_row = transform.process.call_args[0][0]
@@ -1924,7 +1932,7 @@ class TestTransformExecutor:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         factory.execution.begin_node_state.assert_called_once()
         input_data = factory.execution.begin_node_state.call_args[1]["input_data"]
@@ -1954,7 +1962,7 @@ class TestTransformExecutor:
         ctx = make_context()
         assert ctx.contract is None
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert captured_contract is contract
 
@@ -1986,7 +1994,7 @@ class TestTransformExecutor:
         ctx.contract = previous_contract
         ctx.token = previous_token
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert seen["state_id"] == "state_001"
         assert seen["node_id"] == "node_1"
@@ -2014,7 +2022,7 @@ class TestTransformExecutor:
         ctx.contract = previous_contract
         ctx.token = previous_token
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert ctx.state_id == "previous_state"
         assert ctx.node_id == "previous_node"
@@ -2046,7 +2054,7 @@ class TestTransformExecutor:
         ctx.token = previous_token
 
         with pytest.raises(RuntimeError, match="plugin crash"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert ctx.state_id == "previous_state"
         assert ctx.node_id == "previous_node"
@@ -2073,7 +2081,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(ConnectionError) as exc_info:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert stamped_node_state_id(exc_info.value) == "state_001"
 
@@ -2106,7 +2114,7 @@ class TestTransformExecutor:
         token = _make_token(contract=input_contract)
         ctx = make_context()
 
-        _result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx)
+        _result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert isinstance(updated_token.row_data, PipelineRow)
         assert updated_token.row_data["value"] == "processed"
@@ -2126,7 +2134,7 @@ class TestTransformExecutor:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        _result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx)
+        _result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert updated_token is token
         assert updated_token.row_data is token.row_data
@@ -2153,7 +2161,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(OrchestrationInvariantError, match="before on_start") as exc_info:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         # The tier is the load-bearing property, not the class name: it is what
         # makes the processor re-raise instead of converting.
@@ -2174,7 +2182,7 @@ class TestTransformExecutor:
         ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="on_error=None"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_error_reason_none_raises_orchestration_invariant_error(self) -> None:
         """reason=None invariant: prevents incomplete audit records from error results."""
@@ -2191,7 +2199,7 @@ class TestTransformExecutor:
         ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="reason is None"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_success_with_no_output_data_raises_runtime_error(self) -> None:
         """Success with no output data: prevents empty results entering audit trail."""
@@ -2210,7 +2218,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(RuntimeError, match="success but has no output data"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     @pytest.mark.parametrize("can_drop_rows", [False, True])
     def test_success_empty_requires_pass_through_declaration(self, can_drop_rows: bool) -> None:
@@ -2223,7 +2231,7 @@ class TestTransformExecutor:
         ctx = make_context()
 
         with pytest.raises(ZeroEmissionSuccessContractViolation) as exc_info:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert exc_info.value.passes_through_input is False
         assert exc_info.value.can_drop_rows is can_drop_rows
@@ -2304,6 +2312,7 @@ class TestGateExecutor:
             "cg_1",
             token,
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.sink_name is None
@@ -2347,8 +2356,8 @@ class TestGateExecutor:
         ctx = make_context()
 
         with patch("elspeth.engine.executors.gate.ExpressionParser", _CountingParser):
-            first_outcome = executor.execute_config_gate(config, "cg_1", first_token, ctx)
-            second_outcome = executor.execute_config_gate(config, "cg_1", second_token, ctx)
+            first_outcome = executor.execute_config_gate(config, "cg_1", first_token, ctx, attempt_offset=0)
+            second_outcome = executor.execute_config_gate(config, "cg_1", second_token, ctx, attempt_offset=0)
 
         assert first_outcome.next_node_id == NodeID("next_node")
         assert second_outcome.next_node_id == NodeID("next_node")
@@ -2383,6 +2392,7 @@ class TestGateExecutor:
             "cg_1",
             token,
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.sink_name == "error_sink"
@@ -2412,6 +2422,7 @@ class TestGateExecutor:
             "cg_1",
             token,
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.discarded is True
@@ -2447,6 +2458,7 @@ class TestGateExecutor:
             "cg_1",
             token,
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.sink_name is None
@@ -2479,6 +2491,7 @@ class TestGateExecutor:
             "cg_1",
             token,
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.sink_name is None
@@ -2504,6 +2517,7 @@ class TestGateExecutor:
                 "cg_1",
                 token,
                 ctx,
+                attempt_offset=0,
             )
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2526,7 +2540,7 @@ class TestGateExecutor:
             spans.trace_scope("run_1", datetime.now(UTC)),
             pytest.raises(ValueError, match="unknown_label"),
         ):
-            executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+            executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"), attempt_offset=0)
 
         assert len(events) == 1
         assert events[0].name is EngineSpanName.GATE
@@ -2553,7 +2567,7 @@ class TestGateExecutor:
         )
 
         with spans.trace_scope("run_1", datetime.now(UTC)):
-            outcome = executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+            outcome = executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"), attempt_offset=0)
 
         assert outcome.discarded is True
         assert len(events) == 1
@@ -2577,7 +2591,7 @@ class TestGateExecutor:
         ctx = make_context()
 
         with pytest.raises(ValueError) as exc_info:
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         assert secret_label not in str(exc_info.value)
         assert "type=str" in str(exc_info.value)
@@ -2627,6 +2641,7 @@ class TestGateExecutor:
             token,
             ctx,
             token_manager=token_manager,
+            attempt_offset=0,
         )
 
         assert len(outcome.child_tokens) == 2
@@ -2669,6 +2684,7 @@ class TestGateExecutor:
                 token,
                 ctx,
                 token_manager=None,
+                attempt_offset=0,
             )
 
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2694,6 +2710,7 @@ class TestGateExecutor:
                 "cg_1",
                 token,
                 ctx,
+                attempt_offset=0,
             )
 
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2726,6 +2743,7 @@ class TestGateExecutor:
                 "cg_1",
                 token,
                 ctx,
+                attempt_offset=0,
             )
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2754,6 +2772,7 @@ class TestGateExecutor:
             "cg_1",
             _make_token(contract=_make_contract()),
             ctx,
+            attempt_offset=0,
         )
 
         assert outcome.sink_name == "gate_errors"
@@ -2820,6 +2839,7 @@ class TestGateExecutor:
             "cg_1",
             _make_token(data=row, contract=_make_contract()),
             make_context(),
+            attempt_offset=0,
         )
 
         assert outcome.error is not None
@@ -2849,6 +2869,7 @@ class TestGateExecutor:
                 "cg_1",
                 _make_token(contract=_make_contract()),
                 make_context(),
+                attempt_offset=0,
             )
 
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2900,6 +2921,7 @@ class TestGateExecutor:
                 token,
                 ctx,
                 token_manager=None,  # Triggers OrchestrationInvariantError in dispatch
+                attempt_offset=0,
             )
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
@@ -2922,7 +2944,7 @@ class TestGateExecutor:
         ctx = make_context()
 
         with pytest.raises(TypeError, match="NoneType"):
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
     def test_config_gate_int_result_raises_type_error(self) -> None:
         """Expression returning int at runtime raises TypeError — only bool/str are valid.
@@ -2945,7 +2967,7 @@ class TestGateExecutor:
         ctx = make_context()
 
         with pytest.raises(TypeError, match="int"):
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
     def test_config_gate_type_error_redacts_untrusted_eval_result(self) -> None:
         """Unsupported route values must be described with bounded metadata."""
@@ -2967,7 +2989,7 @@ class TestGateExecutor:
         ctx = make_context()
 
         with pytest.raises(TypeError) as exc_info:
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         message = str(exc_info.value)
         assert secret_value not in message
@@ -3003,7 +3025,7 @@ class TestGateExecutor:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        executor.execute_config_gate(config, "cg_1", token, ctx)
+        executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         completed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.COMPLETED)
         context_after = completed_kwargs.get("context_after")
@@ -3037,7 +3059,7 @@ class TestGateExecutor:
 
         # This will fail because no route_resolution_map for "true" label
         with pytest.raises(MissingEdgeError):
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         assert "context_after" not in failed_kwargs
@@ -5831,7 +5853,7 @@ class TestTransformExecutorTerminality:
         transform_mod.stable_hash = failing_hash  # type: ignore[attr-defined, assignment]
         try:
             with pytest.raises(PluginContractViolation, match="non-canonical data"):
-                executor.execute_transform(transform, token, ctx)
+                executor.execute_transform(transform, token, ctx, attempt=0)
         finally:
             transform_mod.stable_hash = original_ref  # type: ignore[attr-defined]
 
@@ -5873,7 +5895,7 @@ class TestTransformExecutorTerminality:
         )
 
         with pytest.raises(PluginContractViolation) as excinfo:
-            executor.execute_transform(transform, _make_token(), make_context())
+            executor.execute_transform(transform, _make_token(), make_context(), attempt=0)
 
         message = str(excinfo.value)
         assert str(bigint) not in message
@@ -5915,7 +5937,7 @@ class TestTransformExecutorTerminality:
         factory.data_flow.update_node_output_contract.side_effect = RuntimeError("contract evolution failed")
 
         with pytest.raises(RuntimeError, match="contract evolution failed"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         # State must be FAILED (guard auto-complete), NOT COMPLETED
         factory.execution.complete_node_state.assert_called_once()
@@ -5936,7 +5958,7 @@ class TestTransformExecutorTerminality:
         token = _make_token()
         ctx = make_context()
 
-        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert result.status == "success"
         assert error_sink is None
@@ -6132,7 +6154,7 @@ class TestGateExecutorExecutionErrorFieldRename:
 
         # Trigger an expression evaluation error
         with pytest.raises(ExpressionEvaluationError):
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
 
@@ -6172,7 +6194,7 @@ class TestGateExecutorExecutionErrorFieldRename:
 
         # "unknown_route" is not in routes, so this raises ValueError
         with pytest.raises(ValueError, match="unknown_route"):
-            executor.execute_config_gate(config, "cg_1", token, ctx)
+            executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
 
@@ -6491,7 +6513,7 @@ class TestTransformExecutorBatchPath:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         # accept() called (batch path taken)
         transform.accept.assert_called_once()
@@ -6524,7 +6546,7 @@ class TestTransformExecutorBatchPath:
         original_claim = ctx.require_work_item()
 
         with pytest.raises(TimeoutError, match="timed out"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         submitted_ctx = transform.accept.call_args[0][1]
         ctx.work_item = None
@@ -6549,7 +6571,7 @@ class TestTransformExecutorBatchPath:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        result, _, _ = executor.execute_transform(transform, token, ctx)
+        result, _, _ = executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.process.assert_called_once()
         assert result.status == "success"
@@ -6662,7 +6684,7 @@ class TestTransformExecutorBatchPath:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        executor.execute_transform(transform, token, ctx)
+        executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert invocation_order == ["register", "accept", "wait"]
         mock_adapter.register.assert_called_once_with(token.token_id, "state_001")
@@ -6686,7 +6708,7 @@ class TestTransformExecutorBatchPath:
         ctx = make_context()
 
         with pytest.raises(TimeoutError, match="timed out"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         # evict_submission called with (token_id, state_id)
         transform.evict_submission.assert_called_once_with(token.token_id, "state_001")
@@ -6714,7 +6736,7 @@ class TestTransformExecutorBatchPath:
         ctx = make_context()
 
         with pytest.raises(RuntimeError, match="Failed to evict timed-out submission"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_non_timeout_exception_does_not_evict(self) -> None:
         """Non-TimeoutError exceptions do NOT trigger eviction."""
@@ -6731,7 +6753,7 @@ class TestTransformExecutorBatchPath:
         ctx = make_context()
 
         with pytest.raises(ValueError, match="not a timeout"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         transform.evict_submission.assert_not_called()
 
@@ -6753,7 +6775,7 @@ class TestTransformExecutorBatchPath:
         ctx = make_context()
         ctx.landscape = factory.execution
 
-        _, _, error_sink = executor.execute_transform(transform, token, ctx)
+        _, _, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert error_sink == "discard"
 
@@ -6778,7 +6800,7 @@ class TestTransformExecutorBatchPath:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        result, _, _ = executor.execute_transform(transform, token, ctx)
+        result, _, _ = executor.execute_transform(transform, token, ctx, attempt=0)
 
         assert_stable_hash(result.input_hash, token.row_data.to_dict())
         assert_stable_hash(result.output_hash, output_row)
@@ -6971,7 +6993,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context()
 
         # Should NOT raise.
-        result, _, _ = executor.execute_transform(transform, token, ctx)
+        result, _, _ = executor.execute_transform(transform, token, ctx, attempt=0)
         assert result.status == "success"
 
     def test_cross_check_raises_on_dropped_field(self) -> None:
@@ -6990,7 +7012,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context(run_id="run_abc")
 
         with pytest.raises(PassThroughContractViolation) as excinfo:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         violation = excinfo.value
         assert violation.divergence_set == frozenset({"extra"})
@@ -7042,7 +7064,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context(run_id="run_xyz")
 
         with pytest.raises(PassThroughContractViolation) as excinfo:
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         violation = excinfo.value
         assert violation.divergence_set == frozenset({"extra"})
@@ -7074,7 +7096,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context()
 
         with pytest.raises(FrameworkBugError, match=r"emitted row with no contract"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_cross_check_crashes_when_input_row_contract_is_none(self) -> None:
         """Input row with contract=None is a framework invariant violation."""
@@ -7094,7 +7116,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context()
 
         with pytest.raises(FrameworkBugError, match=r"input row has no contract"):
-            executor.execute_transform(transform, token, ctx)
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_cross_check_skipped_for_non_pass_through_transforms(self) -> None:
         """passes_through_input=False → cross-check is bypassed even on field drops."""
@@ -7112,7 +7134,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context()
 
         # Should NOT raise — the drop is legal for a non-pass-through transform.
-        result, _, _ = executor.execute_transform(transform, token, ctx)
+        result, _, _ = executor.execute_transform(transform, token, ctx, attempt=0)
         assert result.status == "success"
 
     def test_cross_check_handles_empty_emission(self) -> None:
@@ -7134,7 +7156,7 @@ class TestPassThroughCrossCheck:
         ctx = make_context()
 
         # Cross-check is bypassed for non-success results.
-        result, _, error_sink = executor.execute_transform(transform, token, ctx)
+        result, _, error_sink = executor.execute_transform(transform, token, ctx, attempt=0)
         assert result.status == "error"
         assert error_sink == "discard"
 
@@ -7221,7 +7243,7 @@ class TestPassThroughCrossCheck:
             ctx = make_context()
 
             with pytest.raises(PassThroughContractViolation):
-                executor.execute_transform(transform, token, ctx)
+                executor.execute_transform(transform, token, ctx, attempt=0)
 
             metrics_data = reader.get_metrics_data()
             found = False

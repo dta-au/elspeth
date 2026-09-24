@@ -270,7 +270,7 @@ class GateExecutor:
         ctx: PluginContext,
         token_manager: "TokenManager | None" = None,
         *,
-        attempt_offset: int = 0,
+        attempt_offset: int,
     ) -> GateOutcome:
         """Execute a config-driven gate using ExpressionParser.
 

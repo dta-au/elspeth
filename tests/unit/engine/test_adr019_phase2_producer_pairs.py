@@ -39,6 +39,7 @@ def test_processor_terminal_work_item_returns_default_flow_pair() -> None:
         ctx=PluginContext(run_id="run-adr019-phase2", config={}),
         current_node_id=None,
         on_success_sink="terminal_sink",
+        attempt_offset=0,
     )
 
     assert result is not None

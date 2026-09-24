@@ -2358,7 +2358,7 @@ class RowProcessor:
         token: TokenInfo,
         ctx: PluginContext,
         *,
-        attempt_offset: int = 0,
+        attempt_offset: int,
     ) -> tuple[TransformResult, TokenInfo, str | None]:
         """Execute transform with optional retry for transient failures.
 
@@ -5586,10 +5586,11 @@ class RowProcessor:
         coalesce_node_id: NodeID | None = None,
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
-        attempt_offset: int = 0,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
         collector_name: CollectorName | None = None,
+        *,
+        attempt_offset: int,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         return self._token_traversal.process_single_token(
             token,
@@ -5598,10 +5599,10 @@ class RowProcessor:
             coalesce_node_id,
             coalesce_name,
             on_success_sink,
-            attempt_offset,
             row_union_node_id,
             row_union_name,
             collector_name,
+            attempt_offset=attempt_offset,
         )
 
     def _handle_transform_node(
@@ -5614,7 +5615,8 @@ class RowProcessor:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
-        attempt_offset: int = 0,
+        *,
+        attempt_offset: int,
     ) -> _TransformOutcome:
         return self._token_traversal.handle_transform_node(
             transform,
@@ -5625,7 +5627,7 @@ class RowProcessor:
             coalesce_node_id,
             coalesce_name,
             current_on_success_sink,
-            attempt_offset,
+            attempt_offset=attempt_offset,
         )
 
     def _handle_transform_error_status(
