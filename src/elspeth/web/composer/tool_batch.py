@@ -2218,8 +2218,20 @@ async def run_tool_batch(
         # ``_SESSION_AWARE_TOOL_HANDLERS`` and the per-tool
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
+            # Preflight is infrastructure work, before the session-aware
+            # handler. Its failure/deadline carriers must reach the phase
+            # owner without being recategorized as a handler crash.
             try:
                 review_preflight = await _pending_review_runtime_findings(state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn,
+                ) from preflight_exc.original_exc
+            try:
                 session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
                     tool_name=tool_name,
                     tool_call_id=tool_call.id,

@@ -1533,7 +1533,7 @@ async def test_staged_review_over_unwired_draft_adds_only_reply_turn(
 
 
 @pytest.mark.asyncio
-async def test_staged_review_with_spent_budget_completes_with_qualified_disclosure(
+async def test_staged_review_with_spent_budget_withholds_cards_for_invalid_graph(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
     monkeypatch: pytest.MonkeyPatch,
