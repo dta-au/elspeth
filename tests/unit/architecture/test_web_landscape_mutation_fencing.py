@@ -849,7 +849,9 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # self._execution.complete_collector_failure#1 (the lost-members arm's verdict) and
 # NodeStateGuard.complete_collector_failure -> self._execution.complete_collector_failure#1
 # (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
-_EXPECTED_CALL_COUNT = 289
+# Source replay restores discarded source decisions through the existing fenced
+# PluginContext.record_validation_error API (one new caller, none removed).
+_EXPECTED_CALL_COUNT = 290
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -860,7 +862,7 @@ _EXPECTED_CALL_COUNT = 289
 # Re-derived for the combined K063/K056 tree after the caller exchange.
 # K063 run accounting adds CollectorExecutor.notify_empty_group's direct
 # complete_collector_failure call for a zero-arrival group.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "ca9daf80dbf50d8c27cf8ca06d51603ec0ba58ebd6db99e27f0844f93f86cbb9"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "7683d3e0cfefa635a465005c75805f5aa666f027bc98346f483f647378011cc3"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,

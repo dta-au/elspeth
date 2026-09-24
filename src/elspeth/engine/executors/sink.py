@@ -798,7 +798,7 @@ class SinkExecutor:
         else:
             if ctx.replay_from is None:
                 raise OrchestrationInvariantError("replay sink execution requires a source run")
-            effect_adapter = VirtualReplaySinkEffect(source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
+            effect_adapter = VirtualReplaySinkEffect(factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -1011,9 +1011,23 @@ class SinkExecutor:
         if self._factory is None or failsink.node_id is None:
             raise OrchestrationInvariantError("linked failsink effects require an owning factory and sink node")
         failsink_node_id = failsink.node_id
-        run = self._factory.run_lifecycle.get_run(self._run_id)
+        timestamp_run_id = self._run_id
+        if ctx.run_mode is not RunMode.LIVE:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay failsink execution requires a source run")
+            timestamp_run_id = ctx.replay_from
+        run = self._factory.run_lifecycle.get_run(timestamp_run_id)
         if run is None:
             raise OrchestrationInvariantError("linked failsink effect run is missing")
+        seen_run_ids = {run.run_id}
+        while run.replay_from_run_id is not None:
+            if run.replay_from_run_id in seen_run_ids:
+                raise AuditIntegrityError("linked failsink source run ancestry contains a cycle")
+            seen_run_ids.add(run.replay_from_run_id)
+            source_run = self._factory.run_lifecycle.get_run(run.replay_from_run_id)
+            if source_run is None:
+                raise AuditIntegrityError("linked failsink source run ancestry is missing")
+            run = source_run
         stable_timestamp = run.started_at.astimezone(UTC).isoformat()
         enriched_rows: list[dict[str, object]] = []
         enriched_by_token: dict[str, dict[str, object]] = {}
@@ -1134,6 +1148,15 @@ class SinkExecutor:
             for member in identity.members
         )
         failsink._reset_diversion_log()
+        effect_adapter: SinkProtocol | VirtualReplaySinkEffect
+        if ctx.run_mode is RunMode.LIVE:
+            effect_adapter = failsink
+        else:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay failsink execution requires a source run")
+            effect_adapter = VirtualReplaySinkEffect(
+                factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=failsink_node_id, role=SinkEffectRole.FAILSINK
+            )
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -1153,7 +1176,7 @@ class SinkExecutor:
                 ),
                 finalization_members=finalization_members,
             ),
-            failsink,  # type: ignore[arg-type]
+            cast(_SinkEffectAdapter, effect_adapter),
         )
         durable = self._execution.sink_effects.get_members(result.effect.effect_id)
         if any(member.prepared_disposition != "accepted" for member in durable):

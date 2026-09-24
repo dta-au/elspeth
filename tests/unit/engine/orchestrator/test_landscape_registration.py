@@ -286,5 +286,6 @@ def test_register_nodes_with_landscape_uses_resolved_audit_metadata() -> None:
             "schema_config": _SCHEMA_CONFIG,
             "output_contract": schema_contract,
             "source_file_hash": "sha256:aaaaaaaaaaaaaaaa",
+            "sequence": 0,
         }
     ]
