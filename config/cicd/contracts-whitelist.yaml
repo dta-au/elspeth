@@ -1098,6 +1098,10 @@ allowed_dict_patterns:
   # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
   - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
+  # Reply-only requests quote tool protocol records within the same external
+  # LiteLLM message shape; persisted history remains nominally typed.
+  - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
+  - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
   - "src/elspeth/web/composer/service.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.
