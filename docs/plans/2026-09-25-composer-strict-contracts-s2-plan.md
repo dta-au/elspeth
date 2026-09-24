@@ -971,7 +971,51 @@ the design effect M6 measures, before it is pre-registered.
 7. **Judge-bundle churn** on `decode_wire_arguments` at F1 and every later flip that edits it: ordinary per-commit
    hygiene, nothing staged.
 
-### 7.2 Open decisions for John
+### 7.2 Decisions: ruled 2026-09-25
+
+**Ruled by John on 2026-09-25 ("excellent, lets get that docuemnted").** He accepted the combined recommendation of a
+systems-thinking review and an LLM-behaviour review of every open decision. The reviews are in the lane:
+`$L/rulings-systems.md` and `$L/rulings-llm.md`. The two agreed on the direction of every ruling. The table after
+this one keeps the original options as the record of what was weighed.
+
+Both reviews reached one finding that governs all of these rulings: **every flip depends on a live canary**. None of
+the §5.3 zero-tolerance tripwires would have caught the S1 zero-property regression. The endpoint accepted the
+schema and then produced bad calls. Sending `strict` can make an endpoint that does not enforce it *worse*; it is
+not merely ignored.
+
+| # | Ruling | Conditions |
+|---|---|---|
+| R-A | **Yes.** A flipped tool on `openai_strict` rejects the S-form key as `wire_decode` (this overturns S1 D12) | A flip is enabled only after its live canary passes for that shape on the `provider_served` endpoints that actually serve the route. The rejection text is verified to reach the planner unredacted; today `protocol.py:1074-1091` drops the detail. A repeat guard for identical consecutive rejections lands before F1 |
+| R-B | **Reject duplicate keys**, decided now (P1, compose loop) | P1 lands last before F1. M3's count is a veto, not the decider: at about 5 option calls a day it reads near zero for months |
+| R-C | **Accept** the permanent split: MCP and `none` keep objects; web `openai_strict` uses carriers | Accepted knowingly, as the one ruling that is hard to undo. It is bound to R-A's canary condition, because on a non-enforcing endpoint the split buys nothing |
+| R-D | **Not yet.** Keep the "not strings containing JSON" sentence unchanged, and pin the carrier position as unreachable | Decide at F4. F1 cannot produce the evidence: `patch_node_options` has only `node_id` and `patch` |
+| R-E | **Yes, option (a):** the outer traversal skips declared carrier strings and charges their decoded content once | Add a large-carrier canary case and measure the escape overhead before F5. The residual escaping cost in the raw 1 MiB preflight is stated |
+| R-F | **Confirm:** no machinery lands before its first producer | Also: one new wire shape per flip, or a separate canary for each shape. What broke S1 was a shape on an endpoint, not machinery |
+| R-G | **Moot as a reopen basis. It is replaced by a per-flip acceptance rule.** | A flip needs John's stability call, its prerequisites landed, a live canary before and after, and no tripwire firing, and every call is read by hand for the first K calls. F6 to F10 have no organic traffic, so they need more seeded scenarios than one each |
+| R-H | **State it:** "no dual acceptance" is read per (tool, dialect route). The route is the dialect, not the served endpoint | Pin a maximum length for the mixed-form window, and pause only at family boundaries, so "one at a time" cannot stretch the mixed window into months |
+| R-I | **Allow** M1a/M1b to change the ARG_ERROR `planner_payload` | Sequenced after the defect-0b fix (`docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md`), which touches the same payload path |
+| R-J | **Adopt and freeze the turn-cost definition now** | Add reasoning-token totals and burst length. The live 10-retry burst of 2026-09-25 is a test case. Changing the definition later breaks comparison with windows already recorded |
+| R-K | **Group:** focused tests and the affected whole-tree gates on each commit, one full-suite gate per tranche | The full suite cannot see the defect class that matters here; the canary can |
+| R-L | **Option (a):** repair suggestions are rendered through `encode` for each route (P4) | Add a test of a copied-then-edited carrier, because copy-then-edit brings back the escaping hazard. Option (b) would teach a form that R-A rejects |
+| R-M | **A hierarchy of evidence, never pooled:** canary and battery rounds may accept a flip; organic traffic may only revert one, and one real failure is enough | The fast sources carry acceptance, because organic data takes months. Synthetic clearance never stands in for real validation |
+| R-N (new) | **Not yet:** A2 turns copy-ready repair calls (`validation.py:265-267`) into prose, which contradicts R-L's own argument | Keep the paired round for the A tranche, and decide on A2's measured repair turn-cost |
+
+**Deferred until there is data:**
+- the flip order after F3 (F4/F5 versus F6 to F10), decided on canary data;
+- whether F1 is the acceptance pilot, decided after the S1 canary (if the endpoint does not enforce strict, F1 can only
+  show harm, though it remains a fine pilot for the mechanism);
+- R5 (pin OpenRouter to enforcing endpoints), which goes back to John with the first flip, as the structural lever that
+  decides how much traffic is actually enforced.
+
+**Sequencing that follows from these rulings:**
+1. Run the live canary on S1's *current* strict shapes before any S2 work: strict against a control, one endpoint at
+   a time, and check that the model recovers on the next turn. Re-run it whenever a new endpoint appears.
+2. Take the M6 baseline only after the defect-0 and 0b fixes are deployed. Otherwise the preview and list loops
+   distort every turn metric.
+3. Once defect 0 lands, every "32 strict tools" count is re-anchored to the partition that actually lands (the fix
+   brief proposes 22/20).
+
+**The options as weighed (kept for the record):**
 
 | # | Decision | Gates | Recommendation |
 |---|---|---|---|
