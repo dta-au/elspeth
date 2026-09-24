@@ -57,7 +57,8 @@ while R1 stays no.
   flip steps also need the Tier R rulings in §7.2.
 - **Three steps cannot be made small.** Under R-F (no machinery ahead of its first producer), F1 (L), F4 (L) and F5
   (XL) are the irreducible large steps: each carries machinery whose only producer is that flip. Everything that can
-  run today with identical output has been pulled out of them (P3, P4, A8). If John wants F1, F4 or F5 smaller still,
+  run today with identical output has been pulled out of them (P3, P4), and so has the live-defect fix A8. If John
+  wants F1, F4 or F5 smaller still,
   the price is relaxing R-F for that machinery; §7.2 R-F puts the trade to him directly.
 
 ### 1.2 Goal
@@ -695,7 +696,8 @@ revert it before any A or P step it depends on (principle 7); the flip's own mod
   item 4), and of the fixed pair loc rule (item 7). `upsert_node` has no semantic transcript replay, so
   `test_transcript_argument_order.py` (which covers `set_pipeline` only) is not touched here; it moves in F5.
 - *First null-writing encode* (§3.5 item 3): its first reader is P4's suggestion render. The `wire_conformant(encode(s))`
-  property covers `upsert_node`, and P4's pin gains teeth here.
+  property covers `upsert_node`, and P4's pin gains teeth here. Under R-L option b there is no P4, so the branch would
+  have only a test as its reader; it then lands in F5 instead, where the four `semantic=True` replay sites read it.
 - *The tri-state detector gate lands here:* `upsert_node.options_json` is the first promoted **nullable** carrier. The
   gate proves no promoted field has a `null` that means something other than absent, and covers S1's 13 existing
   promotions too. Control: a synthetic promoted field whose null differs from absent → red.
@@ -937,7 +939,7 @@ the design effect M6 measures, before it is pre-registered.
 | R-C | Accept the permanent split: web `openai_strict` sends `*_json`, MCP and `none` send objects | F1 | Accept. The alternative is a carrier in S, which breaks "`none` = today's bytes" and pulls S3 into every step |
 | R-D | R1's "The 'not strings containing JSON' guidance stands" needs no amendment at carrier positions: an S type fault can never occur there on `openai_strict`. Open: for a type fault at another position of a flipped tool on `openai_strict`, keep the sentence, or append a fixed per-(dialect, flipped tool) variant that names the carrier exception | after the F1 round | Keep the sentence unchanged in F1 and pin the carrier position unreachable. Build the variant only if the F1 round shows the sentence confusing the model; it needs the allowlist (`protocol.py:993-997`) and strip (`:1392-1393`) changes plus a redaction review |
 | R-E | A bounds overrun inside a carrier stays `wire_json_bounds`. Sub-decision on the shared per-call budget: (a) the outer traversal skips declared carrier strings and charges their decoded content once, or (b) accept a roughly halved effective limit for carrier tools | F1 | Yes, and (a): it is what "accepted, as the object form is today" in the carrier table already promises. The raw 1 MiB preflight still charges escapes; state that residual |
-| R-F | No machinery lands ahead of its first producer | step sizes | Confirm (S0 precedent). This is why F1 (L), F4 (L) and F5 (XL) cannot be made smaller, and why the pair codec waits for F4. Everything with a live producer today has been pulled out (P3, P4, A8). Relaxing R-F is the only way to shrink the three further; that is the direct trade against "small steps" |
+| R-F | No machinery lands ahead of its first producer | step sizes | Confirm (S0 precedent). This is why F1 (L), F4 (L) and F5 (XL) cannot be made smaller, and why the pair codec waits for F4. Everything with a live producer today has been pulled out (P3, P4, and the defect fix A8). Relaxing R-F is the only way to shrink the three further; that is the direct trade against "small steps" |
 | R-G | The basis for each reopen: the §6.3 trigger, or a ruling. For F6 to F10, a family ruling, because the per-tool trigger can never fire for tools nobody calls | Tier F timing; F6 to F10 | John's call. Without a family ruling, stop after F5 |
 | R-H | "No dual acceptance, no old wire form alongside the new one" (master plan §4) is read per (tool, route); the mixed window across tools is what "one at a time" entails | every flip | State it explicitly, so it is not relitigated |
 | R-I | M1a changes the ARG_ERROR `planner_payload` in `RejectionRecord`, which S1 lead ruling 6 left untouched (the ticket records this as needing a lead decision) | M1a (and M1b, which shares the rejection path) | Allow it: the payload becomes what the planner saw, which is what the table comment already promises |
