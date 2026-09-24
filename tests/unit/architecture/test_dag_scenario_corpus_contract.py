@@ -766,6 +766,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting that literal
 # reproduces the prior manifest byte for byte. No resume digest moved and no
 # oracle_freeze snapshot moved.
+# Rotated again 2026-09-24 (R6 follow-up): the same docstring correction was
+# narrowed (a raised PluginContractViolation IS converted to a routed error;
+# only TypeError/KeyError escape unconverted), so the hash moved again
+# (8ad41f481a0a1400 -> fc4a2bcdd9d3fa2b, same single pin, same proofs).
 EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

@@ -9,16 +9,17 @@ A wrong-typed array_field (anything but a list/tuple: str, mapping, None, a
 number) and an empty array are facts about one row's data. process() RETURNS a
 non-retryable ``TransformResult.error()`` for each (``invalid_input``, with
 ``error_type: wrong_type`` for the type case), and the node's ``on_error``
-routes the row. It returns rather than raises because only a returned error
-reaches ``on_error``; a raise aborts the run (ADR-008 §"TIER_1 registration is
-load-bearing", Correction 2026-08-21). The value is never coerced: iterating a
-str or a mapping would fabricate rows the operator never supplied.
+routes the row. It returns rather than raises because a TypeError or KeyError
+escaping process() matches no conversion clause in the engine and aborts the
+run (ADR-008 §"TIER_1 registration is load-bearing", Correction 2026-08-21).
+The value is never coerced: iterating a str or a mapping would fabricate rows
+the operator never supplied.
 
 A row that lacks array_field altogether is NOT converted: ``row[array_field]``
-raises KeyError, nothing in the engine turns that into a routed error, and the
-run aborts. Declaring the field in the source schema (for example
-``'items: any'``) makes the source reject such a row at ingest, per its
-``on_validation_failure``, instead.
+raises KeyError, which escapes to the engine unconverted, and the run aborts.
+Declaring the field in the source schema (for example ``'items: any'``) makes
+the source reject such a row at ingest, per its ``on_validation_failure``,
+instead.
 
 JSONExplodeConfig extends DataPluginConfig (not TransformDataConfig), so it
 does not accept ``required_input_fields``. ``on_success`` and ``on_error`` are
@@ -277,7 +278,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8ad41f481a0a1400"
+    source_file_hash: str | None = "sha256:fc4a2bcdd9d3fa2b"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -480,7 +481,8 @@ class JSONExplode(BaseTransform):
             KeyError: If array_field is absent from the row (not converted; the
                 run aborts - see module docstring)
             PluginContractViolation: If output_field or item_index would
-                overwrite a field already present in the row
+                overwrite a field already present in the row (Tier 2: the
+                engine converts it into a routed, non-retryable error)
         """
         # Direct access, no membership check: an absent array_field raises
         # KeyError here and the run aborts (see module docstring).

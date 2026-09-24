@@ -3,8 +3,8 @@
 JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
-THREE-TIER TRUST MODEL:
-- A missing array field is an upstream contract violation and raises ``KeyError``
+ROW FAILURES (see the plugin's module docstring):
+- A missing array field raises ``KeyError``, which the engine does not convert
 - A present field with the wrong value type is a row-level data failure
 - Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
   them without coercing or fabricating array elements
@@ -292,10 +292,9 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Distinguish missing-field contract violations from wrong-type row failures.
+    """Distinguish the missing-field raise from wrong-type row failures.
 
-    Per three-tier trust model:
-    - A missing array field remains an upstream bug and raises ``KeyError``
+    - A missing array field raises ``KeyError`` (not converted by the engine)
     - A present field with the wrong value type returns a non-retryable error
     - Strings and mappings are rejected rather than iterated into fabricated rows
     """
@@ -306,7 +305,7 @@ class TestJSONExplodeTypeViolations:
         return make_context()
 
     def test_missing_field_crashes(self, ctx: PluginContext) -> None:
-        """Missing array field is upstream bug - should crash (KeyError)."""
+        """A missing array field raises KeyError: the current, unconverted behaviour."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
