@@ -340,6 +340,31 @@ def test_restore_rejects_coalesce_tag_on_row_union_node() -> None:
         restore_composer_authority_payload(_projected_payload("row_union", _projection([["a", "a_in"]])))
 
 
+@pytest.mark.parametrize(
+    ("case", "branches", "message"),
+    [
+        ("plain_map", {"a": "a_in", "b": "b_in"}, "branches are malformed"),
+        ("missing_tag", {"items": [["a", "a_in"]]}, "branches are malformed"),
+        ("extra_key", {"schema": _ROW_UNION_TAG, "items": [["a", "a_in"]], "extra": 1}, "branches are malformed"),
+        ("items_not_list", {"schema": _ROW_UNION_TAG, "items": {"a": "a_in"}}, "branches are malformed"),
+        ("duplicate_alias", _projection([["a", "a_in"], ["a", "b_in"]], schema=_ROW_UNION_TAG), "branch item is malformed"),
+        ("non_str_alias", _projection([[1, "a_in"]], schema=_ROW_UNION_TAG), "branch item is malformed"),
+        ("non_list_item", _projection([{"a": "a_in"}], schema=_ROW_UNION_TAG), "branch item is malformed"),
+        ("three_item_entry", _projection([["a", "a_in", "extra"]], schema=_ROW_UNION_TAG), "branch item is malformed"),
+        ("one_item_entry", _projection([["a"]], schema=_ROW_UNION_TAG), "branch item is malformed"),
+    ],
+)
+def test_restore_rejects_malformed_row_union_projection(case: str, branches: object, message: str) -> None:
+    """Characterization: the row_union arm fails closed on the same structures as coalesce.
+
+    The row_union arm rejected these before the shared helper existed, with
+    these exact messages; the duplicate-alias case pins R2 condition 3 for
+    row_union, which no stored-projection test covered.
+    """
+    with pytest.raises(ValueError, match=rf"^row-union authority projection {message}$"):
+        restore_composer_authority_payload(_projected_payload("row_union", branches))
+
+
 # --- 8-10: preimages that must not move; R2 conditions 1-2 -------------------
 
 
