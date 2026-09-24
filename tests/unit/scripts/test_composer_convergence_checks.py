@@ -161,12 +161,18 @@ def _evidence(case: dict[str, Any], state: dict[str, Any], run: dict[str, Any]) 
                 tokens.append(
                     {"token_id": token_id, "row_id": row["row_id"], "join_group_id": f"join-{index}" if token_id == merged else None}
                 )
-            for child, parent, ordinal in ((left, base, 0), (right, base, 0), (merged, left, 0), (merged, right, 1)):
+            for child, parent, ordinal in ((left, base, 0), (right, base, 1), (merged, left, 0), (merged, right, 1)):
                 evidence["token_parents"].append({"token_id": child, "parent_token_id": parent, "ordinal": ordinal})
             for token_id, member in ((left, "left"), (right, "right")):
                 evidence["lineage_frames"].append({"token_id": token_id, "kind": "fork", "group_id": f"fork-{index}", "member_key": member})
+                evidence["token_outcomes"].append(
+                    {"token_id": token_id, "outcome": "success", "path": "coalesced", "completed": 1, "sink_name": None}
+                )
             evidence["token_outcomes"].append(
-                {"token_id": merged, "outcome": "success", "path": "coalesced", "completed": True, "sink_name": "combined"}
+                {"token_id": base, "outcome": "transient", "path": "fork_parent", "completed": 1, "sink_name": None}
+            )
+            evidence["token_outcomes"].append(
+                {"token_id": merged, "outcome": "success", "path": "default_flow", "completed": 1, "sink_name": "combined"}
             )
     elif case["audit"]["shape"] == "expansion":
         for index, count in enumerate(case["audit"]["children_per_source_row"]):
@@ -344,7 +350,21 @@ def test_source_data_immutability_controls(mutation: str) -> None:
     assert check_case(case, state=state, run=run, outputs=outputs, evidence=evidence)
 
 
-@pytest.mark.parametrize("mutation", ["cross_row", "same_branch", "different_fork", "different_parent"])
+@pytest.mark.parametrize("terminal_path", ["default_flow", "coalesced"])
+def test_joined_output_identity_survives_downstream_processing(terminal_path: str) -> None:
+    case = next(case for case in CASES if case["audit"]["shape"] == "fork_join")
+    state, run, outputs = _positive(case)
+    evidence = _evidence(case, state, run)
+    sink_outcomes = [outcome for outcome in evidence["token_outcomes"] if outcome["sink_name"] is not None]
+    assert len(sink_outcomes) == 3
+    for outcome in sink_outcomes:
+        outcome["path"] = terminal_path
+    assert check_case(case, state=state, run=run, outputs=outputs, evidence=evidence) == []
+
+
+@pytest.mark.parametrize(
+    "mutation", ["cross_row", "same_branch", "different_fork", "different_parent", "missing_parent", "duplicate_parent"]
+)
 def test_fork_parent_pairing_controls(mutation: str) -> None:
     case = next(case for case in CASES if case["audit"]["shape"] == "fork_join")
     state, run, outputs = _positive(case)
@@ -357,15 +377,71 @@ def test_fork_parent_pairing_controls(mutation: str) -> None:
         evidence["lineage_frames"][1]["member_key"] = "left"
     elif mutation == "different_fork":
         evidence["lineage_frames"][1]["group_id"] = "foreign-fork"
-    else:
+    elif mutation == "different_parent":
         evidence["token_parents"][1]["parent_token_id"] = "token-1"
+    elif mutation == "missing_parent":
+        evidence["token_parents"].pop(3)
+    else:
+        evidence["token_parents"][3]["parent_token_id"] = "left-0"
     assert check_case(case, state=state, run=run, outputs=outputs, evidence=evidence)
+
+
+@pytest.mark.parametrize("mutation", ["join_identity", "failure", "incomplete", "no_sink", "missing", "duplicate", "wrong_row"])
+def test_joined_output_identity_and_row_coverage_controls(mutation: str) -> None:
+    case = next(case for case in CASES if case["audit"]["shape"] == "fork_join")
+    state, run, outputs = _positive(case)
+    evidence = _evidence(case, state, run)
+    merged_token = next(token for token in evidence["tokens"] if token["token_id"] == "merged-0")
+    outcome = next(item for item in evidence["token_outcomes"] if item["token_id"] == "merged-0")
+    if mutation == "join_identity":
+        merged_token["join_group_id"] = None
+    elif mutation == "failure":
+        outcome["outcome"] = "failure"
+    elif mutation == "incomplete":
+        outcome["completed"] = 0
+    elif mutation == "no_sink":
+        outcome["sink_name"] = None
+    elif mutation == "missing":
+        evidence["token_outcomes"].remove(outcome)
+    elif mutation == "duplicate":
+        evidence["token_outcomes"].append(dict(outcome))
+    else:
+        merged_token["row_id"] = "row-1"
+    expected = (
+        "audit: fork outcome identities do not match emitted tokens exactly once"
+        if mutation in {"missing", "duplicate"}
+        else "audit: joined outputs do not cover each original row exactly once"
+    )
+    assert check_case(case, state=state, run=run, outputs=outputs, evidence=evidence) == [expected]
 
 
 def test_missing_audit_evidence_is_not_a_passing_execution() -> None:
     case = CASES[0]
     state, run, outputs = _positive(case)
     assert check_case(case, state=state, run=run, outputs=outputs) == ["audit: run-bound execution and input evidence missing"]
+
+
+@pytest.mark.parametrize("mutation", ["failed", "incomplete", "unsunk", "unknown", "missing_branch"])
+def test_fork_outcome_identity_census_rejects_extra_or_missing_evidence(mutation: str) -> None:
+    case = next(case for case in CASES if case["audit"]["shape"] == "fork_join")
+    state, run, outputs = _positive(case)
+    evidence = _evidence(case, state, run)
+    extra = dict(next(item for item in evidence["token_outcomes"] if item["token_id"] == "merged-0"))
+    if mutation == "missing_branch":
+        evidence["token_outcomes"].pop(0)
+    else:
+        if mutation == "failed":
+            extra["outcome"] = "failure"
+        elif mutation == "incomplete":
+            extra["completed"] = 0
+        elif mutation == "unsunk":
+            extra["sink_name"] = None
+        else:
+            extra["token_id"] = "unknown-token"
+        evidence["token_outcomes"].append(extra)
+    assert check_case(case, state=state, run=run, outputs=outputs, evidence=evidence) == [
+        "audit: fork outcome identities do not match emitted tokens exactly once"
+    ]
 
 
 @pytest.mark.parametrize("case_id", ["08_json_expansion", "10_multiline_records"])

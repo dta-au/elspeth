@@ -314,7 +314,19 @@ def _check_fork_lineage(evidence: dict[str, Any], tokens: dict[str, dict[str, An
     for frame in _records(evidence["lineage_frames"], "lineage frames"):
         frames.setdefault(frame["token_id"], []).append(frame)
     outcomes = _records(evidence["token_outcomes"], "token outcomes")
-    merged = [outcome for outcome in outcomes if outcome["path"] == "coalesced" and outcome["sink_name"] is not None]
+    outcome_ids = {outcome["token_id"] for outcome in outcomes}
+    if len(outcome_ids) != len(outcomes) or outcome_ids != set(tokens):
+        return ["audit: fork outcome identities do not match emitted tokens exactly once"]
+    # Consumed branches use "coalesced" too; merged tokens retain their join
+    # identity even when downstream nodes finish through the ordinary sink path.
+    merged = [
+        outcome
+        for outcome in outcomes
+        if tokens[outcome["token_id"]]["join_group_id"] is not None
+        and outcome["outcome"] == "success"
+        and outcome["completed"] == 1
+        and outcome["sink_name"] is not None
+    ]
     if len(merged) != len(row_ids) or {tokens[outcome["token_id"]]["row_id"] for outcome in merged} != row_ids:
         return ["audit: joined outputs do not cover each original row exactly once"]
     for outcome in merged:
