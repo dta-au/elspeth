@@ -6348,6 +6348,36 @@ class ComposerServiceImpl:
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
+        if (
+            repair_turns_used == 0
+            and repair_turns_used < _MAX_REPAIR_TURNS
+            and not mutation_success_seen
+            and not recorder.invocations
+            and _state_is_structurally_empty(state)
+            and _no_tool_policy.carries_build_action(message)
+            and (deadline is None or deadline > asyncio.get_running_loop().time())
+        ):
+            # Keep the more specific uploaded-source recovery above. The
+            # disclosure predicate includes questions and revocations; it must
+            # not authorize construction. Give the provider one neutral chance
+            # to reconcile its reply with actual state and the original request.
+            # The shared repair counter bounds this to one extra call, and the
+            # normal call path retains the deadline.
+            llm_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
+                        "Re-check the user's request against that state. If the user requested construction or generated "
+                        "source data, carry out that authorized work using the declared tools before claiming it is complete. "
+                        "If a required product fact is missing, ask the concrete question. If the user asked only for "
+                        "explanation or revoked construction, answer that request without building. Do not describe data "
+                        "as saved, bound, or reviewed until tool results establish it."
+                    ),
+                }
+            )
+            return _TerminateOutcome(action="continue", repair_turns_delta=1)
+
         # Forced-repair gate: when the model claims completion but the proof
         # step still has blocking diagnostics, inject a repair message and
         # continue. At _MAX_REPAIR_TURNS, preserve the blocker as an explicit
