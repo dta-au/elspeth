@@ -31,6 +31,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    DeclaredOutputTypeViolation,
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
@@ -38,11 +39,15 @@ from elspeth.contracts.errors import (
     RunMembershipLostError,
     RunWorkerEvictedError,
     SchedulerLeaseLostError,
+    TypeMismatchViolation,
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
+from elspeth.contracts.plugin_roles import require_output_declaring_plugin
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secret_scrub import scrub_transform_error_reason
+from elspeth.contracts.transform_contract import validate_output_against_contract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -585,6 +590,84 @@ class TransformExecutor:
                 )
                 raise output_violation from e
 
+        self._verify_output_declarations(transform=transform, input_row=token.row_data, emitted_rows=emitted_rows)
+
+    def _verify_output_declarations(
+        self,
+        *,
+        transform: TransformProtocol,
+        input_row: "PipelineRow",
+        emitted_rows: "tuple[PipelineRow, ...]",
+    ) -> None:
+        """Enforce declared output TYPES on the values the transform PRODUCED (ADR-050, Tier 2).
+
+        Every declared, concrete-typed field of an emitted row whose value the
+        transform produced — a field absent from the input row, or an input
+        field whose value the transform rewrote — is validated against the
+        emitted value with the contract's own ``validate``; a value of another
+        type raises ``DeclaredOutputTypeViolation``, which the processor routes
+        through ``on_error`` like every ``PluginContractViolation``. The reason
+        names the field, both types, the emitted index and whether the
+        transform COMPUTED the field (one it creates) or CARRIED it (an input
+        field it rewrote) — never the value. A multi-row emission fails its
+        parent token: an exploded row cannot fail alone. A plugin that returns
+        its own error for a value that breaks its declaration
+        (value_transform's ``type_mismatch``) emits nothing, so nothing
+        reaches here and no row is routed twice.
+
+        An input value the transform passed through UNCHANGED is not
+        re-adjudicated: the strict ``input_schema`` check admitted it under
+        pydantic's rules, which accept an ``int`` or a ``Decimal`` for a
+        ``float`` field where ``SchemaContract.validate`` compares exact types,
+        and a resumed row legitimately carries a type-faithful ``Decimal``
+        under its ``float`` declaration. Re-checking it here with the stricter
+        authority would fault a row the pipeline already accepted.
+
+        Runs after the dispatched declaration contracts, so the Tier-1
+        completeness check (``OutputDeclarationCompletenessContract``: every
+        created field carries a declared contract) has already passed, and
+        every declared field here is one the stamp wrote or the input row
+        carried under an upstream declaration.
+
+        Before ADR-050 the strict ``output_schema`` validation above checked
+        NO types for a field-adding transform (its output model is observed),
+        so a ``page: int`` declaration delivered a str to the sink with exit 0.
+
+        A transform with no ``_output_schema_config`` declares nothing, so
+        there is nothing to enforce.
+        """
+        if transform._output_schema_config is None:
+            return
+        declaring = require_output_declaring_plugin(transform)
+        created = declaring.declared_output_fields | frozenset(definition.name for definition in declaring.created_output_fields())
+        input_values = input_row.to_dict()
+
+        for emitted_index, emitted in enumerate(emitted_rows):
+            emitted_values = emitted.to_dict()
+            produced_fields = tuple(
+                fc
+                for fc in emitted.contract.fields
+                if fc.source == "declared"
+                and fc.python_type is not object
+                and fc.normalized_name in emitted_values
+                and (fc.normalized_name not in input_values or emitted_values[fc.normalized_name] != input_values[fc.normalized_name])
+            )
+            if not produced_fields:
+                continue
+            produced_contract = SchemaContract(mode="FLEXIBLE", fields=produced_fields, locked=True)
+            for violation in validate_output_against_contract(emitted_values, produced_contract):
+                # Exact type: MissingFieldViolation on a required declared field is
+                # ADR-011/ADR-014's finding, and no TypeMismatchViolation subclass exists.
+                if type(violation) is TypeMismatchViolation:
+                    raise DeclaredOutputTypeViolation(
+                        transform=transform.name,
+                        field=violation.normalized_name,
+                        expected_type=violation.expected_type.__name__,
+                        actual_type=violation.actual_type.__name__,
+                        emitted_index=emitted_index,
+                        authorship="computed" if violation.normalized_name in created else "carried",
+                    )
+
     def _populate_result_audit_fields(
         self,
         *,
@@ -708,7 +791,13 @@ class TransformExecutor:
         - TransformResult.error() is a LEGITIMATE processing failure
         - Routes to configured sink via transform.on_error
         - RuntimeError if transform errors without on_error config
-        - Exceptions are BUGS and propagate (not routed)
+        - A raised ``PluginContractViolation`` that is not registered Tier 1 —
+          the preflight collision and input-schema checks, the output checks
+          including the ADR-050 declared-type check, a plugin's own raise — is
+          converted by the processor into a routed transform error
+          (elspeth-181db83da7); a Tier-1 declaration violation records the
+          token's terminal and ends the run; any other exception is a bug
+          and propagates (not routed)
 
         The step position in the DAG is resolved internally via StepResolver
         using transform.node_id, rather than being passed as a parameter.

@@ -2,17 +2,20 @@
 
 Applies expressions to compute new or modified field values.
 
-A computed value is written as evaluated, never coerced. A target the node's
-schema does not type is inferred by the one inference rule
-(``infer_field_type``): a scalar keeps its type, and a nested object or array (a
-field copy such as ``row['meta']``, or a list/tuple/dict literal) is typed
-``any``, as the declared output schema declares every such target. A target the
-schema DOES type (``fields: ["a: int"]`` with ``target: a``) is pinned to that
-type on output: a row whose computed value does not satisfy it is returned as a
-``type_mismatch`` error naming the target and both type names, never the value.
-An expression whose value can be a set is rejected at construction: a set has
-no canonical order to emit. An expression that fails to evaluate on a row
-returns that row as an error.
+A computed value is written as evaluated, never coerced. Every operation
+target is DECLARED before the first row (ADR-050): a target the node's schema
+types (``fields: ["a: int"]`` with ``target: a``) carries that type, and every
+other target — created or overwritten — is ``any`` (nullable), because an
+expression's result type is not knowable from its text. The declaration is
+stamped on every emitted row's contract, so the node's recorded output
+contract is fixed from row 1 whatever the rows compute: an int on one row and
+a str on the next, a nested object or array (a field copy such as
+``row['meta']``, or a list/tuple/dict literal), a null — all are ``any``. A
+typed target is pinned: a row whose computed value does not satisfy the
+declared type is returned as a ``type_mismatch`` error naming the target and
+both type names, never the value. An expression whose value can be a set is
+rejected at construction: a set has no canonical order to emit. An expression
+that fails to evaluate on a row returns that row as an error.
 """
 
 from __future__ import annotations
@@ -26,10 +29,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
-from elspeth.contracts.schema_contract_factory import create_contract_from_config
-from elspeth.contracts.type_normalization import classify_runtime_type, infer_field_type
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.type_normalization import classify_runtime_type
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
     ExpressionParser,
@@ -59,56 +61,6 @@ def _row_key_aliases(name: str) -> frozenset[str]:
         return frozenset({name, normalize_field_name(name)})
     except ExternalHeaderError:
         return frozenset({name})
-
-
-def _retype_contract_field(
-    contract: SchemaContract,
-    field: FieldContract,
-    value: object,
-) -> SchemaContract:
-    """Return a contract with ``field`` rebuilt to match ``value``'s type.
-
-    Used when an operation overwrites an existing typed field with a value of a
-    different type, so the emitted row continues to satisfy its own contract.
-    The type comes from the one inference rule, so a nested value retypes the
-    field ``any`` and a null makes it nullable; the field keeps its
-    requiredness and provenance.
-    """
-    python_type, nullable = infer_field_type(value)
-    retyped = FieldContract(
-        normalized_name=field.normalized_name,
-        original_name=field.original_name,
-        python_type=python_type,
-        required=field.required,
-        source=field.source,
-        nullable=field.nullable or nullable,
-    )
-    new_fields = tuple(retyped if f.normalized_name == field.normalized_name else f for f in contract.fields)
-    return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
-
-
-def _pin_contract_field(contract: SchemaContract, pinned: FieldContract) -> SchemaContract:
-    """Return a contract whose ``pinned.normalized_name`` field carries the declared metadata.
-
-    The emitted field keeps its original name and provenance, and takes its
-    type, requiredness and nullability from the node's declaration: the
-    metadata the ADR-014 output check compares a declared field against.
-    Called only after the value has satisfied ``pinned``.
-    """
-    new_fields = tuple(
-        FieldContract(
-            normalized_name=f.normalized_name,
-            original_name=f.original_name,
-            python_type=pinned.python_type,
-            required=pinned.required,
-            source=f.source,
-            nullable=pinned.nullable,
-        )
-        if f.normalized_name == pinned.normalized_name
-        else f
-        for f in contract.fields
-    )
-    return SchemaContract(mode=contract.mode, fields=new_fields, locked=contract.locked)
 
 
 class OperationSpec(BaseModel):
@@ -383,7 +335,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e45fbb4c22b9900f"
+    source_file_hash: str | None = "sha256:89bb2afff7b49a6b"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -427,17 +379,16 @@ class ValueTransform(BaseTransform):
 
         self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
 
-        # Targets the authored schema TYPES are pinned to that type on output.
-        # The declaration is read from the output config through the same
-        # builder the ADR-014 output check uses, so the pin and the check
-        # cannot disagree; an undeclared target is declared 'any' there and
-        # pins nothing.
-        pinned_fields = tuple(
-            field
-            for field in create_contract_from_config(self._output_schema_config).fields
-            if field.normalized_name in self._configured_targets and field.python_type is not object
+        # Every target's declared contract, from the ONE stamp table
+        # (operator type > this plugin's 'any'), so the pin checked below
+        # and the contract stamped on emission cannot disagree. validate()
+        # skips an 'any' field, so an untyped target pins nothing.
+        stamped = self._stamped_output_field_contracts()
+        self._target_contracts = SchemaContract(
+            mode="FLEXIBLE",
+            fields=tuple(stamped[target] for target in sorted(self._configured_targets)),
+            locked=True,
         )
-        self._pinned_targets = SchemaContract(mode="FLEXIBLE", fields=pinned_fields, locked=True)
 
         self.input_schema = create_schema_from_config(
             cfg.schema_config,
@@ -448,6 +399,17 @@ class ValueTransform(BaseTransform):
             self._output_schema_config,
             "ValueTransformOutput",
             allow_coercion=False,
+        )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Every operation target, declared ``any``: an expression's result type is not knowable from its text.
+
+        The operator's ``schema.fields`` type takes precedence in the stamp
+        (ADR-050), so ``fields: ["a: int"]`` with ``target: a`` still pins
+        ``a`` to ``int``.
+        """
+        return tuple(
+            FieldDefinition(name=target, field_type="any", required=True, nullable=True) for target in sorted(self._configured_targets)
         )
 
     @property
@@ -516,24 +478,6 @@ class ValueTransform(BaseTransform):
             required_fields=cfg.schema_config.required_fields,
         )
 
-    def _reconcile_forwarded_contract(self, contract: SchemaContract) -> SchemaContract:
-        """Apply validated input declarations only to unchanged output fields."""
-        assert self._output_schema_config is not None
-        declared = {field.normalized_name: field for field in create_contract_from_config(self._output_schema_config).fields}
-        fields = tuple(
-            replace(
-                field,
-                required=declared[field.normalized_name].required,
-                nullable=declared[field.normalized_name].nullable,
-            )
-            if field.normalized_name in declared
-            and field.normalized_name not in self._configured_targets
-            and declared[field.normalized_name].python_type is not object
-            else field
-            for field in contract.fields
-        )
-        return replace(contract, fields=fields) if fields != contract.fields else contract
-
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         """Apply expression operations to row.
 
@@ -578,33 +522,26 @@ class ValueTransform(BaseTransform):
                 if target not in fields_added:
                     fields_added.append(target)
 
-            # Write result to working copy
+            # Write result to working copy. A new target enters the working
+            # contract so later operations resolve it; its type, like every
+            # target's, is the DECLARATION stamped on emission below, never
+            # this row's value (ADR-050).
             working_data[target] = result
-            existing_field = working_contract.find_field(target)
-            if existing_field is None:
+            if working_contract.find_field(target) is None:
                 working_contract = working_contract.with_field(target, target, result)
-            elif (existing_field.python_type is not object and classify_runtime_type(result) is not existing_field.python_type) or (
-                result is None and not existing_field.nullable
-            ):
-                # Overwriting a typed field with a different-typed result: retype the
-                # field so the emitted row satisfies its OWN contract. Keeping the stale
-                # python_type produces a self-contradictory audit record (the row fails
-                # out.contract.validate(out.to_dict())) — mirrors type_coerce's
-                # _build_output_contract. 'object'/'any' fields accept any value, so
-                # they never need retyping.
-                working_contract = _retype_contract_field(working_contract, existing_field, result)
 
         # A target the node's schema types is pinned to that type: the emitted
         # row must satisfy the declaration downstream validation relies on. A
         # computed value that does not is this row's error, routed to on_error
         # — never coerced, and never an abort of the run. The reason names the
-        # target and the two type names only.
-        pinned_values = {field.normalized_name: working_data[field.normalized_name] for field in self._pinned_targets.fields}
-        violations = self._pinned_targets.validate(pinned_values)
+        # target and the two type names only. (An 'any' target passes: the
+        # contract's validate() skips it.)
+        target_values = {field.normalized_name: working_data[field.normalized_name] for field in self._target_contracts.fields}
+        violations = self._target_contracts.validate(target_values)
         if violations:
-            pinned = self._pinned_targets.get_field(violations[0].normalized_name)
+            pinned = self._target_contracts.get_field(violations[0].normalized_name)
             expected_name = pinned.python_type.__name__
-            actual_name = classify_runtime_type(pinned_values[pinned.normalized_name]).__name__
+            actual_name = classify_runtime_type(target_values[pinned.normalized_name]).__name__
             return TransformResult.error(
                 {
                     "reason": "type_mismatch",
@@ -618,10 +555,9 @@ class ValueTransform(BaseTransform):
                     ),
                 }
             )
-        for pinned in self._pinned_targets.fields:
-            working_contract = _pin_contract_field(working_contract, pinned)
-
-        output_contract = self._align_output_contract(self._reconcile_forwarded_contract(working_contract))
+        # The one stamp: every target (and every field the node's schema
+        # declares) carries its declared contract on emission.
+        output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(working_contract))
         return TransformResult.success(
             PipelineRow(working_data, output_contract),
             success_reason={

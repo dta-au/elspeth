@@ -812,6 +812,8 @@ class TransformErrorReason(TypedDict):
     actual: NotRequired[str]
     actual_type: NotRequired[str]
     value: NotRequired[str]
+    emitted_index: NotRequired[int]  # Which emitted row broke a declared output type (ADR-050)
+    authorship: NotRequired[Literal["computed", "carried"]]  # Who produced the offending value (ADR-050)
     line_count: NotRequired[int]  # Observed lines before rejecting line-expanding input
     max_lines: NotRequired[int]  # Configured line-expansion limit
 
@@ -1477,6 +1479,45 @@ class DeclaredOutputFieldsViolation(DeclarationContractViolation):
     payload_schema: ClassVar[type] = DeclaredOutputFieldsPayload
 
 
+class UndeclaredOutputFieldRowViolationPayload(TypedDict):
+    """Per-emitted-row evidence for ADR-050 undeclared created fields."""
+
+    emitted_index: Required[int]
+    undeclared: Required[list[str]]
+
+
+class UndeclaredOutputFieldsPayload(TypedDict):
+    """Audit payload for ADR-050 output-declaration completeness failures."""
+
+    stamped: Required[list[str]]
+    carried: Required[list[str]]
+    violation_count: Required[int]
+    violations_truncated: Required[bool]
+    violations: Required[list[UndeclaredOutputFieldRowViolationPayload]]
+
+
+@tier_1_error(
+    reason="ADR-050: a created field without a declared contract makes the node's recorded output contract a per-row measurement",
+    caller_module=__name__,
+)
+class UndeclaredOutputFieldsViolation(DeclarationContractViolation):
+    """Raised when a transform emits a created field it never declared.
+
+    The reverse of ADR-011: ADR-011 checks that every declared field is
+    emitted; this checks that every emitted field the transform CREATED —
+    a key absent from its input row and not carried from an input field —
+    carries a ``source="declared"`` contract, i.e. went through the
+    declaration stamp (ADR-050). A created field that bypassed the stamp is
+    typed from this row's value, so the node's recorded output contract
+    would become a per-row measurement and two rows could conflict at the
+    node-contract merge. That is owned-code drift (a plugin not declaring
+    what it creates), not a row fault, so it is Tier 1 and ends the run
+    after the token's terminal is recorded.
+    """
+
+    payload_schema: ClassVar[type] = UndeclaredOutputFieldsPayload
+
+
 class SourceGuaranteedFieldsPayload(TypedDict):
     """Audit payload for ADR-016 source guaranteed-field mismatches."""
 
@@ -1758,6 +1799,77 @@ class ZeroEmissionSuccessContractViolation(PluginContractViolation):
             "passes_through_input": self.passes_through_input,
             "can_drop_rows": self.can_drop_rows,
             "emitted_count": self.emitted_count,
+        }
+
+
+# TIER-2: Declared output-type violation — an emitted value breaks the type its field was declared with (ADR-050); a row-level plugin fault the engine routes through on_error, never audit corruption.
+class DeclaredOutputTypeViolation(PluginContractViolation):
+    """Raised when an emitted value breaks the type declared for its field.
+
+    The engine's value check of a transform's output declaration (ADR-050):
+    every field a transform declares with a concrete type — an operator's
+    ``schema.fields`` type, or a type the plugin declares for a field it
+    computes — is checked against the emitted value at the post-emission
+    seam, and a value of another type raises this. It is Tier 2 like every
+    ``PluginContractViolation``: the row is routed through ``on_error`` with
+    the reason below, and the run goes on (operator ruling 2026-09-25,
+    elspeth-5887fb7928 S1).
+
+    ``authorship`` records who produced the offending value: ``computed``
+    when the field is one this transform creates (its own code, or an
+    expression it evaluated, computed the value), ``carried`` when the field
+    arrived on the input row and the transform passed it through. A computed
+    violation of a plugin-declared type is a plugin bug recorded as evidence;
+    the bit is what lets that rule tighten later without rework.
+
+    The reason never carries the value: the field name, the two type names,
+    the emitted row's index and the authorship bit only.
+    """
+
+    def __init__(
+        self,
+        *,
+        transform: str,
+        field: str,
+        expected_type: str,
+        actual_type: str,
+        emitted_index: int,
+        authorship: Literal["computed", "carried"],
+    ) -> None:
+        super().__init__(
+            f"Transform '{transform}' emitted row {emitted_index} with field '{field}' of type {actual_type}, "
+            f"but the field is declared {expected_type} ({authorship} by the transform). "
+            "Declare the type the transform computes, or fix the transform."
+        )
+        self.transform = transform
+        self.field = field
+        self.expected_type = expected_type
+        self.actual_type = actual_type
+        self.emitted_index = emitted_index
+        self.authorship = authorship
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "exception_type": "DeclaredOutputTypeViolation",
+            "message": scrub_text_for_audit(str(self)),
+            "transform": self.transform,
+            "field": self.field,
+            "expected_type": self.expected_type,
+            "actual_type": self.actual_type,
+            "emitted_index": self.emitted_index,
+            "authorship": self.authorship,
+        }
+
+    def to_transform_error_reason(self) -> TransformErrorReason:
+        """The routed reason: the field, both type names, the index and the authorship bit — never the value."""
+        return {
+            "reason": "contract_violation",
+            "error": scrub_text_for_audit(str(self)),
+            "field": self.field,
+            "expected": self.expected_type,
+            "actual": self.actual_type,
+            "emitted_index": self.emitted_index,
+            "authorship": self.authorship,
         }
 
 
@@ -2119,13 +2231,28 @@ class ExtraFieldViolation(ContractViolation):
         return f"Extra field '{self.original_name}' ({self.normalized_name}) not allowed in FIXED mode"
 
 
-# TIER-2: Configuration error — fork/join schema type conflict (pipeline design issue), not an external data or system error.
+# TIER-2: Neutral conflict signal from a raising contract merge; each caller assigns the tier (coalesce routes the row, node evolution re-raises FrameworkBugError).
 class ContractMergeError(ValueError):
-    """Raised when schema contracts cannot be merged due to type conflicts.
+    """Raised when two schema contracts type the same field differently.
 
-    This occurs during fork/join (coalesce) operations when parallel paths
-    produce incompatible types for the same field. This is a configuration
-    error (pipeline design issue), not a data error.
+    Seam-neutral: the error carries only the field name and the two type
+    names, and its meaning is the CALLER's. It is raised by the two raising
+    merges — ``merge_union_contracts`` (a coalesce) and
+    ``SchemaContract.merge_for_node_evolution`` (a node's recorded output
+    contract) — and each caller decides what the conflict is:
+
+    - a runtime coalesce fails that row (``contract_type_conflict``, routed
+      through the coalesce's error edge): the two branches carry one row's
+      data with different types, which is a fact about that row;
+    - the node-evolution writer re-raises it as ``FrameworkBugError``: a node's
+      emissions all carry one declared type per field (ADR-050), so a
+      conflict there is a bug in owned code;
+    - the build-time coalesce check translates the underlying
+      ``UnionTypeConflictError`` into ``GraphValidationError`` before this
+      class is ever built.
+
+    The description join used where several producers meet
+    (``SchemaContract.merge_for_batch``) never raises this.
 
     Inherits from ValueError because it represents an invalid combination
     of schema contracts, not an external data issue.

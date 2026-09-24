@@ -313,7 +313,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e30482871023e9a6"
+    source_file_hash: str | None = "sha256:d87d0325cdeb243f"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -432,6 +432,22 @@ class FieldMapper(BaseTransform):
     def self_created_input_fields(self) -> frozenset[str]:
         """Override: non-identity rename targets are created by this node."""
         return self._self_created_input_fields
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """A dotted extraction's target is created ``any``: the nested value's type is in no contract (ADR-050).
+
+        A flat rename is NOT declared here — it carries the source field's
+        contract (``carried_output_fields``).
+        """
+        return tuple(
+            FieldDefinition(name=target, field_type="any", required=True, nullable=True)
+            for source, target in self._mapping.items()
+            if "." in source
+        )
+
+    def carried_output_fields(self) -> frozenset[str]:
+        """A flat rename target carries the source field's contract; the stamp leaves it alone."""
+        return frozenset(target for source, target in self._mapping.items() if "." not in source and source != target)
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:

@@ -150,3 +150,53 @@ def test_concurrent_postgres_writers_lock_and_merge_disjoint_contracts(postgres_
             event.remove(db.engine, "after_cursor_execute", after_execute)
         second_db.close()
         first_db.close()
+
+
+@pytest.mark.timeout(120)
+def test_postgres_type_conflict_at_node_evolution_is_a_framework_bug_and_preserves_the_record(postgres_url: str) -> None:
+    """ADR-050: a node's emissions carry one declared type per field, so a conflict raises before mutation.
+
+    The write path changed with ADR-050 (``merge_for_node_evolution`` under
+    the row lock, re-raised as ``FrameworkBugError``): this is the PostgreSQL
+    twin of the SQLite pin in ``tests/unit/core/landscape/test_graph_recording.py``.
+    """
+    from elspeth.contracts.errors import ContractMergeError, FrameworkBugError
+
+    db = LandscapeDB.from_url(postgres_url)
+    try:
+        factory = make_factory(db)
+        factory.run_lifecycle.begin_run(
+            config={},
+            canonical_version="v1",
+            run_id="run-conflict",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        original = _contract("id", int)
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-conflict"),
+            plugin_name="mapper",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0.0",
+            config={},
+            node_id="xfm",
+            output_contract=original,
+            schema_config=_SCHEMA,
+        )
+        member = leader_coordination_token(factory, "run-conflict").membership
+
+        with pytest.raises(FrameworkBugError, match="'id' has conflicting types 'int' and 'str'") as raised:
+            factory.data_flow.update_node_output_contract("xfm", _contract("id", str), member_token=member)
+        assert isinstance(raised.value.__cause__, ContractMergeError)
+
+        _, stored = factory.data_flow.get_node_contracts("run-conflict", "xfm")
+        assert stored == original
+        with db.read_only_connection() as conn:
+            stored_hash = conn.execute(
+                select(nodes_table.c.output_contract_hash).where(
+                    (nodes_table.c.run_id == "run-conflict") & (nodes_table.c.node_id == "xfm")
+                )
+            ).scalar_one()
+        assert stored_hash == original.version_hash()
+    finally:
+        db.close()

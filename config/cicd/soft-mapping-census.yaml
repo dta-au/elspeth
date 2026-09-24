@@ -73,7 +73,7 @@ files:
     Mapping[str, Any]: 1
   src/elspeth/contracts/errors.py:
     Mapping[str, Any]: 3
-    dict[str, Any]: 20
+    dict[str, Any]: 21
   src/elspeth/contracts/events.py:
     dict[str, Any]: 4
   src/elspeth/contracts/export_records.py:
@@ -1076,6 +1076,6 @@ totals:
   Mapping[str, object]: 311
   MutableMapping[str, Any]: 13
   boundary: 66
-  dict[str, Any]: 1182
+  dict[str, Any]: 1183
   dict[str, object]: 410
-  soft: 2846
+  soft: 2847

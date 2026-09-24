@@ -126,10 +126,12 @@ algorithm now lives in `contracts/union_merge.py`
 `merge_union_fields` (build-time, `core/dag/coalesce_merge.py`) and
 `merge_union_contracts` (runtime) — so build-time and runtime coalesce
 merges cannot diverge. The batch-merge surviving on `SchemaContract`
-(renamed `merge_for_batch`; used by the sink executor to combine
-sibling-token contracts within a batch) is **intentionally** separate —
-it implements different sibling-token semantics, not a leftover
-duplicate.
+(`merge_for_batch`; used by the sink executor and display headers to
+describe sibling-token contracts within a batch) is **intentionally**
+separate — since ADR-050 it is the J1 description join
+(`contracts/union_merge.py::join_batch_contracts`), which never raises on
+a type difference, whereas a coalesce merge and a node's own output
+record (`merge_for_node_evolution`) raise.
 
 ## Forward note
 

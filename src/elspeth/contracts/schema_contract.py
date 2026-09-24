@@ -473,43 +473,75 @@ class SchemaContract:
         return contract
 
     def merge_for_batch(self, other: SchemaContract) -> SchemaContract:
-        """Describe a heterogeneous batch/accumulation of sibling row contracts.
+        """Describe a batch of sibling rows from SEVERAL producers (the J1 join).
 
-        Used when N sibling tokens (possibly from different pipeline
-        branches/paths) are bound for one sink and the batch needs a single
-        truthful description:
+        Used at exactly two seams, where N sibling tokens — possibly from
+        different sources, branches or paths — are bound for one sink and the
+        batch needs a single truthful description: ``SinkExecutor``'s batch
+        contract and ``display_headers`` (ADR-050). It is
+        ``elspeth.contracts.union_merge.join_batch_contracts`` applied to
+        ``(self, other)``, and it never raises on a type difference: each
+        producer's contract is a truthful description of its own rows, so a
+        field the producers type differently is described as ``object``
+        (``int`` ⊔ ``float`` = ``object``, ``bool`` ⊔ ``int`` = ``object``,
+        ``object`` absorbs). Nullable is OR, required is AND, a field some
+        member lacks is optional and nullable, mode is the most restrictive,
+        locked is OR, and ``original_name`` falls back to the identity when
+        the carriers disagree, so the result is arrival-order independent.
 
-        - A field is required only if EVERY member requires it (AND): a field
-          some member's contract does not require cannot be promised for every
-          row in the batch.
-        - Fields absent from any member are optional and nullable: those
-          members' rows lack them.
-        - Shared-field nullable is OR (any member may supply None).
-        - Mode: most restrictive wins (FIXED > FLEXIBLE > OBSERVED);
-          locked: True if either is locked.
-
-        NOT for coalesce union merges — use
-        elspeth.contracts.union_merge.merge_union_contracts, which is
-        policy-aware (require_all coalesces need OR-required semantics).
-        This method delegates to the same canonical algorithm with
-        require_all=False.
+        NOT for a coalesce union merge (``merge_union_contracts``, which is
+        policy-aware and RAISES on a type conflict: a union coalesce promises
+        one type to its consumers) and NOT for a node's own recorded output
+        contract (``merge_for_node_evolution``, which raises too: one node's
+        emissions all carry the same declared types).
 
         Args:
-            other: Contract to merge with
+            other: Contract to join with
 
         Returns:
-            New merged SchemaContract
+            The joined SchemaContract
+        """
+        # Deferred import: union_merge imports SchemaContract from this module.
+        from elspeth.contracts.union_merge import join_batch_contracts
+
+        return join_batch_contracts((self, other))
+
+    def merge_for_node_evolution(self, other: SchemaContract) -> SchemaContract:
+        """Evolve a node's recorded output contract with one more emission.
+
+        Used only by the Landscape's node-contract writer
+        (``DataFlowRepository.update_node_output_contract``) for the record in
+        ``nodes.output_contract_json``, and it does not describe a batch: it
+        FOLDS one node's emitted contracts, which may add fields row to row
+        (an observed pass-through field set legitimately varies) but never
+        change a field's type. A source infers and locks its types on the
+        first valid row; a transform declares the type of every field it
+        creates before row 1 and stamps it on every emission (ADR-050). So a
+        type conflict here is not a data fault and not a batch to describe —
+        it is a bug in owned code (an emission that bypassed the stamp, or a
+        source re-recording a different lock), and this method raises.
+
+        Field-set semantics are ``merge_union_contracts`` with
+        ``require_all=False``: a field absent from one emission becomes
+        optional and nullable in the record; nullable is OR.
+
+        Args:
+            other: The newly emitted contract
+
+        Returns:
+            The evolved SchemaContract
 
         Raises:
-            ContractMergeError: If field types conflict
+            ContractMergeError: If a field's type differs between the record
+                and the emission
         """
         # Deferred import: union_merge imports SchemaContract from this module.
         from elspeth.contracts.union_merge import merge_union_contracts
 
         return merge_union_contracts(
-            {"self": self, "other": other},
+            {"recorded": self, "emitted": other},
             require_all=False,
-            branch_order=("self", "other"),
+            branch_order=("recorded", "emitted"),
         )
 
 

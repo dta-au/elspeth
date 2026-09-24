@@ -2,22 +2,29 @@
 """Property-based tests for SchemaContract merge_for_batch, validation, and checkpoint invariants.
 
 SchemaContract is the central type contract in the pipeline. When a batch of
-sibling tokens (possibly from different pipeline paths) is bound for one sink,
-their contracts are merged with merge_for_batch into one description of the
-batch. The merge operation has:
+sibling tokens (possibly from different sources, branches or paths) is bound
+for one sink, their contracts are joined with merge_for_batch — the J1
+description join of ADR-050 — into one description of the batch:
 - Mode precedence: FIXED > FLEXIBLE > OBSERVED (most restrictive wins)
-- Field union: fields present in both must have matching types
-- Fields from only one side become non-required (those members' rows lack them)
+- Field union: a field the producers type differently is described as ``object``
+  (``object`` absorbs; ``int``/``float`` and ``bool``/``int`` are different types)
+- Fields from only one side become non-required and nullable (those members' rows lack them)
+- Nullable is OR, required is AND, source is declared-if-any
+- original_name is kept when the carriers agree and falls back to the identity otherwise
 - Locked status: True if either input is locked
 
-These require_all=False semantics are fully commutative, so all properties
-below remain valid. (Coalesce union merges use the policy-aware
-merge_union_contracts instead — see tests/unit/contracts/test_union_merge.py.)
+J1 is a lattice join: commutative, associative and idempotent on the full
+recorded identity (version_hash), and sound (every contributing row validates
+against the join). The RAISING merges are pinned elsewhere: coalesce union
+merges use the policy-aware merge_union_contracts (see
+tests/unit/contracts/test_union_merge.py) and a node's own recorded contract
+folds through merge_for_node_evolution (TestMergeTypeConflictProperties).
 
 Properties tested:
 - Merge field commutativity: A.merge_for_batch(B).fields ≡ B.merge_for_batch(A).fields (same set)
+- J1 lattice laws on version_hash: commutativity, associativity, idempotence; soundness
 - Merge mode determinism: same inputs → same mode (most restrictive wins)
-- Merge type conflict detection: mismatched types always raise
+- Merge type difference: described as object; node evolution still raises
 - Checkpoint round-trip: to_checkpoint_format → from_checkpoint preserves all state
 - version_hash determinism: same contract → same hash
 - version_hash sensitivity: different contracts → different hashes
@@ -370,7 +377,14 @@ class TestMergeModePrecedenceProperties:
 
 
 class TestMergeTypeConflictProperties:
-    """Type mismatches in shared fields must always raise ContractMergeError."""
+    """A shared field the producers type differently is described as ``object`` (J1, ADR-050).
+
+    merge_for_batch describes rows from SEVERAL producers, each truthful about
+    its own rows, so it never raises: the join of two types is ``object``.
+    The raising merges are pinned separately — merge_union_contracts (a
+    coalesce, tests/unit/contracts/test_union_merge.py) and
+    merge_for_node_evolution (a node's own record, below).
+    """
 
     @given(
         name=normalized_names,
@@ -378,8 +392,8 @@ class TestMergeTypeConflictProperties:
         type_b=allowed_types,
     )
     @settings(max_examples=100)
-    def test_type_conflict_raises(self, name: str, type_a: type, type_b: type) -> None:
-        """Property: Shared field with different types raises ContractMergeError."""
+    def test_type_conflict_joins_to_object(self, name: str, type_a: type, type_b: type) -> None:
+        """Property: a shared field with different types is described as ``object``, in either order."""
         assume(type_a != type_b)
 
         a = SchemaContract(
@@ -391,8 +405,30 @@ class TestMergeTypeConflictProperties:
             fields=(FieldContract(normalized_name=name, original_name=name, python_type=type_b, required=True, source="declared"),),
         )
 
+        assert a.merge_for_batch(b).get_field(name).python_type is object
+        assert b.merge_for_batch(a).get_field(name).python_type is object
+
+    @given(
+        name=normalized_names,
+        type_a=allowed_types,
+        type_b=allowed_types,
+    )
+    @settings(max_examples=100)
+    def test_node_evolution_type_conflict_raises(self, name: str, type_a: type, type_b: type) -> None:
+        """Property: a node's recorded contract never joins types — a conflict raises ContractMergeError."""
+        assume(type_a != type_b)
+
+        recorded = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(FieldContract(normalized_name=name, original_name=name, python_type=type_a, required=True, source="declared"),),
+        )
+        emitted = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(FieldContract(normalized_name=name, original_name=name, python_type=type_b, required=True, source="declared"),),
+        )
+
         with pytest.raises(ContractMergeError):
-            a.merge_for_batch(b)
+            recorded.merge_for_node_evolution(emitted)
 
     @given(
         name=normalized_names,
@@ -714,3 +750,85 @@ class TestValidationProperties:
             violations = contract.validate({name: value})
             type_violations = [v for v in violations if isinstance(v, TypeMismatchViolation)]
             assert len(type_violations) == 0
+
+
+# =============================================================================
+# J1 Lattice Laws (ADR-050): the description join is a join
+# =============================================================================
+
+
+@st.composite
+def joinable_contracts(draw: st.DrawFn) -> list[SchemaContract]:
+    """Generate 2-3 contracts over one small name pool with FREE types.
+
+    Unlike ``mergeable_contract_pairs`` the shared fields may disagree on
+    type, nullability, requiredness, source and original spelling — the
+    whole space the join must be a lattice over.
+    """
+    pool = draw(st.lists(normalized_names, min_size=1, max_size=4, unique=True))
+    contracts: list[SchemaContract] = []
+    for _ in range(draw(st.integers(min_value=2, max_value=3))):
+        chosen = draw(st.lists(st.sampled_from(pool), min_size=0, max_size=len(pool), unique=True))
+        fields = tuple(
+            FieldContract(
+                normalized_name=name,
+                original_name=draw(st.sampled_from([name, name.upper(), f"{name} raw"])),
+                python_type=draw(allowed_types),
+                required=draw(st.booleans()),
+                source=draw(sources),
+                nullable=draw(st.booleans()),
+            )
+            for name in chosen
+        )
+        contracts.append(SchemaContract(mode=draw(modes), fields=fields, locked=draw(st.booleans())))
+    return contracts
+
+
+def _sample_value(python_type: type, *, nullable: bool) -> object:
+    """One value that satisfies a FieldContract of ``python_type``."""
+    if nullable:
+        return None
+    samples: dict[type, object] = {int: 1, str: "s", float: 1.5, bool: True, type(None): None, object: {"nested": 1}}
+    if python_type in samples:
+        return samples[python_type]
+    from datetime import UTC, datetime
+
+    return datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class TestJ1LatticeLaws:
+    """merge_for_batch is a lattice join on version_hash, and it is sound."""
+
+    @given(contracts=joinable_contracts())
+    @settings(max_examples=200)
+    def test_commutative(self, contracts: list[SchemaContract]) -> None:
+        a, b = contracts[0], contracts[1]
+        assert a.merge_for_batch(b).version_hash() == b.merge_for_batch(a).version_hash()
+
+    @given(contracts=joinable_contracts())
+    @settings(max_examples=200)
+    def test_associative(self, contracts: list[SchemaContract]) -> None:
+        assume(len(contracts) == 3)
+        a, b, c = contracts
+        left = a.merge_for_batch(b).merge_for_batch(c)
+        right = a.merge_for_batch(b.merge_for_batch(c))
+        assert left.version_hash() == right.version_hash()
+
+    @given(contracts=joinable_contracts())
+    @settings(max_examples=200)
+    def test_idempotent(self, contracts: list[SchemaContract]) -> None:
+        joined = contracts[0].merge_for_batch(contracts[1])
+        assert joined.merge_for_batch(joined).version_hash() == joined.version_hash()
+        assert joined.merge_for_batch(contracts[0]).version_hash() == joined.version_hash()
+
+    @given(contracts=joinable_contracts())
+    @settings(max_examples=200)
+    def test_sound_every_contributing_row_validates(self, contracts: list[SchemaContract]) -> None:
+        """A row built to satisfy any ONE member's contract satisfies the join."""
+        joined = contracts[0]
+        for other in contracts[1:]:
+            joined = joined.merge_for_batch(other)
+        for member in contracts:
+            row = {fc.normalized_name: _sample_value(fc.python_type, nullable=fc.nullable) for fc in member.fields}
+            assert member.validate(row) == []
+            assert joined.validate(row) == []

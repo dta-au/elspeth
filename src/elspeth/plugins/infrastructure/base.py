@@ -37,6 +37,7 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
         InputSemanticRequirements,
         OutputSemanticDeclaration,
     )
-    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.contracts.schema import FieldDefinition, SchemaConfig
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
@@ -903,26 +904,179 @@ class BaseTransform(ABC):
             locked=expected_locked,
         )
 
-    def _apply_declared_output_field_contracts(self, contract: SchemaContract) -> SchemaContract:
-        """Apply declared output field metadata to an emitted row contract.
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The fields this transform CREATES, with the types the PLUGIN declares for them.
 
-        Contract propagation infers newly added fields from runtime values, which
-        marks them as ``source="inferred"`` and ``required=False``. When a
-        transform has an explicit ``_output_schema_config`` field declaration,
-        ADR-014 expects emitted contracts to carry that declared metadata.
+        The plugin-authored half of a transform's output declaration (ADR-050).
+        Every field a transform computes gets a contract BEFORE the first row,
+        by precedence: the operator's ``schema.fields`` type, else the type
+        the plugin declares here, else ``any`` (nullable). A field named here
+        with ``field_type="any"`` is an explicit "this plugin cannot know the
+        type" (value_transform's expression targets); a concrete type here is
+        enforced on every emitted value by the engine
+        (``TransformExecutor._verify_success_emissions``), so declare one only
+        for a field whose type the plugin's own code fixes.
+
+        This is a RUNTIME declaration read by ``_apply_declared_output_field_contracts``.
+        It is deliberately not folded into ``_output_schema_config``: that
+        config is the planner-visible projection, and an observed
+        ``SchemaConfig`` cannot carry field definitions at all. Promoting these
+        types into the projection is a separate decision behind the
+        composer/runtime agreement test.
+
+        Names only are still declared through ``declared_output_fields`` (the
+        ADR-011 guarantee surface); a name in both is declared once, here.
+        The default declares nothing: such a transform's created fields are
+        stamped ``any`` from ``declared_output_fields``.
+        """
+        return ()
+
+    def carried_output_fields(self) -> frozenset[str]:
+        """``declared_output_fields`` names whose VALUE this transform copies from an input field.
+
+        A carried field is not created: its value is an upstream field's value
+        under that field's contract — a source-locked or upstream-declared
+        type that is the same on every row — so the stamp must not rewrite it
+        to ``any``. The one shipped case is a field_mapper rename, whose
+        target inherits the source field's contract through
+        ``narrow_contract_to_output``. A dotted extraction is NOT carried: its
+        value's type is not in any contract, so it is created (``any``).
+
+        Excluded from the ``any`` fallback in ``_stamped_output_field_contracts``
+        and admitted by the post-emission completeness check as
+        contract-carrying rather than stamped.
+        """
+        return frozenset()
+
+    def _stamped_output_field_contracts(self) -> dict[str, FieldContract]:
+        """The declared contract of every field this transform stamps on emission.
+
+        One table, built from three declaration sources in precedence order
+        (ADR-050: operator > plugin > ``any``):
+
+        1. the operator's AUTHORED ``schema.fields`` type, read through
+           ``_output_schema_config.fields`` (the output config builders
+           extend the authored fields with a required, nullable ``any`` for
+           each guaranteed name they know only by name — that placeholder
+           is not an operator declaration and yields to the plugin's);
+        2. the plugin's ``created_output_fields()``;
+        3. every remaining ``declared_output_fields`` name as ``any``,
+           required when the output config guarantees it — except the
+           ``carried_output_fields()``, whose contract is the input field's.
+
+        A field the output config carries under a name the operator never
+        authored and the plugin does not declare — a builder's projection of
+        an authored declaration onto a renamed target, or a ``columns``
+        option typed by the plugin's builder — keeps the config's contract.
+
+        An ``any`` field is nullable: nothing checks the value of an ``any``
+        field, so ``nullable=False`` on one would be a claim the engine never
+        verifies. Sources are untouched — this is the transform stamp only.
+
+        Empty when the transform has no ``_output_schema_config`` (a
+        shape-preserving transform that declares no output at all).
         """
         output_schema_config = self._output_schema_config
-        if output_schema_config is None or output_schema_config.fields is None:
+        if output_schema_config is None:
+            return {}
+
+        from elspeth.contracts.schema_contract_factory import create_contract_from_config, field_definition_python_type
+
+        stamped: dict[str, FieldContract] = {}
+        if output_schema_config.fields is not None:
+            stamped = {field.normalized_name: field for field in create_contract_from_config(output_schema_config).fields}
+        authored_schema = self._schema_config
+        authored = (
+            frozenset(field.name for field in authored_schema.fields)
+            if authored_schema is not None and authored_schema.fields is not None
+            else frozenset()
+        )
+        for definition in self.created_output_fields():
+            if definition.name in stamped and definition.name in authored:
+                continue
+            stamped[definition.name] = FieldContract(
+                normalized_name=definition.name,
+                original_name=definition.name,
+                python_type=field_definition_python_type(definition),
+                required=definition.required,
+                source="declared",
+                nullable=definition.nullable,
+            )
+        guaranteed = output_schema_config.get_effective_guaranteed_fields()
+        carried = self.carried_output_fields()
+        for name in self.declared_output_fields:
+            if name in stamped or name in carried:
+                continue
+            stamped[name] = FieldContract(
+                normalized_name=name,
+                original_name=name,
+                python_type=object,
+                required=name in guaranteed,
+                source="declared",
+                nullable=True,
+            )
+        return {
+            name: replace(field, nullable=True) if field.python_type is object and not field.nullable else field
+            for name, field in stamped.items()
+        }
+
+    def _apply_declared_output_field_contracts(
+        self,
+        contract: SchemaContract,
+        *,
+        dynamic_created_fields: tuple[FieldDefinition, ...] = (),
+    ) -> SchemaContract:
+        """Stamp the declared contract of every declared field onto an emitted row contract.
+
+        The ONE stamping authority (ADR-050). Contract propagation infers a
+        newly added field from the value it saw on this row, which is
+        ``source="inferred"`` / ``required=False`` and a type that can differ
+        from one emission to the next; the node's recorded output contract
+        would then be a per-row measurement and the merge of two emissions
+        could conflict. Every declared field — an operator-typed field, a
+        plugin-typed created field, a created field known only by name — is
+        rewritten here to the metadata in ``_stamped_output_field_contracts``,
+        so all of a node's emissions carry the same types from row 1 and the
+        record never changes shape after it. The declared types are enforced
+        against the emitted VALUES by the engine.
+
+        ``dynamic_created_fields`` is for the one shape whose created NAMES
+        are data, not config: blob_csv_expand emits a column per CSV header.
+        Their TYPE is still fixed by the plugin's code before row 1 (a CSV
+        cell is text), so the plugin passes them here on each emission as
+        ``FieldDefinition``s of that type and they are stamped ``declared``
+        like any other created field; the field SET may grow row to row,
+        which the node-contract record folds without a type conflict. A
+        name that is also statically declared keeps its static declaration.
+
+        The emitted field's ``original_name`` is kept: the declaration types a
+        field, it does not rename it, and display headers and lineage read
+        the original spelling.
+        """
+        stamped = self._stamped_output_field_contracts()
+        if dynamic_created_fields:
+            from elspeth.contracts.schema_contract_factory import field_definition_python_type
+
+            for definition in dynamic_created_fields:
+                if definition.name in stamped:
+                    continue
+                python_type = field_definition_python_type(definition)
+                stamped[definition.name] = FieldContract(
+                    normalized_name=definition.name,
+                    original_name=definition.name,
+                    python_type=python_type,
+                    required=definition.required,
+                    source="declared",
+                    nullable=definition.nullable or python_type is object,
+                )
+        if not stamped:
             return contract
 
-        from elspeth.contracts.schema_contract_factory import create_contract_from_config
-
-        declared_fields = {field.normalized_name: field for field in create_contract_from_config(output_schema_config).fields}
         fields: list[FieldContract] = []
         changed = False
         for field in contract.fields:
-            if field.normalized_name in declared_fields:
-                fields.append(declared_fields[field.normalized_name])
+            if field.normalized_name in stamped:
+                fields.append(replace(stamped[field.normalized_name], original_name=field.original_name))
                 changed = True
             else:
                 fields.append(field)

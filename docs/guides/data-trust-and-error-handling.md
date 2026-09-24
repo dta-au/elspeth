@@ -338,7 +338,7 @@ From this point forward, `extracted` is treated as Tier 2 pipeline data. No more
 | Scenario | Correct Response | WRONG Response |
 |----------|------------------|----------------|
 | Plugin method throws exception | **CRASH** - bug in our code | Catch and log silently |
-| Plugin returns wrong type | **CRASH** - bug in our code | Coerce to expected type |
+| Plugin returns wrong type | **ROUTE the row as a `PluginContractViolation`** (Tier 2), recording the bug as evidence with the field, both type names and whether the plugin computed or carried the value ([ADR-050](../architecture/adr/050-transform-outputs-declare-sources-infer-and-lock.md)); a plugin that emits a field it never declared is Tier 1 and **CRASHES** | Coerce to expected type |
 | Plugin missing expected attribute | **CRASH** - interface violation | Use `getattr(x, 'attr', default)` |
 | User data has wrong type | Quarantine row, continue | Crash the pipeline |
 | User data missing field | Quarantine row, continue | Crash the pipeline |

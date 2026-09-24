@@ -548,3 +548,36 @@ class TestInitDisplayHeaders:
 
         with pytest.raises(AttributeError):
             init_display_headers(_BadSink(), HeaderMode.NORMALIZED)  # type: ignore[arg-type]
+
+
+class TestHeterogeneousBatchInOriginalMode:
+    """ADR-050: several producers sharing one sink are described by the J1 join, not refused."""
+
+    def test_a_field_two_producers_type_differently_is_described_as_object(self) -> None:
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+        from elspeth.plugins.infrastructure.display_headers import resolve_contract_from_context_if_needed
+
+        sink = _StubSink(HeaderMode.ORIGINAL)
+        sink._output_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(FieldContract(normalized_name="id", original_name="ID", python_type=int, required=True, source="inferred"),),
+            locked=True,
+        )
+        ctx = _ContextDouble(
+            contract=SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    FieldContract(normalized_name="id", original_name="ID", python_type=str, required=True, source="inferred"),
+                    FieldContract(normalized_name="key", original_name="Key", python_type=str, required=True, source="inferred"),
+                ),
+                locked=True,
+            )
+        )
+
+        resolve_contract_from_context_if_needed(sink, ctx)
+
+        joined = sink._output_contract
+        assert joined.find_field("id").python_type is object
+        assert joined.find_field("id").original_name == "ID"
+        assert joined.find_field("key").required is False
+        assert joined.find_field("key").nullable is True

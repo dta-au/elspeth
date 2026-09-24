@@ -22,7 +22,7 @@ from elspeth.contracts import (
     RoutingMode,
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, ContractMergeError, FrameworkBugError
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.config import sanitize_node_config_for_audit
@@ -414,9 +414,20 @@ class GraphAuditRepository:
             Used for dynamic schema discovery and transform schema evolution.
             The write transaction takes SQLite write intent before reading and
             a PostgreSQL row lock at the read. Identical versions are no-ops;
-            compatible versions merge deterministically; incompatible versions
-            fail before mutation. The final UPDATE also compares the version
-            read under the lock so a violated locking assumption fails closed.
+            an emission that adds fields folds into the record
+            (``SchemaContract.merge_for_node_evolution``); an emission whose
+            type for a recorded field differs fails before mutation. That
+            failure is a ``FrameworkBugError``, not a data fault: a source
+            locks its types on its first valid row and a transform declares
+            the type of every field it creates before row 1 and stamps it on
+            every emission (ADR-050), so no row can legitimately reach this
+            seam with a different type. The final UPDATE also compares the
+            version read under the lock so a violated locking assumption
+            fails closed.
+
+        Raises:
+            FrameworkBugError: If the emitted contract types a recorded field
+                differently (value-free: the field and the two type names).
         """
         run_id = member_token.run_id
         candidate_hash = contract.version_hash()
@@ -445,7 +456,14 @@ class GraphAuditRepository:
                     )
                 if current_hash == candidate_hash:
                     return
-                merged_contract = current_contract.merge_for_batch(contract)
+                try:
+                    merged_contract = current_contract.merge_for_node_evolution(contract)
+                except ContractMergeError as conflict:
+                    raise FrameworkBugError(
+                        f"Node {node_id!r} in run {run_id!r} emitted a contract that types a recorded field "
+                        f"differently: {conflict}. A node's emissions carry one declared type per field "
+                        f"(ADR-050); an emission that bypassed the declaration stamp is a bug in owned code."
+                    ) from conflict
 
             merged_hash = merged_contract.version_hash()
             previous_hash_matches = (

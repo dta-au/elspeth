@@ -735,11 +735,14 @@ class TestJSONExplodeContractPropagation:
 
 
 class TestJSONExplodeHeterogeneousTypes:
-    """Tests for heterogeneous array type handling.
+    """The output field is DECLARED ``any`` (nullable) before the first row (ADR-050).
 
-    When the exploded array contains elements of different types (e.g.,
-    ["a", {"k": 1}]), the output field contract must use `object` (the
-    universal type) rather than inferring from only the first element.
+    Nothing is inferred from the elements: a heterogeneous array
+    (``["a", {"k": 1}]``), a homogeneous one and a single element all record
+    the same contract, so two rows whose arrays differ in element type never
+    conflict at the node-contract merge. An operator who wants the element
+    typed declares it (``page: int``), and the engine enforces that on every
+    emitted value.
     """
 
     @pytest.fixture
@@ -798,8 +801,8 @@ class TestJSONExplodeHeterogeneousTypes:
         assert element_field is not None
         assert element_field.python_type is object
 
-    def test_homogeneous_array_preserves_inferred_type(self, ctx: PluginContext) -> None:
-        """Array with all same-type elements preserves the inferred type."""
+    def test_homogeneous_array_is_declared_any_too(self, ctx: PluginContext) -> None:
+        """A homogeneous array records the same declared ``any`` contract as a mixed one."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -818,11 +821,13 @@ class TestJSONExplodeHeterogeneousTypes:
 
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
-        # For homogeneous str array, type should be inferred as str (not object)
-        assert item_field.python_type is str
+        assert item_field.python_type is object
+        assert item_field.nullable is True
+        assert item_field.required is True
+        assert item_field.source == "declared"
 
-    def test_single_element_array_preserves_inferred_type(self, ctx: PluginContext) -> None:
-        """Single-element array preserves the inferred type (no heterogeneity)."""
+    def test_single_element_array_is_declared_any_too(self, ctx: PluginContext) -> None:
+        """A single-element array records the declared ``any`` contract, not the element's type."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -841,7 +846,8 @@ class TestJSONExplodeHeterogeneousTypes:
 
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
-        assert item_field.python_type is int
+        assert item_field.python_type is object
+        assert item_field.source == "declared"
 
     def test_mixed_none_and_value_uses_object_type(self, ctx: PluginContext) -> None:
         """Array with None and non-None elements gets output_field type=object."""

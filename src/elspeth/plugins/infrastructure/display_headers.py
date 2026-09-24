@@ -158,6 +158,10 @@ def resolve_contract_from_context_if_needed(sink: DisplayHeaderHost, ctx: SinkCo
             f"{', '.join(conflicts)}. Split the sink output by source/contract or normalize headers explicitly."
         )
 
+    # Several producers can share one sink, so the header contract is the J1
+    # description join (ADR-050): a field they type differently becomes
+    # ``object`` rather than ending the run. The original-header conflict
+    # above is still an error — two spellings cannot share one column.
     incoming_names = {field.normalized_name for field in incoming.fields}
     if not incoming_names.issubset(existing_original_by_normalized):
         sink._output_contract = existing.merge_for_batch(incoming)

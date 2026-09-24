@@ -13,7 +13,7 @@ from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 
 if TYPE_CHECKING:
-    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 
 
 # Type mapping from SchemaConfig field types to Python types
@@ -24,6 +24,17 @@ _FIELD_TYPE_MAP: dict[str, type] = {
     "bool": bool,
     "any": object,  # 'any' accepts anything - use object as base type
 }
+
+
+def field_definition_python_type(definition: FieldDefinition) -> type:
+    """The contract ``python_type`` a ``FieldDefinition``'s ``field_type`` names.
+
+    The one mapping from the schema DSL's type tokens to contract types, shared
+    by ``create_contract_from_config`` and the transform declaration stamp
+    (``BaseTransform._stamped_output_field_contracts``) so a plugin-declared
+    created field and an operator-declared one cannot map differently.
+    """
+    return _FIELD_TYPE_MAP[definition.field_type]
 
 
 def map_schema_mode(
@@ -119,7 +130,7 @@ def create_contract_from_config(
             fc = FieldContract(
                 normalized_name=fd.name,
                 original_name=original,
-                python_type=_FIELD_TYPE_MAP[fd.field_type],
+                python_type=field_definition_python_type(fd),
                 required=fd.required,
                 source="declared",
                 nullable=fd.nullable,

@@ -693,7 +693,10 @@ nodes_table = Table(
     # Schema contracts for audit trail (Phase 5: Unified Schema Contracts)
     # Input contract: what the node requires (field names and types)
     Column("input_contract_json", Text),
-    # Output contract: what the node guarantees (field names and types)
+    # Output contract. A source records its inferred-and-locked contract on its
+    # first valid row; a transform records its DECLARED output contract (declared
+    # types, fixed before row 1) whose field set evolves as observed pass-through
+    # fields fold in (ADR-050).
     Column("output_contract_json", Text),
     Column("output_contract_hash", String(32)),
     # Composite PK: same node config can exist in multiple runs

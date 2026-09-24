@@ -67,6 +67,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [047](047-landscape-database-clock-authority.md) | Landscape Database-Clock Authority — Custody, Liveness, Expiry and Takeover Decisions Read the Landscape Database's Clock | 2026-09-05 | **Accepted** |
 | [048](048-required-coordination-token-for-landscape-mutations.md) | Required Coordination Token for Landscape Mutations — Every Mutation API Takes One Current Token, Keyword-Only | 2026-09-06 | **Proposed** |
 | [049](049-tutorial-canary-baseline-is-configuration-relative.md) | The Tutorial Canary's Baseline Is Configuration-Relative, Not Byte-Fixed | 2026-09-10 | **Proposed** |
+| [050](050-transform-outputs-declare-sources-infer-and-lock.md) | Transform Outputs Declare, Sources Infer-and-Lock — Join Only at Multi-Producer Seams | 2026-09-25 | **Accepted** |
 
 ## Status Definitions
 

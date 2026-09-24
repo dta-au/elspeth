@@ -24,6 +24,17 @@ instead.
 JSONExplodeConfig extends DataPluginConfig (not TransformDataConfig), so it
 does not accept ``required_input_fields``. ``on_success`` and ``on_error`` are
 set at the pipeline settings layer (TransformSettings), as for every transform.
+
+OUTPUT DECLARATION (ADR-050):
+
+The fields this transform creates are declared before the first row, in every
+schema mode: ``output_field`` is ``any`` and nullable (an array element can be
+anything, including null) and ``item_index`` is ``int``. An operator type in
+``schema.fields`` takes precedence (``page: int`` pins the element type, and
+the engine routes an emission whose element is not an int). The declaration is
+stamped on every emitted contract, so a heterogeneous array — or two rows
+whose arrays hold different element types — records one contract, and nothing
+is inferred from the elements themselves.
 """
 
 from __future__ import annotations
@@ -39,7 +50,7 @@ from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import PluginContractViolation
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -278,7 +289,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fc4a2bcdd9d3fa2b"
+    source_file_hash: str | None = "sha256:67ab862fbd369a2b"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -410,6 +421,13 @@ class JSONExplode(BaseTransform):
             )
         ]
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """``output_field`` is ``any`` (nullable): an element can be anything; ``item_index`` is ``int``."""
+        created = [FieldDefinition(name=self._output_field, field_type="any", required=True, nullable=True)]
+        if self._include_index:
+            created.append(FieldDefinition(name="item_index", field_type="int", required=True, nullable=False))
+        return tuple(created)
+
     def _build_json_explode_output_schema_config(self, cfg: JSONExplodeConfig) -> SchemaConfig:
         """Build output schema config excluding array_field.
 
@@ -424,26 +442,13 @@ class JSONExplode(BaseTransform):
         base_guaranteed.discard(cfg.array_field)
 
         if cfg.schema_config.fields is not None:
+            # An authored declaration wins; the plugin's own declaration
+            # (created_output_fields) fills in the created fields it does
+            # not name. In observed mode the config carries no fields and
+            # the stamp reads created_output_fields directly.
             kept_fields = tuple(field for field in cfg.schema_config.fields if field.name != cfg.array_field)
-            extra_fields: list[FieldDefinition] = []
-            if all(field.name != cfg.output_field for field in kept_fields):
-                extra_fields.append(
-                    FieldDefinition(
-                        name=cfg.output_field,
-                        field_type="any",
-                        required=True,
-                        nullable=False,
-                    )
-                )
-            if cfg.include_index and all(field.name != "item_index" for field in kept_fields):
-                extra_fields.append(
-                    FieldDefinition(
-                        name="item_index",
-                        field_type="int",
-                        required=True,
-                        nullable=False,
-                    )
-                )
+            authored = {field.name for field in kept_fields}
+            extra_fields = tuple(field for field in self.created_output_fields() if field.name not in authored)
             output_field_defs = (*kept_fields, *extra_fields)
 
         # Add declared output fields (output_field + optionally item_index)
@@ -560,54 +565,14 @@ class JSONExplode(BaseTransform):
                         f"row {i} has fields {sorted(row_keys)}"
                     )
 
-        # Determine the contract type for the output field.
-        # If the exploded array contains heterogeneous types (e.g., ["a", {"k": 1}]),
-        # the output field type must be `object` (the universal type) rather than
-        # the type inferred from only the first element. This prevents downstream
-        # components from relying on a contract type that doesn't hold for all rows.
-        item_types = {type(item) for item in array_value}
-        output_field_is_heterogeneous = len(item_types) > 1
-
-        # Update contract using first output row (all rows have same schema)
+        # The output contract: the input contract narrowed to the emitted
+        # keys, with every created field carrying its DECLARED contract
+        # (output_field 'any' nullable, item_index int, or the operator's
+        # type) rather than anything inferred from this row's elements.
         output_contract = narrow_contract_to_output(
             input_contract=row.contract,
             output_row=output_rows[0],
         )
-        if output_contract.find_field(self._output_field) is None:
-            output_contract = SchemaContract(
-                mode=output_contract.mode,
-                fields=(
-                    *output_contract.fields,
-                    FieldContract(
-                        normalized_name=self._output_field,
-                        original_name=self._output_field,
-                        python_type=object,
-                        required=False,
-                        source="inferred",
-                    ),
-                ),
-                locked=True,
-            )
-        elif output_field_is_heterogeneous:
-            # Override the inferred type to `object` when items have mixed types.
-            # narrow_contract_to_output inferred the type from the first element only,
-            # which would be wrong for subsequent rows with different element types.
-            patched_fields = tuple(
-                FieldContract(
-                    normalized_name=fc.normalized_name,
-                    original_name=fc.original_name,
-                    python_type=object if fc.normalized_name == self._output_field else fc.python_type,
-                    required=fc.required,
-                    source=fc.source,
-                    nullable=fc.nullable,
-                )
-                for fc in output_contract.fields
-            )
-            output_contract = SchemaContract(
-                mode=output_contract.mode,
-                fields=patched_fields,
-                locked=True,
-            )
         output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 

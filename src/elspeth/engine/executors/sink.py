@@ -528,10 +528,21 @@ class SinkExecutor:
             )
 
     def _merge_batch_contract(self, tokens: list[TokenInfo]) -> SchemaContract:
-        """Merge the sink-bound tokens' row contracts into one batch contract.
+        """Describe the sink-bound tokens' row contracts with one batch contract.
 
-        A merge failure is a framework bug (contracts that reached a sink should
-        always be batch-mergeable); TIER_1/audit-integrity errors propagate
+        The tokens of one batch can come from several producers — two observed
+        sources feeding one sink, two fork branches, a transform's rows beside
+        rows that bypassed it — and each producer's contract is a truthful
+        description of its own rows. ``SchemaContract.merge_for_batch`` is the
+        J1 description join (ADR-050): a field the producers type differently
+        is described as ``object``, nullable is OR, required is AND. It never
+        raises on a type difference, so a heterogeneous batch is written, not
+        aborted (before ADR-050 two observed sources disagreeing on ``id``
+        ended the run here with exit 4).
+
+        What can still fail is a contract that is not a contract at all — a
+        duplicate normalized name, a ``python_type`` outside the allowed set —
+        and that is a framework bug; TIER_1/audit-integrity errors propagate
         untouched.
         """
         contract_merge_start = time.perf_counter()

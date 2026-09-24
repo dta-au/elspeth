@@ -770,6 +770,19 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # narrowed (a raised PluginContractViolation IS converted to a routed error;
 # only TypeError/KeyError escape unconverted), so the hash moved again
 # (8ad41f481a0a1400 -> fc4a2bcdd9d3fa2b, same single pin, same proofs).
+# Rotated 2026-09-25 (elspeth-5887fb7928, S1a / ADR-050): a PLUGIN PROVENANCE
+# rotation, not a semantic one. Transform outputs now DECLARE the contract of
+# every created field before the first row (value_transform declares its
+# targets any, json_explode its output_field any / item_index int, field_mapper
+# its dotted targets any, blob_csv_expand its CSV columns str), so the four
+# source_file_hashes moved: value_transform e45fbb4c22b9900f ->
+# 89bb2afff7b49a6b on the rebased tree (the 3 manifest pins,
+# fork-coalesce-policies/union-collision-fail) and json_explode
+# fc4a2bcdd9d3fa2b -> 67ab862fbd369a2b (1 manifest pin,
+# json-explode-parent-child); field_mapper e30482871023e9a6 -> d87d0325cdeb243f
+# and blob_csv_expand f21d43dc7385e82e -> cf7fd4418a151e3a have no manifest pin.
+# Recomputed with scripts/cicd/plugin_hash.py::compute_source_file_hash;
+# reverting the literals reproduces the prior manifest byte for byte.
 EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

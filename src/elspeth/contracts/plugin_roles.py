@@ -12,7 +12,10 @@ runtime boundary contracts that need a lower-layer role check.
 
 from __future__ import annotations
 
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from elspeth.contracts.schema import FieldDefinition
 
 
 class ContractablePlugin(Protocol):
@@ -134,5 +137,35 @@ def require_declared_input_fields_plugin(plugin: object) -> DeclaredInputFieldsP
     is_batch_aware = typed_plugin.is_batch_aware
     if type(is_batch_aware) is not bool:
         raise TypeError(f"{type(plugin).__name__}.is_batch_aware must be bool, got {type(is_batch_aware).__name__!r}.")
+    _require_contractable_plugin(plugin)
+    return typed_plugin
+
+
+class OutputDeclaringPlugin(ContractablePlugin, Protocol):
+    """The ADR-050 output-declaration surface a transform's emissions are checked against."""
+
+    declared_output_fields: frozenset[str]
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]: ...
+
+    def carried_output_fields(self) -> frozenset[str]: ...
+
+
+def require_output_declaring_plugin(plugin: object) -> OutputDeclaringPlugin:
+    """Return a runtime-validated plugin exposing the ADR-050 output declaration.
+
+    ``created_output_fields()`` must return a tuple of ``FieldDefinition`` (an
+    owned type, checked nominally) and ``carried_output_fields()`` a frozenset
+    of str; a plugin returning anything else is a bug, not a declaration.
+    """
+    from elspeth.contracts.schema import FieldDefinition
+
+    typed_plugin = cast(OutputDeclaringPlugin, plugin)
+    owner_name = type(plugin).__name__
+    _validated_string_frozenset(typed_plugin.declared_output_fields, owner_name=owner_name, attr_name="declared_output_fields")
+    _validated_string_frozenset(typed_plugin.carried_output_fields(), owner_name=owner_name, attr_name="carried_output_fields()")
+    created = typed_plugin.created_output_fields()
+    if type(created) is not tuple or any(type(definition) is not FieldDefinition for definition in created):
+        raise TypeError(f"{owner_name}.created_output_fields() must return a tuple of FieldDefinition.")
     _require_contractable_plugin(plugin)
     return typed_plugin

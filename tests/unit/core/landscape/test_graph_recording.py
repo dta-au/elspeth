@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import event, select
 
 from elspeth.contracts import Determinism, NodeType, RoutingMode, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, ContractMergeError
+from elspeth.contracts.errors import AuditIntegrityError, ContractMergeError, FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
@@ -1805,12 +1805,17 @@ class TestUpdateNodeOutputContract:
             schema_config=_DYNAMIC_SCHEMA,
         )
 
-        with pytest.raises(ContractMergeError, match="id"):
+        # A node's emissions carry one declared type per field (ADR-050), so
+        # an emission typing a recorded field differently is a bug in owned
+        # code: the writer re-raises the neutral ContractMergeError as
+        # FrameworkBugError, value-free (the field and the two type names).
+        with pytest.raises(FrameworkBugError, match="'id' has conflicting types 'int' and 'str'") as raised:
             factory.data_flow.update_node_output_contract(
                 "xfm",
                 _make_contract(fields=(_make_field("id", str),), locked=True),
                 member_token=leader_coordination_token(factory, "run-1").membership,
             )
+        assert isinstance(raised.value.__cause__, ContractMergeError)
 
         _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
         assert stored == original
@@ -1934,3 +1939,63 @@ class TestUpdateNodeOutputContract:
         assert "alpha" in field_names
         assert "beta" in field_names
         assert "gamma" in field_names
+
+
+class TestResumeAcrossTheDeclarationChange:
+    """ADR-050 T13: a run recorded BEFORE the declaration change meets the new stamp on resume.
+
+    Its node record says ``T, source: inferred`` (what per-emission inference
+    wrote); the resumed emission says ``object, source: declared``. There is
+    no refusal and no compatibility shim by design: the resume ends at the
+    first stamped node's evolution with ``FrameworkBugError``. The
+    implementation-compatibility check cannot refuse it earlier, because a
+    base-class change moves none of the per-node evidence it compares.
+    """
+
+    def test_a_pre_change_record_aborts_at_the_first_stamped_emission(self) -> None:
+        db, factory = _setup()
+        # Fields in normalized-name order: the record round-trips sorted, and
+        # the preserved-record assertion below compares whole contracts.
+        pre_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="copies", original_name="copies", python_type=int, required=False, source="inferred"),
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="value_transform",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0.0",
+            config={},
+            node_id="xfm",
+            output_contract=pre_change,
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        post_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(
+                    normalized_name="copies", original_name="copies", python_type=object, required=True, source="declared", nullable=True
+                ),
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        with pytest.raises(FrameworkBugError, match="'copies' has conflicting types 'int' and 'object'"):
+            factory.data_flow.update_node_output_contract(
+                "xfm", post_change, member_token=leader_coordination_token(factory, "run-1").membership
+            )
+        _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
+        assert stored == pre_change
+        db.close()
+
+    def test_the_implementation_compatibility_check_cannot_refuse_it(self) -> None:
+        """Measured: the per-node evidence compared on resume has no base-class hash."""
+        from dataclasses import fields as dataclass_fields
+
+        from elspeth.engine.orchestrator.landscape_registration import NodeAuditMetadata
+
+        assert {field.name for field in dataclass_fields(NodeAuditMetadata)} == {"plugin_version", "determinism", "source_file_hash"}

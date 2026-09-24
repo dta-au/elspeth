@@ -94,13 +94,15 @@ class TestValueTransformBehavior:
         assert result.row is not None
         assert result.row["price"] == pytest.approx(110.0)
 
-    def test_overwrite_with_different_type_retypes_output_contract(self, ctx: "PluginContext") -> None:
-        """Overwriting a typed field with a different-typed result retypes the contract.
+    def test_overwrite_with_different_type_emits_the_declared_any(self, ctx: "PluginContext") -> None:
+        """Overwriting a typed field with a different-typed result: the target is declared ``any`` (ADR-050).
 
-        ``price`` is declared int; the expression makes it float. Before this fix
-        ``with_field`` was only called for NEW targets, so the output contract kept
-        python_type=int and the emitted row FAILED its own contract.validate() — a
-        self-contradictory audit record (plugins review Batch 4 item 2).
+        ``price`` arrives int; the expression makes it float. The target's
+        contract is its DECLARATION, not this row's value: an untyped target
+        is ``any`` (nullable) from row 1, so the emitted row satisfies its own
+        contract and a later row computing an int records the same contract.
+        Before ADR-050 the field was retyped per row to the value's type, and
+        two rows disagreeing aborted the run at the node-contract merge.
         """
         from elspeth.contracts.schema_contract import SchemaContract
         from elspeth.plugins.transforms.value_transform import ValueTransform
@@ -123,7 +125,9 @@ class TestValueTransformBehavior:
         assert isinstance(result.row["price"], float)
         out_field = result.row.contract.find_field("price")
         assert out_field is not None
-        assert out_field.python_type is float
+        assert out_field.python_type is object
+        assert out_field.nullable is True
+        assert out_field.source == "declared"
         violations = result.row.contract.validate(result.row.to_dict())
         assert violations == [], f"emitted row must satisfy its own contract, got: {violations}"
 
@@ -906,11 +910,13 @@ class TestValueTransformNestedResults:
     """A nested result is a value the output contract types ``any`` (elspeth-5887fb7928 AC-R3).
 
     Every operation target the node's schema does not type is declared ``any``
-    by the output schema (``declare_missing_guaranteed_fields``), and a source
-    types a nested JSON value ``object``. A target the schema DOES type is
-    pinned to that type: see ``TestValueTransformPinsDeclaredTargets``. The per-row contract used to refuse such a value with a
-    raw ``TypeError`` from ``SchemaContract.with_field``, which aborted the run
-    (exit 4) on the ordinary copy of a JSON array or object.
+    (nullable) before the first row (ADR-050: ``created_output_fields`` and,
+    under fixed/flexible, ``declare_missing_guaranteed_fields``), and the
+    declaration is stamped on every emission. A target the schema DOES type is
+    pinned to that type: see ``TestValueTransformPinsDeclaredTargets``. The
+    per-row contract used to refuse such a value with a raw ``TypeError`` from
+    ``SchemaContract.with_field``, which aborted the run (exit 4) on the
+    ordinary copy of a JSON array or object.
     """
 
     @pytest.fixture
@@ -942,7 +948,9 @@ class TestValueTransformNestedResults:
         out_field = result.row.contract.find_field("out")
         assert out_field is not None
         assert out_field.python_type is object
-        assert out_field.nullable is False
+        assert out_field.nullable is True
+        assert out_field.required is True
+        assert out_field.source == "declared"
         assert result.row.contract.validate(result.row.to_dict()) == []
 
     def test_tuple_and_list_results_hash_identically(self, ctx: "PluginContext") -> None:

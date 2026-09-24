@@ -1102,6 +1102,15 @@ EXPECTED_CONTRACT_SITES: Mapping[str, frozenset[DispatchSiteName]] = MappingProx
         #   Sites:      post_emission_check (single-token TransformExecutor path)
         #               batch_flush_check   (RowProcessor._cross_check_flush_output)
         "schema_config_mode": frozenset({"post_emission_check", "batch_flush_check"}),
+        # OutputDeclarationCompletenessContract
+        #   Defined:    src/elspeth/engine/executors/output_declaration.py
+        #   Registered: src/elspeth/engine/executors/output_declaration.py (module-import side-effect)
+        #   ADR:        ADR-050
+        #   Sites:      post_emission_check (single-token TransformExecutor path)
+        # NOTE: batch_flush_check deliberately absent; aggregation and collector
+        # outputs do not carry the declaration stamp (they record no node
+        # output contract), so the check would describe a seam it does not reach.
+        "output_declaration_completeness": frozenset({"post_emission_check"}),
         # SourceGuaranteedFieldsContract
         #   Defined:    src/elspeth/engine/executors/source_guaranteed_fields.py
         #   Registered: src/elspeth/engine/executors/source_guaranteed_fields.py (module-import side-effect)

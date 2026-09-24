@@ -11,6 +11,17 @@ semantics. Two thin wrappers consume the core algorithm:
 Both derive required/nullable flags from merge_union_field_flags so build-time
 and runtime merges cannot diverge.
 
+A THIRD, separate operation lives here too: ``join_batch_contracts``, the
+DESCRIPTION join (J1) used only where several PRODUCERS' rows meet — the sink
+batch merge and display headers (ADR-050). It never raises on a type
+difference: two producers that type one field differently are both telling
+the truth about their own rows, and the batch description is ``object``. It
+is the wrong tool for a coalesce (a union coalesce PROMISES one type to its
+consumers, so a conflict there is a routed row failure) and for a node's own
+output record (a node's emissions all carry the same declared types, so a
+conflict there is an owned-code bug). Those two seams keep the raising
+``merge_union_contracts`` / ``SchemaContract.merge_for_node_evolution``.
+
 Policy semantics (shared by both wrappers):
 
 - require_all (OR semantics): A field is required if required in ANY branch.
@@ -305,4 +316,74 @@ def merge_union_contracts(
         mode=merged_mode,
         fields=resolve_original_name_collisions(merged_fields),
         locked=merged_locked,
+    )
+
+
+_MODE_ORDER: dict[str, int] = {"FIXED": 0, "FLEXIBLE": 1, "OBSERVED": 2}
+
+
+def join_batch_contracts(contracts: Sequence[SchemaContract]) -> SchemaContract:
+    """Describe the rows of several producers with one contract (the J1 join).
+
+    ``contracts`` are the row contracts of N sibling tokens bound for one sink
+    (or one display-header table). Each is a truthful description of its own
+    rows; the result is a truthful description of ALL of them, and it is a
+    lattice join, so it is commutative, associative and idempotent (pinned by
+    ``tests/property/contracts/test_schema_contract_properties.py``):
+
+    - a field carried with ONE type keeps that type; carried with different
+      types it becomes ``object`` (``int`` and ``float`` are different, and so
+      are ``bool`` and ``int``: ``SchemaContract.validate`` compares exact
+      types); ``object`` absorbs everything;
+    - ``nullable`` is OR across carriers, and a field some member does not
+      carry is nullable (those members' rows lack it);
+    - ``required`` is AND across carriers, and a field some member does not
+      carry is optional;
+    - ``source`` is ``declared`` if any carrier declares it;
+    - ``original_name`` is kept when every carrier agrees and falls back to
+      the identity (the normalized name) when they disagree, so the result
+      does not depend on which producer's row arrived first;
+    - mode is the most restrictive (FIXED > FLEXIBLE > OBSERVED) and
+      ``locked`` is OR.
+
+    Soundness: every contributing row validates against the join
+    (``validate()`` skips ``object`` fields, admits None on a nullable or
+    optional field, and never sees a missing optional field as a violation).
+
+    Raises:
+        ValueError: If ``contracts`` is empty (nothing to describe).
+    """
+    if not contracts:
+        raise ValueError("join_batch_contracts requires at least one contract")
+    if len(contracts) == 1:
+        return contracts[0]
+
+    carriers_by_name: dict[str, list[FieldContract]] = {}
+    for contract in contracts:
+        for fc in contract.fields:
+            carriers_by_name.setdefault(fc.normalized_name, []).append(fc)
+
+    member_count = len(contracts)
+    joined: list[FieldContract] = []
+    for name in sorted(carriers_by_name):
+        carriers = carriers_by_name[name]
+        carried_by_all = len(carriers) == member_count
+        types = {fc.python_type for fc in carriers}
+        python_type = next(iter(types)) if len(types) == 1 else object
+        originals = {fc.original_name for fc in carriers}
+        joined.append(
+            FieldContract(
+                normalized_name=name,
+                original_name=next(iter(originals)) if len(originals) == 1 else name,
+                python_type=python_type,
+                required=carried_by_all and all(fc.required for fc in carriers),
+                source="declared" if any(fc.source == "declared" for fc in carriers) else "inferred",
+                nullable=(not carried_by_all) or any(fc.nullable for fc in carriers),
+            )
+        )
+
+    return SchemaContract(
+        mode=min((contract.mode for contract in contracts), key=lambda m: _MODE_ORDER[m]),
+        fields=resolve_original_name_collisions(joined),
+        locked=any(contract.locked for contract in contracts),
     )

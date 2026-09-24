@@ -1130,8 +1130,13 @@ class TestRAGDeclaredOutputFieldContracts:
         assert context_field.nullable is True
         assert result.row.contract.get_field("policy__rag_count").python_type is int
 
-    def test_observed_mode_emission_keeps_inferred_metadata(self) -> None:
-        """Observed mode declares no fields, so emission stays purely inferred."""
+    def test_observed_mode_emission_is_stamped_declared_any(self) -> None:
+        """Observed mode declares no operator fields, so the created fields are stamped ``any`` (ADR-050).
+
+        Before ADR-050 the emission stayed purely inferred (typed from this
+        row's value); now every created field carries a declared contract
+        fixed before the first row.
+        """
         chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
         transform, _ = _setup_transform_with_mock_provider(chunks)
         row = _make_row({"question": "What is RAG?"})
@@ -1143,7 +1148,8 @@ class TestRAGDeclaredOutputFieldContracts:
         assert transform._output_schema_config is not None
         assert transform._output_schema_config.fields is None
         _run_post_emission_check(transform, result.row)
-        assert result.row.contract.get_field("policy__rag_context").source == "inferred"
+        context_field = result.row.contract.get_field("policy__rag_context")
+        assert (context_field.source, context_field.python_type, context_field.nullable) == ("declared", object, True)
 
 
 def test_plugin_discoverable():

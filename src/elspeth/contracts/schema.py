@@ -872,11 +872,13 @@ def declare_missing_guaranteed_fields(
     transform's own emitted rows fail validation against its own contract
     (elspeth-97487736ca).
 
-    Appends a required, any-typed FieldDefinition for each guaranteed name
-    not already declared: a guarantee asserts the field WILL exist, which
-    is required-ness, but the caller does not know its type. Authored
-    declarations are never modified — a guaranteed name already declared
-    keeps its authored type and (possibly optional) requiredness.
+    Appends a required, any-typed, nullable FieldDefinition for each
+    guaranteed name not already declared: a guarantee asserts the field WILL
+    exist, which is required-ness, but the caller does not know its type.
+    ``any`` is nullable (ADR-050): no check ever reads the value of an ``any``
+    field, so ``nullable=False`` on one would be a claim nothing verifies.
+    Authored declarations are never modified — a guaranteed name already
+    declared keeps its authored type and (possibly optional) requiredness.
 
     Returns fields unchanged when the schema is observed-style
     (fields is None) or nothing is guaranteed.
@@ -887,7 +889,7 @@ def declare_missing_guaranteed_fields(
     missing = [name for name in guaranteed_fields if name not in declared]
     if not missing:
         return fields
-    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True) for name in missing)
+    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True, nullable=True) for name in missing)
 
 
 def raw_options_have_schema(options: Mapping[str, Any]) -> bool:

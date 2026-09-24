@@ -827,8 +827,9 @@ class RowTokenRepository:
         Records all parent relationships.
         Persists a {data, contract} envelope to the payload store so the merged token
         is reconstructable on resume without re-executing the merge strategy and without
-        any nodes-table lookup (ADDENDUM 3 — nodes.output_contract_json is NULL in prod
-        for non-source nodes; the envelope is self-contained).
+        any nodes-table lookup: the envelope is self-contained. (``nodes.output_contract_json``
+        is populated for transform nodes too — it is the node's declared output contract,
+        ADR-050 — but a token's own contract is the per-row truth resume restores.)
 
         Validates that all parent tokens belong to the specified row_id and
         that they all share the same run_id. Cross-run/cross-row contamination
@@ -900,8 +901,9 @@ class RowTokenRepository:
         # Persist a self-contained {data, contract} envelope before the DB write so
         # the token_data_ref is available atomically at INSERT time.
         # The envelope carries both the row data and its SchemaContract so recovery can
-        # reconstruct a faithful PipelineRow without any nodes-table lookup (ADDENDUM 3:
-        # nodes.output_contract_json is NULL for non-source nodes in production).
+        # reconstruct a faithful PipelineRow without any nodes-table lookup: the token's
+        # own contract is the per-row truth, whatever the node's recorded output contract
+        # (populated for transform nodes as well — ADR-050) says.
         # checkpoint_dumps is type-faithful (datetime survives as datetime, not a
         # string) — canonical_json would stringify datetime and destroy Tier-1 fidelity.
         # Crash on store failure: a merged token with no persisted payload is
@@ -1401,8 +1403,9 @@ class RowTokenRepository:
         Each child's {data, contract} envelope is persisted to the payload store before
         the DB write so token_data_ref is written atomically at INSERT time. This
         makes each expanded child self-contained and reconstructable on resume without
-        re-executing the deaggregation transform and without any nodes-table lookup
-        (ADDENDUM 3 — nodes.output_contract_json is NULL for non-source nodes in prod).
+        re-executing the deaggregation transform and without any nodes-table lookup: the
+        child's own contract is the per-row truth, whatever the node's recorded output
+        contract (populated for transform nodes as well — ADR-050) says.
 
         Args:
             parent_ref: TokenRef bundling parent token_id and run_id

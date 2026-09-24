@@ -877,18 +877,19 @@ class TestSchemaContractCheckpoint:
 class TestSchemaContractMergeForBatch:
     """Test merge_for_batch: describing a heterogeneous batch of sibling contracts.
 
-    merge_for_batch produces a single contract that truthfully describes N
-    sibling row contracts bound for one sink (possibly from different pipeline
-    branches/paths). AND-required and exclusive-field forcing are the correct
-    intersection semantics here: nothing guarantees which siblings appear in a
-    batch. Coalesce union merges use the policy-aware merge_union_contracts
-    instead.
+    merge_for_batch is the J1 description join (ADR-050): a single contract
+    that truthfully describes N sibling row contracts bound for one sink
+    (possibly from different sources, branches or paths). AND-required and
+    exclusive-field forcing are the correct intersection semantics here:
+    nothing guarantees which siblings appear in a batch. A field the
+    producers type differently is described as ``object``; the join never
+    raises. Coalesce union merges use the policy-aware, RAISING
+    merge_union_contracts instead, and a node's own recorded contract folds
+    through the raising merge_for_node_evolution.
     """
 
     def test_merge_same_field_same_type(self) -> None:
         """Same field, same type merges successfully."""
-        from elspeth.contracts.errors import ContractMergeError  # noqa: F401 - imported for test setup
-
         c1 = SchemaContract(
             mode="FLEXIBLE",
             fields=(make_field("x", int, original_name="X", required=True, source="declared"),),
@@ -904,10 +905,13 @@ class TestSchemaContractMergeForBatch:
         assert len(merged.fields) == 1
         assert merged.fields[0].python_type is int
 
-    def test_merge_different_types_raises(self) -> None:
-        """Different types raise ContractMergeError."""
-        from elspeth.contracts.errors import ContractMergeError
+    def test_merge_different_types_describes_the_field_as_object(self) -> None:
+        """Two producers typing one field differently: the batch description is ``object`` (J1, ADR-050).
 
+        Before ADR-050 this raised ContractMergeError, and the sink turned it
+        into a FrameworkBugError that ended the run — two observed sources
+        disagreeing on ``id`` could not share a sink.
+        """
         c1 = SchemaContract(
             mode="FLEXIBLE",
             fields=(make_field("x", int, original_name="X", required=True, source="declared"),),
@@ -918,8 +922,54 @@ class TestSchemaContractMergeForBatch:
             fields=(make_field("x", str, original_name="X", required=True, source="declared"),),
             locked=True,
         )
+        merged = c1.merge_for_batch(c2)
+
+        field = merged.get_field("x")
+        assert field.python_type is object
+        assert field.required is True
+        assert field.nullable is False
+        assert field.original_name == "X"
+        # Sound: every contributing row validates against the join.
+        assert merged.validate({"x": 1}) == []
+        assert merged.validate({"x": "one"}) == []
+
+    def test_merge_int_and_float_or_bool_and_int_are_different_types(self) -> None:
+        """``int ⊔ float`` and ``bool ⊔ int`` are ``object``: validate() compares exact types."""
+        for type_a, type_b in ((int, float), (bool, int)):
+            c1 = SchemaContract(mode="OBSERVED", fields=(make_field("x", type_a),), locked=True)
+            c2 = SchemaContract(mode="OBSERVED", fields=(make_field("x", type_b),), locked=True)
+            assert c1.merge_for_batch(c2).get_field("x").python_type is object
+
+    def test_merge_original_name_disagreement_falls_back_to_identity(self) -> None:
+        """Carriers spelling the original header differently: identity, whichever arrives first."""
+        c1 = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, original_name="X"),), locked=True)
+        c2 = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, original_name="x_raw"),), locked=True)
+        assert c1.merge_for_batch(c2).get_field("x").original_name == "x"
+        assert c2.merge_for_batch(c1).get_field("x").original_name == "x"
+        assert c1.merge_for_batch(c2).version_hash() == c2.merge_for_batch(c1).version_hash()
+
+    def test_merge_for_node_evolution_raises_on_a_type_conflict(self) -> None:
+        """A node's own record never joins types: a conflict is ContractMergeError (the writer re-raises FrameworkBugError)."""
+        from elspeth.contracts.errors import ContractMergeError
+
+        recorded = SchemaContract(mode="OBSERVED", fields=(make_field("x", int),), locked=True)
+        emitted = SchemaContract(mode="OBSERVED", fields=(make_field("x", str),), locked=True)
         with pytest.raises(ContractMergeError, match="conflicting types"):
-            c1.merge_for_batch(c2)
+            recorded.merge_for_node_evolution(emitted)
+
+    def test_merge_for_node_evolution_unions_the_field_set(self) -> None:
+        """A field absent from one emission folds in as optional and nullable; a shared field keeps its type."""
+        recorded = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, required=True),), locked=True)
+        emitted = SchemaContract(
+            mode="OBSERVED",
+            fields=(make_field("x", int, required=True), make_field("y", str, required=True)),
+            locked=True,
+        )
+        evolved = recorded.merge_for_node_evolution(emitted)
+        assert evolved.get_field("x").python_type is int
+        assert evolved.get_field("x").required is True
+        assert evolved.get_field("y").required is False
+        assert evolved.get_field("y").nullable is True
 
     def test_merge_field_only_in_one_path_becomes_optional(self) -> None:
         """Field in only one path becomes optional (required=False)."""

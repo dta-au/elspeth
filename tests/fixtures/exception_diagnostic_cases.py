@@ -271,6 +271,16 @@ def _inherited_cases() -> tuple[DiagnosticCase, ...]:
                 "violations": [{"emitted_index": 0, "runtime_observed": [], "missing": ["a"]}],
             },
         ),
+        (
+            errors.UndeclaredOutputFieldsViolation,
+            {
+                "stamped": ["a"],
+                "carried": [],
+                "violation_count": 1,
+                "violations_truncated": False,
+                "violations": [{"emitted_index": 0, "undeclared": ["b"]}],
+            },
+        ),
         (errors.SourceGuaranteedFieldsViolation, {"declared": ["a"], "runtime_observed": [], "missing": ["a"]}),
         (errors.SinkRequiredFieldsViolation, {"declared": ["a"], "runtime_observed": [], "missing": ["a"]}),
         (
@@ -463,6 +473,25 @@ DIAGNOSTIC_CASES = (
             "passes_through_input": (False, True),
             "can_drop_rows": (False, True),
             "emitted_count": (0, 2),
+        },
+    ),
+    *_structured_cases(
+        errors.DeclaredOutputTypeViolation,
+        {
+            "transform": "fixed-transform",
+            "field": "fixed-field",
+            "expected_type": "int",
+            "actual_type": "str",
+            "emitted_index": 0,
+            "authorship": "computed",
+        },
+        {
+            "transform": ("transform-alpha", "transform-omega"),
+            "field": ("field-alpha", "field-omega"),
+            "expected_type": ("int", "float"),
+            "actual_type": ("str", "bool"),
+            "emitted_index": (0, 2),
+            "authorship": ("computed", "carried"),
         },
     ),
     *_structured_cases(

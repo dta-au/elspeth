@@ -79,6 +79,22 @@ Preserve `data/auth.db` and follow the account re-admission guidance in the
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
 
+- **Transform outputs declare, sources infer-and-lock (ADR-050).** A
+  transform's created fields carry a contract declared before the first row
+  (operator type > plugin type > `any`, nullable), enforced on every emitted
+  value: a value that breaks a declared type is routed through `on_error`
+  with a value-free reason that records whether the transform computed or
+  carried it, and a created field that bypassed the declaration ends the run.
+  Row-to-row type variance at a transform output no longer aborts a run, a
+  declared `page: int` can no longer deliver a str, a `value_transform` typing
+  a carried field no longer trips ADR-014 on a valid row, and two observed
+  sources disagreeing on a column now share a sink. The meaning of
+  `nodes.output_contract_json` changes for transform nodes to "the declared
+  output contract, field set evolving", so contract `version_hash`es and the
+  LLM prompt `contract_hash` differ from earlier runs. A run recorded before
+  this change and resumed after it ends with `FrameworkBugError` at the first
+  declared node's contract evolution; there is no compatibility shim (epoch 45
+  is undeployed).
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

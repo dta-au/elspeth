@@ -830,7 +830,7 @@ The `node_states` table has a denormalized `run_id` column (schema comment: "Add
 3. **Reachability** — All nodes are reachable from the source (no orphan nodes).
 4. **Single terminal state** — Each token reaches exactly one terminal outcome.
 5. **Unique edge labels** — From the same node, no duplicate outgoing labels.
-6. **Immutable schemas** — Schema contracts are frozen after first row (types locked).
+6. **Declared or locked schemas** — A source's contract is inferred and locked on its first valid row and every later row is validated against it. A transform's output contract is DECLARED before the first row (operator type > plugin type > `any`, nullable) and enforced on every emitted value; its field set may evolve, its types never do. Where several producers' rows meet — the sink batch contract and display headers — the contract is an order-independent description (the J1 join: a field typed differently by two producers is `object`). See [ADR-050](../architecture/adr/050-transform-outputs-declare-sources-infer-and-lock.md).
 7. **Atomic fork/coalesce** — Parent outcome recorded atomically with children.
 8. **Audit completeness** — Every routing decision is traceable to an edge in the graph.
 9. **No silent drops** — Every row that enters the pipeline reaches a terminal state.
@@ -845,3 +845,4 @@ The `node_states` table has a denormalized `run_id` column (schema comment: "Add
 | 1.0 | 2026-02-08 | Initial contract — Node types, edge types, graph construction, validation, schema propagation, processing model, error routing |
 | 1.1 | 2026-02-08 | Accuracy pass — Fixed edge label formats (dunder convention), node ID prefixes, validation phase separation, fork semantics, contract error severity. Added TokenInfo contract, ID map accessors, GraphValidationWarning, audit_fields. |
 | 1.2 | 2026-08-03 | Added config-gate row-error policy edges and terminal/audit semantics; generalized error-edge labels to processing-node producer names. |
+| 1.3 | 2026-09-25 | Invariant 6 restated per ADR-050: sources infer-and-lock, transform outputs declare before the first row, multi-producer sink seams join. |
