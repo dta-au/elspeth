@@ -112,7 +112,9 @@ additional repair produced the requested six-row generated CSV, persisted and
 bound to the source with matching downloaded-content hashes. That sample used
 tools on its first call, so it does not prove that the new retry fired. Seven
 audited provider calls cost $0.1105702636; three interpretation reviews remained
-pending. Explanation and revocation live controls remain pending.
+pending. Later live explanation-only and revoked-build controls passed: neither
+created a graph, blob, or proposal. Their runner exited zero; these controls used
+the `6bb7c62fb` source snapshot.
 
 ### Explicit repair after review resolution
 
@@ -189,12 +191,117 @@ reported $0.355126269, including the canary and rootless probe above. The revise
 test service explicitly enables the required optional plugins, retaining the
 same global provider ledger across the restart. No deployed policy changed.
 
+The second attempt at `6bb7c62fb` exposed two acceptance-harness defects and one
+production warning defect. The cleanup graph was previewed successfully, but
+bookkeeping and metadata saves changed its record ID. The harness incorrectly
+required that ID to remain unchanged. It now binds the successful preview to
+ordered executable content, retaining controls that reject changed nodes,
+options, sources, and outputs. The numeric-quarantine run correctly published a
+successor quarantine artifact, while the harness attempted to download its old
+24-byte descriptor from the current 34-byte URI. Selection now follows the full
+finalized sink-effect predecessor chain, rejects an incomplete manifest, and
+still requires the download endpoint's content hash check. These failures remain
+recorded as failed attempts, not retrospectively declared live passes.
+
+The keyword workflow exhausted discovery after receiving a false warning about
+a missing `keywords` option. The real option is `blocked_patterns`. The same
+warning inventory had a stale `json_explode.field` name and wrongly required a
+top-level LLM template when individual `queries` supplied templates. All three
+were corrected against actual plugin parsers: 605 focused tests, 20 structural
+checks, and three revert controls passed. The request budget itself was working.
+
+That attempt stopped with 94 completed requests, no unfinished requests, and
+$0.8025377984 in reported cumulative cost. The next attempt used an immutable
+`e32366035` checkout, carried that ledger forward, and raised the request ceiling
+to 400 while retaining the $10 known-cost stop.
+
+At `e32366035`, eight workflows passed through actual execution and output/audit
+checks: cleanup/edit, keyword routing/edit, reference/default edit, complaint/SLA,
+typed LLM extraction/routing, grouped frequency, JSON expansion, and multiline
+expansion. The two LLM cases resumed only after their exact prompt cards were
+inspected and approved. All six complaint rows and all three extraction rows
+matched their expected values, types, and routes.
+
+The numeric case preserved and routed all five rows, but its observed quarantine
+schema produced `id,price,qty`, failing the stricter `id,qty,price` oracle. The
+request had specified success-column order explicitly and quarantine order less
+clearly. Runtime behavior followed the authored schema. CSV assistance also
+incorrectly advised using `headers` to pin order; it now distinguishes display
+names from fixed `schema.fields` order. The fixture's quarantine order is now
+explicit, with expected outputs unchanged. A fresh live retry remains required.
+
+The fork/coalesce case exhausted discovery immediately after its final successful
+preview. Its nine planner turns comprised six discovery and three composition
+turns, including a correctly charged malformed mutation. A subsequent public
+strict-validation request passed all checks with execution and completion ready.
+The runner's generic HTTP-error bucket does not make this a harness defect: the
+product prevented finalization. The repair now permits one reply-only planner
+transition after an actual successful current-state final preview, retaining
+the original deadline, counters, advisor and completion gates. Missing, invalid,
+stale or error-bearing evidence does not qualify, and returned tools cannot
+execute. All 559 affected tests and 20 structural checks passed; three real
+mutations were caught and the 15 final controls passed after restoration.
+Execution acceptance for this case remains outstanding.
+
+The service stopped cleanly with unchanged production/harness hashes. Its ledger
+ended at 213 completed requests, zero unpriced or unfinished requests, and
+$1.5147100296 cumulative reported cost. The aggregate runner exit remains 1 because
+the two failed cases are preserved. This sample is not a ten-of-ten pass.
+
+## Related identity and error-boundary repairs
+
+The [systems review](2026-09-25-composer-identity-systems-review.md) distinguishes
+checkpoint identity, content evidence, and transition authority. The cross-turn
+repair ledger now ignores bookkeeping version changes while retaining authored
+content and user/session/settings/plugin/control context. Runtime validation
+still runs independently. Verification includes 155 affected tests, 108 restored
+checks, and a mutation that made four bookkeeping-version controls fail.
+
+Successful mutations are now audited before interpretation-tolerant preflight.
+A later infrastructure failure retains the successful mutation/version and its
+typed failure cause, calls, and failed-turn metadata. It no longer relabels the
+tool as a plugin crash. Forty-three focused tests and 20 structural checks passed;
+removing the fix failed all three mutation controls.
+
+Narrative results now use the explicitly selected run and retain that identity
+on loaded summaries and download targets. Completed history no longer depends
+on a currently active execution, and late responses from a previous run cannot
+populate the new selection. All 190 affected frontend tests, two revert controls,
+type checking, lint, and the production build passed.
+
+Guided proposal anchors now advance atomically with equivalent checkpoints,
+including per-tool persistence and ordinary proposal acceptance. Each caller
+retains its exact operation authority; changed content or review facts are
+rejected, and a live confirmation cannot lose custody. Positive, rollback, stale
+authority, and PostgreSQL contention controls passed independent review. The
+stored event reasons require session epoch 68; final integration verification
+remains in progress.
+
+The maintainer-requested [read-only guidance audit](2026-09-25-composer-guidance-audit.md)
+reviewed all 56 registered plugins and the 42-tool Composer palette. It records
+eight findings with controlled evidence and scope limits. Parent-reviewed
+corrections align discovery and guided teaching with actual option names,
+review ownership, emitted fields, blank-line handling, schema rejection, and
+source-review/default behavior. Independent review approved all eight corrections:
+512 affected checks passed, followed by 132 controls covering the final CSV
+post-call wording, 156 catalog checks, and 20 structural gates. Old-guidance
+mutations were rejected. Generated CSV provenance passed 106 checks with two
+existing retired-case skips; expected runtime output values were unchanged.
+
+The narrative artifact follow-up offers a download only after its existing
+preview endpoint verifies the artifact bytes. Historical cumulative descriptors
+that fail that check cannot become the convenience download target. The unchanged
+download endpoint still verifies integrity. All 193 affected frontend tests,
+mutation controls, type checking, lint and the production build passed.
+
 ## Scope and deployment
 
 Refresh survival is explicitly parked by the maintainer for the streaming UI
 redesign. No disconnect or explicit-cancel lifecycle change is included. There is
-no session epoch or stored-schema change. Frontend changes require rebuilt assets;
-the task build completed. The original session and deployed service were not
+session epoch 68 for the guided checkpoint event reasons; the old closed reader
+cannot accept them. Existing session stores require the documented pre-release
+recreation procedure before a future deployment. Frontend changes require
+rebuilt assets; the task build completed. The original session and deployed service were not
 modified by the diagnostic probes.
 
 Detailed lane evidence, command logs, exit codes, read-only snapshot and live
