@@ -60,10 +60,12 @@ class VirtualReplaySinkEffect:
         scope = (self._sink_node_id, self._role)
         with self._factory._replay_sink_dispositions_lock:
             cache = self._factory._replay_sink_dispositions
-            cached = cache.get(self._source_run_id)
-            if cached is not None:
+            if self._source_run_id in cache:
+                cached = cache[self._source_run_id]
                 cache.move_to_end(self._source_run_id)
-                return cached.get(scope, {})
+                if scope in cached:
+                    return cached[scope]
+                return {}
             source = self._factory.run_lifecycle.get_run(self._source_run_id)
             dispositions = self._read_run_dispositions(self._factory, self._source_run_id)
             # Only terminal runs are immutable source evidence. Direct callers
@@ -82,8 +84,12 @@ class VirtualReplaySinkEffect:
                 cache[self._source_run_id] = cached
                 if len(cache) > self._DISPOSITION_CACHE_LIMIT:
                     cache.popitem(last=False)
-                return cached.get(scope, {})
-            return dispositions.get(scope, {})
+                if scope in cached:
+                    return cached[scope]
+                return {}
+            if scope in dispositions:
+                return dispositions[scope]
+            return {}
 
     @staticmethod
     def _read_run_dispositions(
@@ -97,7 +103,10 @@ class VirtualReplaySinkEffect:
                 continue
             if effect.state is not SinkEffectState.FINALIZED:
                 raise AuditIntegrityError("replay source run contains a non-finalized sink effect")
-            dispositions = dispositions_by_scope.setdefault((effect.sink_node_id, effect.role), {})
+            scope = (effect.sink_node_id, effect.role)
+            if scope not in dispositions_by_scope:
+                dispositions_by_scope[scope] = {}
+            dispositions = dispositions_by_scope[scope]
             attribution: dict[int, tuple[str, str]] = {}
 
             def merge_attribution(evidence: Mapping[str, object], attribution: dict[int, tuple[str, str]]) -> None:
