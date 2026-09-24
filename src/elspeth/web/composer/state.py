@@ -8898,14 +8898,26 @@ class CompositionState:
         _plugins_requiring_config: dict[str, tuple[str, str]] = {
             "value_transform": ("operations", "no operations defined — nothing will be computed"),
             "type_coerce": ("conversions", "no conversions defined — no types will be changed"),
-            "llm": ("prompt_template", "no prompt_template defined — nothing will be sent to the model"),
             "field_mapper": ("mapping", "no mapping defined — no fields will be renamed"),
             "truncate": ("fields", "no fields specified — nothing will be truncated"),
-            "keyword_filter": ("keywords", "no keywords defined — all rows will pass through"),
+            "keyword_filter": ("blocked_patterns", "no blocked_patterns defined — configure the patterns to block"),
             "web_scrape": ("url_field", "no url_field specified — cannot determine which field contains URLs"),
-            "json_explode": ("field", "no field specified — cannot determine which field to explode"),
+            "json_explode": ("array_field", "no array_field specified — cannot determine which field to explode"),
         }
         for node in self.nodes:
+            # LLM queries may each supply their own template; a top-level
+            # fallback is not required in that case. The plugin config parser
+            # validates individual queries and their effective templates.
+            if node.plugin == "llm" and not any(
+                key in node.options and node.options[key] not in ([], (), {}, None, "") for key in ("prompt_template", "queries")
+            ):
+                warnings.append(
+                    _warn(
+                        f"node:{node.id}",
+                        f"Transform '{node.id}' (llm) appears incomplete: no prompt_template or queries defined.",
+                        "medium",
+                    )
+                )
             if node.plugin in _plugins_requiring_config:
                 required_key, reason = _plugins_requiring_config[node.plugin]
                 if not node.options or required_key not in node.options:
