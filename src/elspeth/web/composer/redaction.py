@@ -3308,6 +3308,15 @@ class _RequestInterpretationReviewSuppressedDataModel(BaseModel):
     model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
 
 
+class _RequestInterpretationReviewBlockedDataModel(BaseModel):
+    """Closed server-authored refusal; detailed findings stay value-redacted."""
+
+    kind_: Literal["interpretation_review_blocked"] = Field(alias="_kind")
+    message: str
+
+    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+
 class _RequestInterpretationReviewResponseModel(BaseModel):
     """Redaction-bearing ``ToolResult`` envelope for interpretation reviews."""
 
@@ -3319,7 +3328,9 @@ class _RequestInterpretationReviewResponseModel(BaseModel):
         _RequestInterpretationReviewPendingDataModel
         | _RequestInterpretationReviewPendingTextDataModel
         | _RequestInterpretationReviewSuppressedDataModel
+        | _RequestInterpretationReviewBlockedDataModel
     )
+    runtime_preflight: _SafeResponseEnvelope = None
 
     model_config = ConfigDict(extra="forbid")
 

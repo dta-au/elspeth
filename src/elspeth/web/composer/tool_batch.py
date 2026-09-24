@@ -155,6 +155,7 @@ from elspeth.web.composer.tools._registry import resolve_tool_effects, response_
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
@@ -2218,6 +2219,7 @@ async def run_tool_batch(
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
             try:
+                review_preflight = await _pending_review_runtime_findings(state, ctx)
                 session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
                     tool_name=tool_name,
                     tool_call_id=tool_call.id,
@@ -2232,6 +2234,7 @@ async def run_tool_batch(
                     llm_messages=llm_messages,
                     anti_anchor=anti_anchor,
                     policy_catalog=ctx.policy_catalog,
+                    review_preflight=review_preflight,
                 )
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Same narrow-class discipline as the sync execute_tool
@@ -2492,6 +2495,15 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
+            if (
+                is_mutation_tool(_tool_name)
+                and dispatched_result.success
+                and dispatched_result.updated_state.version > _state.version
+                and dispatched_result.validation.is_valid
+            ):
+                findings = await _pending_review_runtime_findings(dispatched_result.updated_state, ctx)
+                if findings is not None:
+                    dispatched_result = replace(dispatched_result, runtime_preflight=findings)
             if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
                 return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
@@ -2623,6 +2635,16 @@ async def run_tool_batch(
             # ``type(exc).__name__`` — no poisoned memory work.
             # Closes blocker B2 from the panel review (2026-05-04).
             raise
+        except ComposerRuntimePreflightError as preflight_exc:
+            # A successful mutation may precede its structural preflight.
+            # Preserve that new state instead of recapturing the old loop state.
+            raise ComposerRuntimePreflightError(
+                original_exc=preflight_exc.original_exc,
+                partial_state=preflight_exc.partial_state,
+                tool_invocations=recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=preflight_exc.failed_turn,
+            ) from preflight_exc.original_exc
         except AuditIntegrityError:
             # Tier-1 audit invariant. Do not let the plugin-bug
             # catch-all below launder it into ComposerPluginCrashError.
@@ -2800,6 +2822,31 @@ async def run_tool_batch(
         pre_state_id=pre_state_id,
     )
     return dispatch, advisor_calls_used
+
+
+async def _pending_review_runtime_findings(state: CompositionState, ctx: ToolBatchContext) -> ValidationResult | None:
+    """Check a wired pending-review draft before feedback or card creation.
+
+    Stage 1 does not build the graph, and strict preflight stops at pending
+    reviews. Only publish failures from the masked pass: its green verdict
+    does not authorize execution while the real reviews remain unresolved.
+    """
+    if not state.sources or not state.outputs or not interpretation_sites(state):
+        return None
+    result = await ctx.service._cached_runtime_preflight(
+        state,
+        user_id=ctx.user_id,
+        session_id=ctx.session_id,
+        cache=ctx.runtime_preflight_cache,
+        initial_version=ctx.initial_version,
+        session_scope=ctx.session_scope,
+        llm_calls=ctx.recorder.llm_calls,
+        plugin_snapshot=ctx.plugin_snapshot,
+        session_operation_context=ctx.session_operation_context,
+        interpretation_tolerant=True,
+        deadline=ctx.deadline,
+    )
+    return None if result.is_valid else result
 
 
 _MIN_USEFUL_ADVISOR_SECONDS: Final[float] = 5.0

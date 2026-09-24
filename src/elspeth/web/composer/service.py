@@ -5848,19 +5848,7 @@ class ComposerServiceImpl:
             # The branch is intentionally narrower than "any review tool
             # succeeded": a review followed by another tool call or a mixed
             # success/error batch is not a terminal user-action boundary.
-            # Surfacing runs BEFORE the repair gate below: it creates the
-            # backend-obligation events (model-choice, auto-staged prompt
-            # template, ...) the downstream orphan gate assumes exist, it is
-            # idempotent, and events match sites by (node, term, kind) — so a
-            # repair turn after it composes fine.
-            if session_operation_context is None:
-                raise RuntimeError("pending interpretation surfacing requires the compose operation context")
-            await self.surface_pending_interpretation_reviews(
-                state,
-                session_id=session_id,
-                current_state_id=persist.current_state_id,
-                session_operation_context=session_operation_context,
-            )
+            # Verify the graph before creating any further review cards.
             runtime_result: ValidationResult | None = last_runtime_preflight
             if state.version > initial_version:
                 runtime_result = await self._cached_runtime_preflight(
@@ -5919,7 +5907,31 @@ class ComposerServiceImpl:
                     repair_turns_delta=1,
                 )
 
+            if state.sources and state.outputs and runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
+                findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                    deadline=deadline,
+                )
+                if findings is not None:
+                    runtime_result = findings
+
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
+                if session_operation_context is None:
+                    raise RuntimeError("pending interpretation surfacing requires the compose operation context")
+                await self.surface_pending_interpretation_reviews(
+                    state,
+                    session_id=session_id,
+                    current_state_id=persist.current_state_id,
+                    session_operation_context=session_operation_context,
+                )
                 reply: _AdmittedAssistantMessage | None = None
                 remaining = deadline - asyncio.get_event_loop().time()
                 # A reply with no advertised tools cannot carry protocol tool
@@ -5977,6 +5989,7 @@ class ComposerServiceImpl:
                     mutation_success_seen=mutation_success_seen,
                     repair_turns_used=repair_turns_used,
                     plugin_snapshot=plugin_snapshot,
+                    deadline=deadline,
                 )
                 # ``_surface_and_finalize_no_tools`` now owns the announcement
                 # (with its outstanding-findings qualification) for the
@@ -6165,6 +6178,7 @@ class ComposerServiceImpl:
                         mutation_success_seen=mutation_success_seen,
                         repair_turns_used=repair_turns_used,
                         plugin_snapshot=plugin_snapshot,
+                        deadline=deadline,
                     )
                     result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
                     threaded = replace(
@@ -6517,6 +6531,7 @@ class ComposerServiceImpl:
             mutation_success_seen=mutation_success_seen,
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
         )
         result = _with_advisor_gate_decision(result, completion_gates, advisor_gate.advisor_gate_decision)
         # Thread repair_turns_used through to the result so the route handler can
@@ -6544,6 +6559,7 @@ class ComposerServiceImpl:
         assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
+        runtime_findings: ValidationResult | None = None,
     ) -> ComposerResult | None:
         """Auto-surface backend-derived reviews + run the UNFILTERED orphan gate.
 
@@ -6571,6 +6587,17 @@ class ComposerServiceImpl:
         unfiltered gate keeps it fail-closed. Likewise a genuine bare-token
         vague-term orphan (non-PT) is left fail-closed by the gate.
         """
+
+        if runtime_findings is not None:
+            content = assistant_message.content or ""
+            return ComposerResult(
+                message=_no_tool_policy.compose_preflight_failure_message(content, runtime_result=runtime_findings),
+                state=state,
+                runtime_preflight=runtime_findings,
+                raw_assistant_content=content,
+                tool_invocations=recorder.invocations,
+                llm_calls=recorder.llm_calls,
+            )
 
         # Backend-derived surfacing (elspeth-e51216d305 Case B): surface every
         # review whose writer-boundary precondition holds against the FINAL
@@ -6669,6 +6696,7 @@ class ComposerServiceImpl:
         repair_turns_used: int,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        deadline: float | None = None,
     ) -> ComposerResult:
         """Auto-surface backend-derived reviews, gate orphans, and finalize.
 
@@ -6685,6 +6713,20 @@ class ComposerServiceImpl:
         and in the comments around ``_missing_pending_interpretation_review_sites``.
         """
 
+        runtime_findings = None
+        if state.sources and state.outputs and interpretation_sites(state):
+            runtime_findings = await self._pending_handoff_outstanding_findings(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+                session_operation_context=session_operation_context,
+                deadline=deadline,
+            )
         orphan_result = await self._surface_pt_and_gate_orphans_or_none(
             state=state,
             session_operation_context=session_operation_context,
@@ -6693,6 +6735,7 @@ class ComposerServiceImpl:
             assistant_message=assistant_message,
             recorder=recorder,
             progress=progress,
+            runtime_findings=runtime_findings,
         )
         if orphan_result is not None:
             return orphan_result
@@ -6951,15 +6994,37 @@ class ComposerServiceImpl:
             is_last_pass or not allow_repair_continue or stalled_repair or verdict.repair_unactionable
         )
         if terminal_block:
-            orphan_result = await self._surface_pt_and_gate_orphans_or_none(
-                state=state,
-                session_operation_context=session_operation_context,
-                session_id=session_id,
-                current_state_id=current_state_id,
-                assistant_message=assistant_message,
-                recorder=recorder,
-                progress=progress,
-            )
+            runtime_findings = None
+            if state.sources and state.outputs and interpretation_sites(state):
+                if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0:
+                    raise _AdvisorCheckpointComposeDeadlineExpired
+                runtime_findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                    deadline=deadline,
+                )
+            orphan_result = None
+            if runtime_findings is not None:
+                # Keep the fresh advisor verdict and its publication below;
+                # graph repair takes precedence over surfacing new cards.
+                runtime_preflight = runtime_findings
+            else:
+                orphan_result = await self._surface_pt_and_gate_orphans_or_none(
+                    state=state,
+                    session_operation_context=session_operation_context,
+                    session_id=session_id,
+                    current_state_id=current_state_id,
+                    assistant_message=assistant_message,
+                    recorder=recorder,
+                    progress=progress,
+                )
             if orphan_result is not None:
                 orphan_result = _with_advisor_gate_decision(orphan_result, completion_gates, None)
                 return _TerminalNoToolAdvisorGateOutcome(
@@ -7965,6 +8030,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         anti_anchor: AntiAnchorTracker,
         policy_catalog: PolicyCatalogView,
+        review_preflight: ValidationResult | None = None,
     ) -> _SessionAwareDispatchOutcome:
         """Dispatch a session-aware async composer tool.
 
@@ -8082,7 +8148,20 @@ class ComposerServiceImpl:
             # Hold the arguments to the tool's closed-root flat schema S before
             # the handler's pydantic model, like every execute_tool dispatch.
             require_schema_valid_arguments(tool_name, arguments)
-            result = await handler(**kwargs)
+            if review_preflight is not None:
+                result = ToolResult(
+                    success=False,
+                    updated_state=state,
+                    validation=policy_catalog.validate_composition_state(state).validation,
+                    affected_nodes=(),
+                    runtime_preflight=review_preflight,
+                    data={
+                        "_kind": "interpretation_review_blocked",
+                        "message": "Repair the runtime validation errors before requesting interpretation review cards.",
+                    },
+                )
+            else:
+                result = await handler(**kwargs)
         except ToolArgumentError as exc:
             # Two sub-paths: rate-cap (write F-6 row + emit F-15 telemetry
             # BEFORE raising the LLM-facing ARG_ERROR) vs. generic
