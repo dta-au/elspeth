@@ -2084,6 +2084,18 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # ``_REVIEWED_ALLOWLIST`` above.
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
+    ReviewedWriter(
+        path="tests/integration/web/composer/guided/test_respond.py",
+        enclosing_symbol="TestStep2IntraStep.test_component_back_edit_rejects_proposal_base_bound_to_older_head_atomically",
+        table="composition_states",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "Historical missing-rebase fixture: copy one state to a newer version while retaining the proposal's older base. "
+            "Ordinary saves now rebase that anchor atomically, so the direct insert is required to prove back-edit rejects "
+            "the stale base without changing states, messages, proposal events, or operation settlement."
+        ),
+        count=1,
+    ),
     # Identity workflow tests seed versioned composition states directly so
     # approvals, reviews, permits, and scoped reads exercise real FK parents.
     ReviewedWriter(
