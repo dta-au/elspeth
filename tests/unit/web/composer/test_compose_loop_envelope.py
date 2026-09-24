@@ -123,6 +123,13 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # whether prompt caching is wired.
 ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_000
 
+# The rootless recovery introduced on 2026-09-25 makes one additional provider
+# call when prose claims a build without any tool invocation. Keep the original
+# per-call allowance and allow exactly two such payloads cumulatively. The
+# measured two-call script emits about 434 KB; this does not raise the turn or
+# token caps, or permit an individual request to grow beyond the prior limit.
+ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY = 2 * ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT
+
 
 def _serialize_call(messages: Any, tools: Any) -> int:
     """Return the JSON byte size of the messages+tools sent to a fake _call_llm."""
@@ -193,15 +200,19 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
     service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
-    responses = [_build_scripted_response(turn) for turn in script]
+    responses = iter(_build_scripted_response(turn) for turn in script)
+    sizes: list[int] = []
+
+    async def complete(**kwargs: Any) -> _ScriptedResponse:
+        # Capture at dispatch: the append-only loop mutates the message list
+        # after each call, so inspecting call_args_list later overcounts bytes.
+        sizes.append(_serialize_call(kwargs["messages"], kwargs["tools"]))
+        return next(responses)
 
     with patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm:
-        mock_llm.side_effect = responses
+        mock_llm.side_effect = complete
         result = await service.compose(user_message, [], state, session_id=session_id)
 
-    sizes: list[int] = []
-    for invocation in mock_llm.call_args_list:
-        sizes.append(_serialize_call(invocation.kwargs["messages"], invocation.kwargs["tools"]))
     return _EnvelopeRun(result=result, per_turn_byte_sizes=tuple(sizes))
 
 
@@ -210,23 +221,29 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
 # ---------------------------------------------------------------------------
 
 
-_HAPPY_TRIVIAL_SCRIPT: tuple[ScriptedTurn, ...] = (
-    # Turn 1: model emits a text-only reply, no tool calls — terminates.
+_ROOTLESS_TRIVIAL_SCRIPT: tuple[ScriptedTurn, ...] = (
+    # Turn 1: prose claims a build without any tool call. The empty state
+    # prompts one neutral retry; this is not a successful pipeline build.
     ScriptedTurn(
         content="Done — a CSV pipeline is ready in your workspace.",
         prompt_tokens=8_000,
         completion_tokens=40,
     ),
+    ScriptedTurn(
+        content="I still need your input file before I can build the pipeline.",
+        prompt_tokens=8_000,
+        completion_tokens=40,
+    ),
 )
 
-# Module-load coupling guard: if a future edit grows ``_HAPPY_TRIVIAL_SCRIPT``
+# Module-load coupling guard: if a future edit grows ``_ROOTLESS_TRIVIAL_SCRIPT``
 # beyond the asserted turn ceiling, the test would fail because the SCRIPT
 # is too long, not because a regression was detected — a false positive that
 # erodes trust in the gate. Fail fast at import time so the misalignment is
 # obvious. Bumping the ceiling and the script in lockstep is intentional and
 # requires touching this guard explicitly.
-assert len(_HAPPY_TRIVIAL_SCRIPT) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
-    f"_HAPPY_TRIVIAL_SCRIPT has {len(_HAPPY_TRIVIAL_SCRIPT)} turns but the "
+assert len(_ROOTLESS_TRIVIAL_SCRIPT) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
+    f"_ROOTLESS_TRIVIAL_SCRIPT has {len(_ROOTLESS_TRIVIAL_SCRIPT)} turns but the "
     f"asserted ceiling is {ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT}. The script "
     "cannot exceed the ceiling — otherwise the harness fails for the wrong "
     "reason. Either shrink the script or bump ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT "
@@ -267,8 +284,11 @@ class TestEnvelopeHarness:
     """Regression gate for unbounded compose-loop growth (elspeth-4e79436719)."""
 
     @pytest.mark.asyncio
-    async def test_happy_trivial_prompt_under_turn_ceiling(self) -> None:
-        run = await _run_envelope(_HAPPY_TRIVIAL_SCRIPT)
+    async def test_rootless_trivial_prompt_under_turn_ceiling(self) -> None:
+        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
+        assert run.result.repair_turns_used == 1
+        assert not run.result.state.sources
+        assert "[ELSPETH-SYSTEM]" in run.result.message
         assert len(run.result.llm_calls) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
             f"Trivial first-turn creation exceeded the named turn ceiling "
             f"({ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT}); a regression has lifted the "
@@ -276,7 +296,7 @@ class TestEnvelopeHarness:
         )
 
     @pytest.mark.asyncio
-    async def test_happy_trivial_prompt_under_production_byte_envelope(self) -> None:
+    async def test_rootless_trivial_prompt_under_production_byte_envelope(self) -> None:
         """Real production prompt-size assertion.
 
         Captures the JSON byte size of the messages + tools that
@@ -287,26 +307,27 @@ class TestEnvelopeHarness:
         transcript growth or ships a system prompt that has become
         dramatically larger.
         """
-        run = await _run_envelope(_HAPPY_TRIVIAL_SCRIPT)
+        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
         total_bytes = sum(run.per_turn_byte_sizes)
-        assert total_bytes <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT, (
+        assert all(size <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT for size in run.per_turn_byte_sizes)
+        assert total_bytes <= ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY, (
             f"Trivial first-turn creation emitted {total_bytes} bytes of "
             f"messages+tools across {len(run.per_turn_byte_sizes)} turns "
             f"({run.per_turn_byte_sizes}); exceeded named envelope "
-            f"({ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT}). The compose loop "
+            f"({ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY}). The compose loop "
             "is re-emitting bytes it should not, or the static prefix grew "
             "without compensating compaction."
         )
 
     @pytest.mark.asyncio
-    async def test_happy_trivial_prompt_under_reported_token_envelope(self) -> None:
+    async def test_rootless_trivial_prompt_under_reported_token_envelope(self) -> None:
         """Secondary gate: audit-row prompt_tokens stay under the named envelope.
 
         These are the values the script reported, not production token
-        counts. Pair with ``test_happy_trivial_prompt_under_production_byte_envelope``
+        counts. Pair with ``test_rootless_trivial_prompt_under_production_byte_envelope``
         for actual production-shape coverage.
         """
-        run = await _run_envelope(_HAPPY_TRIVIAL_SCRIPT)
+        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
         total = sum((c.prompt_tokens or 0) for c in run.result.llm_calls)
         assert total <= ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT, (
             f"Trivial first-turn creation script reported {total} prompt tokens, "
@@ -320,9 +341,9 @@ class TestEnvelopeHarness:
 
         Synthetic finalize-only or duplicate records fail this assertion.
         """
-        run = await _run_envelope(_HAPPY_TRIVIAL_SCRIPT)
-        assert len(run.result.llm_calls) == len(_HAPPY_TRIVIAL_SCRIPT)
-        for fake_turn, recorded in zip(_HAPPY_TRIVIAL_SCRIPT, run.result.llm_calls, strict=True):
+        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
+        assert len(run.result.llm_calls) == len(_ROOTLESS_TRIVIAL_SCRIPT)
+        for fake_turn, recorded in zip(_ROOTLESS_TRIVIAL_SCRIPT, run.result.llm_calls, strict=True):
             assert recorded.prompt_tokens == fake_turn.prompt_tokens
             assert recorded.completion_tokens == fake_turn.completion_tokens
 

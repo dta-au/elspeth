@@ -3909,17 +3909,21 @@ async def test_preflight_repair_gate_passes_verified_handoff_to_end_gate(make_se
 
 
 @pytest.mark.asyncio
-async def test_end_gate_blocked_handoff_names_outstanding_findings(make_service, clean_runnable_state):
-    """elspeth-ac85b0ab0e: the blocked END-gate terminal must not imply review-only.
+async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstanding_findings(make_service, clean_runnable_state):
+    """A masked graph failure prevents a review-only handoff even without repair budget.
 
     Battery round 7 g03's terminal was exactly this shape: the bare
     pending-handoff notice ("resolve the pending review cards") over a state
     whose masked re-validation would have named an edge-contract violation.
     With the repair budget exhausted the gate cannot repair, so the terminal
-    envelope must NAME the outstanding validator objection — as trusted
-    chrome around an untrusted Cause segment, mirroring the preflight
-    wrapper.
+    envelope must name the outstanding validator objection, preserve the
+    advisor block, and withhold review-card publication.
     """
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
+        _PREFLIGHT_NOTICE_HEADER,
+    )
+
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(
@@ -3937,23 +3941,26 @@ async def test_end_gate_blocked_handoff_names_outstanding_findings(make_service,
 
     assert outcome.action == "return"
     preflight = outcome.result.runtime_preflight
-    # The resolvable-card shape is still preserved whole (elspeth-66717f0c99).
-    assert is_pending_interpretation_handoff(preflight)
-    assert preflight.readiness.authoring_valid is True
-    assert preflight.readiness.completion_ready is True
-    # ... but the terminal message no longer implies the review is the only
-    # remaining step: the validator's objection is named alongside it.
-    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE in outcome.result.message
+    assert not is_pending_interpretation_handoff(preflight)
+    assert preflight.readiness.authoring_valid is False
+    assert preflight.readiness.execution_ready is False
+    assert preflight.readiness.completion_ready is False
+    assert preflight.errors[0].error_code == "advisor_signoff_blocked"
+    assert _ADVISOR_UNAVAILABLE_USER_DETAIL in preflight.errors[0].message
+    assert service._run_advisor_checkpoint.await_count == 2
+    service._surface_pt_and_gate_orphans_or_none.assert_not_awaited()
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE not in outcome.result.message
     assert "Edge contract violation" in outcome.result.message
-    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER in outcome.result.message
+    assert outcome.result.advisor_terminal_publication.preflight_shape == "red"
     segments = visible_message_segments(
         content=outcome.result.message,
         raw_content=outcome.result.raw_assistant_content,
     )
-    # The model's reply leads (ruling 2026-09-22), then the handoff notice.
+    # Only fixed backend chrome is trusted. The actual validator detail is
+    # preserved as diagnostic text rather than replaced by advisor wording.
     assert segments[0] == AssistantTextSegment(_AssistantMessage.content)
-    assert segments[1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE)
-    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER)
+    assert segments[1] == TrustedSystemNoticeSegment(_PREFLIGHT_NOTICE_HEADER)
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER)
     assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
 
 
@@ -4802,6 +4809,10 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
         errors=[],
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
+    # This test isolates publication over a verified graph. The fixture's
+    # intentionally skeletal LLM options are not a runtime-valid pipeline;
+    # model the masked validation required before review-card publication.
+    service._pending_handoff_outstanding_findings = _AsyncRecorder(return_value=None)
 
     outcome = await service._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
@@ -4829,6 +4840,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
 
     assert outcome.action == "return"
     assert outcome.result.raw_assistant_content == _AssistantMessage.content
+    assert service._pending_handoff_outstanding_findings.await_count == 1
     # Two fenced audit rows, disclosure first, then the ``terminal_block``
     # publication record (audit primacy: the row lands before the publication
     # event mirrors it). No withheld-reply row: nothing was withheld.

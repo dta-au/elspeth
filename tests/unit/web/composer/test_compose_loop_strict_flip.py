@@ -126,15 +126,19 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=_text()) as completion:
         result = await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
 
-    sent = completion.call_args.kwargs["tools"]
-    assert len(sent) == 42
-    if dialect is _STRICT:
-        assert _strict_flags(sent).count(True) == 32
-        assert _strict_flags(sent).count(False) == 10
-    else:
-        assert set(_strict_flags(sent)) == {"omitted"}
-    [call] = result.llm_calls
-    assert (call.tool_contract_dialect, call.strict_tool_count) == (dialect, strict_count)
+    # The rootless build request receives one neutral retry; the resolved
+    # dialect must remain consistent on the original call and the repair.
+    assert completion.call_count == len(result.llm_calls) == 2
+    assert result.repair_turns_used == 1
+    for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
+        sent = request.kwargs["tools"]
+        assert len(sent) == 42
+        if dialect is _STRICT:
+            assert _strict_flags(sent).count(True) == 32
+            assert _strict_flags(sent).count(False) == 10
+        else:
+            assert set(_strict_flags(sent)) == {"omitted"}
+        assert (call.tool_contract_dialect, call.strict_tool_count) == (dialect, strict_count)
 
 
 # ---------------------------------------------------------------- no provider call added (composer invariant)

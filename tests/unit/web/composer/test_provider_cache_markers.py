@@ -20,6 +20,7 @@ not a downstream integration miss.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -327,13 +328,13 @@ class TestCacheMarkersWiredAtCallSite:
         # Bypass availability check (no real Anthropic API key needed).
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
-        captured: dict[str, Any] = {}
+        captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="Done.")
         anthropic_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
-            captured.update(kwargs)
+            captured.append(deepcopy(kwargs))
             return anthropic_response
 
         with patch(
@@ -342,41 +343,42 @@ class TestCacheMarkersWiredAtCallSite:
         ):
             result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
-        # The stable system prompt MUST carry cache_control after the transform.
-        sent_messages = captured["messages"]
-        system_messages = [m for m in sent_messages if m.get("role") == "system"]
-        assert len(system_messages) == 1
-        stable_system_msg = system_messages[0]
-        catalog_context_msg = sent_messages[1]
-        state_context_msg = sent_messages[-2]
-        assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
-        assert "Current pipeline state" not in stable_system_msg["content"]
-        # Cache-layout contract (elspeth-a79f1b2e6b): the deployment-constant
-        # catalog message is breakpointed; the session-varying state message
-        # rides after history, unmarked; the last message carries the sliding
-        # tail marker for the append-only tool loop.
-        assert catalog_context_msg["role"] == "user"
-        assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
-        assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
-        assert state_context_msg["role"] == "user"
-        assert state_context_msg["content"].startswith("Current pipeline state and session progress")
-        assert "UNTRUSTED DATA" in state_context_msg["content"]
-        assert "cache_control" not in state_context_msg
-        assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
+        assert len(captured) == len(result.llm_calls) == 2
+        assert result.repair_turns_used == 1
+        for request, call in zip(captured, result.llm_calls, strict=True):
+            # Cache markers must survive the neutral rootless retry as well
+            # as the initial call. The state stays in its original position;
+            # the sliding tail advances past the prior assistant response.
+            sent_messages = request["messages"]
+            system_messages = [m for m in sent_messages if m.get("role") == "system"]
+            assert len(system_messages) == 1
+            stable_system_msg = system_messages[0]
+            catalog_context_msg = sent_messages[1]
+            state_context_msg = sent_messages[2]
+            assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
+            assert "Current pipeline state" not in stable_system_msg["content"]
+            assert catalog_context_msg["role"] == "user"
+            assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
+            assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
+            assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
+            assert state_context_msg["role"] == "user"
+            assert state_context_msg["content"].startswith("Current pipeline state and session progress")
+            assert "UNTRUSTED DATA" in state_context_msg["content"]
+            assert "cache_control" not in state_context_msg
+            assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
+            assert all("cache_control" not in message for message in sent_messages[2:-1])
 
-        # The trailing tool MUST carry cache_control after the transform.
-        sent_tools = captured["tools"]
-        assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
-        # Other tools are NOT marked (Anthropic caches up to and including the marker).
-        for non_trailing in sent_tools[:-1]:
-            assert "cache_control" not in non_trailing
+            sent_tools = request["tools"]
+            assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
+            for non_trailing in sent_tools[:-1]:
+                assert "cache_control" not in non_trailing
 
-        transmitted_names = tuple(tool["function"]["name"] for tool in sent_tools)
-        call = result.llm_calls[0]
-        assert "splice_transform" in transmitted_names
-        assert call.declared_tool_names == transmitted_names
-        assert call.tools_spec_hash == stable_hash(sent_tools)
+            transmitted_names = tuple(tool["function"]["name"] for tool in sent_tools)
+            assert "splice_transform" in transmitted_names
+            assert call.declared_tool_names == transmitted_names
+            assert call.tools_spec_hash == stable_hash(sent_tools)
+            assert call.messages_hash == stable_hash(sent_messages)
+        assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2
 
     @pytest.mark.asyncio
     async def test_openai_model_does_not_emit_cache_control(self) -> None:
@@ -412,32 +414,36 @@ class TestCacheMarkersWiredAtCallSite:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
-        captured: dict[str, Any] = {}
+        captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="Done.")
         oai_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
-            captured.update(kwargs)
+            captured.append(deepcopy(kwargs))
             return oai_response
 
         with patch(
             "litellm.acompletion",
             new=fake_acompletion,
         ):
-            await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
+            result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
-        sent_messages = captured["messages"]
-        system_messages = [m for m in sent_messages if m.get("role") == "system"]
-        assert len(system_messages) == 1
-        for message in sent_messages:
-            assert "cache_control" not in message
-        assert sent_messages[1]["role"] == "user"
-        assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
-        assert sent_messages[-2]["content"].startswith("Current pipeline state and session progress")
-        assert "cache_control" not in sent_messages[1]
+        assert len(captured) == len(result.llm_calls) == 2
+        assert result.repair_turns_used == 1
+        for request, call in zip(captured, result.llm_calls, strict=True):
+            sent_messages = request["messages"]
+            system_messages = [m for m in sent_messages if m.get("role") == "system"]
+            assert len(system_messages) == 1
+            for message in sent_messages:
+                assert "cache_control" not in message
+            assert sent_messages[1]["role"] == "user"
+            assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
+            assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
+            assert sent_messages[2]["content"].startswith("Current pipeline state and session progress")
 
-        sent_tools = captured["tools"]
-        for tool in sent_tools:
-            assert "cache_control" not in tool
+            sent_tools = request["tools"]
+            for tool in sent_tools:
+                assert "cache_control" not in tool
+            assert call.messages_hash == stable_hash(sent_messages)
+        assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2
