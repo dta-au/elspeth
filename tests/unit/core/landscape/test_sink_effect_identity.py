@@ -23,6 +23,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
     _create_restricted_audit_export_snapshot_reader,
 )
+from elspeth.core.landscape.execution import sink_effect_identity
 from elspeth.core.landscape.execution.sink_effect_identity import (
     MAX_LINEAGE_DEPTH,
     MAX_LINEAGE_EVIDENCE_BYTES,
@@ -85,6 +86,28 @@ class _LineageSource:
         return self.rows.get(row_id)
 
 
+class _CountingLineageSource(_LineageSource):
+    def __init__(self, *, tokens: tuple[_Token, ...], rows: tuple[_Row, ...], parents: tuple[_Parent, ...]) -> None:
+        super().__init__(tokens=tokens, rows=rows, parents=parents)
+        self.reads = {"token": 0, "parents": 0, "tokens_by_ids": 0, "row": 0}
+
+    def get_token(self, token_id: str) -> _Token | None:
+        self.reads["token"] += 1
+        return super().get_token(token_id)
+
+    def get_tokens_by_ids(self, token_ids: tuple[str, ...]) -> list[_Token]:
+        self.reads["tokens_by_ids"] += 1
+        return super().get_tokens_by_ids(token_ids)
+
+    def get_token_parents(self, token_id: str) -> list[_Parent]:
+        self.reads["parents"] += 1
+        return super().get_token_parents(token_id)
+
+    def get_row(self, row_id: str) -> _Row | None:
+        self.reads["row"] += 1
+        return super().get_row(row_id)
+
+
 def _candidate(token_id: str, value: int = 1) -> SinkEffectMemberCandidate:
     return SinkEffectMemberCandidate(token_id=token_id, row={"value": value})
 
@@ -122,6 +145,48 @@ def test_member_order_uses_ingest_then_recursive_parent_ordinals() -> None:
     assert ordered[0].lineage_json == "[[0,[]]]"
     assert ordered[1].lineage_json == "[[0,[[0,[]]]],[1,[[1,[]]]]]"
     assert ordered[2].lineage_json == "[[1,[]]]"
+
+
+@pytest.mark.parametrize("sibling_count", [100, 500])
+def test_shared_ancestor_reads_scale_with_unique_tokens(sibling_count: int) -> None:
+    depth = 16
+    tokens = tuple(_Token(f"chain-{i}", "row-0", "run-1") for i in range(depth)) + tuple(
+        _Token(f"member-{i}", "row-0", "run-1") for i in range(sibling_count)
+    )
+    parents = tuple(_Parent(f"chain-{i}", f"chain-{i - 1}", 0) for i in range(1, depth)) + tuple(
+        _Parent(f"member-{i}", f"chain-{depth - 1}", i) for i in range(sibling_count)
+    )
+    source = _CountingLineageSource(tokens=tokens, rows=(_Row("row-0", "run-1", 0),), parents=parents)
+    members = resolve_sink_effect_members(source, (_candidate(f"member-{i}") for i in range(sibling_count)))
+
+    assert len(members) == sibling_count
+    assert [member.token_id for member in members] == [f"member-{i}" for i in range(sibling_count)]
+    assert source.reads["parents"] <= sibling_count + depth
+    assert source.reads["tokens_by_ids"] <= sibling_count + depth
+    assert source.reads["row"] == 1
+
+
+def test_shared_read_cache_does_not_waive_per_member_node_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _CountingLineageSource(
+        tokens=tuple(_Token(f"t{i}", "row-0", "run-1") for i in range(5)),
+        rows=(_Row("row-0", "run-1", 0),),
+        parents=tuple(_Parent(f"t{i}", f"t{i - 1}", 0) for i in range(1, 5)),
+    )
+    monkeypatch.setattr(sink_effect_identity, "MAX_LINEAGE_NODES_PER_MEMBER", 4)
+    assert len(resolve_sink_effect_members(source, (_candidate("t3"),))) == 1
+    with pytest.raises(AuditIntegrityError, match="node count"):
+        resolve_sink_effect_members(source, (_candidate("t3"), _candidate("t4")))
+
+
+def test_shared_read_cache_does_not_waive_later_member_cycle() -> None:
+    source = _CountingLineageSource(
+        tokens=tuple(_Token(token_id, "row-0", "run-1") for token_id in ("root", "shared", "bad")),
+        rows=(_Row("row-0", "run-1", 0),),
+        parents=(_Parent("shared", "root", 0), _Parent("bad", "shared", 0), _Parent("bad", "bad", 1)),
+    )
+    assert len(resolve_sink_effect_members(source, (_candidate("shared"),))) == 1
+    with pytest.raises(AuditIntegrityError, match="cycle"):
+        resolve_sink_effect_members(source, (_candidate("shared"), _candidate("bad")))
 
 
 @pytest.mark.parametrize(
