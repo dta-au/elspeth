@@ -39,11 +39,27 @@ on_start"). A second smell, not this one.
 
 What it does NOT see (honest false-negative classes)
 ----------------------------------------------------
-Implicit raises (``float(x)``, ``x < 1`` on a str, ``row[missing]``); raises
-inside nested functions and lambdas (a new scope); helpers in another module;
-a ``TypeError`` subclass raised under its own name; and a bare ``raise`` that
-re-raises a caught ``TypeError`` from inside a handler. The gate stops the
-explicit convention from spreading; it does not prove a plugin never aborts.
+The scan is per module and per class. It does not prove that no ``TypeError``
+can escape ``process``; it stops the explicit convention from spreading
+through the shapes the twelve original sites used. It is blind to:
+
+* a class whose ``process`` is inherited from a base in ANOTHER module: the
+  class is never rooted, so the hooks it overrides are never scanned. On
+  2026-09-24 that is 6 of the 38 registered transforms (the two Bedrock
+  guardrails, AzureAISearch, AzureContentSafety, AzurePromptShield and
+  RAGRetrieval, whose ``process`` lives in ``transforms/rag/core.py`` or
+  ``transforms/azure/base.py`` or ``transforms/aws/_guardrail_transform.py``);
+* a helper OBJECT the class composes (``self._builder.build(...)``), in the
+  same module or another. This is the shape of the RAG query builder
+  (``transforms/rag/query.py``), whose two ``raise TypeError`` sites aborted
+  runs at 74c0ce0db and were fixed separately; the gate did not see them;
+* helper functions and classes imported from another module;
+* implicit raises (``float(x)``, ``x < 1`` on a str, ``row[missing]``);
+* raises inside nested functions and lambdas (a new scope);
+* a ``TypeError`` subclass raised under its own name;
+* a ``TypeError`` bound to a name and raised later (``err = TypeError(...)``
+  then ``raise err``);
+* a bare ``raise`` that re-raises a caught ``TypeError`` from inside a handler.
 
 The escape hatch
 ----------------
@@ -61,7 +77,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -126,6 +142,13 @@ def _exception_name(expr: ast.expr) -> str | None:
     return None
 
 
+def _reraises_bound_name(exc: ast.expr, bound: str) -> bool:
+    """``raise exc`` or ``raise exc.with_traceback(...)`` for the handler's bound name."""
+    if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Attribute) and exc.func.attr == "with_traceback":
+        exc = exc.func.value
+    return isinstance(exc, ast.Name) and exc.id == bound
+
+
 def _handler_reraises(handler: ast.ExceptHandler) -> bool:
     """True when the handler body re-raises what it caught (in its own scope)."""
     pending: list[ast.AST] = list(handler.body)
@@ -136,7 +159,7 @@ def _handler_reraises(handler: ast.ExceptHandler) -> bool:
         if isinstance(node, ast.Raise):
             if node.exc is None:
                 return True
-            if handler.name is not None and isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
+            if handler.name is not None and _reraises_bound_name(node.exc, handler.name):
                 return True
         pending.extend(ast.iter_child_nodes(node))
     return False
@@ -267,15 +290,13 @@ def scan_tree(root: Path) -> tuple[list[ProcessPathRaise], int]:
     return sorted(found, key=lambda item: (item.key, item.line)), roots
 
 
-def test_no_unreviewed_type_error_on_a_plugin_process_path() -> None:
-    found, roots = scan_tree(PLUGINS_ROOT)
-
-    assert roots >= MIN_PROCESS_ROOTS, (
-        f"the scan rooted at only {roots} process methods under {PLUGINS_ROOT} "
-        f"(floor {MIN_PROCESS_ROOTS}); it has stopped seeing the plugin tree, so its empty result proves nothing"
-    )
-    unexpected = Counter(item.key for item in found) - Counter(REVIEWED_PROCESS_PATH_TYPE_ERRORS)
-    stale = Counter(REVIEWED_PROCESS_PATH_TYPE_ERRORS) - Counter(item.key for item in found)
+def assert_matches_reviewed(found: Iterable[ProcessPathRaise], reviewed: Iterable[str]) -> None:
+    """Every found key is reviewed and every reviewed key still matches a site (both as multisets)."""
+    found = list(found)
+    found_count = Counter(item.key for item in found)
+    reviewed_count = Counter(reviewed)
+    unexpected = found_count - reviewed_count
+    stale = reviewed_count - found_count
     assert not unexpected, (
         "a bare TypeError can escape a plugin's process path and abort the run:\n"
         + "\n".join(f"  src/elspeth/plugins/{item.path}:{item.line} in {item.function}" for item in found if item.key in unexpected)
@@ -286,6 +307,16 @@ def test_no_unreviewed_type_error_on_a_plugin_process_path() -> None:
         "REVIEWED_PROCESS_PATH_TYPE_ERRORS saying why."
     )
     assert not stale, f"reviewed entries no longer match a site; remove them: {sorted(stale)}"
+
+
+def test_no_unreviewed_type_error_on_a_plugin_process_path() -> None:
+    found, roots = scan_tree(PLUGINS_ROOT)
+
+    assert roots >= MIN_PROCESS_ROOTS, (
+        f"the scan rooted at only {roots} process methods under {PLUGINS_ROOT} "
+        f"(floor {MIN_PROCESS_ROOTS}); it has stopped seeing the plugin tree, so its empty result proves nothing"
+    )
+    assert_matches_reviewed(found, REVIEWED_PROCESS_PATH_TYPE_ERRORS)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +434,135 @@ class Mixed:
 """,
         {"Mixed._values"},
     ),
+    # The same property with the uncaught reference first: a visited set keyed
+    # on the function alone would mark _values seen under the guard and never
+    # revisit it on the unguarded path, whichever order the walk takes.
+    "caught_on_another_path_only_uncaught_first": (
+        """
+class Mixed:
+    def process(self, rows, ctx):
+        values = self._values(rows)
+        try:
+            self._values(rows)
+        except TypeError:
+            pass
+        return values
+
+    def _values(self, rows):
+        raise TypeError("must be numeric")
+""",
+        {"Mixed._values"},
+    ),
+    # A NEW TypeError raised inside ``except TypeError`` escapes: the handler
+    # guards its try body, not itself (the rag/query.py ``_build_regex`` shape).
+    "new_type_error_raised_inside_a_type_error_handler": (
+        """
+class Query:
+    def process(self, row, ctx):
+        return self._regex(row["q"])
+
+    def _regex(self, value):
+        try:
+            return self._pattern.search(value)
+        except TypeError as exc:
+            raise TypeError("query_field expected str") from exc
+""",
+        {"Query._regex"},
+    ),
+    "raise_in_try_else": (
+        """
+class Query:
+    def process(self, row, ctx):
+        try:
+            value = row["q"]
+        except TypeError:
+            return None
+        else:
+            if type(value) is not str:
+                raise TypeError("must be str")
+""",
+        {"Query.process"},
+    ),
+    "raise_in_try_finally": (
+        """
+class Query:
+    def process(self, row, ctx):
+        try:
+            value = row["q"]
+        except TypeError:
+            return None
+        finally:
+            if type(row["q"]) is not str:
+                raise TypeError("must be str")
+""",
+        {"Query.process"},
+    ),
+    "named_reraise_is_not_a_catch": (
+        """
+class Wrapped:
+    def process(self, rows, ctx):
+        try:
+            return self._values(rows)
+        except TypeError as exc:
+            raise exc
+
+    def _values(self, rows):
+        raise TypeError("must be numeric")
+""",
+        {"Wrapped._values"},
+    ),
+    "reraise_with_traceback_is_not_a_catch": (
+        """
+class Wrapped:
+    def process(self, rows, ctx):
+        try:
+            return self._values(rows)
+        except TypeError as exc:
+            raise exc.with_traceback(None)
+
+    def _values(self, rows):
+        raise TypeError("must be numeric")
+""",
+        {"Wrapped._values"},
+    ),
+    "qualified_builtins_type_error": (
+        """
+import builtins
+
+class Replicate:
+    def process(self, row, ctx):
+        if type(row["copies"]) is not int:
+            raise builtins.TypeError("must be int")
+""",
+        {"Replicate.process"},
+    ),
+    "subclass_override_is_the_one_reached": (
+        """
+class _Base:
+    def process(self, row, ctx):
+        return self._hook(row)
+
+    def _hook(self, row):
+        return row
+
+class Search(_Base):
+    def _hook(self, row):
+        if type(row["k"]) is not int:
+            raise TypeError("k must be int")
+        return row
+""",
+        {"Search._hook"},
+    ),
+    "nested_class_is_rooted": (
+        """
+class Outer:
+    class Inner:
+        def process(self, row, ctx):
+            if type(row["v"]) is not int:
+                raise TypeError("must be int")
+""",
+        {"Inner.process"},
+    ),
 }
 
 _CLEAN_CASES = {
@@ -481,6 +641,29 @@ class Explode:
         if row.contract.mode != "fixed":
             raise ValueError("heterogeneous contract modes")
 """,
+    "caught_by_a_bare_except": """
+class Mult:
+    def process(self, row, ctx):
+        try:
+            return self._times(row)
+        except:
+            return {"error": "invalid_input"}
+
+    def _times(self, row):
+        raise TypeError("x")
+""",
+    "overridden_base_helper_is_not_reached": """
+class _Base:
+    def _hook(self, row):
+        raise TypeError("x")
+
+class Search(_Base):
+    def process(self, row, ctx):
+        return self._hook(row)
+
+    def _hook(self, row):
+        return row
+""",
 }
 
 
@@ -505,3 +688,29 @@ def test_the_key_is_line_independent_and_one_per_site() -> None:
     assert [item.key for item in first.raises] == ["stats.py::Stats._values::TypeError"]
     assert [item.key for item in shifted.raises] == [item.key for item in first.raises]
     assert [item.line for item in shifted.raises] != [item.line for item in first.raises]
+
+
+_SITE_B = ProcessPathRaise("b.py", "B._h", 3)
+
+
+def test_a_reviewed_site_passes() -> None:
+    assert_matches_reviewed([_SITE_B], ["b.py::B._h::TypeError"])
+
+
+def test_an_unreviewed_site_fails() -> None:
+    with pytest.raises(AssertionError, match=r"can escape a plugin's process path(?s:.*)b\.py:3 in B\._h"):
+        assert_matches_reviewed([_SITE_B], [])
+
+
+def test_a_reviewed_entry_with_no_matching_site_is_reported_stale() -> None:
+    with pytest.raises(AssertionError, match=r"no longer match a site; remove them: \['a\.py::A\.process::TypeError'\]"):
+        assert_matches_reviewed([_SITE_B], ["b.py::B._h::TypeError", "a.py::A.process::TypeError"])
+
+
+def test_each_reviewed_key_admits_exactly_one_site() -> None:
+    second_site = ProcessPathRaise("b.py", "B._h", 9)
+
+    with pytest.raises(AssertionError, match="can escape"):
+        assert_matches_reviewed([_SITE_B, second_site], ["b.py::B._h::TypeError"])
+    with pytest.raises(AssertionError, match="no longer match"):
+        assert_matches_reviewed([_SITE_B], ["b.py::B._h::TypeError", "b.py::B._h::TypeError"])
