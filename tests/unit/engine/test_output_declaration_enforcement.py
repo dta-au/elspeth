@@ -222,6 +222,15 @@ class TestDeclaredTypesAgainstValues:
         assert sinks["quarantine"].results == []
         assert _transform_error_reasons(db, result.run_id) == []
 
+    def test_an_equal_valued_type_change_on_a_carried_field_is_a_rewrite(self, tmp_path: Any) -> None:
+        """``1 == True`` in Python: a carried ``bool`` rewritten to ``1`` under ``flag: bool`` is still routed."""
+        transform = _Emitting({"schema": {"mode": "flexible", "fields": ["flag: bool"]}}, emit=[{"flag": 1}])
+        result, sinks, db = _run(tmp_path, transform, {"flag": True})
+        assert result.status is RunStatus.FAILED
+        assert sinks["output"].results == []
+        [reason] = _transform_error_reasons(db, result.run_id)
+        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"]) == ("flag", "bool", "int", "carried")
+
     def test_a_carried_value_breaking_the_operator_declared_type_routes_with_authorship_carried(self, tmp_path: Any) -> None:
         """The transform REWROTE a field it neither created nor declared as its own."""
         transform = _Emitting({"schema": {"mode": "flexible", "fields": ["amount: int"]}}, emit=[{"amount": SENTINEL}])

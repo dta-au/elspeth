@@ -148,6 +148,21 @@ def record_transform_error_with_routing(
         )
 
 
+def _value_produced(input_row: "PipelineRow", emitted: "PipelineRow", name: str) -> bool:
+    """Whether the transform PRODUCED ``emitted[name]`` rather than passing it through.
+
+    Created (absent from the input row), or rewritten: a different value, or
+    an equal value of another type — ``1 == True == 1.0`` in Python, so a
+    carried ``bool`` rewritten to ``1`` is a rewrite the type check must see.
+    Both rows hold deep-frozen values, so the comparison is like for like.
+    """
+    if name not in input_row:
+        return True
+    produced = emitted[name]
+    original = input_row[name]
+    return produced != original or type(produced) is not type(original)
+
+
 class TransformExecutor:
     """Executes transforms with audit recording.
 
@@ -615,7 +630,8 @@ class TransformExecutor:
         (value_transform's ``type_mismatch``) emits nothing, so nothing
         reaches here and no row is routed twice.
 
-        An input value the transform passed through UNCHANGED is not
+        An input value the transform passed through UNCHANGED — same value
+        AND same type, since ``1 == True == 1.0`` in Python — is not
         re-adjudicated: the strict ``input_schema`` check admitted it under
         pydantic's rules, which accept an ``int`` or a ``Decimal`` for a
         ``float`` field where ``SchemaContract.validate`` compares exact types,
@@ -640,7 +656,6 @@ class TransformExecutor:
             return
         declaring = require_output_declaring_plugin(transform)
         created = declaring.declared_output_fields | frozenset(definition.name for definition in declaring.created_output_fields())
-        input_values = input_row.to_dict()
 
         for emitted_index, emitted in enumerate(emitted_rows):
             emitted_values = emitted.to_dict()
@@ -650,7 +665,7 @@ class TransformExecutor:
                 if fc.source == "declared"
                 and fc.python_type is not object
                 and fc.normalized_name in emitted_values
-                and (fc.normalized_name not in input_values or emitted_values[fc.normalized_name] != input_values[fc.normalized_name])
+                and _value_produced(input_row, emitted, fc.normalized_name)
             )
             if not produced_fields:
                 continue

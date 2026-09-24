@@ -93,7 +93,8 @@ rows meet.**
 5. **Values, Tier 2.** After the dispatched contracts, `TransformExecutor`
    validates every declared concrete-typed field whose value the transform
    PRODUCED — a field absent from the input row, or an input field whose
-   value it rewrote — with `validate_output_against_contract`. An input
+   value it rewrote (a different value, or an equal value of another type:
+   `1 == True == 1.0`) — with `validate_output_against_contract`. An input
    value passed through unchanged is not re-adjudicated: the strict input
    check admitted it under pydantic's rules (which accept an `int` or a
    `Decimal` for `float`, where `SchemaContract.validate` compares exact
