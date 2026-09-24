@@ -69,6 +69,7 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -92,11 +93,15 @@ ROLE_READER = "reader"
 VERB_CLAIM = "claim_ready"
 VERB_RECOVER = "recover_expired_leases"
 VERB_BEAT = "beat"
+VERB_EXPIRE = "expire_claim"
 
 # Poll interval while waiting for the parent's go-file (start barrier).
 _GO_POLL_SECONDS = 0.005
 # Reader pacing: dashboard-style polling, not a busy spin.
 _READER_PAUSE_SECONDS = 0.010
+# Once measurement finishes, waiting for peer progress must not remain a
+# zero-pause writer loop: SQLite's busy timeout provides no FIFO admission.
+_PROGRESS_PAUSE_SECONDS = 0.010
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -207,19 +212,33 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
             """Run one repository verb; finalize its write-transaction record."""
             idx = len(txns)
             t_start = time.perf_counter()
-            result = fn()
-            t_end = time.perf_counter()
-            record: dict[str, Any] = {"verb": verb, "round_trip_ms": (t_end - t_start) * 1000.0}
-            opened = txns[idx:]
-            # One verb call == one transaction; tolerate (and surface via the
-            # A12 self-check) anything else rather than crashing the child.
-            if len(opened) == 1 and "lock_acquired" in opened[0]:
-                rec = opened[0]
-                record["begin_stmt"] = rec["begin_stmt"]
-                record["lock_wait_ms"] = (rec["lock_acquired"] - rec["txn_started"]) * 1000.0
-                record["hold_ms"] = (t_end - rec["lock_acquired"]) * 1000.0
-            write_txns.append(record)
-            return result
+            try:
+                return fn()
+            finally:
+                # Failed BEGIN waits are latency evidence too; the outer loop
+                # records the error and the parent still rejects every error.
+                t_end = time.perf_counter()
+                record: dict[str, Any] = {"verb": verb, "round_trip_ms": (t_end - t_start) * 1000.0}
+                opened = txns[idx:]
+                # One verb call == one transaction; A12 checks this shape.
+                if len(opened) == 1:
+                    rec = opened[0]
+                    record["begin_stmt"] = rec["begin_stmt"]
+                    if "lock_acquired" in rec:
+                        record["lock_wait_ms"] = (rec["lock_acquired"] - rec["txn_started"]) * 1000.0
+                        record["hold_ms"] = (t_end - rec["lock_acquired"]) * 1000.0
+                    else:
+                        record["lock_wait_ms"] = (t_end - rec["txn_started"]) * 1000.0
+                write_txns.append(record)
+
+        def expire_claim(work_item_id: str) -> None:
+            with begin_write(engine) as conn:
+                conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.work_item_id == work_item_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
+                )
 
         def beat() -> None:
             """§A.3 beat shape: single-row CAS UPDATE in its own write txn."""
@@ -243,6 +262,11 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
             or recovered_total < args.min_recovered
             or not all(Path(path).exists() for path in args.peer_recovered_file)
         ):
+            if time.monotonic() >= deadline:
+                # Preserve the hot measurement window, then cooperate while
+                # proving the claim/recovery floors. Sleep outside all writes
+                # so a late peer can acquire the lock and supply its leases.
+                time.sleep(_PROGRESS_PAUSE_SECONDS)
             iteration += 1
             try:
                 item = timed(
@@ -253,6 +277,9 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         lease_seconds=args.lease_seconds,
                     ),
                 )
+            except Exception as exc:
+                errors.append({"where": VERB_CLAIM, "type": type(exc).__name__, "msg": str(exc)})
+            else:
                 if item is None:
                     claim_none += 1
                 else:
@@ -262,15 +289,10 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         # First commit a valid issued lease through the deadline
                         # guard. Then model its expiry in a separate fixture
                         # transaction so a peer must perform real recovery.
-                        with begin_write(engine) as conn:
-                            conn.execute(
-                                update(token_work_items_table)
-                                .where(token_work_items_table.c.work_item_id == item.work_item_id)
-                                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-                                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
-                            )
-            except Exception as exc:
-                errors.append({"where": VERB_CLAIM, "type": type(exc).__name__, "msg": str(exc)})
+                        try:
+                            timed(VERB_EXPIRE, partial(expire_claim, item.work_item_id))
+                        except Exception as exc:
+                            errors.append({"where": VERB_EXPIRE, "type": type(exc).__name__, "msg": str(exc)})
 
             if iteration % args.sweep_every == 0:
                 try:
