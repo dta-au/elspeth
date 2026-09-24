@@ -1050,28 +1050,32 @@ def test_read_only_root_filesystem_matches_the_container_contract() -> None:
 def test_gateway_sidecar_supplies_every_required_runtime_environment_name() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     gateway = ecs[ecs.index("gateway_container = {") : ecs.index("candidate_web_container = {")]
-    supplied = re.findall(r'\{ name = "(ELSPETH_LLM_GATEWAY_[A-Z_]+)", (?:value|valueFrom) = ', gateway)
+    supplied = re.findall(r'\{ name = "(ELSPETH_LLM_GATEWAY_[^"]+)", (?:value|valueFrom) = ', gateway)
 
-    # Ask the gateway's actual loader which names it requires. This keeps the
+    # Ask the gateway's actual loader which names it requires and accepts. This keeps the
     # deployment test tied to the runtime contract as that contract evolves.
     probe = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import json; from elspeth_llm_gateway.core.config import ConfigError, load_config; "
+            "import json; from elspeth_llm_gateway.core.config import KNOWN_ENV, ConfigError, load_config; "
             "\ntry: load_config({})\nexcept ConfigError as exc: "
-            "print(json.dumps([item.removeprefix('missing_env:') for item in exc.errors if item.startswith('missing_env:')]))",
+            "print(json.dumps({'required': [item.removeprefix('missing_env:') for item in exc.errors "
+            "if item.startswith('missing_env:')], 'known': sorted(KNOWN_ENV)}))",
         ],
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "gateway" / "src")},
         capture_output=True,
         text=True,
         check=True,
     )
-    required = set(json.loads(probe.stdout))
+    contract = json.loads(probe.stdout)
+    required = set(contract["required"])
+    known = set(contract["known"])
     assert "ELSPETH_LLM_GATEWAY_INBOUND_BEARER" in required  # positive control for the probe
     assert "ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS" not in required  # known optional setting
     assert len(supplied) == len(set(supplied))
     assert required <= set(supplied)
+    assert set(supplied) <= known, f"Gateway sidecar supplies unknown environment names: {sorted(set(supplied) - known)}"
 
     root = _text("scenario-c/main.tf")
     root_variables = _text("scenario-c/variables.tf")
