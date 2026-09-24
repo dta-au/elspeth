@@ -478,7 +478,7 @@ comparative (two states that differ only in order) and are unaffected by T4.
 | 4 | ... changes the `set_pipeline` dispatch binding (`begin_dispatch` authority canonical and hash) without mutating the arguments | equal |
 | 5 | Redacted storage keeps the tool's map shape in the generic canonical, and the authority canonical is the projection (`audit_storage.py:250`) | the authority canonical is still a map |
 | 6a | **Characterization:** a content tamper on the projected coalesce items (a changed connection, envelope hash recomputed) is rejected by `PipelineDispatchAuditBinding.from_persisted_envelope` | green on arrival: already rejected at base via the generic canonical (M, `probe_tamper.log`) |
-| 6b | **Reorder detection where it exists:** a proposal row whose `arguments_json` has its coalesce branches reordered, against the original `tool_arguments_hash`, is rejected with "pipeline proposal row arguments hash mismatch" (`sessions/service.py:2373`); mirror it at `pipeline_commit.py:413` ("authoritative pipeline arguments do not match the proposal row") | accepted (the two hashes are equal at base) |
+| 6b | **Reorder detection where it exists:** a proposal row whose `arguments_json` has its coalesce branches reordered, against the original `tool_arguments_hash`, is rejected with "pipeline proposal row arguments hash mismatch" (`sessions/service.py:2373`); mirror it at `pipeline_commit.py:413` ("authoritative pipeline arguments do not match the proposal row"). The sessions-service proposal fixtures live in `tests/unit/web/sessions/test_composer_proposals.py` | accepted (the two hashes are equal at base) |
 | 7 | Restore rejects: a plain dict on coalesce, the row_union tag on a coalesce node, a duplicate alias, a non-`str` alias, a non-list item and a 3-item entry | the plain dict and the row_union tag pass through a coalesce node unchanged |
 | 7c | **Characterization:** restore rejects the coalesce tag on a row_union node | green on arrival: the row_union arm already rejects any foreign tag (`authority_hashing.py:74`) |
 | 8 | **Characterization:** list-form coalesce in a `sources`-free payload gives `arguments_canonical == authority_arguments_canonical`, byte for byte | green on arrival |
@@ -548,7 +548,9 @@ states that restore now accepts any JSON branch value for row_union too (D11), w
 5. **Characterization, end to end (D11):** an argument-error `set_pipeline` with `sources: {"main": null}` goes through
    `redacted_tool_invocation_content_and_envelope` and `from_persisted_envelope` without error. It is green at base
    and must stay green; the mutation below proves it guards something.
-6. **Known positive for D3:** the single-entry `sources` content hash from T0 step 4 differs from its T0 value.
+6. **Known positive for D3:** the single-entry `sources` content hash from T0 step 4 differs from its T0 value. This is
+   an assertion recorded in the T4 log against the T0 literal, not a durable test; the re-pinned
+   `test_state_serialisation_contract.py` literals are the durable form.
 
 **Mutation controls:**
 - Remove the `sources` arm. Tests 1, 2 and 6 must go RED.
@@ -715,11 +717,11 @@ names the deploy obligation from §5.2.
    another, duplicate keys are rejected, and a non-projection map is rejected (T3 tests 7 and 7c, T4 test 2). Any JSON
    value survives the round trip, so a planner argument error persists instead of raising `AuditIntegrityError` (T3
    tests 12 and 13, T4 test 5).
-7. **Order inside a stored dispatch envelope is bound only by the envelope's own hash** (by design, T3). Reorder
-   detection happens where a stored hash meets an order-preserving copy (T3 test 6b).
 5. **The trust-tier corpus is unchanged** (G-tier diff), except for lines that are accounted for.
 6. **No tool, schema or wire byte changed.** G-wire and G-skill stay green, and no test file of tool declarations is
    edited.
+7. **Order inside a stored dispatch envelope is bound only by the envelope's own hash** (by design, T3). Reorder
+   detection happens where a stored hash meets an order-preserving copy (T3 test 6b).
 
 ## 5. Epoch and deploy consequences (plain statement)
 
