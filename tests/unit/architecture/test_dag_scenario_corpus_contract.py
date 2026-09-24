@@ -712,7 +712,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # its source hash rotates d8a9c799bf5895c0 -> 5d131927c2baea3a in 15 node
 # records. The production reopen-resume harness then rotates its full-history
 # pin 59a0d994... -> bd33669a...; runtime semantics and frozen oracles stay fixed.
-EXPECTED_CASE_REGISTRY_SHA256 = "732c07703dcec71a48ee224e59ebf441e85e9c3b9c9a8ccc743590d095da0b3d"
+# ValueTransform metadata/output declaration repair changes only its three
+# source_file_hash tokens in union-collision-fail audit node records. The
+# token-normalized manifest is byte-identical; runtime oracle data is unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "df979f6ac32400caf79780dde303083f8ac11602829a76c20e4a525c7d0abf2d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
