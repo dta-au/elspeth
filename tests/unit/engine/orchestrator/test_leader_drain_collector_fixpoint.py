@@ -83,10 +83,9 @@ def _run(processor: _CollectorOnlyProcessor) -> None:
 def test_flush_loop_does_not_exit_while_collector_holds_remain() -> None:
     processor = _CollectorOnlyProcessor(collector_executor=_CollectorExecutorDouble(buffered=2), blocked_rows=2, resolved_per_intake=1)
     _run(processor)
-    # Two holds settled one per intake; the second pass's convergence check
-    # saw no BLOCKED work and the loop returned — it never early-returned at
-    # zero (the guard mutant makes this 0).
-    assert processor.intake_calls == 2
+    # Two holds settle one per intake. The final intake checks for a
+    # zero-member collector group that has no BLOCKED child row to expose it.
+    assert processor.intake_calls == 3
 
 
 def test_flush_loop_raises_on_nonconverging_collector_holds_naming_the_buffered_count() -> None:

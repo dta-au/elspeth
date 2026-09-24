@@ -227,18 +227,19 @@ def test_eof_loop_exits_once_the_real_collector_hold_settles(monkeypatch: pytest
 
     def _settling_intake(ctx: Any) -> list[Any]:
         calls["count"] += 1
-        processor._scheduler.mark_blocked_barrier_terminal(
-            barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
-            token_ids=("member-0",),
-            coordination_token=leader_coordination_token(factory, processor.run_id),
-        )
+        if calls["count"] == 1:
+            processor._scheduler.mark_blocked_barrier_terminal(
+                barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
+                token_ids=("member-0",),
+                coordination_token=leader_coordination_token(factory, processor.run_id),
+            )
         return []
 
     monkeypatch.setattr(processor, "run_barrier_intake", _settling_intake)
 
     _run_eof_flush(processor)
 
-    assert calls["count"] == 1
+    assert calls["count"] == 2
     assert processor.has_blocked_barrier_work() is False
 
 

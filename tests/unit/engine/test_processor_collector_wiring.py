@@ -144,6 +144,7 @@ def _build(
         traversal=traversal,
         group_bindings=group_bindings,
         scheduler=setup.factory.scheduler,
+        barrier_restore_reads=setup.factory.barrier_restore,
         scheduler_lease_owner=LEADER_OWNER if leader else "follower-1",
         coordination_token=leader_coordination_token(setup.factory, setup.run_id) if leader else None,
         member_token=follower,
