@@ -14,8 +14,10 @@ rewrite path the compose loop takes:
 
 - the replay function itself, on every dialect (exact bytes);
 - the success path (``tool_batch.py`` custody projection, every set_pipeline);
-- the required-control finalization path, auto-commit and explicit approval;
-- the inline-custody path (``inline_blob`` rewritten to ``blob_id``).
+- the required-control finalization path, auto-commit and explicit approval,
+  and auto-commit over a multi-source ``sources`` map;
+- the inline-custody path (``inline_blob`` rewritten to ``blob_id``), which
+  supports only the singular ``source``, so it has no multi-source variant.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
+    _PROPOSAL_SESSION_ID,
     _harness,
     _inline_pipeline_args,
     _ScriptedLLM,
@@ -296,6 +299,78 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
     assert len(caller_lines) == 2, caller_lines
     replayed = _replayed_pipeline(llm.message_snapshots[1], "call_auto")
     assert _node_plugins(replayed) == _WIRED_PLUGINS, "the transcript must be the finalized (auto-wired) arguments"
+    assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
+
+
+def _with_reversed_sources(args: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
+    """Replace the singular inline source with two path sources declared zeta, alpha.
+
+    Inline custody supports only the singular ``source`` (``prepare_pipeline_custody``),
+    so a multi-source finalization fixture must use path sources. Two producers
+    may not share a connection, so ``zeta_src`` feeds the original chain and
+    ``alpha_src`` writes straight to the sink.
+    """
+    template = args.pop("source")
+    sources: dict[str, Any] = {}
+    for name, on_success in zip(_SOURCE_ORDER, (template["on_success"], "output_rows"), strict=True):
+        path = tmp_path / "blobs" / _PROPOSAL_SESSION_ID / f"{name}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("doc_key\ninbox/document.pdf\n", encoding="utf-8")
+        sources[name] = {
+            "plugin": template["plugin"],
+            "on_success": on_success,
+            "options": {**template["options"], "path": str(path)},
+            "on_validation_failure": template["on_validation_failure"],
+        }
+    args["sources"] = sources
+    return args
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Characterization: required-control finalization keeps multi-source ``sources`` order.
+
+    Finalization replaces the arguments with a detached, re-canonicalized copy
+    (``deep_thaw``, ``canonicalize_authored_node_review_requirements``, which
+    rebuilds ``sources`` when a source block changes, and ``wire_required_controls``,
+    which rebuilds it when it splices a source control). This pins that the
+    finalized arguments the transcript replays still declare the sources in the
+    model's order, not only the success-path copy.
+    """
+    harness = _harness(tmp_path)
+    view, snapshot = _required_textract_policy(tmp_path)
+    await harness.sessions.update_composer_preferences(
+        UUID(harness.session_id),
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:proposal-prevalidation-user",
+    )
+    args = _with_reversed_sources(
+        _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows"),
+        tmp_path,
+    )
+    llm = _ScriptedLLM(_tool_turn("call_sources", "set_pipeline", args))
+    caller_lines = _record_replay_callers(monkeypatch)
+
+    with (
+        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service, "_call_llm", new=llm),
+    ):
+        await harness.service.compose(
+            "Build and apply a Textract to LLM pipeline over two manifests.",
+            [],
+            _empty_state(),
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+
+    # Success-path rewrite, then the finalization rewrite (the controls were wired).
+    assert len(caller_lines) == 2, caller_lines
+    replayed = _replayed_pipeline(llm.message_snapshots[1], "call_sources")
+    assert _node_plugins(replayed) == _WIRED_PLUGINS, "the transcript must be the finalized (auto-wired) arguments"
+    assert "source" not in replayed
+    assert list(replayed["sources"]) == _SOURCE_ORDER
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
 
 
