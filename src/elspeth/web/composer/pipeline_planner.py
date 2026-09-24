@@ -142,6 +142,7 @@ from elspeth.web.composer.state import (
     gate_condition_is_constant,
     route_destination_facts,
 )
+from elspeth.web.composer.tool_error_payloads import wire_argument_repair_message
 from elspeth.web.composer.tools._common import (
     COMPONENTS_WITHHELD_KEY,
     PendingCustodyBlobView,
@@ -441,6 +442,8 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
 
 def planner_discovery_information_keys(call: _ParsedToolCall) -> tuple[str, ...]:
     """Map one admitted discovery call to its closed information identities."""
+    if call.wire_error is not None:
+        return ()
     return _tool_information_keys(call.name, call.arguments)
 
 
@@ -1439,6 +1442,9 @@ class _ParsedToolCall:
     # name outside the sent palette).
     strict_sent: bool | None = None
     wire_conformant: bool | None = None
+    # A failed decoder retains unadmitted wire arguments solely for in-memory
+    # replay. It must be audited as a rejection and never dispatched.
+    wire_error: ToolArgumentError | None = None
 
     def __post_init__(self) -> None:
         for fact_name, fact in (("strict_sent", self.strict_sent), ("wire_conformant", self.wire_conformant)):
@@ -1737,7 +1743,9 @@ def _parse_response_tool_calls(
     :func:`~elspeth.web.composer.tools.wire_projection.decode_wire_arguments`
     before :class:`_ParsedToolCall` is built, so every pre-dispatch reader
     (information keys, the cycle guard, schema bookkeeping) and dispatch see
-    the semantic form. Any other name keeps its arguments unchanged with no
+    the semantic form. Decoder rejections retain a ``wire_error`` instead:
+    they supply no information and never reach tool execution. Any other name
+    keeps its arguments unchanged with no
     wire facts (D17): the palette is not enforced at dispatch, so decode
     must not touch a W that was never sent. Both keywords are required
     (D10): a defaulted form would be a second path that decodes nothing.
@@ -1793,12 +1801,20 @@ def _parse_response_tool_calls(
         arguments = _parse_json_object(raw_arguments, label=f"{name} arguments")
         strict_sent: bool | None = None
         wire_conformant: bool | None = None
+        wire_error: ToolArgumentError | None = None
         if name != _TERMINAL_TOOL_NAME and name in sent_tool_names:
             if dialect == ToolContractDialect.OPENAI_STRICT:
                 strict_sent = _WIRE_TOOL_DEFS[dialect][name].strict_capable
-            decoded = decode_wire_arguments(name, dialect, cast(dict[str, Any], arguments))
-            arguments = decoded.semantic
-            wire_conformant = decoded.wire_conformant
+            try:
+                decoded = decode_wire_arguments(name, dialect, cast(dict[str, Any], arguments))
+            except ToolArgumentError as exc:
+                # Preserve a rejected call for audited repair, without treating
+                # its wire arguments as an admitted semantic invocation.
+                wire_error = exc
+                wire_conformant = False
+            else:
+                arguments = decoded.semantic
+                wire_conformant = decoded.wire_conformant
         parsed.append(
             _ParsedToolCall(
                 call_id,
@@ -1807,6 +1823,7 @@ def _parse_response_tool_calls(
                 arguments,
                 strict_sent=strict_sent,
                 wire_conformant=wire_conformant,
+                wire_error=wire_error,
             )
         )
     terminal_calls = tuple(call for call in parsed if call.name == _TERMINAL_TOOL_NAME)
@@ -3222,6 +3239,7 @@ def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any
 class _PlannerArgumentRejection:
     result: ToolResult
     response: AdmittedResponse
+    repair_message: str | None = None
 
 
 def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContract | None, bool]:
@@ -3280,10 +3298,14 @@ def _serialize_provider_discovery_result(
     )
     if isinstance(result, _PlannerArgumentRejection):
         if restricted:
-            return json.dumps(closed_provider_envelope(result.result, data=result.response).to_wire())
-        argument_payload = result.response.to_wire()
-        assert isinstance(argument_payload, dict)
-        return serialize_tool_result(replace(result.result, data=argument_payload))
+            payload = closed_provider_envelope(result.result, data=result.response).to_wire()
+        else:
+            argument_payload = result.response.to_wire()
+            assert isinstance(argument_payload, dict)
+            payload = replace(result.result, data=argument_payload).to_dict()
+        if result.repair_message is not None:
+            payload["message"] = result.repair_message
+        return json.dumps(payload)
     admitted = result if isinstance(result, AdmittedDiscoveryResult) else admit_discovery_result(call.name, result)
     result = admitted.result
     data = admitted.response
@@ -5066,7 +5088,7 @@ async def _plan_pipeline_inner(
         escalate_no_gain = bool(escalating_no_gain_calls) and no_gain_calls_in_round >= 2
         for call in useful_calls:
             pending_information.update(information_keys[call.call_id])
-        keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls)
+        keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls if call.wire_error is None)
         if any(key in seen_discovery for key in keys) or len(set(keys)) != len(keys):
             # A cycling planner is stuck by definition — hand the puzzle to
             # the advisor rather than failing the request.
@@ -5118,7 +5140,7 @@ async def _plan_pipeline_inner(
             dispatch = begin_dispatch(
                 call.call_id,
                 call.name,
-                call.arguments,
+                {"_invalid_wire_arguments": True, "field_count": len(call.arguments)} if call.wire_error is not None else call.arguments,
                 version_before=current_state.version,
                 actor=originating_message.user_id or "pipeline-planner",
                 strict_sent=call.strict_sent,
@@ -5126,6 +5148,8 @@ async def _plan_pipeline_inner(
             )
 
             async def execute_discovery(call_to_execute: _ParsedToolCall = call) -> _AuditedDiscoveryResult:
+                if call_to_execute.wire_error is not None:
+                    raise call_to_execute.wire_error
                 execution_arguments = cast(dict[str, Any], deep_thaw(call_to_execute.arguments))
                 result = cast(
                     ToolResult,
@@ -5178,6 +5202,9 @@ async def _plan_pipeline_inner(
                             affected_nodes=(),
                         ),
                         argument_error_response(exc),
+                        wire_argument_repair_message(_WIRE_TOOL_DEFS[model_config.tool_contract_dialect][call.name])
+                        if call.wire_error is not None
+                        else None,
                     ),
                     False,
                 )

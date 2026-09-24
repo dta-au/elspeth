@@ -129,6 +129,7 @@ from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
+    wire_argument_repair_message,
 )
 from elspeth.web.composer.tool_error_payloads import (
     arg_error_payload as _arg_error_payload,
@@ -1059,12 +1060,15 @@ async def run_tool_batch(
             # Decode the provider arguments against the W that was sent:
             # classify wire conformance, unwrap the set_pipeline envelope, and
             # on openai_strict strip ``null`` at promoted positions. A
-            # malformed set_pipeline envelope is decode's only rejection.
+            # malformed envelope or no-argument marker rejects before S.
             try:
                 decoded = decode_wire_arguments(tool_name, ctx.tool_contract_dialect, decoded_arguments)
             except ToolArgumentError as envelope_rejection:
                 call_wire_facts.wire_conformant = False
-                turn_has_mutation = True
+                if is_discovery_tool(tool_name):
+                    turn_has_discovery = True
+                else:
+                    turn_has_mutation = True
                 audit_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                     "error_class": type(envelope_rejection).__name__,
@@ -1086,7 +1090,7 @@ async def run_tool_batch(
                     strict_sent=call_wire_facts.strict_sent,
                     wire_conformant=call_wire_facts.wire_conformant,
                 )
-                envelope_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
+                envelope_error = wire_argument_repair_message(sent_wire_tools[tool_name])
                 error_payload = {"error": envelope_error}
                 recorder.record(
                     finish_arg_error(

@@ -485,6 +485,11 @@ def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     return schema
 
 
+def declared_argument_names(tool_name: str) -> tuple[str, ...]:
+    """Return server-declared root property names for compose repair guidance."""
+    return tuple(sorted(_TOOL_SCHEMA_BY_NAME[tool_name]["properties"]))
+
+
 def _schema_error_path(error: ValidationError) -> str:
     parts = ["arguments"]
     for segment in error.absolute_path:
