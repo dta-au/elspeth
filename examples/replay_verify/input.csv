@@ -1,0 +1,4 @@
+id,topic,url
+1,returns,http://127.0.0.1:8204/returns.html
+2,shipping,http://127.0.0.1:8204/shipping.html
+3,warranty,http://127.0.0.1:8204/warranty.html
