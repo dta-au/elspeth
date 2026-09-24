@@ -114,13 +114,15 @@ class TestJoinSemantics:
         assert "CSV cells remain strings" in hints
         assert "JSON numbers retain numeric types" in hints
         assert "type_coerce" in hints
+        assert "field_mapper" in hints
+        assert "arriving str" in hints
         assert "Never replace a supplied CSV" in hints
         skill = load_skill("pipeline_composer")
-        repair = next(line for line in skill.splitlines() if line.startswith("| CSV `reference_join` output"))
-        assert "type_coerce" in repair
-        assert "field_mapper" in repair
-        assert "arriving `str`" in repair
-        assert "Never replace supplied CSV" in repair
+        repair = next(line for line in skill.splitlines() if line.startswith("| Joined or enriched field"))
+        assert "get_plugin_schema" in repair
+        assert "get_plugin_assistance" in repair
+        assert "Preserve supplied reference data" in repair
+        assert "explicit conversion before the consumer" in repair
 
     def test_composer_assistance_wires_an_existing_upload(self) -> None:
         assistance = ReferenceJoin.get_agent_assistance()
