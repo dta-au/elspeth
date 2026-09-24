@@ -80,6 +80,25 @@ ROW_API_DYNAMIC_ACCESS = "row-api"
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
+MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
+
+
+def validate_jinja_source(source: str) -> None:
+    """Bound parser input before Jinja sees a web or YAML authored template."""
+    if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
+        raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+    if source.count("{%") > 64 or source.count("{{") > 256:
+        raise ValueError("Template has too many Jinja expressions or blocks")
+    depth = 0
+    for character in source:
+        if character in "([":
+            depth += 1
+            if depth > 64:
+                raise ValueError("Template expression nesting exceeds 64")
+        elif character in ")]":
+            depth = max(0, depth - 1)
+
+
 # None retains a computed dictionary write key without inventing its value.
 # API and macro carriers currently produce concrete paths; row carriers may
 # contain unknown segments, which must match both literal and computed reads.
@@ -117,6 +136,7 @@ def extract_jinja2_field_usage(
     reported separately so security-sensitive callers can fail closed instead
     of treating an empty concrete-field set as "no row fields referenced."
     """
+    validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (
@@ -174,6 +194,7 @@ def extract_jinja2_fields(
         >>> extract_jinja2_fields("{{ lookup.data }}")  # Different namespace
         frozenset()
     """
+    validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (
@@ -1838,6 +1859,7 @@ def extract_jinja2_fields_with_details(
         >>> extract_jinja2_fields_with_details('{{ row.a }} {{ row["a"] }}')
         {'a': ['attr', 'item']}
     """
+    validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (

@@ -108,20 +108,25 @@ class TestFieldOnlyMode:
             b"hello world",  # bytes: bytes.strip() silently succeeds, so without
             42,  # the isinstance guard these would produce wrong-typed
             ["a", "b"],  # QueryResult(query=<non-str>) and corrupt the audit
-        ],  # trail without crashing. Pin that the guard fires.
+        ],  # trail without a row error. Pin the typed failure.
         ids=["bytes", "int", "list"],
     )
-    def test_non_str_value_raises_type_error(self, bad_value):
-        """Non-str field values must crash loudly, not silently corrupt the audit trail.
+    def test_non_str_value_returns_row_error(self, bad_value):
+        """Non-str field values fail their row without corrupting the audit trail.
 
         Regression guard: bytes.strip() and bool(b"x") both succeed, so a bytes
         value would pass _validate_non_empty and produce QueryResult(query=b"...")
-        without the isinstance guard.  That is a wrong-type answer in the audit
-        trail with no crash.  This test pins that the guard fires instead.
+        without the type guard. Pin the failure reason and exclude the value.
         """
         builder = QueryBuilder(query_field="question")
-        with pytest.raises(TypeError, match="expected str"):
-            builder.build({"question": bad_value})
+        assert builder.build({"question": bad_value}).error == {
+            "reason": "invalid_input",
+            "error_type": "wrong_type",
+            "field": "question",
+            "expected": "str",
+            "actual_type": type(bad_value).__name__,
+            "error": f"must be str, got {type(bad_value).__name__}",
+        }
 
 
 # =============================================================================
@@ -153,6 +158,40 @@ class TestTemplateMode:
         result = builder.build({"topic": "test"})
         assert result.error is not None
         assert result.error["reason"] == "template_rendering_failed"
+
+    def test_resource_bounded_render_returns_row_error(self):
+        builder = QueryBuilder(query_field="topic", query_template="{{ query * 300000000 }}")
+        result = builder.build({"topic": "x"})
+        assert result.error is not None
+        assert result.error["reason"] == "template_rendering_failed"
+
+    def test_render_error_reason_names_no_row_value(self):
+        """A lookup key computed from the row never reaches the reason (RAG-F1).
+
+        Before the shared renderer the reason was Jinja's text:
+        ``'dict object' has no attribute 'SENTINEL-rag-4e1f'``.
+        """
+        builder = QueryBuilder(query_field="topic", query_template="{{ query }} {{ row[row.k] }}")
+        result = builder.build({"topic": "t", "k": "SENTINEL-rag-4e1f"})
+        assert result.error == {
+            "reason": "template_rendering_failed",
+            "error": "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>",
+            "field": "topic",
+        }
+
+    def test_a_template_runtime_error_is_a_row_error(self):
+        """The catch list is SandboxedTemplate's, which includes a bare TemplateRuntimeError.
+
+        An unknown filter inside a conditional compiles and raises only when
+        the branch runs; RAG's own catch list used to omit it, so the run aborted.
+        """
+        builder = QueryBuilder(query_field="topic", query_template="{% if query %}{{ query | no_such_filter }}{% endif %}")
+        result = builder.build({"topic": "t"})
+        assert result.error == {
+            "reason": "template_rendering_failed",
+            "error": "Template rendering failed: TemplateRuntimeError (message withheld: it can quote row data)",
+            "field": "topic",
+        }
 
 
 # =============================================================================
@@ -256,23 +295,21 @@ class TestWorkerFailureDetection:
             builder.build({"text": "issue: payment failed"})
         assert "kaboom" in str(exc_info.value)
 
-    def test_non_str_value_crashes_as_type_contract_violation(self):
-        """A non-str query_field value in regex mode is an upstream Tier-2 bug.
-
-        re.Pattern.search() raises TypeError on a non-str input. That TypeError
-        must surface as a TypeError naming the type contract — NOT be mislabeled
-        as a 'regex worker bug' RuntimeError by the broad worker-failure catch.
-        Tier 2 data must not be coerced; a wrong type crashes loudly.
-        """
+    def test_non_str_value_is_a_row_error_before_regex_dispatch(self):
+        """A non-str query value fails its row before the regex worker runs."""
         builder = QueryBuilder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
         try:
-            with pytest.raises(TypeError, match="expected str") as exc_info:
-                builder.build({"text": 12345})
-            assert "text" in str(exc_info.value)
-            assert "upstream plugin bug" in str(exc_info.value)
+            assert builder.build({"text": 12345}).error == {
+                "reason": "invalid_input",
+                "error_type": "wrong_type",
+                "field": "text",
+                "expected": "str",
+                "actual_type": "int",
+                "error": "must be str, got int",
+            }
         finally:
             builder.close()
 

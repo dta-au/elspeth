@@ -15,12 +15,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, select
 from sqlalchemy.engine import Connection, Row
-from sqlalchemy.sql import Executable
+from sqlalchemy.sql import ColumnElement, Executable
 
+from elspeth.contracts import BatchStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.landscape.schema import batches_table
+from elspeth.core.landscape.schema import batch_members_table, batches_table, transform_errors_table
 
 
 def batch_retry_lineage_ids_on(
@@ -104,3 +105,43 @@ def batch_retry_lineage_ids(
         lineage.append(ancestor_id)
         ancestor_id = ancestor.retry_of_batch_id
     return tuple(lineage)
+
+
+def recorded_failure_verdict_condition() -> ColumnElement[bool]:
+    """The ONE predicate for "this batch's FAILED verdict is recorded and final".
+
+    Correlated against the enclosing query's ``batches`` row. A batch
+    transform that returned ``TransformResult.error`` records its verdict
+    atomically (``ExecutionRepository.complete_aggregation_failure``): the
+    batch FAILED plus one ``transform_errors`` row per member at the batch's
+    aggregation node. That verdict is final — resume completes its disposition
+    and never re-invokes the plugin — so such a batch is never retried.
+
+    A batch is FAILED without a verdict only when its flush died before the
+    verdict committed (the plugin raised, or resume found it EXECUTING): no
+    ``transform_errors`` row exists for its members at the node, and resume
+    retries it. A retried batch copies its members into the retry, so once a
+    retry of such a batch records the verdict, the dead ancestor shares the
+    members' rows; "has no retry" keeps the ancestor out — the verdict belongs
+    to the end of the chain only.
+
+    Consumers: ``BatchRepository.get_incomplete_batches`` excludes these
+    batches (nothing to retry), and
+    ``BarrierRestoreReadModel.list_recorded_aggregation_failures`` selects
+    them (their still-BLOCKED members to disposition).
+    """
+    retry = batches_table.alias("verdict_retry")
+    return and_(
+        batches_table.c.status == BatchStatus.FAILED.value,
+        ~exists().where(
+            retry.c.run_id == batches_table.c.run_id,
+            retry.c.retry_of_batch_id == batches_table.c.batch_id,
+        ),
+        exists().where(
+            batch_members_table.c.batch_id == batches_table.c.batch_id,
+            batch_members_table.c.run_id == batches_table.c.run_id,
+            transform_errors_table.c.run_id == batch_members_table.c.run_id,
+            transform_errors_table.c.token_id == batch_members_table.c.token_id,
+            transform_errors_table.c.transform_id == batches_table.c.aggregation_node_id,
+        ),
+    )

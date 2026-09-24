@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 
@@ -31,7 +31,7 @@ from elspeth.contracts.declaration_contracts import (
     DeclarationContractViolation,
 )
 from elspeth.contracts.diversion import RowDiversion
-from elspeth.contracts.enums import NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import NodeStateStatus, RoutingMode, RunMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     FrameworkBugError,
@@ -45,6 +45,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 from elspeth.contracts.sink_effects import (
@@ -68,10 +69,12 @@ from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
+from elspeth.engine.executors.replay_sink_effect import VirtualReplaySinkEffect
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
     SinkEffectExecutionSeam,
+    _SinkEffectAdapter,
 )
 from elspeth.engine.executors.sink_required_fields import _format_optional_missing_fields_context
 from elspeth.engine.spans import SpanFactory
@@ -290,7 +293,8 @@ class SinkExecutor:
                     sink.input_schema.model_validate(row)
                 except ValidationError as e:
                     raise PluginContractViolation(
-                        f"Sink '{sink.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                        f"Sink '{sink.name}' input validation failed: {safe_validation_error_text(e)}. "
+                        "This indicates an upstream transform/source schema bug."
                     ) from e
 
         if sink.declared_required_fields:
@@ -694,6 +698,7 @@ class SinkExecutor:
         sink_name: str,
         sink_node_id: str,
         join_group_id_by_token: Mapping[str, str | None],
+        ctx: PluginContext,
     ) -> _EffectPrimaryWrite:
         """Publish one primary batch through the durable effect coordinator."""
         if self._factory is None:
@@ -714,7 +719,7 @@ class SinkExecutor:
             self._validate_sink_input(sink, rows, contracts=row_contracts)
         except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             self._complete_states_failed(
-                states=[(token, state) for token, state in all_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in all_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=self._build_boundary_error(exc=violation, phase="sink_write"),
             )
@@ -787,6 +792,13 @@ class SinkExecutor:
             for member in identity.members
         )
         sink._reset_diversion_log()
+        effect_adapter: SinkProtocol | VirtualReplaySinkEffect
+        if ctx.run_mode is RunMode.LIVE:
+            effect_adapter = sink
+        else:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay sink execution requires a source run")
+            effect_adapter = VirtualReplaySinkEffect(source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -809,7 +821,7 @@ class SinkExecutor:
                 ),
                 finalization_members=finalization_members,
             ),
-            sink,  # type: ignore[arg-type]  # capability was statically admitted before execution
+            cast(_SinkEffectAdapter, effect_adapter),  # live capability was admitted; replay adapter is owned
         )
         requested_token_ids = tuple(member.token_id for member in identity.members)
         durable_members = self._execution.sink_effects.get_members_for_tokens(
@@ -1045,12 +1057,12 @@ class SinkExecutor:
             # outcomes so no diverted token is left in progress.
             boundary_error = self._build_boundary_error(exc=violation, phase="failsink_write")
             self._complete_states_failed(
-                states=[(token, state) for token, state in failsink_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in failsink_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )
             self._complete_states_failed(
-                states=[(token, state) for token, _index, state in primary_divert_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, _index, state in primary_divert_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )
@@ -1415,6 +1427,7 @@ class SinkExecutor:
             sink_name=sink_name,
             sink_node_id=sink_node_id,
             join_group_id_by_token=join_group_id_by_token,
+            ctx=primary_ctx,
         )
         diversions = effect_write.diversions
 

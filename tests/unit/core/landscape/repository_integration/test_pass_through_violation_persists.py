@@ -102,7 +102,6 @@ def _mk_fctx(transform: Mock, tokens: list[TokenInfo]) -> _FlushContext:
         settings=settings,
         buffered_tokens=tuple(tokens),
         batch_id="batch-1",
-        error_msg="batch failed",
         expand_parent_token=tokens[0],
         triggering_token=tokens[-1],
         coalesce_node_id=None,

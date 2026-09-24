@@ -100,6 +100,7 @@ class RunCeremony:
         rows_routed_success: int = 0,
         rows_routed_failure: int = 0,
         routed_destinations: Mapping[str, int] | tuple[tuple[str, int], ...] = (),
+        collector_groups_failed: int = 0,
     ) -> None:
         """Emit the terminal operator-facing RunSummary event."""
         if isinstance(routed_destinations, Mapping):
@@ -119,6 +120,7 @@ class RunCeremony:
                 routed_success=rows_routed_success,
                 routed_failure=rows_routed_failure,
                 routed_destinations=destination_items,
+                collector_groups_failed=collector_groups_failed,
             )
         )
 
@@ -143,6 +145,7 @@ class RunCeremony:
             rows_routed_success=result.rows_routed_success,
             rows_routed_failure=result.rows_routed_failure,
             routed_destinations=result.routed_destinations,
+            collector_groups_failed=result.collector_groups_failed,
         )
 
     def emit_phase_error(
@@ -238,6 +241,7 @@ class RunCeremony:
         total_duration = time.perf_counter() - start_time
         factory.run_lifecycle.finalize_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
         summary_status, exit_code = cli_completion_for(RunStatus.INTERRUPTED)
+        collector_groups_failed = factory.run_status_projection.count_failed_collector_groups(run_id)
 
         self.emit_run_finished(
             run_id=run_id,
@@ -257,6 +261,7 @@ class RunCeremony:
             rows_routed_success=shutdown_exc.rows_routed_success,
             rows_routed_failure=shutdown_exc.rows_routed_failure,
             routed_destinations=shutdown_exc.routed_destinations,
+            collector_groups_failed=collector_groups_failed,
         )
 
     def emit_failed_ceremony(
@@ -323,4 +328,5 @@ class RunCeremony:
             rows_routed_success=failed_result.rows_routed_success,
             rows_routed_failure=failed_result.rows_routed_failure,
             routed_destinations=failed_result.routed_destinations,
+            collector_groups_failed=failed_result.collector_groups_failed,
         )

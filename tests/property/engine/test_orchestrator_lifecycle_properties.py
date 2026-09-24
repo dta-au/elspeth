@@ -103,6 +103,7 @@ def execution_counters(draw: st.DrawFn) -> ExecutionCounters:
         rows_forked=draw(counter_values),
         rows_coalesced=draw(counter_values),
         rows_coalesce_failed=draw(counter_values),
+        collector_groups_failed=draw(counter_values),
         rows_expanded=draw(counter_values),
         rows_buffered=draw(counter_values),
         rows_diverted=draw(counter_values),
@@ -446,6 +447,7 @@ class TestAccumulateFlushResultProperties:
             rows_forked=counters.rows_forked,
             rows_coalesced=counters.rows_coalesced,
             rows_coalesce_failed=counters.rows_coalesce_failed,
+            collector_groups_failed=counters.collector_groups_failed,
             rows_expanded=counters.rows_expanded,
             rows_buffered=counters.rows_buffered,
             rows_diverted=counters.rows_diverted,
@@ -465,6 +467,7 @@ class TestAccumulateFlushResultProperties:
             rows_forked=counters.rows_forked,
             rows_coalesced=counters.rows_coalesced,
             rows_coalesce_failed=counters.rows_coalesce_failed,
+            collector_groups_failed=counters.collector_groups_failed,
             rows_expanded=counters.rows_expanded,
             rows_buffered=counters.rows_buffered,
             rows_diverted=counters.rows_diverted,
@@ -794,6 +797,7 @@ class TestRunResultFieldProperties:
         assert result.rows_forked == 0
         assert result.rows_coalesced == 0
         assert result.rows_coalesce_failed == 0
+        assert result.collector_groups_failed == 0
         assert result.rows_expanded == 0
         assert result.rows_buffered == 0
         assert result.rows_diverted == 0
@@ -821,6 +825,7 @@ class TestRunResultFieldProperties:
             ("rows_forked", result.rows_forked, counters.rows_forked),
             ("rows_coalesced", result.rows_coalesced, counters.rows_coalesced),
             ("rows_coalesce_failed", result.rows_coalesce_failed, counters.rows_coalesce_failed),
+            ("collector_groups_failed", result.collector_groups_failed, counters.collector_groups_failed),
             ("rows_expanded", result.rows_expanded, counters.rows_expanded),
             ("rows_buffered", result.rows_buffered, counters.rows_buffered),
             ("rows_diverted", result.rows_diverted, counters.rows_diverted),

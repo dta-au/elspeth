@@ -349,10 +349,9 @@ def _routing_label_errors(
 
     Field-by-field the wording tracks the runtime validator that owns the
     field (empty-check text is per field there too); label rules come from
-    :func:`_label_message`. Aggregation ``on_error`` and source
-    ``on_validation_failure`` carry no ``config.py`` validator — the DAG
-    builder resolves them — so they are deliberately absent here; the
-    dangling-target rules already cover them.
+    :func:`_label_message`. Source ``on_validation_failure`` carries no
+    ``config.py`` validator — the DAG builder resolves it — so it is
+    deliberately absent here; the dangling-target rules already cover it.
     """
     found: list[ValidationEntry] = []
 
@@ -412,6 +411,11 @@ def _routing_label_errors(
                     add(component, "on_success must be a connection name, sink name, or omitted entirely")
                 else:
                     label(component, node.on_success, "Aggregation on_success connection name")
+            if node.on_error is not None:
+                if not node.on_error.strip():
+                    add(component, "on_error must be a sink name or 'discard'")
+                elif node.on_error != _DISCARD_ROUTE_TARGET:
+                    label(component, node.on_error, "Aggregation on_error sink name")
         elif node.node_type == "gate":
             for route_label, destination in (node.routes or {}).items():
                 if not route_label:
@@ -1683,6 +1687,14 @@ def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[st
     return frozenset(cls.name for cls in transforms if cls.is_batch_aware and not cls.supports_row_mode_when_batch_aware)
 
 
+def _known_transform_plugins_requiring_aggregation_batch_context() -> frozenset[str]:
+    """Return transform names that read the aggregation flush window (``ctx.aggregation_batch``)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.requires_aggregation_batch_context)
+
+
 def _declared_input_fields_option(options: Mapping[str, Any]) -> object:
     """Return the raw declared-input-field option, including wrapper-shaped aggregations."""
     if _DECLARED_INPUT_FIELDS_OPTION in options:
@@ -1724,8 +1736,23 @@ def _batch_aware_placement_error(
     plugin_name: str | None,
     output_mode: str | None,
 ) -> str | None:
-    """Reject batch-only transforms from row-mode composer placement."""
-    if plugin_name is None or plugin_name not in _known_batch_aware_transform_plugins_requiring_aggregation():
+    """Reject a batch-aware transform from a node kind it cannot run in.
+
+    Mirrors runtime_factory's placement refusals, from the same plugin class
+    declarations: a batch-only plugin as a row transform, and a plugin that
+    reads the aggregation flush window as a collector.
+    """
+    if plugin_name is None:
+        return None
+
+    if node_type == "collector" and plugin_name in _known_transform_plugins_requiring_aggregation_batch_context():
+        return (
+            f"Node '{node_id}' uses '{plugin_name}' as a collector, but the plugin requires an aggregation "
+            "flush window (its trigger and row positions), which a collector's end_of_group flush does not have. "
+            "Configure this node as node_type='aggregation' with an aggregation trigger instead."
+        )
+
+    if plugin_name not in _known_batch_aware_transform_plugins_requiring_aggregation():
         return None
 
     if node_type == "transform":
@@ -2960,12 +2987,17 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
                     },
                 )
             node_on_error = node.on_error
+            # An aggregation on_error has no rule-9 closer relax (rule 6 bans
+            # aggregations inside every bound region), so a closer-shaped
+            # value is still dangling there — matching the
+            # aggregation_on_error_unknown_sink rule, which checks sinks only.
+            on_error_closer_relaxed = node.node_type != "aggregation" and node_on_error in closer_names
             if (
-                node.node_type in ("transform", "gate")
+                node.node_type in ("transform", "aggregation", "gate")
                 and node_on_error is not None
                 and node_on_error != "discard"
                 and node_on_error not in output_names
-                and node_on_error not in closer_names
+                and not on_error_closer_relaxed
             ):
                 _merge(
                     component,
@@ -3140,9 +3172,12 @@ def _validate_runtime_route_destinations(
                         "aggregation_on_success_dangling",
                     )
                 )
-            # AggregationSettings.on_error is a sink name or 'discard'; a
-            # failing batch routed to a ghost sink is a deterministic runtime
-            # failure the engine only discovers when a batch actually fails.
+            # AggregationSettings.on_error is a sink name or 'discard': every
+            # input row of a failed batch goes there. The DAG builder refuses a
+            # ghost sink while wiring the __error_<name>__ edge
+            # (elspeth-d2e3f29d10); rejecting it here keeps the planner from
+            # authoring a pipeline the runtime will not build. No closer relax:
+            # aggregations never sit inside a bound region (rule 6).
             if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET and node.on_error not in output_names:
                 errors.append(
                     _err(

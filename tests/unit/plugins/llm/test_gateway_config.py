@@ -31,6 +31,7 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
+from elspeth.contracts.enums import RunMode
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS as _LLM_PRIVATE_OPTIONS
 from elspeth.core.rate_limit.registry import RateLimitRegistry
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
@@ -263,6 +264,8 @@ def _make_ctx() -> SimpleNamespace:
         telemetry_emit=lambda event: None,
         payload_store=None,
         llm_call_governance=None,
+        call_mode_session=None,
+        run_mode=RunMode.LIVE,
     )
 
 

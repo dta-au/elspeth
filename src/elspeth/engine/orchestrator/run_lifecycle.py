@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
@@ -38,6 +39,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import (
     GracefulShutdownError,
     OrchestrationInvariantError,
@@ -63,6 +65,7 @@ from elspeth.engine.orchestrator.export import (
     prepare_audit_export_binding,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from elspeth.engine.orchestrator.run_modes import admit_source_run, resolve_runtime_run_mode
 from elspeth.engine.orchestrator.run_state import _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.run_status import (
     assert_bound_groups_settled_from_audit,
@@ -71,6 +74,8 @@ from elspeth.engine.orchestrator.run_status import (
     derive_terminal_status_from_audit,
 )
 from elspeth.engine.orchestrator.shutdown import shutdown_handler_context
+from elspeth.engine.orchestrator.source_compatibility import admit_source_configuration
+from elspeth.engine.orchestrator.source_replay import prepare_audited_sources
 
 if TYPE_CHECKING:
     import threading
@@ -217,8 +222,12 @@ class RunLifecycleCoordinator:
             # on the fresh path, no read-back.
             run_id = run_id or (run_start_permit.run_id if run_start_permit is not None else generate_id())
             worker_id = mint_worker_id(run_id)
+            configured_mode = config.config["run_mode"] if "run_mode" in config.config else RunMode.LIVE
+            replay_from_run_id = config.config["replay_from"] if "replay_from" in config.config else None
             run = factory.run_lifecycle.begin_run(
                 config=config.config,
+                run_mode=RunMode(configured_mode),
+                replay_from_run_id=replay_from_run_id,
                 canonical_version=self._canonical_version,
                 source_schema_json=source_schema_json,
                 run_id=run_id,
@@ -443,6 +452,26 @@ class RunLifecycleCoordinator:
         if payload_store is None:
             raise OrchestrationInvariantError("PayloadStore is required for audit compliance.")
 
+        runtime_mode = resolve_runtime_run_mode(config, settings)
+        admit_source_run(self._db, runtime_mode, current_run_id=run_id)
+        audited_sources: Mapping[str, object] | None = None
+        if runtime_mode.mode is not RunMode.LIVE:
+            source_run_id = runtime_mode.replay_from
+            if source_run_id is None:
+                raise OrchestrationInvariantError("Replay/verify source run ID is missing")
+            source_factory = RecorderFactory.read_only(self._db, payload_store=payload_store)
+            admit_source_configuration(
+                source_factory,
+                source_run_id=source_run_id,
+                config=config,
+                canonical_version=self._canonical_version,
+            )
+            audited_sources = prepare_audited_sources(
+                source_factory,
+                source_run_id,
+                config.sources,
+            )
+
         # Fail fast on missing export resources (elspeth-749e75a59b): when
         # export is enabled, the sink factory and durable content-store
         # resources are REQUIRED and must be validated BEFORE any irreversible
@@ -509,6 +538,7 @@ class RunLifecycleCoordinator:
             run_start_permit=run_start_permit,
             pre_effect_guard=pre_effect_guard if run_start_permit is not None else None,
         )
+        factory.audited_sources = audited_sources
 
         # Record pre-flight results (deferred from bootstrap_and_run)
         if pre_effect_guard is not None:
@@ -694,6 +724,7 @@ class RunLifecycleCoordinator:
                 rows_routed_success=result.rows_routed_success,
                 rows_routed_failure=result.rows_routed_failure,
                 routed_destinations=result.routed_destinations,
+                collector_groups_failed=result.collector_groups_failed,
             )
 
             return result

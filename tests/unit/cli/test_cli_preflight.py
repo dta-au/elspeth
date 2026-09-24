@@ -15,10 +15,12 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
+import elspeth.cli as cli_module
 from elspeth.cli import _preflight_follower_sink_effects, _preflight_raw_settings_sink_effects, app
-from elspeth.contracts import CallType
+from elspeth.contracts import CallType, RunMode
 from elspeth.contracts.preflight import DependencyRunResult, PreflightResult
 from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, SinkEffectContract, SinkEffectInputKind
 
@@ -34,6 +36,37 @@ def test_follower_preflight_passes_explicit_pipeline_members_kind() -> None:
         configured_modes={"output": "write"},
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
     )
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "enters_plugin_preflight"),
+    ((RunMode.LIVE, True), (RunMode.REPLAY, False), (RunMode.VERIFY, False)),
+)
+def test_follower_join_refuses_non_live_before_plugin_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_mode: RunMode,
+    enters_plugin_preflight: bool,
+) -> None:
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text("settings loaded by test boundary\n")
+    constructed = False
+
+    def fake_instantiate(*args: object, **kwargs: object) -> None:
+        nonlocal constructed
+        del args, kwargs
+        constructed = True
+        raise RuntimeError("stop after live guard")
+
+    monkeypatch.setattr(cli_module, "_preflight_raw_settings_sink_effects", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli_module, "_load_settings_with_secrets", lambda path: (SimpleNamespace(run_mode=run_mode), ()))
+    monkeypatch.setattr(cli_module, "_instantiate_plugins_for_runtime_preflight", fake_instantiate)
+
+    with pytest.raises(typer.Exit) as exc:
+        cli_module.join("run-test", settings_file=str(settings_path), database=None, output_format="console")
+
+    assert exc.value.exit_code == 1
+    assert constructed is enters_plugin_preflight
 
 
 @dataclass(slots=True)
@@ -432,6 +465,7 @@ def _make_resume_config_and_database(tmp_path: Path) -> tuple[Path, Path]:
 
 def _fake_config(*, with_depends_on: bool) -> SimpleNamespace:
     return SimpleNamespace(
+        run_mode=RunMode.LIVE,
         depends_on=[SimpleNamespace(name="indexer")] if with_depends_on else [],
         collection_probes=[SimpleNamespace(name="probe")] if with_depends_on else [],
         gates=[],
@@ -615,13 +649,14 @@ def test_cli_resume_rejects_legacy_sink_before_resume_mutation_or_payload_access
         result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
 
     assert result.exit_code == 1
-    # The resume-mode switch precedes admission (elspeth-fc9906e398), so a
-    # sink without resume support is rejected by the supports_resume gate —
-    # still before any live-instance mutation, passphrase, or database access.
+    # The persisted run-mode guard reads Landscape before plugin construction;
+    # sink capability refusal still precedes any live-instance mutation.
     assert "does not support resume/append mode" in result.output.lower()
     sink.configure_for_resume.assert_not_called()
     resolve_passphrase.assert_not_called()
-    open_database.assert_not_called()
+    open_database.assert_called_once()
+    assert open_database.call_args.kwargs["read_only"] is True
+    assert open_database.call_args.kwargs["create_tables"] is False
     assert not (tmp_path / "payloads").exists()
 
 
@@ -648,6 +683,7 @@ def test_cli_resume_reissues_admission_for_post_resume_live_mode(tmp_path: Path)
             rows_processed=0,
             rows_succeeded=0,
             rows_failed=0,
+            collector_groups_failed=0,
             status=RunStatus.COMPLETED,
         )
 
@@ -758,6 +794,7 @@ def test_cli_resume_exit_code_reflects_terminal_status(
             rows_processed=2,
             rows_succeeded=1,
             rows_failed=1,
+            collector_groups_failed=0,
             status=RunStatus(terminal_status),
         )
 

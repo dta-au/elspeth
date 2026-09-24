@@ -43,15 +43,16 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
     from sqlalchemy import func, select
 
     from elspeth.core.landscape.schema import (
+        collector_group_failures_table,
         node_states_table,
         nodes_table,
         operations_table,
         rows_table,
         token_outcomes_table,
         tokens_table,
-        transform_errors_table,
         validation_errors_table,
     )
+    from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 
     run = factory.run_lifecycle.get_run(run_id)
     if run is None:
@@ -107,6 +108,11 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             or 0
         )
 
+        # A group failure is a structural verdict, not a failed-row error.
+        collector_groups_failed = conn.execute(
+            select(func.count()).select_from(collector_group_failures_table).where(collector_group_failures_table.c.run_id == run_id)
+        ).scalar_one()
+
         # Count validation errors
         validation_error_count = (
             conn.execute(
@@ -115,11 +121,12 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             or 0
         )
 
-        # Count transform errors
-        transform_error_count = (
-            conn.execute(select(func.count()).select_from(transform_errors_table).where(transform_errors_table.c.run_id == run_id)).scalar()
-            or 0
-        )
+        # Count tokens whose terminal outcome is a failure a transform error
+        # decided, not transform_errors rows: a row records an ATTEMPT, and a
+        # resumed attempt can fail again (another row) or succeed and deliver
+        # the row (a row for a token that never failed).
+        deciding = deciding_transform_errors((run_id,)).subquery()
+        transform_error_count = conn.execute(select(func.count(func.distinct(deciding.c.token_id)))).scalar_one()
 
         # Get outcome distribution. ADR-019 makes outcome path-aware:
         # outcome is TerminalOutcome.value or NULL, path is always populated.
@@ -171,6 +178,7 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             "source_loads": source_load_count,
             "sink_writes": sink_write_count,
             "runtime_preflights": runtime_preflight_count,
+            "collector_groups_failed": collector_groups_failed,
         },
         "errors": {
             "validation": validation_error_count,
@@ -374,6 +382,7 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
         transform_errors_table,
         validation_errors_table,
     )
+    from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 
     run = factory.run_lifecycle.get_run(run_id)
     if run is None:
@@ -396,18 +405,39 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
         )
         val_rows = conn.execute(val_by_node).fetchall()
 
-        # Transform errors by transform node using composite key
+        # Corruption guard over EVERY transform_errors row, not only the
+        # deciding ones counted below: a row naming no node is Tier-1
+        # corruption whether or not its token terminally failed, and gating
+        # the guard on the count would let such a row vanish silently.
+        orphaned_token_count = conn.execute(
+            select(func.count(func.distinct(transform_errors_table.c.token_id)))
+            .select_from(
+                transform_errors_table.outerjoin(
+                    nodes_table,
+                    (transform_errors_table.c.transform_id == nodes_table.c.node_id)
+                    & (transform_errors_table.c.run_id == nodes_table.c.run_id),
+                )
+            )
+            .where(transform_errors_table.c.run_id == run_id)
+            .where(nodes_table.c.node_id.is_(None))
+        ).scalar_one()
+
+        # Terminally failed tokens by the transform node whose error decided
+        # them. A transform_errors row records an ATTEMPT: a resumed attempt
+        # can fail again (another row) or succeed and deliver the row, and
+        # neither is a second failure or a failure at all.
+        deciding = deciding_transform_errors((run_id,)).subquery()
         trans_by_node = (
             select(
                 nodes_table.c.plugin_name,
-                func.count(transform_errors_table.c.error_id).label("count"),
+                func.count(func.distinct(deciding.c.token_id)).label("count"),
             )
-            .outerjoin(
-                nodes_table,
-                (transform_errors_table.c.transform_id == nodes_table.c.node_id)
-                & (transform_errors_table.c.run_id == nodes_table.c.run_id),
+            .select_from(
+                deciding.join(
+                    nodes_table,
+                    (deciding.c.transform_id == nodes_table.c.node_id) & (deciding.c.run_id == nodes_table.c.run_id),
+                )
             )
-            .where(transform_errors_table.c.run_id == run_id)
             .group_by(nodes_table.c.plugin_name)
         )
         trans_rows = conn.execute(trans_by_node).fetchall()
@@ -431,15 +461,13 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
     ]
 
     # Corruption guard: transform_errors always reference a transform node.
-    # A None plugin_name bucket means the outerjoin found no matching node row.
-    for row in trans_rows:
-        if row.plugin_name is None:
-            msg = (
-                f"Tier-1 corruption: {row.count} transform_errors row(s) reference "
-                f"transform_id(s) with no matching node in nodes table "
-                f"for run_id={run_id!r}"
-            )
-            raise AuditIntegrityError(msg)
+    if orphaned_token_count:
+        msg = (
+            f"Tier-1 corruption: transform_errors for {orphaned_token_count} token(s) reference "
+            f"transform_id(s) with no matching node in nodes table "
+            f"for run_id={run_id!r}"
+        )
+        raise AuditIntegrityError(msg)
 
     transform_summary = [{"transform_plugin": row.plugin_name, "count": row.count} for row in trans_rows]
 

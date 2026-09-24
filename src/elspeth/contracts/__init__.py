@@ -161,6 +161,7 @@ from elspeth.contracts.engine import (
     CommittedCoalesceResidual,
     CommittedCollect,
     PendingOutcome,
+    RecordedAggregationFailure,
     RetryPolicy,
 )
 from elspeth.contracts.enums import (
@@ -594,6 +595,7 @@ __all__ = [  # Grouped by category for readability
     "CommittedCoalesceResidual",
     "CommittedCollect",
     "PendingOutcome",
+    "RecordedAggregationFailure",
     "RetryPolicy",
     # payload_store
     "IntegrityError",

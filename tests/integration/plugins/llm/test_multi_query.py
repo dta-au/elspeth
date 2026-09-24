@@ -257,7 +257,7 @@ def mock_azure_openai_multi_query(
                 )
             ],
             model="gpt-4o",
-            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=20),
+            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=20, cost=0.001),
             model_dump=lambda *_args, **_kwargs: raw_response,
         )
 

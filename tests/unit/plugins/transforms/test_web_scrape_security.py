@@ -19,11 +19,14 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_mode import ReplaySSRFRequest
 from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.mock_audit import mock_item_audit_authority
@@ -63,8 +66,10 @@ class _RecordCallRecorder:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         assert token_usage == UNKNOWN_TOKEN_USAGE
+        assert source_call_id is None
         kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -231,6 +236,44 @@ def test_ssrf_blocks_cloud_metadata(transform, mock_ctx):
 
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
+
+
+def test_web_scrape_replay_uses_archived_pin_without_dns(transform, mock_ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.web_scrape as web_scrape_module
+
+    url = "https://example.com/image"
+    captured: list[SSRFSafeRequest] = []
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            return ReplaySSRFRequest(url, "93.184.216.34", "example.com", 443, "/image", "https", "example.com")
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> object:
+        raise AssertionError("DNS validation called during replay")
+
+    monkeypatch.setattr(web_scrape_module, "validate_url_for_ssrf", _dns_forbidden)
+    response = httpx.Response(
+        200,
+        content=b"binary",
+        headers={"content-type": "image/png"},
+        request=httpx.Request("GET", "https://93.184.216.34/image"),
+    )
+
+    def _fetch(safe: SSRFSafeRequest, _ctx: object) -> tuple[httpx.Response, str, None]:
+        captured.append(safe)
+        return response, url, None
+
+    monkeypatch.setattr(transform, "_fetch_url", _fetch)
+    mock_ctx.call_mode_session = _ReplaySession()
+    mock_ctx.run_mode = RunMode.REPLAY
+    mock_ctx.replay_from = "source-run"
+    result = transform.process(make_pipeline_row({"url": url}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+    assert captured[0].resolved_ip == "93.184.216.34"
 
 
 @respx.mock

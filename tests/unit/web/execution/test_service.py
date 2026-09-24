@@ -51,7 +51,7 @@ from elspeth.contracts.chargeable_admission import (
     ChargeableAdmissionRefused,
     QuotaDisposition,
 )
-from elspeth.contracts.enums import CreationModality, RunStatus
+from elspeth.contracts.enums import CreationModality, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -11318,6 +11318,16 @@ source:
 # ── Phase 2.2 propagation: _partial_completion_message ───────────────
 
 
+def test_structural_failure_message_names_group_count_without_row_claim() -> None:
+    from elspeth.web.execution.service import _structural_failure_message
+
+    msg = _structural_failure_message(rows_processed=1, collector_groups_failed=1)
+
+    assert "collector_groups_failed=1" in msg
+    assert "All rows either failed terminally" not in msg
+    assert "failure accounting" in msg
+
+
 class TestPartialCompletionMessage:
     """Sibling to ``_structural_failure_message`` for COMPLETED_WITH_FAILURES.
 
@@ -11351,11 +11361,26 @@ class TestPartialCompletionMessage:
             rows_failed=3,
             rows_routed_failure=1,
             rows_quarantined=2,
+            collector_groups_failed=1,
         )
         assert "rows_succeeded=7" in msg
         assert "rows_failed=3" in msg
         assert "rows_routed_failure=1" in msg
         assert "rows_quarantined=2" in msg
+        assert "collector_groups_failed=1" in msg
+
+    def test_structural_only_partial_failure_names_group_count(self) -> None:
+        from elspeth.web.execution.service import _partial_completion_message
+
+        msg = _partial_completion_message(
+            rows_succeeded=1,
+            rows_failed=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+            collector_groups_failed=1,
+        )
+        assert "collector_groups_failed=1" in msg
+        assert "rows_failed=0" in msg
 
     def test_points_at_user_visible_affordance_when_no_samples(self) -> None:
         """Without enrichment samples, the message must direct the operator to
@@ -11531,6 +11556,15 @@ class TestFailureSampleClientEgress:
                     "error_type": f"BadGzipFile: {_EGRESS_CANARY_PROVIDER}",
                 },
                 destination="discard",
+            )
+            # The row's terminal discard: the failure summary counts tokens
+            # whose terminal outcome a transform error decided.
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(factory, run.run_id),
+                ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="a" * 16,
             )
         return run.run_id
 

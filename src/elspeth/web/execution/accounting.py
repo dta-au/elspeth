@@ -15,6 +15,7 @@ from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, _NON_TERMINAL_PATHS, 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
+    collector_group_failures_table,
     rows_table,
     run_sources_table,
     runs_table,
@@ -294,6 +295,7 @@ def load_run_accounting_map_from_db(
         missing_terminal_outcomes = _zero_counts(present_run_ids)
         duplicate_terminal_outcomes = _zero_counts(present_run_ids)
         abandoned_tokens = _zero_counts(present_run_ids)
+        collector_groups_failed = _zero_counts(present_run_ids)
 
         source_name = func.coalesce(run_sources_table.c.source_name, rows_table.c.source_node_id).label("source_name")
         source_stmt = (
@@ -363,6 +365,14 @@ def load_run_accounting_map_from_db(
         )
         for run_id, count in conn.execute(emitted_stmt):
             emitted_tokens[str(run_id)] = int(count)
+
+        collector_failures_stmt = (
+            select(collector_group_failures_table.c.run_id, func.count().label("count"))
+            .where(collector_group_failures_table.c.run_id.in_(present_run_ids))
+            .group_by(collector_group_failures_table.c.run_id)
+        )
+        for run_id, count in conn.execute(collector_failures_stmt):
+            collector_groups_failed[str(run_id)] = int(count)
 
         terminal_stmt = (
             select(
@@ -550,6 +560,7 @@ def load_run_accounting_map_from_db(
                     quarantined=quarantined[run_id],
                     discarded=discarded[run_id],
                 ),
+                collector_groups_failed=collector_groups_failed[run_id],
                 integrity=RunAccountingIntegrity(
                     closure=closure,
                     missing_terminal_outcomes=missing_terminal_outcomes[run_id],

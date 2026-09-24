@@ -5,6 +5,7 @@ Single place that wires up loaders, database operations, and repository instance
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -412,6 +413,9 @@ class RecorderFactory:
     def __init__(self, db: LandscapeDB, *, payload_store: PayloadStore | None = None) -> None:
         self._db = db
         self._payload_store = payload_store
+        # Validated source-run snapshot passed from run admission to the
+        # executor. It is per-factory and never a persisted audit authority.
+        self.audited_sources: Mapping[str, object] | None = None
 
         # Database operations helper for reduced boilerplate
         ops = DatabaseOps(db)

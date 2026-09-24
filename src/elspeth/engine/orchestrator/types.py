@@ -210,6 +210,7 @@ class ExecutionCounters:
     rows_forked: int = 0
     rows_coalesced: int = 0
     rows_coalesce_failed: int = 0
+    collector_groups_failed: int = 0
     rows_expanded: int = 0
     rows_buffered: int = 0
     rows_diverted: int = 0
@@ -272,6 +273,7 @@ class ExecutionCounters:
             rows_forked=self.rows_forked,
             rows_coalesced=self.rows_coalesced,
             rows_coalesce_failed=self.rows_coalesce_failed,
+            collector_groups_failed=self.collector_groups_failed,
             rows_expanded=self.rows_expanded,
             rows_buffered=self.rows_buffered,
             rows_diverted=self.rows_diverted,

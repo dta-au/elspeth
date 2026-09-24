@@ -100,6 +100,7 @@ def _persist_blocked_collector_member(factory: RecorderFactory, processor: RowPr
     processor._scheduler.mark_blocked(
         member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
         expected_lease_owner=processor._scheduler_lease_owner,
@@ -114,6 +115,7 @@ def _persist_blocked_queue_hold(factory: RecorderFactory, processor: RowProcesso
     processor._scheduler.mark_blocked(
         member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=str(_COLLECTOR_NODE),
         barrier_key=None,
         expected_lease_owner=processor._scheduler_lease_owner,
@@ -225,18 +227,19 @@ def test_eof_loop_exits_once_the_real_collector_hold_settles(monkeypatch: pytest
 
     def _settling_intake(ctx: Any) -> list[Any]:
         calls["count"] += 1
-        processor._scheduler.mark_blocked_barrier_terminal(
-            barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
-            token_ids=("member-0",),
-            coordination_token=leader_coordination_token(factory, processor.run_id),
-        )
+        if calls["count"] == 1:
+            processor._scheduler.mark_blocked_barrier_terminal(
+                barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
+                token_ids=("member-0",),
+                coordination_token=leader_coordination_token(factory, processor.run_id),
+            )
         return []
 
     monkeypatch.setattr(processor, "run_barrier_intake", _settling_intake)
 
     _run_eof_flush(processor)
 
-    assert calls["count"] == 1
+    assert calls["count"] == 2
     assert processor.has_blocked_barrier_work() is False
 
 

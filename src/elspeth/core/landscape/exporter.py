@@ -50,6 +50,7 @@ from elspeth.contracts.export_records import (
     BatchExportRecord,
     BatchMemberExportRecord,
     CallExportRecord,
+    CollectorGroupFailureExportRecord,
     EdgeExportRecord,
     ExportRecord,
     GroupLossExportRecord,
@@ -118,6 +119,8 @@ class ExportReadModel(Protocol):
     def get_group_records_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]: ...
 
@@ -199,6 +202,9 @@ class RecorderFactoryExportReadModel:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self._factory.data_flow.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]:
         return self._factory.query.get_token_parents_for_tokens(token_ids)
@@ -951,6 +957,17 @@ class LandscapeExporter:
                 "adopted_epoch": group_loss.adopted_epoch,
             }
             yield group_loss_record
+
+        for failure in self._read_model.get_collector_group_failures_for_run(run_id):
+            failure_record: CollectorGroupFailureExportRecord = {
+                "record_type": "collector_group_failure",
+                "run_id": run_id,
+                "group_id": failure.group_id,
+                "collector_node_id": failure.collector_node_id,
+                "failure_reason": failure.failure_reason,
+                "recorded_at": failure.recorded_at.isoformat(),
+            }
+            yield failure_record
 
         yield from self._iter_batch_and_artifact_records(run_id)
 

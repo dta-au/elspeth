@@ -16,9 +16,9 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     nodes_table,
     token_outcomes_table,
-    transform_errors_table,
     validation_errors_table,
 )
+from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import DiscardStageSummary, DiscardSummary
 
@@ -96,16 +96,24 @@ def load_discard_summaries_from_db(
                 )
             )
 
+        # Tokens whose TERMINAL outcome is a transform-error discard, at the
+        # node whose error decided it (elspeth-5887fb7928 ruling: counts derive
+        # from terminal outcomes). A transform_errors row is one attempt's
+        # evidence: a resumed attempt can write another row for the same token,
+        # or succeed and deliver the row, and neither makes the token discarded
+        # twice or at all. deciding_transform_errors keeps one row per
+        # terminally failed token; a routed token (on_error names a sink)
+        # failed but was not discarded, and its deciding row names that sink.
+        deciding = deciding_transform_errors(run_ids).subquery()
         transform_query = (
             select(
-                transform_errors_table.c.run_id,
-                transform_errors_table.c.transform_id,
-                func.count().label("count"),
+                deciding.c.run_id,
+                deciding.c.transform_id,
+                func.count(func.distinct(deciding.c.token_id)).label("count"),
             )
-            .where(transform_errors_table.c.run_id.in_(run_ids))
-            .where(transform_errors_table.c.destination == DISCARD_DESTINATION)
-            .group_by(transform_errors_table.c.run_id, transform_errors_table.c.transform_id)
-            .order_by(transform_errors_table.c.run_id.asc(), transform_errors_table.c.transform_id.asc())
+            .where(deciding.c.destination == DISCARD_DESTINATION)
+            .group_by(deciding.c.run_id, deciding.c.transform_id)
+            .order_by(deciding.c.run_id.asc(), deciding.c.transform_id.asc())
         )
         for run_id, transform_id, count in conn.execute(transform_query):
             count_value = int(count)

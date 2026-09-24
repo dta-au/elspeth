@@ -73,6 +73,25 @@ Without the registration: a transform with `on_error="quarantine_sink"` would ca
 > only. The sink and aggregation-flush seams record and re-raise regardless of
 > tier; whether `AggregationSettings.on_error` means anything is open.
 
+> **Correction 2026-09-23 (elspeth-d2e3f29d10).** The open question in limit
+> (2) above is closed for RETURNED errors: `AggregationSettings.on_error` is now
+> wired. The DAG builder adds the aggregation's `__error_<name>__` DIVERT edge
+> (refusing an unknown sink), and when a batch transform returns
+> `TransformResult.error` the whole batch follows it — every buffered row to the
+> named sink as `(failure, on_error_routed)`, or `(failure,
+> quarantined_at_source)` under `discard` — with one DIVERT routing_event on the
+> flush node_state and one `transform_errors` row per member. It is closed for
+> an unregistered `PluginContractViolation` too (operator ruling 2026-09-23,
+> elspeth-5887fb7928 B2): one raised at the aggregation or collector flush
+> before anything is recorded — the buffered-input schema preflight, the batch
+> plugin itself, the result's canonical hashing or its output checks — fails
+> the whole batch exactly as a returned error does (at a collector, the group
+> fails). Three things still abort: a `TIER_1_ERRORS` subclass (registration
+> stays load-bearing), the batch-flush declaration cross-check (it records each
+> member's terminal before raising), and any other exception from the plugin.
+> The sink seam still records and re-raises. The 2026-08-21 correction above is
+> left as written; this note supersedes only its last clause.
+
 ### Audit-recording path
 
 `NodeStateGuard.__exit__` (L2 engine) now populates the new `ExecutionError.context` field (L0 contract) from `PluginContractViolation.to_audit_dict()` when the raised exception is a `PluginContractViolation` or subclass. The `isinstance` check is a Tier-2/Tier-1 boundary discriminator — not defensive programming — and it benefits every `PluginContractViolation` subclass that defines `to_audit_dict()`, not just the pass-through case. The full 9-key structured payload (transform, transform_node_id, run_id, row_id, token_id, static_contract, runtime_observed, divergence_set, exception_type) reaches the Landscape and is queryable via `json_extract(error_data, '$.context.<key>')`.

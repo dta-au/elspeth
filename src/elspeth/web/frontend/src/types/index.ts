@@ -756,6 +756,8 @@ export interface RunAccounting {
   sources: Record<string, RunAccountingSource>;
   tokens: RunAccountingTokens;
   routing: RunAccountingRouting;
+  /** Failed collector groups; counts groups, not rows or tokens. */
+  collector_groups_failed: number;
   integrity: RunAccountingIntegrity;
 }
 

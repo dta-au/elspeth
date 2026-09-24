@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from elspeth.contracts import AggregationResultMember, PipelineRow
+    from elspeth.contracts.audit import TokenRef
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
@@ -333,6 +334,16 @@ class NodeStateGuard:
                 f"{type(db_err).__name__}: {db_err}"
             ) from db_err
         except LandscapeRecordError as db_err:
+            # A verdict verb (complete_aggregation_failure,
+            # complete_collector_failure) may have committed this state
+            # terminal and then raised before returning — a lost
+            # acknowledgement. The state is then durably terminal, not OPEN:
+            # read it back and let the original exception stand rather than
+            # report a corruption that does not exist.
+            durable = self._execution.get_node_state(self.state_id)
+            if durable is not None and durable.status in _GUARD_TERMINAL_NODE_STATE_STATUSES:
+                self._terminal_persisted = True
+                return
             # Audit trail corruption (permanent OPEN state) is MORE critical than
             # the original exception. Raise AuditIntegrityError with both contexts.
             raise AuditIntegrityError(
@@ -487,6 +498,62 @@ class NodeStateGuard:
         except LandscapePostCommitError:
             self._terminal_persisted = True
             raise
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_failure(
+        self,
+        *,
+        batch_id: str,
+        coordination_token: CoordinationToken,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        members: Sequence[tuple[TokenRef, PipelineRow]],
+        reason: TransformErrorReason,
+        destination: str,
+        divert_edge_id: str | None,
+        duration_ms: float,
+    ) -> None:
+        """Record the batch's FAILED verdict — node, batch, transform_errors and DIVERT — atomically."""
+        self._execution.complete_aggregation_failure(
+            batch_id=batch_id,
+            coordination_token=coordination_token,
+            aggregation_node_id=aggregation_node_id,
+            state_id=self.state_id,
+            trigger_type=trigger_type,
+            members=members,
+            reason=reason,
+            destination=destination,
+            divert_edge_id=divert_edge_id,
+            duration_ms=duration_ms,
+        )
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_collector_failure(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        group_id: str,
+        collector_node_id: str,
+        failure_reason: str,
+        flush_error: ExecutionError,
+        duration_ms: float,
+        member_holds: Sequence[tuple[TokenRef, str, float]],
+        hold_error: ExecutionError,
+    ) -> None:
+        """Record the collector group's FAILED verdict — this flush state and every member hold — atomically."""
+        self._execution.complete_collector_failure(
+            coordination_token=coordination_token,
+            group_id=group_id,
+            collector_node_id=collector_node_id,
+            failure_reason=failure_reason,
+            flush_state_id=self.state_id,
+            flush_error=flush_error,
+            flush_duration_ms=duration_ms,
+            member_holds=member_holds,
+            hold_error=hold_error,
+        )
         self._terminal_persisted = True
         self._completed = True
 

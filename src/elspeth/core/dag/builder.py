@@ -1470,11 +1470,13 @@ def build_execution_graph(
 
     # rule 9 (spec §7): on_error may target the ENCLOSING bound region's
     # closer, not only a sink. closer_name_to_node collects every legal
-    # closer name (coalesce/row_union/collector) so the two error-edge loops
-    # below can recognize a closer-shaped on_error and DEFER it — region
-    # membership is not known yet (compute_bound_regions runs later, after
-    # these loops) — rather than misclassifying it as an unknown sink.
-    # Resolved after region computation, below.
+    # closer name (coalesce/row_union/collector) so the transform and gate
+    # error-edge loops below can recognize a closer-shaped on_error and DEFER
+    # it — region membership is not known yet (compute_bound_regions runs
+    # later, after these loops) — rather than misclassifying it as an unknown
+    # sink. Resolved after region computation, below. The third loop
+    # (aggregations) never defers: rule 6 bans aggregations inside every
+    # bound region, so a closer-named aggregation on_error is an unknown sink.
     closer_name_to_node: dict[str, NodeID] = {
         **{str(name): nid for name, nid in coalesce_ids.items()},
         **{str(name): nid for name, nid in row_union_ids.items()},
@@ -1530,6 +1532,37 @@ def build_execution_graph(
             config_gate_ids[GateName(gate_config.name)],
             sink_ids[SinkName(gate_on_error)],
             label=error_edge_label(gate_config.name),
+            mode=RoutingMode.DIVERT,
+        )
+
+    # Aggregation batch-error edges (elspeth-d2e3f29d10). Structural DIVERT
+    # markers like the transform/gate edges above: when a flush fails, the
+    # processor routes every buffered input token of the batch to this sink
+    # as ON_ERROR_ROUTED, and the executor records the DIVERT routing_event
+    # on the flush node_state. No rule-9 closer deferral: rule 6
+    # (validate_no_aggregations_in_regions) bans aggregations inside every
+    # bound region, so a closer-named on_error falls through to the
+    # unknown-sink error. on_error is NOT part of the aggregation node config
+    # (node identity): the edges row is the audit record of the route. The
+    # edge IS hashed into the full topology hash, so a named route changes it
+    # (and a checkpoint taken without the edge is refused); discard does not.
+    for agg_name, (_agg_transform, agg_settings) in aggregations.items():
+        agg_on_error = agg_settings.on_error
+        if agg_on_error == "discard":
+            continue
+        if SinkName(agg_on_error) not in sink_ids:
+            suggestions = _suggest_similar(agg_on_error, sorted(str(s) for s in sink_ids))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Aggregation '{agg_settings.name}' on_error '{agg_on_error}' references unknown sink.{hint} "
+                f"Available sinks: {', '.join(sorted(str(s) for s in sink_ids))}",
+                component_id=agg_settings.name,
+                component_type="aggregation",
+            )
+        graph.add_edge(
+            aggregation_ids[AggregationName(agg_name)],
+            sink_ids[SinkName(agg_on_error)],
+            label=error_edge_label(agg_settings.name),
             mode=RoutingMode.DIVERT,
         )
 

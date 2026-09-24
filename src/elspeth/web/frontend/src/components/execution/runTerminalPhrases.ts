@@ -101,6 +101,7 @@ export const RUN_ACCOUNTING_LABELS = {
   tokensPending: "Tokens pending",
   tokensAbandoned: "Tokens abandoned",
   rowsDiscarded: "Rows discarded",
+  collectorGroupsFailed: "Collector groups failed",
   auditClosure: "Audit closure",
   missingTerminal: "Missing terminal",
   duplicateTerminal: "Duplicate terminal",

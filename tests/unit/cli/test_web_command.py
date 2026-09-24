@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,12 +24,20 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import auth_events_table
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.models import AccessPending
+from elspeth.web.config import settings_from_env
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.unit.web.auth.conftest import build_local_auth_provider
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _restore_web_command_environment() -> Iterator[None]:
+    """The CLI bridges web options through process environment variables."""
+    with patch.dict(os.environ, os.environ.copy(), clear=True):
+        yield
 
 
 @dataclass(frozen=True)
@@ -146,6 +155,57 @@ class TestWebCommandAuthBridging:
     is tested in tests/unit/web/test_config.py at the WebSettings level.
     """
 
+    @pytest.mark.parametrize(
+        ("provider", "provider_settings"),
+        [
+            ("entra", {"ELSPETH_WEB__ENTRA_TENANT_ID": "00000000-0000-0000-0000-000000000001"}),
+            ("oidc", {"ELSPETH_WEB__SSO_ISSUER": "https://identity.example.test/tenant"}),
+        ],
+    )
+    def test_env_configured_sso_reaches_app_factory(self, provider: str, provider_settings: dict[str, str]) -> None:
+        """An SSO deployment without --auth must retain the provider from its environment."""
+        captured_auth: list[str] = []
+
+        def capture_settings(*args: object, **kwargs: object) -> None:
+            captured_auth.append(settings_from_env().auth_provider)
+
+        uvicorn = FakeUvicornModule(side_effect=capture_settings)
+        environment = {
+            "ELSPETH_WEB__AUTH_PROVIDER": provider,
+            "ELSPETH_WEB__SSO_CLIENT_ID": "test-client",
+            "ELSPETH_WEB__SSO_CLIENT_SECRET": "test-client-secret",
+            "ELSPETH_WEB__SSO_TRANSACTION_SECRET": "0" * 64,
+            "ELSPETH_WEB__PUBLIC_BASE_URL": "https://elspeth.example.test",
+            "ELSPETH_WEB__COMPARTMENT_ID": "test-compartment",
+            "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY": "1000",
+            "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES": "1048576",
+            "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+            "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+            "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+            "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+            "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+            **provider_settings,
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
+
+        assert result.exit_code == 0, result.output
+        assert captured_auth == [provider]
+
+    def test_explicit_auth_overrides_environment(self) -> None:
+        """The CLI flag retains precedence when an operator deliberately selects a provider."""
+        captured_auth: list[str] = []
+
+        def capture_env(*args: object, **kwargs: object) -> None:
+            captured_auth.append(os.environ["ELSPETH_WEB__AUTH_PROVIDER"])
+
+        uvicorn = FakeUvicornModule(side_effect=capture_env)
+        with patch.dict(os.environ, {"ELSPETH_WEB__AUTH_PROVIDER": "entra"}, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web", "--auth", "local"])
+
+        assert result.exit_code == 0, result.output
+        assert captured_auth == ["local"]
+
     def test_auth_provider_bridged_to_env_var(self) -> None:
         """--auth=oidc sets ELSPETH_WEB__AUTH_PROVIDER for create_app()."""
         import os
@@ -162,7 +222,7 @@ class TestWebCommandAuthBridging:
         assert captured_env["auth"] == "oidc"
 
     def test_default_auth_bridged_as_local(self) -> None:
-        """Default --auth=local sets ELSPETH_WEB__AUTH_PROVIDER=local."""
+        """Without a CLI flag or environment setting, local auth remains the default."""
         import os
 
         captured_env: dict[str, str] = {}
@@ -171,8 +231,8 @@ class TestWebCommandAuthBridging:
             captured_env["auth"] = os.environ.get("ELSPETH_WEB__AUTH_PROVIDER", "")
 
         uvicorn = FakeUvicornModule(side_effect=capture_env)
-        with patch.dict("sys.modules", {"uvicorn": uvicorn}):
-            result = runner.invoke(app, ["web", "--auth", "local"])
+        with patch.dict(os.environ, {}, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
 
         assert result.exit_code == 0
         assert captured_env["auth"] == "local"

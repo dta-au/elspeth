@@ -22,7 +22,12 @@ from pydantic import ConfigDict
 from elspeth.contracts import PluginSchema, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    OrchestrationInvariantError,
+    PluginContractViolation,
+    SinkTransactionalInvariantError,
+)
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
@@ -82,6 +87,18 @@ class _StrictAssembledSchema(PluginSchema):
     assembled: bool
 
 
+class _DeclaresAssembledSchema(PluginSchema):
+    """An output schema that DECLARES `assembled` (as an int) and admits the rest."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
+
+    assembled: int
+
+
+# Beyond the JSON safe integer range (2**53 - 1): canonical JSON refuses it.
+_NON_CANONICAL_INT = 1152921504606859321
+
+
 class _SpanFactorySentinel:
     """Unused by CollectorExecutor's shown behaviour — stored, never invoked."""
 
@@ -97,6 +114,12 @@ class _FakeCollectorTransform:
     # unaffected; a test that wants the preflight to BITE swaps in a strict one.
     input_schema: type[PluginSchema] = _EngineTestSchema
     output_schema: type[PluginSchema] = _EngineTestSchema
+    # The declared presence requirement the flush preflight enforces (R1); a
+    # test that wants the presence check to BITE sets a field name here.
+    declared_required_columns: frozenset[str] = frozenset()
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        return self.declared_required_columns
 
     def __init__(self, name: str = "recording_stitch") -> None:
         self.name = name
@@ -105,6 +128,9 @@ class _FakeCollectorTransform:
         self.return_zero_rows = False
         self.return_error = False
         self.echo_rows = False
+        # The value emitted under ``assembled``; a test swaps in a value canonical
+        # JSON refuses (an int beyond 2**53) to arm the flush's output hash.
+        self.emit_assembled: Any = True
         self.raise_on_process: BaseException | None = None
         self.seen_rows: list[dict[str, Any]] = []
         self.call_count = 0
@@ -145,7 +171,7 @@ class _FakeCollectorTransform:
             out_rows = tuple(rows)
         else:
             contract = rows[0].contract
-            out_rows = (PipelineRow({"assembled": True, "count": len(rows)}, contract),)
+            out_rows = (PipelineRow({"assembled": self.emit_assembled, "count": len(rows)}, contract),)
         return TransformResult.success_multi(out_rows, success_reason=success_reason)
 
 
@@ -169,7 +195,7 @@ class _EnvExecutor:
         )
 
     def notify_empty_group(self, collector_name: str, group_id: str) -> CollectorOutcome:
-        return self._executor.notify_empty_group(collector_name, group_id)
+        return self._executor.notify_empty_group(collector_name, group_id, self._default_ctx)
 
     def has_recorded_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
         return self._executor.has_recorded_member_loss(collector_name, group_id, member_key)
@@ -462,6 +488,27 @@ class _CollectorEnv:
         parsed = json.loads(row["error_json"])
         assert isinstance(parsed, dict)
         return parsed
+
+    def failed_flush_state_errors(self, *, node: str, member_token_ids: set[str]) -> list[dict[str, Any]]:
+        """The parsed error_json of every FAILED state at the collector node that is
+        NOT a member's own hold — i.e. the opener-anchored flush guard state(s)."""
+        import json
+
+        from sqlalchemy import select
+
+        assert node == "stitch"
+        with self.db.connection() as conn:
+            rows = (
+                conn.execute(
+                    select(node_states_table.c.token_id, node_states_table.c.error_json)
+                    .where(node_states_table.c.run_id == self.run_id)
+                    .where(node_states_table.c.node_id == str(self.node_id))
+                    .where(node_states_table.c.status == "failed")
+                )
+                .mappings()
+                .all()
+            )
+        return [json.loads(row["error_json"]) for row in rows if row["token_id"] not in member_token_ids]
 
     def node_state_error_exception_for_token(self, *, node: str, token_id: str) -> str:
         """The error_json['exception'] text for THIS token's own hold state —
@@ -869,12 +916,17 @@ class TestFlush:
             env.executor.accept(members[1], "stitch")
 
     def test_success_with_neither_row_nor_rows_is_a_contract_violation(self, collector_env: _CollectorEnv) -> None:
-        # aggregation.py:527-532 guard, replicated with the same semantics.
+        # aggregation.py's guard, replicated with the same semantics: a Tier-2
+        # violation that fails the group (operator ruling 2026-09-23, B2).
         env = collector_env
         env.transform.return_empty_success = True
         members, _group_id = env.seed_group(count=1)
-        with pytest.raises(PluginContractViolation, match="neither row nor rows"):
-            env.executor.accept(members[0], "stitch")
+        outcome = env.executor.accept(members[0], "stitch")
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.released_tokens == ()
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "PluginContractViolation"
+        assert "neither row nor rows" in flush_error["exception"]
 
     def test_passthrough_quarantine_goes_through_ordinary_transform_mode_handling(self, collector_env: _CollectorEnv) -> None:
         # Collectors are transform-only; a plugin returning per-row passthrough
@@ -912,6 +964,9 @@ class TestFlush:
             assert env.transform.call_count == 0
             assert outcome.closed_without_plugin == "empty_expansion"
             assert (outcome.failure_reason == "empty_expansion") is expect_failure
+            assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == int(expect_failure)
+            env.executor.notify_empty_group("stitch", group_id)
+            assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == int(expect_failure)
 
     def test_all_members_lost_best_effort_closes_without_plugin(self, best_effort_env: _CollectorEnv) -> None:
         env = best_effort_env
@@ -921,6 +976,15 @@ class TestFlush:
         assert outcome is not None
         assert outcome.closed_without_plugin == "all_members_lost"
         assert env.transform.call_count == 0
+
+    def test_all_members_lost_require_all_records_one_group_failure(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        assert env.executor.notify_member_lost("stitch", group_id, members[0].token_id, "quarantined") is None
+        outcome = env.executor.notify_member_lost("stitch", group_id, members[1].token_id, "quarantined")
+        assert outcome is not None and outcome.failure_reason == "collector_missing_members"
+        assert outcome.consumed_tokens == ()
+        assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == 1
 
     def test_plugin_emitting_zero_rows_flushes_the_contract_guard_and_mints_an_empty_release_durably(
         self, collector_env: _CollectorEnv
@@ -966,7 +1030,9 @@ class TestFlushContractPreflight:
     merely missing a diagnostic.
     """
 
-    def test_buffered_row_violating_the_declared_input_contract_raises(self, collector_env: _CollectorEnv) -> None:
+    def test_buffered_row_violating_the_declared_input_contract_fails_the_group(self, collector_env: _CollectorEnv) -> None:
+        """The violation fails the WHOLE group, as a returned error would, and the
+        run goes on (operator ruling 2026-09-23, elspeth-5887fb7928 B2)."""
         env = collector_env
         # The closer admits `assembled` only, so the arriving member `{"item": 0}`
         # carries a forbidden extra AND misses a required field — the same shape
@@ -974,26 +1040,35 @@ class TestFlushContractPreflight:
         env.transform.input_schema = _StrictAssembledSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation, match=r"Collector transform .* input validation failed for buffered row 0"):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
+        assert outcome.held is False
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert outcome.released_tokens == ()
         # The plugin must never have seen the violating row — preflight, not postmortem.
         assert env.transform.call_count == 0
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "PluginContractViolation"
+        assert flush_error["exception"].startswith("Collector transform ")
+        assert "input validation failed for buffered row 0: " in flush_error["exception"]
+        # The member's own hold is closed with the group cause, not left OPEN.
+        member_error = env.node_state_error_for_token(node="stitch", token_id=members[0].token_id)
+        assert member_error["context"]["failure_reason"] == "collector_contract_violation"
 
     def test_the_preflight_failure_is_audited_against_the_flush_phase(self, collector_env: _CollectorEnv) -> None:
-        # Raised INSIDE the NodeStateGuard, so the flush state auto-fails and
-        # the violation is recorded rather than escaping unattributed. Same
-        # phase the plugin-exception case records.
+        # Recorded on the flush state, in the same phase the plugin-exception
+        # case records, rather than escaping unattributed.
         env = collector_env
         env.transform.input_schema = _StrictAssembledSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
-        assert env.latest_node_state_error_phase(node="stitch") == "collector_flush"
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["phase"] == "collector_flush"
 
-    def test_emitted_row_violating_the_declared_output_contract_raises(self, collector_env: _CollectorEnv) -> None:
+    def test_emitted_row_violating_the_declared_output_contract_fails_the_group(self, collector_env: _CollectorEnv) -> None:
         # The OUTPUT half. The audit lane could only ARGUE this one, because it
         # could not author a plugin that violates its own output schema without
         # writing one — which is exactly what a stand-in transform is for.
@@ -1001,11 +1076,72 @@ class TestFlushContractPreflight:
         env.transform.output_schema = _StrictItemSchema
         members, _group_id = env.seed_group(count=1)
 
-        with pytest.raises(PluginContractViolation, match=r"Collector transform .* output validation failed for emitted row 0"):
-            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
 
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.released_tokens == ()
         # The plugin DID run — this is postflight, unlike the input case above.
         assert env.transform.call_count == 1
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert "output validation failed for emitted row 0: " in flush_error["exception"]
+
+    @pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+    def test_emitted_non_canonical_output_fails_the_group_naming_no_value(self, collector_env: _CollectorEnv, declared: bool) -> None:
+        """The rows to release must canonicalize, as at the aggregation and per-row seams.
+
+        Released, the value would end the run at the next node's input hash. The
+        violation comes from the shared value-free builder: it names the field
+        only when the output schema declares it, and never the value.
+        """
+        env = collector_env
+        env.transform.emit_assembled = _NON_CANONICAL_INT
+        if declared:
+            env.transform.output_schema = _DeclaresAssembledSchema
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        outcome = env.executor.accept(members[1], "stitch", ctx=env.ctx)
+
+        assert outcome.held is False
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert outcome.released_tokens == ()
+        assert env.transform.call_count == 1
+        member_ids = {member.token_id for member in members}
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids=member_ids)
+        location = "emitted row 0 field 'assembled'" if declared else "emitted row 0, in a field its output schema does not declare"
+        assert flush_error["type"] == "PluginContractViolation"
+        assert flush_error["phase"] == "collector_flush"
+        assert flush_error["exception"].startswith(
+            f"Collector transform 'recording_stitch' emitted non-canonical data at {location} (IntegerDomainError). "
+        )
+        member_errors = [env.node_state_error_for_token(node="stitch", token_id=token_id) for token_id in sorted(member_ids)]
+        assert {error["context"]["failure_reason"] for error in member_errors} == {"collector_contract_violation"}
+        assert str(_NON_CANONICAL_INT) not in repr([flush_error, *member_errors])
+
+    def test_a_contract_violation_raised_by_the_plugin_fails_the_group(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        env.transform.raise_on_process = PluginContractViolation("plugin rejected row 0")
+        members, _group_id = env.seed_group(count=1)
+
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        assert outcome.failure_reason == "collector_contract_violation"
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["exception"] == "plugin rejected row 0"
+
+    def test_a_tier_1_contract_violation_still_aborts(self, collector_env: _CollectorEnv) -> None:
+        """``SinkTransactionalInvariantError`` is a PluginContractViolation AND Tier 1;
+        registration opts it out of the group-failure arm (ADR-008)."""
+        env = collector_env
+        env.transform.raise_on_process = SinkTransactionalInvariantError("commit boundary diverged")
+        members, _group_id = env.seed_group(count=1)
+
+        with pytest.raises(SinkTransactionalInvariantError, match="commit boundary diverged"):
+            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["type"] == "SinkTransactionalInvariantError"
 
     def test_a_conforming_group_still_flushes_under_the_same_locked_contract(self, collector_env: _CollectorEnv) -> None:
         """The paired control, and it must use a LOCKED schema too.
@@ -1023,6 +1159,36 @@ class TestFlushContractPreflight:
 
         assert outcome.held is False
         assert env.transform.call_count == 1
+
+    @pytest.mark.parametrize(("declared", "fails"), [("score", True), ("item", False)], ids=["absent", "present-control"])
+    def test_a_member_omitting_a_declared_required_field_fails_the_group(
+        self, collector_env: _CollectorEnv, declared: str, fails: bool
+    ) -> None:
+        """elspeth-5887fb7928 R1: the permissive model cannot see the declaration; the presence check does.
+
+        Before, the plugin's own ``row[field]`` raised KeyError and the run
+        ended. The control declares a field every member carries, so the check
+        must discriminate rather than fail every group.
+        """
+        env = collector_env
+        env.transform.declared_required_columns = frozenset({declared})
+        members, _group_id = env.seed_group(count=1)
+
+        outcome = env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        if not fails:
+            assert outcome.failure_reason is None
+            assert env.transform.call_count == 1
+            return
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert outcome.consumed_tokens == tuple(members)
+        assert env.transform.call_count == 0
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
+        assert flush_error["phase"] == "collector_flush"
+        assert flush_error["exception"] == (
+            "Collector transform 'recording_stitch' input validation failed for buffered row 0: "
+            "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+        )
 
 
 def test_collector_flush_plugin_exception_autofails_with_phase(collector_env: _CollectorEnv) -> None:

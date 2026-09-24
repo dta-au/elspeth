@@ -64,7 +64,13 @@ module "scenario" {
   gateway_adapter_fingerprint            = var.gateway_adapter_fingerprint
   gateway_upstream_origin                = var.gateway_upstream_origin
   gateway_oauth_token_url                = var.gateway_oauth_token_url
+  gateway_oauth_auth_method              = var.gateway_oauth_auth_method
   gateway_model_mappings_json            = var.gateway_model_mappings_json
+  gateway_max_messages                   = var.gateway_max_messages
+  gateway_max_tools                      = var.gateway_max_tools
+  gateway_max_string_chars               = var.gateway_max_string_chars
+  gateway_max_schema_bytes               = var.gateway_max_schema_bytes
+  gateway_max_schema_depth               = var.gateway_max_schema_depth
 }
 
 # R2-D3 (elspeth-a229c247a1): ECS's service-linked role re-creates the

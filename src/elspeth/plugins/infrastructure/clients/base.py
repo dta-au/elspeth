@@ -165,6 +165,7 @@ class AuditedClientBase:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         llm_call_attempt: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record a call under the configured audit parent.
 
@@ -188,8 +189,9 @@ class AuditedClientBase:
                 latency_ms=latency_ms,
                 approved_prompt_artifact_hash=approved_prompt_artifact_hash,
                 token_usage=token_usage,
+                source_call_id=source_call_id,
             )
-            if call_type is CallType.LLM and self._llm_call_governance is not None:
+            if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
                 if llm_call_attempt is None:
                     raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
                 self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
@@ -209,8 +211,9 @@ class AuditedClientBase:
             latency_ms=latency_ms,
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
+            source_call_id=source_call_id,
         )
-        if call_type is CallType.LLM and self._llm_call_governance is not None:
+        if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
             if llm_call_attempt is None:
                 raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
             self._llm_call_governance.after_call(llm_call_attempt, call.call_id)

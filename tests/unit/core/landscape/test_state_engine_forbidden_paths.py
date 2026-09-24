@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts import (
     AggregationResultMember,
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
     NodeType,
     OutputMode,
@@ -37,6 +38,7 @@ from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipTo
 from elspeth.contracts.enums import AggregationMemberAction
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    ExecutionError,
     RunLeadershipLostError,
     RunMembershipLostError,
 )
@@ -54,10 +56,12 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
+    group_records_table,
     run_coordination_table,
     run_workers_table,
     token_work_items_table,
 )
+from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.tree_gate import iter_gate_sources
@@ -178,6 +182,7 @@ def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierE
     return repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
+        row_payload_json=PAYLOAD,
         queue_key="queue-a",
         barrier_key=None,
         expected_lease_owner=WRONG_OWNER,
@@ -708,6 +713,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "fork_token",
         "record_call",
         "record_call_payload_refs",
+        "record_verification_decision",
         "record_routing_events",
         "record_token_outcome",
         "record_transform_error",
@@ -721,8 +727,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "claim_ready",
         "coalesce_tokens",
         "collect_tokens",
+        "complete_aggregation_failure",
         "complete_aggregation_result",
         "complete_batch",
+        "complete_collector_failure",
         "complete_node_state",
         "complete_operation",
         "create_batch",
@@ -871,6 +879,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_call_recording.py",
             "test_f10_call_payload_refs_refuse_reclaimed_item",
         ),
+        "record_verification_decision": (
+            "tests/unit/core/landscape/test_call_mode_persistence.py",
+            "test_verification_decision_requires_current_live_leader_before_write",
+        ),
         "record_routing_events": (
             "tests/unit/core/landscape/test_node_state_recording.py",
             "test_f10_routing_events_refuse_reclaimed_item",
@@ -914,11 +926,19 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         ),
         "coalesce_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_coalesce_materialization_is_leader_fenced"),
         "collect_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_collector_release_is_leader_fenced"),
+        "complete_aggregation_failure": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_aggregation_failure_requires_current_leader",
+        ),
         "complete_aggregation_result": (
             "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
             "test_f10_aggregation_result_requires_current_leader",
         ),
         "complete_batch": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_batch"),
+        "complete_collector_failure": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_collector_failure_requires_current_leader",
+        ),
         "complete_node_state": (
             "tests/unit/core/landscape/test_execution_authority.py",
             "test_departed_member_cannot_begin_or_complete_state",
@@ -1379,6 +1399,109 @@ def test_f10_aggregation_result_requires_current_leader(harness: _Harness, stale
         completed_batch = execution.get_batch(batch.batch_id)
         assert completed_state is not None and completed_state.status is NodeStateStatus.COMPLETED
         assert completed_batch is not None and completed_batch.status is BatchStatus.COMPLETED
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_aggregation_failure_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    """A batch's FAILED verdict (transform_errors + state + batch, one transaction) needs the current leader."""
+    register_test_node(harness.factory.data_flow, RUN_ID, "aggregation-1", node_type=NodeType.AGGREGATION)
+    _, token_id, _ = _enqueue(harness, "aggregation-member", 0)
+    execution = harness.factory.execution
+    state = execution.begin_node_state(token_id, "aggregation-1", 1, {"value": 1}, member_token=harness.coordination_token.membership)
+    batch = execution.create_batch("aggregation-1", coordination_token=harness.coordination_token)
+    with fenced_leader_transaction(
+        harness.db.engine, token=harness.coordination_token, window_seconds=300, verb="test_aggregation_failure_setup"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token_id, ordinal=0, expected_run_id=RUN_ID)
+        record_buffered_outcome_guarded(conn, run_id=RUN_ID, token_id=token_id, batch_id=batch.batch_id, recorded_at=datetime.now(UTC))
+    execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING, coordination_token=harness.coordination_token)
+
+    def record_verdict() -> None:
+        execution.complete_aggregation_failure(
+            batch_id=batch.batch_id,
+            coordination_token=harness.coordination_token,
+            aggregation_node_id="aggregation-1",
+            state_id=state.state_id,
+            trigger_type=TriggerType.END_OF_SOURCE,
+            members=((TokenRef(token_id=token_id, run_id=RUN_ID), make_pipeline_row({"value": 1})),),
+            reason={"reason": "batch_failed", "error": "flush failed"},
+            destination="discard",
+            divert_edge_id=None,
+            duration_ms=1.0,
+        )
+
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            record_verdict()
+        assert raised.value.verb == "complete_aggregation_failure"
+        _assert_only_fence_refusal(harness, before, verb="complete_aggregation_failure")
+    else:
+        record_verdict()
+        failed_state = execution.get_node_state(state.state_id)
+        failed_batch = execution.get_batch(batch.batch_id)
+        assert failed_state is not None and failed_state.status is NodeStateStatus.FAILED
+        assert failed_batch is not None and failed_batch.status is BatchStatus.FAILED
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    """A collector group's FAILED verdict (flush state + every member hold, one transaction) needs the current leader."""
+    register_test_node(harness.factory.data_flow, RUN_ID, "collector-1", node_type=NodeType.COLLECTOR)
+    execution = harness.factory.execution
+    member = harness.coordination_token.membership
+    _, opener_id, _ = _enqueue(harness, "collector-opener", 0)
+    _, first_id, _ = _enqueue(harness, "collector-member-a", 1)
+    _, second_id, _ = _enqueue(harness, "collector-member-b", 2)
+    with harness.db.engine.begin() as conn:
+        conn.execute(
+            insert(group_records_table).values(
+                run_id=RUN_ID,
+                group_id="g-1",
+                kind=FrameKind.EXPAND.value,
+                opener_token_id=opener_id,
+                member_count=2,
+                created_at=NOW,
+            )
+        )
+    flush = execution.begin_node_state(opener_id, "collector-1", 1, {"batch_rows": []}, member_token=member)
+    holds = [
+        execution.begin_node_state(token_id, "collector-1", 1, {"value": 1}, member_token=member) for token_id in (first_id, second_id)
+    ]
+    hold_error = ExecutionError(
+        exception="Collector group 'g-1' failed (collector_transform_error)",
+        exception_type="CollectorGroupFailure",
+        phase="collector_flush",
+        context={"failure_reason": "collector_transform_error", "lost_members": [], "member_disposition": "scope_group_failed"},
+    )
+
+    def record_verdict() -> None:
+        execution.complete_collector_failure(
+            coordination_token=harness.coordination_token,
+            group_id="g-1",
+            collector_node_id="collector-1",
+            failure_reason="collector_transform_error",
+            flush_state_id=flush.state_id,
+            flush_error=ExecutionError(exception="{'reason': 'deliberate'}", exception_type="TransformError"),
+            flush_duration_ms=1.0,
+            member_holds=tuple(
+                (TokenRef(token_id=token_id, run_id=RUN_ID), hold.state_id, 1.0)
+                for token_id, hold in zip((first_id, second_id), holds, strict=True)
+            ),
+            hold_error=hold_error,
+        )
+
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            record_verdict()
+        assert raised.value.verb == "complete_collector_failure"
+        _assert_only_fence_refusal(harness, before, verb="complete_collector_failure")
+    else:
+        record_verdict()
+        for state_id in (flush.state_id, *(hold.state_id for hold in holds)):
+            failed = execution.get_node_state(state_id)
+            assert failed is not None and failed.status is NodeStateStatus.FAILED
 
 
 @pytest.mark.parametrize("status", ["departed", "evicted"])

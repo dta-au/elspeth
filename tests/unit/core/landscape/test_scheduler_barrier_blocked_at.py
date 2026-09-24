@@ -165,6 +165,7 @@ def _enqueue_and_block(
         repo.mark_blocked(
             member_token=WorkerMembershipToken(run_id=item.run_id, worker_id=f"{item.run_id}:w1"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=queue_key,
             barrier_key=barrier_key,
             expected_lease_owner=f"{run_id}:w1",
@@ -203,6 +204,7 @@ def test_mark_blocked_stamps_barrier_blocked_at() -> None:
     blocked = repo.mark_blocked(
         member_token=WorkerMembershipToken(run_id=item.run_id, worker_id=f"{item.run_id}:w1"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="agg-1",
         expected_lease_owner=f"{run_id}:w1",

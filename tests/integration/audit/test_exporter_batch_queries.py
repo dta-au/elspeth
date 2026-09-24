@@ -286,6 +286,7 @@ def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -
     factory.scheduler.mark_blocked(
         member_token=member,
         work_item_id=sink_item.work_item_id,
+        row_payload_json=sink_item.row_payload_json,
         queue_key=None,
         barrier_key=barrier_key,
         expected_lease_owner=member.worker_id,

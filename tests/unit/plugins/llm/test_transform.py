@@ -837,6 +837,44 @@ class TestTemplateTierPolicy:
         assert result.status == "error"
         assert result.reason["reason"] == "template_rendering_failed"
 
+    def test_render_error_reason_names_no_row_value(self) -> None:
+        """A lookup key computed from the row never reaches the reason (RAG-F1).
+
+        Before the shared renderer the reason quoted Jinja: ``Undefined
+        variable: '...PipelineRow object' has no attribute 'SENTINEL-llm-2b9d'``.
+        """
+        config = _make_config(prompt_template="{{ row[row.k] }}", required_input_fields=[])
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+
+        result = transform._process_row(_make_row({"text": "hello", "k": "SENTINEL-llm-2b9d"}), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "template_rendering_failed",
+            "error": (
+                "Undefined variable: 'elspeth.contracts.schema_contract.PipelineRow object' has no attribute "
+                "<a key the template does not spell out>"
+            ),
+            "template_hash": transform._template.template_hash,
+        }
+        mock_provider.execute_query.assert_not_called()
+
+    def test_multi_query_render_error_reason_names_no_row_value(self) -> None:
+        """The per-query template path renders through the same value-free renderer."""
+        config = _make_multi_query_config(required_input_fields=[])
+        config["queries"] = {
+            "quality": {"input_fields": {"text_content": "text", "key": "k"}, "template": "{{ row[row.key] }}"},
+        }
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+
+        result = transform._process_row(_make_row({"text": "hello", "k": "SENTINEL-llm-mq-6a0c"}), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "template_rendering_failed"
+        assert result.reason["error"] == "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>"
+        mock_provider.execute_query.assert_not_called()
+
 
 class TestMultiQueryPartialFailure:
     """Verify multi-query atomicity — partial failure discards all results."""
@@ -2478,11 +2516,13 @@ class TestMultiQueryParallelExecution:
             pool_size=4,
         )
         transform = LLMTransform(config)
-        call_count = [0]
 
         def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
-            call_count[0] += 1
-            if call_count[0] == 1:
+            # Concurrent calls can arrive in either order. Match the response
+            # to the output contract in the prompt sent for this query.
+            prompt = messages[-1].content
+            assert isinstance(prompt, str)
+            if '"label"' in prompt:
                 return LLMQueryResult(
                     content='{"score": 85, "label": "high"}',
                     usage=TokenUsage.known(10, 5),

@@ -39,7 +39,7 @@ def _make_chat_completion(content: str = '{"score": 85, "rationale": "test"}') -
         created=0,
         model="gpt-4o",
         object="chat.completion",
-        usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        usage=CompletionUsage.model_validate({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.001}),
     )
 
 

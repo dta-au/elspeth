@@ -19,6 +19,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.batch_lineage import recorded_failure_verdict_condition
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.model_loaders import BatchLoader, BatchMemberLoader
@@ -435,12 +436,18 @@ class BatchRepository:
         return [self._batch_loader.load(row) for row in rows]
 
     def get_incomplete_batches(self, run_id: str) -> list[Batch]:
-        """Get batches that need recovery (draft, executing, or failed).
+        """Get batches whose flush recovery must (re-)run.
 
         Used during crash recovery to find batches that were:
         - draft: Still collecting rows when crash occurred
         - executing: Mid-flush when crash occurred
-        - failed: Flush failed and needs retry
+        - failed without a recorded verdict: the flush died (the plugin
+          raised, or an earlier resume found it executing) — retried
+
+        A FAILED batch whose verdict is recorded
+        (``recorded_failure_verdict_condition``) is NOT incomplete: the verdict
+        is final, and resume completes its disposition from the recorded rows
+        instead of retrying the flush.
 
         Args:
             run_id: The run to query
@@ -453,6 +460,7 @@ class BatchRepository:
             select(batches_table)
             .where(batches_table.c.run_id == run_id)
             .where(batches_table.c.status.in_([BatchStatus.DRAFT, BatchStatus.EXECUTING, BatchStatus.FAILED]))
+            .where(~recorded_failure_verdict_condition())
             .order_by(batches_table.c.created_at.asc())
         )
         result = self._ops.execute_fetchall(query)
@@ -513,7 +521,9 @@ class BatchRepository:
             New or existing Batch with attempt = original.attempt + 1
 
         Raises:
-            ValueError: If original batch not found or not in failed status
+            AuditIntegrityError: If the original batch is not found, is not
+                FAILED, or carries a recorded FAILED verdict (final, never
+                retried: ``recorded_failure_verdict_condition``)
         """
         with fenced_leader_transaction(
             self._db.engine,
@@ -541,6 +551,14 @@ class BatchRepository:
             ).fetchone()
             if existing_row is not None:
                 return self._batch_loader.load(existing_row)
+            # A recorded FAILED verdict is final: resume completes its
+            # disposition from the recorded rows and never re-runs the flush.
+            if conn.execute(
+                select(batches_table.c.batch_id).where(batches_table.c.batch_id == batch_id).where(recorded_failure_verdict_condition())
+            ).first():
+                raise AuditIntegrityError(
+                    f"retry_batch: batch {batch_id} carries a recorded FAILED verdict, which is final — it is never retried"
+                )
 
             # 3. Create new batch
             new_batch_id = generate_id()

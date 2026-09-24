@@ -799,7 +799,7 @@ def test_direct_orchestrator_entry_rejects_before_fresh_or_resume_coordinator(op
     orchestrator = object.__new__(Orchestrator)
     orchestrator._run_lifecycle = MagicMock(spec=["run"])
     orchestrator._resume_coordinator = MagicMock(spec=["resume"])
-    config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={}, sink_effect_admission=None)
+    config = SimpleNamespace(config={}, sinks={"output": sink}, sink_effect_modes={}, sink_effect_admission=None)
 
     with pytest.raises(SinkEffectCapabilityError, match="effect protocol"):
         if operation == "run":

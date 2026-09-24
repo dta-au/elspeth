@@ -36,7 +36,7 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
-def test_epoch_is_forty() -> None:
+def test_epoch_is_forty_five() -> None:
     # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
     # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
     # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
@@ -49,7 +49,8 @@ def test_epoch_is_forty() -> None:
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
-    assert SQLITE_SCHEMA_EPOCH == 43
+    # Epoch 44 adds replay/verify evidence. Epoch 45 records collector-group failures.
+    assert SQLITE_SCHEMA_EPOCH == 45
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

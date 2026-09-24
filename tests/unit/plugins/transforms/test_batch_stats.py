@@ -16,6 +16,7 @@ import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.type_normalization import ALLOWED_CONTRACT_TYPES
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.testing import make_field, make_row
 from tests.fixtures.factories import make_context
@@ -24,11 +25,17 @@ from tests.fixtures.factories import make_context
 DYNAMIC_SCHEMA = {"mode": "observed"}
 
 
+def _observed_type(value: object) -> type:
+    """The field type OBSERVED inference records: a contract type, else object."""
+    if value is None or type(value) not in ALLOWED_CONTRACT_TYPES:
+        return object
+    return type(value)
+
+
 def _make_row(data: dict[str, Any]):
     """Create a PipelineRow with OBSERVED contract for testing."""
     fields = tuple(
-        make_field(key, type(value) if value is not None else object, original_name=key, required=False, source="inferred")
-        for key, value in data.items()
+        make_field(key, _observed_type(value), original_name=key, required=False, source="inferred") for key, value in data.items()
     )
     contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
     return make_row(data, contract=contract)
@@ -496,44 +503,123 @@ class TestBatchStatsGroupByRollups:
         assert rollups["returns"]["mean"] == 20.0
         assert rollups["returns"]["batch_size"] == 1
 
-    def test_distinct_group_keys_do_not_scan_every_prior_group(self, ctx: PluginContext) -> None:
-        """Distinct group_by values are partitioned without quadratic prior-group scans."""
+    def test_distinct_group_keys_do_not_scan_every_prior_group(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Distinct group_by values are partitioned without quadratic prior-group scans.
+
+        Group keys are scalars (anything else fails the batch), so the
+        comparisons are counted on the bucket KEY the partitioner hashes: a
+        list scan over prior groups would compare each new key with every
+        earlier one.
+        """
+        from elspeth.plugins.transforms import batch_stats
         from elspeth.plugins.transforms.batch_stats import BatchStats
 
-        class CountingGroupKey:
+        class CountingBucketKey:
             comparisons = 0
 
-            def __init__(self, value: int) -> None:
-                self.value = value
+            def __init__(self, key: tuple[type[object], object]) -> None:
+                self.key = key
 
             def __eq__(self, other: object) -> bool:
-                CountingGroupKey.comparisons += 1
-                return isinstance(other, CountingGroupKey) and self.value == other.value
+                CountingBucketKey.comparisons += 1
+                return isinstance(other, CountingBucketKey) and self.key == other.key
 
             def __hash__(self) -> int:
-                return hash(self.value)
+                return hash(self.key)
+
+        real_bucket_key = batch_stats.scalar_bucket_key
+        monkeypatch.setattr(batch_stats, "scalar_bucket_key", lambda value: CountingBucketKey(real_bucket_key(value)))
 
         transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "amount", "group_by": "category"})
         row_count = 64
-        group_values = [CountingGroupKey(row_index) for row_index in range(row_count)]
-        contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(
-                make_field("id", int, original_name="id", required=False, source="inferred"),
-                make_field("amount", float, original_name="amount", required=False, source="inferred"),
-                make_field("category", object, original_name="category", required=False, source="inferred"),
-            ),
-            locked=True,
-        )
-        rows = [
-            make_row({"id": row_index, "amount": 1.0, "category": group_values[row_index]}, contract=contract)
-            for row_index in range(row_count)
-        ]
+        group_values = [f"group-{row_index}" for row_index in range(row_count)]
+        rows = [_make_row({"id": row_index, "amount": 1.0, "category": group_values[row_index]}) for row_index in range(row_count)]
 
         grouped = transform._group_rows(rows)
 
         assert [group_value for group_value, _ in grouped] == group_values
-        assert CountingGroupKey.comparisons <= row_count
+        assert CountingBucketKey.comparisons <= row_count
+
+    @pytest.mark.parametrize(
+        ("group_values", "bad_row", "found"),
+        [
+            pytest.param(
+                [{"tenant": "SECRET-GROUP-A"}, "sales", "sales"],
+                0,
+                "mappingproxy",
+                id="json-object-in-row-0",
+            ),
+            pytest.param(
+                ["sales", "returns", {"tenant": "SECRET-GROUP-A"}],
+                2,
+                "mappingproxy",
+                id="json-object-in-a-later-row",
+            ),
+            pytest.param(
+                ["sales", [{"tenant": "SECRET-GROUP-A"}], "sales"],
+                1,
+                "tuple",
+                id="json-array-of-objects",
+            ),
+            pytest.param(
+                ["sales", ["SECRET-GROUP-A", "SECRET-GROUP-B"], "sales"],
+                1,
+                "tuple",
+                id="json-array-of-strings",
+            ),
+        ],
+    )
+    def test_non_scalar_group_key_fails_the_whole_batch_with_a_recorded_reason(
+        self,
+        ctx: PluginContext,
+        group_values: list[object],
+        bad_row: int,
+        found: str,
+    ) -> None:
+        """A group_by value that is not one scalar fails the WHOLE batch.
+
+        A JSON object is unhashable and used to escape ``process`` as a bare
+        ``TypeError`` (run abort, exit 4); an array is not a category. Either
+        one is a wrong-typed row at a reductive seam, so the batch fails with a
+        returned, non-retryable error naming the field, the expected and found
+        types, and the BATCH row index -- never the offending value.
+        """
+        from elspeth.plugins.transforms.batch_stats import BatchStats
+
+        transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "amount", "group_by": "category"})
+        rows = [_make_row({"id": row_index, "amount": 10.0, "category": group_value}) for row_index, group_value in enumerate(group_values)]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "category"
+        assert result.reason["expected"] == "a scalar group key"
+        assert result.reason["actual_type"] == found
+        assert f"in row {bad_row}" in result.reason["error"]
+        assert f"must be a scalar group key, got {found}" in result.reason["error"]
+        assert "SECRET-GROUP" not in repr(sorted(result.reason.items()))
+        assert "tenant" not in repr(sorted(result.reason.items()))
+
+    def test_none_group_key_stays_a_legal_bucket(self, ctx: PluginContext) -> None:
+        """None is a scalar group key: it is bucketed, not rejected by the scalar guard."""
+        from elspeth.plugins.transforms.batch_stats import BatchStats
+
+        transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "amount", "group_by": "category"})
+        rows = [
+            _make_row({"id": 1, "amount": 10.0, "category": None}),
+            _make_row({"id": 2, "amount": 20.0, "category": "sales"}),
+            _make_row({"id": 3, "amount": 30.0, "category": None}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert [(row["category"], row["sum"]) for row in result.rows] == [(None, 40.0), ("sales", 20.0)]
 
     def test_two_group_batch_emits_two_rollups(self, ctx: PluginContext) -> None:
         """Mixed group_by values emit one aggregate row per group."""
@@ -570,8 +656,72 @@ class TestBatchStatsGroupByRollups:
         assert result.reason is not None
         assert result.reason["reason"] == "all_non_finite"
         assert result.reason["group_by"] == "category"
-        assert result.reason["group_value"] == "sales"
         assert result.reason["skipped_non_finite_indices"] == [0]
+        # The group is named by field and first batch row, never by its value.
+        assert result.reason["error"] == "group 'category' first seen in row 0"
+        assert "group_value" not in result.reason
+        assert "sales" not in repr(sorted(result.reason.items()))
+
+    @pytest.mark.parametrize(
+        ("rows_data", "expected_reason", "first_row"),
+        [
+            pytest.param(
+                [
+                    {"id": 1, "amount": 1.0, "category": "returns"},
+                    {"id": 2, "amount": sys.float_info.max, "category": "SECRET-GROUP"},
+                    {"id": 3, "amount": sys.float_info.max, "category": "SECRET-GROUP"},
+                ],
+                {"reason": "float_overflow"},
+                1,
+                id="sum-overflow",
+            ),
+            pytest.param(
+                [
+                    {"id": 1, "amount": 1.0, "category": "returns"},
+                    {"id": 2, "amount": 10**1000, "category": "SECRET-GROUP"},
+                ],
+                {"reason": "float_overflow", "operation": "mean"},
+                1,
+                id="mean-overflow",
+            ),
+            pytest.param(
+                [
+                    {"id": 1, "amount": 1.0, "category": "returns"},
+                    {"id": 2, "amount": 2.0, "category": "returns"},
+                    {"id": 3, "amount": None, "category": "SECRET-GROUP"},
+                ],
+                {"reason": "validation_failed", "cause": "no_valid_values"},
+                2,
+                id="no-valid-values",
+            ),
+        ],
+    )
+    def test_group_error_names_the_group_without_its_value(
+        self,
+        ctx: PluginContext,
+        rows_data: list[dict[str, Any]],
+        expected_reason: dict[str, str],
+        first_row: int,
+    ) -> None:
+        """A failing group is named by field and first batch row, never by its value.
+
+        The group_by value is row content; the audit reason carries row
+        indices only (the ruling's "never the row VALUE").
+        """
+        from elspeth.plugins.transforms.batch_stats import BatchStats
+
+        transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "amount", "group_by": "category"})
+
+        result = transform.process([_make_row(data) for data in rows_data], ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        for key, value in expected_reason.items():
+            assert result.reason[key] == value
+        assert result.reason["group_by"] == "category"
+        assert result.reason["error"] == f"group 'category' first seen in row {first_row}"
+        assert "group_value" not in result.reason
+        assert "SECRET-GROUP" not in repr(sorted(result.reason.items()))
 
     def test_group_by_field_missing_from_all_rows_raises(self, ctx: PluginContext) -> None:
         """Configured group_by missing from all rows should fail fast."""

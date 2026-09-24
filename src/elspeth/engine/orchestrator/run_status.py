@@ -199,6 +199,9 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     # re-drives (same run_id), replacing the resume-only live-counter graft
     # that forgot run-1 failures.
     counters.rows_coalesce_failed = factory.run_status_projection.count_failed_coalesce_barrier_rows(run_id)
+    # Collector failures are group verdicts, not token outcomes. The durable
+    # marker also covers a failed group with no arrived members.
+    counters.collector_groups_failed = factory.run_status_projection.count_failed_collector_groups(run_id)
     for outcome_record in outcomes:
         if not outcome_record.completed:
             if outcome_record.path is TerminalPath.ABANDONED:
@@ -247,6 +250,7 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
         rows_routed_failure=counters.rows_routed_failure,
         rows_quarantined=counters.rows_quarantined,
         rows_coalesce_failed=counters.rows_coalesce_failed,
+        collector_groups_failed=counters.collector_groups_failed,
     )
     return terminal_status, counters
 
@@ -271,9 +275,11 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 #      node_states — live counts it, the derive cannot, so live MAY EXCEED
 #      audit (accepted, audit-is-truth doctrine).
 #
+# collector_groups_failed is audit-only: live row accumulation has no
+# group-verdict unit, and failed groups may have no terminal member tokens.
 # routed_destinations is compared separately as a plain dict below because
 # RunResult stores a frozen Mapping while ExecutionCounters stores a Counter.
-_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset({"rows_coalesce_failed", "routed_destinations"})
+_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset({"rows_coalesce_failed", "collector_groups_failed", "routed_destinations"})
 _PARITY_STRICT_FIELDS: tuple[str, ...] = (
     "rows_processed",
     "rows_succeeded",
@@ -293,8 +299,8 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
     """Cross-check the demoted live loop counters against the audit derive.
 
     ADR-030 §D: the audit-derived counters ARE the terminal record; the live
-    accumulator survives only as this assertion. Any divergence outside the
-    two documented ``rows_coalesce_failed`` arms means one of the two bookkeepers is broken —
+    accumulator survives only as this assertion. Any strict-field divergence
+    means one of the two bookkeepers is broken —
     crash loudly rather than record an unexplained terminal status.
 
     Raises:

@@ -73,6 +73,7 @@ class _EarlyCompletionResume:
         _insert_failed_run(self.db, run_id)
         self.factory = MagicMock(spec=RecorderFactory)
         self.factory.scheduler.count_active_work.return_value = 0
+        self.factory.barrier_restore.pending_empty_expansion_groups.return_value = ()
         self.factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=object)
         self.factory.run_lifecycle.finalize_run = MagicMock(spec=object)
         self.token = _make_heartbeat_safe_token(run_id, self.factory)

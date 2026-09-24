@@ -10,10 +10,12 @@ from typing import Annotated, Any, Literal, cast
 import httpx
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_data import HTTPCallRequest
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
@@ -22,9 +24,9 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
-from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_archived_ssrf_request, validate_url_for_ssrf
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -286,7 +288,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ea3d3d1b406ad2aa"
+    source_file_hash: str | None = "sha256:04caeac653f577b2"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -475,7 +477,47 @@ class BlobFetch(BaseTransform):
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         try:
             url = row[self._url_field]
-            safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
+            if type(url) is not str:
+                raise TypeError("URL field must be a string")
+            session = ctx.call_mode_session
+            if session is not None and session.mode is RunMode.REPLAY:
+                archived = session.replay_ssrf_request(
+                    original_url=url,
+                    audited_url=fingerprint_url(url),
+                    call_type=CallType.HTTP,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                safe_request = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+            elif session is not None and session.mode is RunMode.VERIFY:
+                archived = session.replay_ssrf_request(
+                    original_url=url,
+                    audited_url=fingerprint_url(url),
+                    call_type=CallType.HTTP,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                archived_safe = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+                pre_dns_request = HTTPCallRequest(
+                    method="GET",
+                    url=fingerprint_url(url),
+                    headers=fingerprint_headers(
+                        {
+                            "X-Abuse-Contact": self._abuse_contact,
+                            "X-Fetch-Reason": self._fetch_reason,
+                            "Host": archived_safe.host_header,
+                        }
+                    ),
+                    params=None,
+                )
+                session.preflight_verify_http_request(
+                    request_data=pre_dns_request.to_dict(),
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
+            else:
+                safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
         except (KeyError, SSRFBlockedError, SSRFNetworkError, TypeError) as exc:
             return TransformResult.error(
                 {
@@ -587,6 +629,7 @@ class BlobFetch(BaseTransform):
             limiter=limiter,
             token_id=ctx.token.token_id if ctx.token is not None else None,
             max_response_body_bytes=self._max_body_bytes,
+            call_mode_session=ctx.call_mode_session,
         )
         headers = {
             "X-Abuse-Contact": self._abuse_contact,

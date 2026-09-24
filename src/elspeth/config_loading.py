@@ -13,10 +13,12 @@ import yaml
 from pydantic import BaseModel
 
 from elspeth.contracts.emitted_option import emitted_option_fields, env_placeholders_in
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.config import (
     _DYNACONF_INTERNAL_KEYS,
     ElspethSettings,
+    TemplateOptionMaterializer,
     _expand_config_templates,
     _expand_env_vars,
     _lower_llm_profile_nodes,
@@ -225,7 +227,11 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     test_ref="tests/unit/core/test_config.py::TestLoadSettingsYamlDocumentShape::test_falsy_non_mapping_yaml_file_rejected",
     test_fingerprint="6630775a55fe8121574e8df12084ed45b8e357b21888df810f9e50599584bac4",
 )
-def load_settings(config_path: Path) -> ElspethSettings:
+def load_settings(
+    config_path: Path,
+    *,
+    source_settings: object | None = None,
+) -> ElspethSettings:
     """Load settings from YAML file with environment variable overrides.
 
     Uses Dynaconf for multi-source loading with precedence:
@@ -299,7 +305,15 @@ def load_settings(config_path: Path) -> ElspethSettings:
     # Expand template files in plugin options before validation
     # NOTE: Secrets are NOT fingerprinted here - they stay available for runtime.
     # Fingerprinting happens in resolve_config() when creating the audit copy.
-    raw_config = _expand_config_templates(raw_config, settings_path=config_path)
+    run_mode = RunMode(raw_config["run_mode"] if "run_mode" in raw_config else RunMode.LIVE)
+    if run_mode is RunMode.LIVE:
+        raw_config = _expand_config_templates(raw_config, settings_path=config_path)
+    else:
+        raw_config = TemplateOptionMaterializer(config_path).materialize_config(
+            raw_config,
+            run_mode=run_mode,
+            source_settings=source_settings,
+        )
 
     return ElspethSettings(**raw_config)
 

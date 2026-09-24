@@ -693,7 +693,19 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # reopen-resume's resumed_full_projection_sha256 (6ede4243... -> 4947c833...,
 # captured from the production harness's own failure output), then this digest.
 # No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "4023b22566b3c8d24bc9cfdc4c8633fce4be37afde4a6eaa3c3345ab03ace049"
+# Rotated 2026-09-23 (elspeth-5887fb7928, U2): a PLUGIN PROVENANCE rotation, not
+# a semantic one. The input-free ValidationError renderer moved from
+# plugins/sources/_safe_validation_errors.py to
+# contracts/safe_validation_errors.py so the engine can call it, which changed
+# one import line in each source plugin. csv_source's source_file_hash moved
+# (5e8324e0e8280e22 -> d8a9c799bf5895c0, 15 manifest pins) and json_source's
+# (0ecba5e947ba4010 -> 33fd5411565563bb, 1 pin), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 16
+# literals reproduces the prior manifest byte for byte. Then reopen-resume's
+# resumed_full_projection_sha256 (4947c833... -> 188207f6..., captured from the
+# production harness's own failure output), then this digest. No oracle_freeze
+# snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "2b88d01f41aeaefa1a9b9c4cfe3b72eeeddbb48d032f65e5d2be835e235b0a68"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

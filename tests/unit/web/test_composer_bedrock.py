@@ -117,7 +117,7 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
         captured.append(kwargs)
         return SimpleNamespace(
             model=_BEDROCK_ADVISOR,
-            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply, tool_calls=[]))],
             usage=SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13),
         )
 

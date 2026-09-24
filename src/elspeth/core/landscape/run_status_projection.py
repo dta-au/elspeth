@@ -11,6 +11,7 @@ from elspeth.contracts.enums import GroupSettlementReason
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.schema import (
+    collector_group_failures_table,
     node_states_table,
     nodes_table,
     token_outcomes_table,
@@ -23,6 +24,15 @@ class AuditRunStatusProjection:
 
     def __init__(self, ops: ReadOnlyDatabaseOps) -> None:
         self._ops = ops
+
+    def count_failed_collector_groups(self, run_id: str) -> int:
+        """Count immutable group-level failure verdicts, including empty groups."""
+        row = self._ops.execute_fetchone(
+            select(func.count()).select_from(collector_group_failures_table).where(collector_group_failures_table.c.run_id == run_id)
+        )
+        if row is None:
+            raise AuditIntegrityError("count_failed_collector_groups returned no row for a COUNT aggregate")
+        return int(row[0])
 
     def count_distinct_source_rows_with_terminal_outcome(self, run_id: str) -> int:
         """Count the distinct source rows that reached a terminal outcome.

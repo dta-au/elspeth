@@ -402,6 +402,9 @@ class TestDispatchFailure:
                 "child_items": [],
                 "group_failed": True,
                 "frame_kind": FrameKind.EXPAND,
+                # Live: no member carries a prior terminal (a resumed recorded
+                # verdict may; elspeth-5887fb7928 CODEX-R2).
+                "already_terminal": frozenset(),
             }
         ]
         assert scheduler.calls == ["release"]

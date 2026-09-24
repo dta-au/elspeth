@@ -13,6 +13,7 @@ import yaml
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.config_loading import load_settings
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
@@ -271,7 +272,16 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
     )
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     store = FilesystemPayloadStore(tmp_path / "payloads")
-    result = Orchestrator(db).run(pipeline, graph=graph, settings=settings, payload_store=store)
+    telemetry_events: list[TelemetryEvent] = []
+
+    class _CaptureTelemetry:
+        def handle_event(self, event: TelemetryEvent) -> None:
+            telemetry_events.append(event)
+
+        def flush(self) -> None:
+            pass
+
+    result = Orchestrator(db, telemetry_manager=_CaptureTelemetry()).run(pipeline, graph=graph, settings=settings, payload_store=store)
 
     assert result.rows_processed == 1
     assert result.rows_succeeded == 1
@@ -355,7 +365,11 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
         },
     ]
     retained = json.dumps(retained_payloads, sort_keys=True)
-    assert _RAW_NEXT_TOKEN not in retained
+    # Exact replay needs the provider token in the protected call archive.
+    # The row output and operational telemetry must not expose it.
+    assert _RAW_NEXT_TOKEN in retained
+    assert _RAW_NEXT_TOKEN not in json.dumps(output, sort_keys=True)
+    assert _RAW_NEXT_TOKEN not in json.dumps([event.to_dict() for event in telemetry_events], sort_keys=True, default=str)
     assert "provider-private-header" not in retained
     assert "aws_access_key_id" not in retained
     assert "aws_secret_access_key" not in retained

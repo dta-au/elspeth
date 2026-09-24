@@ -197,7 +197,7 @@ class RunSummary:
 
     Routing breakdown:
     - routed_success: Rows routed via gate route_to_sink (intentional MOVE — success-side routing)
-    - routed_failure: Rows routed via transform on_error (DIVERT — failure-side routing)
+    - routed_failure: Rows routed via transform/config-gate/aggregation on_error (DIVERT — failure-side routing)
     - routed_destinations: Count per destination sink {sink_name: count}; the per-sink
       breakdown is not split by routing intent — see ADR-004 for rationale.
     """
@@ -211,8 +211,9 @@ class RunSummary:
     duration_seconds: float
     exit_code: int  # 0=success, 1=partial failure, 2=total failure
     routed_success: int = 0  # Rows routed via gate route_to_sink (intentional MOVE)
-    routed_failure: int = 0  # Rows routed via transform on_error (DIVERT)
+    routed_failure: int = 0  # Rows routed via transform/config-gate/aggregation on_error (DIVERT)
     routed_destinations: tuple[tuple[str, int], ...] = ()  # (sink_name, count) pairs
+    collector_groups_failed: int = 0  # Structural group failures, separate from failed rows
 
     def __post_init__(self) -> None:
         require_int(self.total_rows, "total_rows", min_value=0)
@@ -222,6 +223,7 @@ class RunSummary:
         require_int(self.exit_code, "exit_code", min_value=0)
         require_int(self.routed_success, "routed_success", min_value=0)
         require_int(self.routed_failure, "routed_failure", min_value=0)
+        require_int(self.collector_groups_failed, "collector_groups_failed", min_value=0)
 
 
 # =============================================================================

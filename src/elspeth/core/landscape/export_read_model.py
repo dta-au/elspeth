@@ -47,6 +47,7 @@ from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
     calls_table,
+    collector_group_failures_table,
     edges_table,
     group_losses_table,
     group_records_table,
@@ -373,6 +374,15 @@ class ConnectionBoundExportReadModel:
         return list(
             self._connection.execute(
                 select(group_losses_table).where(group_losses_table.c.run_id == run_id).order_by(group_losses_table.c.loss_id)
+            ).fetchall()
+        )
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return list(
+            self._connection.execute(
+                select(collector_group_failures_table)
+                .where(collector_group_failures_table.c.run_id == run_id)
+                .order_by(collector_group_failures_table.c.group_id)
             ).fetchall()
         )
 

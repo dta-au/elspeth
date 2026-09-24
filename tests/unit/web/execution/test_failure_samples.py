@@ -14,9 +14,11 @@ import dataclasses
 import json
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -76,6 +78,12 @@ def _record_error(
     token_id: str,
     row_index: int,
 ) -> None:
+    """Record one token's transform error AND its terminal discard, as the per-row discard arm does.
+
+    The summary counts tokens whose terminal outcome is a failure a transform
+    error decided, so a fixture token without its terminal would model a run
+    that never finished that token.
+    """
     factory = RecorderFactory(db)
     _row, token = factory.data_flow.create_row_with_token(
         coordination_token=leader_coordination_token(factory, run_id),
@@ -88,6 +96,37 @@ def _record_error(
     )
     member = leader_coordination_token(factory, run_id).membership
     work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id=transform_id)
+    factory.data_flow.record_transform_error(
+        member_token=member,
+        work_item=work_item,
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        transform_id=transform_id,
+        row_data={"url": f"row-{row_index}"},
+        error_details=error_details,  # type: ignore[arg-type]
+        destination="discard",
+    )
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        error_hash="a" * 16,
+    )
+
+
+def _record_resumed_attempt(
+    db: LandscapeDB,
+    run_id: str,
+    transform_id: str,
+    *,
+    error_details: dict[str, object],
+    token_id: str,
+    row_index: int,
+) -> None:
+    """Write the SAME token's error again, as a resumed attempt does after a crash."""
+    factory = RecorderFactory(db)
+    member = leader_coordination_token(factory, run_id).membership
+    work_item = claim_test_work_item(factory, member_token=member, token_id=token_id, node_id=transform_id)
     factory.data_flow.record_transform_error(
         member_token=member,
         work_item=work_item,
@@ -256,6 +295,26 @@ class TestLoadTopFailureCategories:
             ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=4),
             ClientSafeFailureSummary(transform_id=transform_id, category="rate_limited", count=2),
         ]
+
+    def test_a_token_whose_error_a_resumed_attempt_rewrote_counts_once(self) -> None:
+        """Two attempts' rows for N tokens report ``Nx``, not ``2Nx`` (elspeth-5887fb7928 E8).
+
+        ``transform_errors`` has no ``(token_id, transform_id)`` uniqueness,
+        so a crash after the error write and a resumed attempt leave two rows
+        per token. The summary counts failed tokens.
+        """
+        db, run_id, transform_id = _make_run_with_transform()
+        details: dict[str, object] = {"reason": "decode_failed"}
+        for index in range(3):
+            _record_error(db, run_id, transform_id, error_details=details, token_id=f"tok_{index}", row_index=index)
+            _record_resumed_attempt(db, run_id, transform_id, error_details=details, token_id=f"tok_{index}", row_index=index)
+        with db.connection() as conn:
+            rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+        assert len(rows) == 6, "control: both attempts' rows are in the audit trail"
+
+        summaries = load_top_failure_categories(db, run_id)
+
+        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
 
     def test_distinct_nodes_stay_distinct(self) -> None:
         db, run_id, first = _make_run_with_transform("fetch")

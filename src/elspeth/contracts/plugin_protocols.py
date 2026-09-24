@@ -393,6 +393,10 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # placement unless they explicitly set this True.
     supports_row_mode_when_batch_aware: bool
 
+    # True when the plugin reads ``ctx.aggregation_batch``, which only an
+    # aggregation flush supplies; runtime_factory refuses it as a collector.
+    requires_aggregation_batch_context: bool
+
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
     # and new tokens will be created for each output row.
@@ -625,6 +629,10 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # placement unless they explicitly set this True.
     supports_row_mode_when_batch_aware: bool
 
+    # True when the plugin reads ``ctx.aggregation_batch``, which only an
+    # aggregation flush supplies; runtime_factory refuses it as a collector.
+    requires_aggregation_batch_context: bool
+
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
     # and new tokens will be created for each output row.
@@ -682,6 +690,15 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
         """Return the transform's static output guarantee surface.
 
         See :meth:`TransformProtocol.effective_static_contract`.
+        """
+        ...
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        """Return the fields every buffered row must carry before ``process`` runs.
+
+        The transform's ``schema.required_fields``, including the columns it
+        folds in from its own options. Batch-only: the flush preflight
+        (``engine.executors.batch_contract_validation``) is its one consumer.
         """
         ...
 

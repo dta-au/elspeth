@@ -162,7 +162,11 @@ def test_limiter_is_keyed_by_search_service_host() -> None:
 def test_build_searcher_asks_the_registry_for_the_host_keyed_limiter() -> None:
     registry = MagicMock(spec=RateLimitRegistry)
     ctx = SimpleNamespace(
-        landscape=MagicMock(spec=PluginAuditWriterAdapter), run_id="run-1", telemetry_emit=lambda event: None, rate_limit_registry=registry
+        landscape=MagicMock(spec=PluginAuditWriterAdapter),
+        run_id="run-1",
+        call_mode_session=None,
+        telemetry_emit=lambda event: None,
+        rate_limit_registry=registry,
     )
     searcher = AzureAISearchTransform(_BASE)._build_searcher(ctx)
     try:

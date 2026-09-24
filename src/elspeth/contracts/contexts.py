@@ -29,9 +29,12 @@ from elspeth.contracts.events import TelemetryEvent
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_data import CallPayload
     from elspeth.contracts.call_governance import LLMCallGovernance
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.enums import RunMode
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
@@ -93,6 +96,12 @@ class SourceContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def node_id(self) -> str | None: ...
 
     @property
@@ -144,8 +153,31 @@ class TransformContext(Protocol):
 
     def require_work_item(self) -> TokenWorkItem: ...
 
+    def allocate_call_index(self) -> int: ...
+
+    def record_row_call(
+        self,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        latency_ms: float | None = None,
+        source_call_id: str | None = None,
+    ) -> Call: ...
+
+    @property
+    def landscape(self) -> PluginAuditWriter | None: ...
+
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
     def state_id(self) -> str | None: ...
@@ -195,6 +227,12 @@ class SinkContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def contract(self) -> SchemaContract | None: ...
 
     @property
@@ -230,6 +268,12 @@ class LifecycleContext(Protocol):
 
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
     def llm_call_governance(self) -> LLMCallGovernance | None: ...

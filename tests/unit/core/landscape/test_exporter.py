@@ -16,6 +16,7 @@ from collections import defaultdict as collections_defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
@@ -502,6 +503,7 @@ class _QueryRecorder:
     lineage_paths: dict[str, tuple[Any, ...]] = field(default_factory=dict)
     group_records: list[Any] = field(default_factory=list)
     group_losses: list[Any] = field(default_factory=list)
+    collector_group_failures: list[Any] = field(default_factory=list)
 
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         for offset in range(0, len(self.rows), batch_size):
@@ -519,6 +521,9 @@ class _QueryRecorder:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self.group_losses
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self.collector_group_failures
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         wanted = set(token_ids)
@@ -617,6 +622,9 @@ class _ExportReadModelRecorder:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self._query.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         return self._query.get_token_parents_for_tokens(token_ids)
@@ -1111,6 +1119,7 @@ class _SpyReadModel:
             "get_lineage_paths_for_tokens",
             "get_group_records_for_run",
             "get_group_losses_for_run",
+            "get_collector_group_failures_for_run",
             "get_token_parents_for_tokens",
             "get_token_outcomes_for_tokens",
             "get_scheduler_events_for_tokens",
@@ -1219,6 +1228,10 @@ class _SpyReadModel:
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         self._record("get_group_losses_for_run")
         return self._inner.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_collector_group_failures_for_run")
+        return self._inner.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         self._record("get_token_parents_for_tokens")
@@ -1926,6 +1939,20 @@ class TestStateCallRecords:
         assert c["operation_id"] is None  # State calls don't have operation_id
         assert c["call_type"] == "llm"
 
+    def test_call_summary_exports_payload_reference_without_provider_response(self) -> None:
+        """Opaque SDK pagination tokens stay in the protected call payload."""
+        exporter = _make_exporter(
+            rows=[_ROW],
+            tokens=[_TOKEN],
+            node_states=[_NODE_STATE_COMPLETED],
+            state_calls=[_STATE_CALL],
+        )
+        calls = [record for record in exporter.export_run("run-1") if record["record_type"] == "call"]
+        assert len(calls) == 1
+        assert calls[0]["response_ref"] == "resp-ref-2"
+        assert "response_data" not in calls[0]
+        assert "next_token" not in calls[0]
+
 
 # ===========================================================================
 # Batch records
@@ -2135,6 +2162,29 @@ class TestErrorRecords:
 
 class TestRecordOrder:
     """Tests for record yield order in export."""
+
+    def test_collector_group_failure_exports_as_one_group_record(self) -> None:
+        read_model = _make_export_read_model()
+        read_model._query.collector_group_failures.append(
+            SimpleNamespace(
+                group_id="group-1",
+                collector_node_id="collector-1",
+                failure_reason="collector_missing_members",
+                recorded_at=datetime(2026, 9, 24, tzinfo=UTC),
+            )
+        )
+        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, compartment_id="test-compartment")
+        failures = [record for record in exporter.export_run("run-1") if record["record_type"] == "collector_group_failure"]
+        assert failures == [
+            {
+                "record_type": "collector_group_failure",
+                "run_id": "run-1",
+                "group_id": "group-1",
+                "collector_node_id": "collector-1",
+                "failure_reason": "collector_missing_members",
+                "recorded_at": "2026-09-24T00:00:00+00:00",
+            }
+        ]
 
     def test_order_is_run_secrets_nodes_edges_ops_rows_batches_artifacts(self) -> None:
         """Records should yield in the documented order."""

@@ -165,6 +165,7 @@ describe("ProgressView", () => {
             quarantined: 0,
             discarded: 0,
           },
+          collector_groups_failed: 0,
           integrity: {
             closure: "closed",
             missing_terminal_outcomes: 0,
@@ -494,6 +495,7 @@ function accounting(integrity: Partial<{ closure: string; missing_terminal_outco
     source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
     tokens: { emitted: 4, terminal: 4, succeeded: 4, failed: 0, structural: 0, pending: 0, abandoned: 0 },
     routing: { routed_success: 0, routed_failure: 0, quarantined: 0, discarded: 0 },
+    collector_groups_failed: 0,
     integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0, ...integrity },
   };
 }
@@ -505,14 +507,22 @@ describe("detail level (elspeth-05a240b82a)", () => {
     useSessionStore.setState({ compositionState: null } as never);
   });
 
-  it("keeps the closure verdict visible and collapses the six-cell grid by default", () => {
+  it("keeps the closure verdict visible and collapses the accounting grid by default", () => {
     const { container } = mountProgress({ status: "completed", accounting: accounting({}) });
     expect(screen.getByText("Audit closure: complete — every row is accounted for.")).toBeInTheDocument();
     const detail = screen.getByText("Accounting detail").closest("details") as HTMLElement;
     expect(detail).not.toBeNull();
     expect(detail).not.toHaveAttribute("open");
     expect(within(detail).getByText("Tokens emitted")).toBeInTheDocument();
+    expect(within(detail).getByText("Collector groups failed")).toBeInTheDocument();
     expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("shows failed collector groups separately from failed tokens", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    mountProgress({ status: "completed_with_failures", accounting: { ...accounting({}), collector_groups_failed: 1 } });
+    const detail = screen.getByText("Accounting detail").closest("details") as HTMLElement;
+    expect(within(detail).getByText("Collector groups failed").nextElementSibling).toHaveTextContent("1");
   });
 
   it("opens the grid when show_advanced is on, and keeps integrity warnings out of the disclosure", () => {

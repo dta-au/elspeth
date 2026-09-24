@@ -521,8 +521,12 @@ deployment you will teach on.
    controls, plus Textract). Statistical `batch_*` transforms, `json_explode`,
    `value_transform`, `type_coerce`, `truncate` are **not** web-authorised by
    default — so Segment 6's pre-built sessions must be built with what your
-   deployment allows (use `line_explode` as the scope opener, `report_assemble`
-   as a collector, and LLM nodes as branch arms). Check `Plugin catalog`.
+   deployment allows (use `line_explode` as the scope opener and LLM nodes as
+   branch arms). `report_assemble` cannot close a scope: it is
+   aggregation-only, and validation refuses it as a collector. A collector
+   session therefore needs a batch-aware plugin other than `report_assemble`
+   (for example `batch_stats`) authorised on the deployment; a stock
+   deployment authorises none. Check `Plugin catalog`.
 3. **Guided coverage.** The user manual at HEAD states guided authors all nine
    structures including require-all coalesce and cross-sink `on_write_failure`.
    An older snapshot listed those two as freeform-only. If your deployment is

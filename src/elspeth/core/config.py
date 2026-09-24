@@ -632,17 +632,24 @@ class AggregationSettings(BaseModel):
     - passthrough: Batch releases all accepted rows unchanged
     - transform: Batch applies a transform function to produce results
 
+    A batch whose transform returns an error fails as a WHOLE: every
+    buffered input row goes to the ``on_error`` sink with its original
+    values (``discard`` records them failed without writing them anywhere).
+
     Example YAML:
         aggregations:
-          - name: batch_stats
-            plugin: stats_aggregation
-            on_error: discard
+          - name: amount_stats
+            plugin: batch_stats
+            input: amounts
+            on_success: stats_out
+            on_error: quarantine
             trigger:
               count: 100
             output_mode: transform
             expected_output_count: 1  # Optional: validate N->1 aggregation
             options:
-              fields: ["value"]
+              schema: {mode: observed}
+              value_field: amount
               compute_mean: true
     """
 
@@ -656,7 +663,10 @@ class AggregationSettings(BaseModel):
         description="Connection name or sink name for aggregation output",
     )
     on_error: str = Field(
-        description="Sink name for rows that fail batch processing, or 'discard'",
+        description=(
+            "Sink that receives every input row of a batch whose flush fails (each row routed with its original "
+            "values and the batch-level reason), or 'discard' to record those rows failed without routing them"
+        ),
     )
     trigger: TriggerConfig = Field(
         default_factory=TriggerConfig,
@@ -698,6 +708,22 @@ class AggregationSettings(BaseModel):
             raise ValueError("Aggregation input connection must not be empty")
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Aggregation input connection name")
+
+    @field_validator("on_error")
+    @classmethod
+    def validate_on_error(cls, v: str) -> str:
+        """Ensure on_error is a valid sink name or 'discard'.
+
+        Mirrors ``TransformSettings.validate_on_error``: the value becomes the
+        ``__error_<name>__`` DIVERT edge's target, so it is admitted by the
+        same label rules at parse time.
+        """
+        if not v.strip():
+            raise ValueError("on_error must be a sink name or 'discard'")
+        value = v.strip()
+        if value == "discard":
+            return value
+        return _validate_connection_or_sink_name(value, field_label="Aggregation on_error sink name")
 
     @field_validator("on_success")
     @classmethod

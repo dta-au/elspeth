@@ -70,6 +70,7 @@ class _ExecutionRepositoryDouble:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         call_kwargs = {
             "state_id": state_id,
@@ -84,6 +85,7 @@ class _ExecutionRepositoryDouble:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
+            "source_call_id": source_call_id,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
@@ -104,6 +106,7 @@ class _ExecutionRepositoryDouble:
         response_ref: str | None = None,
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
         actual_call_index = (
             call_index
@@ -123,6 +126,7 @@ class _ExecutionRepositoryDouble:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
+            "source_call_id": source_call_id,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
@@ -146,6 +150,7 @@ class _ExecutionRepositoryDouble:
             completion_tokens=call_kwargs["token_usage"].completion_tokens,
             cached_prompt_tokens=call_kwargs["token_usage"].cached_prompt_tokens,
             reasoning_tokens=call_kwargs["token_usage"].reasoning_tokens,
+            source_call_id=call_kwargs["source_call_id"],
         )
 
 

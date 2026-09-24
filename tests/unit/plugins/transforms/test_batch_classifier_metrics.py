@@ -209,13 +209,45 @@ class TestBatchClassifierMetrics:
         assert result.row["binary_recall"] is None
         assert result.row["binary_f1"] is None
 
-    def test_non_scalar_labels_raise_type_error(self, ctx: PluginContext) -> None:
+    @pytest.mark.parametrize("bad_field", ["actual", "predicted"])
+    def test_float_label_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext, bad_field: str) -> None:
+        """A wrong-typed label fails the WHOLE batch with a value-free reason.
+
+        Disposition (elspeth-d5034647f0): no metric is published over the
+        surviving pairs, the result is a non-retryable error the aggregation's
+        on_error route applies to every buffered row, and the reason names the
+        field, the expected and found types and the BATCH row index. The None
+        row ahead of the bad one still skips as a missing pair, and does not
+        shift the reported index. No coercion: a float label is not accepted.
+        """
         from elspeth.plugins.transforms.batch_classifier_metrics import BatchClassifierMetrics
 
         transform = BatchClassifierMetrics({"schema": DYNAMIC_SCHEMA, "actual_field": "actual", "predicted_field": "predicted"})
+        bad_row = {"actual": "yes", "predicted": "yes"}
+        bad_row[bad_field] = 2.75  # a float label, as a JSON source delivers `2.75`
 
-        with pytest.raises(TypeError, match="must be a scalar label"):
-            transform.process([_make_row({"actual": object(), "predicted": "yes"})], ctx)
+        result = transform.process(
+            [
+                _make_row({"actual": "yes", "predicted": "no"}),
+                _make_row({"actual": None, "predicted": "no"}),
+                _make_row(bad_row),
+                _make_row({"actual": "no", "predicted": "no"}),
+            ],
+            ctx,
+        )
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == bad_field
+        assert result.reason["expected"] == "a scalar label (str, int, or bool)"
+        assert result.reason["actual_type"] == "float"
+        assert result.reason["error"] == "must be a scalar label (str, int, or bool), got float in row 2"
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "2.75" not in repr(sorted(result.reason.items()))
 
     def test_empty_batch_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_classifier_metrics import BatchClassifierMetrics

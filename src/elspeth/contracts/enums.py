@@ -584,11 +584,12 @@ def is_llm_authored_creation_modality(modality: CreationModality) -> bool:
 def error_edge_label(producer_id: str) -> str:
     """Canonical label for a processing-node error DIVERT edge.
 
-    Shared between DAG construction and transform/config-gate error-routing
-    audit recording to prevent label drift.
+    Shared between DAG construction and the transform, config-gate and
+    aggregation error-routing audit recording to prevent label drift.
 
     Args:
-        producer_id: Stable transform or config-gate name for error-route labels.
+        producer_id: Stable transform, config-gate or aggregation name for
+            error-route labels.
     """
     return f"__error_{producer_id}__"
 

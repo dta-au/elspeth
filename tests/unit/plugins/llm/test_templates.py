@@ -14,6 +14,20 @@ from elspeth.testing import make_field, make_row
 class TestPromptTemplate:
     """Tests for PromptTemplate wrapper."""
 
+    def test_constant_power_is_bounded_during_configuration(self) -> None:
+        with pytest.raises(TemplateError, match="Power expressions"):
+            PromptTemplate("{{ (3**(3**15)) % 7 }}")
+
+    def test_row_dependent_string_multiplication_is_bounded_at_render(self) -> None:
+        template = PromptTemplate("{{ row.text * 300000000 }}")
+        with pytest.raises(TemplateError):
+            template.render({"text": "x"})
+
+    def test_nested_no_output_loops_are_bounded_at_render(self) -> None:
+        template = PromptTemplate("{% for a in range(100000) %}{% for b in range(100000) %}{% set x = a + b %}{% endfor %}{% endfor %}")
+        with pytest.raises(TemplateError, match=r"worker stopped|execution time limit"):
+            template.render({})
+
     def test_simple_variable_substitution(self) -> None:
         """Basic variable substitution works."""
         template = PromptTemplate("Hello, {{ row.name }}!")
@@ -120,6 +134,16 @@ Analyze these entries:
 
         assert result.prompt == "Analyze: sample"
         assert result.variables_hash is not None
+
+    def test_variables_hash_failure_names_no_row_value(self) -> None:
+        """The canonicalizer quotes the offending value; only its type is kept (RAG-F1).
+
+        Its message is ``1152921504606859321 exceeds safe integer domain``.
+        """
+        template = PromptTemplate("{{ row.n }}")
+        with pytest.raises(TemplateError) as caught:
+            template.render_with_metadata({"n": 1152921504606859321})
+        assert str(caught.value) == "Cannot compute variables hash: IntegerDomainError (message withheld: it can quote row data)"
 
     def test_undefined_variable_raises_error(self) -> None:
         """Missing required variable raises TemplateError."""

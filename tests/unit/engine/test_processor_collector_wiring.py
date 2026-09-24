@@ -144,6 +144,7 @@ def _build(
         traversal=traversal,
         group_bindings=group_bindings,
         scheduler=setup.factory.scheduler,
+        barrier_restore_reads=setup.factory.barrier_restore,
         scheduler_lease_owner=LEADER_OWNER if leader else "follower-1",
         coordination_token=leader_coordination_token(setup.factory, setup.run_id) if leader else None,
         member_token=follower,
@@ -227,8 +228,14 @@ class TestArrivalHoldIsTheDurableWriter:
         assert [(token_id, name) for token_id, name, _ctx in executor.accepted] == [(token.token_id, "stitch")]
         assert executor.accepted[0][2] is ctx
 
-    def test_follower_holds_without_a_stash_and_still_derives_the_compound_key(self) -> None:
-        """Verification obligation 3: the collector_executor is None path."""
+    def test_follower_records_the_arrival_under_the_compound_key(self) -> None:
+        """Verification obligation 3: the collector_executor is None path.
+
+        The follower records its arrival exactly as the leader does
+        (elspeth-5887fb7928 AC-R4): the drain persists the BLOCKED row's
+        barrier_key and held row from it, so the leader adopts the member as
+        it arrived, not as it was enqueued.
+        """
         processor, setup, _clock = _build(mode=ProcessorMode.FOLLOWER, executor=None)
         assert processor.collector_executor is None
         token = _expand_member(setup, sequence=2)
@@ -236,10 +243,35 @@ class TestArrivalHoldIsTheDurableWriter:
         handled, result = processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
 
         assert (handled, result) == (True, None)
-        assert processor._live_barrier_holds == {}
+        assert set(processor._live_barrier_holds) == {token.token_id}
+        hold = processor._live_barrier_holds[token.token_id]
+        assert hold.token is token
+        assert hold.barrier_key == collector_barrier_key("stitch", _group_of(token))
         item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
         assert processor._barrier_key_for_blocked_item(item) == collector_barrier_key("stitch", _group_of(token))
         assert processor._queue_key_for_blocked_item(item) is None
+
+    def test_follower_drain_persists_the_recorded_arrival_and_then_drops_it(self) -> None:
+        """No intake runs on a follower, so its drain consumes the recorded arrival.
+
+        The BLOCKED row carries the recorded barrier_key and the arriving row, and
+        the in-memory record is gone once that row is durable. Nothing else would
+        ever pop it on a follower.
+        """
+        processor, setup, _clock = _build(mode=ProcessorMode.FOLLOWER, executor=None)
+        token = _expand_member(setup, sequence=4)
+        item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
+        ctx = PluginContext(run_id=setup.run_id, config={}, landscape=None, member_token=processor._member_token)
+
+        results = processor._drain_durable_work_queue(item, ctx)
+
+        assert results == []
+        assert processor._live_barrier_holds == {}
+        blocked = setup.factory.scheduler.list_blocked_barrier_items(run_id=setup.run_id)
+        assert [(row.token_id, row.barrier_key, row.barrier_adopted_epoch) for row in blocked] == [
+            (token.token_id, collector_barrier_key("stitch", _group_of(token)), None),
+        ]
+        assert blocked[0].row_payload_json == setup.factory.scheduler.serialize_row_payload(token.row_data)
 
     def test_arrival_elsewhere_is_not_a_collector_hold(self) -> None:
         processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())

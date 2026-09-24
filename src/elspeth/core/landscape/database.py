@@ -515,6 +515,8 @@ _EPOCH_26_REQUIRED_TABLES = (
     "sink_effect_export_snapshots",
 )
 _REQUIRED_COLUMNS += (
+    ("runs", "run_mode"),
+    ("runs", "replay_from_run_id"),
     *((table_name, column.name) for table_name in _EPOCH_26_REQUIRED_TABLES for column in metadata.tables[table_name].columns),
     ("operations", "sink_effect_id"),
     ("artifacts", "sink_effect_id"),
@@ -537,6 +539,18 @@ _REQUIRED_COLUMNS += tuple(
 # verified, so an epoch-36 store fails HERE, naming the column, instead of
 # raising an opaque SQL error the first time an admin opens the audit view.
 _REQUIRED_COLUMNS += (("auth_events", "identity_id"),)
+_REQUIRED_COLUMNS += (
+    ("calls", "source_call_id"),
+    ("call_verifications", "current_call_id"),
+    ("call_verifications", "current_run_id"),
+    ("call_verifications", "source_run_id"),
+    ("call_verifications", "source_call_id"),
+    ("call_verifications", "is_match"),
+    ("call_verifications", "differences_json"),
+    ("call_verifications", "recorded_at"),
+    ("operations", "occurrence_index"),
+    *(("collector_group_failures", column.name) for column in metadata.tables["collector_group_failures"].columns),
+)
 
 # Required foreign keys for audit integrity (Tier 1 trust).
 # Format: (table_name, column_name, referenced_table)
@@ -571,6 +585,8 @@ _REQUIRED_COMPOSITE_FOREIGN_KEYS: tuple[tuple[str, tuple[str, ...], str, tuple[s
     ("token_outcomes", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("node_states", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("node_states", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
+    ("collector_group_failures", ("run_id", "group_id"), "group_records", ("run_id", "group_id")),
+    ("collector_group_failures", ("collector_node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("validation_errors", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("transform_errors", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("transform_errors", ("transform_id", "run_id"), "nodes", ("node_id", "run_id")),
@@ -690,6 +706,10 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("scheduler_events", "ck_scheduler_events_from_attempt_non_negative"),
     ("scheduler_events", "ck_scheduler_events_to_attempt_non_negative"),
     ("calls", "calls_has_parent"),
+    ("runs", "ck_runs_mode"),
+    ("runs", "ck_runs_mode_source"),
+    ("call_verifications", "ck_call_verifications_distinct_runs"),
+    ("call_verifications", "ck_call_verifications_match_has_source"),
     ("calls", "calls_prompt_tokens_nonnegative"),
     ("calls", "calls_completion_tokens_nonnegative"),
     ("calls", "calls_cached_prompt_tokens_nonnegative"),
@@ -768,6 +788,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("calls", "ix_calls_state_call_index_unique"),
     ("calls", "ix_calls_operation_call_index_unique"),
     ("calls", "ix_calls_approved_prompt_artifact_hash"),
+    ("call_verifications", "ix_call_verifications_run"),
     ("checkpoints", "ix_checkpoints_run_sequence_unique"),
     ("preflight_results", "ix_preflight_results_run"),
     ("token_outcomes", "ix_token_outcomes_terminal_unique"),
@@ -790,6 +811,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("tokens", "uq_tokens_coalesce_result_identity"),
     ("node_states", "uq_node_states_coalesce_member_identity"),
     ("operations", "uq_operations_sink_effect_id"),
+    ("operations", "uq_operations_occurrence"),
     ("sink_effect_streams", "uq_sink_effect_stream_identity"),
     ("sink_effect_members", "uq_sink_effect_member_binding"),
     ("audit_export_snapshots", "uq_audit_export_snapshots_registry_key"),

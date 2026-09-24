@@ -78,6 +78,7 @@ function ProgressAccountingDetails({
     [RUN_ACCOUNTING_LABELS.tokensPending, accounting.tokens.pending],
     [RUN_ACCOUNTING_LABELS.tokensAbandoned, accounting.tokens.abandoned],
     [RUN_ACCOUNTING_LABELS.rowsDiscarded, accounting.routing.discarded],
+    [RUN_ACCOUNTING_LABELS.collectorGroupsFailed, accounting.collector_groups_failed],
   ] as const;
   const integrityWarnings = [
     [

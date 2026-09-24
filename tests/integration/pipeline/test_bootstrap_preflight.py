@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import CommencementGateFailedError
 from elspeth.contracts.preflight import DependencyRunResult
 from elspeth.core.dependency_config import (
@@ -30,7 +31,10 @@ from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 @pytest.fixture(autouse=True)
 def _raw_sink_effect_preflight_boundary() -> Iterator[None]:
     """These dispatch tests use a synthetic non-existent settings path."""
-    with patch("elspeth.cli._preflight_raw_settings_sink_effects"):
+    with (
+        patch("elspeth.cli._preflight_raw_settings_sink_effects"),
+        patch("elspeth.cli._admit_raw_cli_nonlive_run", return_value=(RunMode.LIVE, frozenset(), None)),
+    ):
         yield
 
 
@@ -104,6 +108,8 @@ def _make_bootstrap_config() -> SimpleNamespace:
         return {}
 
     return SimpleNamespace(
+        run_mode=RunMode.LIVE,
+        replay_from=None,
         depends_on=[],
         commencement_gates=[],
         collection_probes=[],

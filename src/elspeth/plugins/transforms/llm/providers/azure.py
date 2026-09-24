@@ -19,12 +19,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
 import structlog
 from pydantic import Field, field_validator, model_validator
 
+from elspeth.contracts import CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
-from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError, build_llm_call_request
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     derive_azure_model,
@@ -36,6 +38,7 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 logger = structlog.get_logger(__name__)
@@ -154,6 +157,7 @@ class AzureLLMProvider:
         approved_prompt_artifact_hash: str | None = None,
         llm_call_governance: LLMCallGovernance | None = None,
         pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key: str | None = api_key
@@ -169,6 +173,7 @@ class AzureLLMProvider:
         self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
         self._llm_call_governance = llm_call_governance
         self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
         # (always acquire _llm_clients_lock first to prevent deadlock)
@@ -209,6 +214,23 @@ class AzureLLMProvider:
         # This prevents the openrouter.py bug where ctx.state_id was read
         # in the finally block, evicting the wrong cache entry during retries.
         cache_key = audit_parent.cache_key
+
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                provider="azure",
+                max_tokens=max_tokens,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                response_format=response_format,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
 
         try:
             client = self._get_llm_client(audit_parent)
@@ -253,6 +275,22 @@ class AzureLLMProvider:
 
     def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Azure OpenAI call under an operation parent."""
+        smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=smoke_messages,
+                temperature=None,
+                provider="azure",
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=None,
+                current_operation_id=operation_id,
+            )
         client = AuditedLLMClient(
             execution=self._recorder,
             state_id=None,
@@ -260,17 +298,20 @@ class AzureLLMProvider:
             coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
-            underlying_client=self._get_underlying_client(),
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
             provider="azure",
             pricing_model=self._pricing_model,
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
             max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            call_mode_session=self._call_mode_session,
         )
         try:
             response = client.chat_completion(
                 model=model,
-                messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+                messages=smoke_messages,
                 # No temperature: reasoning deployments reject any explicit
                 # value with HTTP 400, and a smoke test has no determinism
                 # requirement.
@@ -310,12 +351,15 @@ class AzureLLMProvider:
                     execution=self._recorder,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
-                    underlying_client=self._get_underlying_client(),
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
                     provider="azure",
                     pricing_model=self._pricing_model,
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
                     max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

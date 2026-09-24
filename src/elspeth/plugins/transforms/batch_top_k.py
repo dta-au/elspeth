@@ -18,6 +18,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type TopKValue = str | int | float | bool | None
@@ -80,7 +81,7 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:036001b0996472a6"
+    source_file_hash: str | None = "sha256:38df4426e24e4a63"
     config_model = BatchTopKConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -235,10 +236,19 @@ class BatchTopK(BaseTransform):
             return None
 
         if type(value) not in (str, int, float, bool):
-            raise TypeError(
-                f"Field '{field_name}' must be a scalar top-k value (str, int, float, bool, or None), "
-                f"got {type(value).__name__} in row {row_index}. "
-                f"This indicates an upstream validation bug - check source schema or prior transforms."
+            # BATCH-level failure, not a skip. A missing value (None, above) and a
+            # non-finite float (in `_top_k_row_for`) skip-and-report; a non-scalar
+            # (a JSON array or object, deep-frozen to tuple / mappingproxy) has no
+            # frequency bucket, and John's ruling (elspeth-d5034647f0) fails the
+            # whole batch rather than publishing top-k over a set the operator
+            # never specified. Raised here because this helper returns a value;
+            # `process` converts it once. `row_index` is the BATCH index: the
+            # grouped rows carry it from `_group_rows`.
+            raise BatchRowTypeError(
+                field=field_name,
+                row_index=row_index,
+                expected="a scalar top-k value (str, int, float, bool, or None)",
+                found=type(value).__name__,
             )
 
         return cast(TopKValue, value)
@@ -322,7 +332,16 @@ class BatchTopK(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
-        results = [self._top_k_row_for(group_value, grouped_rows) for group_value, grouped_rows in self._group_rows(rows)]
+        try:
+            results = [self._top_k_row_for(group_value, grouped_rows) for group_value, grouped_rows in self._group_rows(rows)]
+        except BatchRowTypeError as exc:
+            # The whole batch fails with a value-free reason naming the field,
+            # the expected and found types and the batch row index. The
+            # structural caller owns disposition: an aggregation applies its
+            # declared on_error (RowProcessor.handle_timeout_flush sends every
+            # buffered row to the on_error sink, or records it discarded),
+            # while a collector turns this into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         output_contract = self._output_contract_for(results)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]

@@ -146,6 +146,7 @@ class TestCallRecordingRoutesToExecution:
             # without per-call-site adapter changes.
             approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
+            source_call_id=None,
         )
 
 
@@ -243,6 +244,7 @@ class TestOperationCallRoutesToExecution:
             # is an LLM operation downstream of a resolved interpretation.
             approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
+            source_call_id=None,
         )
 
 

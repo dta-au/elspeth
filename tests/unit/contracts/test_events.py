@@ -414,6 +414,23 @@ class TestRunSummaryIntValidation:
         )
         assert summary.total_rows == 10
 
+    @pytest.mark.parametrize("value", [True, -1])
+    def test_rejects_invalid_collector_group_failure_count(self, value: int) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        with pytest.raises((TypeError, ValueError), match="collector_groups_failed"):
+            RunSummary(
+                run_id="r",
+                status=RunCompletionStatus.PARTIAL,
+                total_rows=0,
+                succeeded=0,
+                failed=0,
+                quarantined=0,
+                duration_seconds=1.0,
+                exit_code=1,
+                collector_groups_failed=value,
+            )
+
 
 class TestRunFinishedIntValidation:
     """RunFinished rejects bool values for row_count."""

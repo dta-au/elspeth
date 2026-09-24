@@ -19,6 +19,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
     same_scalar_bucket_value,
@@ -69,15 +70,30 @@ _MAX_BATCH_ROWS = 4096
 
 @dataclass(frozen=True, slots=True)
 class _CohortValues:
+    """One cohort's usable values, with every skipped row named by its BATCH index.
+
+    Indices are positions in the flushed batch, not in the cohort, so an audit
+    reason built from them points at the row the operator will find in the batch.
+    """
+
     cohort: Any
+    first_row_index: int
     total_count: int
     values: tuple[object, ...]
-    missing_count: int = 0
-    non_finite_count: int = 0
+    missing_indices: tuple[int, ...] = ()
+    non_finite_indices: tuple[int, ...] = ()
 
     @property
     def count(self) -> int:
         return len(self.values)
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_indices)
+
+    @property
+    def non_finite_count(self) -> int:
+        return len(self.non_finite_indices)
 
 
 class BatchDriftCompareConfig(TransformDataConfig):
@@ -128,7 +144,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5be275066a3063c5"
+    source_file_hash: str | None = "sha256:8bfd699a81524059"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -256,86 +272,111 @@ class BatchDriftCompare(BaseTransform):
         }
         return TransformResult.error(reason, retryable=False)
 
-    def _collect_cohorts(self, rows: list[PipelineRow]) -> list[tuple[Any, list[PipelineRow]]]:
-        cohorts: list[tuple[Any, list[PipelineRow]]] = []
-        for row in rows:
+    def _collect_cohorts(self, rows: list[PipelineRow]) -> list[tuple[Any, list[tuple[int, PipelineRow]]]]:
+        """Partition rows by cohort in first-seen order, keeping each row's BATCH index."""
+        cohorts: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
+        for row_index, row in enumerate(rows):
             cohort_value = row[self._cohort_field]
             for existing_cohort, cohort_rows in cohorts:
                 if same_scalar_bucket_value(cohort_value, existing_cohort):
-                    cohort_rows.append(row)
+                    cohort_rows.append((row_index, row))
                     break
             else:
-                cohorts.append((cohort_value, [row]))
+                cohorts.append((cohort_value, [(row_index, row)]))
         return cohorts
 
-    def _numeric_values_for(self, cohort: Any, rows: list[PipelineRow]) -> _CohortValues:
+    def _numeric_values_for(self, cohort: Any, cohort_rows: list[tuple[int, PipelineRow]]) -> _CohortValues:
         values: list[int | float] = []
-        missing_count = 0
-        non_finite_count = 0
+        missing_indices: list[int] = []
+        non_finite_indices: list[int] = []
 
-        for row_index, row in enumerate(rows):
+        for row_index, row in cohort_rows:
             raw_value = row[self._value_field]
             if raw_value is None:
-                missing_count += 1
+                missing_indices.append(row_index)
                 continue
+            # type() rather than isinstance() so bool (an int subclass) is rejected.
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip: the whole batch fails with a
+                # recorded reason (elspeth-d5034647f0) rather than publishing a
+                # drift statistic over a set the operator never specified. The
+                # missing and non-finite branches either side keep
+                # skip-and-report. Raised here and converted once in `process`,
+                # because this helper returns values, not results.
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
             if type(raw_value) is float and not math.isfinite(raw_value):
-                non_finite_count += 1
+                non_finite_indices.append(row_index)
                 continue
             values.append(raw_value)
 
         return _CohortValues(
             cohort=cohort,
-            total_count=len(rows),
+            first_row_index=cohort_rows[0][0],
+            total_count=len(cohort_rows),
             values=tuple(values),
-            missing_count=missing_count,
-            non_finite_count=non_finite_count,
+            missing_indices=tuple(missing_indices),
+            non_finite_indices=tuple(non_finite_indices),
         )
 
-    def _categorical_values_for(self, cohort: Any, rows: list[PipelineRow]) -> _CohortValues:
+    def _categorical_values_for(self, cohort: Any, cohort_rows: list[tuple[int, PipelineRow]]) -> _CohortValues:
         values: list[CategoricalValue] = []
-        missing_count = 0
+        missing_indices: list[int] = []
 
-        for row_index, row in enumerate(rows):
+        for row_index, row in cohort_rows:
             raw_value = row[self._value_field]
             if raw_value is None:
-                missing_count += 1
+                missing_indices.append(row_index)
                 continue
+            # type() rather than isinstance() so a bool is its own category,
+            # never bucketed with the int 1.
             if type(raw_value) not in (str, int, bool):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be a scalar category (str, int, or bool), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip — same disposition as the
+                # numeric branch: the whole batch fails with a recorded reason
+                # and a missing value keeps skip-and-report.
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="a scalar category (str, int, or bool)",
+                    found=type(raw_value).__name__,
                 )
             values.append(raw_value)
 
         return _CohortValues(
             cohort=cohort,
-            total_count=len(rows),
+            first_row_index=cohort_rows[0][0],
+            total_count=len(cohort_rows),
             values=tuple(values),
-            missing_count=missing_count,
-            non_finite_count=0,
+            missing_indices=tuple(missing_indices),
         )
 
-    def _values_for(self, cohort: Any, rows: list[PipelineRow]) -> _CohortValues:
+    def _values_for(self, cohort: Any, cohort_rows: list[tuple[int, PipelineRow]]) -> _CohortValues:
         if self._value_type == "numeric":
-            return self._numeric_values_for(cohort, rows)
-        return self._categorical_values_for(cohort, rows)
+            return self._numeric_values_for(cohort, cohort_rows)
+        return self._categorical_values_for(cohort, cohort_rows)
 
-    @staticmethod
-    def _error_for_no_values(stats: _CohortValues, *, batch_size: int) -> TransformResult:
+    def _error_for_no_values(self, stats: _CohortValues, *, batch_size: int) -> TransformResult:
+        # The cohort is named by the batch rows that make it up, never by its
+        # value: the cohort value is row content, and an audit reason records
+        # WHICH rows, not what they contain.
+        row_errors: list[RowErrorEntry] = []
+        for row_index in stats.missing_indices:
+            row_errors.append({"row_index": row_index, "reason": "missing_value"})
+        for row_index in stats.non_finite_indices:
+            row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "no_valid_values",
-            "group_value": stats.cohort,
+            "field": self._value_field,
+            "group_by": self._cohort_field,
             "batch_size": batch_size,
             "valid_count": 0,
             "skipped_count": stats.missing_count + stats.non_finite_count,
+            "row_errors": row_errors,
         }
         return TransformResult.error(reason, retryable=False)
 
@@ -484,11 +525,19 @@ class BatchDriftCompare(BaseTransform):
             try:
                 return self._numeric_result(baseline=baseline, cohort=cohort, batch_size=batch_size), None
             except OverflowError as exc:
+                operation = str(exc) or "numeric_drift"
+                # Both cohorts are named by the batch row where each was first
+                # seen, never by their values: a cohort value is row content.
                 reason: TransformErrorReason = {
                     "reason": "float_overflow",
-                    "operation": str(exc) or "numeric_drift",
-                    "group_value": cohort.cohort,
-                    "value": str(baseline.cohort),
+                    "operation": operation,
+                    "field": self._value_field,
+                    "group_by": self._cohort_field,
+                    "batch_size": batch_size,
+                    "error": (
+                        f"{operation} overflowed comparing the cohort first seen in row {cohort.first_row_index} "
+                        f"against the baseline cohort first seen in row {baseline.first_row_index}"
+                    ),
                 }
                 return {}, TransformResult.error(reason, retryable=False)
         return self._categorical_result(baseline=baseline, cohort=cohort, batch_size=batch_size), None
@@ -523,7 +572,16 @@ class BatchDriftCompare(BaseTransform):
             return non_finite_error
 
         grouped = self._collect_cohorts(rows)
-        cohort_values = [(cohort, self._values_for(cohort, cohort_rows)) for cohort, cohort_rows in grouped]
+        try:
+            cohort_values = [(cohort, self._values_for(cohort, cohort_rows)) for cohort, cohort_rows in grouped]
+        except BatchRowTypeError as exc:
+            # A wrong-typed value fails the WHOLE batch with a recorded,
+            # value-free reason (which row, which field, what was required,
+            # what was found); the aggregation's on_error route then carries
+            # every buffered row of the batch.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+        # Only a CONFIGURED baseline can be absent: a first-seen default always
+        # matches itself, because the NaN keys that would not were rejected above.
         baseline_cohort = self._baseline_cohort if self._baseline_cohort is not None else cohort_values[0][0]
         baseline = None
         for cohort, values in cohort_values:
@@ -531,12 +589,16 @@ class BatchDriftCompare(BaseTransform):
                 baseline = values
                 break
         if baseline is None:
+            # `expected` is the configured baseline (operator config, not row
+            # data); the cohorts actually seen are row content and are counted,
+            # not listed.
             return TransformResult.error(
                 {
                     "reason": "validation_failed",
                     "cause": "baseline_cohort_missing",
+                    "group_by": self._cohort_field,
                     "expected": str(baseline_cohort),
-                    "errors": [str(cohort) for cohort, _values in cohort_values],
+                    "count": len(cohort_values),
                 },
                 retryable=False,
             )

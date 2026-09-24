@@ -14,7 +14,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -259,6 +259,7 @@ class DataverseClient:
         limiter: LimiterProtocol | None = None,
         retry_after_cap: float = 60.0,
         additional_domains: tuple[str, ...] = (),
+        before_request: Callable[[str], None] | None = None,
     ) -> None:
         raw_environment_url = environment_url.rstrip("/")
         parsed = urllib.parse.urlparse(raw_environment_url)
@@ -280,6 +281,7 @@ class DataverseClient:
         self._limiter = limiter
         self._retry_after_cap = retry_after_cap
         self._additional_domains = additional_domains
+        self._before_request = before_request
 
         # Validate environment_url against domain allowlist
         if not _validate_domain_allowlist(hostname, self._additional_domains):
@@ -504,6 +506,8 @@ class DataverseClient:
         Raises:
             DataverseClientError: For protocol-level errors
         """
+        if self._before_request is not None:
+            self._before_request(url)
         self._acquire_rate_limit()
 
         auth_headers = self.get_auth_headers()
@@ -824,6 +828,8 @@ class DataverseClient:
             # The returned SSRFSafeRequest is passed to _execute_request
             # so the HTTP call connects to the validated IP, preventing
             # DNS rebinding between validation and connection.
+            if self._before_request is not None:
+                self._before_request(page.next_link)
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 

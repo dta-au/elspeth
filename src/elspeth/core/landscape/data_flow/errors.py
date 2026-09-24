@@ -8,11 +8,12 @@ persisted quarantine rows, and the error read models.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, get_args
 
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
     TransformErrorReason,
@@ -22,7 +23,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, TransformErrorCategory
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -33,6 +34,7 @@ from elspeth.core.landscape.data_flow.serialization import (
     canonical_or_recorded_hash,
     canonical_or_recorded_json,
 )
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import TransformErrorLoader, ValidationErrorLoader
 from elspeth.core.landscape.ports import LandscapeConnectionProvider
@@ -43,7 +45,95 @@ if TYPE_CHECKING:
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.schema_contract import PipelineRow
 
-__all__ = ["ErrorAuditRepository"]
+__all__ = ["ErrorAuditRepository", "insert_batch_transform_errors_on"]
+
+
+def _require_transform_error_category(error_details: TransformErrorReason) -> None:
+    """Refuse a transform error whose reason is not a known TransformErrorCategory.
+
+    Tier 1 write guard shared by the per-row and batch writers. TypedDict has
+    zero runtime enforcement — the Literal annotation only helps at compile
+    time. Invalid reasons must crash before persisting.
+    """
+    reason = error_details["reason"]
+    valid_reasons = get_args(TransformErrorCategory)
+    if reason not in valid_reasons:
+        raise AuditIntegrityError(
+            f"Invalid TransformErrorCategory '{reason}' at Tier 1 write boundary. "
+            f"This is a plugin bug — transforms must use a valid error category. "
+            f"Valid categories: {sorted(valid_reasons)}"
+        )
+
+
+def insert_batch_transform_errors_on(
+    conn: Connection,
+    *,
+    run_id: str,
+    members: Sequence[tuple[TokenRef, PipelineRow]],
+    transform_id: str,
+    error_details: TransformErrorReason,
+    destination: str,
+) -> tuple[str, ...]:
+    """Insert one transform error per member of a FAILED aggregation batch, on ``conn``.
+
+    The batch-level twin of :meth:`ErrorAuditRepository.record_transform_error`
+    (operator ruling B5). A batch transform that returns
+    ``TransformResult.error`` fails the WHOLE batch, so every buffered member
+    gets its own ``transform_errors`` row carrying its own row and the one
+    (already scrubbed) batch reason, with the ``destination`` the per-row seam
+    records (the ``on_error`` sink name, or ``"discard"``). ONE executemany
+    INSERT, so no crash leaves a partially attributed batch.
+
+    Deliberately a connection-level helper with no transaction of its own:
+    the rows are part of the batch's recorded FAILED verdict, which
+    ``ExecutionRepository.complete_aggregation_failure`` writes in ONE
+    leader-fenced transaction with the flush node_state, the batch row and
+    the DIVERT routing_event. Whether that verdict exists is then never a
+    matter of crash timing.
+
+    Returns:
+        The error_ids, in member order.
+
+    Raises:
+        AuditIntegrityError: The member set is empty, a member belongs to
+            another run, or the reason category is not a known
+            TransformErrorCategory.
+        LandscapeRecordError: The database rejected the write or wrote fewer
+            rows than members.
+    """
+    if not members:
+        raise AuditIntegrityError("insert_batch_transform_errors_on: a failed batch has at least one member")
+    if any(ref.run_id != run_id for ref, _row_data in members):
+        raise AuditIntegrityError("insert_batch_transform_errors_on: token reference does not belong to the authority's run")
+    _require_transform_error_category(error_details)
+
+    # Coerce-and-record exactly as record_transform_error does: the reason
+    # and each member's row are canonicalised before the INSERT runs.
+    error_details_json = canonical_or_recorded_error_details_json(error_details)
+    created_at = now()
+    values = [
+        {
+            "error_id": f"terr_{generate_id()[:12]}",
+            "run_id": run_id,
+            "token_id": ref.token_id,
+            "transform_id": transform_id,
+            "row_hash": canonical_or_recorded_hash(row_data),
+            "row_data_json": canonical_or_recorded_json(row_data),
+            "error_details_json": error_details_json,
+            "destination": destination,
+            "created_at": created_at,
+        }
+        for ref, row_data in members
+    ]
+    try:
+        result = conn.execute(transform_errors_table.insert().returning(transform_errors_table.c.error_id), values)
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"insert_batch_transform_errors_on failed — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if len(result.fetchall()) != len(values):
+        raise LandscapeRecordError("insert_batch_transform_errors_on: incomplete batch — audit write failed")
+    return tuple(str(value["error_id"]) for value in values)
 
 
 class ErrorAuditRepository:
@@ -253,21 +343,7 @@ class ErrorAuditRepository:
         # Validate token belongs to the specified run (Tier 1 invariant)
         self._ownership.validate_token_run_ownership(ref)
 
-        # Validate reason is a known TransformErrorCategory (Tier 1 write guard).
-        # TypedDict has zero runtime enforcement — the Literal annotation only
-        # helps at compile time. Invalid reasons must crash before persisting.
-        from typing import get_args
-
-        from elspeth.contracts.errors import TransformErrorCategory
-
-        reason = error_details["reason"]
-        valid_reasons = get_args(TransformErrorCategory)
-        if reason not in valid_reasons:
-            raise AuditIntegrityError(
-                f"Invalid TransformErrorCategory '{reason}' at Tier 1 write boundary. "
-                f"This is a plugin bug — transforms must use a valid error category. "
-                f"Valid categories: {sorted(valid_reasons)}"
-            )
+        _require_transform_error_category(error_details)
 
         error_id = f"terr_{generate_id()[:12]}"
 

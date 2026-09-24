@@ -1,0 +1,392 @@
+"""Failure and discard COUNTS derive from terminal outcomes, not transform_errors rows (elspeth-5887fb7928).
+
+Operator ruling 2026-09-23: a token counts as failed or discarded at a node
+only when its terminal ``token_outcomes`` row says it failed on a transform
+error, and only at the node whose error decided it. ``transform_errors`` rows
+record attempts. They stay as evidence and never inflate a count.
+
+Every case runs the four counting readers over one audit state built with the
+real recorder writers: the web discard summary, the web failure categories,
+and the MCP run summary and error analysis. The end-to-end batch cases
+(fail-then-succeed on resume, a genuine discard, a routed batch) live in
+``tests/integration/pipeline/test_batch_flush_recovery_and_redaction.py``,
+and the ordinary per-row run (one row fails a transform the others complete)
+in ``tests/integration/pipeline/test_transform_failure_counts.py``. The
+per-row resume twins are here: a per-row crash cannot be resumed end to end,
+because the source is still ``loading`` when a row fails.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import sqlite
+from sqlalchemy.engine import Connection
+
+from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import TransformErrorCategory, TransformErrorReason
+from elspeth.core.landscape.data_flow import errors as data_flow_errors
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.schema import node_states_table, transform_errors_table
+from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
+from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
+from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from elspeth.web.execution.failure_samples import load_top_failure_categories
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    claim_test_work_item,
+    leader_coordination_token,
+    make_recorder_with_run,
+    register_test_node,
+)
+
+_PLUGINS = {"xform": "mapper", "yform": "scorer"}
+
+
+@dataclass(frozen=True, slots=True)
+class _Counts:
+    discarded: dict[str | None, int]
+    categories: list[tuple[str, str, int]]
+    run_summary_transform: int
+    analysis_total: int
+    analysis_by_plugin: dict[str, int]
+
+
+def _setup(run_id: str, db: LandscapeDB | None = None) -> RecorderSetup:
+    setup = make_recorder_with_run(run_id=run_id, source_node_id="src", db=db)
+    for node_id, plugin in _PLUGINS.items():
+        register_test_node(setup.data_flow, run_id, node_id, node_type=NodeType.TRANSFORM, plugin_name=plugin)
+    return setup
+
+
+def _token(setup: RecorderSetup, index: int) -> str:
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+        source_node_id="src",
+        row_index=index,
+        data={"x": index},
+        source_row_index=index,
+        ingest_sequence=index,
+    )
+    return token.token_id
+
+
+def _error(setup: RecorderSetup, token_id: str, node_id: str, *, reason: TransformErrorCategory, destination: str) -> None:
+    """One attempt's transform_errors row, through the real writer."""
+    member = leader_coordination_token(setup.factory, setup.run_id).membership
+    work_item = claim_test_work_item(setup.factory, member_token=member, token_id=token_id, node_id=node_id)
+    details: TransformErrorReason = {"reason": reason}
+    setup.data_flow.record_transform_error(
+        ref=TokenRef(token_id=token_id, run_id=setup.run_id),
+        transform_id=node_id,
+        row_data={"x": 0},
+        error_details=details,
+        destination=destination,
+        member_token=member,
+        work_item=work_item,
+    )
+
+
+def _terminal(setup: RecorderSetup, token_id: str, outcome: TerminalOutcome, path: TerminalPath, *, sink_name: str | None = None) -> None:
+    error_hash = None if outcome is TerminalOutcome.SUCCESS else "a" * 16
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+        ref=TokenRef(token_id=token_id, run_id=setup.run_id),
+        outcome=outcome,
+        path=path,
+        sink_name=sink_name,
+        error_hash=error_hash,
+    )
+
+
+def _completed_state(setup: RecorderSetup, token_id: str, node_id: str) -> None:
+    """A later attempt that got the token past ``node_id``."""
+    member = leader_coordination_token(setup.factory, setup.run_id).membership
+    state = setup.execution.begin_node_state(token_id, node_id, 1, {"x": 0}, member_token=member, attempt=1)
+    setup.execution.complete_node_state(
+        state.state_id, NodeStateStatus.COMPLETED, output_data={"x": 0}, duration_ms=1.0, member_token=member
+    )
+
+
+def _error_created_order(setup: RecorderSetup, token_id: str) -> list[str]:
+    """Control: the node order the writer stamped, oldest first, with no tie."""
+    with setup.db.connection() as conn:
+        rows = conn.execute(
+            select(transform_errors_table.c.transform_id, transform_errors_table.c.created_at)
+            .where(transform_errors_table.c.token_id == token_id)
+            .order_by(transform_errors_table.c.created_at)
+        ).all()
+    stamps = [row.created_at for row in rows]
+    assert len(set(stamps)) == len(stamps), f"control: the attempts need distinct created_at stamps, got {stamps}"
+    return [row.transform_id for row in rows]
+
+
+def _counts(setup: RecorderSetup) -> _Counts:
+    summaries = load_discard_summaries_from_db(setup.db, [setup.run_id])
+    discarded = (
+        {stage.node_id: stage.count for stage in summaries[setup.run_id].stages if stage.stage == "transform_validation"}
+        if setup.run_id in summaries
+        else {}
+    )
+    categories = [(s.transform_id, s.category, s.count) for s in load_top_failure_categories(setup.db, setup.run_id)]
+    run_summary: Any = get_run_summary(setup.db, setup.factory, setup.run_id)
+    analysis: Any = get_error_analysis(setup.db, setup.factory, setup.run_id)
+    return _Counts(
+        discarded=discarded,
+        categories=categories,
+        run_summary_transform=run_summary["errors"]["transform"],
+        analysis_total=analysis["transform_errors"]["total"],
+        analysis_by_plugin={group["transform_plugin"]: group["count"] for group in analysis["transform_errors"]["by_transform"]},
+    )
+
+
+_NOTHING_FAILED = _Counts(discarded={}, categories=[], run_summary_transform=0, analysis_total=0, analysis_by_plugin={})
+
+
+def test_a_token_whose_retried_attempt_was_delivered_is_neither_failed_nor_discarded() -> None:
+    """Two attempts failed and were recorded, and the resumed third was delivered.
+
+    No node state records the success here, which is the shape of a failed
+    batch's non-triggering members. Only the terminal outcome says the token
+    did not fail.
+    """
+    setup = _setup("delivered-after-retry")
+    token = _token(setup, 0)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _terminal(setup, token, TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="output")
+
+    assert _counts(setup) == _NOTHING_FAILED
+
+
+def test_a_token_counts_once_at_the_node_whose_error_decided_it() -> None:
+    """An attempt failed at X, a resumed attempt passed X, and the token was then discarded at Y.
+
+    The X row is evidence of an attempt the resume superseded. The token
+    failed at Y and only at Y, with Y's category.
+    """
+    setup = _setup("x-then-y")
+    token = _token(setup, 0)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _error(setup, token, "yform", reason="validation_failed", destination="discard")
+    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    assert _error_created_order(setup, token) == ["xform", "yform"]
+
+    assert _counts(setup) == _Counts(
+        discarded={"yform": 1},
+        categories=[("yform", "validation_failed", 1)],
+        run_summary_transform=1,
+        analysis_total=1,
+        analysis_by_plugin={"scorer": 1},
+    )
+
+
+def test_the_category_is_the_deciding_attempts_not_every_attempts() -> None:
+    """Two attempts at one node recorded different categories; the token failed once, under the last."""
+    setup = _setup("two-categories")
+    token = _token(setup, 0)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _error(setup, token, "xform", reason="validation_failed", destination="discard")
+    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    assert _error_created_order(setup, token) == ["xform", "xform"]
+
+    counts = _counts(setup)
+
+    assert counts.categories == [("xform", "validation_failed", 1)]
+    assert counts.discarded == {"xform": 1}
+    assert counts.run_summary_transform == counts.analysis_total == 1
+
+
+def test_a_per_row_discard_counts_as_discarded_and_a_routed_row_as_failed_only() -> None:
+    """The per-row twin of the batch discard/routed pair.
+
+    ``on_error: discard`` ends (FAILURE, QUARANTINED_AT_SOURCE) and is a
+    discard. ``on_error: quarantine`` ends (FAILURE, ON_ERROR_ROUTED) at that
+    sink. The row failed, but it was routed, not discarded.
+    """
+    setup = _setup("per-row-twin")
+    discarded, routed = _token(setup, 0), _token(setup, 1)
+    _error(setup, discarded, "xform", reason="api_error", destination="discard")
+    _terminal(setup, discarded, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    _error(setup, routed, "xform", reason="api_error", destination="quarantine")
+    _terminal(setup, routed, TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED, sink_name="quarantine")
+
+    assert _counts(setup) == _Counts(
+        discarded={"xform": 1},
+        categories=[("xform", "api_error", 2)],
+        run_summary_transform=2,
+        analysis_total=2,
+        analysis_by_plugin={"mapper": 2},
+    )
+
+
+@pytest.mark.parametrize(
+    ("destination", "path", "sink_name", "discarded"),
+    [
+        ("discard", TerminalPath.QUARANTINED_AT_SOURCE, None, {"xform": 1}),
+        ("quarantine", TerminalPath.ON_ERROR_ROUTED, "quarantine", {}),
+    ],
+    ids=["discard", "routed"],
+)
+def test_a_failed_token_still_counts_when_other_tokens_completed_the_node(
+    destination: str, path: TerminalPath, sink_name: str | None, discarded: dict[str | None, int]
+) -> None:
+    """The ordinary run: two rows pass X and one row fails there.
+
+    The completed-state exclusion is about THIS token getting past X. Another
+    token's completed state at X says nothing about the failed one, so the
+    failed token counts once on both on_error arms.
+    """
+    setup = _setup(f"mixed-node-{destination}")
+    passed_first, failed, passed_last = _token(setup, 0), _token(setup, 1), _token(setup, 2)
+    for passed in (passed_first, passed_last):
+        _completed_state(setup, passed, "xform")
+        _terminal(setup, passed, TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="output")
+    _error(setup, failed, "xform", reason="api_error", destination=destination)
+    _terminal(setup, failed, TerminalOutcome.FAILURE, path, sink_name=sink_name)
+    with setup.db.connection() as conn:
+        completed_at_x = (
+            conn.execute(
+                select(node_states_table.c.token_id)
+                .where(node_states_table.c.node_id == "xform")
+                .where(node_states_table.c.status == NodeStateStatus.COMPLETED)
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(completed_at_x) == sorted([passed_first, passed_last]), "control: two other tokens COMPLETED the failing node"
+
+    assert _counts(setup) == _Counts(
+        discarded=discarded,
+        categories=[("xform", "api_error", 1)],
+        run_summary_transform=1,
+        analysis_total=1,
+        analysis_by_plugin={"mapper": 1},
+    )
+
+
+def test_a_token_that_completed_the_node_did_not_fail_there() -> None:
+    """A resumed attempt completed X, and a path that writes no transform error then quarantined the token.
+
+    The collector and batch-member quarantines end (FAILURE,
+    QUARANTINED_AT_SOURCE) without a transform_errors row. The token's latest
+    row is still the superseded X attempt. The completed X state is what
+    shows a transform error did not decide this token.
+    """
+    setup = _setup("completed-then-quarantined")
+    token = _token(setup, 0)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _completed_state(setup, token, "xform")
+    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+
+    assert _counts(setup) == _NOTHING_FAILED
+
+
+@pytest.mark.parametrize(
+    ("path", "sink_name"),
+    [
+        (TerminalPath.SINK_DISCARDED, DISCARD_SINK_NAME),
+        (TerminalPath.UNROUTED, None),
+        (TerminalPath.GATE_ERROR_DISCARDED, None),
+    ],
+    ids=["sink-discarded", "unrouted", "gate-error-discarded"],
+)
+def test_a_failure_a_transform_error_did_not_decide_is_not_counted(path: TerminalPath, sink_name: str | None) -> None:
+    """A recorded, superseded transform error, then a FAILURE decided elsewhere.
+
+    A sink discard, an unrouted crash and a gate error each fail the token
+    somewhere other than X, so none of them is a transform failure at X.
+    """
+    setup = _setup(f"decided-elsewhere-{path.value}")
+    token = _token(setup, 0)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _terminal(setup, token, TerminalOutcome.FAILURE, path, sink_name=sink_name)
+
+    counts = _counts(setup)
+
+    assert counts.categories == []
+    assert counts.discarded == {}
+    assert counts.run_summary_transform == counts.analysis_total == 0
+
+
+def test_a_created_at_tie_still_counts_the_token_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two attempts stamped at the same instant: the ``error_id`` tie-break still picks ONE row.
+
+    Error ids are random (``terr_`` plus a generated id), so which attempt
+    wins a tie means nothing. That exactly one wins is what keeps the token
+    from counting once under each attempt's category.
+    """
+    setup = _setup("created-at-tie")
+    token = _token(setup, 0)
+    instant = datetime(2026, 9, 23, tzinfo=UTC)
+    monkeypatch.setattr(data_flow_errors, "now", lambda: instant)
+    _error(setup, token, "xform", reason="api_error", destination="discard")
+    _error(setup, token, "xform", reason="validation_failed", destination="discard")
+    _terminal(setup, token, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    with setup.db.connection() as conn:
+        stamps = conn.execute(select(transform_errors_table.c.created_at).where(transform_errors_table.c.token_id == token)).scalars().all()
+    assert len(stamps) == 2 and len(set(stamps)) == 1, f"control: the two attempts must tie on created_at, got {stamps}"
+
+    counts = _counts(setup)
+
+    assert len(counts.categories) == 1, counts.categories
+    transform_id, category, count = counts.categories[0]
+    assert (transform_id, count) == ("xform", 1)
+    assert category in {"api_error", "validation_failed"}
+    assert counts.discarded == {"xform": 1}
+    assert counts.run_summary_transform == counts.analysis_total == 1
+
+
+def _plan(conn: Connection, sql: str) -> list[tuple[int, int, str]]:
+    """SQLite's EXPLAIN QUERY PLAN rows as (id, parent id, detail)."""
+    return [(row[0], row[1], row[3]) for row in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {sql}")]
+
+
+@pytest.mark.parametrize(
+    "created_last",
+    ["ix_transform_errors_run", "ix_transform_errors_token"],
+)
+def test_the_latest_attempt_is_ranked_in_one_pass_whatever_order_the_indexes_were_created_in(created_last: str) -> None:
+    """Pin the PLAN: the runs' error rows are read once, never once per error row.
+
+    A "latest row for this token" subquery correlated on ``run_id`` and
+    ``token_id`` gives SQLite two single-column index candidates. With no
+    ANALYZE statistics it takes the one created last, and ``create_all``
+    creates a table's indexes in set order, which varies per process. Where
+    the run index came last, every error row rescanned and sorted the whole
+    run: 14.4s for 10k failed tokens on the web run-completion path. Recreating
+    one index forces each order, and the control shows the trap is armed.
+    """
+    column = created_last.removeprefix("ix_transform_errors_")
+    db = LandscapeDB.in_memory()
+    try:
+        with db.write_connection() as conn:
+            conn.exec_driver_sql(f"DROP INDEX {created_last}")
+            conn.exec_driver_sql(f"CREATE INDEX {created_last} ON transform_errors ({column}_id)")
+        with db.read_only_connection() as conn:
+            trap = _plan(conn, "SELECT error_id FROM transform_errors WHERE run_id = 'run-1' AND token_id = 'token-1'")
+            assert any(created_last in detail for _id, _parent, detail in trap), f"control: the trap is not armed: {trap}"
+            query = deciding_transform_errors(("run-1",)).compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True})
+            plan = _plan(conn, str(query))
+    finally:
+        db.close()
+
+    details = {plan_id: detail for plan_id, _parent, detail in plan}
+    parents = {plan_id: parent for plan_id, parent, _detail in plan}
+
+    def ancestors(plan_id: int) -> list[str]:
+        chain = []
+        while parents[plan_id] in details:
+            plan_id = parents[plan_id]
+            chain.append(details[plan_id])
+        return chain
+
+    reads = [plan_id for plan_id, detail in details.items() if "transform_errors" in detail]
+    assert len(reads) == 1, plan
+    assert not any(step.startswith("CORRELATED") for step in ancestors(reads[0])), plan

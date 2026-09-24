@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
     from elspeth.contracts import SourceProtocol
     from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.engine.orchestrator.source_replay import AuditedSource
 
 
 class SourceLifecycleRecorder:
@@ -52,6 +53,7 @@ class SourceLifecycleRecorder:
         factory: RecorderFactory,
         *,
         active_source: SourceProtocol,
+        audited_source: AuditedSource | None = None,
         previously_recorded: tuple[Mapping[str, str], str | None] | None = None,
         coordination_token: CoordinationToken,
     ) -> tuple[Mapping[str, str], str | None] | None:
@@ -73,7 +75,13 @@ class SourceLifecycleRecorder:
             The recorded (mapping, normalization_version) snapshot, or None if
             the source has no field resolution.
         """
-        field_resolution = active_source.get_field_resolution()
+        field_resolution = (
+            (audited_source.field_resolution, audited_source.normalization_version)
+            if audited_source is not None and audited_source.field_resolution is not None
+            else None
+            if audited_source is not None
+            else active_source.get_field_resolution()
+        )
         if field_resolution is None:
             return None
         if previously_recorded is not None and field_resolution == previously_recorded:
@@ -106,11 +114,18 @@ class SourceLifecycleRecorder:
         active_source: SourceProtocol,
         lifecycle_state: RunSourceLifecycleState,
         *,
+        audited_source: AuditedSource | None = None,
         coordination_token: CoordinationToken,
     ) -> None:
         """Record source lifecycle with the latest source schema evidence."""
 
-        field_resolution = active_source.get_field_resolution()
+        field_resolution = (
+            (audited_source.field_resolution, audited_source.normalization_version)
+            if audited_source is not None and audited_source.field_resolution is not None
+            else None
+            if audited_source is not None
+            else active_source.get_field_resolution()
+        )
         resolution_mapping: Mapping[str, str] | None = None
         normalization_version: str | None = None
         if field_resolution is not None:
@@ -121,8 +136,10 @@ class SourceLifecycleRecorder:
             source_name=source_name,
             plugin_name=active_source.name,
             config_hash=stable_hash(active_source.config),
-            source_schema_json=json.dumps(active_source.output_schema.model_json_schema()),
-            schema_contract=active_source.get_schema_contract(),
+            source_schema_json=audited_source.source_schema_json
+            if audited_source is not None
+            else json.dumps(active_source.output_schema.model_json_schema()),
+            schema_contract=audited_source.schema_contract if audited_source is not None else active_source.get_schema_contract(),
             field_resolution_mapping=resolution_mapping,
             normalization_version=normalization_version,
             lifecycle_state=lifecycle_state,

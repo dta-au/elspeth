@@ -95,6 +95,29 @@ class CommittedAggregationOutputReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedAggregationFailure:
+    """A batch's recorded FAILED verdict whose members are still BLOCKED.
+
+    Written atomically by ``ExecutionRepository.complete_aggregation_failure``
+    and final: resume completes the disposition ``destination`` names for every
+    member (the named ``on_error`` sink, or ``"discard"``) with the recorded
+    reason, without re-invoking the batch plugin.
+
+    Attributes:
+        reason_json: The recorded reason — the canonical JSON every member's
+            ``transform_errors.error_details_json`` and the flush node_state's
+            ``error_json`` carry, byte for byte.
+    """
+
+    batch_id: str
+    aggregation_node_id: str
+    aggregation_state_id: str
+    member_token_ids: tuple[str, ...]
+    reason_json: str
+    destination: str
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedCoalesceResidual:
     """Durable coalesce merge whose scheduler barrier has not completed."""
 

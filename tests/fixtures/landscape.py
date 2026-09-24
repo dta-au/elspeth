@@ -620,6 +620,7 @@ def make_recorder_with_run(
     canonical_version: str = "v1",
     payload_store: PayloadStore | None = None,
     leader_worker_id: str | None = None,
+    db: LandscapeDB | None = None,
 ) -> RecorderSetup:
     """Create LandscapeDB + RecorderFactory + run + source node in one call.
 
@@ -643,8 +644,12 @@ def make_recorder_with_run(
         leader_worker_id: Optional registered leader worker identity. Tests that
             drive fenced scheduler claim verbs with a fixed lease owner should
             pass that same value here.
+        db: An existing database to begin the run in, such as a PostgreSQL
+            target for a ``testcontainer`` suite. Defaults to a fresh
+            in-memory SQLite database.
     """
-    db = make_landscape_db()
+    if db is None:
+        db = make_landscape_db()
     factory = make_factory(db, payload_store=payload_store)
 
     # Build kwargs, only passing explicit IDs if provided

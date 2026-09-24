@@ -27,7 +27,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunMode, RunStatus
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.errors import (
@@ -36,6 +36,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.events import PhaseCompleted, PipelinePhase
 from elspeth.contracts.types import NodeID
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.orchestrator.aggregation import flush_remaining_aggregation_buffers
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.leader_follower_drain import LeaderFollowerDrain
@@ -358,6 +359,15 @@ class LeaderDrainCoordinator:
 
                 _leader_follower_drain.drain_pending_sink_work(_drain_and_flush)
 
+                if loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.assert_complete()
+
             # ADR-019 Phase 4: deferred cross-table invariant sweep.
             #
             # AUDIT-TRAIL DURABILITY CONTRACT:
@@ -532,7 +542,16 @@ def run_end_of_input_barrier_flush(
         # roster settles through intake (arrival or loss replay); a group
         # that never settles is the non-convergence below, named as such.
         if not processor.has_blocked_barrier_work():
-            return
+            if collector_executor is not None:
+                # An EOF aggregation flush can emit a zero-member scope after
+                # this round's first intake. No child has a BLOCKED row, so
+                # the ordinary loop predicate cannot detect that pending
+                # group. One final intake discovers its durable opener record
+                # before terminal run accounting, including on resume.
+                intake_results = processor.run_barrier_intake(ctx)
+                accumulate_row_outcomes(intake_results, counters, pending_tokens)
+            if not processor.has_blocked_barrier_work():
+                return
 
     collector_detail = ""
     if collector_executor is not None:

@@ -449,6 +449,7 @@ function runFixtures(sessionId: string): Run[] {
     sources: { source: { rows_processed: 2, rows_rejected: 0, rows_read: 2 } },
     tokens: { emitted: 2, terminal: 2, succeeded: 2, failed: 0, structural: 0, pending: 0, abandoned: 0 },
     routing: { routed_success: 2, routed_failure: 0, quarantined: 0, discarded: 0 },
+    collector_groups_failed: 0,
     integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0 },
   } satisfies RunAccounting;
   return [

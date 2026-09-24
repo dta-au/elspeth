@@ -20,15 +20,36 @@ and nothing makes them drift together. ``node_kind`` is the ONLY thing the two
 callers vary, and it varies solely to name the node in the operator-facing
 message.
 
-Both raise rather than returning a routable error, deliberately. What they
-check is a function of the CONFIG, not of the row: the node's declared contract
-either admits the arriving shape or it does not, identically for every row in
-the group. Routing it per-row would quarantine an entire dataset and report
-PARTIAL, telling the operator their data was bad when the pipeline was
-misconfigured — the disposition ADR-008 §Alternative 3 rejects, and the same
-reasoning ``TransformExecutor._run_preflight`` records for its own lifecycle
-guard. This is the opposite polarity from elspeth-5887fb7928, where the checks
-WERE facts about one row and had to become routable returns.
+Both raise a Tier-2 ``PluginContractViolation``, and both executors ROUTE it:
+the whole batch fails, following the aggregation's ``on_error`` or failing the
+collector's group, as a returned error would (``AggregationExecutor.
+_run_flush_transform``, ``CollectorExecutor._execute_flush``). This reverses the
+decision recorded here before 2026-09-23, which held that the checks were a
+function of the CONFIG alone and so had to abort. Measurement refuted that: a
+typed aggregation schema over an observed upstream is ordinary, and one
+wrongly-typed row of three failed the check while the other two passed, so it
+is a fact about that row and the run must not end on it. Operator ruling
+2026-09-23 (elspeth-5887fb7928 B2) chose to route; the per-row seam already
+routes the same violation (``RowProcessor._convert_contract_violation_to_error_result``).
+When every row fails because the configuration is wrong, every batch is routed
+and the run reports its failures instead of a traceback.
+
+The input check also enforces PRESENCE of the fields the transform declares
+required (``schema_required_input_fields``: ``schema.required_fields`` plus the
+columns each batch transform folds in from its own options). An observed input
+model has no fields, so pydantic never saw that declaration, and a buffered row
+omitting ``value_field`` reached the plugin as a raw ``KeyError`` that ended the
+run (elspeth-5887fb7928 R1). The build-time edge check does not cover it
+either: it reads the AUTHORED config, not the fields a plugin folds in, and an
+observed upstream guarantees nothing. So an absent field is a fact about that
+row, like a wrong type, and it is routed the same way. The per-row
+``DeclaredRequiredInputFieldsViolation`` (ADR-013) is not the model here: its
+fields are guaranteed upstream at build time, so a miss there is a framework
+fault and Tier 1, and ADR-013 scopes it to single-row transforms.
+
+The message names the row index, field and error type, never the row VALUE
+(``contracts.safe_validation_errors``): it becomes the routed reason. An absent
+field is named from the transform's CONFIG, never from the row's own keys.
 """
 
 from __future__ import annotations
@@ -39,6 +60,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
 from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 
 
 def validate_batch_inputs(
@@ -55,16 +77,32 @@ def validate_batch_inputs(
         node_kind: Operator-facing name for the node kind ("Aggregation",
             "Collector") — message text only, never control flow.
 
+    Presence is checked before the model, for the reason the per-row preflight
+    runs its declaration check first: an absent field is reported as absent,
+    not diluted into a schema failure.
+
     Raises:
-        PluginContractViolation: If any buffered row fails the declared input
-            schema.
+        PluginContractViolation: If any buffered row lacks a field the transform
+            declares required, or fails the declared input schema.
     """
+    required = transform.schema_required_input_fields()
     for idx, row in enumerate(rows):
+        # ``in`` on a PipelineRow resolves original and normalized names exactly
+        # as ``row[field]`` does, so a field reported present here cannot raise
+        # KeyError inside the plugin.
+        absent = sorted(field for field in required if field not in row)
+        if absent:
+            raise PluginContractViolation(
+                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: "
+                f"required input field(s) {absent} absent from the row. "
+                "The transform's schema declares them required."
+            )
         try:
             transform.input_schema.model_validate(row.to_dict(), strict=True)
         except ValidationError as exc:
             raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: {exc}. "
+                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: "
+                f"{safe_validation_error_text(exc)}. "
                 "This indicates an upstream transform/source schema bug."
             ) from exc
 
@@ -98,6 +136,7 @@ def validate_success_outputs(
             transform.output_schema.model_validate(row.to_dict(), strict=True)
         except ValidationError as exc:
             raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: {exc}. "
+                f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: "
+                f"{safe_validation_error_text(exc)}. "
                 "This indicates a transform schema bug."
             ) from exc

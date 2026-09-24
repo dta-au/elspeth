@@ -106,7 +106,7 @@ def producer_results():
 
 
 def test_real_producers_preserve_frozen_baseline_bytes_and_readmit(producer_results):
-    baseline = json.loads(Path(__file__).with_name("fixtures").joinpath("generation_response_wire_a6c58c68.json").read_text())
+    baseline = json.loads(Path(__file__).with_name("fixtures").joinpath("generation_response_wire_4f206253.json").read_text())
     assert set(producer_results) == set(baseline["cases"])
     for name, result in producer_results.items():
         assert result.success is baseline["cases"][name]["success"] is True

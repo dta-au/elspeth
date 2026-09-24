@@ -342,6 +342,7 @@ function makeAccounting(overrides: Partial<RunAccounting> = {}): RunAccounting {
       quarantined: 0,
       discarded: 0,
     },
+    collector_groups_failed: 0,
     integrity: {
       closure: "closed",
       missing_terminal_outcomes: 0,

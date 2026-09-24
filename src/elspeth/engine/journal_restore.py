@@ -426,6 +426,21 @@ class RestoredPendingCollectorGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class RestoredRecordedCollectorFailure:
+    """A collector group whose FAILED verdict is recorded but whose members the journal still holds.
+
+    ``complete_collector_failure`` failed every arrived member's hold in the
+    verdict's one transaction; the crashed process died before the settle
+    seam released them. Resume completes this verdict (``failure_reason``,
+    read back from the holds) without re-invoking the plugin.
+    """
+
+    key: tuple[str, str]  # (collector_name, group_id)
+    members: tuple[TokenInfo, ...]  # journal order; the executor orders them by opener ordinal
+    failure_reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class RestoredCollectorState:
     """Whole-executor restored collector state (single-shot apply, Task 7)."""
 
@@ -439,6 +454,7 @@ class RestoredCollectorState:
     # reconstruction is the principled fix for both rather than a second,
     # partial in-memory structure.
     completed_groups: tuple[tuple[tuple[str, str], frozenset[str]], ...]
+    recorded_failures: tuple[RestoredRecordedCollectorFailure, ...]
     token_count: int
 
 
@@ -621,9 +637,25 @@ class CollectorJournalRestorer:
         completed_groups = self._reconstruct_completed_groups_from_landscape()
         completed_key_set = {key for key, _settled in completed_groups}
 
+        # Step 2b: a durably completed group whose members the journal STILL
+        # holds is either a post-closure residual (dropped below) or a
+        # recorded FAILED verdict the crashed process never disposed of. The
+        # verdict failed every arrived member's hold in ONE transaction, so it
+        # covers all of that group's held members or none of them.
+        recorded_failures = self._recorded_failures(
+            [item for item in items if group_of[item.token_id][:2] in completed_key_set],
+            group_of=group_of,
+            configured_collector_node_ids=configured_collector_node_ids,
+            attempt_offsets=attempt_offsets,
+            resume_checkpoint_id=resume_checkpoint_id,
+        )
+        recorded_keys = {failure.key for failure in recorded_failures}
+
         live_items: list[TokenWorkItem] = []
         for item in items:
             collector_name, group_id, _member_key = group_of[item.token_id]
+            if (collector_name, group_id) in recorded_keys:
+                continue
             if (collector_name, group_id) in completed_key_set:
                 slog.info(
                     "collector_journal_restore_dropped_post_closure_residual",
@@ -713,8 +745,68 @@ class CollectorJournalRestorer:
         return RestoredCollectorState(
             pending_groups=tuple(pending_groups),
             completed_groups=tuple(completed_groups),
+            recorded_failures=recorded_failures,
             token_count=len(group_of),
         )
+
+    def _recorded_failures(
+        self,
+        closed_group_items: Sequence[TokenWorkItem],
+        *,
+        group_of: Mapping[str, tuple[str, str, str]],
+        configured_collector_node_ids: Sequence[str],
+        attempt_offsets: Mapping[str, int],
+        resume_checkpoint_id: str,
+    ) -> tuple[RestoredRecordedCollectorFailure, ...]:
+        """The recorded FAILED verdicts among durably closed groups' held members, proved whole.
+
+        Raises:
+            AuditIntegrityError: A closed group whose held members only partly
+                carry the verdict, carry divergent reasons, or carry it at a
+                node other than their own collector's (the verdict is one
+                transaction at one node); or a verdict member with no attempt
+                offset.
+        """
+        if not closed_group_items:
+            return ()
+        holds = self._barrier_restore_reads.get_recorded_collector_group_failures(
+            self._run_id,
+            node_ids=configured_collector_node_ids,
+            token_ids=[item.token_id for item in closed_group_items],
+        )
+        by_key: dict[tuple[str, str], list[TokenWorkItem]] = {}
+        for item in closed_group_items:
+            collector_name, group_id, _member_key = group_of[item.token_id]
+            by_key.setdefault((collector_name, group_id), []).append(item)
+        failures: list[RestoredRecordedCollectorFailure] = []
+        for key, group_items in by_key.items():
+            carrying = [item for item in group_items if item.token_id in holds]
+            if not carrying:
+                continue  # a post-closure residual of a released group
+            collector_name, group_id = key
+            config_node_id = str(self._node_ids[collector_name])
+            reasons = {holds[item.token_id].failure_reason for item in carrying}
+            nodes = {holds[item.token_id].node_id for item in carrying}
+            if len(carrying) != len(group_items) or len(reasons) != 1 or nodes != {config_node_id}:
+                raise AuditIntegrityError(
+                    f"Collector group {group_id!r} at {collector_name!r} (run {self._run_id!r}, resume checkpoint "
+                    f"{resume_checkpoint_id!r}) holds {len(group_items)} BLOCKED member(s) of which {len(carrying)} carry a "
+                    f"group-failure verdict, reasons {sorted(reasons)!r} at node(s) {sorted(nodes)!r}; a verdict fails every "
+                    f"arrived member's hold at {config_node_id!r} in one transaction."
+                )
+            members: list[TokenInfo] = []
+            for item in group_items:
+                if item.token_id not in attempt_offsets:
+                    raise AuditIntegrityError(
+                        f"No entry in attempt_offsets for recorded-verdict member {item.token_id!r} of group {group_id!r} "
+                        f"at collector {collector_name!r} (run {self._run_id!r})."
+                    )
+                members.append(
+                    token_from_journal_item(item, attempt_offset=attempt_offsets[item.token_id], resume_checkpoint_id=resume_checkpoint_id)
+                )
+            (failure_reason,) = reasons
+            failures.append(RestoredRecordedCollectorFailure(key=key, members=tuple(members), failure_reason=failure_reason))
+        return tuple(failures)
 
     def _reconstruct_completed_groups_from_landscape(self) -> list[tuple[tuple[str, str], frozenset[str]]]:
         """Read completed collector groups AND their settled member token_ids.

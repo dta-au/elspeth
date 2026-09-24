@@ -75,6 +75,7 @@ repos:
         name: mypy
         entry: .venv/bin/mypy
         language: system
+        require_serial: true
         types: [python]
         files: ^(src/elspeth/|elspeth-lints/src/).*\.py$
         # Mirror pyproject's mypy exclude: deliberately-malformed lint-rule test

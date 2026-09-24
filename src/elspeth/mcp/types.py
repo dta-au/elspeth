@@ -328,10 +328,19 @@ class RunSummaryCounts(TypedDict):
     source_loads: int
     sink_writes: int
     runtime_preflights: int
+    collector_groups_failed: int
 
 
 class RunSummaryErrors(TypedDict):
-    """Error count sub-dict inside ``RunSummaryReport``."""
+    """Error count sub-dict inside ``RunSummaryReport``.
+
+    ``validation`` counts ``validation_errors`` rows (a source row that failed
+    validation has no token). ``transform`` counts tokens whose terminal
+    outcome is a failure decided by a transform error. It does not count
+    ``transform_errors`` rows, which record attempts: a resumed attempt can
+    fail again (a second row) or succeed and deliver the row (a row for a
+    token that did not fail).
+    """
 
     validation: int
     transform: int
@@ -430,7 +439,12 @@ class ValidationErrorGroup(TypedDict):
 
 
 class TransformErrorGroup(TypedDict):
-    """Transform error group by transform plugin."""
+    """Transform error group by transform plugin.
+
+    ``count`` is the number of tokens whose terminal outcome is a failure a
+    transform error at this plugin decided. It never counts ``transform_errors``
+    rows, which record attempts.
+    """
 
     transform_plugin: str
     count: int
@@ -445,7 +459,14 @@ class ValidationErrorSummary(TypedDict):
 
 
 class TransformErrorSummary(TypedDict):
-    """Transform errors sub-dict in ``ErrorAnalysisReport``."""
+    """Transform errors sub-dict in ``ErrorAnalysisReport``.
+
+    ``total`` and ``by_transform`` count terminally failed tokens, each at the
+    node whose transform error decided it. ``sample_details`` is ATTEMPT
+    evidence: up to five raw ``transform_errors`` rows. These may include an
+    attempt whose resumed retry succeeded, or an earlier attempt of a token
+    that failed again, so they are never a failure count.
+    """
 
     total: int
     by_transform: list[TransformErrorGroup]
@@ -641,7 +662,14 @@ class FailureValidationError(TypedDict):
 
 
 class FailurePatterns(TypedDict):
-    """Patterns identified in failure analysis."""
+    """Patterns identified in failure analysis.
+
+    ``failure_count``, ``transform_error_count`` and
+    ``validation_error_count`` are the lengths of the ``limit``-bounded record
+    listings beside them. Each counts sampled records, not failed tokens.
+    ``transform_errors`` in particular lists ATTEMPT evidence, which can
+    include an attempt whose resumed retry succeeded.
+    """
 
     plugins_failing: list[str]
     has_retries: bool

@@ -117,6 +117,19 @@ def instantiate_plugins_from_config(
         transforms: list[WiredTransform] = []
         for plugin_config in config.transforms:
             transform_cls = manager.get_transform_by_name(plugin_config.plugin)
+            # A batch-aware plugin's process() takes a list of rows. Under
+            # transforms: it would be handed one row and iterate its field
+            # names, aborting the run on every row. Decided on the CLASS,
+            # before construction, as the aggregation and collector arms below
+            # are (elspeth-98a0a9e732); the composer's Stage-1 placement rule
+            # (_batch_aware_placement_error) reads the same two declarations.
+            if transform_cls.is_batch_aware and not transform_cls.supports_row_mode_when_batch_aware:
+                raise ValueError(
+                    f"Transform '{plugin_config.name}' uses transform '{plugin_config.plugin}' which is "
+                    f"batch-aware: it processes a whole batch of rows at once and does not support row mode. "
+                    f"Declare it under aggregations: (with a trigger) or collectors: (as a scope closer), "
+                    f"not transforms:."
+                )
             transform = transform_cls(dict(plugin_config.options))
             transform.on_success = plugin_config.on_success
             transform.on_error = plugin_config.on_error
@@ -156,6 +169,16 @@ def instantiate_plugins_from_config(
                     f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' "
                     f"which has is_batch_aware=False. Collectors reuse the batch-transform plugin "
                     f"contract and require batch-aware plugins."
+                )
+            # A collector flushes on end_of_group, so it has no aggregation
+            # flush window to put on ctx.aggregation_batch; a plugin that
+            # reads one would abort on every group (the composer mirror is the
+            # collector arm of _batch_aware_placement_error).
+            if transform_cls.requires_aggregation_batch_context:
+                raise ValueError(
+                    f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' which "
+                    f"requires an aggregation flush window (its trigger and row positions); a collector's "
+                    f"end_of_group flush does not have one. Declare it under aggregations: with a trigger."
                 )
             transform = transform_cls(dict(collector_config.options))
             transform.on_success = collector_config.on_success

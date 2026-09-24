@@ -82,7 +82,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
 
     name = "azure_ai_search"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cf98a8deff5a5b6a"
+    source_file_hash: str | None = "sha256:9f6868cfb9180327"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True
@@ -144,6 +144,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
             self._search_config.provider_config(),
             execution=ctx.landscape,
             run_id=ctx.run_id,
+            call_mode_session=ctx.call_mode_session,
             telemetry_emit=ctx.telemetry_emit,
             limiter=(ctx.rate_limit_registry.get_limiter(self.limiter_service_name) if ctx.rate_limit_registry is not None else None),
         )

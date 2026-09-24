@@ -49,6 +49,9 @@ class _ScalarResultFake:
     def scalar(self) -> int | float | None:
         return self.value
 
+    def scalar_one(self) -> int | float | None:
+        return self.value
+
 
 @dataclass(frozen=True)
 class _RowsResultFake:
@@ -92,7 +95,8 @@ class _LandscapeDBFake:
 
 
 def _run_summary_results_with(avg_duration_ms: float | None) -> list[_ScalarResultFake | _RowsResultFake]:
-    zero_count_results = [_ScalarResultFake(0) for _ in range(10)]
+    # Include the separate structural collector-group count in run summaries.
+    zero_count_results = [_ScalarResultFake(0) for _ in range(11)]
     return [
         *zero_count_results,
         _RowsResultFake(),

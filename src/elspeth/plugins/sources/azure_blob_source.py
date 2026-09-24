@@ -25,8 +25,11 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
@@ -38,7 +41,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
@@ -422,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2a0ed119eba86aeb"
+    source_file_hash: str | None = "sha256:bfe66878ce6d846d"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -583,42 +585,87 @@ class AzureBlobSource(BaseSource):
         """
         # Track first valid row for FLEXIBLE/OBSERVED type inference
         self._first_valid_row_processed = False
+        request_data = {
+            "operation": "download_blob",
+            "container": self._container,
+            "blob_path": self._blob_path,
+        }
+        verify_session = ctx.call_mode_session
+        if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+            source_call_id = verify_session.preflight_verify_request(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+            )
+            admitted_call_id = verify_session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+                current_call_index=None,
+            )
+            if admitted_call_id != source_call_id:
+                raise AuditIntegrityError("Azure blob source call changed after pre-dispatch admission")
+
         # EXTERNAL SYSTEM: Azure Blob SDK calls - wrap with try/except
         # Record call for audit trail (ctx.operation_id is set by orchestrator)
         start_time = time.perf_counter()
         download_result = self._download_blob_payload()
         latency_ms = (time.perf_counter() - start_time) * 1000
         if isinstance(download_result, _AzureBlobDownloadFailure):
-            ctx.record_call(
+            error_data = {"type": download_result.provider_error_type}
+            recorded_call = ctx.record_call(
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
-                request_data={
-                    "operation": "download_blob",
-                    "container": self._container,
-                    "blob_path": self._blob_path,
-                },
-                error={"type": download_result.provider_error_type},
+                request_data=request_data,
+                error=error_data,
                 latency_ms=latency_ms,
                 provider="azure_blob_storage",
             )
+            if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+                if recorded_call is None:
+                    raise AuditIntegrityError("Azure blob verify call was not recorded")
+                verify_session.verify_call(
+                    call_type=CallType.HTTP,
+                    request_data=request_data,
+                    current_state_id=None,
+                    current_operation_id=ctx.operation_id,
+                    current_call_index=recorded_call.call_index,
+                    current_call_id=recorded_call.call_id,
+                    live_status=CallStatus.ERROR,
+                    live_response_data=None,
+                    live_error_data=error_data,
+                )
             raise RuntimeError(f"Failed to download blob {self._blob_path!r} from container {self._container!r}.") from None
 
         blob_data = download_result
         if type(blob_data) is not bytes:
             raise TypeError("Azure BlobClient.download_blob().readall() must return exact bytes")
 
-        ctx.record_call(
+        response_data = {"size_bytes": len(blob_data), "content_hash": hashlib.sha256(blob_data).hexdigest()}
+        recorded_call = ctx.record_call(
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_data={
-                "operation": "download_blob",
-                "container": self._container,
-                "blob_path": self._blob_path,
-            },
-            response_data={"size_bytes": len(blob_data), "content_hash": hashlib.sha256(blob_data).hexdigest()},
+            request_data=request_data,
+            response_data=response_data,
             latency_ms=latency_ms,
             provider="azure_blob_storage",
         )
+        if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+            if recorded_call is None:
+                raise AuditIntegrityError("Azure blob verify call was not recorded")
+            verify_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+                current_call_index=recorded_call.call_index,
+                current_call_id=recorded_call.call_id,
+                live_status=CallStatus.SUCCESS,
+                live_response_data=response_data,
+                live_error_data=None,
+            )
 
         # Parse blob content based on format
         if self._format == "csv":

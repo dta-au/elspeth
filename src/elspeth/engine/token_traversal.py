@@ -232,10 +232,19 @@ class TokenTraversalEngine:
                 # success_empty() is not an expansion and mints nothing.
                 # Idempotent per opener under re-driven claims.
                 if transform.creates_tokens:
-                    self._processor._token_manager.record_empty_expansion(
+                    group_id = self._processor._token_manager.record_empty_expansion(
                         current_token,
                         member_token=ctx.require_member_token(),
                     )
+                    if node_id in self._processor._opener_binding_by_node_id:
+                        binding = self._processor._opener_binding_by_node_id[node_id]
+                        if binding.closer_kind is CloserKind.COLLECTOR:
+                            # A follower cannot close a group: only the leader has
+                            # CollectorExecutor and coordination authority. Its
+                            # intake sweep discovers the durable zero-member row.
+                            executor = self._processor._collector_executor
+                            if executor is not None:
+                                executor.notify_empty_group(binding.closer_name, group_id, ctx)
                 self._processor._record_dropped_by_filter_outcome(
                     ctx=ctx,
                     token=current_token,
@@ -510,6 +519,7 @@ class TokenTraversalEngine:
         current_on_success_sink: str,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
+        attempt_offset: int = 0,
     ) -> _GateOutcome:
         """Handle a gate node: evaluate, then fork/route/divert/continue.
 
@@ -535,6 +545,7 @@ class TokenTraversalEngine:
             token=current_token,
             ctx=ctx,
             token_manager=self._processor._token_manager,
+            attempt_offset=attempt_offset,
         )
         current_token = outcome.updated_token
 
@@ -1196,6 +1207,7 @@ class TokenTraversalEngine:
                     last_on_success_sink,
                     row_union_node_id,
                     row_union_name,
+                    attempt_offset,
                 )
                 if isinstance(gate_outcome, _GateTerminal):
                     return gate_outcome.result, child_items
@@ -1233,11 +1245,12 @@ class TokenTraversalEngine:
                 # leader-only per §B.2).  If this batch-aware transform sits at
                 # a known aggregation node, the follower must NOT execute it
                 # row-wise — doing so produces wrong aggregate output and
-                # bypasses the leader's barrier.  Return (None, []) so that
-                # _drain_scheduler_claims hits the ``result is None and not
-                # child_items`` arm (line 4241) and calls mark_blocked with the
-                # aggregation barrier key.  The leader's next journal-intake
-                # adopts the arrival and runs trigger evaluation.
+                # bypasses the leader's barrier.  The arrival is recorded, then
+                # (None, []) sends _drain_scheduler_claims to its ``result is
+                # None and not child_items`` arm, which marks the row BLOCKED
+                # under the aggregation barrier key with the token as it
+                # arrived here. The leader's next journal-intake adopts that
+                # row and runs trigger evaluation.
                 if (
                     row_transform.is_batch_aware
                     and transform_node_id is not None
@@ -1248,6 +1261,7 @@ class TokenTraversalEngine:
                         current_token.token_id,
                         transform_node_id,
                     )
+                    self._processor._record_barrier_arrival(current_token, barrier_key=str(transform_node_id))
                     return None, child_items
 
                 # NOTE: child_items is mutated inside (deagg appends, coalesce notifications).

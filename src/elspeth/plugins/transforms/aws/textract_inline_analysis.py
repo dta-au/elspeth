@@ -21,7 +21,7 @@ from typing import Any, ClassVar, Self, cast
 import structlog
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_MAX_BYTES,
@@ -43,6 +43,7 @@ from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputP
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_client import (
     SDK_TOTAL_MAX_ATTEMPTS,
     TextractInlineClient,
@@ -257,7 +258,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4faa7438003a3fae"
+    source_file_hash: str | None = "sha256:3489990c6e5a9453"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -377,7 +378,19 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._payload_store = ctx.payload_store
         if ctx.shutdown_event is not None:
             self._shutdown = ctx.shutdown_event
-        if self._sdk_client is None:
+        if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
+            self._sdk_client = ReplayOnlySDK()
+        elif self._sdk_client is None and ctx.run_mode is RunMode.VERIFY:
+            self._sdk_client = DeferredAWSClient(
+                lambda: build_textract_sync_sdk_client(
+                    region=self._region,
+                    aws_access_key_id=self._aws_access_key_id,
+                    aws_secret_access_key=self._aws_secret_access_key,
+                    aws_session_token=self._aws_session_token,
+                    read_timeout=self._request_timeout_seconds,
+                )
+            )
+        elif self._sdk_client is None:
             self._sdk_client = build_textract_sync_sdk_client(
                 region=self._region,
                 aws_access_key_id=self._aws_access_key_id,
@@ -439,6 +452,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 max_response_bytes=self._max_result_bytes,
                 limiter=self._limiter,
                 token_id=token_id,
+                call_mode_session=ctx.call_mode_session,
             )
             self._row_clients[state_id] = client
             return client

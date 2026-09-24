@@ -8,6 +8,7 @@ will buffer rows and call process() with a list when the trigger fires.
 """
 
 import math
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -26,6 +27,10 @@ from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
 
 type BatchStatsAggregateRow = dict[str, object]
+
+# Row types a group_by value may carry: the scalar pipeline-row types plus
+# Decimal, whose non-finite form `_is_non_finite_group_key` already rejects.
+_SCALAR_GROUP_KEY_TYPES: tuple[type, ...] = (str, int, float, bool, type(None), Decimal, datetime)
 
 
 class BatchStatsConfig(TransformDataConfig):
@@ -126,7 +131,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f288b3e52978198d"
+    source_file_hash: str | None = "sha256:8bc2fe4afa94f1eb"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -218,24 +223,25 @@ class BatchStats(BaseTransform):
             stat_fields.add(cfg.group_by)
         self.declared_output_fields = frozenset(stat_fields)
 
-        # Declare group_by as required input when configured, so the DAG builder
-        # can validate upstream output guarantees. value_field is enforced at
-        # runtime via direct field access (KeyError = upstream bug) rather than
-        # build-time schema requirements — observed-mode schemas don't declare
-        # guaranteed fields, so a build-time requirement would reject valid pipelines.
+        # Declare every column process() reads as required input: value_field,
+        # and group_by when configured. The flush preflight enforces this set on
+        # every buffered row, so a row that omits one fails the batch as a routed
+        # contract violation instead of a KeyError inside process()
+        # (elspeth-5887fb7928 R1). It adds no build-time requirement: the DAG's
+        # edge check reads the authored config, not this rebuilt one, so an
+        # observed upstream still validates.
+        base_required = set(cfg.schema_config.required_fields or ())
+        base_required.add(cfg.value_field)
         if cfg.group_by is not None:
-            base_required = set(cfg.schema_config.required_fields or ())
             base_required.add(cfg.group_by)
-            if base_required != set(cfg.schema_config.required_fields or ()):
-                schema_config = SchemaConfig(
-                    mode=cfg.schema_config.mode,
-                    fields=cfg.schema_config.fields,
-                    guaranteed_fields=cfg.schema_config.guaranteed_fields,
-                    audit_fields=cfg.schema_config.audit_fields,
-                    required_fields=tuple(base_required),
-                )
-            else:
-                schema_config = cfg.schema_config
+        if base_required != set(cfg.schema_config.required_fields or ()):
+            schema_config = SchemaConfig(
+                mode=cfg.schema_config.mode,
+                fields=cfg.schema_config.fields,
+                guaranteed_fields=cfg.schema_config.guaranteed_fields,
+                audit_fields=cfg.schema_config.audit_fields,
+                required_fields=tuple(base_required),
+            )
         else:
             schema_config = cfg.schema_config
 
@@ -342,6 +348,20 @@ class BatchStats(BaseTransform):
         groups: dict[ScalarBucketKey, tuple[Any, list[tuple[int, PipelineRow]]]] = {}
         for row_index, row in enumerate(rows):
             group_value = row[self._group_by]
+            # Groups are dict buckets, so the key must be one scalar value. A
+            # JSON object or array arrives deep-frozen (mappingproxy / tuple):
+            # an object is unhashable and used to abort the run with a bare
+            # TypeError, and an array is not a category. Either one fails the
+            # WHOLE batch with a recorded reason, the same disposition as a
+            # wrong-typed value_field (elspeth-d5034647f0); it is never bucketed
+            # by equality or stringified into a key. None stays a legal key.
+            if type(group_value) not in _SCALAR_GROUP_KEY_TYPES:
+                raise BatchRowTypeError(
+                    field=self._group_by,
+                    row_index=row_index,
+                    expected="a scalar group key",
+                    found=type(group_value).__name__,
+                )
             group_key = scalar_bucket_key(group_value)
             grouped = groups.get(group_key)
             if grouped is None:
@@ -360,7 +380,7 @@ class BatchStats(BaseTransform):
         skipped_missing_indices: list[int] = []
         skipped_non_finite_indices: list[int] = []
         for row_index, row in grouped_rows:
-            # Direct access - field must exist (KeyError = upstream bug)
+            # Present on every row: declared required, enforced by the flush preflight.
             raw_value = row[self._value_field]
 
             # None is a missing value, not a type error: skip-and-report it the
@@ -371,8 +391,9 @@ class BatchStats(BaseTransform):
                 skipped_missing_indices.append(row_index)
                 continue
 
-            # Contract enforcement: value_field must be numeric (int or float)
-            # Tier 2 pipeline data - wrong types indicate upstream bug
+            # Contract enforcement: value_field must be numeric (int or float).
+            # A wrong type in Tier 2 row data fails the WHOLE batch (below);
+            # it is not a plugin crash.
             # Use type() instead of isinstance() to reject bool (bool is subclass of int)
             if type(raw_value) not in (int, float):
                 # BATCH-level failure, not a skip. The two branches around this
@@ -415,7 +436,6 @@ class BatchStats(BaseTransform):
             if skipped_missing_indices:
                 return {}, self._error_for_no_valid_values(
                     grouped_rows,
-                    group_value,
                     skipped_missing_indices,
                     skipped_non_finite_indices,
                 )
@@ -425,9 +445,7 @@ class BatchStats(BaseTransform):
                 "skipped_non_finite": len(skipped_non_finite_indices),
                 "skipped_non_finite_indices": skipped_non_finite_indices,
             }
-            if self._group_by is not None:
-                reason["group_by"] = self._group_by
-                reason["group_value"] = group_value
+            self._locate_group(reason, grouped_rows)
             return {}, TransformResult.error(
                 reason,
                 retryable=False,
@@ -445,9 +463,7 @@ class BatchStats(BaseTransform):
                 "batch_size": len(grouped_rows),
                 "valid_count": count,
             }
-            if self._group_by is not None:
-                overflow_reason["group_by"] = self._group_by
-                overflow_reason["group_value"] = group_value
+            self._locate_group(overflow_reason, grouped_rows)
             return {}, TransformResult.error(overflow_reason, retryable=False)
 
         result: BatchStatsAggregateRow = {
@@ -466,9 +482,7 @@ class BatchStats(BaseTransform):
                     "batch_size": len(grouped_rows),
                     "valid_count": count,
                 }
-                if self._group_by is not None:
-                    mean_error_reason["group_by"] = self._group_by
-                    mean_error_reason["group_value"] = group_value
+                self._locate_group(mean_error_reason, grouped_rows)
                 return {}, TransformResult.error(mean_error_reason, retryable=False)
 
         if skipped_missing_indices:
@@ -487,7 +501,6 @@ class BatchStats(BaseTransform):
     def _error_for_no_valid_values(
         self,
         grouped_rows: list[tuple[int, PipelineRow]],
-        group_value: Any,
         missing_indices: list[int],
         non_finite_indices: list[int],
     ) -> TransformResult:
@@ -510,10 +523,22 @@ class BatchStats(BaseTransform):
             "skipped_count": len(missing_indices) + len(non_finite_indices),
             "row_errors": row_errors,
         }
-        if self._group_by is not None:
-            reason["group_by"] = self._group_by
-            reason["group_value"] = group_value
+        self._locate_group(reason, grouped_rows)
         return TransformResult.error(reason, retryable=False)
+
+    def _locate_group(self, reason: TransformErrorReason, grouped_rows: list[tuple[int, PipelineRow]]) -> None:
+        """Name the failing group in an error reason without recording its value.
+
+        The group_by VALUE is row content (a customer, a tenant, a label), and an
+        audit reason records row indices, never row bodies. The group is named
+        by its field and the batch row where it was first seen, which is how
+        `_group_rows` orders groups. The value still reaches the OUTPUT row of a
+        successful group, where it is data.
+        """
+        if self._group_by is None:
+            return
+        reason["group_by"] = self._group_by
+        reason["error"] = f"group {self._group_by!r} first seen in row {grouped_rows[0][0]}"
 
     def _output_contract_for(self, results: list[BatchStatsAggregateRow]) -> SchemaContract:
         """Build one shared output contract for aggregate result rows."""
@@ -543,8 +568,9 @@ class BatchStats(BaseTransform):
         Returns:
             TransformResult with aggregated statistics
 
-        Raises:
-            KeyError: If value_field is missing from any row (upstream bug)
+        Every row carries ``value_field`` (and ``group_by`` when configured):
+        both are declared required, and the flush preflight fails the batch
+        before this runs when a row omits one.
         """
         if not rows:
             # Empty batch is an anomaly — return error, not fabricated statistics.
@@ -564,8 +590,11 @@ class BatchStats(BaseTransform):
             # Requirement 2 of the ruling: the batch records that it failed and
             # WHY — which row, which field, what was found where a number was
             # required. The structural caller owns disposition: an aggregation
-            # applies its declared error route, while a collector turns this
-            # into a whole-group failure settled by scope policy and nesting.
+            # applies its declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason and the DIVERT; RowProcessor.handle_timeout_flush
+            # sends every buffered row to the on_error sink, or records it
+            # discarded), while a collector turns this into a whole-group
+            # failure settled by scope policy and nesting.
             return TransformResult.error(exc.as_reason(), retryable=False)
 
     def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:

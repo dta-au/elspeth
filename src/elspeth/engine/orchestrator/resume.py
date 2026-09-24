@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunStatus
+from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunMode, RunStatus
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
@@ -62,6 +62,7 @@ from elspeth.core.checkpoint.recovery import (
     check_source_lifecycle_resumable,
     group_binding_view_from_graph,
 )
+from elspeth.core.dag.group_bindings import CloserKind
 from elspeth.core.landscape.factory import RecorderFactory
 
 # The immutable-success family (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY)
@@ -74,6 +75,7 @@ from elspeth.core.landscape.run_lifecycle_repository import _IMMUTABLE_SUCCESS_R
 from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
 from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
@@ -476,6 +478,7 @@ def _resume_failure_result_from_baseline(
         rows_forked=baseline.rows_forked + partial_result.rows_forked,
         rows_coalesced=baseline.rows_coalesced + partial_result.rows_coalesced,
         rows_coalesce_failed=baseline.rows_coalesce_failed + partial_result.rows_coalesce_failed,
+        collector_groups_failed=baseline.collector_groups_failed + partial_result.collector_groups_failed,
         rows_expanded=baseline.rows_expanded + partial_result.rows_expanded,
         rows_buffered=baseline.rows_buffered + partial_result.rows_buffered,
         rows_diverted=baseline.rows_diverted + partial_result.rows_diverted,
@@ -919,6 +922,7 @@ class ResumeCoordinator:
             rows_routed_success=result.rows_routed_success,
             rows_routed_failure=result.rows_routed_failure,
             routed_destinations=result.routed_destinations,
+            collector_groups_failed=result.collector_groups_failed,
         )
 
         return result
@@ -1147,8 +1151,9 @@ class ResumeCoordinator:
             # them and reconcile the durable sink effect. Early-completing in
             # either case would finalize the run and delete checkpoints
             # WITHOUT constructing the recovery processor. The no-work arm
-            # therefore requires both restored barrier work and the complete
-            # scheduler journal to be quiescent.
+            # therefore requires restored barrier work, the complete scheduler
+            # journal, and any leader-pending zero-member collector groups to
+            # be quiescent. Those groups have no child journal rows to inspect.
             # Only consult the journal when the other two work sources are
             # empty. Once rows or restored barriers are present the processing
             # path is already mandatory, so an additional database query cannot
@@ -1156,9 +1161,25 @@ class ResumeCoordinator:
             has_active_scheduler_work = (
                 not unprocessed_rows and not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
             )
-            if has_active_scheduler_work:
-                resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
+            pending_empty_collector_groups: tuple[tuple[str, str], ...] = ()
             if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
+                require_all_opener_node_ids = tuple(
+                    str(node_id)
+                    for node_id, binding in graph.get_group_bindings().by_opener_node().items()
+                    if binding.closer_kind is CloserKind.COLLECTOR and binding.policy == "require_all"
+                )
+                pending_empty_collector_groups = factory.barrier_restore.pending_empty_expansion_groups(
+                    run_id=run_id,
+                    opener_node_ids=require_all_opener_node_ids,
+                )
+            if has_active_scheduler_work or pending_empty_collector_groups:
+                resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
+            if (
+                not unprocessed_rows
+                and not state.has_restored_barrier_work
+                and not has_active_scheduler_work
+                and not pending_empty_collector_groups
+            ):
                 check_combined_coordination_latch()
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
@@ -1464,6 +1485,15 @@ class ResumeCoordinator:
                     coordination_token=coordination_token,
                 )
 
+                if not interrupted and loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.assert_complete()
+
                 # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b
                 # postconditions only after resume sink writes finish.
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
@@ -1497,18 +1527,27 @@ def handle_incomplete_batches(
     """Find and handle incomplete batches for recovery.
 
     - EXECUTING batches: Mark as failed (crash interrupted), then retry
-    - FAILED batches: Retry with incremented attempt
+    - FAILED batches without a recorded verdict (the flush died before
+      recording one): Retry with incremented attempt
     - DRAFT batches: Leave as-is (collection continues)
+
+    A FAILED batch whose verdict was recorded
+    (``ExecutionRepository.complete_aggregation_failure``) never reaches
+    here: ``get_incomplete_batches`` excludes it because the verdict is
+    final, and the journal restore completes its disposition instead.
 
     Args:
         execution: ExecutionRepository for database operations
         coordination_token: Acquired leadership of the run being recovered
 
     Returns:
-        Mapping of old_batch_id to new_batch_id for retried batches.
-        Callers must use this to rebind batch_ids in restored checkpoint
-        state so that resumed execution references the retry batches,
-        not the dead originals.
+        Mapping of old_batch_id to new_batch_id for retried batches: one
+        retry hop per entry. ``retry_batch`` is idempotent, so a batch that
+        an earlier resume already retried maps to that same retry; when the
+        retry itself failed, it has its own entry and the edges chain
+        (``{A: B, B: C}``). The journal restore reads the chain through
+        ``barrier_coordination.resolve_retry_chain`` to reach the batch the
+        buffered members must flush in — never with a single lookup.
     """
     from elspeth.contracts.enums import BatchStatus
 

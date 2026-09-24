@@ -22,11 +22,24 @@ One home rather than a copy per plugin: a second implementation of a rule is
 the same defect as a restatement of it, and copying is how the original
 ``TypeError`` convention reached seventeen sites in the first place.
 
-SCOPE — this covers the wrong-TYPE branch only. A missing value (``None``) and
-a non-finite float keep their skip-and-report behaviour; those branches were
-deliberately fixed with their polarity documented (``batch_stats.py``, "None is
-a missing value, not a type error"), and the ruling explicitly did not reopen
-them.
+SCOPE — two row-data faults, each failing the whole batch:
+
+* the wrong-TYPE branch (``BatchRowTypeError``). A missing value (``None``) and
+  a non-finite float keep their skip-and-report behaviour wherever a plugin
+  already has that branch; those branches were deliberately fixed with their
+  polarity documented (``batch_stats.py``, "None is a missing value, not a type
+  error"), and the ruling explicitly did not reopen them. A plugin with NO
+  ``None`` branch (``batch_replicate``) reports ``None`` as a wrong type, which
+  fails the batch; no skip branch is invented for it.
+* a buffered row that already carries a field the plugin emits
+  (``BatchRowFieldCollisionError``). Under an observed or sparse upstream only
+  the row DATA decides whether the field is present, so this is a row fault,
+  not a configuration fact: the operator's ruling on elspeth-d90495084c routes
+  it like any other failed batch. The certain case — an explicit schema that
+  declares the emitted field — is still refused at construction
+  (``_reject_explicit_*_collision``, ``PluginConfigError``).
+
+Both reasons name the batch row INDEX and field NAMES only, never a row value.
 """
 
 from __future__ import annotations
@@ -74,4 +87,35 @@ class BatchRowTypeError(Exception):
             "expected": self.expected,
             "actual_type": self.found,
             "error": f"must be {self.expected}, got {self.found} in row {self.row_index}",
+        }
+
+
+class BatchRowFieldCollisionError(Exception):
+    """A buffered row already carries a field the plugin would write onto it.
+
+    The batch counterpart of the per-row engine collision check
+    (``TransformExecutor``), which routes the same fault through ``on_error``
+    for a single-row transform. At a batch seam the plugin performs the check
+    itself, so it renders the reason here: one renderer for every batch plugin
+    that emits fields onto its input rows, never a copy per plugin.
+    """
+
+    def __init__(self, *, row_index: int, collisions: list[str]) -> None:
+        super().__init__(f"would overwrite existing input fields {collisions} in row {row_index}")
+        self.row_index = row_index
+        self.collisions = collisions
+
+    def as_reason(self) -> TransformErrorReason:
+        """Render the audit reason: the colliding field NAMES and the batch row index.
+
+        The names are the plugin's own declared output fields (configuration),
+        so they are safe to record. The value the row already held under that
+        name is row content and is never read.
+        """
+        return {
+            "reason": "field_collision",
+            # `collisions` is the key TransformErrorReason declares for
+            # exactly this ("Field names that would be overwritten").
+            "collisions": list(self.collisions),
+            "error": f"would overwrite existing input fields {self.collisions} in row {self.row_index}",
         }

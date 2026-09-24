@@ -446,6 +446,7 @@ class TestFollowerDispositions:
         barrier_key = "barrier_0"
         crashed.repo.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key=None,
             barrier_key=barrier_key,
             expected_lease_owner=follower_id,
@@ -1303,6 +1304,77 @@ gates:
         assert item["status"] == TokenWorkStatus.TERMINAL.value
         assert item["pending_sink_name"] is None
         assert not output_path.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_holds_the_row_that_reached_the_aggregation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A follower that crosses a transform in-claim holds the TRANSFORMED row (elspeth-5887fb7928 AC-R4).
+
+    The follower has no aggregation executor: the leader adopts the member
+    from this BLOCKED row, with no live stash. Before the fix the follower's
+    drain derived the barrier key from the claim-start item (the transform
+    node), found none, and raised "no queue or barrier key … processor bug"
+    in a live run. Had it found one, the row would still have been the
+    READY-time payload without the transform's ``n``.
+    """
+    from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+    from elspeth.core.landscape.schema import nodes_table
+
+    def _typed_contract(row: dict[str, Any]) -> SchemaContract:
+        return SchemaContract(
+            mode="OBSERVED",
+            fields=tuple(
+                FieldContract(normalized_name=key, original_name=key, python_type=type(value), required=False, source="inferred")
+                for key, value in row.items()
+            ),
+            locked=True,
+        )
+
+    # The shared seed types every field `object`, while the fresh run typed id
+    # and value `int`. The transform's output-contract evolution would then
+    # refuse the merge before the barrier is ever reached, which is a different
+    # defect family. Seed with the types the fresh run observed.
+    import tests.e2e.recovery.harness as harness
+
+    monkeypatch.setattr(harness, "_observed_contract", _typed_contract)
+    db, run_id, token_id, _plugins, _output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: lift
+    plugin: value_transform
+    input: processing
+    on_success: lifted
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations:
+        - target: n
+          expression: "row['value'] * 10"
+aggregations:
+  - name: summarise
+    plugin: batch_stats
+    input: lifted
+    on_success: output
+    on_error: discard
+    trigger: {count: 100}
+    options:
+      value_field: n
+      schema: {mode: observed}
+""",
+        row_data={"id": 7, "value": 4},
+    )
+    try:
+        item = _work_item(db, token_id)
+        with db.engine.connect() as conn:
+            aggregation_node_id = conn.execute(
+                select(nodes_table.c.node_id).where(nodes_table.c.run_id == run_id, nodes_table.c.plugin_name == "batch_stats")
+            ).scalar_one()
+        assert item["status"] == TokenWorkStatus.BLOCKED.value
+        assert item["barrier_key"] == aggregation_node_id
+        assert json.loads(item["row_payload_json"])["row"]["data"] == {"id": 7, "value": 4, "n": 40}
     finally:
         db.close()
 
