@@ -9,15 +9,19 @@ is compared with the source run before the run can finish successfully.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from hashlib import sha256
 
 from elspeth.contracts.enums import CallType, NodeType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     RestrictedSinkEffectContext,
+    SinkEffectAttemptAction,
+    SinkEffectAttemptState,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
     SinkEffectInspection,
@@ -27,9 +31,12 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPlan,
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
+    SinkEffectRole,
     SinkEffectState,
 )
+from elspeth.core.landscape.execution.sink_effect_attempt_results import decode_sink_effect_returned_result
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.executors.sink_effects import SinkEffectCoordinator
 
 
 class VirtualReplaySinkEffect:
@@ -37,9 +44,76 @@ class VirtualReplaySinkEffect:
 
     effect_call_type = CallType.FILESYSTEM
 
-    def __init__(self, *, source_run_id: str, sink_node_id: str) -> None:
+    def __init__(
+        self, *, factory: RecorderFactory, source_run_id: str, sink_node_id: str, role: SinkEffectRole = SinkEffectRole.PRIMARY
+    ) -> None:
+        self._factory = factory
         self._source_run_id = source_run_id
         self._sink_node_id = sink_node_id
+        self._role = role
+
+    def _source_dispositions(self) -> dict[tuple[int, str, str], tuple[str, str | None, str | None]]:
+        """Bind outcomes and attribution to stable member identity across runs."""
+        repository = self._factory.execution.sink_effects
+        dispositions: dict[tuple[int, str, str], tuple[str, str | None, str | None]] = {}
+        for effect in repository.get_effects_for_run(self._source_run_id):
+            if effect.sink_node_id != self._sink_node_id or effect.role is not self._role:
+                continue
+            if effect.state is not SinkEffectState.FINALIZED:
+                raise AuditIntegrityError("replay source run contains a non-finalized sink effect")
+            attribution: dict[int, tuple[str, str]] = {}
+
+            def merge_attribution(evidence: Mapping[str, object], attribution: dict[int, tuple[str, str]]) -> None:
+                if "diversion_attribution" not in evidence:
+                    return
+                raw = deep_thaw(evidence["diversion_attribution"])
+                if type(raw) is not list:
+                    raise AuditIntegrityError("source sink diversion attribution must be a list")
+                for item in raw:
+                    if type(item) is not dict or set(item) != {"ordinal", "reason_hash", "error_hash"}:
+                        raise AuditIntegrityError("source sink diversion attribution has a divergent field set")
+                    ordinal, reason_hash, error_hash = item["ordinal"], item["reason_hash"], item["error_hash"]
+                    if (
+                        type(ordinal) is not int
+                        or ordinal < 0
+                        or type(reason_hash) is not str
+                        or len(reason_hash) != 64
+                        or any(char not in "0123456789abcdef" for char in reason_hash)
+                        or type(error_hash) is not str
+                        or len(error_hash) != 16
+                        or any(char not in "0123456789abcdef" for char in error_hash)
+                    ):
+                        raise AuditIntegrityError("source sink diversion attribution is invalid")
+                    value = (reason_hash, error_hash)
+                    if ordinal in attribution and attribution[ordinal] != value:
+                        raise AuditIntegrityError("source sink diversion attribution sources diverge")
+                    attribution[ordinal] = value
+
+            merge_attribution(SinkEffectCoordinator._load_plan(effect).safe_evidence, attribution)
+            for attempt in repository.get_attempts(effect.effect_id):
+                if (
+                    attempt.state is SinkEffectAttemptState.RETURNED
+                    and attempt.action in (SinkEffectAttemptAction.COMMIT, SinkEffectAttemptAction.RECONCILE)
+                    and attempt.evidence_json is not None
+                ):
+                    merge_attribution(decode_sink_effect_returned_result(attempt.action, attempt.evidence_json).evidence, attribution)
+            members = repository.get_members(effect.effect_id)
+            if set(attribution) != {member.ordinal for member in members if member.prepared_disposition == "diverted"}:
+                raise AuditIntegrityError("source sink effect is missing durable diversion attribution")
+            for member in members:
+                if member.prepared_disposition not in ("accepted", "diverted"):
+                    raise AuditIntegrityError("source sink member has no prepared disposition")
+                reason_hash, error_hash = attribution[member.ordinal] if member.prepared_disposition == "diverted" else (None, None)
+                # Commit-time diversions retain attribution in the returned
+                # attempt; the member's prepare-time reason may be absent.
+                if member.reason_hash is not None and member.reason_hash != reason_hash:
+                    raise AuditIntegrityError("source sink diversion reason disagrees with durable member")
+                key = (member.ingest_sequence, member.lineage_hash, member.payload_hash)
+                disposition = (member.prepared_disposition, reason_hash, error_hash)
+                if key in dispositions and dispositions[key] != disposition:
+                    raise AuditIntegrityError("source sink members have ambiguous dispositions")
+                dispositions[key] = disposition
+        return dispositions
 
     def inspect_effect(self, request: SinkEffectInspectionRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectInspection:
         del request, ctx
@@ -53,11 +127,29 @@ class VirtualReplaySinkEffect:
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise OrchestrationInvariantError("virtual replay sink requires pipeline members")
         members = request.effect_input.members
+        source_dispositions = self._source_dispositions()
+        accepted: list[int] = []
+        diverted: list[int] = []
+        attribution: list[dict[str, object]] = []
+        for member in members:
+            key = (member.ingest_sequence, member.lineage_hash, member.payload_hash)
+            if key not in source_dispositions:
+                # New or changed output remains visible to the complete member
+                # comparison, which reports the mode-specific drift verdict.
+                accepted.append(member.ordinal)
+                continue
+            disposition, reason_hash, error_hash = source_dispositions[key]
+            if disposition == "accepted":
+                accepted.append(member.ordinal)
+            else:
+                diverted.append(member.ordinal)
+                attribution.append({"ordinal": member.ordinal, "reason_hash": reason_hash, "error_hash": error_hash})
         target = f"virtual-replay://{ctx.run_id}/{self._sink_node_id}"
         payload_hash = stable_hash([member.payload_hash for member in members])
         evidence = {
-            "accepted_ordinals": [member.ordinal for member in members],
-            "diverted_ordinals": [],
+            "accepted_ordinals": accepted,
+            "diverted_ordinals": diverted,
+            "diversion_attribution": attribution,
             "member_count": len(members),
             "publication_kind": "virtual",
             "schema": "virtual-replay-sink-plan-v1",

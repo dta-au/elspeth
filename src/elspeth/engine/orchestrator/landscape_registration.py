@@ -176,7 +176,7 @@ def register_nodes_with_landscape(
         source_contracts_by_node_id: Pre-resolved output contracts for source nodes.
     """
 
-    for node_id in execution_order:
+    for sequence, node_id in enumerate(execution_order):
         node_info = graph.get_node_info(node_id)
         try:
             audit_metadata = audit_metadata_by_node[NodeID(node_id)]
@@ -211,6 +211,7 @@ def register_nodes_with_landscape(
             schema_config=schema_config,
             output_contract=output_contract,
             source_file_hash=audit_metadata.source_file_hash,
+            sequence=sequence,
         )
 
 
