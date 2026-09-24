@@ -2,7 +2,8 @@
 
 Owns process isolation, wall-clock timeout, and orphan-process cleanup for
 ``worker.rasterize_document``. Copies the timeout/orphan-kill sequence from
-``plugins/transforms/rag/query.py:143-167`` (load-bearing: without it a timed-out
+``plugins/transforms/rag/query.py`` (``QueryBuilder._build_regex``, the
+``FuturesTimeoutError`` arm) (load-bearing: without it a timed-out
 worker keeps burning CPU and the interpreter hangs at exit).
 """
 

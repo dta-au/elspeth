@@ -91,17 +91,7 @@ class QueryBuilder:
             )
 
         if self._compiled_template is None and not isinstance(extracted, str):
-            actual_type = type(extracted).__name__
-            return QueryResult(
-                error=TransformErrorReason(
-                    reason="invalid_input",
-                    error_type="wrong_type",
-                    field=self._query_field,
-                    expected="str",
-                    actual_type=actual_type,
-                    error=f"must be str, got {actual_type}",
-                )
-            )
+            return self._wrong_type(extracted)
 
         if self._compiled_template is not None:
             return self._build_template(extracted, row_data)
@@ -112,16 +102,40 @@ class QueryBuilder:
 
     def _build_field_only(self, extracted: Any) -> QueryResult:
         # build() routes observed wrong types before dispatch. Keep this guard
-        # for direct private calls so bytes cannot become a successful query.
+        # for direct private calls so bytes cannot become a successful query:
+        # bytes.strip() and bool(b"x") both succeed, so a bytes value would
+        # otherwise PASS _validate_non_empty as QueryResult(query=b"...").
+        # Returned rather than raised: it is a fact about this row's data, like
+        # the missing and None cases in build(), so it takes the same exit.
         if not isinstance(extracted, str):
-            raise TypeError(
-                f"query_field '{self._query_field}' expected str, got {type(extracted).__name__} "
-                f"— upstream plugin bug (Tier 2 data must not be coerced)"
-            )
+            return self._wrong_type(extracted)
         return self._validate_non_empty(extracted)
+
+    def _wrong_type(self, extracted: Any) -> QueryResult:
+        """Reject a non-str query value: the field and the TYPE, never the value.
+
+        The value is Tier-2 row content; the audit reason names what was
+        required and what was found so the failure is attributable without
+        copying the row into it.
+        """
+        found = type(extracted).__name__
+        return QueryResult(
+            error=TransformErrorReason(
+                reason="invalid_input",
+                error_type="wrong_type",
+                field=self._query_field,
+                expected="str",
+                actual_type=found,
+                error=f"must be str, got {found}",
+            )
+        )
 
     def _build_template(self, extracted: Any, row_data: dict[str, Any]) -> QueryResult:
         assert self._compiled_template is not None  # guaranteed by build() guard
+        # No str check here, deliberately: `{{ query }}` is a template binding
+        # like `{{ row.x }}`, and every ELSPETH template surface (LLM prompts
+        # included) interpolates a row value of any type. Field-only and regex
+        # modes USE the value as the query, so they require a str.
         try:
             query = self._compiled_template.render(query=extracted, row=row_data)
         except TemplateError as e:
@@ -140,6 +154,13 @@ class QueryBuilder:
     def _build_regex(self, extracted: Any) -> QueryResult:
         assert self._compiled_pattern is not None  # guaranteed by build() guard
         assert self._regex_pool is not None  # created when pattern is compiled
+
+        # Checked BEFORE the worker (build() already routed a wrong type; this
+        # keeps the invariant local): re.Pattern.search() rejects a non-str
+        # with its own TypeError, and after this check any exception from the
+        # worker is the worker's fault, never the row's.
+        if not isinstance(extracted, str):
+            return self._wrong_type(extracted)
 
         future = self._regex_pool.submit(run_regex_worker, self._compiled_pattern, extracted)
         try:
@@ -167,17 +188,6 @@ class QueryBuilder:
                     max_seconds=self._regex_timeout,
                 )
             )
-        except TypeError as exc:
-            # re.Pattern.search() raises TypeError when handed a non-str value
-            # (int, bytes, list, ...). The field reached us as Tier 2 pipeline
-            # data, so a non-str here is an upstream plugin contract violation,
-            # not a regex-engine bug — crash with a message that names the
-            # actual fault (Tier 2 data must not be coerced).
-            raise TypeError(
-                f"query_field '{self._query_field}' expected str, got "
-                f"{type(extracted).__name__} — upstream plugin bug "
-                f"(Tier 2 data must not be coerced): {exc}"
-            ) from exc
         except Exception as exc:
             # _regex_worker is system-owned code — a crash is a code bug, not a data issue.
             raise RuntimeError(

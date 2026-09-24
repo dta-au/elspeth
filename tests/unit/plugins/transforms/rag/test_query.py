@@ -106,20 +106,25 @@ class TestFieldOnlyMode:
         "bad_value",
         [
             b"hello world",  # bytes: bytes.strip() silently succeeds, so without
-            42,  # the isinstance guard these would produce wrong-typed
+            42,  # the type guard these would produce wrong-typed
             ["a", "b"],  # QueryResult(query=<non-str>) and corrupt the audit
-        ],  # trail without a row error. Pin the typed failure.
+        ],  # trail. Pin that the guard fires and returns a routable error.
         ids=["bytes", "int", "list"],
     )
-    def test_non_str_value_returns_row_error(self, bad_value):
-        """Non-str field values fail their row without corrupting the audit trail.
+    def test_non_str_value_returns_wrong_type_error(self, bad_value):
+        """A non-str field value is a row failure returned for on_error, never a query.
 
         Regression guard: bytes.strip() and bool(b"x") both succeed, so a bytes
         value would pass _validate_non_empty and produce QueryResult(query=b"...")
-        without the type guard. Pin the failure reason and exclude the value.
+        without the type guard. The guard RETURNS the failure (like the missing
+        and None cases) so the engine routes the row; a raise here aborted the
+        run. The reason names the field and the type, never the value.
         """
         builder = QueryBuilder(query_field="question")
-        assert builder.build({"question": bad_value}).error == {
+        result = builder.build({"question": bad_value})
+
+        assert result.query is None
+        assert result.error == {
             "reason": "invalid_input",
             "error_type": "wrong_type",
             "field": "question",
@@ -127,6 +132,7 @@ class TestFieldOnlyMode:
             "actual_type": type(bad_value).__name__,
             "error": f"must be str, got {type(bad_value).__name__}",
         }
+        assert repr(bad_value) not in repr(sorted(result.error.items()))
 
 
 # =============================================================================
@@ -280,6 +286,25 @@ class TestWorkerFailureDetection:
         with pytest.raises(RuntimeError, match="Regex worker failed"):
             builder.build({"text": "issue: payment failed"})
 
+    def test_worker_type_error_on_a_str_is_a_worker_bug(self):
+        """A TypeError from the worker is not a row fault once the value is a str.
+
+        The type check runs before submit, so the worker only ever sees a str;
+        a TypeError it raises is reported like any other worker failure, never
+        relabelled as a wrong-typed row.
+        """
+        builder = QueryBuilder(
+            query_field="text",
+            query_pattern=r"issue:\s*(.+)",
+        )
+
+        failed_future = Future()
+        failed_future.set_exception(TypeError("simulated worker bug"))
+        _replace_regex_pool(builder, failed_future)
+
+        with pytest.raises(RuntimeError, match="Regex worker failed"):
+            builder.build({"text": "issue: payment failed"})
+
     def test_worker_error_includes_pattern_and_cause(self):
         """RuntimeError from worker failure includes the pattern for diagnostics."""
         builder = QueryBuilder(
@@ -295,23 +320,46 @@ class TestWorkerFailureDetection:
             builder.build({"text": "issue: payment failed"})
         assert "kaboom" in str(exc_info.value)
 
-    def test_non_str_value_is_a_row_error_before_regex_dispatch(self):
-        """A non-str query value fails its row before the regex worker runs."""
+    def test_non_str_value_is_rejected_before_the_regex_worker(self):
+        """A non-str query_field value in regex mode is a returned row failure.
+
+        The type is checked BEFORE the value reaches the worker, so the row is
+        routed via on_error with the same reason as field-only mode, and no
+        worker exception can ever be the signal for a row fault (the broad
+        worker-failure catch reports a code bug, not a data issue). The
+        pattern would match the digits if the int were stringified, so a
+        coercing implementation fails here too.
+        """
         builder = QueryBuilder(
             query_field="text",
-            query_pattern=r"issue:\s*(.+)",
+            query_pattern=r"(\d+)",
         )
+        submitted: list[object] = []
+
+        class _RecordingPool(_RegexPoolFake):
+            def submit(self, *args: object, **kwargs: object) -> Future:
+                submitted.append(args)
+                return super().submit(*args, **kwargs)
+
+        assert builder._regex_pool is not None
+        builder._regex_pool.shutdown(wait=False)
+        builder._regex_pool = _RecordingPool(Future())
         try:
-            assert builder.build({"text": 12345}).error == {
-                "reason": "invalid_input",
-                "error_type": "wrong_type",
-                "field": "text",
-                "expected": "str",
-                "actual_type": "int",
-                "error": "must be str, got int",
-            }
+            result = builder.build({"text": 12345})
         finally:
             builder.close()
+
+        assert submitted == [], "a non-str value must never reach the regex worker"
+        assert result.query is None
+        assert result.error == {
+            "reason": "invalid_input",
+            "error_type": "wrong_type",
+            "field": "text",
+            "expected": "str",
+            "actual_type": "int",
+            "error": "must be str, got int",
+        }
+        assert "12345" not in repr(sorted(result.error.items()))
 
 
 # =============================================================================
