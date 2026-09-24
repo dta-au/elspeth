@@ -23,6 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.audit import begin_dispatch, finish_success
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
 from elspeth.web.composer.guided.state_machine import (
@@ -372,7 +373,7 @@ async def _assert_revert_integrity_failure_is_atomic(
 
 
 def _handoff_state_content_hash(state: CompositionStateData) -> str:
-    return stable_hash(
+    return composer_authority_hash(
         {
             "sources": state.sources,
             "nodes": state.nodes,

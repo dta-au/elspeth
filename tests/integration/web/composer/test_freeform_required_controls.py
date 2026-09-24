@@ -20,6 +20,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.required_controls import (
@@ -692,7 +693,8 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
         "field_mapper",
     ]
     _assert_required_control_disclosures(sealed)
-    assert proposal.tool_arguments_hash == stable_hash(sealed)
+    assert type(sealed["sources"]) is dict
+    assert proposal.tool_arguments_hash == composer_authority_hash(sealed)
     assert set(proposal.affects) >= {"graph", "validation"}
     assert result.state is initial_state
     invocation = next(item for item in result.tool_invocations if item.tool_call_id == "call_review_incremental_completion")

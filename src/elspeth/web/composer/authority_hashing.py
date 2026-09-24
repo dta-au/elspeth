@@ -6,8 +6,13 @@ row_union releases rows in branch order, and a coalesce merges (and, under
 the default ``union_collision_policy=last_wins``, resolves field collisions)
 in branch order.  Composer authority hashes therefore project those fields
 into an explicitly ordered pair array, tagged with one schema per node type,
-before canonicalizing.  The projection is detached: persisted and executed
-pipeline payloads retain their public mapping shape.
+before canonicalizing.  The top-level multi-source ``sources`` map is
+order-semantic too (declaration order is the cross-source ingest order and
+names the first source), so every ``sources`` dict, including ``{}`` and a
+single entry, is projected the same way under ``composer.ordered-sources.v1``.
+The singular ``source`` field is not a map of sources and is left alone.  The
+projection is detached: persisted and executed pipeline payloads retain their
+public mapping shape.
 
 Order inside a stored dispatch envelope is bound only by the envelope's own
 hash.  Both restore callers compare the restored payload's RFC 8785 canonical
@@ -44,6 +49,7 @@ _ORDERED_BRANCH_LABELS: Final[Mapping[str, str]] = MappingProxyType(
         "coalesce": "coalesce",
     }
 )
+_ORDERED_SOURCES_SCHEMA: Final = "composer.ordered-sources.v1"
 
 
 def _project_ordered_pairs(mapping: dict[str, JsonValue], schema: str) -> dict[str, JsonValue]:
@@ -80,9 +86,10 @@ def _restore_ordered_pairs(
 
 
 def project_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, JsonValue]:
-    """Return a detached hash projection with ordered row-union and coalesce branches.
+    """Return a detached hash projection with ordered sources and structural branches.
 
-    Only top-level pipeline ``nodes`` are inspected.  This avoids assigning
+    Only the top-level ``sources`` dict and top-level pipeline ``nodes`` are
+    inspected.  This avoids assigning
     Composer topology meaning to plugin-owned nested dictionaries that happen
     to contain similarly named fields.  A ``node_type`` that is not a string
     passes through unprojected: projection runs on raw planner arguments
@@ -91,6 +98,10 @@ def project_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, 
     projected = cast(dict[str, JsonValue], deep_thaw(payload))
     if type(projected) is not dict:
         raise TypeError("Composer authority payload must thaw to a dict")
+
+    sources = projected["sources"] if "sources" in projected else None
+    if type(sources) is dict:
+        projected["sources"] = _project_ordered_pairs(sources, _ORDERED_SOURCES_SCHEMA)
 
     nodes = projected["nodes"] if "nodes" in projected else None
     if type(nodes) is not list:
@@ -115,12 +126,21 @@ def restore_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, 
     The ordered pair array is validated strictly before it becomes a mapping:
     a plain map where a projection must be, a missing or foreign schema tag,
     extra envelope keys, malformed entries and duplicate keys fail closed.
-    Branch values may be any JSON value.  The restored mapping retains the
+    Branch values and source specs may be any JSON value.  The restored mapping retains the
     pair-array order for the redaction pass that follows.
     """
     restored = cast(dict[str, JsonValue], deep_thaw(payload))
     if type(restored) is not dict:
         raise ValueError("Composer authority projection must thaw to a dict")
+
+    sources = restored["sources"] if "sources" in restored else None
+    if type(sources) is dict:
+        restored["sources"] = _restore_ordered_pairs(
+            sources,
+            schema=_ORDERED_SOURCES_SCHEMA,
+            malformed="sources authority projection is malformed",
+            item_malformed="sources authority projection item is malformed",
+        )
 
     nodes = restored["nodes"] if "nodes" in restored else None
     if type(nodes) is not list:

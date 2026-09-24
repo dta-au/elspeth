@@ -22,7 +22,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
-from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_commit import (
     PipelineCommitConfig,
@@ -116,7 +116,7 @@ def _state_data(*, composer_meta: dict[str, object] | None = None) -> Compositio
 
 
 def _state_content_hash(state: CompositionStateData) -> str:
-    return stable_hash(
+    return composer_authority_hash(
         {
             "sources": state.sources,
             "nodes": state.nodes,
