@@ -208,6 +208,61 @@ def test_expanded_call_lookup_reads_source_siblings_once_per_parent_group() -> N
     assert len(selects) <= member_count * 12
 
 
+def test_unmatched_current_lineage_has_no_source_calls() -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
+    current_state_id = "current-unmatched-state"
+    for run_id in ("source", "current"):
+        authority = leader_coordination_token(factory, run_id)
+        register_test_node(factory.data_flow, run_id, "transform", plugin_name="transform")
+        row, token = factory.data_flow.create_row_with_token(
+            "source-node", 0, {"value": 1}, source_row_index=0, ingest_sequence=0, coordination_token=authority
+        )
+        if run_id == "current":
+            children, _group = factory.data_flow.expand_token(
+                TokenRef(token_id=token.token_id, run_id=run_id),
+                row.row_id,
+                [{"value": 1}],
+                output_contract=contract,
+                member_token=authority.membership,
+            )
+            token = children[0]
+        factory.execution.begin_node_state(
+            token.token_id,
+            "transform",
+            0,
+            {"value": 1},
+            state_id=f"{run_id}-unmatched-state",
+            member_token=authority.membership,
+        )
+    with factory._db.write_connection() as conn:
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.run_id == "source")
+            .values(status=RunStatus.COMPLETED.value, completed_at=datetime.now(UTC))
+        )
+    assert (
+        factory.execution.list_source_calls_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            current_state_id=current_state_id,
+            current_operation_id=None,
+        )
+        == []
+    )
+    assert (
+        factory.execution.find_call_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            request_hash=None,
+            current_state_id=current_state_id,
+            current_operation_id=None,
+            current_call_index=0,
+        )
+        is None
+    )
+
+
 def test_source_parent_index_eviction_reloads_completed_source_row() -> None:
     factory, _source_operation, _current_operation = _two_runs()
     states_by_row = []
