@@ -65,7 +65,7 @@ def _snapshot_values(**overrides: object) -> dict[str, object]:
         "exported_at": COMPLETED_AT,
         "registry_key_hash": "5" * 64,
         "exporter_version": "v2",
-        "serialization_version": "audit-export-v2",
+        "serialization_version": "audit-export-v3",
         "export_format": "json",
         "signing_mode": "unsigned",
         "signer_key_id": "UNSIGNED",

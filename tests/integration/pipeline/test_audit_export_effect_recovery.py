@@ -219,7 +219,7 @@ def _config(**overrides: object) -> LandscapeExportSettings:
         signer_key_id="UNSIGNED",
         exporter_version="landscape-exporter-auth-v2",
         compartment_id="test-compartment",
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="record-framing-v1",
         total_record_limit=10_000,
         total_byte_limit=10 * 1024 * 1024,

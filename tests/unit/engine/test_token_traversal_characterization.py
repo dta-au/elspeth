@@ -106,7 +106,7 @@ class TestProcessSingleTokenOrchestration:
         token = make_token_info(data={"value": 1})
 
         with pytest.raises(OrchestrationInvariantError, match="current_node_id=None"):
-            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=None)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=None, attempt_offset=0)
 
     def test_null_current_node_with_inherited_sink_completes_default_flow(self) -> None:
         """Explicit on_success_sink lets a nodeless terminal token complete."""
@@ -119,6 +119,7 @@ class TestProcessSingleTokenOrchestration:
             ctx=_claimed_context(factory, token),
             current_node_id=None,
             on_success_sink="terminal_sink",
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -146,6 +147,7 @@ class TestProcessSingleTokenOrchestration:
             ctx=_claimed_context(factory, token),
             current_node_id=None,
             on_success_sink="ignored_sink",
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -171,6 +173,7 @@ class TestProcessSingleTokenOrchestration:
             token=token,
             ctx=_claimed_context(factory, token),
             current_node_id=structural,
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -193,7 +196,7 @@ class TestProcessSingleTokenOrchestration:
         token = make_token_info(data={"value": 1})
 
         with pytest.raises(OrchestrationInvariantError, match="Inner traversal exceeded"):
-            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=looping)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=looping, attempt_offset=0)
 
     def test_non_gate_plugin_dispatches_as_transform(self) -> None:
         """Every non-GateSettings plugin takes the transform arm (negative nominal dispatch).
@@ -229,7 +232,9 @@ class TestProcessSingleTokenOrchestration:
             return success, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=node, attempt_offset=0
+        )
 
         assert dispatched == [transform], "dispatch must hand the non-conforming plugin to the transform arm"
         assert isinstance(result, RowResult)
@@ -258,7 +263,9 @@ class TestProcessSingleTokenOrchestration:
             return sink_outcome
 
         processor._gate_executor.execute_config_gate = _route  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED)
@@ -287,7 +294,9 @@ class TestProcessSingleTokenOrchestration:
             return continue_outcome
 
         processor._gate_executor.execute_config_gate = _continue  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
@@ -343,7 +352,9 @@ class TestProcessSingleTokenOrchestration:
             lambda _token, *, outcome, path: emitted.append((outcome, path))
         )
 
-        result, _child_items = processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)
@@ -460,7 +471,9 @@ class TestProcessSingleTokenOrchestration:
         processor._emit_gate_evaluated = _telemetry_failure  # type: ignore[method-assign]
         processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
 
-        result, child_items = processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node)
+        result, child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, expected_path)
@@ -493,7 +506,7 @@ class TestProcessSingleTokenOrchestration:
 
         processor._gate_executor.execute_config_gate = _jump  # type: ignore[method-assign]
         with pytest.raises(OrchestrationInvariantError, match="not in the DAG step map"):
-            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0)
 
 
 # =============================================================================
@@ -525,6 +538,7 @@ class TestHandleTransformNode:
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformContinue)
@@ -556,6 +570,7 @@ class TestHandleTransformNode:
                 coalesce_node_id=None,
                 coalesce_name=None,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
     def test_multi_row_empty_returns_filter_dropped_terminal(self) -> None:
@@ -581,6 +596,7 @@ class TestHandleTransformNode:
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -625,6 +641,7 @@ class TestHandleTransformNode:
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -665,6 +682,7 @@ class TestHandleTransformNode:
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -711,6 +729,7 @@ class TestHandleTransformNode:
             coalesce_node_id=NodeID("coalesce::merge"),
             coalesce_name=coalesce_name,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)

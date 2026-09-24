@@ -169,6 +169,24 @@ def test_template_source_limits_apply_before_parse_and_compile():
         env.from_string(oversized)
 
 
+@pytest.mark.parametrize("expression", ["*".join(["7"] * 300), "not " * 1500 + "true"], ids=["binary-chain", "parser-overflow"])
+def test_deep_template_is_a_typed_error_before_name_discovery(expression: str) -> None:
+    source = "{{ " + expression + " }}{{ row.a }}"
+    with pytest.raises(TemplateError, match="nesting"):
+        create_sandboxed_environment().parse(source)
+
+
+def test_template_ast_budget_preserves_shallow_names_and_bounds_wide_trees() -> None:
+    from elspeth.plugins.infrastructure.templates import find_runtime_unbound_variables
+
+    env = create_sandboxed_environment()
+    source = "{{ " + "*".join(["7"] * 30) + " }}{{ row.a }}"
+    assert find_runtime_unbound_variables(env.parse(source)) == frozenset({"row"})
+    env.from_string(source)
+    with pytest.raises(TemplateError, match="2048 nodes"):
+        env.parse("{{ [" + ",".join(["1"] * 2050) + "] }}")
+
+
 def test_name_discovery_and_compilation_never_fold_authored_expressions(monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.plugins.infrastructure.templates import find_runtime_unbound_variables
 

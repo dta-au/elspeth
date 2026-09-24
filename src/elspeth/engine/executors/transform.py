@@ -689,7 +689,8 @@ class TransformExecutor:
         transform: TransformProtocol,
         token: TokenInfo,
         ctx: PluginContext,
-        attempt: int = 0,
+        *,
+        attempt: int,
     ) -> tuple[TransformResult, TokenInfo, str | None]:
         """Execute a transform with full audit recording and error routing.
 

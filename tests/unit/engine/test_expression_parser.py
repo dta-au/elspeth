@@ -17,6 +17,22 @@ from elspeth.core.expression_parser import (
 )
 
 
+@pytest.mark.parametrize(
+    "expression",
+    ["-" * 1000 + "1", "+".join(["row['a']"] * 300)],
+    ids=["unary-chain", "binary-chain"],
+)
+def test_deep_expression_rejected_before_recursive_validation(expression: str) -> None:
+    with pytest.raises(ExpressionSyntaxError, match="nesting"):
+        ExpressionParser(expression)
+
+
+def test_shallow_expression_still_validates_and_evaluates() -> None:
+    parser = ExpressionParser("+".join(["row['a']"] * 30))
+    assert parser.evaluate({"a": 2}) == 60
+    assert not parser.is_boolean_expression()
+
+
 class TestExpressionParserBasicOperations:
     """Test basic allowed operations."""
 

@@ -40,7 +40,6 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import pipeline_planner
@@ -3664,22 +3663,36 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
     import elspeth.web.composer.pipeline_planner as planner_module
 
     original = planner_module.execute_discovery_tool_with_context
-    rendezvous = threading.Barrier(2)
     both_workers_entered = threading.Event()
+    both_workers_finished = threading.Event()
     release_workers = threading.Event()
+    entered_count = 0
     finished_count = 0
-    finished_lock = threading.Lock()
+    worker_lock = threading.Lock()
 
     def controlled_discovery(*args: Any, **kwargs: Any) -> Any:
-        nonlocal finished_count
-        rendezvous.wait(timeout=2)
-        both_workers_entered.set()
-        release_workers.wait(timeout=5)
+        nonlocal entered_count, finished_count
+        with worker_lock:
+            entered_count += 1
+            if entered_count == 2:
+                both_workers_entered.set()
+        # Only the test releases these workers. A wall-clock timeout here
+        # could let discovery succeed before cancellation on a loaded host.
+        release_workers.wait()
         try:
             return original(*args, **kwargs)
         finally:
-            with finished_lock:
+            with worker_lock:
                 finished_count += 1
+                if finished_count == 2:
+                    both_workers_finished.set()
+
+    async def wait_for_workers(event: threading.Event) -> None:
+        # Keep a loop timer active even when thread completion does not wake
+        # the selector promptly in a constrained test environment.
+        async with asyncio.timeout(30):
+            while not event.is_set():
+                await asyncio.sleep(0.01)
 
     monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", controlled_discovery)
     recorder = BufferingRecorder()
@@ -3694,8 +3707,12 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
         )
     )
     try:
-        await asyncio.wait_for(run_sync_in_worker(both_workers_entered.wait, 2), timeout=3)
+        # Await actual entry rather than ignoring Event.wait's False timeout
+        # result and cancelling a planner that has not dispatched either call.
+        await wait_for_workers(both_workers_entered)
         task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=30)
+        assert task in done, "planner cancellation waited for blocked discovery workers"
         with pytest.raises(asyncio.CancelledError):
             await task
         assert len(recorder.invocations) == 2
@@ -3706,14 +3723,15 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
         assert events[-1] == "settled:cancelled"
     finally:
         release_workers.set()
+        if not task.done():
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=30)
+            assert task in done, "planner did not settle after discovery workers were released"
+            await asyncio.gather(task, return_exceptions=True)
 
-    for _attempt in range(200):
-        with finished_lock:
-            if finished_count == 2:
-                break
-        await asyncio.sleep(0.01)
+    await wait_for_workers(both_workers_finished)
     await asyncio.sleep(0)
-    with finished_lock:
+    with worker_lock:
         assert finished_count == 2
     assert tuple(call.to_dict() for call in recorder.invocations) == closed_snapshot
 

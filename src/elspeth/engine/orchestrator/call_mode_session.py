@@ -714,4 +714,14 @@ class AuditedCallModeSession:
                 f"{len(self._failed_decisions)} failed decisions, {len(self._verify_admissions)} unsettled admissions"
             )
         if self._failed_decisions:
-            raise VerificationMismatchError(f"Verify call results differ from source run: {len(self._failed_decisions)} mismatches")
+            raise VerificationMismatchError(
+                f"Verify call results differ from source run: {len(self._failed_decisions)} mismatches. "
+                "Fixed response comparison policy: ignore only LLM raw_response.id and raw_response.created; "
+                "HTTP/HTTP_REDIRECT Date headers (case-insensitive); "
+                "for HTTP POST paths ending /chat/completions with a parsed body.choices array, also ignore "
+                "body.id, body.created, Content-Length headers, body_size, and transport.body_b64. "
+                "Header exclusions apply to both headers and transport.headers. "
+                "All other response fields are compared, including x-request-id, Set-Cookie, cf-ray, rate-limit headers, "
+                "and system_fingerprint; a mismatch can reflect metadata drift as well as content changes. "
+                "Both complete raw responses remain in the audit trail."
+            )

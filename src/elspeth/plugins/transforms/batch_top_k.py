@@ -18,7 +18,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type TopKValue = str | int | float | bool | None
@@ -81,7 +81,7 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:38df4426e24e4a63"
+    source_file_hash: str | None = "sha256:6ae674a8cab7ac73"
     config_model = BatchTopKConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -222,6 +222,7 @@ class BatchTopK(BaseTransform):
         groups: list[tuple[object | None, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             group_value = row[self._group_by]
+            require_scalar_group_key(group_value, field=self._group_by, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(group_value, existing_value):
                     grouped_rows.append((row_index, row))

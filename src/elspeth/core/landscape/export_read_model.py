@@ -12,6 +12,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.engine import Connection, Engine
 
 from elspeth.contracts import RunStatus, SecretResolution
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.audit_export import AuditExportTerminalWitness
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
@@ -141,6 +142,11 @@ class ConnectionBoundExportReadModel:
     def get_run(self, run_id: str) -> Any | None:
         row = self._connection.execute(select(runs_table).where(runs_table.c.run_id == run_id)).one_or_none()
         return None if row is None else self._run_loader.load(row)
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        from elspeth.core.landscape.verification_reads import iter_verification_decisions_for_run
+
+        return iter_verification_decisions_for_run(self._connection, run_id, batch_size=batch_size)
 
     def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]:
         """Page the deployment history visible in this transaction up to cutoff.

@@ -207,16 +207,51 @@ VERDICTS="$(scalar "SELECT COUNT(*) FROM call_verifications WHERE current_run_id
 echo "  Verdicts (call_verifications):"
 query "SELECT substr(current_call_id, 1, 12) AS verify_call, substr(source_call_id, 1, 12) AS source_call,
               is_match, differences_json FROM call_verifications WHERE current_run_id = ?" "$VERIFY_RUN"
+VERIFY_TOKEN="$(scalar "SELECT token_id FROM tokens WHERE run_id = ? ORDER BY token_id LIMIT 1" "$VERIFY_RUN")"
+"$ELSPETH" explain --run "$VERIFY_RUN" --token "$VERIFY_TOKEN" --json --database "$DB" \
+    > "$RUNS/verify_explain.out"
+"$PYTHON" - "$RUNS/verify_explain.out" "$DB" "$VERIFY_RUN" <<'PY'
+import json, sys
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.exporter import LandscapeExporter
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    explanation = json.load(stream)
+assert "verification_decisions" in explanation, "explain omitted verify verdicts"
+decisions = explanation["verification_decisions"]
+assert len(decisions) == 1 and decisions[0]["is_match"] is True, decisions
+db = LandscapeDB.from_url(f"sqlite:///{sys.argv[2]}", create_tables=False, read_only=True)
+try:
+    records = list(LandscapeExporter(db, compartment_id="replay-verify-example").export_run(sys.argv[3]))
+finally:
+    db.close()
+verdicts = [record for record in records if record["record_type"] == "call_verification"]
+assert len(verdicts) == 3 and all(record["is_match"] is True for record in verdicts), verdicts
+assert decisions[0]["current_call_id"] in {record["current_call_id"] for record in verdicts}
+print("  Explain shows this token's verdict; the audit export includes all 3 verdicts.")
+PY
+[ "$(scalar "SELECT COUNT(*) FROM sink_effects WHERE run_id IN (?, ?)" "$REPLAY_RUN" "$VERIFY_RUN")" -gt 0 ] \
+    || fail "replay/verify retained no virtual sink evidence"
+[ "$(scalar "SELECT COUNT(*) FROM sink_effects WHERE run_id IN (?, ?)
+             AND (publication_performed IS NOT 0 OR publication_evidence_kind IS NOT 'virtual')" "$REPLAY_RUN" "$VERIFY_RUN")" -eq 0 ] \
+    || fail "replay/verify sink evidence is not virtual without publication"
 echo ""
 
 # --- Refusal a: nonexistent source run ------------------------------------------
 echo "--- Refusal a: replay_from names a run that does not exist ---"
 write_mode_settings replay "no-such-run" "$RUNS/settings_missing_source.yaml"
 run_pipeline "$RUNS/settings_missing_source.yaml" refuse_missing_source
-[ "$RC" -ne 0 ] || fail "replay of a missing source run exited 0"
+[ "$RC" -eq 1 ] || fail "replay of a missing source run exited $RC, expected 1"
 grep -q "source run 'no-such-run' does not exist" "$RUNS/refuse_missing_source.err" \
     || fail "missing-source refusal gave an unexpected reason (see $RUNS/refuse_missing_source.err)"
 echo "  $(grep -m1 "does not exist" "$RUNS/refuse_missing_source.err")"
+VALIDATE_RC=0
+"$ELSPETH" validate --settings "$RUNS/settings_missing_source.yaml" \
+    > "$RUNS/validate_missing_source.out" 2> "$RUNS/validate_missing_source.err" || VALIDATE_RC=$?
+[ "$VALIDATE_RC" -eq 1 ] || fail "validate of a missing source run exited $VALIDATE_RC, expected 1"
+grep -q "source run 'no-such-run' does not exist" "$RUNS/validate_missing_source.out" "$RUNS/validate_missing_source.err" \
+    || fail "validate did not report the same missing-source reason as run"
+echo "  validate also refuses the missing source before execution."
 echo ""
 
 # --- Refusal b: settings drift --------------------------------------------------
@@ -225,7 +260,7 @@ write_mode_settings replay "$LIVE_RUN" "$RUNS/settings_drifted.yaml"
 sed -i.bak 's/timeout: 10$/timeout: 20/' "$RUNS/settings_drifted.yaml" && rm -f "$RUNS/settings_drifted.yaml.bak"
 grep -q 'timeout: 20$' "$RUNS/settings_drifted.yaml" || fail "could not introduce the drift"
 run_pipeline "$RUNS/settings_drifted.yaml" refuse_drift
-[ "$RC" -ne 0 ] || fail "replay with drifted settings exited 0"
+[ "$RC" -eq 4 ] || fail "replay with drifted settings exited $RC, expected 4"
 DRIFT_REASON="$(fatal_reason refuse_drift)"
 [ "$DRIFT_REASON" = "AuditIntegrityError: Replay execution settings differ from the source run at settings.transforms" ] \
     || fail "drift refusal gave an unexpected reason: '$DRIFT_REASON' (see $RUNS/refuse_drift.err)"

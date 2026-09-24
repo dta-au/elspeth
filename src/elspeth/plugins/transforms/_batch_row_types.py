@@ -44,7 +44,26 @@ Both reasons name the batch row INDEX and field NAMES only, never a row value.
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
+
 from elspeth.contracts.errors import TransformErrorReason
+
+
+def require_scalar_group_key(value: object, *, field: str, row_index: int) -> None:
+    """Reject container keys without recording row content.
+
+    Pipeline scalars and Decimal are categories; frozen JSON arrays and objects
+    are not. None remains a legal key. Non-finite scalar handling stays with
+    each plugin's existing validation policy.
+    """
+    if type(value) not in (str, int, float, bool, type(None), Decimal, datetime):
+        raise BatchRowTypeError(
+            field=field,
+            row_index=row_index,
+            expected="a scalar group key",
+            found=type(value).__name__,
+        )
 
 
 class BatchRowTypeError(Exception):

@@ -857,6 +857,17 @@ class ExpressionParser:
         except SyntaxError as e:
             msg = f"Invalid syntax: {e.msg}"
             raise ExpressionSyntaxError(msg) from e
+        except RecursionError as exc:
+            raise ExpressionSyntaxError("Expression nesting exceeds the parser limit") from exc
+
+        # Bound depth iteratively before validation, classification, or
+        # evaluation can recurse over an authored chain of operations.
+        pending: list[tuple[ast.AST, int]] = [(self._ast, 0)]
+        while pending:
+            node, depth = pending.pop()
+            if depth > 64:
+                raise ExpressionSyntaxError("Expression AST nesting exceeds 64 levels")
+            pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
 
         # Phase 2: Validate for security
         validator = _ExpressionValidator(allowed_names=self._allowed_names)

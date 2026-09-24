@@ -297,6 +297,14 @@ _TOOLS: dict[str, _ToolDef] = {
             "operation_id": {"type": "string", "description": "Operation ID to query"},
         },
     ),
+    "list_verification_decisions": _ToolDef(
+        description="Read persisted match, mismatch, and unavailable comparisons for all external calls in a verify run",
+        args=_ArgSpec(required_str=("run_id",)),
+        handler=lambda a, args: a.list_verification_decisions(args["run_id"]),
+        schema_properties={
+            "run_id": {"type": "string", "description": "Current verification run ID"},
+        },
+    ),
     "explain_token": _ToolDef(
         description="Get complete lineage for a token: source row, node states, calls, routing, errors, outcome",
         args=_ArgSpec(

@@ -37,7 +37,7 @@ PUBLIC_CONFIG = {
     "include_raw_error_rows": False,
     "per_chunk_byte_limit": 1_048_576,
     "per_chunk_record_limit": 1_000,
-    "serialization_version": "audit-export-v2",
+    "serialization_version": "audit-export-v3",
     "signer_key_id": "UNSIGNED",
     "signing_mode": "unsigned",
 }
@@ -46,28 +46,28 @@ PUBLIC_CONFIG_BYTES = (
     b'"compartment_id":"test-compartment","export_format":"json",'
     b'"exporter_version":"landscape-exporter-auth-v2","include_raw_error_rows":false,'
     b'"per_chunk_byte_limit":1048576,"per_chunk_record_limit":1000,'
-    b'"serialization_version":"audit-export-v2","signer_key_id":"UNSIGNED",'
+    b'"serialization_version":"audit-export-v3","signer_key_id":"UNSIGNED",'
     b'"signing_mode":"unsigned"},"schema":"audit-export-public-config-v1"}'
 )
-PUBLIC_CONFIG_HASH = "ab96600caf7502488e36f326e79b70dac111ff434566aa404146f938f44c5014"
+PUBLIC_CONFIG_HASH = "fb8052aa1a33d59fd2f50c3233c252d1d15071dced5f5519997b7e040671efd2"
 
 REGISTRY_KEY = {
     "export_format": "json",
     "exporter_version": "landscape-exporter-auth-v2",
     "public_export_config_hash": PUBLIC_CONFIG_HASH,
-    "serialization_version": "audit-export-v2",
+    "serialization_version": "audit-export-v3",
     "signer_key_id": "UNSIGNED",
     "signing_mode": "unsigned",
     "source_run_id": "run-golden-001",
 }
 REGISTRY_KEY_BYTES = (
     b'{"payload":{"export_format":"json","exporter_version":"landscape-exporter-auth-v2",'
-    b'"public_export_config_hash":"ab96600caf7502488e36f326e79b70dac111ff434566aa404146f938f44c5014",'
-    b'"serialization_version":"audit-export-v2","signer_key_id":"UNSIGNED",'
+    b'"public_export_config_hash":"fb8052aa1a33d59fd2f50c3233c252d1d15071dced5f5519997b7e040671efd2",'
+    b'"serialization_version":"audit-export-v3","signer_key_id":"UNSIGNED",'
     b'"signing_mode":"unsigned","source_run_id":"run-golden-001"},'
     b'"schema":"audit-export-registry-key-v1"}'
 )
-REGISTRY_KEY_HASH = "e24704ace6022b39eb202c80c0cb9b09144eabec2809ec6c16d6493d5881b420"
+REGISTRY_KEY_HASH = "09bb88137b7ea1171876a72481702b6c92c18737363a959637397a31a1a6814f"
 
 
 def _golden_config(
@@ -84,7 +84,7 @@ def _golden_config(
         source_completed_at="2026-07-16T12:00:00.000001Z",
         export_format="json",
         exporter_version="landscape-exporter-auth-v2",
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
         per_chunk_byte_limit=1_048_576,
@@ -398,28 +398,28 @@ def test_literal_final_manifest_identity_vector() -> None:
             (
                 PUBLIC_CONFIG_HASH,
                 REGISTRY_KEY_HASH,
-                "05a4388588c580ce7c09772d4ab78797dc007688c306cdfcb5f65d9f2ebbda99",
-                "3d4fbe7d60eadb1c87d9e3a20c95bfba166758b2f21430513d244c29869f5afc",
-                "f62468f7f0652139baf32a75fee5031016377b8c56303f49570c6afde671864c",
-                "8f9ca8713d576bf3edee648583d9dbbb3fe489921d99ad2d7d29abc4f4c14a97",
-                "72f4df0b07b580372841185c58b17b500e71409c4e2ad918c62b9352cf6ec785",
+                "d97933b0b30320fcb9184d0a0ba2952c6913fea5654cc2bacf743adaaae5b936",
+                "eb33931eccd6a2e4071d7625a723af2340b84918fd5ac0b5a4324a1fb13bfb60",
+                "24635ed83754783470156de43a3e47915c7e6d5ee57a92511ca5c29ac857fefc",
+                "712b8332184b97a960878ac6b65ed2ebecbeecd03c1cdd9b2320d3064eca2c46",
+                "1a1752560f1e044ce182cdfdd6ce9e2ea3c482e386e5c125d209e83a97ac64b0",
             ),
         ),
         (
             True,
             (
-                "03c9f0ed204664d87ea0dfa7f31547f8499ddd786506f6435e375edcea166395",
-                "b9b87f9d8530d2ab7e87f4c7d1853b75e94c220a320a932ae2f9e9ce3e4b76e4",
-                "5f69d425ec7b885ed1711874125e2ff59baec53e4371ed6630dab03a8a84dcba",
-                "009ee82d402179601b1092ce36a4ab850f5b11d4e214295e87fc4cb02ec26fbe",
-                "5114d3d80480518b93d003a3afe92df6c9397cc02887e3b0e7c9e03d802a801b",
-                "7ff72b8bfdb9aa2fa6126adbd8a289e37496d2716756037a8699a7ed44684b86",
-                "abbf59e6f9f028030e206544e7248144a30537d3afaa368565a8b75b45aa6900",
+                "a822f1271e5f8dede0ca711139722630ce1c9d4ea6c9107b561ab5c1f070bb3b",
+                "369e0c2b3c42e03f21dfb8e4e0876d1a0ad143f868368edf652cb7bda75df5a2",
+                "c20ed3da48648143b084bd89a859f3f5635226ebc400a7e47f8a0cf0e262e52b",
+                "e8a6afff5ae5752a155913373c7baed03ad45dc5547e3c2645c3f833505e2631",
+                "d64514326a491e71447f576cb82a2c51c879e792702da43bf553fdaf869bd04f",
+                "6ff73ae1fe60ed0c39968e69ff39302fc6f2fdaaad3bf3992a4c21e397348c10",
+                "df0faddc00d3bd47d639429311e52191720d5395daf3299bb030b83b6ee224c9",
             ),
         ),
     ],
 )
-def test_auth_v2_end_to_end_literal_derivation_vector(signed: bool, expected: tuple[str, ...]) -> None:
+def test_serialization_v3_end_to_end_literal_derivation_vector(signed: bool, expected: tuple[str, ...]) -> None:
     config = (
         _golden_config(signing_mode="hmac_sha256", signer_key_id="operator-key-v1", signing_key=b"golden-key")
         if signed

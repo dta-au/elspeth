@@ -306,7 +306,7 @@ def _insert_snapshot(db: LandscapeDB, run_id: str) -> str:
                 exported_at=completed,
                 registry_key_hash="5" * 64,
                 exporter_version="v2",
-                serialization_version="audit-export-v2",
+                serialization_version="audit-export-v3",
                 export_format="json",
                 signing_mode="unsigned",
                 signer_key_id="UNSIGNED",

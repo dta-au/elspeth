@@ -781,6 +781,18 @@ class DivertSummary(TypedDict):
     reason_hash: str | None
 
 
+class VerificationDecisionRecord(TypedDict):
+    """Persisted comparison evidence for one current-run external call."""
+
+    current_call_id: str
+    current_run_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
 class ExplainTokenResult(TypedDict):
     """Return type for ``explain_token``.
 
@@ -801,6 +813,7 @@ class ExplainTokenResult(TypedDict):
     transform_errors: list[dict[str, Any]]
     outcome: dict[str, Any] | None
     divert_summary: DivertSummary | None
+    verification_decisions: list[VerificationDecisionRecord]
 
 
 class ErrorResult(TypedDict):

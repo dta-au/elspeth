@@ -1597,6 +1597,7 @@ class TestFollowerBarrierNodeIds:
             ctx=ctx,
             current_node_id=agg_node_id,
             on_success_sink="default",
+            attempt_offset=0,
         )
 
         # The follower MUST return (None, []) — barrier hold, no transform executed.

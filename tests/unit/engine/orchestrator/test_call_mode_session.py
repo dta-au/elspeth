@@ -12,7 +12,7 @@ from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
-from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
+from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession, _verification_response
 
 _CURRENT_TOKEN = CoordinationToken(run_id="current", worker_id="worker:current:test", leader_epoch=1)
 
@@ -113,8 +113,76 @@ def test_verify_persists_mismatch_and_refuses_success() -> None:
     assert recorded["current_call_id"] == "current-call"
     assert recorded["source_call_id"] == "source-call"
     assert recorded["is_match"] is False
-    with pytest.raises(VerificationMismatchError, match="1 mismatches"):
+    with pytest.raises(VerificationMismatchError, match="1 mismatches") as exc:
         session.assert_complete()
+    message = str(exc.value)
+    assert "Fixed response comparison policy" in message
+    assert "LLM raw_response.id and raw_response.created" in message
+    assert "HTTP/HTTP_REDIRECT Date headers (case-insensitive)" in message
+    assert "HTTP POST paths ending /chat/completions with a parsed body.choices array" in message
+    assert "body.id, body.created, Content-Length headers, body_size, and transport.body_b64" in message
+    assert "All other response fields are compared" in message
+    assert "x-request-id, Set-Cookie, cf-ray, rate-limit headers, and system_fingerprint" in message
+    assert "Both complete raw responses remain in the audit trail" in message
+
+
+@pytest.mark.parametrize("call_type", [CallType.HTTP, CallType.HTTP_REDIRECT])
+def test_http_comparison_excludes_only_date_headers(call_type: CallType) -> None:
+    headers = {
+        "dAtE": "today",
+        "Content-Length": "7",
+        "x-request-id": "request-id",
+        "Set-Cookie": "session-id",
+        "cf-ray": "ray-id",
+        "x-ratelimit-remaining": "100",
+    }
+    response = {"headers": headers, "transport": {"headers": list(map(list, headers.items())), "body_b64": "cGF5bG9hZA=="}}
+    comparison = _verification_response(call_type, response)
+    retained = {name: value for name, value in headers.items() if name != "dAtE"}
+    assert comparison == {
+        "headers": retained,
+        "transport": {"headers": list(map(list, retained.items())), "body_b64": "cGF5bG9hZA=="},
+    }
+    assert response["headers"]["dAtE"] == "today"
+    assert response["transport"]["headers"][0] == ["dAtE", "today"]
+
+
+def test_llm_comparison_excludes_only_raw_response_identity() -> None:
+    response = {
+        "id": "semantic-id",
+        "raw_response": {"id": "request-id", "created": 123, "system_fingerprint": "fingerprint", "choices": [{"text": "answer"}]},
+    }
+    assert _verification_response(CallType.LLM, response) == {
+        "id": "semantic-id",
+        "raw_response": {"system_fingerprint": "fingerprint", "choices": [{"text": "answer"}]},
+    }
+    assert response["raw_response"]["id"] == "request-id"
+
+
+@pytest.mark.parametrize("chat_completion_request", [False, True])
+def test_chat_completion_comparison_requires_admitted_request(chat_completion_request: bool) -> None:
+    response = {
+        "body": {"id": "request-id", "created": 123, "system_fingerprint": "fingerprint", "choices": []},
+        "body_size": 100,
+        "headers": {"DATE": "today", "Content-Length": "100", "x-request-id": "request-id"},
+        "transport": {"headers": [["Date", "today"], ["content-length", "100"]], "body_b64": "e30="},
+    }
+    comparison = _verification_response(CallType.HTTP, response, chat_completion_request=chat_completion_request)
+    if chat_completion_request:
+        assert comparison == {
+            "body": {"system_fingerprint": "fingerprint", "choices": []},
+            "headers": {"x-request-id": "request-id"},
+            "transport": {"headers": []},
+        }
+    else:
+        assert comparison == {
+            "body": response["body"],
+            "body_size": 100,
+            "headers": {"Content-Length": "100", "x-request-id": "request-id"},
+            "transport": {"headers": [["content-length", "100"]], "body_b64": "e30="},
+        }
+    assert response["body"]["id"] == "request-id"
+    assert response["transport"]["body_b64"] == "e30="
 
 
 @pytest.mark.parametrize(

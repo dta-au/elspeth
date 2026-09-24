@@ -708,7 +708,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Persisted node execution order for replay admission changes only the 52
 # sequence_in_pipeline values in exact node audit records and the dependent
 # terminal-resume full-history hash; frozen runtime surfaces remain unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "d52a2dc82028dc62dd155ad4b43dc93f4b55ff64ce03e58b9640a5a058112a4d"
+# 2026-09-25: audit-export-v3 rotates the recorded settings digest for the
+# fourteen exact run cases and the checkpoint full-history digest. Recomputed
+# through the corpus canonical projection helpers; changing only the export
+# serialization version back to v2 reproduces every prior digest. No runtime
+# rows, routes, outcomes, audit record counts, or semantic-runtime pins changed.
+EXPECTED_CASE_REGISTRY_SHA256 = "68216169612c67f782f03140f39658fa2fdc0a280946103f045db88288c80281"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

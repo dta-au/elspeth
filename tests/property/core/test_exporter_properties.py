@@ -294,7 +294,7 @@ def _make_exporter_with_data(
         export_format="json",
         exporter_version="landscape-exporter-auth-v2",
         compartment_id="test-compartment",
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
         per_chunk_byte_limit=1_048_576,

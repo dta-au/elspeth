@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
 AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION: Final = "landscape-exporter-auth-v2"
-AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
+AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v3"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
 AUDIT_EXPORT_MAX_CHUNK_BYTES: Final = 64 * 1024 * 1024
@@ -132,6 +132,8 @@ class AuditExportSnapshotRegistryKey:
                 raise ValueError(f"{field_name} must be a non-empty exact string")
         if self.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
             raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
+            raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         if type(self.export_format) is not AuditExportFormat:
             raise TypeError("export_format must be exact AuditExportFormat")
         if type(self.signing_mode) is not AuditExportSigningMode:
@@ -169,6 +171,8 @@ def _validate_snapshot_bundle(snapshot: AuditExportSnapshot, chunks: tuple[Audit
         raise TypeError("snapshot must be exact AuditExportSnapshot")
     if snapshot.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
         raise AuditIntegrityError("audit-export snapshot exporter_version must be landscape-exporter-auth-v2")
+    if snapshot.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
+        raise AuditIntegrityError(f"audit-export snapshot serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
     if not chunks or any(type(chunk) is not AuditExportSnapshotChunk for chunk in chunks):
         raise ValueError("chunks must be a non-empty exact AuditExportSnapshotChunk tuple")
     if len(chunks) != snapshot.chunk_count:
@@ -352,7 +356,7 @@ def _validate_public_config(payload: object) -> None:
         minimum=1,
         maximum=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
     )
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)
@@ -374,7 +378,7 @@ def _validate_registry_key(payload: object) -> None:
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
     _string(obj["exporter_version"], "exporter_version", allowed=frozenset({AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION}))
     _hash(obj["public_export_config_hash"], "public_export_config_hash")
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)
@@ -399,7 +403,7 @@ def _validate_snapshot_content(payload: object) -> None:
             _integer(chunk[field], f"chunks[{index}].{field}", minimum=1)
         _integer(chunk["ordinal"], f"chunks[{index}].ordinal")
     _integer(obj["record_count"], "record_count", minimum=1)
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     _integer(obj["total_bytes"], "total_bytes", minimum=1)
 
 
@@ -446,7 +450,7 @@ def _validate_chunk_seal(payload: object) -> None:
         pred = _object(predecessor, fields=frozenset({"hash", "kind"}), path="predecessor")
         _string(pred["kind"], "predecessor.kind", allowed=frozenset({"chunk_seal"}))
         _hash(pred["hash"], "predecessor.hash")
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     _hash(obj["snapshot_id"], "snapshot_id")
 
 
@@ -606,7 +610,7 @@ def _validate_effect_identity(payload: object) -> None:
     _string(obj["input_kind"], "input_kind", allowed=frozenset({"audit_export_snapshot"}))
     _string(obj["protocol_version"], "protocol_version", allowed=frozenset({"sink-effect-v1"}))
     _string(obj["role"], "role", allowed=frozenset({"primary", "failsink"}))
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)

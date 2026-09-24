@@ -180,7 +180,7 @@ def _export_input(
         "signer_key_id": signer_key_id,
         "record_count": chunk_record_count,
         "total_bytes": len(chunk_bytes),
-        "serialization_version": "audit-export-v2",
+        "serialization_version": "audit-export-v3",
         "exported_at": "2026-07-16T01:02:03.456789Z",
         "source_completed_at": "2026-07-16T01:02:03.456789Z",
         "source_status": "completed",
@@ -207,7 +207,7 @@ def _export_input(
         registry_key_hash=registry_key_hash,
         manifest_hash=manifest_hash,
         snapshot_hash=snapshot_hash,
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         export_format=AuditExportFormat.JSON,
         signing_mode=signing_mode,
         signer_key_id=signer_key_id,
@@ -528,7 +528,7 @@ def test_verify_signed_manifest_bytes_rejects_non_dict_json() -> None:
         signer_key_id="UNSIGNED",
         record_count=1,
         total_bytes=10,
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at="2026-07-16T01:02:03.456789Z",
         source_completed_at="2026-07-16T01:02:03.456789Z",
         source_status="completed",
@@ -870,9 +870,9 @@ def test_export_input_is_dense_bounded_exact_and_has_no_pipeline_fields() -> Non
 def test_audit_export_reader_binds_exact_serialization_version() -> None:
     export_input = _export_input()
 
-    assert replace(export_input, serialization_version="audit-export-v2").serialization_version == "audit-export-v2"
+    assert replace(export_input, serialization_version="audit-export-v3").serialization_version == "audit-export-v3"
     with pytest.raises(ValueError, match=r"serialization_version|reader binding"):
-        replace(export_input, serialization_version="audit-export-v3")
+        replace(export_input, serialization_version="audit-export-v2")
 
 
 def test_chunk_and_manifest_references_must_match_exact_lowercase_hashes() -> None:

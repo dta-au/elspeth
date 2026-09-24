@@ -22,7 +22,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 if TYPE_CHECKING:
@@ -109,7 +109,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:dc649721e20a2c30"
+    source_file_hash: str | None = "sha256:f81ed534b401e442"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -292,6 +292,7 @@ class BatchDistributionProfile(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             group_value = row[self._group_by]
+            require_scalar_group_key(group_value, field=self._group_by, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(group_value, existing_value):
                     grouped_rows.append((row_index, row))

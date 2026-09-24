@@ -27,6 +27,7 @@ from elspeth.contracts.audit import (
     Batch,
     BatchMember,
     Call,
+    CallVerification,
     Edge,
     Node,
     NodeStateCompleted,
@@ -473,6 +474,9 @@ class _ExecutionRecorder:
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self.operation_calls
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return iter(())
+
     def get_batches(self, run_id: str) -> list[Any]:
         return self.batches
 
@@ -586,6 +590,9 @@ class _ExportReadModelRecorder:
 
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self._execution.get_all_operation_calls_for_run(run_id)
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self._execution.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
 
     def get_batches(self, run_id: str) -> list[Any]:
         return self._execution.get_batches(run_id)
@@ -850,7 +857,7 @@ class TestConstructor:
                     "include_raw_error_rows": False,
                     "per_chunk_byte_limit": 64 * 1024 * 1024,
                     "per_chunk_record_limit": 1_000_000,
-                    "serialization_version": "audit-export-v2",
+                    "serialization_version": "audit-export-v3",
                     "signer_key_id": "UNSIGNED",
                     "signing_mode": "unsigned",
                 },
@@ -1107,6 +1114,7 @@ class _SpyReadModel:
             "get_transform_errors_for_run",
             "get_operations_for_run",
             "get_all_operation_calls_for_run",
+            "iter_verification_decisions_for_run",
             "get_batches",
             "get_all_batch_members_for_run",
             "get_artifacts",
@@ -1180,6 +1188,10 @@ class _SpyReadModel:
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         self._record("get_all_operation_calls_for_run")
         return self._inner.get_all_operation_calls_for_run(run_id)
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        self._record("iter_verification_decisions_for_run")
+        return self._inner.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
 
     def get_batches(self, run_id: str) -> list[Any]:
         self._record("get_batches")

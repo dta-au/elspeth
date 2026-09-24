@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select, text
 
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
@@ -144,6 +144,131 @@ def test_verification_decision_requires_current_live_leader_before_write() -> No
             coordination_token=replace(current_token, leader_epoch=current_token.leader_epoch + 1),
         )
     assert factory.execution.get_verification_decision(current_call.call_id) is None
+
+
+@pytest.mark.parametrize("read_many", [False, True], ids=["single", "run"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "UPDATE call_verifications SET differences_json = '[]'",
+        "UPDATE call_verifications SET differences_json = 'broken'",
+        "UPDATE call_verifications SET differences_json = X'7b7d'",
+        "UPDATE call_verifications SET differences_json = '{\"nested\": [NaN]}'",
+        "UPDATE call_verifications SET differences_json = '{\"nested\": [1e999]}'",
+        'UPDATE call_verifications SET differences_json = \'{"x": 1, "x": 2}\'',
+        "UPDATE call_verifications SET differences_json = '{\"unexpected\": true}'",
+        "UPDATE call_verifications SET is_match = 2",
+        "UPDATE call_verifications SET is_match = 'truthy'",
+        "UPDATE call_verifications SET source_call_id = NULL",
+        "UPDATE call_verifications SET source_call_id = current_call_id",
+        "UPDATE calls SET call_type = 'llm' WHERE operation_id = (SELECT operation_id FROM operations WHERE run_id = 'source')",
+        "UPDATE calls SET call_type = 'unknown' WHERE operation_id = (SELECT operation_id FROM operations WHERE run_id = 'source')",
+        "UPDATE runs SET run_mode = 'live' WHERE run_id = 'current'",
+        "UPDATE runs SET replay_from_run_id = NULL WHERE run_id = 'current'",
+        "UPDATE call_verifications SET current_run_id = 'source'",
+        "UPDATE calls SET operation_id = (SELECT operation_id FROM operations WHERE run_id = 'source'), "
+        "call_index = 1 WHERE call_id = (SELECT current_call_id FROM call_verifications)",
+    ],
+)
+def test_verification_read_rejects_persisted_corruption(corruption: str, read_many: bool) -> None:
+    factory, source_operation, current_operation = _two_runs()
+    source_call = _record(factory, "source", source_operation)
+    current_call = _record(factory, "current", current_operation)
+    factory.execution.record_verification_decision(
+        current_run_id="current",
+        current_call_id=current_call.call_id,
+        source_run_id="source",
+        source_call_id=source_call.call_id,
+        is_match=True,
+        differences_json="{}",
+        coordination_token=leader_coordination_token(factory, "current"),
+    )
+    # Model corrupted persisted Tier-1 data, bypassing write-time checks deliberately.
+    with factory._db.engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
+        conn.execute(text(corruption))
+        conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
+    with pytest.raises(AuditIntegrityError):
+        if read_many:
+            factory.execution.get_verification_decisions_for_run("current")
+        else:
+            factory.execution.get_verification_decision(current_call.call_id)
+
+
+@pytest.mark.parametrize("is_match", [True, False, None])
+def test_verification_read_preserves_each_valid_verdict(is_match: bool | None) -> None:
+    factory, source_operation, current_operation = _two_runs()
+    source_call = _record(factory, "source", source_operation)
+    current_call = _record(factory, "current", current_operation)
+    source_call_id = None if is_match is None else source_call.call_id
+    differences = '{"missing": true}' if is_match is None else "{}"
+    factory.execution.record_verification_decision(
+        current_run_id="current",
+        current_call_id=current_call.call_id,
+        source_run_id="source",
+        source_call_id=source_call_id,
+        is_match=is_match,
+        differences_json=differences,
+        coordination_token=leader_coordination_token(factory, "current"),
+    )
+    actual = factory.execution.get_verification_decision(current_call.call_id)
+    assert actual is not None
+    assert actual.is_match is is_match
+    assert actual.source_call_id == source_call_id
+    assert factory.execution.get_verification_decisions_for_run("current") == [actual]
+
+
+@pytest.mark.parametrize("count", [1, 10])
+@pytest.mark.parametrize("batch_size", [None, 2, 3])
+def test_verification_run_read_uses_one_joined_query(count: int, batch_size: int | None) -> None:
+    factory, source_operation, current_operation = _two_runs()
+    expected_call_ids: list[str] = []
+    for _ in range(count):
+        source_call = _record(factory, "source", source_operation)
+        current_call = _record(factory, "current", current_operation)
+        expected_call_ids.append(current_call.call_id)
+        factory.execution.record_verification_decision(
+            current_run_id="current",
+            current_call_id=current_call.call_id,
+            source_run_id="source",
+            source_call_id=source_call.call_id,
+            is_match=True,
+            differences_json="{}",
+            coordination_token=leader_coordination_token(factory, "current"),
+        )
+    # Equal timestamps force the call-id keyset tiebreaker across page boundaries.
+    with factory._db.write_connection() as conn:
+        conn.execute(call_verifications_table.update().values(recorded_at=datetime(2026, 1, 1, tzinfo=UTC)))
+    statements: list[str] = []
+
+    def capture_statement(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(factory._db.engine, "before_cursor_execute", capture_statement)
+    try:
+        if batch_size is None:
+            decisions = factory.execution.get_verification_decisions_for_run("current")
+        else:
+            iterator = factory.execution.iter_verification_decisions_for_run("current", batch_size=batch_size)
+            assert statements == []
+            first = next(iterator)
+            assert sum(statement.startswith("SELECT") for statement in statements) == 1
+            decisions = [first, *iterator]
+        assert len(decisions) == count
+        assert [decision.current_call_id for decision in decisions] == sorted(expected_call_ids)
+    finally:
+        event.remove(factory._db.engine, "before_cursor_execute", capture_statement)
+    expected_queries = 1 if batch_size is None else count // batch_size + 1
+    queries = [statement for statement in statements if statement.startswith("SELECT")]
+    assert len(queries) == expected_queries
+    assert all("LIMIT" in statement for statement in queries)
+
+
+@pytest.mark.parametrize("batch_size", [True, 0, -1, 1.5])
+def test_verification_iterator_rejects_invalid_batch_size(batch_size: int) -> None:
+    factory, _, _ = _two_runs()
+    with pytest.raises(ValueError, match="positive exact integer"):
+        list(factory.execution.iter_verification_decisions_for_run("current", batch_size=batch_size))
 
 
 def test_repeated_source_loads_bind_transactional_occurrence() -> None:

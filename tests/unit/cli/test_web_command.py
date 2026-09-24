@@ -221,17 +221,25 @@ class TestWebCommandAuthBridging:
 
         assert captured_env["auth"] == "oidc"
 
-    def test_default_auth_bridged_as_local(self) -> None:
-        """Without a CLI flag or environment setting, local auth remains the default."""
+    def test_default_auth_is_owned_by_settings(self) -> None:
+        """The CLI leaves the default to the settings loader when auth is omitted."""
         import os
 
         captured_env: dict[str, str] = {}
 
         def capture_env(*args: object, **kwargs: object) -> None:
-            captured_env["auth"] = os.environ.get("ELSPETH_WEB__AUTH_PROVIDER", "")
+            assert "ELSPETH_WEB__AUTH_PROVIDER" not in os.environ
+            captured_env["auth"] = settings_from_env().auth_provider
 
         uvicorn = FakeUvicornModule(side_effect=capture_env)
-        with patch.dict(os.environ, {}, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+        environment = {
+            "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+            "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+            "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+            "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+            "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
             result = runner.invoke(app, ["--no-dotenv", "web"])
 
         assert result.exit_code == 0

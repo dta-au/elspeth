@@ -400,7 +400,10 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
 
     def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
         _check_template_source(source)
-        ast = super().parse(source, name=name, filename=filename)
+        try:
+            ast = super().parse(source, name=name, filename=filename)
+        except RecursionError as exc:
+            raise TemplateError("Template expression nesting exceeds the parser limit") from exc
         _check_template_ast(ast)
         return ast
 
@@ -427,8 +430,18 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
 
 
 def _check_template_ast(ast: nodes.Template) -> None:
-    if sum(1 for _ in ast.find_all(nodes.Node)) > 2048:
-        raise TemplateError("Template AST exceeds 2048 nodes")
+    # Admit depth before Jinja's code generator and our name analysis recurse.
+    # find_all itself recurses, so it cannot safely enforce this budget.
+    pending = [(child, 1) for child in ast.iter_child_nodes()]
+    count = 0
+    while pending:
+        node, depth = pending.pop()
+        count += 1
+        if count > 2048:
+            raise TemplateError("Template AST exceeds 2048 nodes")
+        if depth > 64:
+            raise TemplateError("Template AST nesting exceeds 64 levels")
+        pending.extend((child, depth + 1) for child in node.iter_child_nodes())
     if next(ast.find_all(nodes.Pow), None) is not None:
         raise TemplateError("Power expressions are not supported in pipeline templates")
     for modifier in ast.find_all(nodes.EvalContextModifier):

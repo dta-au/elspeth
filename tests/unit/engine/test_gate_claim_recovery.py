@@ -70,7 +70,9 @@ def test_reclaimed_gate_claim_persists_second_attempt() -> None:
     )
     # The first owner finished the gate write, then left before disposing its
     # scheduler claim. Only that gate node_state survives from the attempt.
-    processor._gate_executor.execute_config_gate(gate, gate_id, token, PluginContext(run_id=setup.run_id, config={}, member_token=follower))
+    processor._gate_executor.execute_config_gate(
+        gate, gate_id, token, PluginContext(run_id=setup.run_id, config={}, member_token=follower), attempt_offset=0
+    )
     expire_lease(setup.db.engine, first_claim.work_item_id)
     setup.factory.run_coordination.depart_worker(member_token=follower)
     assert scheduler.recover_expired_leases(coordination_token=leader) == 1

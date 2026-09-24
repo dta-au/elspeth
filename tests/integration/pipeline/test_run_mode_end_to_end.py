@@ -206,7 +206,8 @@ def test_verify_source_drift_has_distinct_nonfatal_cli_verdict(tmp_path: Path) -
     assert '"traceback"' not in verify.output
 
 
-def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mismatch_kind", ["content", "metadata"])
+def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: Path, mismatch_kind: str) -> None:
     settings = _settings(tmp_path)
     (tmp_path / "input.csv").write_text("url\nhttps://example.org/page\n")
     settings["transforms"] = [
@@ -280,10 +281,22 @@ def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: P
 
     with respx.mock(assert_all_mocked=True) as router, patch("socket.getaddrinfo", side_effect=fixed_dns):
         router.get(f"https://{ip}:443/page").mock(
-            return_value=httpx.Response(200, text="<html><body>changed page</body></html>", headers={"content-type": "text/html"})
+            return_value=httpx.Response(
+                200,
+                text=f"<html><body>{'changed' if mismatch_kind == 'content' else 'original'} page</body></html>",
+                headers={"content-type": "text/html", "x-request-id": "new-request"}
+                if mismatch_kind == "metadata"
+                else {"content-type": "text/html"},
+            )
         )
         mismatch = invoke()
-    assert mismatch.exit_code != 0, mismatch.output
+    assert mismatch.exit_code == 2, mismatch.output
+    if mismatch_kind == "metadata":
+        events = [json.loads(line) for line in mismatch.output.splitlines()]
+        (event,) = [event for event in events if event["event"] == "verification_mismatch"]
+        assert "Fixed response comparison policy" in event["error"]
+        assert "x-request-id" in event["error"]
+        assert "metadata drift as well as content changes" in event["error"]
     assert sink_path.read_bytes() == artifact
     with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
         after = set(connection.execute(select(runs_table.c.run_id)).scalars())

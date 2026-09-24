@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
+from collections.abc import Iterator
 from concurrent.futures import Future
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
@@ -51,6 +52,11 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     token_parents_table,
     tokens_table,
+)
+from elspeth.core.landscape.verification_reads import (
+    get_verification_decision,
+    get_verification_decisions_for_run,
+    iter_verification_decisions_for_run,
 )
 
 if TYPE_CHECKING:
@@ -920,39 +926,16 @@ class CallAuditRepository:
         )
 
     def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
-        row = self._ops.execute_fetchone(
-            select(call_verifications_table).where(call_verifications_table.c.current_call_id == current_call_id)
-        )
-        if row is None:
-            return None
-        return CallVerification(
-            current_call_id=row.current_call_id,
-            current_run_id=row.current_run_id,
-            source_run_id=row.source_run_id,
-            source_call_id=row.source_call_id,
-            is_match=row.is_match,
-            differences_json=row.differences_json,
-            recorded_at=row.recorded_at,
-        )
+        with self._db.engine.connect() as conn:
+            return get_verification_decision(conn, current_call_id)
 
     def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
-        rows = self._ops.execute_fetchall(
-            select(call_verifications_table)
-            .where(call_verifications_table.c.current_run_id == current_run_id)
-            .order_by(call_verifications_table.c.recorded_at, call_verifications_table.c.current_call_id)
-        )
-        return [
-            CallVerification(
-                current_call_id=row.current_call_id,
-                current_run_id=row.current_run_id,
-                source_run_id=row.source_run_id,
-                source_call_id=row.source_call_id,
-                is_match=row.is_match,
-                differences_json=row.differences_json,
-                recorded_at=row.recorded_at,
-            )
-            for row in rows
-        ]
+        with self._db.engine.connect() as conn:
+            return get_verification_decisions_for_run(conn, current_run_id)
+
+    def iter_verification_decisions_for_run(self, current_run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        with self._db.engine.connect() as conn:
+            yield from iter_verification_decisions_for_run(conn, current_run_id, batch_size=batch_size)
 
     def find_call_by_request_hash(
         self,

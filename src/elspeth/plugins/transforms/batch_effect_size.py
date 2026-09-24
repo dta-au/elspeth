@@ -19,7 +19,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchEffectSizeRow = dict[str, object]
@@ -119,7 +119,7 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8e4adf4a85229544"
+    source_file_hash: str | None = "sha256:4547c9802e7c16d0"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
     usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
@@ -248,6 +248,7 @@ class BatchEffectSize(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             variant_value = row[self._variant_field]
+            require_scalar_group_key(variant_value, field=self._variant_field, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(variant_value, existing_value):
                     grouped_rows.append((row_index, row))
@@ -458,8 +459,8 @@ class BatchEffectSize(BaseTransform):
         if non_finite_variant_error is not None:
             return non_finite_variant_error
 
-        grouped = self._group_rows(rows)
         try:
+            grouped = self._group_rows(rows)
             stats_by_variant = [self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped]
         except BatchRowTypeError as exc:
             # The whole batch fails with a recorded, value-free reason naming
