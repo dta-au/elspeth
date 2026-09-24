@@ -470,6 +470,10 @@ def _replace_llm_tool_call_arguments(
     ``encode_semantic_arguments``) or a redaction sentinel, which keeps the
     plain ``{"pipeline": ...}`` wrap. In S1 both give the same bytes, because
     set_pipeline is non-strict on every dialect.
+
+    The transcript keeps the model's key order: map order in ``sources``,
+    ``row_union.branches`` and ``coalesce.branches`` is semantic, so a sorted
+    re-serialisation would show the model an order it never authored.
     """
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
@@ -495,7 +499,7 @@ def _replace_llm_tool_call_arguments(
                 provider_arguments = encode_semantic_arguments(function_name, dialect, arguments)
             else:
                 provider_arguments = {"pipeline": arguments}
-            encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
+            encoded = json.dumps(provider_arguments, separators=(",", ":"))
             function["arguments"] = encoded
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
