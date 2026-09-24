@@ -5544,7 +5544,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "SchedulerLeaseRepository.peer_active_leases",
         "<non-session-write-connection>",
         "write_connection",
-        "aa5f90c521e4b5ff",
+        "e6f248b018079f85",
         1,
         None,
         line=969,
