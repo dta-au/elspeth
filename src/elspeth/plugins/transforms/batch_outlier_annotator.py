@@ -162,7 +162,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cfb0a00e922cf570"
+    source_file_hash: str | None = "sha256:8365ac03597d3e0e"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     preserves_input_values = True
@@ -536,6 +536,9 @@ class BatchOutlierAnnotator(BaseTransform):
                 if field.normalized_name not in merged_fields:
                     merged_fields[field.normalized_name] = field
 
+        # Each annotation enters as a placeholder; the ONE stamp rewrites it to
+        # the plugin's declaration (ADR-050) and the batch postflight checks
+        # every declared concrete type against the emitted values.
         for field_name in sorted(self.declared_output_fields):
             merged_fields[field_name] = FieldContract(
                 normalized_name=field_name,
@@ -550,7 +553,7 @@ class BatchOutlierAnnotator(BaseTransform):
             fields=tuple(merged_fields.values()),
             locked=True,
         )
-        return self._align_output_contract(output_contract)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
 
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext

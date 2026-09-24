@@ -17,8 +17,8 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -126,7 +126,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a1c9994dd6e3537a"
+    source_file_hash: str | None = "sha256:875b1ce09351d385"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -267,14 +267,31 @@ class BatchStats(BaseTransform):
         """
         return self._all_possible_output_keys
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The conditional skip diagnostics, declared ``any`` and optional (ADR-050).
+
+        They are written only when a row was skipped, so they are not in
+        ``declared_output_fields`` (the guarantee surface); naming them here
+        puts them through the declaration stamp like every other key the
+        aggregate writes. The guaranteed stat fields are stamped from
+        ``declared_output_fields``.
+        """
+        return (
+            FieldDefinition("skipped_missing", "any", required=False),
+            FieldDefinition("skipped_missing_indices", "any", required=False),
+            FieldDefinition("skipped_non_finite", "any", required=False),
+            FieldDefinition("skipped_non_finite_indices", "any", required=False),
+        )
+
     def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
         """Override (elspeth-f5f798f797): aggregation output is independent of input shape.
 
         The user's ``schema:`` block describes the INPUT contract that batch_stats
         consumes — what fields/types upstream produces and which the consumer
         requires. The aggregation's OUTPUT is computed: stat fields plus an
-        optional group_by, all OBSERVED-typed (``python_type=object``). It does
-        not carry the user's input field declarations.
+        optional group_by, declared by the plugin and stamped on the emitted
+        contract (ADR-050). It does not carry the user's input field
+        declarations.
 
         The base class implementation copies ``fields``, ``required_fields``, and
         the user's input-side ``guaranteed_fields`` into the output config, which
@@ -284,7 +301,8 @@ class BatchStats(BaseTransform):
         ``customer_tier`` (declared ``str``, observed ``object``).
 
         Returns a config that honestly describes batch_stats output:
-          - ``mode='observed'`` — output types are inferred from aggregate values.
+          - ``mode='observed'`` — no operator-authored fields; the emitted
+            contract carries the plugin's own declaration through the stamp.
           - ``fields=None`` — no explicit field declarations on output.
           - ``guaranteed_fields`` — the actual emitted set (declared_output_fields).
           - ``required_fields=None`` — input-only consumer requirement, irrelevant on output.
@@ -529,22 +547,6 @@ class BatchStats(BaseTransform):
         reason["group_by"] = self._group_by
         reason["error"] = f"group {self._group_by!r} first seen in row {grouped_rows[0][0]}"
 
-    def _output_contract_for(self, results: list[BatchStatsAggregateRow]) -> SchemaContract:
-        """Build one shared output contract for aggregate result rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,  # OBSERVED mode - infer all as object type
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -595,7 +597,7 @@ class BatchStats(BaseTransform):
                 return error
             results.append(aggregate)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

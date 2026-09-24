@@ -1107,9 +1107,13 @@ EXPECTED_CONTRACT_SITES: Mapping[str, frozenset[DispatchSiteName]] = MappingProx
         #   Registered: src/elspeth/engine/executors/output_declaration.py (module-import side-effect)
         #   ADR:        ADR-050
         #   Sites:      post_emission_check (single-token TransformExecutor path)
-        # NOTE: batch_flush_check deliberately absent; aggregation and collector
-        # outputs do not carry the declaration stamp (they record no node
-        # output contract), so the check would describe a seam it does not reach.
+        # NOTE: batch_flush_check deliberately absent. Batch outputs DO carry
+        # the declaration stamp, but the batch-flush dispatch carries the
+        # INTERSECTION of the buffered rows' input fields (ADR-009), which
+        # cannot tell a created key from an input field only some buffered
+        # rows carried; and the collector flush dispatches no declaration
+        # contracts. Batch-aware completeness is the registry gate
+        # (tests/invariants/test_output_declaration_completeness.py).
         "output_declaration_completeness": frozenset({"post_emission_check"}),
         # SourceGuaranteedFieldsContract
         #   Defined:    src/elspeth/engine/executors/source_guaranteed_fields.py

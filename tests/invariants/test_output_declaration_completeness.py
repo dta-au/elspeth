@@ -17,8 +17,10 @@ Two sweeps over the live transform registry, built from each plugin's
   ``source="declared"`` contract — the same predicate the runtime
   ``OutputDeclarationCompletenessContract`` enforces per row, applied here
   across the roster so a plugin that bypasses the stamp is caught in CI, not
-  in a run. Batch-aware transforms are skipped with a reason: aggregation and
-  collector outputs do not carry the stamp today (ADR-050 §Consequences).
+  in a run. Batch-aware transforms run through the same probe: their
+  reductive outputs carry the stamp via ``_batch_output_contract`` and their
+  passthrough outputs stamp the created fields, so every emitted created key
+  must be ``declared`` there too.
 
 Controls: web_scrape (a plugin that promotes observed to a typed flexible
 output) passes; the predicate itself is exercised against an in-file plugin
@@ -107,12 +109,17 @@ def test_every_emitted_created_field_carries_a_declared_contract(_transform_cls:
         transform = _probe_instantiate(_transform_cls)
     except _UnprobeableTransform as exc:
         pytest.skip(f"{_transform_cls.__name__}: {exc.reason}")
-    if transform.is_batch_aware:
-        pytest.skip(f"{_transform_cls.__name__}: batch-aware outputs do not carry the declaration stamp (ADR-050 §Consequences)")
-
-    probe_rows = transform.forward_invariant_probe_rows(make_pipeline_row({"baseline": "kept"}))
-    result = transform.execute_forward_invariant_probe(probe_rows, _probe_context(transform))
-    assert result.status == "success", f"{_transform_cls.__name__}: the forward probe did not emit ({result.status}); nothing to check"
+    # The ADR-009 harness's own selection: the forward probe for a pass-through
+    # transform, the backward probe otherwise — a reductive batch transform
+    # grafts the value fields its process() reads onto the backward probe rows.
+    probe = make_pipeline_row({"baseline": "kept"})
+    if transform.passes_through_input:
+        probe_rows = transform.forward_invariant_probe_rows(probe)
+        result = transform.execute_forward_invariant_probe(probe_rows, _probe_context(transform))
+    else:
+        probe_rows = transform.backward_invariant_probe_rows(probe)
+        result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
+    assert result.status == "success", f"{_transform_cls.__name__}: the probe did not emit ({result.status}); nothing to check"
     emitted = _emitted_rows_from_result(result)
     assert emitted, f"{_transform_cls.__name__}: the forward probe emitted no rows"
 
@@ -171,3 +178,88 @@ def test_predicate_controls() -> None:
     unnamed = _Probe({"schema": {"mode": "observed"}}, declare=False, stamp=True)
     assert undeclared_created_fields(unnamed, *_emit(unnamed)) == {"created": frozenset({"source='inferred'"})}
     assert "created" not in unnamed._stamped_output_field_contracts()
+
+
+# Batch plugins write some created keys only when a row was skipped or a pair
+# was incomplete. Those keys are not in ``declared_output_fields`` (the
+# guarantee surface), so neither sweep above reaches them from the plugin's
+# probe rows: each plugin names them in ``created_output_fields()`` and this
+# case makes it emit them. (plugin class, config, rows, the conditional keys
+# the rows must make it write)
+_CONDITIONAL_CREATED_CASES: list[tuple[str, dict[str, Any], list[dict[str, Any]], frozenset[str]]] = [
+    (
+        "batch_stats",
+        {"schema": {"mode": "observed"}, "value_field": "v"},
+        [{"v": 1}, {"v": None}, {"v": float("nan")}],
+        frozenset({"skipped_missing", "skipped_missing_indices", "skipped_non_finite", "skipped_non_finite_indices"}),
+    ),
+    (
+        "batch_distribution_profile",
+        {"schema": {"mode": "observed"}, "value_field": "v"},
+        [{"v": 1}, {"v": 2}, {"v": None}, {"v": float("nan")}],
+        frozenset({"missing_indices", "non_finite_indices"}),
+    ),
+    (
+        "batch_classifier_metrics",
+        {"schema": {"mode": "observed"}, "actual_field": "a", "predicted_field": "p"},
+        [{"a": "x", "p": "x"}, {"a": None, "p": "x"}],
+        frozenset({"missing_indices"}),
+    ),
+    (
+        "batch_effect_size",
+        {"schema": {"mode": "observed"}, "variant_field": "g", "score_field": "s"},
+        [
+            {"g": "b", "s": 1.0},
+            {"g": "b", "s": 2.0},
+            {"g": "b", "s": None},
+            {"g": "b", "s": float("nan")},
+            {"g": "c", "s": 3.0},
+            {"g": "c", "s": 5.0},
+            {"g": "c", "s": None},
+            {"g": "c", "s": float("nan")},
+        ],
+        frozenset({"baseline_missing_indices", "baseline_non_finite_indices", "variant_missing_indices", "variant_non_finite_indices"}),
+    ),
+    (
+        "batch_experiment_compare",
+        {"schema": {"mode": "observed"}, "variant_field": "g", "score_field": "s"},
+        [
+            {"g": "b", "s": 1.0},
+            {"g": "b", "s": 2.0},
+            {"g": "b", "s": None},
+            {"g": "b", "s": float("nan")},
+            {"g": "c", "s": 3.0},
+            {"g": "c", "s": 5.0},
+            {"g": "c", "s": None},
+            {"g": "c", "s": float("nan")},
+        ],
+        frozenset({"baseline_missing_indices", "baseline_non_finite_indices", "variant_missing_indices", "variant_non_finite_indices"}),
+    ),
+    (
+        "batch_paired_preference",
+        {"schema": {"mode": "observed"}, "pair_field": "k", "variant_field": "g", "score_field": "s"},
+        [{"k": 1, "g": "b", "s": 1.0}, {"k": 1, "g": "c", "s": 2.0}, {"k": 2, "g": "b", "s": 1.0}],
+        frozenset({"incomplete_pairs"}),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("plugin_name", "config", "rows", "conditional"), _CONDITIONAL_CREATED_CASES, ids=[c[0] for c in _CONDITIONAL_CREATED_CASES]
+)
+def test_conditional_batch_created_fields_carry_a_declared_contract(
+    plugin_name: str, config: dict[str, Any], rows: list[dict[str, Any]], conditional: frozenset[str]
+) -> None:
+    [transform_cls] = [cls for cls in _registered_transform_classes() if cls.name == plugin_name]
+    transform = transform_cls(config)
+    input_rows = [make_pipeline_row(row) for row in rows]
+    result = transform.process(input_rows, _probe_context(transform))
+    assert result.status == "success", result.reason
+    emitted = _emitted_rows_from_result(result)
+    written = set().union(*(row.to_dict().keys() for row in emitted))
+    assert conditional <= written, f"{plugin_name}: the case did not make it write {sorted(conditional - written)!r}; nothing is armed"
+    assert undeclared_created_fields(transform, input_rows, emitted) == {}
+    for row in emitted:
+        contract_fields = {fc.normalized_name: fc for fc in row.contract.fields}
+        for name in conditional & set(row.to_dict()):
+            assert (contract_fields[name].source, contract_fields[name].required) == ("declared", False), name

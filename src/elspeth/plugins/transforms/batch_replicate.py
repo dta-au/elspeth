@@ -21,6 +21,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import TransformSuccessReason
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
@@ -130,7 +131,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7a1cb813e1dfadc0"
+    source_file_hash: str | None = "sha256:3b2052704496be8f"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -232,6 +233,12 @@ class BatchReplicate(BaseTransform):
         # that is not knowable from the config alone would otherwise be guarded
         # by neither.
         self._reject_input_options_naming_created_fields({"copies_field": cfg.copies_field})
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """``copy_index`` is the replica's ordinal, an ``int`` fixed by the loop that emits it (ADR-050)."""
+        if not self._include_copy_index:
+            return ()
+        return (FieldDefinition(COPY_INDEX_FIELD, "int"),)
 
     def _reject_explicit_copy_index_collision(self, cfg: BatchReplicateConfig) -> None:
         """Reject explicit schemas that would always collide with copy_index emission."""
@@ -381,12 +388,14 @@ class BatchReplicate(BaseTransform):
                 if fc.normalized_name not in merged_fields:
                     merged_fields[fc.normalized_name] = fc
 
-        # Add copy_index as a new inferred field if configured
+        # copy_index enters as a placeholder; the ONE stamp rewrites it to the
+        # plugin's declaration (``int``, ADR-050) and the batch postflight
+        # checks that declaration against the emitted value.
         if self._include_copy_index:
             merged_fields[COPY_INDEX_FIELD] = FieldContract(
                 normalized_name=COPY_INDEX_FIELD,
                 original_name=COPY_INDEX_FIELD,
-                python_type=int,
+                python_type=object,
                 required=False,
                 source="inferred",
             )
@@ -396,7 +405,7 @@ class BatchReplicate(BaseTransform):
             fields=tuple(merged_fields.values()),
             locked=True,
         )
-        output_contract = self._align_output_contract(output_contract)
+        output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
 
         success_reason: TransformSuccessReason = {
             "action": "processed",

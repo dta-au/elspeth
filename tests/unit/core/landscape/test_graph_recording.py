@@ -1945,11 +1945,15 @@ class TestResumeAcrossTheDeclarationChange:
     """ADR-050 T13: a run recorded BEFORE the declaration change meets the new stamp on resume.
 
     Its node record says ``T, source: inferred`` (what per-emission inference
-    wrote); the resumed emission says ``object, source: declared``. There is
-    no refusal and no compatibility shim by design: the resume ends at the
-    first stamped node's evolution with ``FrameworkBugError``. The
-    implementation-compatibility check cannot refuse it earlier, because a
-    base-class change moves none of the per-node evidence it compares.
+    wrote). There is no refusal and no compatibility shim by design, and the
+    node writer raises on a TYPE difference only, so the outcome depends on
+    the field (ADR-050 §Negative): where the declaration changed the type
+    (``int`` recorded, ``object`` declared) the resume ends at that node's
+    evolution with ``FrameworkBugError``; where the declared type equals the
+    recorded one the emission folds and the record's ``source`` flips
+    ``inferred`` → ``declared``. The implementation-compatibility check
+    cannot refuse either earlier, because a base-class change moves none of
+    the per-node evidence it compares.
     """
 
     def test_a_pre_change_record_aborts_at_the_first_stamped_emission(self) -> None:
@@ -1990,6 +1994,42 @@ class TestResumeAcrossTheDeclarationChange:
             )
         _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
         assert stored == pre_change
+        db.close()
+
+    def test_a_pre_change_record_whose_type_matches_folds_with_source_declared(self) -> None:
+        """Measured, not refused: an equal type folds and only the recorded ``source`` changes."""
+        db, factory = _setup()
+        pre_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="item_index", original_name="item_index", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="json_explode",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0.0",
+            config={},
+            node_id="xfm",
+            output_contract=pre_change,
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        post_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="item_index", original_name="item_index", python_type=int, required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.update_node_output_contract(
+            "xfm", post_change, member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
+        assert stored is not None
+        assert [(fc.normalized_name, fc.python_type, fc.source) for fc in stored.fields] == [("item_index", int, "declared")]
+        assert stored.version_hash() != pre_change.version_hash()
         db.close()
 
     def test_the_implementation_compatibility_check_cannot_refuse_it(self) -> None:

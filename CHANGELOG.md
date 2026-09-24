@@ -91,10 +91,15 @@ drained and repair this release forward.
   sources disagreeing on a column now share a sink. The meaning of
   `nodes.output_contract_json` changes for transform nodes to "the declared
   output contract, field set evolving", so contract `version_hash`es and the
-  LLM prompt `contract_hash` differ from earlier runs. A run recorded before
-  this change and resumed after it ends with `FrameworkBugError` at the first
-  declared node's contract evolution; there is no compatibility shim (epoch 45
-  is undeployed).
+  LLM prompt `contract_hash` differ from earlier runs. Aggregation and
+  collector outputs carry the same declaration, and a declared type is
+  checked at the flush: a batch plugin emitting the wrong type for a field it
+  declares fails the batch (or the collector group) with the same value-free
+  reason. A run recorded before this change and resumed after it ends with
+  `FrameworkBugError` at the first node whose declared type differs from the
+  type it recorded; a node whose types match continues and its record's
+  `source` becomes `declared`. There is no compatibility shim (epoch 45 is
+  undeployed).
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

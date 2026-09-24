@@ -15,7 +15,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -144,7 +144,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:feb868b1b6bcaab5"
+    source_file_hash: str | None = "sha256:d9a83901a2e1c580"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -543,22 +543,6 @@ class BatchDriftCompare(BaseTransform):
                 return {}, TransformResult.error(reason, retryable=False)
         return self._categorical_result(baseline=baseline, cohort=cohort, batch_size=batch_size), None
 
-    def _output_contract_for(self, results: list[BatchDriftCompareRow]) -> SchemaContract:
-        """Build one shared output contract for drift comparison rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -622,7 +606,7 @@ class BatchDriftCompare(BaseTransform):
                 return error
             results.append(comparison)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

@@ -61,6 +61,7 @@ from pydantic import ValidationError
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
 from elspeth.contracts.errors import PluginContractViolation
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.engine.executors.declared_output_types import verify_created_output_types
 
 
 def validate_batch_inputs(
@@ -115,6 +116,20 @@ def validate_success_outputs(
 ) -> None:
     """Validate successful batch output rows before audit completion.
 
+    Two checks, both Tier 2: the declared output schema (pydantic strict,
+    which types nothing for an observed output model), then the ADR-050
+    VALUE check — every created field (``declared_output_fields`` and
+    ``created_output_fields()``) whose stamped type is concrete, against the
+    emitted value, through the same ``declared_output_types`` module the
+    per-row seam uses. Input fields a passthrough batch output carries are
+    not re-checked: the buffer preflight validated them. A batch
+    transform's emitted contract carries the declaration stamp
+    (``BaseTransform._batch_output_contract`` and the passthrough shapes'
+    ``_apply_declared_output_field_contracts`` call), so a plugin computing
+    the wrong type for its own statistic is caught here, value-free, with
+    ``authorship: computed``, and fails the whole batch like any other
+    violation of this postflight.
+
     Args:
         transform: The batch transform whose declared output contract governs.
         result: The successful result whose emitted rows are checked.
@@ -122,7 +137,8 @@ def validate_success_outputs(
 
     Raises:
         PluginContractViolation: If any emitted row fails the declared output
-            schema.
+            schema, or (``DeclaredOutputTypeViolation``) a created field's
+            value breaks the type the transform declared for it.
     """
     if result.row is not None:
         emitted_rows: tuple[PipelineRow, ...] = (result.row,)
@@ -140,3 +156,5 @@ def validate_success_outputs(
                 f"{safe_validation_error_text(exc, transform.output_schema)}. "
                 "This indicates a transform schema bug."
             ) from exc
+
+    verify_created_output_types(transform=transform, emitted_rows=emitted_rows)

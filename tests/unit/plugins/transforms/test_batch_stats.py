@@ -916,7 +916,7 @@ class TestOutputSchemaConfigDoesNotPropagateInputContract:
             assert error is None
             results.append(aggregate)
 
-        contract = transform._output_contract_for(results)
+        contract = transform._batch_output_contract(key for result in results for key in result)
         emitted_rows = [PipelineRow(r, contract) for r in results]
 
         # Must NOT raise SchemaConfigModeViolation.

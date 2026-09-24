@@ -19,7 +19,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -99,7 +99,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fb073b4482ffa0c5"
+    source_file_hash: str | None = "sha256:8c9904b4ecaea469"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -238,21 +238,6 @@ class ReportAssemble(BaseTransform):
         # Literal type guarantees the only remaining value is "html_fragment".
         return self._render_html_fragment(lines)
 
-    def _output_contract_for(self, output: ReportAssembleRow) -> SchemaContract:
-        """Build one shared output contract for the assembled report row."""
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in output
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         # Hypothesis-generated probe rows arrive without ``text_field``, so the
         # aggregate output path can't run on them as-is. Mirror the
@@ -311,7 +296,7 @@ class ReportAssemble(BaseTransform):
             "flush_trigger": batch.trigger_type,
             "is_end_of_source_report": batch.is_end_of_source,
         }
-        output_contract = self._output_contract_for(output)
+        output_contract = self._batch_output_contract(output)
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={

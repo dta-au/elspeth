@@ -102,6 +102,7 @@ from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import ArtifactDescriptor, GateResult
 from elspeth.contracts.routing import RouteDestination, RoutingAction
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.config import AggregationSettings, GateSettings, TriggerConfig
@@ -428,6 +429,9 @@ class _AggregationTransformDouble:
         self.name = name
         self.input_schema = _PermissiveSchema
         self.output_schema = _PermissiveSchema
+        # `BatchTransformProtocol` requires it; the flush postflight's ADR-050
+        # value check reads it. None declares no output contract to enforce.
+        self._output_schema_config: SchemaConfig | None = None
         self.process = _CallRecorder()
 
     def schema_required_input_fields(self) -> frozenset[str]:
@@ -4169,6 +4173,7 @@ class TestAggregationExecutor:
             name = "capturing_agg"
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
+            _output_schema_config: SchemaConfig | None = None
 
             def schema_required_input_fields(self) -> frozenset[str]:
                 return frozenset()
@@ -4315,6 +4320,7 @@ class TestAggregationExecutor:
             name = "capturing_agg"
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
+            _output_schema_config: SchemaConfig | None = None
 
             def schema_required_input_fields(self) -> frozenset[str]:
                 return frozenset()

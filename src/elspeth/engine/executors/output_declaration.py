@@ -15,14 +15,21 @@ could conflict at the node-contract merge. That is owned-code drift (a plugin
 not declaring what it creates), not a row fault: Tier 1, the run ends after
 the token's terminal is recorded.
 
-The batch-flush site is deliberately NOT claimed: aggregation and collector
-outputs do not carry the stamp today (they record no node output contract —
-ADR-050 §Consequences), so the check would be a statement about a seam the
-declaration does not yet reach.
+The batch-flush site is deliberately NOT claimed. Aggregation and collector
+outputs carry the stamp (``BaseTransform._batch_output_contract`` and the
+passthrough plugins' stamp call), but the batch-flush dispatch hands a
+contract only the INTERSECTION of the buffered rows' input fields (ADR-009),
+so a passthrough-shaped batch output carrying an input field that only some
+buffered rows had would read as an undeclared created key; and the collector
+flush dispatches no declaration contracts at all. Batch-aware completeness is
+enforced by the registry gate instead
+(``tests/invariants/test_output_declaration_completeness.py``, static and
+probe emissions, every batch-aware transform included).
 
 The companion VALUE check — a declared concrete type against the emitted
-value — is Tier 2 (routed), so it lives in ``TransformExecutor`` rather than
-in this dispatcher, whose catch scope is the Tier-1 declaration family.
+value — is Tier 2 (routed), so it lives in ``engine/executors/declared_output_types``
+(called by ``TransformExecutor`` and by the shared batch postflight) rather
+than in this dispatcher, whose catch scope is the Tier-1 declaration family.
 """
 
 from __future__ import annotations

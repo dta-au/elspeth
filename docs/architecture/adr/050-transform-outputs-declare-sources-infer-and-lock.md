@@ -89,7 +89,12 @@ rows meet.**
    `source="declared"` contract. A created field that bypassed the stamp is
    owned-code drift, not a row fault: the token's terminal is recorded and
    `UndeclaredOutputFieldsViolation` ends the run. The batch-flush site is
-   deliberately not claimed (see Consequences).
+   deliberately not claimed: that dispatch hands a contract only the
+   INTERSECTION of the buffered rows' input fields (ADR-009), so a
+   passthrough-shaped batch output carrying an input field that only some
+   buffered rows had would read as an undeclared created key; and the
+   collector flush dispatches no declaration contracts. Batch-aware
+   completeness is enforced by the registry gate (Decision 11).
 5. **Values, Tier 2.** After the dispatched contracts, `TransformExecutor`
    validates every declared concrete-typed field whose value the transform
    PRODUCED — a field absent from the input row, or an input field whose
@@ -110,7 +115,17 @@ rows meet.**
    twice. Per the 2026-09-25 ruling a plugin's own computed value breaking
    its own declared type is ROUTED, recorded as evidence with
    `authorship: computed`; the bit is what lets that tighten later without
-   rework.
+   rework. The check is ONE module (`engine/executors/declared_output_types`)
+   with two seams that differ only in which fields count as produced: the
+   per-row seam above, and the aggregation/collector flush postflight
+   (`batch_contract_validation.validate_success_outputs`), where the produced
+   fields are exactly the created names (`declared_output_fields` and
+   `created_output_fields()`) — a reductive output has no input row, and a
+   passthrough batch output's carried input fields were validated by the
+   buffer preflight — so authorship there is always `computed`. A violation
+   at the flush fails the whole batch through the aggregation's `on_error`,
+   or the collector group with a `collector_contract_violation` verdict,
+   exactly as every other Tier-2 violation of that postflight.
 6. **The node record never changes type.** `DataFlowRepository.update_node_output_contract`
    folds an emission with `SchemaContract.merge_for_node_evolution` (field
    union, `require_all=False` flags, a type conflict raises). Because every
@@ -141,17 +156,39 @@ rows meet.**
    names; the caller assigns the tier (a coalesce routes the row, the node
    writer re-raises Tier 1, the description join never raises it).
 10. **Declaration location is the runtime stamp.** The planner-visible
-    `_output_schema_config` projection is unchanged; promoting plugin types
-    into the flexible output schema is a follow-up behind the
-    composer/runtime agreement test.
+    `_output_schema_config` projection is unchanged in substance; promoting
+    plugin types into the flexible output schema is a follow-up behind the
+    composer/runtime agreement test. One attribute moved, measured by the
+    review: json_explode's flexible-mode builder reads `created_output_fields()`
+    for the created names the operator did not author, so its projected
+    `output_field` is `any` with `nullable=True` where it was
+    `nullable=False` (D4: `any` is nullable). No composer reader of the
+    projection consumes `nullable` (`web/composer/state.py`,
+    `tools/generation.py` read names and `field_type`), and the
+    composer/runtime agreement test is unchanged.
+11. **Batch-aware transforms declare too.** A reductive batch output (a
+    statistics row, a comparison, an assembled report) builds its contract
+    with `BaseTransform._batch_output_contract`, which puts every emitted key
+    through the same stamp; a passthrough-shaped batch output (outlier
+    annotations, replicas) calls the stamp on its merged contract. Keys a
+    batch plugin writes only sometimes (skip diagnostics such as
+    `skipped_missing`, `*_missing_indices`, `incomplete_pairs`) are not in
+    its guarantee surface, so it names them in `created_output_fields()` as
+    optional. The registry gate (`tests/invariants/test_output_declaration_completeness.py`)
+    runs every batch-aware transform through its probe and makes each
+    plugin with conditional keys write them. Aggregation nodes still record
+    no node output contract; the stamp describes their emitted rows to the
+    nodes downstream.
 
 ### What this is NOT
 
 - Not coercion. A value is written as computed; the declaration is checked
   against it, never applied to it.
 - Not a source change. `ContractBuilder` and the source seam are untouched.
-- Not an aggregation change. Batch and collector outputs record no node
-  output contract today and do not carry the stamp.
+- Not an aggregation-recording change. Aggregation and collector nodes
+  still record no node output contract; their emitted rows carry the stamp
+  and their declared concrete types are value-checked at the flush
+  (Decisions 5 and 11).
 
 ## Consequences
 
@@ -168,9 +205,11 @@ rows meet.**
   orders and a four-worker pool record the same bytes).
 - A declared type is now a promise the engine keeps, at the node that made it.
 - The plugin-drift masking the panel named is closable: a plugin that
-  declares a concrete type gets it enforced. Until the 22-transform sweep
-  (unit S1b) lands, a plugin-computed field declared `any` is carried, not
-  caught — the named residual.
+  declares a concrete type gets it enforced, per row and at a batch flush.
+  Until the concrete-type sweep over the plugins (unit S1b) lands, a
+  plugin-computed field declared `any` is carried, not caught — the named
+  residual. The one concrete batch type today is batch_replicate's
+  `copy_index: int`, typed by construction before this change.
 
 ### Negative
 
@@ -178,14 +217,24 @@ rows meet.**
   (`source: declared`, `any` nullable), and the LLM prompt `contract_hash`
   with it. Prior-run comparisons across the change differ.
 - A pre-change run at the same Landscape epoch that is resumed after the
-  change meets `T inferred` in its node record and `object declared` in the
-  resumed emission: `merge_for_node_evolution` raises and the resume ends
-  with `FrameworkBugError` at the first stamped node's evolution. There is
-  no refusal and no compatibility shim by design (the pre-1.0 "no old rows"
-  posture): `implementation_compatibility` compares per-node
+  change is neither refused up front nor uniformly aborted. The node writer
+  (`merge_for_node_evolution`) raises on a TYPE difference only, so it
+  depends on the field. Where the declaration changed the recorded type — a
+  created field the pre-change inference typed `T` that is now `any`
+  (`object`), the case for every observed-mode created field — the resume
+  ends with `FrameworkBugError` at that node's evolution, before any token
+  reaches a sink. Where the declared type equals the recorded inferred type
+  (json_explode's `item_index: int`, a flexible-declared field, a
+  pass-through) the emission folds without error and the record's `source`
+  flips `inferred` → `declared` in place (the merge keeps `declared` when any
+  carrier declares). That flip is a change to a recorded contract across a
+  resume, and it is accepted rather than engineered around: there is no
+  refusal and no compatibility shim by design (the pre-1.0 "no old rows"
+  posture), `implementation_compatibility` compares per-node
   `plugin_version` / `determinism` / `source_file_hash`, none of which a
-  base-class change moves. Landscape epoch 45 is undeployed, so no deployed
-  database holds such a run.
+  base-class change moves, and Landscape epoch 45 is undeployed, so no
+  deployed database holds such a run. Both arms are pinned in
+  `tests/unit/core/landscape/test_graph_recording.py::TestResumeAcrossTheDeclarationChange`.
 - The stamp keeps the emitted `original_name` where it used to overwrite it
   with the normalized name; a renamed declared field's recorded lineage
   changes accordingly (deliberate, measured: no corpus projection moved).
@@ -245,7 +294,10 @@ The panel's TD/TS/SA position. Deferred by ruling: routed as a PCV with the
   (D5/D6 through the Orchestrator), `tests/unit/plugins/infrastructure/test_output_declaration_stamp.py`
   (precedence, nullable, lineage, carried, dynamic, plugin hooks),
   `tests/invariants/test_output_declaration_completeness.py` (the roster
-  gate with controls), `tests/property/contracts/test_schema_contract_properties.py::TestJ1LatticeLaws`,
+  gate with controls, batch-aware transforms and their conditional keys
+  included), `tests/integration/pipeline/test_output_declaration_batch_seams.py`
+  (the value check at the aggregation flush, the collector flush and a
+  passthrough batch), `tests/property/contracts/test_schema_contract_properties.py::TestJ1LatticeLaws`,
   `tests/unit/core/landscape/test_graph_recording.py` (the node writer
   raises `FrameworkBugError`), `tests/testcontainer/core/test_output_contract_concurrency_postgres.py`
   (the PostgreSQL twin under the row lock).

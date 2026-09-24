@@ -68,10 +68,14 @@ def test_batch_stats_returns_contract_in_transform_mode():
         f"Contract should include all output fields. Expected {expected_fields}, got {contract_field_names}"
     )
 
-    # Verify all fields are marked as inferred (OBSERVED mode pattern)
-    for field in result.row.contract.fields:
-        assert field.source == "inferred", f"Field {field.normalized_name} should be inferred"
-        assert field.python_type is object, f"Field {field.normalized_name} should have object type"
+    # Every created field carries the declaration stamp (ADR-050), never a
+    # type inferred from this batch's values: the plugin declares none of
+    # these concretely, so each is ``any`` (object, nullable) and required as
+    # a guaranteed output.
+    declared = {
+        field.normalized_name: (field.source, field.python_type, field.nullable, field.required) for field in result.row.contract.fields
+    }
+    assert declared == dict.fromkeys(expected_fields, ("declared", object, True, True))
 
 
 def test_batch_stats_contract_empty_batch():

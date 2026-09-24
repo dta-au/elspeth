@@ -69,6 +69,11 @@ class _FakeBatchTransform:
         self.input_schema: type[PluginSchema] = input_schema
         self.output_schema: type[PluginSchema] = _StrictItemSchema
         self._required = required
+        # Declares no output contract, so the ADR-050 value check
+        # (`verify_created_output_types`) has nothing to enforce here; the
+        # declared-type route at this seam is pinned below with a real
+        # batch-aware BaseTransform.
+        self._output_schema_config = None
 
     def schema_required_input_fields(self) -> frozenset[str]:
         return self._required

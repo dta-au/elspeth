@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
@@ -914,15 +914,21 @@ class BaseTransform(ABC):
         with ``field_type="any"`` is an explicit "this plugin cannot know the
         type" (value_transform's expression targets); a concrete type here is
         enforced on every emitted value by the engine
-        (``TransformExecutor._verify_success_emissions``), so declare one only
-        for a field whose type the plugin's own code fixes.
+        (``engine/executors/declared_output_types``: the per-row seam and the
+        aggregation/collector flush postflight), so declare one only for a
+        field whose type the plugin's own code fixes.
 
         This is a RUNTIME declaration read by ``_apply_declared_output_field_contracts``.
-        It is deliberately not folded into ``_output_schema_config``: that
+        The base class does not fold it into ``_output_schema_config``: that
         config is the planner-visible projection, and an observed
         ``SchemaConfig`` cannot carry field definitions at all. Promoting these
         types into the projection is a separate decision behind the
-        composer/runtime agreement test.
+        composer/runtime agreement test. One builder reads the hook for the
+        names the operator did not author: json_explode's flexible-mode
+        builder projects ``output_field`` (``any``, nullable) and
+        ``item_index`` (``int``) from it, so that projection now records
+        ``any`` as nullable (ADR-050 §Decision 10); no composer reader
+        consumes ``nullable``.
 
         Names only are still declared through ``declared_output_fields`` (the
         ADR-011 guarantee surface); a name in both is declared once, here.
@@ -1089,6 +1095,42 @@ class BaseTransform(ABC):
             fields=tuple(fields),
             locked=contract.locked,
         )
+
+    def _batch_output_contract(self, emitted_keys: Iterable[str]) -> SchemaContract:
+        """The contract of the rows a batch transform COMPUTES from its buffered input (ADR-050).
+
+        A reductive batch output — a statistics row, a comparison, an
+        assembled report — carries no input row's contract: every key is
+        created by the plugin. Each key enters as an ``any``/``inferred``
+        placeholder and the ONE stamp (``_apply_declared_output_field_contracts``)
+        rewrites every declared one to the type the plugin fixes in
+        ``created_output_fields()`` (``any`` for a value it carries from the
+        data), ``source="declared"``, required when guaranteed. The batch
+        postflight (``batch_contract_validation.validate_success_outputs``)
+        then checks those declared types against the emitted values, so a
+        plugin computing the wrong type for its own statistic fails the batch
+        value-free instead of recording a false contract.
+        ``_align_output_contract`` sets the declared output mode and lock.
+        Keys are deduplicated in first-seen order.
+
+        A passthrough batch output (rows the plugin annotates or replicates)
+        merges its input contracts instead and stamps the created fields with
+        the same call; see ``batch_outlier_annotator`` and ``batch_replicate``.
+        """
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        fields = tuple(
+            FieldContract(
+                normalized_name=key,
+                original_name=key,
+                python_type=object,
+                required=False,
+                source="inferred",
+            )
+            for key in dict.fromkeys(emitted_keys)
+        )
+        contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(contract))
 
     def _align_output_row_contract(self, row: PipelineRow) -> PipelineRow:
         """Return ``row`` with contract semantics aligned to this transform."""

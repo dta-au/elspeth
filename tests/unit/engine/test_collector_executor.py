@@ -31,6 +31,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CollectorSettings, ScopeSettings
@@ -117,6 +118,10 @@ class _FakeCollectorTransform:
     # The declared presence requirement the flush preflight enforces (R1); a
     # test that wants the presence check to BITE sets a field name here.
     declared_required_columns: frozenset[str] = frozenset()
+    # Also REQUIRED by `BatchTransformProtocol`: the flush postflight's ADR-050
+    # value check reads it. None declares no output contract, so that check has
+    # nothing to enforce on this stand-in.
+    _output_schema_config: SchemaConfig | None = None
 
     def schema_required_input_fields(self) -> frozenset[str]:
         return self.declared_required_columns

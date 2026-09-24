@@ -12,7 +12,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -104,7 +104,7 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:871caf28db77c49e"
+    source_file_hash: str | None = "sha256:f5c5f15f82de8963"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -309,22 +309,6 @@ class BatchThresholdSummary(BaseTransform):
             )
         return results
 
-    def _output_contract_for(self, results: list[BatchThresholdSummaryRow]) -> SchemaContract:
-        """Build one shared output contract for threshold summary rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -352,7 +336,7 @@ class BatchThresholdSummary(BaseTransform):
             missing_count=len(missing_indices),
             non_finite_count=len(non_finite_indices),
         )
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

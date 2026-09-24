@@ -2199,7 +2199,7 @@ class TestComposerRuntimeAgreement:
             aggregate, error = transform._aggregate_group(grouped, group_value)
             assert error is None
             results.append(aggregate)
-        emitted_contract = transform._output_contract_for(results)
+        emitted_contract = transform._batch_output_contract(key for result in results for key in result)
         emitted_rows = [PipelineRow(r, emitted_contract) for r in results]
 
         # Narrow ``transform._output_schema_config`` (typed as

@@ -17,8 +17,8 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -109,7 +109,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f81ed534b401e442"
+    source_file_hash: str | None = "sha256:a464386a4739865b"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -207,6 +207,15 @@ class BatchDistributionProfile(BaseTransform):
             required_fields=None,
             audit_fields=None,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The conditional index lists, declared ``any`` and optional (ADR-050).
+
+        Written only when a row was skipped, so they are not in
+        ``declared_output_fields`` (the guarantee surface); naming them here
+        puts them through the declaration stamp with the guaranteed profile.
+        """
+        return tuple(FieldDefinition(name, "any", required=False) for name in sorted(_CONDITIONAL_PROFILE_FIELDS))
 
     @classmethod
     def get_agent_assistance(
@@ -465,22 +474,6 @@ class BatchDistributionProfile(BaseTransform):
 
         return result, None
 
-    def _output_contract_for(self, results: list[BatchDistributionProfileRow]) -> SchemaContract:
-        """Build one shared output contract for profile result rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -514,7 +507,7 @@ class BatchDistributionProfile(BaseTransform):
                 return error
             results.append(profile)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 
