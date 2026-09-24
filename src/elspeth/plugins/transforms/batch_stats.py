@@ -8,7 +8,6 @@ will buffer rows and call process() with a list when the trigger fires.
 """
 
 import math
-from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,14 +22,10 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
 
 type BatchStatsAggregateRow = dict[str, object]
-
-# Row types a group_by value may carry: the scalar pipeline-row types plus
-# Decimal, whose non-finite form `_is_non_finite_group_key` already rejects.
-_SCALAR_GROUP_KEY_TYPES: tuple[type, ...] = (str, int, float, bool, type(None), Decimal, datetime)
 
 
 class BatchStatsConfig(TransformDataConfig):
@@ -131,7 +126,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8bc2fe4afa94f1eb"
+    source_file_hash: str | None = "sha256:a1c9994dd6e3537a"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -355,13 +350,7 @@ class BatchStats(BaseTransform):
             # WHOLE batch with a recorded reason, the same disposition as a
             # wrong-typed value_field (elspeth-d5034647f0); it is never bucketed
             # by equality or stringified into a key. None stays a legal key.
-            if type(group_value) not in _SCALAR_GROUP_KEY_TYPES:
-                raise BatchRowTypeError(
-                    field=self._group_by,
-                    row_index=row_index,
-                    expected="a scalar group key",
-                    found=type(group_value).__name__,
-                )
+            require_scalar_group_key(group_value, field=self._group_by, row_index=row_index)
             group_key = scalar_bucket_key(group_value)
             grouped = groups.get(group_key)
             if grouped is None:

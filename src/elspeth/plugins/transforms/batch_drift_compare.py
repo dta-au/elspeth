@@ -19,7 +19,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
     same_scalar_bucket_value,
@@ -144,7 +144,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8bfd699a81524059"
+    source_file_hash: str | None = "sha256:feb868b1b6bcaab5"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -277,6 +277,7 @@ class BatchDriftCompare(BaseTransform):
         cohorts: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             cohort_value = row[self._cohort_field]
+            require_scalar_group_key(cohort_value, field=self._cohort_field, row_index=row_index)
             for existing_cohort, cohort_rows in cohorts:
                 if same_scalar_bucket_value(cohort_value, existing_cohort):
                     cohort_rows.append((row_index, row))
@@ -571,8 +572,8 @@ class BatchDriftCompare(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
-        grouped = self._collect_cohorts(rows)
         try:
+            grouped = self._collect_cohorts(rows)
             cohort_values = [(cohort, self._values_for(cohort, cohort_rows)) for cohort, cohort_rows in grouped]
         except BatchRowTypeError as exc:
             # A wrong-typed value fails the WHOLE batch with a recorded,

@@ -25,7 +25,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchExperimentComparisonRow = dict[str, object]
@@ -124,7 +124,7 @@ class BatchExperimentCompare(BaseTransform):
     name = "batch_experiment_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3fb49884d7b68b81"
+    source_file_hash: str | None = "sha256:10a9b27e5a0f3998"
     config_model = BatchExperimentCompareConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -270,6 +270,7 @@ class BatchExperimentCompare(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             variant_value = row[self._variant_field]
+            require_scalar_group_key(variant_value, field=self._variant_field, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(variant_value, existing_value):
                     grouped_rows.append((row_index, row))
@@ -475,8 +476,8 @@ class BatchExperimentCompare(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
-        grouped = self._group_rows(rows)
         try:
+            grouped = self._group_rows(rows)
             stats_by_variant: list[_VariantStats] = [
                 self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped
             ]

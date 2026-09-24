@@ -19,7 +19,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import (
     append_unique_bucket_value,
     same_scalar_bucket_value,
@@ -120,7 +120,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3a13cc2a136f6632"
+    source_file_hash: str | None = "sha256:b9ef64ece189c9eb"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -230,6 +230,7 @@ class BatchPairedPreference(BaseTransform):
     def _score_entry_for(self, row: PipelineRow, *, row_index: int) -> _ScoreEntry:
         raw_score = row[self._score_field]
         variant = row[self._variant_field]
+        require_scalar_group_key(variant, field=self._variant_field, row_index=row_index)
 
         if raw_score is None:
             return _ScoreEntry(variant=variant, row_index=row_index, score=None, missing=True)
@@ -285,6 +286,7 @@ class BatchPairedPreference(BaseTransform):
 
         for row_index, row in enumerate(rows):
             pair_id = row[self._pair_field]
+            require_scalar_group_key(pair_id, field=self._pair_field, row_index=row_index)
             entry = self._score_entry_for(row, row_index=row_index)
 
             append_unique_bucket_value(variants, entry.variant)

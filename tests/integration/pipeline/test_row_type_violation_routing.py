@@ -1689,6 +1689,40 @@ _BATCH_PLUGIN_CASES = [
 ]
 
 
+_BATCH_KEY_CASES = [
+    ("batch_distribution_profile", {"value_field": "score", "group_by": "key"}, "key"),
+    ("batch_top_k", {"field": "score", "group_by": "key", "k": 2}, "key"),
+    ("batch_drift_compare", {"value_field": "score", "cohort_field": "key", "value_type": "numeric"}, "key"),
+    ("batch_drift_compare", {"value_field": "score", "cohort_field": "key", "value_type": "categorical"}, "key"),
+    ("batch_effect_size", {"score_field": "score", "variant_field": "key"}, "key"),
+    ("batch_experiment_compare", {"score_field": "score", "variant_field": "key"}, "key"),
+    ("batch_paired_preference", {"score_field": "score", "variant_field": "key", "pair_field": "pair"}, "key"),
+    ("batch_paired_preference", {"score_field": "score", "variant_field": "key", "pair_field": "pair"}, "pair"),
+]
+
+_BATCH_PLUGIN_CASES.extend(
+    pytest.param(
+        plugin,
+        "json",
+        [
+            {"key": "baseline", "pair": "p1", "score": 1, field: bad_key},
+            {"key": "candidate", "pair": "p1", "score": 2},
+            {"key": "baseline", "pair": "p2", "score": 3},
+            {"key": "candidate", "pair": "p2", "score": 4},
+        ],
+        options,
+        "SENTINEL-container-key-6c93",
+        _wrong_type(field, "a scalar group key", found, 0),
+        id=f"{plugin}-{case_index}-{field}-{found}-key",
+    )
+    for case_index, (plugin, options, field) in enumerate(_BATCH_KEY_CASES)
+    for bad_key, found in [
+        (["SENTINEL-container-key-6c93"], "tuple"),
+        ({"private": "SENTINEL-container-key-6c93"}, "mappingproxy"),
+    ]
+)
+
+
 def _run_batch_plugin_pipeline(
     tmp_path: Any, *, plugin: str, source: str, rows: list[dict[str, Any]], options: dict[str, Any]
 ) -> tuple[Any, Any, Any, list[dict[str, Any]], list[dict[str, Any]]]:
