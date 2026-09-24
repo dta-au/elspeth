@@ -37,7 +37,8 @@ Three work items, in this order:
    alphabetical order. Fix it so the transcript keeps the model's key order.
 3. **Defect B (T3 to T6).** The composer authority hashes are blind to the order of coalesce mapping-form branches and
    of the multi-source `sources` map, and so is the advisor sign-off fingerprint. Both maps are order-semantic at
-   runtime. Bind their order the way the row_union precedent does. Restore is narrowed to check only the
+   runtime. Bind their order the way the row_union precedent does. Two plugin-owned option maps were also found to be
+   order-semantic; they are recorded for a scope ruling, not fixed (D13, §1.4 item 11). Restore is narrowed to check only the
    projection's own structure, which also fixes a base defect in the row_union arm (D11). This changes persisted hash
    preimages that are re-verified with a hard failure (every stored composition content hash moves), so it ends with
    a session schema epoch bump, as the last commit.
@@ -81,9 +82,10 @@ Three work items, in this order:
 | D7 | **`completion_gate_fingerprint` is routed through the projection (T5).** | It is the same class of gap: the advisor's sign-off is carried forward onto a graph whose merge order or ingest order changed (`completion_gates.py:166`, `advisor_block_covers_unchanged_graph` at `:383`). The epoch cut in T6 is being paid anyway, so the fix is almost free. Leaving it out would be the kind of debt John has ruled against. |
 | D8 | **The epoch bump is 66 → 67. It is the last commit (T6) and touches 10 files (§5).** | Stored hashes are recomputed on read and fail hard with `AuditIntegrityError` (§5.1). John's no-tech-debt rule forbids dual acceptance or a legacy hash path. |
 | D9 | **Appendix A joins on `(session_id, call_id)`**, not on `parent_assistant_id`. | The brief names the session-scoped join. It gives the same counts as the parent join on all 13 DB copies (M, `understand-docs.md` §1.2). The parent join is mentioned in the appendix as the tighter alternative. |
-| D10 | **The status line in T1 cites the S1 gate record as it stands, with the measured attribution of the two non-drift reds.** At `d5f8c5aac` the result was FAIL, with 10 failures and `frozen=yes`. | All 10 red ids also fail at `c4c52c110` (M, §2). The tree immediately before S1 is `c4c52c110^1` = **`e69498f6c`**, not the S0 merge `85ebf2739`: `34f0fed73`, the S1 branch's root commit, has parent `e69498f6c`, and `git merge-base c4c52c110^1 c4c52c110^2` is `e69498f6c`. Measured on `git archive` exports with `elspeth.__file__` inside each export: `test_composer_bedrock` **passes at `85ebf2739` and fails at `e69498f6c`** with the same `_MalformedLLMResponseError`, so it was introduced by `e69498f6c` ("fix(composer): reject malformed advisor checkpoint envelopes"), a direct `release/0.8.1` commit that is **not part of S1**. `p5_budget_exhaustion` already fails at `85ebf2739`, so it predates S0 and S1 (M, `$L/rev-85ebf2739.log`, `$L/rev-e69498f6c.log`, `$L/critique0/pre-s1-*.log`, `$L/critique-1/crit1-reds-*.log`). The other 8 are epoch and line-pin drift. No red in the set is attributable to S1. |
+| D10 | **The status line in T1 cites the S1 gate record as it stands, with the measured attribution of the two non-drift reds.** At `d5f8c5aac` the result was FAIL, with 10 failures and `frozen=yes`. | All 10 red ids also fail at `c4c52c110` (M, §2). The tree immediately before S1 is `c4c52c110^1` = **`e69498f6c`**, not the S0 merge `85ebf2739`: `34f0fed73`, the S1 branch's root commit, has parent `e69498f6c`, and `git merge-base c4c52c110^1 c4c52c110^2` is `e69498f6c`. Measured on `git archive` exports with `elspeth.__file__` inside each export: `test_composer_bedrock` **passes at `85ebf2739` and fails at `e69498f6c`** with the same `_MalformedLLMResponseError`, so it was introduced by `e69498f6c` ("fix(composer): reject malformed advisor checkpoint envelopes"), a direct `release/0.8.1` commit that is **not part of S1**. `p5_budget_exhaustion` already fails at the S0 merge `85ebf2739`, so it predates S1. Whether it predates S0 was not measured: `85ebf2739` is the merge itself (parents `780ef0f56` and `35d6bad86`), and no run was made at its pre-S0 parent `780ef0f56` (M, `$L/rev-85ebf2739.log`, `$L/rev-e69498f6c.log`, `$L/critique0/pre-s1-*.log`, `$L/critique-1/crit1-reds-*.log`). The other 8 are epoch and line-pin drift. No red in the set is attributable to S1. |
 | D11 | **Restore checks only the projection's own structure. The value position accepts any JSON value, for row_union, coalesce and `sources` alike.** Restore still rejects: a plain map where a projection must be, a missing or foreign schema tag, extra envelope keys, a non-list `items`, an item that is not a 2-list, a non-`str` key, and a duplicate key. The row_union error strings stay byte-identical. | The dispatch audit is opened before any schema gate, and a malformed `set_pipeline` is still projected (`tool_batch.py:1120-1135`, `audit.py:639-640`). Persistence then restores it (`audit_storage.py:103`). Today the row_union arm's `type(item[1]) is not str` check turns an ordinary planner argument error into `AuditIntegrityError` at persistence: M, `$L/critique0/probe_malformed_e2e.log` through the real compose loop ("row_union_int_connection: status=arg_error ... AuditIntegrityError"), and `$L/critique0/probe_malformed_roundtrip.log` for `{'a': 1}` and `{'a': None}`. Extending that check to coalesce and `sources` would spread the defect, and it breaks R2 condition 1 (lossless), because restore would reject its own projection's output. The value check was never what guards integrity: both restore callers compare `primitive_canonical_json(restored)` with the stored generic `arguments_canonical` (`pipeline_commit.py:112`, `audit_storage.py:106`), which catches any value tamper. No preimage changes, because `project` is untouched. T3 therefore fixes the row_union arm as well. |
 | D12 | **The frontend content-equality check is recorded, not changed** (§1.4 item 10). | It is a UI freshness heuristic, not a hash consumer; the server re-runs preflight at execute. It already disagrees with the backend on row_union order since `49825dd86`. Changing it adds a frontend rebuild and a surface the brief does not name. The lead or John decides whether to widen scope. |
+| D13 | **Plugin-owned option maps are not projected. This plan binds the order of the topology maps the composer owns (`branches`, `sources`) and no others; the order-semantic option maps Codex found are recorded (§1.4 item 11) for John's scope ruling.** | The brief asks for "any other order-semantic map found", and two are found: an LLM transform's `options.queries` (`plugins/transforms/llm/multi_query.py:306-307` builds the specs in map order; `transform.py:915-945` runs them in sequence and stops at the first non-retryable failure, recording `discarded_successful_queries`) and `field_mapper`'s `options.mapping` (`field_mapper.py:678-730` writes output fields in map order, and an observed-schema CSV sink takes its columns from `list(row.keys())`, `csv_sink.py:534-536`). A reorder of either leaves `composer_authority_hash` equal (M, `$L/codex/recheck_f1_f2.log`, with the row_union reorder as the known positive). Binding them is not a projection of the same kind: the composer cannot tell an order-semantic option map from an order-free one without a per-plugin declaration, `project_composer_authority_payload` deliberately inspects only top-level `nodes` so that it never assigns topology meaning to plugin-owned nested dictionaries (its docstring, `authority_hashing.py:25-27`), and projecting every option dictionary would make every hash sensitive to key order the planner happens to emit in maps where order means nothing. It needs a plugin-contract design (which option fields declare an ordered map), which is out of this plan's reach; Codex's own fix offers exactly this choice. The handover raises it with §1.4 item 1, because the durable execution envelope alphabetises these maps too. T2 already keeps their order in the transcript. |
 
 ### 1.4 Out of scope: recorded here, not fixed
 
@@ -125,7 +127,9 @@ The lead files them.**
    (`understand-docs.md` §3, F1).
 7. **The S-gate `(loc, code)` pairs are persisted nowhere**, so the option-tool split that T1 defines cannot yet be
    measured. Persisting them is redaction-safe, but it touches S1 ruling 6 ("RejectionRecord untouched"). The lead
-   decides.
+   decides. Persisting the pairs alone still cannot separate options sent as a string from other wrong types
+   (`invalid_type` covers every JSON-schema `type` failure); that needs the sent JSON type as well, which is also
+   value-free.
 8. **Six epoch doc, website and receipt pins already fail on base (65 against 66).** The brief forbids editing them.
    After T6 they will expect 67; their count does not change.
 9. **Planner-turn cost has no adopted definition.** `understand-docs.md` §3 proposes one, for John to accept.
@@ -136,6 +140,13 @@ The lead files them.**
     as a content change; the frontend keeps the old verdict on screen. That is already true of row_union order today.
     The run gate is unaffected (the server re-runs preflight at execute). Fixing it is a small frontend change plus a
     rebuild.
+11. **Order-semantic plugin option maps stay unbound by the composer hashes (D13; needs John's scope ruling).**
+    An LLM transform's `options.queries` sets the order in which queries run and which provider calls happen before a
+    non-retryable failure; `field_mapper`'s `options.mapping` sets output field order, which an observed-schema CSV
+    sink writes as its column order. A reorder of either leaves every composer authority hash equal (M,
+    `$L/codex/recheck_f1_f2.log`). Binding them needs a plugin-declared ordered-map contract, not another composer
+    projection. Other plugins were not surveyed for the same property. The brief asked for "any other order-semantic
+    map found", so the handover states plainly that these two were found and not fixed.
 
 ### 1.5 The ordering rule (hard)
 
@@ -181,7 +192,7 @@ cd $W && $PY -m pytest -n 0 -p no:cacheprovider -o "pythonpath=$W/src $W/elspeth
 | Epoch docs that pass on base and must move with the constant | `docs/runbooks/staging-session-db-recreation.md` and `CHANGELOG.md:9-10`, both pinned by `tests/unit/docs/test_staging_session_recreation_policy.py` | R, and M in `understand-hash-epochpins.log` |
 | Appendix A fork fix | Corrected total = tool rows in all 13 DB copies. The old join gives 26 against 14 in db10. Per-(tool, outcome) totals equal `census.py`: 496 = 496 | `docs_appendix_a_corrected_dbs.py` → `docs-appendix-a-corrected-dbs.log` (M) |
 | T12 fixture on the corrected SQL | 8 groups unchanged, both negative controls unchanged. Fork phase: corrected n=2, old n=4, and removing the session condition restores the over-count | `docs_t12_corrected_test.py` → `docs-t12-corrected.log` (M, 1 passed) |
-| Options-as-string signature | `schema_shape`, with a violation whose last loc segment is `options` or `patch` and whose code is `invalid_type`. Structural control: `on_success: 5` gives `('on_success',)` | `docs-loc-probe.log` (M) |
+| Wrong-type options signature | `schema_shape`, with a violation whose last loc segment is `options` or `patch` and whose code is `invalid_type`. Structural control: `on_success: 5` gives `('on_success',)`. **It does not identify a string**: an int, a list and `null` in `options` give the same pair, because every JSON-schema `type` failure maps to `invalid_type` (`_dispatch.py:560-561`) | `docs-loc-probe.log`, `codex/recheck_f3.log` (M) |
 | No test reads the master plan | 8 test files cite it, all in docstrings. The doc-walker excludes `docs/plans/` | R and M, `understand-docs.md` §2 |
 
 ---
@@ -288,7 +299,8 @@ cd $W && $PY -m pytest -n 0 -p no:cacheprovider -o "pythonpath=$W/src $W/elspeth
      is inside the `set_pipeline` required-control finalization (`:565-590`). If the walk finds another tool with a
      top-level `sources` property, **stop and report**: a future caller could then give that field topology meaning.
 6. **Attribution of the two non-drift base reds: answered, no run needed** (§2, D10). `test_composer_bedrock` was
-   introduced by `e69498f6c`, outside S1; `p5_budget_exhaustion` predates S0. The implementer may re-confirm with a
+   introduced by `e69498f6c`, outside S1; `p5_budget_exhaustion` already fails at the S0 merge `85ebf2739`, so it
+   predates S1 (whether it predates S0 is unmeasured; the pre-S0 parent is `780ef0f56`). The implementer may re-confirm with a
    `git archive c4c52c110^1` export (check `elspeth.__file__`), logging to `$L/t0-pre-s1-reds.log`. The comparison
    point is **`c4c52c110^1` (`e69498f6c`)**, never `85ebf2739`. E1 records the answer (T1).
 7. **Finalization-path fixture for T2.** Find a compose-loop test that drives `finalization.changed` at
@@ -305,14 +317,14 @@ with the changes below. Re-anchor every OLD string first, because the line numbe
 
 | Edit | Where | Change from the draft |
 |---|---|---|
-| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. **Replace "one commit per task on `85ebf2739`"**: the S1 branch is rooted on `e69498f6c` (= `c4c52c110^1`, the parent of S1's root commit `34f0fed73`), which is the S0 merge `85ebf2739` plus `e69498f6c` "fix(composer): reject malformed advisor checkpoint envelopes". Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. State the measured attribution (D10): `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`, so it came in with `e69498f6c`, not with S1; `p5_budget_exhaustion` already fails at `85ebf2739`, so it predates S0 and S1; none of the 10 is attributable to S1. Do not write that S1 introduced any of them. Still owed: the CHANGELOG line and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
+| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. **Replace "one commit per task on `85ebf2739`"**: the S1 branch is rooted on `e69498f6c` (= `c4c52c110^1`, the parent of S1's root commit `34f0fed73`), which is the S0 merge `85ebf2739` plus `e69498f6c` "fix(composer): reject malformed advisor checkpoint envelopes". Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. State the measured attribution (D10): `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`, so it came in with `e69498f6c`, not with S1; `p5_budget_exhaustion` already fails at the S0 merge `85ebf2739`, so it predates S1 (do not write that it predates S0: that was not measured); none of the 10 is attributable to S1. Do not write that S1 introduced any of them. Still owed: the CHANGELOG line and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
 | E2 | new opening paragraph of §1 | as drafted |
 | E3 | §1.1 "delivered as" | as drafted |
 | E4 | §1.2 bullets | as drafted |
 | E5 | §2.3 last row, replaced by three rows | As drafted, with one citation fix: write "`persist_compose_turn` (`sessions/service.py:6650`; the `record_composition_rejection` call is at `:6862`)", not `:6862` alone. This is the correction to "shape and value cannot be told apart", and the citation of `composition_rejection_events` as the unredacted store |
 | E6, E7 | S2 and S3 headings, openings and closing line | as drafted (withdrawn, with the reopen trigger) |
 | E8 | §5.3 table rows 1 and 3 | as drafted |
-| E9 | §5.3 sample-size paragraph, plus a new **§5.4 Option-tool split** | As drafted. It defines the options-as-string signature, other-field shape, inside-options content and other rules, and says plainly that the first two classes are not measurable until the `(loc, code)` pairs are persisted (§1.4 item 7). |
+| E9 | §5.3 sample-size paragraph, plus a new **§5.4 Option-tool split** | As drafted, with one correction (Codex finding 3). The first class is renamed **"Wrong-type options/patch"**, not "Options sent as a string": the S gate maps every JSON-schema `type` failure to `invalid_type` (`web/composer/tools/_dispatch.py:560-561`), so a string, an int, a list and `null` in `options` all give the same `(('options',), 'invalid_type')` pair (M, `$L/codex/recheck_f3.log`). Say that the `a5d9e5414` options-as-string signature is a subset of this class, and that telling it apart needs a value-free observed-type discriminator (the JSON type that was sent) persisted beside the `(loc, code)` pairs; the pairs alone cannot. The other classes (other-field shape, inside-options content, other rule) are as drafted. Say plainly that the first two classes are not measurable until the `(loc, code)` pairs are persisted (§1.4 item 7). |
 | E10 | §6.1 risk 1 | as drafted |
 | E11 | §5.2 `wire_decode` row | as drafted |
 | E12 | §6.3 items 1-2 | as drafted (R1 ruled no with the trigger; R2 ruled yes with the five conditions) |
@@ -415,7 +427,7 @@ full suite covers it.
 | `service.py:5934` | the reply-only turn quoting historical messages | leave. It sorts the message envelope only, and `arguments` is an opaque string that inherits the fix |
 | `turn_audit.py:237` | persisted P4 assistant rows | already keeps order |
 | `audit.py:637-640`, `audit_storage.py:204`, `service.py:2779-2797` | RFC 8785 `arguments_canonical`/hash, redacted canonical | sorted by design. Order is bound by the authority projection (T3 to T5) |
-| `pipeline_planner.py:3870` | planner `current_state` | leave. Inert (§1.4 item 5) |
+| `pipeline_planner.py:3870` | planner `current_state` | leave. Inert on freeform only; **live on guided-full** (`composer/service.py:4428-4435` passes a non-empty state), deferred under the guided-removal ruling (D2, §1.4 item 5) |
 | `pipeline_planner.py:1937` | planner transcript | already keeps order: it replays `raw_arguments` |
 | `pipeline_planner.py:5068`, `discovery_cache.py:97` | dedupe and cache keys | sorted by design. Discovery tools carry no order-semantic maps |
 | `redaction.py:1400`, `wire_projection.py:305`, `prompts.py:668` | counts, schema text, diagnostics | not planner arguments |
@@ -436,6 +448,12 @@ full suite covers it.
 - **`project_composer_authority_payload`:** for each top-level `nodes` entry whose `node_type` is in the map and whose
   `branches` is a `dict`, replace `branches` with `{"schema": <that node type's tag>, "items": [[alias, connection], ...]}`.
   List branches pass through unchanged. Do not read `merge` or `policy` (D4).
+- **Guard the discriminant before the lookup, in both `project` and `restore`:** `type(node["node_type"]) is str`
+  first, then membership in `_ORDERED_BRANCH_SCHEMAS`. Projection runs on raw planner arguments before any schema
+  gate (`audit.py:639-640`), and today's `node["node_type"] != "row_union"` tolerates any type, but a mapping
+  lookup with a list or dict raises `TypeError: unhashable type` (M, `$L/codex/recheck_f1_f2.log`). Without the
+  guard, a planner `set_pipeline` with `node_type: []` would crash dispatch auditing instead of becoming an
+  auditable argument error (Codex finding 1). A non-`str` `node_type` passes through unprojected, as today.
 - **`restore_composer_authority_payload`:** for the same node types, a `dict` `branches` must be exactly the
   projection carrying **that node type's** tag. Each item is a 2-list whose first element is a `str` alias, with no
   duplicate alias. **The second element may be any JSON value (D11).** Anything else raises `ValueError`.
@@ -487,6 +505,7 @@ comparative (two states that differ only in order) and are unaffected by T4.
 | 11 | The runtime preflight cache key (`RuntimePreflightKey.state_content_hash`) differs for two states that differ only in coalesce order | equal (I, confirm in RED) |
 | 12 | **Base defect (D11):** restore accepts a non-`str` branch value (int, null, object) for row_union and for coalesce, and `restore(project(p)) == p` for it | row_union raises `ValueError` |
 | 13 | **Base defect (D11), end to end:** an argument-error `set_pipeline` whose row_union branch value is `1`, and one whose coalesce branch value is `null`, both go through `redacted_tool_invocation_content_and_envelope` without error, and `from_persisted_envelope` round-trips them. Lift `$L/critique0/test_probe_malformed_e2e.py` (real compose loop, run with `-p tests.unit.web.composer.conftest`) | the row_union case raises `AuditIntegrityError` (the coalesce case is green at base and must stay green) |
+| 14 | **Characterization, malformed discriminant (Codex finding 1):** a `set_pipeline` whose node has `node_type` `[]`, `{}` or `1` and a map `branches` goes through `project_composer_authority_payload`, `restore_composer_authority_payload(project(p))` and `begin_dispatch` without raising, and the branches pass through unprojected; parametrise over the three values. Add one end-to-end case through the compose loop (the test 13 harness) asserting an argument error, not a crash | green on arrival (today's `!=` tolerates any type); the mutation below proves it guards the new lookup |
 
 **Mutation controls:**
 - Remove `"coalesce"` from the map. Tests 1 to 5, 6b, the RED sub-cases of 7, and 11 must go RED. (6a and 7c stay
@@ -495,6 +514,8 @@ comparative (two states that differ only in order) and are unaffected by T4.
 - In restore, drop the duplicate-alias check. The duplicate case of test 7 must go RED.
 - In restore, put back `type(item[1]) is not str`. Tests 12 and 13 must go RED.
 - In `project`, iterate over `sorted(branches.items())`. Tests 1 to 4, 6b and 10 must go RED.
+- Drop the `type(node["node_type"]) is str` guard, in `project` and then separately in `restore`. Test 14 must go RED
+  with `TypeError: unhashable type` each time.
 
 **Known negative:** `test_state_serialisation_contract.py::test_persisted_shape_content_hashes_are_pinned` pins 4
 content hashes whose coalesce and row_union shapes are list-form (`:120-133`, `:155-181`). T3 must **not** move them.
@@ -711,12 +732,14 @@ names the deploy obligation from §5.2.
 2. **The row_union branch projection did not move, and a `sources`-free payload using the singular `source` did not
    move.** The T3 test 9 and T4 test 3 goldens, captured at base in T0 from payloads with no `sources` key. (A payload
    that carries `sources`, even `{}`, moves at T4 by design, D3.)
-3. **Each order-semantic map is bound by every stored hash that re-derives it.** This covers content, draft,
+3. **Each order-semantic topology map the composer owns (mapping-form coalesce and row_union `branches`, top-level
+   `sources`) is bound by every stored hash that re-derives it.** Plugin-owned option maps are not covered (D13, §1.4
+   item 11). This covers content, draft,
    private-arguments, audit-payload, state-data, dispatch binding and fingerprint (T3, T4, T5).
 4. **Restore is strict about structure and lossless about values.** The tag for one kind is not accepted for
    another, duplicate keys are rejected, and a non-projection map is rejected (T3 tests 7 and 7c, T4 test 2). Any JSON
    value survives the round trip, so a planner argument error persists instead of raising `AuditIntegrityError` (T3
-   tests 12 and 13, T4 test 5).
+   tests 12 and 13, T4 test 5). A non-`str` `node_type` passes through unprojected instead of crashing (T3 test 14).
 5. **The trust-tier corpus is unchanged** (G-tier diff), except for lines that are accounted for.
 6. **No tool, schema or wire byte changed.** G-wire and G-skill stay green, and no test file of tool declarations is
    edited.
@@ -740,7 +763,11 @@ These stored hashes are recomputed from stored payloads and compared, and a mism
   `:8071` (`StaleComposeStateError`), and at `pipeline_commit.py:405` (`BASE_CONFLICT`);
 - the executor content hash persisted in the dispatch result (`pipeline_content_hash`, `audit_storage.py:236`),
   recovered through `PipelineDispatchRecovery` (`service.py:911`) and compared with the recomputed state hash at
-  `service.py:7881` ("pipeline candidate/executor/state content hash mismatch").
+  `service.py:7881` ("pipeline candidate/executor/state content hash mismatch");
+- the `committed_state_content_hash` in the `proposal.accepted` terminal event (`_pipeline_accepted_payload`,
+  `sessions/service.py:756`, persisted at `:8086-8100`). On an exact retry of a committed proposal it is recomputed from
+  the committed state row and the whole payload is compared (`:967-976`, "committed pipeline proposal exact retry
+  binding mismatch", `AuditIntegrityError`). T4 moves its preimage; the T6 epoch covers it (Codex finding 4).
 
 After T4, **every** stored row that carries a composition content hash fails one of these, whatever its pipeline
 shape, because every state's `to_dict()` has a `sources` map (D3; M, `$L/critique-1/probe_sources_always.log`). So
@@ -799,7 +826,9 @@ Consumers that are **not** reasons for the epoch:
    - the §4 evidence;
    - the pin moves (T3, T4, T5, T6);
    - the §5.2 deploy obligation;
-   - the §1.4 tickets owed. Item 1, the execution envelope, is the one to raise first;
+   - the §1.4 tickets owed. Item 1, the execution envelope, is the one to raise first; item 11 (plugin option maps
+     found order-semantic and not bound, D13) needs John's scope ruling, because the brief asked for every
+     order-semantic map found;
    - the attribution of the two non-drift base reds (D10): `test_composer_bedrock` came in with `e69498f6c`, not S1.
 
    Merge only on John's word, after running `git merge-tree` against the current `release/0.8.1` tip and
@@ -879,4 +908,23 @@ What changed:
   (`envelope.py:599`/`:559`, `service.py:6650`/`:6862`, `pending_interpretation.py:1561`, full node ids for the base
   reds, the S1 gate record path, and the runbook line 7 that no test pins).
 
-The review and fix cycle with Codex adds its own subsection here, in the same way as the S1 plan's §9.
+### Codex plan review
+
+After the two critiques, Codex (`gpt-6-astra`, medium reasoning, read-only sandbox) reviewed the revised plan at
+`3ba282476`. Its verdict was **"yes with fixes"**. The report is in the lane at `$L/codex/plan-review.md` and the
+brief at `$L/codex/brief.md`. Codex confirmed these parts as sound: the coalesce and advisor gaps (with list-form
+branches as the negative control); that both restore callers compare the generic canonical and re-project, so D11
+keeps integrity; that a real `{schema, items}` map is itself projected, so there is no collision; that T4 moves every
+content hash and the epoch is warranted; D6; the T1 instruments comparing two different texts; and that nothing
+authors pipeline structure or needs compatibility acceptance. Each of its six findings was re-checked against the
+code before it was applied. All six held. Finding 2 is applied as a recorded scope decision (D13), which is one of
+the two fixes Codex offered. The dispositions, with the evidence for each, are in `$L/codex/dispositions.md`.
+
+| # | Severity | Finding | Checked against | Applied as |
+|---|---|---|---|---|
+| 1 | Major | T3: membership in `_ORDERED_BRANCH_SCHEMAS` raises `TypeError: unhashable type` on a planner `node_type` of `[]` or `{}`, which today's `!= "row_union"` tolerates. Projection runs before the schema gate | M, `$L/codex/recheck_f1_f2.log`: base `project` accepts both values, and the mapping lookup raises for both. R, `authority_hashing.py:39`, `:67` | T3 guards `type(node["node_type"]) is str` before the lookup in `project` and `restore`; new T3 test 14 (characterization, including one compose-loop case) with a mutation control for each function; §4 invariant 4 |
+| 2 | Major | §4 invariant 3 claimed every order-semantic map is bound, but `options.queries` (LLM multi-query) and `field_mapper` `options.mapping` are order-semantic and stay unbound | M, `$L/codex/recheck_f1_f2.log`: both reorders give equal authority hashes, and a row_union reorder does not (known positive). R, `multi_query.py:306-307`, `transform.py:915-945`, `field_mapper.py:678-730`, `csv_sink.py:534-536` | D13 and §1.4 item 11: not projected (it needs a plugin-declared ordered-map contract, and the projection deliberately never gives plugin-owned nested maps topology meaning); §1.1, §4 invariant 3 narrowed to the composer-owned topology maps; §6 handover raises it for John's scope ruling |
+| 3 | Minor | T1 E9: `(loc, code)` cannot identify options sent as a string, because every JSON-schema `type` failure is `invalid_type` | M, `$L/codex/recheck_f3.log`: a string, `1`, `[]` and `null` in `set_source` options all give `[{'loc': ['options'], 'type': 'invalid_type'}]`; `{}` is admitted. R, `_dispatch.py:560-561` | E9 renames the class "Wrong-type options/patch", with the string signature as a subset that needs the sent JSON type as an extra value-free discriminator; §2 row and §1.4 item 7 |
+| 4 | Minor | §5.1 omitted the `proposal.accepted` event's `committed_state_content_hash`, recomputed and compared on an exact retry | R, `sessions/service.py:756`, `:967-976` ("committed pipeline proposal exact retry binding mismatch"), `:8086-8100` | New §5.1 bullet. The T6 epoch already covers it; no change to the epoch decision |
+| 5 | Minor | D10, T0 step 6, E1: a failure at the S0 merge `85ebf2739` shows the p5 red predates S1, not S0 | M, `git show -s --format='%h %p %s' 85ebf2739` → parents `780ef0f56` `35d6bad86`, "Merge strict tool-contract S0 ..." | D10, T0 step 6 and E1 now say "fails at the S0 merge, so it predates S1", and that pre-S0 was not measured |
+| 6 | Minor | §3.2 still called `pipeline_planner.py:3870` "Inert", against D2 and §1.4 item 5 | R, this plan's D2; `composer/service.py:4428-4435` | The §3.2 row says "inert on freeform only; live on guided-full, deferred under the guided-removal ruling" |
