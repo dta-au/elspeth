@@ -90,7 +90,7 @@ class QueryBuilder:
                 )
             )
 
-        if self._compiled_template is None and not isinstance(extracted, str):
+        if self._compiled_template is None and type(extracted) is not str:
             return self._wrong_type(extracted)
 
         if self._compiled_template is not None:
@@ -107,7 +107,7 @@ class QueryBuilder:
         # otherwise PASS _validate_non_empty as QueryResult(query=b"...").
         # Returned rather than raised: it is a fact about this row's data, like
         # the missing and None cases in build(), so it takes the same exit.
-        if not isinstance(extracted, str):
+        if type(extracted) is not str:
             return self._wrong_type(extracted)
         return self._validate_non_empty(extracted)
 
@@ -159,7 +159,7 @@ class QueryBuilder:
         # keeps the invariant local): re.Pattern.search() rejects a non-str
         # with its own TypeError, and after this check any exception from the
         # worker is the worker's fault, never the row's.
-        if not isinstance(extracted, str):
+        if type(extracted) is not str:
             return self._wrong_type(extracted)
 
         future = self._regex_pool.submit(run_regex_worker, self._compiled_pattern, extracted)
