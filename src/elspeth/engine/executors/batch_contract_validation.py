@@ -122,13 +122,19 @@ def validate_success_outputs(
     ``created_output_fields()``) whose stamped type is concrete, against the
     emitted value, through the same ``declared_output_types`` module the
     per-row seam uses. Input fields a passthrough batch output carries are
-    not re-checked: the buffer preflight validated them. A batch
-    transform's emitted contract carries the declaration stamp
+    not checked here: the buffer preflight validated their INPUT values, and
+    a batch output row has no single input row to detect a rewrite against,
+    so a passthrough batch plugin that rewrote a carried input field would
+    not be caught at the flush (no shipped batch plugin does; both
+    passthrough shapes only add fields). A batch transform's emitted
+    contract carries the declaration stamp
     (``BaseTransform._batch_output_contract`` and the passthrough shapes'
     ``_apply_declared_output_field_contracts`` call), so a plugin computing
     the wrong type for its own statistic is caught here, value-free, with
-    ``authorship: computed``, and fails the whole batch like any other
-    violation of this postflight.
+    ``authorship: computed`` and the declarer of the broken type
+    (``declared_by: plugin`` for a type the plugin fixes, ``operator`` for
+    the pipeline's ``schema.fields``), and fails the whole batch like any
+    other violation of this postflight.
 
     Args:
         transform: The batch transform whose declared output contract governs.

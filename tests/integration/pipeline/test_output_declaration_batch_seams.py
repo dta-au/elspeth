@@ -20,8 +20,10 @@ is ``batch_replicate``'s ``copy_index`` (``int``); the reductive case uses
 the violation fails the WHOLE batch — every buffered row follows the
 aggregation's ``on_error``, or the collector group records a
 ``collector_contract_violation`` verdict — with a reason naming the field,
-both type names and ``authorship: computed``, never the value; the sentinel
-is absent from every Landscape table.
+both type names, ``authorship: computed`` and ``declared_by: plugin`` (each
+case's type is fixed by the plugin's ``created_output_fields()``: the RC-2
+cell of the 2026-09-25 ruling), never the value; the sentinel is absent from
+every Landscape table.
 
 Before this change a batch transform's emitted contract carried no
 declaration and the flush postflight typed nothing, so the sentinel reached
@@ -107,7 +109,14 @@ def _settings_file(tmp_path: Path, body: dict[str, Any]) -> Path:
 
 def _assert_value_free_computed_reason(reason: dict[str, Any], *, field: str) -> None:
     assert reason["reason"] == "contract_violation"
-    assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"]) == (field, "int", "str", "computed")
+    assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"], reason["declared_by"]) == (
+        field,
+        "int",
+        "str",
+        "computed",
+        "plugin",
+    )
+    assert "declared int by the transform itself" in reason["error"]
     assert SENTINEL not in json.dumps(reason)
 
 
@@ -214,7 +223,9 @@ def test_a_collector_computing_the_wrong_type_fails_the_group_value_free(tmp_pat
         for (text,) in _query(tmp_path, "select error_json from node_states where error_json is not null")
         if (error := json.loads(text)).get("context", {}).get("exception_type") == "DeclaredOutputTypeViolation"
     ]
-    assert [(c["field"], c["expected_type"], c["actual_type"], c["authorship"]) for c in contexts] == [("count", "int", "str", "computed")]
+    assert [(c["field"], c["expected_type"], c["actual_type"], c["authorship"], c["declared_by"]) for c in contexts] == [
+        ("count", "int", "str", "computed", "plugin")
+    ]
     assert _audit_cells_containing(tmp_path, SENTINEL) == []
 
 

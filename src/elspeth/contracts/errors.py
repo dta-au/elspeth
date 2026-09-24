@@ -813,7 +813,8 @@ class TransformErrorReason(TypedDict):
     actual_type: NotRequired[str]
     value: NotRequired[str]
     emitted_index: NotRequired[int]  # Which emitted row broke a declared output type (ADR-050)
-    authorship: NotRequired[Literal["computed", "carried"]]  # Who produced the offending value (ADR-050)
+    authorship: NotRequired[Literal["computed", "carried"]]  # Transform created the field / rewrote an input field (ADR-050)
+    declared_by: NotRequired[Literal["operator", "plugin", "upstream"]]  # Who declared the violated type (ADR-050 D6)
     line_count: NotRequired[int]  # Observed lines before rejecting line-expanding input
     max_lines: NotRequired[int]  # Configured line-expansion limit
 
@@ -1815,15 +1816,25 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
     the reason below, and the run goes on (operator ruling 2026-09-25,
     elspeth-5887fb7928 S1).
 
-    ``authorship`` records who produced the offending value: ``computed``
-    when the field is one this transform creates (its own code, or an
-    expression it evaluated, computed the value), ``carried`` when the field
-    arrived on the input row and the transform passed it through. A computed
-    violation of a plugin-declared type is a plugin bug recorded as evidence;
-    the bit is what lets that rule tighten later without rework.
+    Two bits say whose declaration broke and how the field got there:
+
+    * ``declared_by`` — who declared the violated type. ``operator``: the
+      pipeline author's ``schema.fields`` (a data fault, or a wrong
+      declaration). ``plugin``: a type the plugin's own code fixes for a
+      value it computes — the case whose disposition may later tighten from
+      routing to ending the run (operator ruling 2026-09-25, RC-2), which is
+      why the bit is recorded now. ``upstream``: the field arrived on the
+      input row under a declaration made before this transform, and the
+      transform rewrote it.
+    * ``authorship`` — ``computed`` when the transform created the field (it
+      was absent from the input row, or the output is a batch flush's),
+      ``carried`` when the field arrived on the input row and the transform
+      rewrote its value. An unchanged input value is never checked, and
+      neither is a ``carried_output_fields()`` rename target, so ``carried``
+      never means "passed through".
 
     The reason never carries the value: the field name, the two type names,
-    the emitted row's index and the authorship bit only.
+    the emitted row's index and the two bits only.
     """
 
     def __init__(
@@ -1835,11 +1846,21 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
         actual_type: str,
         emitted_index: int,
         authorship: Literal["computed", "carried"],
+        declared_by: Literal["operator", "plugin", "upstream"],
     ) -> None:
+        action = "created" if authorship == "computed" else "rewrote"
+        if declared_by == "operator":
+            declarer, guidance = (
+                "by the pipeline's schema",
+                "The value does not match the declared type: correct the data or the declaration.",
+            )
+        elif declared_by == "plugin":
+            declarer, guidance = "by the transform itself", "The transform broke its own declaration: fix the transform."
+        else:
+            declarer, guidance = "upstream of this transform", "The transform replaced a declared input field with a value of another type."
         super().__init__(
             f"Transform '{transform}' emitted row {emitted_index} with field '{field}' of type {actual_type}, "
-            f"but the field is declared {expected_type} ({authorship} by the transform). "
-            "Declare the type the transform computes, or fix the transform."
+            f"but the field is declared {expected_type} {declarer} (the transform {action} the field). {guidance}"
         )
         self.transform = transform
         self.field = field
@@ -1847,6 +1868,7 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
         self.actual_type = actual_type
         self.emitted_index = emitted_index
         self.authorship = authorship
+        self.declared_by = declared_by
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
@@ -1858,10 +1880,11 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
             "actual_type": self.actual_type,
             "emitted_index": self.emitted_index,
             "authorship": self.authorship,
+            "declared_by": self.declared_by,
         }
 
     def to_transform_error_reason(self) -> TransformErrorReason:
-        """The routed reason: the field, both type names, the index and the authorship bit — never the value."""
+        """The routed reason: the field, both type names, the index and the two bits — never the value."""
         return {
             "reason": "contract_violation",
             "error": scrub_text_for_audit(str(self)),
@@ -1870,6 +1893,7 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
             "actual": self.actual_type,
             "emitted_index": self.emitted_index,
             "authorship": self.authorship,
+            "declared_by": self.declared_by,
         }
 
 

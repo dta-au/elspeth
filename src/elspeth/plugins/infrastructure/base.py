@@ -66,7 +66,7 @@ if TYPE_CHECKING:
         InputSemanticRequirements,
         OutputSemanticDeclaration,
     )
-    from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+    from elspeth.contracts.schema import FieldDefinition, OutputFieldDeclarer, SchemaConfig
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
@@ -948,9 +948,13 @@ class BaseTransform(ABC):
         ``narrow_contract_to_output``. A dotted extraction is NOT carried: its
         value's type is not in any contract, so it is created (``any``).
 
-        Excluded from the ``any`` fallback in ``_stamped_output_field_contracts``
-        and admitted by the post-emission completeness check as
-        contract-carrying rather than stamped.
+        Excluded from the ``any`` fallback in ``_stamped_output_field_contracts``,
+        admitted by the post-emission completeness check as contract-carrying
+        rather than stamped, and never value-checked by the engine
+        (``engine/executors/declared_output_types``): the input check already
+        admitted the value. Not to be confused with ``authorship: carried`` on
+        a ``DeclaredOutputTypeViolation``, which marks an input field the
+        transform REWROTE under the same name.
         """
         return frozenset()
 
@@ -958,7 +962,30 @@ class BaseTransform(ABC):
         """The declared contract of every field this transform stamps on emission.
 
         One table, built from three declaration sources in precedence order
-        (ADR-050: operator > plugin > ``any``):
+        (ADR-050: operator > plugin > ``any``) by ``_output_field_declarations``;
+        see there for the precedence and for who is recorded as each field's
+        declarer.
+        """
+        return {name: contract for name, (contract, _declared_by) in self._output_field_declarations().items()}
+
+    def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]:
+        """Who declared the type of each field in the stamp table: ``operator`` or ``plugin`` (ADR-050).
+
+        The authorship bit of the amended spec's D6, read from the same table
+        the stamp is built from so the two cannot disagree. The engine's value
+        check records it on a ``DeclaredOutputTypeViolation``: a plugin whose
+        own computed value breaks the type IT declared is a plugin bug, while
+        a value breaking the operator's declared type is the row's data (or
+        the operator's declaration) at fault. Keyed by the same names as
+        ``_stamped_output_field_contracts``.
+        """
+        return {name: declared_by for name, (_contract, declared_by) in self._output_field_declarations().items()}
+
+    def _output_field_declarations(self) -> dict[str, tuple[FieldContract, OutputFieldDeclarer]]:
+        """Every stamped field's declared contract and the declarer of its type.
+
+        Three declaration sources in precedence order (ADR-050: operator >
+        plugin > ``any``):
 
         1. the operator's AUTHORED ``schema.fields`` type, read through
            ``_output_schema_config.fields`` (the output config builders
@@ -972,8 +999,19 @@ class BaseTransform(ABC):
 
         A field the output config carries under a name the operator never
         authored and the plugin does not declare — a builder's projection of
-        an authored declaration onto a renamed target, or a ``columns``
-        option typed by the plugin's builder — keeps the config's contract.
+        an authored declaration onto a renamed target, or a field the
+        plugin's builder types itself (blob_fetch's ``blob_size_bytes: int``,
+        a reference_join type derived from its fixed table) — keeps the
+        config's contract.
+
+        The declarer is ``operator`` when the output config holds the
+        operator's authored definition unchanged, or when the name is a
+        ``carried_output_fields()`` target (the builder projected the
+        operator's declaration of the source field onto it); it is ``plugin``
+        for everything the plugin's code typed: a builder-typed config field
+        (including one a builder REPLACED under an authored name, as
+        blob_json_expand does for its record index), a ``created_output_fields()``
+        entry, and an ``any`` fallback.
 
         An ``any`` field is nullable: nothing checks the value of an ``any``
         field, so ``nullable=False`` on one would be a claim the engine never
@@ -988,42 +1026,54 @@ class BaseTransform(ABC):
 
         from elspeth.contracts.schema_contract_factory import create_contract_from_config, field_definition_python_type
 
-        stamped: dict[str, FieldContract] = {}
-        if output_schema_config.fields is not None:
-            stamped = {field.normalized_name: field for field in create_contract_from_config(output_schema_config).fields}
         authored_schema = self._schema_config
-        authored = (
-            frozenset(field.name for field in authored_schema.fields)
+        authored_definitions = (
+            {field.name: field for field in authored_schema.fields}
             if authored_schema is not None and authored_schema.fields is not None
-            else frozenset()
+            else {}
         )
+        carried = self.carried_output_fields()
+        declarations: dict[str, tuple[FieldContract, OutputFieldDeclarer]] = {}
+        if output_schema_config.fields is not None:
+            config_definitions = {field.name: field for field in output_schema_config.fields}
+            for contract in create_contract_from_config(output_schema_config).fields:
+                name = contract.normalized_name
+                operator_declared = name in carried or (
+                    name in authored_definitions and authored_definitions[name] == config_definitions[name]
+                )
+                declarations[name] = (contract, "operator" if operator_declared else "plugin")
         for definition in self.created_output_fields():
-            if definition.name in stamped and definition.name in authored:
+            if definition.name in declarations and definition.name in authored_definitions:
                 continue
-            stamped[definition.name] = FieldContract(
-                normalized_name=definition.name,
-                original_name=definition.name,
-                python_type=field_definition_python_type(definition),
-                required=definition.required,
-                source="declared",
-                nullable=definition.nullable,
+            declarations[definition.name] = (
+                FieldContract(
+                    normalized_name=definition.name,
+                    original_name=definition.name,
+                    python_type=field_definition_python_type(definition),
+                    required=definition.required,
+                    source="declared",
+                    nullable=definition.nullable,
+                ),
+                "plugin",
             )
         guaranteed = output_schema_config.get_effective_guaranteed_fields()
-        carried = self.carried_output_fields()
         for name in self.declared_output_fields:
-            if name in stamped or name in carried:
+            if name in declarations or name in carried:
                 continue
-            stamped[name] = FieldContract(
-                normalized_name=name,
-                original_name=name,
-                python_type=object,
-                required=name in guaranteed,
-                source="declared",
-                nullable=True,
+            declarations[name] = (
+                FieldContract(
+                    normalized_name=name,
+                    original_name=name,
+                    python_type=object,
+                    required=name in guaranteed,
+                    source="declared",
+                    nullable=True,
+                ),
+                "plugin",
             )
         return {
-            name: replace(field, nullable=True) if field.python_type is object and not field.nullable else field
-            for name, field in stamped.items()
+            name: (replace(contract, nullable=True) if contract.python_type is object and not contract.nullable else contract, declared_by)
+            for name, (contract, declared_by) in declarations.items()
         }
 
     def _apply_declared_output_field_contracts(

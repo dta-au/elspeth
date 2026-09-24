@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
-    from elspeth.contracts.schema import FieldDefinition
+    from elspeth.contracts.schema import FieldDefinition, OutputFieldDeclarer
 
 
 class ContractablePlugin(Protocol):
@@ -150,13 +150,16 @@ class OutputDeclaringPlugin(ContractablePlugin, Protocol):
 
     def carried_output_fields(self) -> frozenset[str]: ...
 
+    def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]: ...
+
 
 def require_output_declaring_plugin(plugin: object) -> OutputDeclaringPlugin:
     """Return a runtime-validated plugin exposing the ADR-050 output declaration.
 
     ``created_output_fields()`` must return a tuple of ``FieldDefinition`` (an
-    owned type, checked nominally) and ``carried_output_fields()`` a frozenset
-    of str; a plugin returning anything else is a bug, not a declaration.
+    owned type, checked nominally), ``carried_output_fields()`` a frozenset
+    of str, and ``output_field_declared_by()`` a dict of str to ``operator`` /
+    ``plugin``; a plugin returning anything else is a bug, not a declaration.
     """
     from elspeth.contracts.schema import FieldDefinition
 
@@ -167,5 +170,10 @@ def require_output_declaring_plugin(plugin: object) -> OutputDeclaringPlugin:
     created = typed_plugin.created_output_fields()
     if type(created) is not tuple or any(type(definition) is not FieldDefinition for definition in created):
         raise TypeError(f"{owner_name}.created_output_fields() must return a tuple of FieldDefinition.")
+    declared_by = typed_plugin.output_field_declared_by()
+    if type(declared_by) is not dict or any(
+        type(name) is not str or declarer not in ("operator", "plugin") for name, declarer in declared_by.items()
+    ):
+        raise TypeError(f"{owner_name}.output_field_declared_by() must return a dict of str to 'operator' or 'plugin'.")
     _require_contractable_plugin(plugin)
     return typed_plugin

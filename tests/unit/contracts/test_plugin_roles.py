@@ -12,6 +12,7 @@ from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.plugin_roles import (
     require_declared_input_fields_plugin,
     require_declared_output_fields_plugin,
+    require_output_declaring_plugin,
     sink_declared_required_fields,
     source_declared_guaranteed_fields,
 )
@@ -294,3 +295,39 @@ def test_require_declared_input_fields_plugin_rejects_invalid_contract_surface(
 ) -> None:
     with pytest.raises(TypeError, match=match):
         require_declared_input_fields_plugin(plugin)
+
+
+class _OutputDeclaringPlugin(_DeclaredOutputPlugin):
+    """The ADR-050 output-declaration surface (``OutputDeclaringPlugin``)."""
+
+    def __init__(self, declared_by: Any) -> None:
+        self.declared_by = declared_by
+
+    def created_output_fields(self) -> tuple[Any, ...]:
+        return ()
+
+    def carried_output_fields(self) -> frozenset[str]:
+        return frozenset()
+
+    def output_field_declared_by(self) -> Any:
+        return self.declared_by
+
+
+def test_require_output_declaring_plugin_accepts_an_operator_or_plugin_declarer() -> None:
+    plugin = _OutputDeclaringPlugin({"customer_id": "plugin", "region": "operator"})
+    assert require_output_declaring_plugin(plugin) is plugin
+
+
+@pytest.mark.parametrize(
+    "declared_by",
+    [
+        pytest.param({"customer_id": "upstream"}, id="upstream-is-never-a-stamp-declarer"),
+        pytest.param({"customer_id": "computed"}, id="not-a-declarer"),
+        pytest.param({1: "plugin"}, id="non-str-name"),
+        pytest.param((("customer_id", "plugin"),), id="not-a-dict"),
+    ],
+)
+def test_require_output_declaring_plugin_rejects_an_invalid_declarer_table(declared_by: Any) -> None:
+    plugin = _OutputDeclaringPlugin(declared_by)
+    with pytest.raises(TypeError, match=r"output_field_declared_by\(\) must return a dict of str to 'operator' or 'plugin'"):
+        require_output_declaring_plugin(plugin)

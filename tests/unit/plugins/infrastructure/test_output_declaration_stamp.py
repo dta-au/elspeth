@@ -339,6 +339,65 @@ class TestBlobCsvExpandDeclaration:
         assert (name.python_type, name.required, name.nullable, name.source) == (str, True, False, "declared")
 
 
+class TestTheDeclarerOfEachStampedField:
+    """``output_field_declared_by()``: who declared each stamped type, from the same table as the stamp (ADR-050 D6)."""
+
+    def test_the_table_and_the_declarers_have_the_same_names(self) -> None:
+        transform = _DeclaringTransform(
+            {"schema": {"mode": "flexible", "fields": ["score: int"]}},
+            created=(FieldDefinition(name="note", field_type="str", required=True),),
+        )
+        assert set(transform.output_field_declared_by()) == set(transform._stamped_output_field_contracts())
+
+    def test_an_authored_type_is_the_operators_and_a_hook_type_the_plugins(self) -> None:
+        transform = _DeclaringTransform(
+            {"schema": {"mode": "flexible", "fields": ["score: int"]}},
+            created=(FieldDefinition(name="note", field_type="str", required=True),),
+        )
+        declared_by = transform.output_field_declared_by()
+        assert (declared_by["score"], declared_by["note"]) == ("operator", "plugin")
+
+    def test_an_any_fallback_is_the_plugins(self) -> None:
+        transform = _DeclaringTransform({"schema": DYNAMIC_SCHEMA})
+        assert transform.output_field_declared_by() == {"score": "plugin", "note": "plugin"}
+
+    def test_json_explode_an_authored_element_type_is_the_operators_and_item_index_the_plugins(self) -> None:
+        """ex_str_int: ``page: int`` is the operator's declaration, not the plugin's."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {"schema": {"mode": "flexible", "fields": ["items: any", "item: int"]}, "array_field": "items", "output_field": "item"}
+        )
+        declared_by = transform.output_field_declared_by()
+        assert (declared_by["item"], declared_by["item_index"]) == ("operator", "plugin")
+
+    def test_a_builder_typed_output_field_is_the_plugins(self) -> None:
+        from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+        transform = BlobFetch(BlobFetch.probe_config())
+        stamped = transform._stamped_output_field_contracts()
+        assert stamped["blob_size_bytes"].python_type is int
+        assert transform.output_field_declared_by()["blob_size_bytes"] == "plugin"
+
+    def test_a_builder_replacing_an_authored_definition_is_the_plugins(self) -> None:
+        """blob_json_expand types its record index ``int`` over an authored ``str``: the stamped type is the plugin's."""
+        from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
+
+        config = {**BlobJSONExpand.probe_config(), "schema": {"mode": "flexible", "fields": ["json_record_index: str"]}}
+        transform = BlobJSONExpand(config)
+        assert transform._stamped_output_field_contracts()["json_record_index"].python_type is int
+        assert transform.output_field_declared_by()["json_record_index"] == "plugin"
+
+    def test_a_field_mapper_rename_target_carries_the_operators_declaration(self) -> None:
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": {"mode": "flexible", "fields": ["id: int", "amount: float"]}, "mapping": {"amount": "total"}})
+        assert transform.carried_output_fields() == frozenset({"total"})
+        assert transform._stamped_output_field_contracts()["total"].python_type is float
+        declared_by = transform.output_field_declared_by()
+        assert (declared_by["id"], declared_by["total"]) == ("operator", "operator")
+
+
 def test_declare_missing_guaranteed_fields_declares_any_nullable() -> None:
     """D4: a created field known only by name is ``any`` and nullable in the output config too."""
     from elspeth.contracts.schema import declare_missing_guaranteed_fields

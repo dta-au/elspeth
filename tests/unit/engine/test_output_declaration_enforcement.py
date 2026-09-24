@@ -8,8 +8,10 @@ the production ``Orchestrator`` so the recorded outcomes are the real ones:
    terminal is recorded.
 2. DECLARED TYPES AGAINST VALUES (Tier 2): a value breaking a concrete
    declared type routes the row through ``on_error`` with a value-free reason
-   that records whether the transform COMPUTED or CARRIED the value; a
-   multi-row emission fails its parent token once.
+   that records who DECLARED the broken type (``declared_by``: operator,
+   plugin or upstream) and whether the transform created the field or
+   rewrote an input field (``authorship``: computed or carried); a multi-row
+   emission fails its parent token once.
 
 Before ADR-050 ``validate_output_against_contract`` had no production caller
 and the strict ``output_schema`` check typed nothing for a field-adding
@@ -184,7 +186,8 @@ class TestCompleteness:
 
 
 class TestDeclaredTypesAgainstValues:
-    def test_a_computed_value_breaking_the_plugin_declared_type_routes_with_authorship_computed(self, tmp_path: Any) -> None:
+    def test_a_created_value_breaking_the_plugin_declared_type_routes_as_plugin_declared(self, tmp_path: Any) -> None:
+        """The RC-2 case: the plugin's own code fixes ``score: int`` and its own value breaks it."""
         transform = _Emitting(
             {"schema": {"mode": "observed"}},
             emit=[{"score": SENTINEL}],
@@ -206,8 +209,13 @@ class TestDeclaredTypesAgainstValues:
             "actual": "str",
             "emitted_index": 0,
             "authorship": "computed",
+            "declared_by": "plugin",
         }
-        assert "'score' of type str, but the field is declared int (computed by the transform)" in reason["error"]
+        assert (
+            "'score' of type str, but the field is declared int by the transform itself (the transform created the field)"
+            in reason["error"]
+        )
+        assert "fix the transform" in reason["error"]
         assert SENTINEL not in json.dumps(reason)
 
     def test_an_untouched_carried_value_the_input_check_admitted_is_not_re_adjudicated(self, tmp_path: Any) -> None:
@@ -222,24 +230,38 @@ class TestDeclaredTypesAgainstValues:
         assert sinks["quarantine"].results == []
         assert _transform_error_reasons(db, result.run_id) == []
 
-    def test_an_equal_valued_type_change_on_a_carried_field_is_a_rewrite(self, tmp_path: Any) -> None:
-        """``1 == True`` in Python: a carried ``bool`` rewritten to ``1`` under ``flag: bool`` is still routed."""
+    def test_an_equal_valued_type_change_on_an_input_field_is_a_rewrite(self, tmp_path: Any) -> None:
+        """``1 == True`` in Python: an input ``bool`` rewritten to ``1`` under ``flag: bool`` is still routed."""
         transform = _Emitting({"schema": {"mode": "flexible", "fields": ["flag: bool"]}}, emit=[{"flag": 1}])
         result, sinks, db = _run(tmp_path, transform, {"flag": True})
         assert result.status is RunStatus.FAILED
         assert sinks["output"].results == []
         [reason] = _transform_error_reasons(db, result.run_id)
-        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"]) == ("flag", "bool", "int", "carried")
+        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"], reason["declared_by"]) == (
+            "flag",
+            "bool",
+            "int",
+            "carried",
+            "operator",
+        )
 
-    def test_a_carried_value_breaking_the_operator_declared_type_routes_with_authorship_carried(self, tmp_path: Any) -> None:
-        """The transform REWROTE a field it neither created nor declared as its own."""
+    def test_a_rewritten_input_value_breaking_the_operator_declared_type_routes_as_operator_declared(self, tmp_path: Any) -> None:
+        """The transform REWROTE an input field under the operator's ``amount: int``: authorship carried, declared_by operator."""
         transform = _Emitting({"schema": {"mode": "flexible", "fields": ["amount: int"]}}, emit=[{"amount": SENTINEL}])
         result, sinks, db = _run(tmp_path, transform, {"amount": 250})
 
         assert result.status is RunStatus.FAILED
         assert sinks["quarantine"].results == [{"amount": 250}]
         [reason] = _transform_error_reasons(db, result.run_id)
-        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"]) == ("amount", "int", "str", "carried")
+        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"], reason["declared_by"]) == (
+            "amount",
+            "int",
+            "str",
+            "carried",
+            "operator",
+        )
+        assert "declared int by the pipeline's schema (the transform rewrote the field)" in reason["error"]
+        assert "correct the data or the declaration" in reason["error"]
         assert SENTINEL not in json.dumps(reason)
 
     def test_a_multi_row_emission_fails_its_parent_once(self, tmp_path: Any) -> None:
@@ -282,3 +304,52 @@ class TestDeclaredTypesAgainstValues:
         assert result.status is RunStatus.FAILED
         [reason] = _transform_error_reasons(db, result.run_id)
         assert (reason["expected"], reason["actual"]) == ("int", "NoneType")
+
+
+def _declared_row(values: dict[str, Any], types: dict[str, type]) -> PipelineRow:
+    from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+    return PipelineRow(
+        values,
+        SchemaContract(
+            mode="OBSERVED",
+            fields=tuple(
+                FieldContract(normalized_name=name, original_name=name, python_type=python_type, required=True, source="declared")
+                for name, python_type in types.items()
+            ),
+            locked=True,
+        ),
+    )
+
+
+class TestTheDeclarerOfAFieldOutsideTheStampTable:
+    """``declared_by`` for a checked field this transform's stamp table does not hold (``declared_output_types._declarer``)."""
+
+    def test_an_input_field_declared_upstream_and_rewritten_records_upstream(self) -> None:
+        from elspeth.contracts.errors import DeclaredOutputTypeViolation
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform = _Emitting({"schema": {"mode": "observed"}}, emit=[])
+        assert "amount" not in transform.output_field_declared_by()
+        input_row = _declared_row({"amount": 250}, {"amount": int})
+        emitted = _declared_row({"amount": SENTINEL}, {"amount": int})
+        with pytest.raises(DeclaredOutputTypeViolation) as raised:
+            verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[emitted])
+        reason = raised.value.to_transform_error_reason()
+        assert (reason["field"], reason["authorship"], reason["declared_by"]) == ("amount", "carried", "upstream")
+        assert "declared int upstream of this transform (the transform rewrote the field)" in reason["error"]
+        assert SENTINEL not in json.dumps(reason)
+
+    def test_a_created_field_stamped_per_emission_records_plugin(self) -> None:
+        """blob_csv_expand's ``dynamic_created_fields`` shape: created, declared by the plugin, outside the static table."""
+        from elspeth.contracts.errors import DeclaredOutputTypeViolation
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform = _Emitting({"schema": {"mode": "observed"}}, emit=[])
+        assert "column" not in transform.output_field_declared_by()
+        input_row = _declared_row({"id": 1}, {"id": int})
+        emitted = _declared_row({"id": 1, "column": 5}, {"id": int, "column": str})
+        with pytest.raises(DeclaredOutputTypeViolation) as raised:
+            verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[emitted])
+        reason = raised.value.to_transform_error_reason()
+        assert (reason["field"], reason["authorship"], reason["declared_by"]) == ("column", "computed", "plugin")

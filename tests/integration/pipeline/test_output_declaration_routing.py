@@ -13,8 +13,8 @@ ones the elspeth-5887fb7928 R2 unit and the S1 specialist panel measured
   that separates "declared before row 1" from "widened as rows arrive".
 - T2/T3: a concrete operator type is ENFORCED on the emitted value — the
   violating row (or the parent of an exploded row) is routed with a
-  value-free reason (before: ``page: int, declared`` recorded while a str was
-  delivered, exit 0).
+  value-free reason recording ``declared_by: operator`` (before: ``page: int,
+  declared`` recorded while a str was delivered, exit 0).
 - T4: an explicit ``any`` on a value_transform target is honoured.
 - T5: value_transform as a TYPED CONSUMER of a carried field passes a valid
   row and routes the wrong-typed one (before: Tier-1
@@ -331,7 +331,13 @@ def test_a_concrete_operator_type_routes_the_violating_row_value_free(
     assert reason["expected"] == "int"
     assert reason["actual"] == "str"
     if routed_by == "engine":
-        assert reason["authorship"] == "computed"
+        # The OPERATOR declared the type and the transform created the field
+        # from the row's own data (the array element, the dotted leaf): a data
+        # fault against the pipeline's declaration, never attributed to the
+        # plugin (review-S1a-declare-r1 A1).
+        assert (reason["declared_by"], reason["authorship"]) == ("operator", "computed")
+        assert "declared int by the pipeline's schema (the transform created the field)" in reason["error"]
+        assert "fix the transform" not in reason["error"]
         assert reason["emitted_index"] == (1 if shape == "explode_str" else 0)
     assert SENTINEL not in json.dumps(reason)
 

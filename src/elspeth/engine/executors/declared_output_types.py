@@ -19,19 +19,39 @@ Two seams call it, and they differ ONLY in which fields count as produced:
   the completeness contract exempts the same names.
 * ``verify_created_output_types`` — the batch-flush seam
   (``batch_contract_validation.validate_success_outputs``, shared by the
-  aggregation and collector executors). A reductive output row (a statistics
-  row, an assembled report) has no input row, and a passthrough batch output
-  adds fields to rows the buffer preflight already validated, so the fields
-  produced are exactly the ones the transform CREATES: ``declared_output_fields``
-  and ``created_output_fields()``. Authorship is therefore always ``computed``.
+  aggregation and collector executors). A batch output row has no single
+  input row to compare against, so the fields produced are exactly the ones
+  the transform CREATES: ``declared_output_fields`` and
+  ``created_output_fields()``. The limit that follows: a passthrough batch
+  output (batch_outlier_annotator, batch_replicate) carries its buffered
+  rows' input fields, and the buffer preflight validated those INPUT values;
+  if such a plugin REWROTE a carried input field, the rewrite would not be
+  value-checked at the flush. No shipped batch plugin rewrites a carried
+  field (both only add fields).
 
 Both raise ``DeclaredOutputTypeViolation``, a ``PluginContractViolation`` the
 callers route: the per-row processor sends the token through ``on_error``; the
 batch executors fail the whole batch (aggregation ``on_error``) or the group
 (collector verdict), exactly as they route every other Tier-2 violation. The
-reason names the field, both type names, the emitted index and the authorship
-bit — never the value. A multi-row emission fails its parent once. An ``any``
-declaration (``python_type is object``) checks nothing by construction.
+reason names the field, both type names, the emitted index and two bits —
+never the value:
+
+* ``declared_by`` — who declared the violated type: ``operator`` (the
+  pipeline author's ``schema.fields``, or its projection onto a rename
+  target), ``plugin`` (a type the plugin's own code fixes: its
+  ``created_output_fields()``, a builder-typed output field, or a per-emission
+  ``dynamic_created_fields`` declaration), or ``upstream`` (the field arrived
+  on the input row under a declaration made before this transform, which is
+  not in this transform's stamp table). Read from
+  ``output_field_declared_by()``, the same table the stamp is built from.
+* ``authorship`` — whether the transform created the field (``computed``:
+  absent from its input row; always so at the batch seam) or rewrote an input
+  field's value (``carried``). This is about the FIELD, not the declaration,
+  and it is unrelated to ``carried_output_fields()``, whose names are never
+  checked at all.
+
+A multi-row emission fails its parent once. An ``any`` declaration
+(``python_type is object``) checks nothing by construction.
 
 A transform with no ``_output_schema_config`` declares nothing, so there is
 nothing to enforce.
@@ -39,11 +59,12 @@ nothing to enforce.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from typing import Literal
 
 from elspeth.contracts.errors import DeclaredOutputTypeViolation, TypeMismatchViolation
 from elspeth.contracts.plugin_protocols import BatchTransformProtocol, TransformProtocol
-from elspeth.contracts.plugin_roles import require_output_declaring_plugin
+from elspeth.contracts.plugin_roles import OutputDeclaringPlugin, require_output_declaring_plugin
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.transform_contract import validate_output_against_contract
 
@@ -52,8 +73,8 @@ def value_produced(input_row: PipelineRow, emitted: PipelineRow, name: str) -> b
     """Whether the transform PRODUCED ``emitted[name]`` rather than passing it through.
 
     Created (absent from the input row), or rewritten: a different value, or
-    an equal value of another type — ``1 == True == 1.0`` in Python, so a
-    carried ``bool`` rewritten to ``1`` is a rewrite the type check must see.
+    an equal value of another type — ``1 == True == 1.0`` in Python, so an
+    input ``bool`` rewritten to ``1`` is a rewrite the type check must see.
     Both rows hold deep-frozen values, so the comparison is like for like.
     """
     if name not in input_row:
@@ -70,11 +91,7 @@ def verify_produced_output_types(
     emitted_rows: Sequence[PipelineRow],
 ) -> None:
     """Per-row seam: check every declared concrete-typed field the transform produced from ``input_row``."""
-    _verify_declared_types(
-        transform,
-        emitted_rows,
-        produced=lambda created, carried, emitted, name: name not in carried and value_produced(input_row, emitted, name),
-    )
+    _verify_declared_types(transform, emitted_rows, input_row=input_row)
 
 
 def verify_created_output_types(
@@ -83,21 +100,26 @@ def verify_created_output_types(
     emitted_rows: Sequence[PipelineRow],
 ) -> None:
     """Batch-flush seam: check every declared concrete-typed field the transform creates."""
-    _verify_declared_types(transform, emitted_rows, produced=lambda created, carried, emitted, name: name in created)
+    _verify_declared_types(transform, emitted_rows, input_row=None)
 
 
 def _verify_declared_types(
     transform: TransformProtocol | BatchTransformProtocol,
     emitted_rows: Sequence[PipelineRow],
     *,
-    produced: Callable[[frozenset[str], frozenset[str], PipelineRow, str], bool],
+    input_row: PipelineRow | None,
 ) -> None:
-    """The one check; ``produced`` decides, given the created and carried sets, which emitted fields the transform produced."""
+    """The one check; ``input_row`` is the per-row seam's input, ``None`` at the batch flush."""
     if transform._output_schema_config is None:
         return
     declaring = require_output_declaring_plugin(transform)
     created = declaring.declared_output_fields | frozenset(definition.name for definition in declaring.created_output_fields())
     carried = declaring.carried_output_fields()
+
+    def produced(emitted: PipelineRow, name: str) -> bool:
+        if input_row is None:
+            return name in created
+        return name not in carried and value_produced(input_row, emitted, name)
 
     for emitted_index, emitted in enumerate(emitted_rows):
         emitted_values = emitted.to_dict()
@@ -107,7 +129,7 @@ def _verify_declared_types(
             if fc.source == "declared"
             and fc.python_type is not object
             and fc.normalized_name in emitted_values
-            and produced(created, carried, emitted, fc.normalized_name)
+            and produced(emitted, fc.normalized_name)
         )
         if not produced_fields:
             continue
@@ -116,11 +138,31 @@ def _verify_declared_types(
             # Exact type: MissingFieldViolation on a required declared field is
             # ADR-011/ADR-014's finding, and no TypeMismatchViolation subclass exists.
             if type(violation) is TypeMismatchViolation:
+                name = violation.normalized_name
+                arrived_on_input = input_row is not None and name in input_row
                 raise DeclaredOutputTypeViolation(
                     transform=transform.name,
-                    field=violation.normalized_name,
+                    field=name,
                     expected_type=violation.expected_type.__name__,
                     actual_type=violation.actual_type.__name__,
                     emitted_index=emitted_index,
-                    authorship="computed" if violation.normalized_name in created else "carried",
+                    authorship="carried" if arrived_on_input else "computed",
+                    declared_by=_declarer(declaring, name, arrived_on_input=arrived_on_input),
                 )
+
+
+def _declarer(declaring: OutputDeclaringPlugin, name: str, *, arrived_on_input: bool) -> Literal["operator", "plugin", "upstream"]:
+    """Who declared the violated type of ``name``.
+
+    A name in this transform's stamp table carries the table's declarer. A
+    name outside it was not declared by this transform: an input field keeps
+    the declaration it arrived with (``upstream``); a created field outside
+    the static table can only have been stamped by the plugin itself
+    (blob_csv_expand's per-emission ``dynamic_created_fields``), because the
+    completeness contract ends the run on any created field without a
+    declared contract.
+    """
+    declared_by = declaring.output_field_declared_by()
+    if name in declared_by:
+        return declared_by[name]
+    return "upstream" if arrived_on_input else "plugin"

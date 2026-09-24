@@ -103,6 +103,13 @@ def _dict_field_spec_invalid_identifier_message(name: str) -> str:
     )
 
 
+# Who declared a transform output field's type (ADR-050, the D6 authorship
+# bit): the pipeline author's schema, or the plugin's own code. Recorded on a
+# DeclaredOutputTypeViolation so the disposition of a plugin breaking its own
+# declaration can tighten later without rework.
+OutputFieldDeclarer = Literal["operator", "plugin"]
+
+
 @dataclass(frozen=True, slots=True)
 class FieldDefinition:
     """Definition of a single field in a schema.

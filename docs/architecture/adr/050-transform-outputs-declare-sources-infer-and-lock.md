@@ -110,25 +110,47 @@ rows meet.**
    completeness contract exempts the same names. A violation raises
    `DeclaredOutputTypeViolation(PluginContractViolation)`, routed through
    `on_error` like every Tier-2 violation, with a reason that carries the
-   field, both type names, the emitted index and an **authorship bit** —
-   `computed` when the transform created the field, `carried` when it
-   rewrote an input field — and never the value. A multi-row emission fails
-   its parent token once. A plugin that returns its own error first
-   (value_transform's `type_mismatch`) emits nothing, so nothing is routed
-   twice. Per the 2026-09-25 ruling a plugin's own computed value breaking
-   its own declared type is ROUTED, recorded as evidence with
-   `authorship: computed`; the bit is what lets that tighten later without
-   rework. The check is ONE module (`engine/executors/declared_output_types`)
-   with two seams that differ only in which fields count as produced: the
-   per-row seam above, and the aggregation/collector flush postflight
+   field, both type names, the emitted index and two bits, never the value:
+   - **`declared_by`** (the amended spec's D6 authorship bit): who declared
+     the violated type — `operator` (the pipeline author's `schema.fields`,
+     or its projection onto a field_mapper rename target), `plugin` (a type
+     the plugin's own code fixes: `created_output_fields()`, a builder-typed
+     output field, a per-emission `dynamic_created_fields` declaration), or
+     `upstream` (an input field declared before this transform, which the
+     transform rewrote). It is read from `output_field_declared_by()`, a
+     projection of the same table the stamp is built from, and it is not
+     stored on `FieldContract`: the node record's shape and `version_hash`
+     do not change for a bit only a violation needs.
+   - **`authorship`**: `computed` when the transform created the field,
+     `carried` when the field arrived on the input row and the transform
+     rewrote its value. It describes the FIELD, not the declaration; an
+     unchanged input value and a `carried_output_fields()` name are never
+     checked, so `carried` never means "passed through".
+
+   `ex_str_int` (json_explode copying an array element into an
+   operator-declared `page: int`) therefore records `declared_by: operator`,
+   `authorship: computed` — the row's data broke the pipeline's declaration —
+   while a batch statistic breaking a type its plugin declares records
+   `declared_by: plugin`. A multi-row emission fails its parent token once. A
+   plugin that returns its own error first (value_transform's
+   `type_mismatch`) emits nothing, so nothing is routed twice. Per the
+   2026-09-25 ruling a plugin's own computed value breaking its own declared
+   type is ROUTED, recorded as evidence with `declared_by: plugin`; that bit
+   is what lets the disposition tighten later without rework. The check is
+   ONE module (`engine/executors/declared_output_types`) with two seams that
+   differ only in which fields count as produced: the per-row seam above, and
+   the aggregation/collector flush postflight
    (`batch_contract_validation.validate_success_outputs`), where the produced
    fields are exactly the created names (`declared_output_fields` and
-   `created_output_fields()`) — a reductive output has no input row, and a
-   passthrough batch output's carried input fields were validated by the
-   buffer preflight — so authorship there is always `computed`. A violation
-   at the flush fails the whole batch through the aggregation's `on_error`,
-   or the collector group with a `collector_contract_violation` verdict,
-   exactly as every other Tier-2 violation of that postflight.
+   `created_output_fields()`), so authorship there is always `computed`. A
+   batch output row has no single input row to detect a rewrite against: the
+   buffer preflight validated a passthrough batch output's carried input
+   VALUES, and a passthrough batch plugin that rewrote one would not be
+   value-checked at the flush. No shipped batch plugin rewrites a carried
+   field (batch_outlier_annotator and batch_replicate only add fields). A
+   violation at the flush fails the whole batch through the aggregation's
+   `on_error`, or the collector group with a `collector_contract_violation`
+   verdict, exactly as every other Tier-2 violation of that postflight.
 6. **The node record never changes type.** `DataFlowRepository.update_node_output_contract`
    folds an emission with `SchemaContract.merge_for_node_evolution` (field
    union, `require_all=False` flags, a type conflict raises). Because every
@@ -257,7 +279,7 @@ rows meet.**
   contract (types fixed; the field set evolves)" for transform nodes; the
   column comment and `execution-graph.md` invariant 6 say so.
 - `docs/guides/data-trust-and-error-handling.md` §Implications: "plugin
-  returns wrong type" is ROUTE-as-PCV (with the authorship bit), and "plugin
+  returns wrong type" is ROUTE-as-PCV (with `declared_by` and `authorship`), and "plugin
   emits a field it never declared" is CRASH.
 - `EXPECTED_CONTRACT_SITES` gains `output_declaration_completeness`.
 
@@ -288,7 +310,9 @@ routes a fact about the RECORD as a fact about the ROW.
 ### End the run when a plugin's own computed value breaks its own declared type
 
 The panel's TD/TS/SA position. Deferred by ruling: routed as a PCV with the
-`authorship` bit recorded, so the tightening can be decided on evidence.
+declarer recorded (`declared_by: plugin`), so the tightening can be decided
+on evidence and applied to exactly that case — never to a value breaking the
+operator's declaration, which is the row's data.
 
 ## Tests and gates
 

@@ -53,7 +53,7 @@ from elspeth.contracts.errors import (
     UndeclaredOutputFieldsViolation,
 )
 from elspeth.contracts.plugin_roles import require_output_declaring_plugin
-from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, OutputFieldDeclarer, SchemaConfig
 from elspeth.contracts.schema_contract import (
     FieldContract,
     PipelineRow,
@@ -185,6 +185,9 @@ class OutputDeclarationCompletenessContract(DeclarationContract):
             def carried_output_fields(self) -> frozenset[str]:
                 return frozenset()
 
+            def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]:
+                return {}
+
         inputs = PostEmissionInputs(
             plugin=_MinimalTransform(),
             node_id="output-declaration-neg-1",
@@ -213,6 +216,9 @@ class OutputDeclarationCompletenessContract(DeclarationContract):
 
             def carried_output_fields(self) -> frozenset[str]:
                 return frozenset()
+
+            def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]:
+                return {}
 
         inputs = PostEmissionInputs(
             plugin=_NonApplyingTransform(),

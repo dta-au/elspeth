@@ -484,6 +484,7 @@ DIAGNOSTIC_CASES = (
             "actual_type": "str",
             "emitted_index": 0,
             "authorship": "computed",
+            "declared_by": "plugin",
         },
         {
             "transform": ("transform-alpha", "transform-omega"),
@@ -492,6 +493,7 @@ DIAGNOSTIC_CASES = (
             "actual_type": ("str", "bool"),
             "emitted_index": (0, 2),
             "authorship": ("computed", "carried"),
+            "declared_by": ("operator", "upstream"),
         },
     ),
     *_structured_cases(
