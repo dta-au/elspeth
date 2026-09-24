@@ -1,8 +1,10 @@
 # Independent review follow-up sweep — 0.8.1
 
-**Ready for review.** The final six-stage gate records `RESULT=PASS` and
+**Merged locally to `release/0.8.1`.** Independent review, repairs, and current
+validation are recorded in the final section below. Earlier sections describe
+the original review handoff, whose six-stage gate records `RESULT=PASS` and
 `frozen=yes`; the deliberate lint-corpus exception is documented below.
-The sweep has not been merged into release or pushed. This report follows all ten
+At that original handoff the sweep had not been merged or pushed. This report follows all ten
 items in `sweep-prompt.md` and the complete `fix-review-consolidated.md`, including
 the re-review at `1f500c6ae`.
 
@@ -327,7 +329,7 @@ PostgreSQL's separate completed selection covers the required F10 database gate.
 The script treats the deliberate lint corpus as nonfatal; its PASS does not mean
 the lint command passed or that operator HMAC signatures were verified.
 
-## Delivery state
+## Original delivery state (historical)
 
 Branch: `fix/review-sweep-20260925`. Final verified code/test head:
 `2f1507616cc33bbb4dca586fc822ab959896876f`. The final delivery commit adds only this
@@ -336,7 +338,7 @@ report after the frozen gate; resolve its identity with
 The delivery commit is reported in the handoff alongside this report's path.
 All integrated implementation commits listed above and the repair bundle were
 rechecked with `git merge-base --is-ancestor <commit> HEAD`: every exit was 0.
-No sweep merge into release or push was performed. Later release fixes listed
+No sweep merge into release or push had been performed at that handoff. Later release fixes listed
 above still require normal integration review when the maintainer lands this
 branch; the gate certifies the recorded review candidate, not that future merge.
 
@@ -350,3 +352,67 @@ available. Release subsequently records the deliberate local tracker retirement
 in `d479eb2b4`. The shared tracker was not recreated. Consequently, this report does
 not claim a final tracker transition; branch commits and gate logs are the
 delivery evidence.
+
+## Independent review and local integration — 2026-09-25
+
+The sweep and review repairs were fast-forwarded into local `release/0.8.1` at
+`2e964f1aec41aa8b918443df0444649e100d530e`. The original delivery commit
+`5fcd15093`, frozen integration candidate `610cffa50`, and final inventory repair
+`2e964f1ae` were each measured ancestors of release (all exit 0). The existing
+138 dirty/untracked files captured immediately before landing were unchanged
+byte-for-byte afterward. Nothing was pushed or deployed. This subsequent
+report-only commit does not change the validated production tree.
+
+Independent review found one remaining P2: authored export settings accepted v2
+although the export contract requires v3. Commit `04d5c682e` restricts the settings
+field to `Literal["audit-export-v3"]`; programmatic and CLI rejection controls
+failed before the fix and passed afterward. The full affected selection passed
+358 tests. Canonical rejection-inventory repair `6172ed956` removes the obsolete
+min/max constraint entry; all 12 parity tests, including mutation controls, pass.
+
+Release advanced during review with substantial Composer, DAG type-proof and
+session-schema changes. The final combination includes release `1fb39f26b`.
+Canonical producers regenerated the overlapping DAG settings/checkpoint/registry
+hashes; controls reproduce both prior sides, and 39 production/checkpoint/control
+tests pass. Three moved connection locations were refreshed without changing the
+scanner. Additional combined checks passed 489 runtime/batch/template tests,
+401 template/CLI tests, and the replay/verify walkthrough.
+
+An earlier combined gate exposed a scheduler contention fixture timeout. Commit
+`610cffa50` preserves unpaced writes during the measurement window, yields only
+while waiting for later peer progress, records failed acquisition timing and
+fixture expiry writes, and attributes expiry failures correctly. All original
+zero-error, latency and progress assertions remain. Eight tests, including the
+30-second three-process soak, pass; isolated mutations of post-window yielding,
+failed-call timing, active-window pacing and expiry attribution each fail. The
+captured timing supports a fixture starvation risk; unavailable original temporary
+artifacts prevent a definitive reconstruction of that one timeout.
+
+Final canonical gate on `610cffa508dc52462c1ccf9d4703334f55505055`:
+`/tmp/sweep-astra-current-final/20260924T230411Z-sweep-final-integration-20260925-1999090/summary.txt`.
+
+```text
+stage=ruff exit=0
+stage=mypy exit=0
+stage=contracts exit=0
+stage=lints exit=1 findings=2363
+stage=pytest exit=1 1 failed, 58339 passed, 100 skipped, 2 xfailed
+stage=testcontainer exit=0 571 passed, 1 skipped
+frozen=yes
+RESULT=FAIL
+```
+
+The sole final Python failure was the latest release's intentional historical
+state-corruption fixture missing from its exact reviewed writer inventory. The
+same failure was reproduced on release baseline `8191240be` (the later release
+commit is documentation-only). Commit `2e964f1ae` adds exactly one justified
+`count=1` test-fixture entry. All 17 scanner/fixture tests pass; duplicate-insert
+and removed-insert controls still report surplus and stale entries. Its diff is
+one test file only, with no production or scanner changes. This bounded repair was
+verified separately; the canonical gate above remains red and is not represented
+as a green full-suite rerun. PostgreSQL passed on the identical production tree.
+
+The controlled full lint-corpus comparison against the latest release baseline
+is 2362 to 2363: exactly the previously documented owned-`LoadedState` R5 and zero
+removals. No signatures or suppressions were edited. The deliberate fail-closed
+lint status remains; operator HMAC verification is not claimed.
