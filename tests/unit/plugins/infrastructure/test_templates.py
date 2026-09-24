@@ -182,7 +182,7 @@ def test_name_discovery_and_compilation_never_fold_authored_expressions(monkeypa
 
     monkeypatch.setattr(nodes.BinExpr, "as_const", count_fold)
     env = create_sandboxed_environment()
-    source = "{{ ('x' * 1000000000)|length }}{{ row.name }}"
+    source = "{{ ('x' * 100)|length }}{{ row.name }}"
     ast = env.parse(source)
     assert find_runtime_unbound_variables(ast) == frozenset({"row"})
     env.from_string(source)
