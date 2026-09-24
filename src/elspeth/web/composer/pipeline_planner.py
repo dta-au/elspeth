@@ -58,6 +58,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
@@ -142,7 +143,7 @@ from elspeth.web.composer.state import (
     gate_condition_is_constant,
     route_destination_facts,
 )
-from elspeth.web.composer.tool_error_payloads import wire_argument_repair_message
+from elspeth.web.composer.tool_error_payloads import INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, wire_argument_repair_message
 from elspeth.web.composer.tools._common import (
     COMPONENTS_WITHHELD_KEY,
     PendingCustodyBlobView,
@@ -193,6 +194,8 @@ _CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
 _AID_SUPPLIED_INFORMATION_KEYS: Final[frozenset[str]] = frozenset({"model.catalog", "expression.grammar"})
 _FULL_STATE_ALIASES: Final[frozenset[str]] = frozenset({"", "all", "full", "pipeline"})
 _ALL_INFORMATION_GAPS_CLOSED_NOTICE: Final[str] = "All declared information gaps are closed; emit the terminal proposal now."
+_ARGUMENT_REJECTION_HINT_AFTER: Final[int] = 3
+_MAX_CONSECUTIVE_ARGUMENT_REJECTIONS: Final[int] = 6
 
 
 def _valid_information_key(key: str) -> bool:
@@ -1951,7 +1954,14 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
             {
                 "id": call.call_id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": call.raw_arguments},
+                "function": {
+                    "name": call.name,
+                    "arguments": canonical_json(
+                        {"_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, "error_class": "ToolArgumentError"}
+                    )
+                    if call.wire_error is not None
+                    else call.raw_arguments,
+                },
             }
             for call in calls
         ],
@@ -3908,6 +3918,9 @@ async def _plan_pipeline_inner(
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
     no_gain_calls_in_round = 0
+    argument_retry = AntiAnchorTracker()
+    last_argument_failure: tuple[str, str] | None = None
+    consecutive_argument_failures = 0
     # Account for selected plugin contracts as the exact canonical aggregate
     # supplied to the planner, including the enclosing list and separators.
     # Summing each contract independently creates a small but real gap at the
@@ -5064,6 +5077,9 @@ async def _plan_pipeline_inner(
             seen_discovery.clear()
             seen_discovery_round = repair_count
             no_gain_calls_in_round = 0
+            argument_retry.record_success()
+            last_argument_failure = None
+            consecutive_argument_failures = 0
         information_keys = {call.call_id: planner_discovery_information_keys(call) for call in calls}
         no_gain_calls = tuple(
             call
@@ -5305,12 +5321,22 @@ async def _plan_pipeline_inner(
                     else:
                         selected_schema_contracts.append(contract_payload)
             if information_resolved:
+                # A non-argument outcome breaks the rejection sequence. In
+                # particular, a successful sibling in this authored batch
+                # prevents an earlier rejection from poisoning its retry.
+                argument_retry.record_success()
+                last_argument_failure = None
+                consecutive_argument_failures = 0
                 information_manifest = information_manifest.with_result(
                     information_keys[call.call_id],
                     available=information_available,
                 )
                 new_information.extend(_planner_information_classes(newly_covered_keys))
             else:
+                failure = (call.name, stable_hash(call.arguments))
+                consecutive_argument_failures = consecutive_argument_failures + 1 if failure == last_argument_failure else 1
+                last_argument_failure = failure
+                argument_retry.record_failure(*failure)
                 # An argument error resolves nothing, so the call's keys are
                 # rolled back to exactly what they were before it was seen:
                 # its keys entered pending BEFORE dispatch, and a key minted
@@ -5327,6 +5353,30 @@ async def _plan_pipeline_inner(
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         if next(discovery_results, None) is not None:
             raise AuditIntegrityError("planner discovery produced an unowned result")
+        if consecutive_argument_failures >= _MAX_CONSECUTIVE_ARGUMENT_REJECTIONS:
+            # The first three errors earn the shared structural hint. Three
+            # more identical errors without progress exhaust this repair
+            # attempt independently of the broader discovery-turn budget.
+            trail.finish_attempt(
+                "discovery",
+                "guard_fired",
+                planner_code="DISCOVERY_CYCLE",
+                led_to="hatch" if _hatch_available() else "terminal",
+                tool_calls=len(calls),
+            )
+            argument_cycle_error = PipelinePlannerError(
+                "planner repeated identical rejected tool arguments without progress", code="DISCOVERY_CYCLE"
+            )
+            if _hatch_available():
+                _engage_escape_hatch(argument_cycle_error)
+                continue
+            raise argument_cycle_error
+        # Only reuse the identical-failure hint. The composer's drift hint
+        # recommends mutation tools that this read-only planner cannot call.
+        retry_hint = argument_retry.next_hint() if consecutive_argument_failures >= _ARGUMENT_REJECTION_HINT_AFTER else None
+        if retry_hint is not None:
+            messages.append({"role": "user", "content": retry_hint})
+            argument_retry.consume_fire()
         discovery_policy = discovery_policy.with_manifest(information_manifest)
         tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect, terminal_contract=terminal_contract)
         trail.finish_attempt(
