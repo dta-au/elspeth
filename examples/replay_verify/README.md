@@ -173,9 +173,9 @@ The code also refuses the following. `run.sh` does not exercise these:
   telemetry exporters and Key Vault secrets.
 - A source run that did not complete, or a changed graph, plugin version or
   plugin source file.
-- Plugins outside the reviewed built-in inventory. Every shipped built-in
-  plugin is in that inventory. A third-party plugin is refused even if it
-  reuses a built-in name.
+- Plugins outside the reviewed built-in inventory. At 0.8.1, every plugin
+  that `elspeth plugins list` reports is in that inventory. A third-party
+  plugin is refused even if it reuses a built-in name.
 - Payloads or call evidence from the recorded run that are missing or have
   been tampered with.
 - `elspeth resume` of a replay or verify run.
