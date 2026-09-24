@@ -23,7 +23,10 @@ provider. It is derived from S once, at import, by one pure walk per
   - keywords outside ``WIRE_KEYWORD_ALLOWLIST`` move to a ledger and are
     rendered as description text from a closed template map;
   - the 6 descriptions that tell the model to *omit* a now-required key are
-    rewritten to say "pass null" (``_STRICT_DESCRIPTION_OVERRIDES``).
+    rewritten to say "pass null" (``_STRICT_DESCRIPTION_OVERRIDES``);
+  - a parameterless tool carries exactly ``{"_elspeth_no_arguments": true}``
+    on the wire. Its dedicated decode node validates this framing before
+    returning the empty semantic object; MCP and NONE keep ``{}``.
 
   The 10 option-bearing tools keep their ``none`` parameters, and the wire
   list stamps them ``strict: false``.
@@ -34,10 +37,10 @@ faithful to S stops web boot rather than reaching a provider.
 
 It also owns the way back. :func:`decode_wire_arguments` classifies the
 provider's arguments against the W that was sent (``wire_conformant``),
-unwraps the set_pipeline envelope (its one rejection), and on
+unwraps the set_pipeline envelope and the exact empty-argument marker, and on
 ``openai_strict`` turns a ``null`` at a promoted position back into the
-omission S expects. It never admits or rejects on W: S stays the only
-contract. :func:`encode_semantic_arguments` is the inverse of the envelope.
+omission S expects. Framing is validated before decoding; S stays the
+semantic contract. :func:`encode_semantic_arguments` is the inverse framing.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ from elspeth.web.composer.tools.strict_profile import StrictViolationKind, check
 __all__ = [
     "OPENAI_STRICT_LIMITS",
     "DecodedArguments",
+    "EmptyArgumentsMarker",
     "EnvelopeUnwrap",
     "LedgerEntry",
     "StripNull",
@@ -109,7 +113,14 @@ class StripNull:
     path: tuple[str, ...]
 
 
-DecodeNode = EnvelopeUnwrap | StripNull
+@dataclass(frozen=True, slots=True)
+class EmptyArgumentsMarker:
+    """A required true wire marker represents the one empty semantic object."""
+
+    key: str = "_elspeth_no_arguments"
+
+
+DecodeNode = EnvelopeUnwrap | StripNull | EmptyArgumentsMarker
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +522,16 @@ def project_tool(
     if orphaned:
         raise WireProjectionError(f"{name}: ledger text has no description to render into")
     description = " ".join([definition["description"], *projection.tool_sentences])
+    marker: EmptyArgumentsMarker | None = None
+    if "properties" in flat and flat["properties"] == {}:
+        # The deployed forwarding route cannot generate an empty object
+        # reliably, even with strict false or the per-tool stamp omitted.
+        # This closed wire-only marker gives its grammar a token to emit;
+        # decode admits exactly this framing and the semantic tool stays {}.
+        marker = EmptyArgumentsMarker()
+        parameters["properties"] = {marker.key: {"type": "boolean", "enum": [True]}}
+        parameters["required"] = [marker.key]
+        description += ' This tool takes no semantic arguments. Call it with {"_elspeth_no_arguments": true} exactly.'
     function = {"name": name, "description": description, "parameters": parameters}
     _apply_overrides(function, name, overrides)
     rows = check_openai_strict(parameters, tool=name)
@@ -522,7 +543,7 @@ def project_tool(
         dialect=dialect,
         function=function,
         strict_capable=True,
-        decode_plan=tuple(projection.strip),
+        decode_plan=(marker,) if marker is not None else tuple(projection.strip),
         ledger=tuple(projection.ledger),
         promoted_paths=frozenset(node.path for node in projection.strip),
     )
@@ -645,6 +666,17 @@ def assert_wire_projection_faithful(
         rows = check_openai_strict(function["parameters"], tool=name)
         if rows:
             raise WireProjectionError(f"{name}: strict-capable W fails the strict checker")
+        marker_nodes = tuple(node for node in tool.decode_plan if type(node) is EmptyArgumentsMarker)
+        parameterless = "properties" in flat and flat["properties"] == {}
+        if parameterless:
+            marker = EmptyArgumentsMarker()
+            expected_parameters = deepcopy(flat)
+            expected_parameters["properties"] = {marker.key: {"type": "boolean", "enum": [True]}}
+            expected_parameters["required"] = [marker.key]
+            if tool.decode_plan != (marker,) or not _same_json(function["parameters"], expected_parameters):
+                raise WireProjectionError(f"{name}: empty-argument marker does not match its semantic contract")
+        elif marker_nodes:
+            raise WireProjectionError(f"{name}: empty-argument marker requires a parameterless semantic contract")
         # Checks 2 and 3: requiredness and nullability follow S.
         failures = list(_requiredness_failures(tool, flat, function["parameters"], ()))
         if failures:
@@ -887,12 +919,13 @@ def _strip_null(arguments: dict[str, Any], path: tuple[str, ...]) -> None:
     suppresses=("R1", "R5"),
     invariant=(
         "raises ToolArgumentError (category wire_envelope) before use when set_pipeline arguments are not exactly "
-        "one 'pipeline' object field; never rejects on W, which is classified as wire_conformant only; removes a "
+        "one 'pipeline' object field, or a parameterless strict call lacks its exact true marker; "
+        "other W failures are classified as wire_conformant only; removes a "
         "null only at a promoted position on openai_strict and never inserts, coerces or recurses into an "
         "undeclared key"
     ),
-    test_ref="tests/unit/web/composer/test_wire_decode.py::test_decode_rejects_a_malformed_set_pipeline_envelope",
-    test_fingerprint="47b22a3ef9296ebe6e0f2070c36202350754f4a371ce89d1faab81c2c9913c1b",
+    test_ref="tests/unit/web/composer/test_wire_decode.py::test_decode_rejects_malformed_framing_and_preserves_null_semantics",
+    test_fingerprint="daa6da2a616fe8cfabf8b9b1185ec35e56a8082e32836f63f6703982bba7dcf7",
 )
 def decode_wire_arguments(tool_name: str, dialect: ToolContractDialect, raw: dict[str, Any]) -> DecodedArguments:
     """Decode provider arguments sent under ``dialect`` into S's semantic form.
@@ -901,8 +934,10 @@ def decode_wire_arguments(tool_name: str, dialect: ToolContractDialect, raw: dic
        sent. Classification only.
     2. ``EnvelopeUnwrap``: set_pipeline arguments must be exactly
        ``{"pipeline": <object>}``, or :class:`ToolArgumentError` (category
-       ``wire_envelope``) is raised. This is decode's only rejection.
-    3. ``StripNull`` (``openai_strict`` only): a ``null`` at a promoted
+       ``wire_envelope``) is raised.
+    3. ``EmptyArgumentsMarker``: exactly the declared true marker decodes
+       to ``{}``; missing, extra or different values raise ``wire_envelope``.
+    4. ``StripNull`` (``openai_strict`` only): a ``null`` at a promoted
        position becomes an omitted key.
 
     Callers decode only a tool name that was in the list sent on that call;
@@ -914,6 +949,15 @@ def decode_wire_arguments(tool_name: str, dialect: ToolContractDialect, raw: dic
     wire_conformant = next(iter(_WIRE_VALIDATORS[dialect][tool_name].iter_errors(raw)), None) is None
     semantic: dict[str, Any] = deepcopy(raw)
     for node in tool.decode_plan:
+        if type(node) is EmptyArgumentsMarker:
+            if set(semantic) != {node.key} or semantic[node.key] is not True:
+                raise ToolArgumentError(
+                    argument=f"{tool_name} arguments",
+                    expected="an object conforming to the declared argument schema",
+                    actual_type="invalid_schema",
+                    category=ToolArgumentErrorCategory.WIRE_ENVELOPE,
+                )
+            semantic = {}
         if type(node) is EnvelopeUnwrap:
             if set(semantic) != {node.key} or type(semantic[node.key]) is not dict:
                 raise ToolArgumentError(
@@ -931,14 +975,18 @@ def decode_wire_arguments(tool_name: str, dialect: ToolContractDialect, raw: dic
 
 
 def encode_semantic_arguments(tool_name: str, dialect: ToolContractDialect, semantic: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the wire form of semantic arguments: the inverse of the envelope only.
+    """Return the wire framing of semantic arguments.
 
-    set_pipeline becomes ``{"pipeline": semantic}``; every other tool is
-    returned unchanged (as a fresh plain-JSON copy) on both dialects.
+    set_pipeline becomes ``{"pipeline": semantic}``; strict parameterless
+    tools emit their true marker. Other tools return a fresh unchanged copy.
     """
     tool = _sent_wire_tool(tool_name, dialect)
     arguments = cast(dict[str, Any], deep_thaw(semantic))
     for node in tool.decode_plan:
+        if type(node) is EmptyArgumentsMarker:
+            if arguments:
+                raise WireProjectionError("parameterless wire encoding requires empty semantic arguments")
+            return {node.key: True}
         if type(node) is EnvelopeUnwrap:
             return {node.key: arguments}
     return arguments

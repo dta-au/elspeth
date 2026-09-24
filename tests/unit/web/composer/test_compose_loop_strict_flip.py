@@ -38,6 +38,7 @@ from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerO
 from elspeth.web.composer.pipeline_proposal import PresentBase
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import GuidedOperationFence
 from tests.helpers.session_fences import fenced_operation_context
@@ -222,9 +223,14 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
         )
         requests: list[dict[str, Any]] = []
 
-        async def completion(*, _requests: list[dict[str, Any]] = requests, **kwargs: Any) -> Any:
+        async def completion(
+            *,
+            _requests: list[dict[str, Any]] = requests,
+            _dialect: ToolContractDialect = service._planner_dialect,
+            **kwargs: Any,
+        ) -> Any:
             _requests.append(kwargs)
-            return _response(("list_sources", {}))
+            return _response(("list_sources", encode_semantic_arguments("list_sources", _dialect, {})))
 
         monkeypatch.setattr("litellm.acompletion", completion)
         with pytest.raises(PipelinePlannerError):

@@ -1,5 +1,17 @@
 # Composer planner: strict tool contracts — implementation plan
 
+**2026-09-25 parameterless wire correction:** the strict loop partition remains
+**32 true / 10 false**. The ten parameterless strict tools now use the exact
+wire object `{"_elspeth_no_arguments": true}`; a dedicated decode node rejects
+missing, extra or differently typed marker values before returning semantic
+`{}`. Their NONE and MCP argument schemas remain unchanged. Live controls on
+the deployed DeepSeek/Together route showed that changing only their strict
+stamp to false or omitting that stamp while other tools remained strict did
+not repair empty-object calls. The full 42-tool marker control succeeded for
+both preview and blob discovery. This supersedes the original assumption that
+strict parameterless calls can be emitted as `{}`. No model-authored key names
+are persisted. Rollback remains `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
+
 - **Date:** 2026-09-23
 - **Goal (John):** "ultimately we want a strict contract for every tool call" made by the Web Composer planner.
 - **Status:** S0 implemented and merged into local `release/0.8.1` (`85ebf2739`); S0 acceptance items 2, 4 and 5

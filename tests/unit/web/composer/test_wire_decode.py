@@ -49,6 +49,81 @@ from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, exec
 NONE = ToolContractDialect.NONE
 STRICT = ToolContractDialect.OPENAI_STRICT
 
+_PARAMETERLESS_TOOLS = (
+    "list_blobs",
+    "list_composer_blobs",
+    "list_sources",
+    "get_expression_grammar",
+    "get_audit_info",
+    "preview_pipeline",
+    "diff_pipeline",
+    "list_transforms",
+    "list_sinks",
+    "list_secret_refs",
+)
+
+
+@pytest.mark.parametrize("tool", _PARAMETERLESS_TOOLS)
+def test_parameterless_marker_round_trip_is_strict_only(tool: str) -> None:
+    wire = {"_elspeth_no_arguments": True}
+    assert encode_semantic_arguments(tool, STRICT, {}) == wire
+    decoded = decode_wire_arguments(tool, STRICT, wire)
+    assert decoded.wire_conformant is True
+    assert _semantic(decoded) == {}
+    require_schema_valid_arguments(tool, _semantic(decoded))
+    assert encode_semantic_arguments(tool, NONE, {}) == {}
+    assert decode_wire_arguments(tool, NONE, {}).wire_conformant is True
+    # The marker is wire framing, never a new semantic or MCP argument.
+    with pytest.raises(ToolArgumentError):
+        require_schema_valid_arguments(tool, wire)
+
+
+@pytest.mark.parametrize("tool", _PARAMETERLESS_TOOLS)
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},
+        {"_elspeth_no_arguments": False},
+        {"_elspeth_no_arguments": 1},
+        {"_elspeth_no_arguments": None},
+        {"_elspeth_no_arguments": "true"},
+        {"_elspeth_no_arguments": True, "x": 1},
+        {"x": 1},
+    ],
+)
+def test_parameterless_marker_rejects_every_noncanonical_shape(tool: str, raw: dict[str, Any]) -> None:
+    with pytest.raises(ToolArgumentError) as info:
+        decode_wire_arguments(tool, STRICT, raw)
+    assert info.value.category is ToolArgumentErrorCategory.WIRE_ENVELOPE
+
+
+@pytest.mark.parametrize("tool", _PARAMETERLESS_TOOLS)
+def test_parameterless_encode_refuses_to_hide_nonempty_semantic_arguments(tool: str) -> None:
+    with pytest.raises(WireProjectionError):
+        encode_semantic_arguments(tool, STRICT, {"x": 1})
+
+
+@pytest.mark.parametrize(
+    ("tool", "dialect", "raw"),
+    [
+        ("set_pipeline", NONE, {}),
+        ("set_pipeline", STRICT, {"pipeline": 1}),
+        ("preview_pipeline", STRICT, {}),
+        ("preview_pipeline", STRICT, {"_elspeth_no_arguments": 1}),
+        ("preview_pipeline", STRICT, {"_elspeth_no_arguments": True, "x": 1}),
+    ],
+)
+def test_decode_rejects_malformed_framing_and_preserves_null_semantics(
+    tool: str, dialect: ToolContractDialect, raw: dict[str, Any]
+) -> None:
+    with pytest.raises(ToolArgumentError):
+        decode_wire_arguments(tool, dialect, raw)
+    assert _semantic(decode_wire_arguments("preview_pipeline", STRICT, {"_elspeth_no_arguments": True})) == {}
+    assert _semantic(decode_wire_arguments("list_models", STRICT, {"provider": None, "limit": None})) == {}
+    assert _semantic(decode_wire_arguments("list_models", NONE, {"provider": None})) == {"provider": None}
+    assert _semantic(decode_wire_arguments("list_models", STRICT, {"provider": None, "x": None})) == {"x": None}
+
+
 # One minimal S-valid call for each of the 32 strict-capable tools: the
 # flat-required keys only. The promoted positions are filled from
 # ``_PROMOTED_VALUES`` below.
@@ -256,7 +331,7 @@ def test_decode_never_rejects_on_a_w_failure() -> None:
 @pytest.mark.parametrize("tool", sorted(_SEEDS))
 def test_a_full_call_is_conformant_on_both_dialects(tool: str) -> None:
     for dialect in (NONE, STRICT):
-        decoded = decode_wire_arguments(tool, dialect, _full_call(tool))
+        decoded = decode_wire_arguments(tool, dialect, encode_semantic_arguments(tool, dialect, _full_call(tool)))
         assert decoded.wire_conformant is True
         assert _semantic(decoded) == _full_call(tool)
 
@@ -337,8 +412,10 @@ def test_envelope_round_trip(dialect: ToolContractDialect) -> None:
 
 
 @pytest.mark.parametrize("dialect", [NONE, STRICT])
-def test_encode_returns_other_tools_unchanged(dialect: ToolContractDialect) -> None:
+def test_encode_returns_non_parameterless_tools_unchanged(dialect: ToolContractDialect) -> None:
     for tool in sorted(_SEEDS):
+        if dialect is STRICT and tool in _PARAMETERLESS_TOOLS:
+            continue
         assert encode_semantic_arguments(tool, dialect, _full_call(tool)) == _full_call(tool)
 
 
