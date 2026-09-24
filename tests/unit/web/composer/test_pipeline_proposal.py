@@ -519,7 +519,13 @@ def test_envelope_defines_no_duplicate_topology_dataclasses_or_rationale() -> No
     assert "why" not in PipelineProposal.__slots__
 
 
-def test_composition_content_hash_exactly_matches_moved_legacy_preimage() -> None:
+def test_composition_content_hash_exactly_matches_the_ordered_sources_preimage() -> None:
+    """The preimage is the content fields with ``sources`` as an ordered pair array.
+
+    ``version`` and ``composer_meta`` stay excluded; the ``sources`` map is the
+    Composer authority projection (``composer.ordered-sources.v1``).
+    """
+
     class _State:
         # Real CompositionState instances always carry the memo slot; the
         # stand-in models that contract so the preimage pin exercises the
@@ -539,16 +545,16 @@ def test_composition_content_hash_exactly_matches_moved_legacy_preimage() -> Non
 
     state = _State()
     state_d = state.to_dict()
-    legacy_hash = stable_hash(
+    expected_hash = stable_hash(
         {
-            "sources": state_d["sources"],
+            "sources": {"schema": "composer.ordered-sources.v1", "items": [["main", {"plugin": "csv"}]]},
             "nodes": state_d["nodes"],
             "edges": state_d["edges"],
             "outputs": state_d["outputs"],
             "metadata": state_d["metadata"],
         }
     )
-    assert composition_content_hash(state) == legacy_hash
+    assert composition_content_hash(state) == expected_hash
 
 
 @pytest.mark.parametrize("pipeline", [[], {"nodes": float("nan")}])

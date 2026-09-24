@@ -359,7 +359,11 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # 66: control-message v2 binds origin and provider role alongside content.
 #     Semantic JSON cut: reject v1 histories at startup; no migration or replay
 #     fallback to the content-only checksum. Pre-1.0 delete/recreate.
-SESSION_SCHEMA_EPOCH = 66
+# 67: the composer authority projection binds coalesce mapping-branch order and
+#     multi-source ``sources`` order, and the advisor fingerprint binds both;
+#     stored draft, content, private-argument, dispatch-binding and fingerprint
+#     preimages changed. Pre-1.0 delete/recreate, no legacy path.
+SESSION_SCHEMA_EPOCH = 67
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

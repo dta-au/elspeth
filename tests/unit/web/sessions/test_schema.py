@@ -363,7 +363,9 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 binds control-message provenance in the v2 checksum; v1 rows
     # must be rejected at startup rather than during conversation replay.
-    assert SESSION_SCHEMA_EPOCH == 66
+    # Epoch 67 binds coalesce branch order and sources order in the composer
+    # authority hashes; stored epoch-66 preimages cannot be re-verified.
+    assert SESSION_SCHEMA_EPOCH == 67
     expected_tables = frozenset(
         {
             "web_instances",
