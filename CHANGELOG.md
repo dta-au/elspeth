@@ -2668,7 +2668,7 @@ Moved `SourceProtocol`, `TransformProtocol`, `SinkProtocol`, `BatchTransformProt
 ### Removed
 
 - Gate plugin subsystem — routing is now config-driven only
-- Beads (bd) issue tracker — migrated to Filigree
+- Beads (bd) issue tracker — migrated to legacy issue tracker
 - V1 test suite (7,487 tests, 222K lines) — replaced by v2
 - Dead plugin protocols (CoalesceProtocol, GateProtocol, PluginProtocol)
 

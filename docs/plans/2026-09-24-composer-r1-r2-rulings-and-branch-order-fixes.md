@@ -89,7 +89,7 @@ Three work items, in this order:
 
 ### 1.4 Out of scope: recorded here, not fixed
 
-**Filigree was unreachable in this session (the MCP connect timed out), so no ticket was filed for any of these.
+**legacy issue tracker was unreachable in this session (the MCP connect timed out), so no ticket was filed for any of these.
 The lead files them.**
 
 1. **The durable execution envelope alphabetises order-semantic maps before every web run (a live defect, and the

@@ -24,7 +24,7 @@ The immediate objective is therefore:
 
 ## Hard-gate implementation defects
 
-| Priority | Defect | Consequence | Existing Filigree owner |
+| Priority | Defect | Consequence | Existing legacy issue tracker owner |
 | --- | --- | --- | --- |
 | P1 | Normal dispositions accept sink-redrive LEASED rows | A redrive can take an invalid disposition and retain stale sink metadata. | `elspeth-f8f9272b68` |
 | P1 | `claim_pending_sink` accepts an incomplete PENDING_SINK subtype | Malformed durable work becomes leased and ambiguous. | `elspeth-d8e172676c` |

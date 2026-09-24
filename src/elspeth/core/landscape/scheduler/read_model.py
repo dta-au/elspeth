@@ -3,7 +3,7 @@
 Read-only aggregation queries plus the shared quiescence/unresolved
 predicates the engine's invariant checks are built on. No writes, no
 events. Extracted from ``TokenSchedulerRepository``
-(filigree elspeth-ef9c36d767).
+(archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

@@ -599,13 +599,13 @@ session affinity is NOT qualified; `deploy/kubernetes/base/service.yaml` keeps
 
 | Surface | Test | Assertion text (verbatim from the log) | Owner |
 | --- | --- | --- | --- |
-| <run replay / ticket single-use / composer in-flight / latest snapshot / Service scatter> | `<test id>` | `<the failing assert line and its message>` | filigree ticket id, filed with the log path |
+| <run replay / ticket single-use / composer in-flight / latest snapshot / Service scatter> | `<test id>` | `<the failing assert line and its message>` | legacy issue tracker ticket id, filed with the log path |
 
 Nothing in `deploy/` changes until every row above is closed and this entry
 is replaced with the §5.2 pass entry by the task that closes it.
 ```
 
-Fill the table from `/tmp/k8s-K7-step4.log`; one row per failing surface; file one filigree ticket per row (`filigree create` with the log path in the description) and put its id in the Owner column. Leave `service.yaml`, `test_kubernetes_bundle.py` and `ingress.yaml` untouched. The K7 tests stay in the file as written — a residual is a red the lane must keep reporting, not a test to delete or xfail.
+Fill the table from `/tmp/k8s-K7-step4.log`; one row per failing surface; file one legacy issue tracker ticket per row (archived tool command with the log path in the description) and put its id in the Owner column. Leave `service.yaml`, `test_kubernetes_bundle.py` and `ingress.yaml` untouched. The K7 tests stay in the file as written — a residual is a red the lane must keep reporting, not a test to delete or xfail.
 
 - [ ] **Step 6: Commit (one of the two, by file pathspec — message BEFORE the separator, never a directory).**
 

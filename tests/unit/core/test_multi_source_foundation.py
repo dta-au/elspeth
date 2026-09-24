@@ -1475,7 +1475,7 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
     that fails CAS in ``mark_terminal`` / ``mark_pending_sink`` / ``mark_blocked``
     and kills the run with ``AuditIntegrityError``.
 
-    Filigree elspeth-941f1508f5.
+    archived issue elspeth-941f1508f5.
     """
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository, TokenWorkStatus
@@ -1594,7 +1594,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
     UPDATE, the UPDATE matches 0 rows and ``recovered`` returns 0; without the
     fix, ``recovered`` returns 1 and the peer's lease is destroyed.
 
-    Filigree elspeth-28aaa36a62 (G1 P2).
+    archived issue elspeth-28aaa36a62 (G1 P2).
     """
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository, TokenWorkStatus
@@ -1687,7 +1687,7 @@ def test_scheduler_recover_expired_leases_reaps_null_owner_wedged_row() -> None:
     Such rows represent a Tier-1 invariant violation we want to *recover from*,
     not leak. The OR-NULL predicate makes them recoverable.
 
-    Filigree elspeth-28aaa36a62 (G1 P2, adjacent embedded-database-reviewer fix).
+    archived issue elspeth-28aaa36a62 (G1 P2, adjacent embedded-database-reviewer fix).
     """
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository, TokenWorkStatus
@@ -3132,7 +3132,7 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
 
 
 # =============================================================================
-# Lease heartbeat primitive (ADR-026 RC6 multi-worker, filigree elspeth-ddde8144b6)
+# Lease heartbeat primitive (ADR-026 RC6 multi-worker, archived issue elspeth-ddde8144b6)
 # =============================================================================
 # A worker mid-processing extends its own ``lease_expires_at`` periodically so
 # a peer's ``recover_expired_leases`` sweep does NOT reap an alive-but-slow

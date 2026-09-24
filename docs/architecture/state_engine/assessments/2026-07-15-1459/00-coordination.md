@@ -17,7 +17,7 @@
   1 results with read-only Wave 2 reconnaissance, deduplicate live tracker
   ownership, and write the smallest-first test/remediation sequence.
 - **Mutation boundary:** Documentation under `docs/architecture/state_engine/`
-  only. No source, tests, Filigree state, existing DAG assessment files, or
+  only. No source, tests, legacy issue tracker state, existing DAG assessment files, or
   existing documentation index edits are changed by this assessment.
 
 ## Completion rule applied
@@ -47,7 +47,7 @@ See [completeness criteria](../../completeness-criteria.md).
   `31a06b16d32c6d94ac98f288f72f55474225730e`.
 - 2026-07-15: Completed Wave 1 and committed its executed evidence ledger at
   `0dcd61acaa44082d93ec205683700e798748ee6d`.
-- 2026-07-15: Reconciled Wave 2 production paths, tests, and live Filigree
+- 2026-07-15: Reconciled Wave 2 production paths, tests, and live legacy issue tracker
   ownership without editing source, tests, or tracker state.
 - 2026-07-15: Confirmed the read-model truth-table proof gap and selected it as
   the first Wave 2 test patch.

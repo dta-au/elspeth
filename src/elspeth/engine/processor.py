@@ -4201,7 +4201,7 @@ class RowProcessor:
         ``peer_active_leases`` is **diagnostic only** from slice 4 onward. Its
         result is logged for observability but no longer causes a refusal. The
         old ADR-026 Precondition #9 single-active-resume enforcement is replaced
-        by the membership fence on the claim verbs (filigree elspeth-66be4216cd,
+        by the membership fence on the claim verbs (archived issue elspeth-66be4216cd,
         G3 — the original concern was duplicate RowResult emission; the fence CAS
         prevents non-members from claiming, closing that race structurally).
         """
@@ -5464,7 +5464,7 @@ class RowProcessor:
         Delegate: ``SchedulerDrainCoordinator.heartbeat_active_claim`` owns the
         active-claim state and the at-most-once-per-interval write.
         ``_process_single_token`` calls this on every node-iteration boundary
-        (ADR-026 RC6, filigree elspeth-ddde8144b6); it raises
+        (ADR-026 RC6, archived issue elspeth-ddde8144b6); it raises
         ``SchedulerLeaseLostError`` when the lease was reaped by a peer and
         ``RunWorkerEvictedError`` when the active-membership CAS refuses.
         """

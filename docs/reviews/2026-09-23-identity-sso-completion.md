@@ -635,7 +635,7 @@ The migration reason is defensible — the detail did move to the programme fold
 but `skipped` is the wrong verb for finished work, and anyone reading the tracker
 alone will conclude the opposite of the truth on both rows.
 
-(The `filigree` MCP server failed to connect this session — `CONNECT_TIMEOUT` —
+(The `legacy-tracker` MCP server failed to connect this session — `CONNECT_TIMEOUT` —
 so I did not read or touch the tracker. Row states above are quoted from the
 brief and from `tracker-rows.json` in the programme folder.)
 

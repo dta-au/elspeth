@@ -247,7 +247,7 @@ Constraints:
 - `CheckConstraint ck_token_work_items_lease_owner_required_when_leased`
   — `status='LEASED'` implies `lease_owner IS NOT NULL` and non-empty.
   Closes the wedge the recovery sweep's OR-NULL predicate tolerates;
-  closes filigree elspeth-9990c81e14.
+  closes legacy issue tracker elspeth-9990c81e14.
 - Composite FKs to `tokens`, `rows`, `nodes` (twice — `node_id` and
   `coalesce_node_id`).
 

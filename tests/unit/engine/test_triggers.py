@@ -1399,7 +1399,7 @@ class TestAnchorRewindRecompute:
     carry an EARLIER durable arrival than already-adopted members. The count
     and condition latches (and therefore the persisted checkpoint offsets)
     must be pure functions of the durable member set, invariant under
-    adoption order (filigree elspeth-eed319ed3d). Timeout already anchors at
+    adoption order (archived issue elspeth-eed319ed3d). Timeout already anchors at
     the min durable arrival; these tests pin count/condition parity.
     """
 

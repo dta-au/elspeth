@@ -6872,7 +6872,7 @@ class TestDurableSchedulerResumeDrain:
         ``active_worker_fence_clause`` membership fence compiled into the claim
         verbs — a non-member's claim CAS fails the EXISTS fence. A concurrent
         peer holding an unexpired lease is a NORMAL multi-worker state, not a
-        precondition violation (filigree elspeth-66be4216cd, G3).
+        precondition violation (archived issue elspeth-66be4216cd, G3).
 
         This test was previously ``test_drain_refuses_when_peer_worker_holds_active_lease``
         and asserted an ``AuditIntegrityError`` raise. It now asserts the

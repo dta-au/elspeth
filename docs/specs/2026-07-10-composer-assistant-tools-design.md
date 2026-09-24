@@ -128,7 +128,7 @@ always errors.
 **Docs search** (`docs.py`)
 - `search_docs` — keyword/BM25 over ELSPETH docs + plugin reference prose;
   ranked snippets with source anchors. Semantic ranking is a later opt-in
-  (mirrors Loomweave posture).
+  (mirrors retired code index posture).
 
 **Profiling** (`profiling.py`)
 - `profile_blob` — column types, null rates, distinct counts, value

@@ -124,7 +124,7 @@ The set of known pass-through plugins is re-derived per call from the live plugi
 ### Neutral Consequences
 
 - `passes_through_input` is declared as bare `bool` (not `ClassVar[bool]`) to match adjacent `creates_tokens: bool = False` and `declared_output_fields: frozenset[str] = frozenset()` pattern on `BaseTransform`. Stylistic consistency with existing class-body-attribute declarations takes priority over typing precision.
-- A bidirectional annotation-integrity test (`test_non_pass_through_transforms_do_drop_fields`) fires filigree observations when transforms annotated `False` appear to preserve input fields on probe rows. Fire-and-forget observations expire after 14 days; governance is the shared `STRICT_DATE` constant in the redundancy linter (see §Migration in the implementation plan).
+- A bidirectional annotation-integrity test (`test_non_pass_through_transforms_do_drop_fields`) fires legacy issue tracker observations when transforms annotated `False` appear to preserve input fields on probe rows. Fire-and-forget observations expire after 14 days; governance is the shared `STRICT_DATE` constant in the redundancy linter (see §Migration in the implementation plan).
 
 ## Alternatives Considered
 

@@ -76,7 +76,7 @@
     "sensitive_environment_captured": false
   },
   "structure_snapshot": {
-    "provider": "Loomweave 1.4.1 CLI analyze/doctor",
+    "provider": "retired code index 1.4.1 CLI analyze/doctor",
     "captured_at": "2026-07-18T18:23:34+10:00",
     "analysis_run_id": "5c676394-9df2-441d-a0ed-c9e99ad4dc67",
     "analyzed_commit": "3c782ac3c7efb0550495be38f75800eddffa639a",
@@ -89,10 +89,10 @@
     "limitation": "The index is fresh at the merge commit, but doctor reports classifier-tag failures and eight stale file entities. This assessment makes no unreachability claim from graph absence."
   },
   "tracker_snapshot": {
-    "provider": "Filigree 3.1.0",
+    "provider": "legacy issue tracker 3.1.0",
     "captured_at": "2026-07-18T18:22:15+10:00",
     "query_argv": [
-      "filigree",
+      "legacy issue tracker",
       "search",
       "[state engine]",
       "--json"
@@ -1857,7 +1857,7 @@
     "Evidence remains deliberately conservative: prior passing runs and closed issues were not promoted without fresh exact attachment.",
     "The focused runs use the repository SQLite test profile and do not establish every advertised database or deployment profile.",
     "The source crash/restart evidence uses deterministic BaseException injection and fresh public-resume objects, not abrupt operating-system process death.",
-    "Loomweave is fresh at the commit but reports classifier-tag failures and eight stale file entities, so graph absence is not an unreachability proof.",
+    "retired code index is fresh at the commit but reports classifier-tag failures and eight stale file entities, so graph absence is not an unreachability proof.",
     "The tracker snapshot is mutable ownership context and was not used as behavioral proof."
   ],
   "review_record": "docs/architecture/state_engine/assessments/2026-07-18-1820/review.md"

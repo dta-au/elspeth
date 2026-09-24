@@ -1,7 +1,10 @@
 # Migrating ELSPETH's issue tracking to GitHub Issues
 
-ELSPETH tracked its work in **filigree**, an agent-native issue tracker with a local
-database. That fitted a project with one developer and a fleet of agents. It does not fit
+As of 2026-09-25, GitHub Issues is the shared system of record and the local
+tracker integrations are removed. The maintainer will triage and upload the
+remaining archived backlog separately; this retirement does not publish issues.
+
+ELSPETH previously tracked its work in a local issue database. That fitted a project with one developer and a fleet of agents. It does not fit
 a project with several developers, so GitHub Issues becomes the system of record.
 
 This directory is the migration: one Markdown file per issue, reviewed before anything is
@@ -56,15 +59,15 @@ Two categories stay out of GitHub, both by operator ruling on 2026-09-23.
 
 **Internal governance** — the trust-tier allowlist burn-downs, the lint gate's own
 internals, and the agent tooling. These are the project's own machinery rather than
-product defects, and they mean nothing to an outside contributor. They keep the
-`exclude:gh-migration` label in filigree.
+product defects, and they mean nothing to an outside contributor. They remain in the private archive with their
+`exclude:gh-migration` labels until the maintainer decides their disposition.
 
 > **A security defect is not internal governance, even when it lives in governance
 > tooling.** An earlier draft of this file excluded "judge-signing tooling" wholesale,
 > which would have put the CI key-exposure findings — the work that makes this repository
 > safe to give several people push access to — in a local database those same people
 > cannot read. That is the opposite of what the migration is for, and it would have meant
-> filigree was not actually being retired.
+> the local tracker was not actually being retired.
 >
 > The exclusion covers *ceremony*: burn-downs, allowlist hygiene, the signing workflow
 > itself. It does not cover a vulnerability. An unfixed vulnerability belongs in a
@@ -109,7 +112,7 @@ not disclosure. Holding a file back withholds reach, not content, so anything wh
 Forty tracker rows were closed with the GitHub URL in the close reason. **Four were
 not**, because another session held a live claim on them; each got a comment naming
 its GitHub issue and was left alone. They are `#158`, `#162`, `#188` and `#190` —
-close them when that work lands, or let the lease lapse.
+their historical claims are now retained only in the private archive.
 
 ## After the import
 

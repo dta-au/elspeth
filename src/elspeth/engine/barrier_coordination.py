@@ -1656,7 +1656,7 @@ class BarrierIntakeCoordinator:
                 # real built graph: build_group_binding_registry guarantees a
                 # binding for every executable coalesce/row_union/collector
                 # closer (collector closers are reachable here since the
-                # integration lift; filigree elspeth-c00a82bf97).
+                # integration lift; archived issue elspeth-c00a82bf97).
                 del self._failed_group_notes[(closer_name, group_id)]
                 continue
             if not self._group_roster_settled(closer_name=closer_name, group_id=group_id, binding=failed_binding):

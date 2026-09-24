@@ -3,7 +3,7 @@
 The lease-owner-CAS ``mark_*`` verbs (BLOCKED / TERMINAL / FAILED /
 PENDING_SINK), the strict post-sink terminalizers, and the crash-repair
 terminalization sweep, all built on the shared ``_transition`` CAS.
-Extracted from ``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
+Extracted from ``TokenSchedulerRepository`` (archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

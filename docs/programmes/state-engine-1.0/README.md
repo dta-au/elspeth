@@ -3,13 +3,14 @@
 Six contract-closure cohorts plus the final assessment and the maintained gates.
 
 One GitHub issue points here. This folder is the detail: the programme's scope as it stood in
-the filigree tracker on 2026-09-23, captured verbatim before those rows were closed.
+the legacy issue tracker on 2026-09-23, captured before those rows were closed. Tool names have since been generalized;
+the original wording is preserved in the local tool-retirement archive.
 
 ## Why this is a folder and not seven issues
 
 GitHub has no `milestone` / `phase` / `step` issue type. Operator ruling 2026-09-23 (John):
 *"for the epics, a single ticket pointing to a folder with the details"*. So the container rows
-below were closed in filigree and their content lives here. The tracker rows are preserved
+below were closed in legacy issue tracker and their content lives here. The tracker rows are preserved
 verbatim in `tracker-rows.json` alongside this file — nothing was summarised away.
 
 ## Documents of record
@@ -25,7 +26,7 @@ The epic is already the flattened form of a cancelled milestone/phase/step tree 
 
 ## A note on the `elspeth-…` identifiers
 
-The identifiers below are rows from **filigree**, the internal tracker ELSPETH used
+The identifiers below are rows from **legacy issue tracker**, the internal tracker ELSPETH used
 before moving to GitHub Issues. They are opaque local ids: they name nothing outside that
 tracker, and the tracker is being retired.
 

@@ -123,7 +123,7 @@ class RowWaiter:
                 processor translates it into the row-scoped
                 ``shutdown_requested`` error result
                 (``_convert_retryable_to_error_result``), so shutdown policy
-                lives in one layer (filigree elspeth-14571961a6).
+                lives in one layer (archived issue elspeth-14571961a6).
             Exception: Re-raised from worker thread if plugin bug occurred
         """
         return self._wait_for(self._key, self._event, timeout, shutdown_event)

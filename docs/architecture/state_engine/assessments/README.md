@@ -22,7 +22,7 @@ receipts, or approval chains.
   verdict-changing assessment.
 - Correct a factual mistake in an old package only with a visible erratum.
 - Never promote a historical remediation checklist to live work authority;
-  Filigree owns current status, priority, dependencies, and assignment.
+  GitHub Issues owns current status, priority, dependencies, and assignment.
 - A historical rerun writes below that assessment's `reruns/` directory and
   records divergence without replacing the original result.
 - Keep packages small: assessment result, evidence, and technical review are

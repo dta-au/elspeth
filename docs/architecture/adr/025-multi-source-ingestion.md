@@ -67,7 +67,7 @@ it. The structural state is unambiguous across four review lenses:
 ### Why this matters now
 
 The architecture review identified a broad issue cohort, represented by the
-Filigree records named below. The structural family splits into four clusters:
+legacy issue tracker records named below. The structural family splits into four clusters:
 
 1. **Dual-truth surface** — `config.source` / `config.sources`,
    singular / plural ResumeState fields, dual writers for source schema
@@ -168,7 +168,7 @@ by code**. The singular `source` surface is deleted, not deprecated.
    docs/guides/data-trust-and-error-handling.md) forbids implicit
    fabrication (e.g., `.get(k, default)` pitching the decision to an
    untrusted provider), not explicit exception-raising for graceful
-   upstream management. A future refactor (filigree
+   upstream management. A future refactor (legacy issue tracker
    elspeth-4b61252164) may strengthen this to a
    discriminated-union return type so the empty case becomes
    literally unrepresentable at the type level rather than

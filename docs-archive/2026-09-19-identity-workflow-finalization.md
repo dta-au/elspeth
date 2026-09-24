@@ -30,7 +30,7 @@ defines product behavior. Kubernetes Workstream K is independent delivery.
   Approval, review, and library authorities and workflow routes are absent.
   The admin and mailbox/library frontend components are absent. Their tables
   reserve the shape; they are not delivered behavior.
-- The Filigree milestone marks Phase 2 auth core completed. Its other phases
+- The legacy issue tracker milestone marks Phase 2 auth core completed. Its other phases
   and open steps need reconciliation with the above code before status changes.
   The Phase 6 title and cutover ticket still mention live checks or an ECS/VM
   split superseded by the operator's no-live-testing and recreate rulings.
@@ -69,7 +69,7 @@ defines product behavior. Kubernetes Workstream K is independent delivery.
 
 1. **Reconcile the substrate and tracker.** Pin the current schema/contract
    metadata and the implemented quota behaviors. Retire I0's obsolete
-   instruction, narrow I1 to any measured residual, and update Filigree titles,
+   instruction, narrow I1 to any measured residual, and update legacy issue tracker titles,
    descriptions, and comments without claiming unfinished storage or workflow
    behavior complete. Confirm the 0.8.1 changelog target against the branch.
 2. **I8 — governance switch.** Add the `workflow_governance` setting and R11

@@ -6,7 +6,7 @@
 
 **Architecture:** Treat pinning and completion as two distinct gates. First reconcile current source, supported deployment profiles, state vocabulary, plugin inventory, and compiler-facing runtime obligations into the frozen v2 catalog; then execute bounded implementation/proof cohorts and publish a v3 catalog whose explicit applicability and provider-variant cases can derive the final complete verdict without a false Cartesian product. Preserve production authority: tests proceed from real orchestration boundaries inward, independent-process claims use operating-system processes, PostgreSQL claims use a real PostgreSQL 16 service, and missing provider credentials remain `unknown` rather than being replaced by mocks.
 
-**Tech Stack:** Python 3.12+, pytest/xdist, Hypothesis, SQLAlchemy, SQLite WAL, PostgreSQL 16/testcontainers, Filigree, Loomweave, Warpline, Wardline, and the existing Landscape/scheduler/orchestrator packages.
+**Tech Stack:** Python 3.12+, pytest/xdist, Hypothesis, SQLAlchemy, SQLite WAL, PostgreSQL 16/testcontainers, legacy issue tracker, retired code index, Warpline, Wardline, and the existing Landscape/scheduler/orchestrator packages.
 
 **Prerequisites:**
 
@@ -30,7 +30,7 @@ The v1 catalog cannot be completed honestly against current source because it is
 - The live plugin inventory has grown from 7/31/8 to 9/33/9 source/transform/sink plugins.
 - v1 names only `sqlite-wal`, while maintained AWS deployment material configures a PostgreSQL Landscape database. ADR-030 still says PostgreSQL runtime is unsupported. This contradiction opens `HG-10-normative-contract-drift` before any behavioral test runs.
 - Warpline's current edge snapshot is 1,007 commits behind the planning baseline. Its worklist is advisory and incomplete until a fresh snapshot is captured.
-- Six live `[state engine]` Filigree tasks remain open: `elspeth-c0d4a28e11`, `elspeth-9cd07962c7`, `elspeth-9a52eb80f9`, `elspeth-2aba594afb`, `elspeth-2e66723070`, and `elspeth-6f6bbbec00`.
+- Six live `[state engine]` legacy issue tracker tasks remain open: `elspeth-c0d4a28e11`, `elspeth-9cd07962c7`, `elspeth-9a52eb80f9`, `elspeth-2aba594afb`, `elspeth-2e66723070`, and `elspeth-6f6bbbec00`.
 
 The default support decision for this plan is:
 
@@ -403,10 +403,10 @@ Expected: the import is inside the assessment worktree and there is no behaviora
 
 **Step 2: Refresh structural and temporal authorities**
 
-- Require Loomweave `project_status_get.staleness == "fresh"` at the assessment commit.
+- Require retired code index `project_status_get.staleness == "fresh"` at the assessment commit.
 - Capture a fresh full Warpline edge snapshot at the same commit.
 - Run `changed` and `reverify` from the prior assessment baseline to the new baseline.
-- Capture exact, non-truncated Filigree JSON for `[state engine]`, ready, and blocked work.
+- Capture exact, non-truncated legacy issue tracker JSON for `[state engine]`, ready, and blocked work.
 
 If the edge snapshot remains partial or stale, record that limitation and do not make a downstream unreachability claim.
 
@@ -427,7 +427,7 @@ Expected: a full manifest containing every v2 leg, cell, and hard gate with no i
 
 Do not inherit any 2026-07-18 pass merely because its test still exists. Collect and run exact current selectors, beginning with production paths and then direct repository tests. Attach each result only to assertions it actually proves.
 
-**Step 5: Reconcile Filigree ownership**
+**Step 5: Reconcile legacy issue tracker ownership**
 
 Retain the six existing open issues where their exit gates still match current evidence. Create coherent cohort owners for newly visible gaps:
 
@@ -442,7 +442,7 @@ Retain the six existing open issues where their exit gates still match current e
 
 Create one issue per coherent implementation/evidence cohort, never one per cell. Wire dependencies so implementation cohorts depend on the pinning assessment and final completion depends on every cohort.
 
-Create the hierarchy with `filigree create-plan`. Write this JSON to a
+Create the hierarchy with archived tool command. Write this JSON to a
 temporary file, replacing only titles if the pinning assessment discovers a
 materially different cohort boundary:
 
@@ -486,9 +486,7 @@ materially different cohort boundary:
 
 Run:
 
-```bash
-filigree create-plan --file /tmp/state-engine-v2-plan.json
-```
+> Retired tool command example omitted. The original is preserved in the local tool-retirement archive.
 
 Then link the six pre-existing open issues as context or dependencies rather
 than creating duplicates. Do not claim implementation issues during planning.
@@ -518,7 +516,7 @@ git commit -m "docs(state-engine): publish the current v2 pinning assessment"
 - [ ] The hub points at the current baseline and v2 catalog.
 - [ ] Every cell has current status, reason, exit gate, and owner field.
 - [ ] Closed historical issues are not reused as owners for residual work.
-- [ ] Loomweave, Warpline, and Filigree limitations are explicit.
+- [ ] retired code index, Warpline, and legacy issue tracker limitations are explicit.
 - [ ] The package validator passes without editing historical assessments.
 
 ---
@@ -804,7 +802,7 @@ Use direct function objects in parametrization; do not resolve functions by dyna
 
 **Step 2: Add forbidden-path cases**
 
-Own F-04, F-06, F-07, F-10, and F-12 in this task, matching the pinned proof-matrix cohort. Assert the exact exception/error category and complete before/after durable image. Reach every production surface that could attempt the path; where a path is deliberately absent, attach fresh Loomweave caller evidence and an executable architecture gate.
+Own F-04, F-06, F-07, F-10, and F-12 in this task, matching the pinned proof-matrix cohort. Assert the exact exception/error category and complete before/after durable image. Reach every production surface that could attempt the path; where a path is deliberately absent, attach fresh retired code index caller evidence and an executable architecture gate.
 
 Integrate the retained evidence for the other forbidden legs from their assigned cohorts (Tasks 5, 8, 9, and 10/11); do not reassign, duplicate, or close those owners from Task 7. F-10 permits only its contracted best-effort `fence_refusal` event as an explicit image delta.
 F-07's valid-leader zero-recovery arm is a fence-as-heartbeat operation under
@@ -1555,7 +1553,7 @@ repository paths from an untrusted run ID.
 Review `git diff --name-only` against the Task 11 file inventory, including
 every newly resolved Azure/LLM/Search/Chroma lane and every defect-driven plugin
 file. Construct one explicit `git add` invocation that spells out every
-intended file; preserve that exact path list in the Filigree completion comment.
+intended file; preserve that exact path list in the legacy issue tracker completion comment.
 Do not use directory arguments or globs. Then commit with:
 
 ```bash
@@ -1811,8 +1809,8 @@ Stop and surface the result rather than narrowing the claim when:
 - a test proves only repository behavior while the cell requires production composition;
 - a failure reveals a new state/subtype or cross-transaction seam absent from the current catalog;
 - any required selector skips, times out, or is not collected;
-- Loomweave is stale for a reachability claim or Warpline is stale for a blast-radius claim;
-- Filigree returns `SCHEMA_MISMATCH`;
+- retired code index is stale for a reachability claim or Warpline is stale for a blast-radius claim;
+- legacy issue tracker returns `SCHEMA_MISMATCH`;
 - a proposed fix requires an operator signing key.
 
 In these cases, keep the verdict `not_complete` or `insufficient_evidence`, update the exact gap owner and exit gate, and continue with other independent cohorts where safe.

@@ -6407,7 +6407,7 @@
     },
     {
       "issue_id": "elspeth-924ed77807",
-      "title": "filigree: 'observation list --source-issue-id' returns nothing for observations that carry that source_issue_id",
+      "title": "legacy-tracker: 'observation list --source-issue-id' returns nothing for observations that carry that source_issue_id",
       "status": "triage",
       "priority": 3,
       "type": "bug",

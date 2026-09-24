@@ -42,7 +42,7 @@ The pattern is **established** by Phase 18 (5b)'s `interpretation_events_table` 
 * **Live schema:** `src/elspeth/web/sessions/models.py` defines the
   `composer_completion_events_table` alongside the precedent table.
 
-Phase 6 follows the precedent with one deliberate sharpening: where `interpretation_events_table` permits DELETE on PENDING rows for orphan recovery, `composer_completion_events_table` is fully append-only — both `BEFORE UPDATE` and `BEFORE DELETE` triggers are unconditional ABORT from day 1, correcting the Phase 18 omission tracked under filigree `elspeth-9aba8da942`.
+Phase 6 follows the precedent with one deliberate sharpening: where `interpretation_events_table` permits DELETE on PENDING rows for orphan recovery, `composer_completion_events_table` is fully append-only — both `BEFORE UPDATE` and `BEFORE DELETE` triggers are unconditional ABORT from day 1, correcting the Phase 18 omission tracked under legacy issue tracker `elspeth-9aba8da942`.
 
 **Consequences:**
 

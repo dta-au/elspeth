@@ -3170,7 +3170,7 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
 
     Keyed on the PLUGIN alone. There used to be a `node.node_type ==
     "aggregation"` gate here, which silently dropped the whole diagnostic for
-    the identical plugin wired as a collector (filigree elspeth-1016a47e8f).
+    the identical plugin wired as a collector (archived issue elspeth-1016a47e8f).
     It was removed rather than widened to `{"aggregation", "collector"}`,
     because the composer has no canonical set of "batch-barrier node kinds" to
     derive such a tuple from, and hand-writing one would be a fifth inline copy

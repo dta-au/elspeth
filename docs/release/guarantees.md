@@ -505,7 +505,7 @@ The HMAC fingerprint allows an auditor to verify that the same value was used ac
 
 - A session created by principal A is not visible to principal B
 - Preference state is keyed on the principal ID
-- The session database enforces the principal-key boundary at the schema level: `user_id` is `NOT NULL` and indexed on every session-scoped table. The principal identifier originates from an external auth provider (`local`, `oidc`, `entra`, `vanguard` or `google`) and is carried as an `identities.identity_id`. No foreign key is declared, but the reason is cost, not impossibility: as of 0.8.0 the session store creates the `identities` table on the same metadata, so an FK is available and is deferred because adding one is a table-shape change that must ride an epoch window already being paid for (`elspeth-2371269e07`). The contract today is integrity-by-not-null-plus-index, not by referential constraint.
+- The session database enforces the principal-key boundary at the schema level: `user_id` is `NOT NULL` and indexed on every session-scoped table. The principal identifier originates from an external auth provider (`local`, `oidc`, `entra`, `vanguard` or `google`) and is carried as an `identities.identity_id`. No foreign key is declared, but the reason is cost, not impossibility: as of 0.8.0 the session store creates the `identities` table on the same metadata, so an FK is available and is deferred because adding one is a table-shape change that must ride an epoch window already being paid for. The contract today is integrity-by-not-null-plus-index, not by referential constraint.
 
 ### 13.2 Session State Is Persisted
 

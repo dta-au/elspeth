@@ -1,7 +1,7 @@
 """IdleTimeoutPump: one long-lived idle-flush worker per source-iteration run.
 
 Extracted from ``SourceIterationDriver._next_source_item_with_idle_timeout_flushes``
-(filigree elspeth-735df9576d). The driver used to construct, start, and join a
+(archived issue elspeth-735df9576d). The driver used to construct, start, and join a
 fresh daemon ``threading.Thread`` around EVERY source ``next()`` call in timed
 aggregation/coalesce pipelines — one thread lifecycle per row at a 10ms poll
 interval — and relied on the implicit fact that the orchestrator thread was

@@ -164,7 +164,7 @@ dimensions. Two sub-tranches by mechanism:
   they need a *pattern*, not per-leg improvisation:
   - `maintenance` = "exact evidence locators remain collected and run in the
     maintained verification selection, with coherent actionable gap themes either
-    live-owned in Filigree or explicitly unowned" (forbidden family: "the
+    live-owned in legacy issue tracker or explicitly unowned" (forbidden family: "the
     deliberate-absence decision remains maintained"). Candidate: one parametrized
     node per leg asserting the leg's selector locators are collected by the
     maintained selection and its owner/gap-theme is live — bound to the lane's

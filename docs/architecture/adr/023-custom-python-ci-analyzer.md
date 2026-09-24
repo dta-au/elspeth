@@ -24,7 +24,7 @@ identified that the 14 scripts should consolidate into a single
 findings-parity contract. **That consolidation has since landed**. The last
 script outside the package was ported as
 `contract_invariants.adapter_method_budget` and deleted
-(commit `7882a127d`); no `enforce_*.py` scripts remain. The associated Filigree
+(commit `7882a127d`); no `enforce_*.py` scripts remain. The associated legacy issue tracker
 issue, `elspeth-3575a7f15d`, remained `in_progress` at the 2026-08-29 checked
 cutoff.
 
@@ -87,7 +87,7 @@ covers ELSPETH-specific invariants; CodeQL covers general Python vulnerability p
 
 **Decision:** We accept that some external reviewers will start from "why didn't you use CodeQL?" The cost is real; we judge it lower than the cost of either porting the existing rules to a foreign toolchain or losing the project-specific expressiveness that makes the rules write-able at all.
 
-**Why acceptable:** the perception cost is one ADR-read away from being addressed. Reviewers who dismiss custom analyzers without reading the rationale aren't going to give the project's other architectural choices fair hearing either; reviewers who do read the rationale find the manifest-class-rules argument and the team-fluency argument compelling. The risk is bounded and the mitigation (this ADR, plus the rule-taxonomy rationale doc tracked at filigree `elspeth-797cac825e`) is straightforward.
+**Why acceptable:** the perception cost is one ADR-read away from being addressed. Reviewers who dismiss custom analyzers without reading the rationale aren't going to give the project's other architectural choices fair hearing either; reviewers who do read the rationale find the manifest-class-rules argument and the team-fluency argument compelling. The risk is bounded and the mitigation (this ADR, plus the rule-taxonomy rationale doc tracked at legacy issue tracker `elspeth-797cac825e`) is straightforward.
 
 ### D4. Future taint analysis is a planned direction; this ADR does not preclude it
 
@@ -148,7 +148,7 @@ Re-open this ADR if one of these conditions becomes true:
 The consolidation work (rule registry, SARIF emission, parity harness,
 per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split,
 CI-graph collapse, and rule-taxonomy rationale) has landed, with the final
-port landing in commit `7882a127d`. The associated Filigree issue
+port landing in commit `7882a127d`. The associated legacy issue tracker issue
 `elspeth-3575a7f15d` remained `in_progress` at the 2026-08-29 checked cutoff.
 The taint-analysis future direction (D4) has no committed timeline; when it
 begins, a new ADR will record the chosen toolchain for those specific rules.
@@ -156,12 +156,12 @@ begins, a new ADR will record the chosen toolchain for those specific rules.
 ### Operator actions
 
 None at ADR-acceptance time. The consolidation work has since landed in full;
-the final port landed in commit `7882a127d`, while its associated Filigree issue
+the final port landed in commit `7882a127d`, while its associated legacy issue tracker issue
 remained `in_progress` at the 2026-08-29 checked cutoff.
 
 ## References
 
-* **Consolidation residual:** the port landed in commit `7882a127d`; Filigree
+* **Consolidation residual:** the port landed in commit `7882a127d`; legacy issue tracker
   `elspeth-3575a7f15d` remained `in_progress` at the 2026-08-29 checked cutoff.
 * **Rule-taxonomy rationale:** [elspeth-lints rationale](../../elspeth-lints/rationale.md).
 * **Current SARIF publication:** [CI workflow](../../../.github/workflows/ci.yaml).

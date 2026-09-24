@@ -3,7 +3,7 @@
 The CAS claim verbs (READY and PENDING_SINK), the single-timestamp lease
 heartbeat, the liveness-aware expired-lease recovery sweep, and the
 peer-lease probe. Extracted from ``TokenSchedulerRepository``
-(filigree elspeth-ef9c36d767).
+(archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ class SchedulerLeaseRepository:
                         token_work_items_table.c.created_at,
                         # Stable last-resort tiebreaker for cross-source same-tick
                         # collisions where ingest_sequence/step_index/created_at
-                        # are not jointly disambiguating (filigree elspeth-6cb89db535,
+                        # are not jointly disambiguating (archived issue elspeth-6cb89db535,
                         # G3 determinism-reviewer M1).
                         token_work_items_table.c.work_item_id,
                     )
@@ -352,7 +352,7 @@ class SchedulerLeaseRepository:
                         token_work_items_table.c.step_index,
                         token_work_items_table.c.created_at,
                         # Stable last-resort tiebreaker for cross-source same-tick
-                        # collisions (filigree elspeth-6cb89db535, G3 M1).
+                        # collisions (archived issue elspeth-6cb89db535, G3 M1).
                         token_work_items_table.c.work_item_id,
                     )
                     .limit(1)
@@ -540,7 +540,7 @@ class SchedulerLeaseRepository:
         kills the run. The function's job is to reap leases held by *other*
         workers (a previous crashed RowProcessor with a different uuid; in
         future a peer worker), not the caller's own work. See
-        filigree elspeth-941f1508f5.
+        archived issue elspeth-941f1508f5.
         """
         require_coordination_token(coordination_token, verb="recover_expired_leases")
         with fenced_write(self._engine, coordination_token=coordination_token, verb="recover_expired_leases") as conn:
@@ -564,7 +564,7 @@ class SchedulerLeaseRepository:
         caller_owner = coordination_token.worker_id
         leader_epoch = coordination_token.leader_epoch
         # Predicate symmetric across the SELECT and UPDATE to close two
-        # multi-worker race classes (filigree elspeth-28aaa36a62, G1 P2):
+        # multi-worker race classes (archived issue elspeth-28aaa36a62, G1 P2):
         #
         # 1. PENDING_SINK ABA window. ``next_work_item_id`` for the
         #    PENDING_SINK-recovery branch is the row's existing
@@ -671,7 +671,7 @@ class SchedulerLeaseRepository:
                 token_work_items_table.c.ingest_sequence,
                 token_work_items_table.c.step_index,
                 # Stable last-resort tiebreaker for cross-source same-tick
-                # collisions (filigree elspeth-6cb89db535, G3 M1).
+                # collisions (archived issue elspeth-6cb89db535, G3 M1).
                 token_work_items_table.c.work_item_id,
             )
         ).mappings()
@@ -818,7 +818,7 @@ class SchedulerLeaseRepository:
         longer lease than the reaper will honour: the reaper compares against
         the same database clock.
 
-        Single-timestamp heartbeat for ADR-026 RC6 multi-worker (filigree
+        Single-timestamp heartbeat for ADR-026 RC6 multi-worker (archived issue
         elspeth-ddde8144b6). A worker mid-processing calls this periodically
         from inside the slow work loop so a peer's ``recover_expired_leases``
         sweep does NOT reap an alive-but-slow worker. ``peer_active_leases``
@@ -956,7 +956,7 @@ class SchedulerLeaseRepository:
         sink-bound RowResult emission (PENDING_SINK can transition to LEASED
         under the peer's identity and the helper would re-emit a duplicate
         RowResult on a later iteration once the lease expires). See
-        filigree elspeth-66be4216cd (G3 single-active-resume invariant).
+        archived issue elspeth-66be4216cd (G3 single-active-resume invariant).
 
         Under ADR-026 Precondition #9 (multi-worker deployment-shape ADR not
         yet authored), no code path exists today that spawns concurrent

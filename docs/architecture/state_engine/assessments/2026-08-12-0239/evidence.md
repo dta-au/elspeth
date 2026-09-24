@@ -79,7 +79,7 @@ not erase or downgrade the 3.14 defect.
 
 ## Structural and temporal capture
 
-`loomweave worktree analyze <assessment-worktree> --no-incremental` created
+archived tool command created
 isolated store `wt-be4cafe43983c9793bbee6fcb29c125233f6f86bd2aa0fb26127a4614031e3bf`.
 Run `1aa9de74-7763-44a5-98e6-07cc88ff0d66` persisted status `completed` at the
 exact baseline commit with 71,628 entities, 152,366 edges, zero dropped edges,
@@ -94,7 +94,7 @@ than claiming that tool's `staleness` field or semantic-search completeness.
 Warpline 1.3.0 was then invoked once against the same detached worktree:
 
 - full snapshot 1 is `SKIPPED`, with `source_version: no_index`, 0 entities,
-  and 0 edges because Warpline could not consume Loomweave's isolated store;
+  and 0 edges because Warpline could not consume retired code index's isolated store;
 - `changed` for
   `3c782ac3c7efb0550495be38f75800eddffa639a..af79b34040f5ce5fd989aa0d42a1b80ad8366829`
   returns an empty local set, which is non-authoritative because this worktree's
@@ -112,29 +112,29 @@ The retained artifact hashes are:
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `artifacts/loomweave-analysis.json` | `3389a3b140a027b8df91ef42ed20b584b4d7e722f8fe0812f76adeecb628e679` |
+| `artifacts/retired-code-index-analysis.json` | `3389a3b140a027b8df91ef42ed20b584b4d7e722f8fe0812f76adeecb628e679` |
 | `artifacts/warpline-snapshot.json` | `592c956f186932cf20df5803c0f2d970ca4b4df452d497b09020252e3255009d` |
 | `artifacts/warpline-changed.json` | `401bddd3c63f192c2ae9da12d6d622935e807523ddd24963d87c8ae8b7dcf9e3` |
 | `artifacts/warpline-reverify.json` | `0599d868447698ba2d807cdbdd10d2c800ef294b9c394639214538ba7092a2f8` |
 
 No absence or downstream-unreachability conclusion is drawn from this
-warning-bearing Loomweave edge surface or Warpline's SKIPPED/NO_SNAPSHOT
+warning-bearing retired code index edge surface or Warpline's SKIPPED/NO_SNAPSHOT
 results. Current source, executable tests, and the conservative unknown cells
 remain authoritative.
 
-## Filigree capture
+## legacy issue tracker capture
 
-Filigree 3.1.0 JSON was captured after creating and wiring the v2 plan. Each
+legacy issue tracker 3.1.0 JSON was captured after creating and wiring the v2 plan. Each
 retained envelope reports `has_more: false`:
 
 | Query | Items | Artifact SHA-256 |
 | --- | ---: | --- |
-| `filigree search '[state engine]' --json` | 18 | `e30835e472c5bab7b79838e9d1d61ed245bceab989750ae08561a631934f4685` |
-| `filigree ready --json` | 832 | `0e4d46b66235a0e6c3a958804cb7b588ae8086e4d9268ec7c041f2e418b4ee3b` |
-| `filigree blocked --json` | 43 | `e1515d5a56f462443d6c68be92d72aaca1d8bba6ed581462b40d3ba0785c87e1` |
+| archived tool command | 18 | `e30835e472c5bab7b79838e9d1d61ed245bceab989750ae08561a631934f4685` |
+| archived tool command | 832 | `0e4d46b66235a0e6c3a958804cb7b588ae8086e4d9268ec7c041f2e418b4ee3b` |
+| archived tool command | 43 | `e1515d5a56f462443d6c68be92d72aaca1d8bba6ed581462b40d3ba0785c87e1` |
 
-In addition, `artifacts/filigree-show-records.ndjson` retains exact
-`filigree show --json` records for the milestone, all three phases, all eight
+In addition, `artifacts/legacy-tracker-show-records.ndjson` retains exact
+archived tool command records for the milestone, all three phases, all eight
 steps, the six linked pre-existing issues, and the Python 3.14 bug (19 records;
 SHA-256
 `859e6ad7fe719e3fdfc7b1c4be8d6ec60dbc3e98f3d5805613290c94840d1727`).
@@ -146,7 +146,7 @@ list/search responses above and before this package commit.
 The phase-0 catalog step `elspeth-4833bc0dc1` is completed against the Task 1
 and Task 2 commits; `elspeth-af65f78095` is ready and will close only after the
 assessment package has a commit to cite. The three queries and later exact
-record capture were sequential and Filigree is live mutable state, so this is
+record capture were sequential and legacy issue tracker is live mutable state, so this is
 a complete capture of each response rather than a cross-command atomic
 snapshot. The exact records establish that the six retained pre-existing
 issues and the Python 3.14 bug were open and unclaimed at record-capture time;

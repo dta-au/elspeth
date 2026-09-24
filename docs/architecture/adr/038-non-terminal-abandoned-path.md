@@ -9,7 +9,7 @@
 
 ADR-019's two-axis terminal model gives a failed token exactly one fate,
 `(FAILURE, UNROUTED)`, and exactly one non-terminal path, `BUFFERED`
-("hasn't decided yet"). Filigree `elspeth-b4254f9a01` (child of
+("hasn't decided yet"). legacy issue tracker `elspeth-b4254f9a01` (child of
 `elspeth-82d4c5146c`) documents the gap between those two: a token whose
 fate **nothing will ever decide**, on a run that will never resume, has no
 honest representation.
@@ -390,7 +390,7 @@ encode.
   the sweep's home; §E.3a reconcile semantics are deliberately untouched.
 - ADR-029 (Journal is Barrier-Buffer Truth) — journal rows of abandoned
   runs are left intact.
-- Filigree `elspeth-b4254f9a01` (this gap), `elspeth-82d4c5146c` (parent;
+- legacy issue tracker `elspeth-b4254f9a01` (this gap), `elspeth-82d4c5146c` (parent;
   row-level half fixed as `3cb883229`).
 
 ## Implementation Notes

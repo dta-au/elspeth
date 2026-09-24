@@ -905,7 +905,7 @@ composition_states_table = Table(
     # of: (a) a spec amendment documenting the writer path and the audit
     # semantics that distinguish it from neighbouring values; (b) an
     # integration test that drives the writer and asserts the row was
-    # committed with the new ``provenance`` value; (c) a Filigree ticket
+    # committed with the new ``provenance`` value; (c) a GitHub issue
     # linking the change back to this enum so the audit history shows the
     # addition as a deliberate governance step rather than a drive-by
     # edit. Mirror also goes into ``CompositionStateProvenance`` at

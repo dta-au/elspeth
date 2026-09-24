@@ -96,7 +96,7 @@ with doctrine status:
 ## Amendment: collector authoring is canaried without touching the frozen script (2026-08-25)
 
 **Deciders:** ELSPETH maintainer
-**Review evidence:** The WS6 collector-authoring work and ruling recorded in Filigree `elspeth-88bb77953c`
+**Review evidence:** The WS6 collector-authoring work and ruling recorded in legacy issue tracker `elspeth-88bb77953c`
 
 The WS6 guard lift (ruling 7878, elspeth-88bb77953c) made collectors
 authorable on the guided surface. The frozen tutorial cannot cover them, and

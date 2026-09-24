@@ -1,4 +1,4 @@
-"""Batch-flush dispatcher routing regression (filigree issue elspeth-ef8d5d92ff).
+"""Batch-flush dispatcher routing regression (archived issue elspeth-ef8d5d92ff).
 
 Post-H2 (ADR-010 §Semantics amendment 2026-04-20): ``_cross_check_flush_output``
 calls ``run_batch_flush_checks`` on its own dispatch site (not the post-

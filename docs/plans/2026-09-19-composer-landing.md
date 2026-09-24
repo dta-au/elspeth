@@ -71,7 +71,7 @@ ticket; this checkpoint does not certify a gate still in progress.
    identity expectations, and Azure retry construction; these are leads, not
    an attribution of all 116 failures.
 3. Repair confirmed release defects in owned branches and link them to existing
-   Filigree issues or file focused issues where none exist. Keep those repairs
+   legacy issue tracker issues or file focused issues where none exist. Keep those repairs
    separate from the frontend panel diff. Run focused regressions first, then
    the default suite on the integrated tip. Any schema, session persistence,
    audit storage or lock repair also needs the serial PostgreSQL testcontainer

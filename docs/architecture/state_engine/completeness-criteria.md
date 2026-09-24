@@ -80,7 +80,7 @@ Every catalog leg accounts for all ten dimensions:
    state/subtype/owner/expiry arm correctly.
 10. `maintenance` — exact evidence locators remain collected and run in the
     maintained verification selection, with coherent actionable gap themes
-    either live-owned in Filigree or explicitly unowned.
+    either live-owned in GitHub Issues or explicitly unowned.
 
 Applicability is catalog-owned. An assessor cannot mark a dimension N/A merely
 because it is inconvenient to execute.

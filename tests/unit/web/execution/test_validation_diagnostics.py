@@ -249,7 +249,7 @@ def test_proof_blocker_is_labelled_with_the_node_kind_the_detector_recorded(node
     the label off the code therefore mislabelled every collector-hosted case on
     a user-facing blocker. The detector records the real kind in
     ``evidence_locator["node_type"]`` and this is what reads it
-    (filigree elspeth-1016a47e8f).
+    (archived issue elspeth-1016a47e8f).
     """
 
     merged = execution_service._merge_authoritative_proof_diagnostics(

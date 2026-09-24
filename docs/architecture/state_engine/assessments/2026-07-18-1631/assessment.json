@@ -62,7 +62,7 @@
     "sensitive_environment_captured": false
   },
   "structure_snapshot": {
-    "provider": "Loomweave",
+    "provider": "retired code index",
     "captured_at": "2026-07-18T17:54:00+10:00",
     "analysis_run_id": "3259eaf3-df8f-4971-b385-03850b934d81",
     "analyzed_commit": "36146eac4f4346c56a0ef2b44ec8801a60e3972e",
@@ -90,9 +90,9 @@
     "limitation": "The index commit predates the assessed commit by two documentation-only commits. index_diff_get reported no dirty indexed files and no modified indexed files, and Git proved no non-doc diff, so structural source claims are disjoint from the commit drift. Unresolved/external sites and historical missing-file tombstones still prevent an unreachability claim from index absence alone."
   },
   "tracker_snapshot": {
-    "provider": "Filigree 3.1.0",
+    "provider": "legacy issue tracker 3.1.0",
     "captured_at": "2026-07-18T17:42:00+10:00",
-    "query_argv": ["filigree", "search", "[state engine]", "--json"],
+    "query_argv": ["legacy issue tracker", "search", "[state engine]", "--json"],
     "has_more": false,
     "items": [
       {"id": "elspeth-aafba3b298", "status": "in_progress", "priority": 1},
@@ -328,7 +328,7 @@
     "Evidence was deliberately conservative: prior passing runs and closed issues were not promoted without fresh exact attachment.",
     "The focused runs use the repository SQLite test profile and do not establish every advertised database/deployment profile.",
     "Injected response loss and exception rollback are not abrupt operating-system process death.",
-    "Loomweave was fresh at the commit but reports unresolved and external call/reference sites, so absence is not an unreachability proof.",
+    "retired code index was fresh at the commit but reports unresolved and external call/reference sites, so absence is not an unreachability proof.",
     "The tracker snapshot is mutable ownership context and was not used as behavioral evidence."
   ],
   "review_record": "docs/architecture/state_engine/assessments/2026-07-18-1631/review.md"

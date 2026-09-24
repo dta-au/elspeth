@@ -1,59 +1,29 @@
 ---
 name: bug-sweep
 description: >
-  Use to run a read-only, multi-agent bug sweep over a directory or subsystem —
-  fan a fleet of review agents across the files (each owning a bounded slice),
-  have them lodge verified findings in Filigree under one sweep tag, then
-  reconcile the tracker into a clean, deduplicated, severity-ranked report.
-  Invoke for "deep dive / audit <dir> for bugs", "sweep <subsystem> and file
-  what you find", or any large read-only review that must scale past one agent.
+  Use to run a read-only, multi-agent bug sweep over a directory or subsystem.
+  Assign bounded file slices, verify findings against callers and tests, and
+  produce a local deduplicated report for operator triage. GitHub issue uploads
+  are a separate effort.
 user-invocable: true
 ---
 
-# Bug sweep — fan-out review → tracker → reconciled report
+# Bug sweep — parallel review and local report
 
-A bug sweep is three phases. The middle one is a workflow; the discipline around
-it is what makes the result trustworthy.
+Run the `dir-bug-sweep` workflow to review source without modifying it. The
+workflow returns findings locally; it never creates, labels, comments on, or
+closes remote issues. The operator triages findings and uploads selected issues
+to GitHub separately through the shared development configuration.
 
-1. **Scope** — decide the target dir, the sweep tag, and the knobs.
-2. **Fan out** — run the `dir-bug-sweep` workflow (scout → bin-pack → waves of
-   read-only review agents that lodge findings tagged with your sweep tag).
-3. **Reconcile** — query the tag authoritatively, dedup, close stray duplicates,
-   present by severity. **This phase is yours, not the workflow's.** Skipping it
-   is how phantom IDs and duplicates reach the user.
+## Scope
 
-Requires the Filigree MCP server (the tag is a Filigree label) and, ideally,
-Loomweave (agents use it to verify findings against real callers).
+State the target directory or explicit file list, a unique sweep tag, and the
+review parameters. Defaults are `lineCap: 1000`, `maxParallel: 6`, and
+`glob: '*.py'`. Use `extraGuidance` for relevant project defect doctrine.
+Oversized files get one agent each with high effort. Do not reduce coverage
+by overfilling bins.
 
-## Phase 1 — Scope
-
-Pick, and state to the user:
-
-- **Target** — the dir or file (e.g. `src/elspeth/contracts`).
-- **Tag** — a unique, memorable label for *this* sweep, e.g. `2806bugsweep`
-  (date + word). Everything is reconciled through this tag, so it must not
-  collide with a previous sweep.
-- **Knobs** (defaults are good): `lineCap` (max lines one agent owns, default
-  1000), `maxParallel` (concurrent agents per wave, default 6 — this is the cap
-  the workflow honours by chunking into waves), `glob` (default `*.py`),
-  `extraGuidance` (project-specific defect doctrine to inject into every agent —
-  e.g. "treat dict.get-with-default fabrication as a defect; the audit DB is a
-  legal record").
-
-Arithmetic to set expectations: `bins ≈ total_lines / lineCap` (plus one solo
-bin per oversized file); `waves ≈ bins / maxParallel`. A 22k-line dir → ~24
-agents → 4 waves. That is the honest cost of "review every file"; don't shrink
-it by overfilling bins.
-
-## Phase 2 — Fan out
-
-**Compute the inventory yourself first — do not rely on the in-workflow scout.**
-The scout is an LLM agent asked to run `find` + `wc`; it has been observed to
-ignore its scoped path, enumerate the whole repo (`.venv`, caches, 30k+ files),
-exhaust its context, and emit nothing — killing the run before a single review
-agent launches. You (the orchestrator) have a shell; the workflow's JS sandbox
-does not (that's *why* it delegates). One deterministic command yields the exact
-`[{path, lines}]` the workflow wants:
+Compute the inventory before dispatch, using a repository-relative target:
 
 ```bash
 find <path> -type f -name '<glob>' -not -path '*/__pycache__/*' -print0 \
@@ -61,123 +31,55 @@ find <path> -type f -name '<glob>' -not -path '*/__pycache__/*' -print0 \
   | python3 -c "import sys,json; rows=[parts for line in sys.stdin if len(parts := line.split(None,1)) == 2]; print(json.dumps([{'path':p.rstrip('\n'),'lines':int(n)} for n,p in rows if p.rstrip('\n') != 'total']))"
 ```
 
-Pass that array as `args.files`; the workflow skips the scout and goes straight
-to bin-pack + waves. **Invoke via `scriptPath` to the live workflow file, NOT
-`name`** — the `name: 'dir-bug-sweep'` registration is *cached* and silently lags
-edits you just made to the file (this bit hard once: a stale cache re-ran a
-pre-fix version and mis-scoped the whole run). `scriptPath` re-reads from disk:
+Check the inventory against known files before dispatch. The workflow's optional
+LLM scout has previously broadened scope into caches and exhausted its context;
+use it only for a small, clearly scoped directory.
+
+## Run
+
+Invoke the live workflow by absolute `scriptPath`, not by its cached registered
+name. Pass the explicit inventory as `files`:
 
 ```
 Workflow({ scriptPath: '/abs/path/to/.claude/workflows/dir-bug-sweep.js', args: {
-  path: 'src/elspeth/web/composer',   // still pass it — used for labels + logging
-  tag:  '2806web-composer',
-  files: [{ path: '.../service.py', lines: 5320 }, ...],   // the inventory above
-  extraGuidance: '...project defect doctrine...'   // optional
+  path: 'src/elspeth/web/composer',
+  tag: '20260925-composer-review',
+  files: [{ path: 'src/elspeth/web/composer/service.py', lines: 5320 }],
+  maxParallel: 6,
+  extraGuidance: 'Verify every suspected failure against the real callers.'
 }})
 ```
 
-(Omitting `files` falls back to the agent scout — acceptable only for a small,
-clearly-scoped dir where it cannot wander. For anything subsystem-sized, precompute.)
+The runtime may deliver `args` as a JSON string; the workflow parses it and logs
+its resolved scope. Check that first line. With explicit files, no scout should
+run. Stop a mis-scoped run and correct the arguments.
 
-**`args` arrives at the script as a JSON *string*, not an object** (runtime
-serialises it at the tool boundary). The workflow already `JSON.parse`s it and
-logs a `Resolved scope:` line first thing + fails closed if it resolves to a
-whole-repo `.` sweep. After launching, **verify scope before trusting the run**:
-the first review agents should own files under your target dir, and for a
-precomputed run **no scout agent should spawn at all**. If you see `path='.'`,
-a scout, or repo-root files, kill it (`TaskStop`) — args didn't land.
+Each agent reads every assigned file, follows callers and tests using `rg` and
+file reads, and returns evidence for each verified finding: exact file:line,
+broken invariant, expected behavior, and how the failure was verified. Clean
+files are valid outcomes. Findings include title, severity P0–P4, kind, file,
+and an evidence-bearing summary; no remote issue ID is expected.
 
-The workflow returns self-reported results **and** an `unreviewedFiles` list.
-**Do not trust agent-reported issue IDs** — they can be phantom or confabulated;
-they're a cross-check, not the source of truth. The tracker is.
+If agents fail, use `unreviewedFiles` to rerun only the missing files with the
+same tag and explicit inventory. Do not use `resumeFromRunId`: its cache can
+rerun successful agents after the first failure and duplicate findings.
 
-### If agents fail (transient rate limits, deaths)
+## Reconcile and report
 
-`binsReturned < binsDispatched`, and `unreviewedFiles` is non-empty. **Re-run
-only the missing files — do NOT `resumeFromRunId`.** Resume's cache prefix breaks
-at the *first* failure, so every downstream agent re-runs and re-lodges
-duplicates (this is exactly how a clean sweep grows a pile of dupes). Instead:
-
-```
-Workflow({ scriptPath: '/abs/path/to/.claude/workflows/dir-bug-sweep.js', args: {
-  tag: '2806bugsweep',                              // SAME tag
-  files: [{ path: '.../data.py', lines: 392 }, ...] // the unreviewedFiles, scout skipped
-}})
-```
-
-To stay under server-side rate limits on big sweeps, keep `maxParallel` at 6 and
-avoid bunching several oversized (effort:high) files in one wave — the workflow
-already spreads them, but a very large dir can still trip throttling; a targeted
-re-run of the failed slice is the recovery, not a panic.
-
-## Phase 3 — Reconcile (the integrity step — always do this)
-
-1. **Authoritative query** — the single source of truth:
-
-   ```
-   mcp__filigree__issue_list({ label: '<tag>', no_limit: true, sort_by: 'created_at', direction: 'asc' })
-   ```
-
-   If it's too large to return inline it lands in a tool-results file; parse with
-   `jq`. A compact view + total:
-
-   ```bash
-   jq -r '.items | length' "$F"                                   # count
-   jq -r '.items | sort_by(.created_at)
-     | .[] | "\(.created_at[11:19])  \(.issue_id)  P\(.priority) \(.type)  \(.title)"' "$F"
-   ```
-
-2. **Find duplicates.** Sort by `created_at`; a re-run shows up as a later
-   timestamp cluster. Two issues on the **same file** with the **same defect**
-   (compare descriptions, not just titles — re-run wording differs) are dupes.
-   Re-runs are non-deterministic, so the second pass also surfaces *distinct*
-   findings on already-covered files — keep those. Verify each candidate pair's
-   descriptions before acting (a wrong close loses a real finding):
-
-   ```bash
-   jq -r --arg a "$CANON" --arg d "$DUP" '.items[]
-     | select(.issue_id==$a or .issue_id==$d)
-     | "\(.issue_id)\n  \(.description[0:340])\n"' "$F"
-   ```
-
-3. **Close the duplicate copies** (keep the earliest of each pair). Bugs sit at
-   `triage` with no direct close transition, so use `force: true`, and name the
-   canonical in the reason so the audit trail explains itself:
-
-   ```
-   mcp__filigree__issue_close({ issue_id: '<dup>', force: true, actor: 'bug-sweep',
-     reason: 'Duplicate of <canonical> (same file, same defect) — re-lodged by a
-              workflow-resume/re-run. Closing redundant copy; canonical remains open.' })
-   ```
-
-4. **Coverage check.** "No issue lodged" ≠ "reviewed clean." For any file that
-   came back with zero findings — *especially* files from a failed-then-re-run
-   bin — read that agent's `notes` and confirm a substantive clean-or-dismissed
-   rationale (named candidates examined and cleared), not a bare mention. If a
-   file is only listed in `files_reviewed` with no reasoning, re-run that bin.
-
-5. **Present** by severity. Lead with P0/P1/P2 (the real blast radius), compress
-   the P3 tail thematically. Be transparent about the mechanism if rows were
-   deduped ("N raw → M canonical, and here's why"). Surface cross-file themes the
-   agents flagged as out-of-scope. End by noting it was read-only and offering
-   the highest-value fix cluster as the next step — but **do not fix anything in
-   this skill**; lodging + dedup cleanup are the only authorized writes.
-
-## Discipline (non-negotiable)
-
-- **Read-only.** Agents may roam the whole codebase to verify, but the only
-  writes anywhere in a sweep are Filigree create/label (agents) and the dedup
-  closes (you). No source edits, no auto-fixing.
-- **Verify before lodge.** Each finding needs file:line + why-it-breaks +
-  expected + the trace that confirms it. Baked into the agent prompt; hold the
-  line in reconciliation by spot-checking descriptions.
-- **One tag per sweep**, reconciled once at the end. The tag isolates this
-  sweep's findings from the rest of the tracker and from prior sweeps.
-- **The tracker is truth, agent IDs are a hint.** Build the final list from the
-  authoritative query, never from the workflow's `selfReportedIssues`.
+1. Compare returned `files_reviewed` with the dispatched inventory. A missing
+   finding does not prove a file was reviewed clean. Check each agent's notes
+   for substantive clean-or-dismissed reasoning; rerun inadequate reviews.
+2. Deduplicate findings about the same file and defect, comparing the full
+   evidence rather than titles. Keep distinct failures on the same file.
+3. Spot-check each retained finding against source and tests. Separate confirmed
+   defects from uncertain candidates and record unresolved coverage.
+4. Write the durable report under `docs/audit/` after confirming the chosen
+   path is not ignored. Use `.claude/lanes/<run>/` for coordination artifacts.
+5. Present findings by severity, including coverage, verification limits, and
+   the report path. The report is ready for operator triage and later GitHub
+   upload; this workflow does not publish it or fix source.
 
 ## Files
 
-- Workflow: `.claude/workflows/dir-bug-sweep.js` (scout → FFD bin-pack → waves).
-  Edit it to change the review prompt, schema, or packing; re-invoke via its
-  absolute `scriptPath` so the runtime reads the live file.
+- `.claude/workflows/dir-bug-sweep.js`: scout, first-fit-decreasing bin packing,
+  parallel review waves, and structured local findings.

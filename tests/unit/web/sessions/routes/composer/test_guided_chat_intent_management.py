@@ -181,7 +181,7 @@ def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes
     Collector is deliberately absent from `PLUGIN_FREE_NODE_TYPES` — that
     tuple's copy asserts "not a transform plugin", which is false for a
     plugin-bearing collector — so the teaching composes into the frame instead
-    (filigree elspeth-270e81443d).
+    (archived issue elspeth-270e81443d).
 
     No clause may attribute the unavailable plugin to the collector: nothing
     reaching `_model_catalog_identity_chat` says which node the plugin was for
@@ -221,7 +221,7 @@ def test_collector_and_structural_clauses_both_emit_inside_one_frame() -> None:
     clause away; a returning collector branch placed after the `next()` scan
     would never be reached whenever a structural node was also named. Composing
     the clauses gives the user both, so no ordering is load-bearing and nothing
-    true is traded away (filigree elspeth-270e81443d, review comment 7977 §7.1).
+    true is traded away (archived issue elspeth-270e81443d, review comment 7977 §7.1).
     """
 
     result = _apply(

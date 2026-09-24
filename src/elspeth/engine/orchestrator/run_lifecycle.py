@@ -1,7 +1,7 @@
 """RunLifecycleCoordinator: fresh-run lifecycle ownership for the orchestrator.
 
 Extracted from ``Orchestrator.run`` / ``Orchestrator._initialize_database_phase``
-/ ``Orchestrator._execute_export_phase`` (filigree elspeth-9e71ae82a4). The
+/ ``Orchestrator._execute_export_phase`` (archived issue elspeth-9e71ae82a4). The
 facade keeps thin delegators; this coordinator owns the ordering.
 
 CRASH-BEHAVIOUR CONTRACT (do not reorder):

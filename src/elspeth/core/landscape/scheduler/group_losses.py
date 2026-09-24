@@ -4,7 +4,7 @@
 The append-only ``group_losses`` table: in-transaction recording (riding the
 caller's disposition transaction), the intake/takeover reads, the fenced
 replay-cursor adoption mark, and the adoption-context frame guard. Migrated
-1:1 from ``branch_losses.py`` (filigree elspeth-ef9c36d767) onto the
+1:1 from ``branch_losses.py`` (archived issue elspeth-ef9c36d767) onto the
 group-scoped natural key (run_id, closer_name, group_id, member_key).
 """
 
