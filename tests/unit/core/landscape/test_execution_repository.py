@@ -3153,6 +3153,12 @@ class TestDelegationSignatureAlignment:
             id="get_group_record",
         ),
         pytest.param(
+            "get_collector_group_failures_for_run",
+            lambda execution: execution.get_collector_group_failures_for_run,
+            ExecutionRepository.get_collector_group_failures_for_run,
+            id="get_collector_group_failures_for_run",
+        ),
+        pytest.param(
             "any_member_token_for_group",
             lambda execution: execution.any_member_token_for_group,
             ExecutionRepository.any_member_token_for_group,

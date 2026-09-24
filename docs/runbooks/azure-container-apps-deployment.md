@@ -106,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-66 image (session epoch 66, Landscape epoch 44) in the registry.
+- The epoch-66 image (session epoch 66, Landscape epoch 45) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -449,7 +449,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
   with the schema-owner URLs and initializes both schemas at session epoch 66
-  and Landscape epoch 44.
+  and Landscape epoch 45.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -462,7 +462,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
 
 > **LIVE:** for 0.8.1 acceptance, run the Jobs with the candidate digest and
 > require both schema checks to pass after initialization at session epoch 66
-> and Landscape epoch 44. Record the execution names. Any no-schema dry run
+> and Landscape epoch 45. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
 
@@ -535,7 +535,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 66, "landscape_epoch": 44, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 66, "landscape_epoch": 45, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",

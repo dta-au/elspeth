@@ -612,6 +612,7 @@ class TestResumeFinalizesAsFailed:
         mock_factory.query.get_all_token_outcomes_for_run.return_value = []
         mock_factory.run_status_projection.count_distinct_source_rows_with_terminal_outcome.return_value = 0
         mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
         prepare_for_run()
         mock_factory.run_lifecycle.get_runtime_val_manifest.return_value = canonical_json(build_runtime_val_manifest())
 
@@ -2212,6 +2213,7 @@ class TestResumeFinalizesAsFailed:
         mock_factory.run_lifecycle.finalize_run = MagicMock(spec=object)
         mock_factory.run_status_projection.count_distinct_source_rows_with_terminal_outcome.return_value = 0
         mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
         # ADR-030 §A.3 (slice 4): provide a valid token + healthy heartbeat snapshot.
         coordination_token = _make_heartbeat_safe_token(run_id, mock_factory)
         scalars = BarrierScalars(
@@ -2306,6 +2308,7 @@ class TestResumeFinalizesAsFailed:
         # rows_coalesce_failed likewise derives from a dedicated query (DISTINCT
         # failed-barrier pairs over node_states); no coalesce failures here.
         mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
         # ADR-030 §A.3 (slice 4): provide a valid token + healthy heartbeat snapshot.
         coordination_token = _make_heartbeat_safe_token(run_id, mock_factory)
         mock_factory.query.get_all_token_outcomes_for_run.return_value = [
@@ -2425,6 +2428,7 @@ class TestResumeFinalizesAsFailed:
         mock_factory = MagicMock(spec=RecorderFactory)
         mock_factory.run_status_projection.count_distinct_source_rows_with_terminal_outcome.return_value = 0
         mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
         # ADR-030 §A.3 (slice 4): provide a valid token + healthy heartbeat snapshot.
         coordination_token = _make_heartbeat_safe_token(run_id, mock_factory)
 

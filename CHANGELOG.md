@@ -35,7 +35,7 @@ Session epoch 66 requires control-message v2 checksums that bind the origin,
 provider role, schema and content together. Stored v1 control messages use
 content-only checksums and cannot be replayed by this release; epoch-65 session
 databases must also be recreated, not relabelled as epoch 66.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 44 for immutable web
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 45 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
@@ -49,16 +49,19 @@ the exported node record.
 Epoch 44 records the actual run mode and source run, links replayed calls to
 their source calls, stores verification decisions, and numbers source/preflight
 operation occurrences under the run leader.
+Epoch 45 records one durable collector-group failure verdict per group,
+including groups with no arrived members. Run results report these separately
+from failed rows.
 These changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 66 (including epoch 65) and Landscape databases below epoch 44 must be
+epoch 66 (including epoch 65) and Landscape databases below epoch 45 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 66, Landscape 44); these are not minimum versions.
+current schema epoch (session 66, Landscape 45); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

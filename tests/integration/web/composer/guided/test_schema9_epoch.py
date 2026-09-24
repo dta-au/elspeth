@@ -62,7 +62,7 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every Landscape digest column a shape CHECK; pairs with session 63.
-    assert SQLITE_SCHEMA_EPOCH == 44
+    assert SQLITE_SCHEMA_EPOCH == 45
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

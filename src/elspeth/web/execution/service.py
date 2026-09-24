@@ -909,21 +909,21 @@ def _session_status_from_run_result_status(status: RunStatus) -> SessionRunStatu
         ) from exc
 
 
-def _structural_failure_message(*, rows_processed: int, failure_samples: str = "") -> str:
+def _structural_failure_message(*, rows_processed: int, collector_groups_failed: int = 0, failure_samples: str = "") -> str:
     """elspeth-0de989c56d / elspeth-5069612f3c — synthetic structural error
     for FAILED-from-row-shape after the rows_routed split.
 
     The L3 RunRecord.__post_init__ invariant requires a non-empty error for
-    status='failed'. When the engine returns RunStatus.FAILED from a row-shape
-    decision (no exception propagated; no success indicator: rows_succeeded == 0
-    AND rows_routed_success == 0), this helper produces a structural fact —
+    status='failed'. When the engine returns RunStatus.FAILED from a row or
+    collector-group verdict (no exception propagated; no success indicator:
+    rows_succeeded == 0 AND rows_routed_success == 0), this helper produces a structural fact —
     operator-readable, no candidate-secret material, no echoed user-row data.
 
     After elspeth-5069612f3c, gate-routed pipelines (rows_routed_success > 0)
     no longer reach this code path — they classify as COMPLETED. This message
     fires only when no row reached EITHER the success-counted terminal state
-    OR an intentional gate-routed sink, i.e. when every row failed terminally
-    or was diverted via on_error.
+    OR an intentional gate-routed sink. A collector group can fail with no
+    arrived members, so the message includes its separate structural count.
 
     ``failure_samples`` is an optional pre-formatted bullet list summarising
     the dominant per-row failures as count + failing node + error category
@@ -937,12 +937,17 @@ def _structural_failure_message(*, rows_processed: int, failure_samples: str = "
     """
     base = (
         f"No row reached a success path (rows_processed={rows_processed}, "
-        f"rows_succeeded=0, rows_routed_success=0). "
-        f"All rows either failed terminally or were routed via on_error to a "
-        f"failure sink."
+        f"rows_succeeded=0, rows_routed_success=0, "
+        f"collector_groups_failed={collector_groups_failed})."
     )
+    if collector_groups_failed:
+        base += " Structural collector-group failures occurred."
+    else:
+        base += " All rows either failed terminally or were routed via on_error to a failure sink."
     if failure_samples:
         return f"{base} Top per-row failures:\n{failure_samples}"
+    if collector_groups_failed:
+        return f"{base} Expand this run for failure accounting."
     return f"{base} Expand this run for per-row failure details."
 
 
@@ -952,6 +957,7 @@ def _partial_completion_message(
     rows_failed: int,
     rows_routed_failure: int,
     rows_quarantined: int,
+    collector_groups_failed: int = 0,
     failure_samples: str = "",
 ) -> str:
     """Operator-readable summary for COMPLETED_WITH_FAILURES runs.
@@ -973,7 +979,8 @@ def _partial_completion_message(
     base = (
         f"Run completed with failures (rows_succeeded={rows_succeeded}, "
         f"rows_failed={rows_failed}, rows_routed_failure={rows_routed_failure}, "
-        f"rows_quarantined={rows_quarantined})."
+        f"rows_quarantined={rows_quarantined}, "
+        f"collector_groups_failed={collector_groups_failed})."
     )
     if failure_samples:
         return f"{base} Top per-row failures:\n{failure_samples}"
@@ -3795,6 +3802,7 @@ class ExecutionServiceImpl:
                 if result.status == RunStatus.FAILED:
                     session_error = _structural_failure_message(
                         rows_processed=result.rows_processed,
+                        collector_groups_failed=result.collector_groups_failed,
                         failure_samples=samples_text,
                     )
                 else:
@@ -3805,6 +3813,7 @@ class ExecutionServiceImpl:
                         rows_failed=result.rows_failed,
                         rows_routed_failure=result.rows_routed_failure,
                         rows_quarantined=result.rows_quarantined,
+                        collector_groups_failed=result.collector_groups_failed,
                         failure_samples=samples_text,
                     )
             # R14 (Task I1): charge the run's LLM calls before its terminal status.

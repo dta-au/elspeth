@@ -542,7 +542,16 @@ def run_end_of_input_barrier_flush(
         # roster settles through intake (arrival or loss replay); a group
         # that never settles is the non-convergence below, named as such.
         if not processor.has_blocked_barrier_work():
-            return
+            if collector_executor is not None:
+                # An EOF aggregation flush can emit a zero-member scope after
+                # this round's first intake. No child has a BLOCKED row, so
+                # the ordinary loop predicate cannot detect that pending
+                # group. One final intake discovers its durable opener record
+                # before terminal run accounting, including on resume.
+                intake_results = processor.run_barrier_intake(ctx)
+                accumulate_row_outcomes(intake_results, counters, pending_tokens)
+            if not processor.has_blocked_barrier_work():
+                return
 
     collector_detail = ""
     if collector_executor is not None:

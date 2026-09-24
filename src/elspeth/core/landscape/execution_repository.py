@@ -100,6 +100,7 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     batch_members_table,
     batches_table,
+    collector_group_failures_table,
     group_records_table,
     node_states_table,
     token_lineage_frames_table,
@@ -509,6 +510,14 @@ class ExecutionRepository:
             opener_token_id=str(row.opener_token_id),
             member_count=int(row.member_count),
             closes_group_id=None if row.closes_group_id is None else str(row.closes_group_id),
+        )
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        """Read immutable collector-group verdicts for audit export."""
+        return self._ops.execute_fetchall(
+            select(collector_group_failures_table)
+            .where(collector_group_failures_table.c.run_id == run_id)
+            .order_by(collector_group_failures_table.c.group_id)
         )
 
     def any_member_token_for_group(self, *, run_id: str, group_id: str) -> str | None:
@@ -1333,7 +1342,9 @@ class ExecutionRepository:
         self,
         *,
         coordination_token: CoordinationToken,
+        group_id: str,
         collector_node_id: str,
+        failure_reason: str,
         flush_state_id: str | None,
         flush_error: ExecutionError | None,
         flush_duration_ms: float | None,
@@ -1350,32 +1361,38 @@ class ExecutionRepository:
         - the flush's opener-anchored node_state FAILED with ``flush_error``
           (absent for the lost-members arm, which never opens a flush);
         - every arrived member's accept-time hold FAILED with ``hold_error``,
-          the group-level ``CollectorGroupFailure`` each survivor carries.
+          the group-level ``CollectorGroupFailure`` each survivor carries;
+        - one immutable group failure row, even when no member arrived.
 
-        So the holds ARE the verdict's witness. OPEN holds mean no verdict:
-        a flush that died before this commits is re-run on resume. FAILED
-        ``CollectorGroupFailure`` holds on members the journal still holds
-        BLOCKED mean a recorded verdict, and resume completes its disposition
-        without the plugin (the aggregation twin is
+        The holds witness the verdict for member-bearing groups. OPEN holds
+        mean no verdict: a flush that died before this commits is re-run on
+        resume. FAILED ``CollectorGroupFailure`` holds on members the journal
+        still holds BLOCKED mean a recorded verdict, and resume completes its
+        disposition without the plugin (the aggregation twin is
         ``complete_aggregation_failure``, operator ruling 2026-09-23). Before
         this verb each hold completed in its own transaction, so a crash
         after the first left a group restore treated as closed while its
-        members stayed BLOCKED forever.
+        members stayed BLOCKED forever. A zero-arrival group has no holds;
+        its failure row is the durable verdict.
 
         ``member_holds`` is ``(member, hold state_id, hold duration_ms)`` in
         member order.
 
         Raises:
-            AuditIntegrityError: The members are empty, repeated or cross the
-                run; a flush state is named without its error or vice versa;
-                a state is missing, foreign, at another node, not OPEN, or a
-                hold does not belong to its member.
+            AuditIntegrityError: The group or reason is missing; members are
+                repeated or cross the run; a flush state is named without its
+                error or vice versa; a state is missing, foreign, at another
+                node, not OPEN, or a hold does not belong to its member.
         """
         subject = "collector failure verdict"
         run_id = coordination_token.run_id
-        member_token_ids = self._validate_verdict_members(
-            [ref for ref, _state_id, _duration in member_holds], run_id=run_id, subject=subject
+        member_token_ids = (
+            self._validate_verdict_members([ref for ref, _state_id, _duration in member_holds], run_id=run_id, subject=subject)
+            if member_holds
+            else ()
         )
+        if not group_id or not failure_reason:
+            raise AuditIntegrityError(f"{subject} requires a group ID and failure reason")
         if (flush_state_id is None) != (flush_error is None) or (flush_state_id is None) != (flush_duration_ms is None):
             raise AuditIntegrityError(f"{subject} names a flush state, its error and its duration together or not at all")
         with fenced_leader_transaction(
@@ -1384,6 +1401,24 @@ class ExecutionRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="complete_collector_failure",
         ) as conn:
+            existing = conn.execute(
+                select(collector_group_failures_table.c.collector_node_id, collector_group_failures_table.c.failure_reason)
+                .where(collector_group_failures_table.c.run_id == run_id)
+                .where(collector_group_failures_table.c.group_id == group_id)
+                .with_for_update(of=collector_group_failures_table)
+            ).one_or_none()
+            if existing is not None:
+                if (
+                    not member_holds
+                    and flush_state_id is None
+                    and (existing.collector_node_id, existing.failure_reason)
+                    == (
+                        collector_node_id,
+                        failure_reason,
+                    )
+                ):
+                    return
+                raise AuditIntegrityError(f"{subject} for group {group_id!r} was already recorded")
             self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject=subject)
             if flush_state_id is not None:
                 flush_status, _opener = self._lock_verdict_state_on(
@@ -1402,7 +1437,17 @@ class ExecutionRepository:
             ]
             if flush_state_id is not None and flush_error is not None and flush_duration_ms is not None:
                 failed_states.insert(0, (flush_state_id, flush_duration_ms, flush_error))
-            self.node_states.complete_node_states_failed_many(failed_states, conn=conn)
+            if failed_states:
+                self.node_states.complete_node_states_failed_many(failed_states, conn=conn)
+            conn.execute(
+                collector_group_failures_table.insert().values(
+                    run_id=run_id,
+                    group_id=group_id,
+                    collector_node_id=collector_node_id,
+                    failure_reason=failure_reason,
+                    recorded_at=now(),
+                )
+            )
 
     def complete_aggregation_failure(
         self,

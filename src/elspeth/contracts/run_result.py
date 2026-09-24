@@ -31,6 +31,7 @@ class RunResult:
     rows_forked: int = 0
     rows_coalesced: int = 0
     rows_coalesce_failed: int = 0  # Coalesce failures (quorum_not_met, incomplete_branches)
+    collector_groups_failed: int = 0  # Structural collector-group verdicts, not failed rows
     rows_expanded: int = 0  # Deaggregation parent tokens
     rows_buffered: int = 0  # Passthrough mode buffered tokens
     rows_diverted: int = 0  # Rows diverted to failsink during sink write
@@ -50,6 +51,7 @@ class RunResult:
         require_int(self.rows_forked, "rows_forked", min_value=0)
         require_int(self.rows_coalesced, "rows_coalesced", min_value=0)
         require_int(self.rows_coalesce_failed, "rows_coalesce_failed", min_value=0)
+        require_int(self.collector_groups_failed, "collector_groups_failed", min_value=0)
         require_int(self.rows_expanded, "rows_expanded", min_value=0)
         require_int(self.rows_buffered, "rows_buffered", min_value=0)
         require_int(self.rows_diverted, "rows_diverted", min_value=0)
@@ -94,20 +96,23 @@ class RunResult:
         * ``failure_indicator`` — at least one row reached an *uncaught*
           failure state (failed without being quarantined, or a
           run-level coalesce failure):
-          ``(rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0``.
+          ``(rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0
+          or collector_groups_failed > 0``.
 
         A run that quarantined every row is COMPLETED_WITH_FAILURES, not
         FAILED — the pipeline made a clean determination on every row.
 
-        ``rows_coalesce_failed`` remains a separate run-level failure
-        signal: a coalesce quorum failure is not a per-row outcome and is
-        never offset by quarantine.
+        ``rows_coalesce_failed`` and ``collector_groups_failed`` are separate
+        structural failure signals, never added to failed-row totals or offset
+        by quarantine.
 
         Non-terminal (``RUNNING``) and signal-bounded (``INTERRUPTED``)
         statuses bypass the predicate.
         """
         terminal_clean_indicator = self.rows_succeeded > 0 or self.rows_quarantined > 0
-        failure_indicator = (self.rows_failed - self.rows_quarantined) > 0 or self.rows_coalesce_failed > 0
+        failure_indicator = (
+            (self.rows_failed - self.rows_quarantined) > 0 or self.rows_coalesce_failed > 0 or self.collector_groups_failed > 0
+        )
         # ``has_quarantine`` distinguishes "clean-direct-success only" from
         # "any quarantine in the mix" — COMPLETED requires the former.
         has_quarantine = self.rows_quarantined > 0
@@ -130,9 +135,10 @@ class RunResult:
                 raise ValueError(
                     f"RunResult: status=COMPLETED requires no uncaught failures "
                     f"(rows_failed - rows_quarantined = {self.rows_failed - self.rows_quarantined}, "
-                    f"rows_coalesce_failed={self.rows_coalesce_failed}); "
-                    f"use status=COMPLETED_WITH_FAILURES when at least one row "
-                    f"reached an uncaught failure terminal state"
+                    f"rows_coalesce_failed={self.rows_coalesce_failed}, "
+                    f"collector_groups_failed={self.collector_groups_failed}); "
+                    f"use status=COMPLETED_WITH_FAILURES when a row or "
+                    f"structural group reached an uncaught failure state"
                 )
             case (RunStatus.COMPLETED, _, _, _, True):
                 raise ValueError(
@@ -158,10 +164,12 @@ class RunResult:
             case (RunStatus.COMPLETED_WITH_FAILURES, _, _, False, False):
                 raise ValueError(
                     f"RunResult: status=COMPLETED_WITH_FAILURES requires at least one failure-like indicator "
-                    f"(uncaught rows_failed > 0, rows_coalesce_failed > 0, or rows_quarantined > 0); "
+                    f"(uncaught rows_failed > 0, rows_coalesce_failed > 0, "
+                    f"collector_groups_failed > 0, or rows_quarantined > 0); "
                     f"got rows_failed={self.rows_failed}, "
                     f"rows_quarantined={self.rows_quarantined}, "
-                    f"rows_coalesce_failed={self.rows_coalesce_failed} "
+                    f"rows_coalesce_failed={self.rows_coalesce_failed}, "
+                    f"collector_groups_failed={self.collector_groups_failed} "
                     f"(use status=COMPLETED for clean runs with no quarantine)"
                 )
             case (RunStatus.FAILED, _, _, _, _):
@@ -183,7 +191,8 @@ class RunResult:
                     f"RunResult: status=EMPTY requires no failures "
                     f"(rows_failed={self.rows_failed}, "
                     f"rows_quarantined={self.rows_quarantined}, "
-                    f"rows_coalesce_failed={self.rows_coalesce_failed}); "
+                    f"rows_coalesce_failed={self.rows_coalesce_failed}, "
+                    f"collector_groups_failed={self.collector_groups_failed}); "
                     f"use status=FAILED when the run encountered uncaught failures with "
                     f"no clean terminal rows"
                 )
@@ -215,6 +224,7 @@ class RunResult:
             "rows_forked": self.rows_forked,
             "rows_coalesced": self.rows_coalesced,
             "rows_coalesce_failed": self.rows_coalesce_failed,
+            "collector_groups_failed": self.collector_groups_failed,
             "rows_expanded": self.rows_expanded,
             "rows_buffered": self.rows_buffered,
             "rows_diverted": self.rows_diverted,
@@ -231,6 +241,7 @@ def derive_terminal_run_status(
     rows_routed_failure: int,
     rows_quarantined: int,
     rows_coalesce_failed: int,
+    collector_groups_failed: int = 0,
 ) -> RunStatus:
     """Pick a terminal RunStatus from ADR-019 lifecycle counters.
 
@@ -247,7 +258,8 @@ def derive_terminal_run_status(
     * ``failure_indicator`` — at least one row reached an *uncaught*
       failure state (failed without being quarantined, or a run-level
       coalesce failure):
-      ``(rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0``.
+      ``(rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0
+      or collector_groups_failed > 0``.
 
     Decision tree:
 
@@ -291,7 +303,7 @@ def derive_terminal_run_status(
         )
 
     terminal_clean_indicator = rows_succeeded > 0 or rows_quarantined > 0
-    failure_indicator = (rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0
+    failure_indicator = (rows_failed - rows_quarantined) > 0 or rows_coalesce_failed > 0 or collector_groups_failed > 0
 
     if rows_processed == 0 and not terminal_clean_indicator:
         return RunStatus.FAILED if failure_indicator else RunStatus.EMPTY

@@ -43,6 +43,7 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
     from sqlalchemy import func, select
 
     from elspeth.core.landscape.schema import (
+        collector_group_failures_table,
         node_states_table,
         nodes_table,
         operations_table,
@@ -106,6 +107,11 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             ).scalar()
             or 0
         )
+
+        # A group failure is a structural verdict, not a failed-row error.
+        collector_groups_failed = conn.execute(
+            select(func.count()).select_from(collector_group_failures_table).where(collector_group_failures_table.c.run_id == run_id)
+        ).scalar_one()
 
         # Count validation errors
         validation_error_count = (
@@ -172,6 +178,7 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             "source_loads": source_load_count,
             "sink_writes": sink_write_count,
             "runtime_preflights": runtime_preflight_count,
+            "collector_groups_failed": collector_groups_failed,
         },
         "errors": {
             "validation": validation_error_count,

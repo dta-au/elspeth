@@ -59,6 +59,7 @@ from elspeth.core.landscape.schema import (
     batches_table,
     coalesce_effect_members_table,
     coalesce_effects_table,
+    collector_group_failures_table,
     group_losses_table,
     group_records_table,
     node_states_table,
@@ -416,6 +417,44 @@ class BarrierRestoreReadModel:
             member_count=row.member_count,
             closes_group_id=row.closes_group_id,
         )
+
+    def pending_empty_expansion_groups(self, *, run_id: str, opener_node_ids: Sequence[str]) -> tuple[tuple[str, str], ...]:
+        """Zero-member groups awaiting a require_all collector verdict.
+
+        A follower can mint the group under membership authority but cannot
+        write the leader-fenced failure marker. Match the opener's completed
+        or open node state to this run's declared require_all opener nodes;
+        the marker anti-join makes the leader sweep idempotent on takeover.
+        """
+        if not opener_node_ids:
+            return ()
+        query = (
+            select(group_records_table.c.group_id, node_states_table.c.node_id)
+            .distinct()
+            .join(
+                node_states_table,
+                and_(
+                    node_states_table.c.run_id == group_records_table.c.run_id,
+                    node_states_table.c.token_id == group_records_table.c.opener_token_id,
+                ),
+            )
+            .outerjoin(
+                collector_group_failures_table,
+                and_(
+                    collector_group_failures_table.c.run_id == group_records_table.c.run_id,
+                    collector_group_failures_table.c.group_id == group_records_table.c.group_id,
+                ),
+            )
+            .where(
+                group_records_table.c.run_id == run_id,
+                group_records_table.c.kind == FrameKind.EXPAND.value,
+                group_records_table.c.member_count == 0,
+                group_records_table.c.closes_group_id.is_(None),
+                node_states_table.c.node_id.in_(opener_node_ids),
+                collector_group_failures_table.c.group_id.is_(None),
+            )
+        )
+        return tuple((str(row.group_id), str(row.node_id)) for row in self._ops.execute_fetchall(query))
 
     def get_token_mint_step(self, *, run_id: str, token_id: str) -> int | None:
         """``tokens.step_in_pipeline`` of one token: the step of the node that minted it.

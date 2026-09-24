@@ -534,7 +534,9 @@ class NodeStateGuard:
         self,
         *,
         coordination_token: CoordinationToken,
+        group_id: str,
         collector_node_id: str,
+        failure_reason: str,
         flush_error: ExecutionError,
         duration_ms: float,
         member_holds: Sequence[tuple[TokenRef, str, float]],
@@ -543,7 +545,9 @@ class NodeStateGuard:
         """Record the collector group's FAILED verdict — this flush state and every member hold — atomically."""
         self._execution.complete_collector_failure(
             coordination_token=coordination_token,
+            group_id=group_id,
             collector_node_id=collector_node_id,
+            failure_reason=failure_reason,
             flush_state_id=self.state_id,
             flush_error=flush_error,
             flush_duration_ms=duration_ms,

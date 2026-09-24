@@ -52,6 +52,7 @@ def _accounting(
     routed_failure: int = 0,
     quarantined: int = 0,
     discarded: int = 0,
+    collector_groups_failed: int = 0,
 ) -> RunAccounting:
     terminal = succeeded + failed + structural
     if emitted is None:
@@ -73,6 +74,7 @@ def _accounting(
             quarantined=quarantined,
             discarded=discarded,
         ),
+        collector_groups_failed=collector_groups_failed,
         integrity=RunAccountingIntegrity(
             closure=closure,
             missing_terminal_outcomes=missing_terminal_outcomes,
@@ -1454,6 +1456,15 @@ class TestRunStatusResponseStatusInvariant:
     def test_completed_rejects_failures(self) -> None:
         with pytest.raises(pydantic.ValidationError, match=r"completed.*tokens.failed == 0"):
             self._build(status="completed", accounting=_accounting(source_rows=10, succeeded=7, failed=3))
+
+    def test_completed_rejects_collector_group_failure(self) -> None:
+        with pytest.raises(pydantic.ValidationError, match=r"completed.*collector_groups_failed == 0"):
+            self._build(status="completed", accounting=_accounting(collector_groups_failed=1))
+
+    def test_completed_with_failures_accepts_structural_group_failure(self) -> None:
+        response = self._build(status="completed_with_failures", accounting=_accounting(collector_groups_failed=1))
+        assert response.accounting is not None
+        assert response.accounting.collector_groups_failed == 1
 
     def test_completed_with_failures_rejects_zero_succeeded(self) -> None:
         with pytest.raises(pydantic.ValidationError, match=r"completed_with_failures.*tokens.succeeded > 0"):

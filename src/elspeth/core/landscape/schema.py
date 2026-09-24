@@ -450,7 +450,10 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        operations gain a fenced per-node/type occurrence index for repeatable
 #        source/preflight call matching.
 #        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
-SQLITE_SCHEMA_EPOCH = 44
+#  45 → One immutable collector-group failure verdict per group, including
+#        groups with no arrived members. The run result counts these separately
+#        from failed rows. Populated epoch-44 stores require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 45
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -1304,6 +1307,18 @@ Index(
     group_records_table.c.run_id,
     group_records_table.c.opener_token_id,
     unique=True,
+)
+
+collector_group_failures_table = Table(
+    "collector_group_failures",
+    metadata,
+    Column("run_id", String(64), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("collector_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("failure_reason", String(64), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(["run_id", "group_id"], ["group_records.run_id", "group_records.group_id"]),
+    ForeignKeyConstraint(["collector_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
 
 group_losses_table = Table(

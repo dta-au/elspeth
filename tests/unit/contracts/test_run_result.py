@@ -44,6 +44,7 @@ class TestRunResultValidation:
             "rows_forked",
             "rows_coalesced",
             "rows_coalesce_failed",
+            "collector_groups_failed",
             "rows_expanded",
             "rows_buffered",
             "rows_diverted",
@@ -76,6 +77,7 @@ class TestRunResultValidation:
             "rows_forked",
             "rows_coalesced",
             "rows_coalesce_failed",
+            "collector_groups_failed",
             "rows_expanded",
             "rows_buffered",
             "rows_diverted",
@@ -442,6 +444,7 @@ class TestRunStatusRowsRoutedSplitPredicate:
         rows_routed_failure: int = 0,
         rows_quarantined: int = 0,
         rows_coalesce_failed: int = 0,
+        collector_groups_failed: int = 0,
     ) -> RunResult:
         return RunResult(
             run_id="rsp-1",
@@ -453,6 +456,7 @@ class TestRunStatusRowsRoutedSplitPredicate:
             rows_routed_failure=rows_routed_failure,
             rows_quarantined=rows_quarantined,
             rows_coalesce_failed=rows_coalesce_failed,
+            collector_groups_failed=collector_groups_failed,
         )
 
     def test_gate_routed_only_classifies_as_completed(self) -> None:
@@ -700,6 +704,23 @@ class TestRunStatusRowsRoutedSplitPredicate:
             rows_coalesce_failed=3,
         )
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
+
+    def test_collector_group_failure_has_its_own_count_and_failure_status(self) -> None:
+        kwargs = {
+            "rows_processed": 0,
+            "rows_succeeded": 0,
+            "rows_failed": 0,
+            "rows_routed_success": 0,
+            "rows_routed_failure": 0,
+            "rows_quarantined": 0,
+            "rows_coalesce_failed": 0,
+            "collector_groups_failed": 1,
+        }
+        assert derive_terminal_run_status(**kwargs) is RunStatus.FAILED
+        failed = self._build(status=RunStatus.FAILED, collector_groups_failed=1)
+        assert failed.rows_failed == 0
+        assert failed.to_dict()["collector_groups_failed"] == 1
+        assert derive_terminal_run_status(**(kwargs | {"rows_processed": 1, "rows_succeeded": 1})) is RunStatus.COMPLETED_WITH_FAILURES
 
     def test_on_error_routed_with_quarantine_and_coalesce_failures_classifies_as_completed_with_failures(self) -> None:
         """Post-quarantine-promotion: quarantine is a clean terminal outcome

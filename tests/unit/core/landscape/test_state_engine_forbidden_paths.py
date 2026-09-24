@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts import (
     AggregationResultMember,
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
     NodeType,
     OutputMode,
@@ -55,6 +56,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
+    group_records_table,
     run_coordination_table,
     run_workers_table,
     token_work_items_table,
@@ -1451,6 +1453,17 @@ def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale:
     _, opener_id, _ = _enqueue(harness, "collector-opener", 0)
     _, first_id, _ = _enqueue(harness, "collector-member-a", 1)
     _, second_id, _ = _enqueue(harness, "collector-member-b", 2)
+    with harness.db.engine.begin() as conn:
+        conn.execute(
+            insert(group_records_table).values(
+                run_id=RUN_ID,
+                group_id="g-1",
+                kind=FrameKind.EXPAND.value,
+                opener_token_id=opener_id,
+                member_count=2,
+                created_at=NOW,
+            )
+        )
     flush = execution.begin_node_state(opener_id, "collector-1", 1, {"batch_rows": []}, member_token=member)
     holds = [
         execution.begin_node_state(token_id, "collector-1", 1, {"value": 1}, member_token=member) for token_id in (first_id, second_id)
@@ -1465,7 +1478,9 @@ def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale:
     def record_verdict() -> None:
         execution.complete_collector_failure(
             coordination_token=harness.coordination_token,
+            group_id="g-1",
             collector_node_id="collector-1",
+            failure_reason="collector_transform_error",
             flush_state_id=flush.state_id,
             flush_error=ExecutionError(exception="{'reason': 'deliberate'}", exception_type="TransformError"),
             flush_duration_ms=1.0,

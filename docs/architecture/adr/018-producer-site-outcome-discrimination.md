@@ -87,13 +87,20 @@ inline coalesce flush), and the consumed tokens additionally bump
 accounting must add their own structural counter and register it in the
 `failure_indicator` predicate at the same time.
 
+Collector group failures use `collector_groups_failed`, counted once per
+durable group verdict in Landscape's `collector_group_failures` table. This
+counts a failed group even when no member arrived. It is a separate unit of
+account from `rows_failed`; the terminal failure predicate includes it, and
+resume derives it from the durable verdicts.
+
 **Resume nuance.** The "Aggregate counter(s) incremented" column reflects
 the in-flight live-accumulator path. The resume-time aggregation in
-`engine/orchestrator/core.py::_derive_resume_terminal_status_from_audit`
+`engine/orchestrator/run_status.py::derive_terminal_status_from_audit`
 deliberately restores **only the predicate-input counters** needed to feed
 the biconditional in `contracts/run_result.py::RunResult`
 (`rows_succeeded`, `rows_routed_success`, `rows_failed`, `rows_quarantined`,
-`rows_routed_failure`, `rows_coalesce_failed`, `rows_processed`). Structural
+`rows_routed_failure`, `rows_coalesce_failed`, `collector_groups_failed`,
+`rows_processed`). Structural
 counters (`rows_coalesced`, `rows_forked`, `rows_expanded`, `rows_buffered`,
 `rows_diverted`) are not re-derived from `token_outcomes` on the
 all-rows-already-processed branch and reflect only activity in the resumed

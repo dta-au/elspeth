@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +31,13 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from tests.unit.web.auth.conftest import build_local_auth_provider
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _restore_web_command_environment() -> Iterator[None]:
+    """The CLI bridges web options through process environment variables."""
+    with patch.dict(os.environ, os.environ.copy(), clear=True):
+        yield
 
 
 @dataclass(frozen=True)

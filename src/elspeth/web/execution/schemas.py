@@ -465,6 +465,7 @@ class RunAccounting(_StrictResponse):
     sources: dict[str, RunAccountingSource] = Field(default_factory=dict)
     tokens: RunAccountingTokens
     routing: RunAccountingRouting
+    collector_groups_failed: int = Field(default=0, ge=0)
     integrity: RunAccountingIntegrity
 
     @model_validator(mode="after")
@@ -560,6 +561,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError("status='completed' requires tokens.succeeded > 0")
         if accounting.tokens.failed != 0:
             raise ValueError("status='completed' requires tokens.failed == 0")
+        if accounting.collector_groups_failed != 0:
+            raise ValueError("status='completed' requires collector_groups_failed == 0")
         return
 
     if status == "completed_with_failures":
@@ -573,8 +576,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError(
                 "status='completed_with_failures' requires a clean terminal indicator (tokens.succeeded > 0 or routing.quarantined > 0)"
             )
-        if accounting.tokens.failed <= 0:
-            raise ValueError("status='completed_with_failures' requires tokens.failed > 0")
+        if accounting.tokens.failed <= 0 and accounting.collector_groups_failed <= 0:
+            raise ValueError("status='completed_with_failures' requires tokens.failed > 0 or collector_groups_failed > 0")
         return
 
     if status == "failed":
@@ -588,6 +591,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError(f"status='empty' requires accounting.source.rows_processed == 0, got {accounting.source.rows_processed}")
         if accounting.tokens.emitted != 0:
             raise ValueError(f"status='empty' requires accounting.tokens.emitted == 0, got {accounting.tokens.emitted}")
+        if accounting.collector_groups_failed != 0:
+            raise ValueError("status='empty' requires collector_groups_failed == 0")
         return
 
     raise ValueError(f"Unknown status {status!r}")

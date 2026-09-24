@@ -328,6 +328,7 @@ class RunSummaryCounts(TypedDict):
     source_loads: int
     sink_writes: int
     runtime_preflights: int
+    collector_groups_failed: int
 
 
 class RunSummaryErrors(TypedDict):

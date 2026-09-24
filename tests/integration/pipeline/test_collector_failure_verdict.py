@@ -40,11 +40,14 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
-from elspeth.core.landscape.schema import node_states_table, token_work_items_table
-from elspeth.engine.executors.collector import CollectorExecutor
+from elspeth.core.landscape.schema import collector_group_failures_table, node_states_table, token_work_items_table
+from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.batch_stats import BatchStats
+from elspeth.plugins.transforms.json_explode import JSONExplode
+from elspeth.web.execution.accounting import load_run_accounting_from_db
 from tests.integration.pipeline.test_barrier_hold_payload import build_pipeline, resume_pipeline, run_pipeline, terminal_counts
 
 _COLLECTOR_PIPELINE = """
@@ -88,6 +91,124 @@ _DOCS = [{"id": 1, "items": [3, 1, 2]}]
 # Two canonical integers whose sum is not canonical (beyond 2**53): the
 # UNMODIFIED shipped batch_stats fails its group on every call (C5).
 _OVERFLOW_DOCS = [{"id": 1, "items": [5000000000000000, 5000000000000000]}]
+
+
+@pytest.mark.parametrize("policy, expected_failures", [("require_all", 1), ("best_effort", 0)])
+def test_zero_member_scope_records_only_structural_group_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str, expected_failures: int
+) -> None:
+    """A conforming opener's zero-row success closes its bound group without a collector flush."""
+    pipeline = _COLLECTOR_PIPELINE.replace("    policy: require_all", f"    policy: {policy}")
+    env = build_pipeline(tmp_path, pipeline, [{"id": 1, "items": []}])
+
+    def emit_empty(self: JSONExplode, row: PipelineRow, ctx: PluginContext) -> TransformResult:
+        assert row["items"] == ()
+        return TransformResult.success_empty(success_reason={"action": "transformed"})
+
+    def collector_must_not_run(self: BatchStats, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
+        pytest.fail("zero-member collector group must never invoke the plugin")
+
+    # Model an installed custom opener that declares filter semantics for its
+    # zero-row arm. Shipped expanders route empty input as row errors instead.
+    monkeypatch.setattr(JSONExplode, "passes_through_input", True)
+    monkeypatch.setattr(JSONExplode, "can_drop_rows", True)
+    monkeypatch.setattr(JSONExplode, "process", emit_empty)
+    monkeypatch.setattr(BatchStats, "process", collector_must_not_run)
+
+    result = run_pipeline(env)
+
+    assert result.collector_groups_failed == expected_failures
+    assert result.rows_failed == 0
+    assert _collector_group_failure_count(env) == expected_failures
+    assert load_run_accounting_from_db(env["db"], landscape_run_id=result.run_id).collector_groups_failed == expected_failures
+    assert result.status is (RunStatus.COMPLETED_WITH_FAILURES if expected_failures else RunStatus.COMPLETED)
+    require_all_openers = tuple(
+        str(node_id) for node_id, binding in env["graph"].get_group_bindings().by_opener_node().items() if binding.policy == "require_all"
+    )
+    assert (
+        RecorderFactory(env["db"]).barrier_restore.pending_empty_expansion_groups(run_id=result.run_id, opener_node_ids=require_all_openers)
+        == ()
+    )
+
+
+def test_leader_intake_closes_a_zero_member_group_minted_without_leader_authority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The durable zero-member row alone lets the next leader intake close a follower's group."""
+    env = build_pipeline(tmp_path, _COLLECTOR_PIPELINE, [{"id": 1, "items": []}])
+    real_notify = CollectorExecutor.notify_empty_group
+    calls: list[str] = []
+
+    def emit_empty(self: JSONExplode, row: PipelineRow, ctx: PluginContext) -> TransformResult:
+        return TransformResult.success_empty(success_reason={"action": "transformed"})
+
+    def defer_opener_notification(self: CollectorExecutor, collector_name: str, group_id: str, ctx: PluginContext) -> CollectorOutcome:
+        calls.append(group_id)
+        if len(calls) == 1:
+            # Models a follower, which mints with membership authority and has
+            # no CollectorExecutor or leader coordination token to notify.
+            return CollectorOutcome(held=False, collector_name=collector_name, group_id=group_id)
+        return real_notify(self, collector_name, group_id, ctx)
+
+    monkeypatch.setattr(JSONExplode, "passes_through_input", True)
+    monkeypatch.setattr(JSONExplode, "can_drop_rows", True)
+    monkeypatch.setattr(JSONExplode, "process", emit_empty)
+    monkeypatch.setattr(CollectorExecutor, "notify_empty_group", defer_opener_notification)
+
+    result = run_pipeline(env)
+
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
+    assert result.rows_failed == 0
+    assert result.collector_groups_failed == 1
+    assert _collector_group_failure_count(env) == 1
+
+
+def test_zero_member_group_pending_at_crash_is_closed_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An opener does not rerun merely to rescue its empty group's missing leader verdict."""
+    env = build_pipeline(tmp_path, _COLLECTOR_PIPELINE, [{"id": 1, "items": []}])
+    real_notify = CollectorExecutor.notify_empty_group
+    opener_calls: list[bool] = []
+    notify_calls: list[str] = []
+
+    def emit_empty(self: JSONExplode, row: PipelineRow, ctx: PluginContext) -> TransformResult:
+        opener_calls.append(True)
+        return TransformResult.success_empty(success_reason={"action": "transformed"})
+
+    def crash_before_sweep_verdict(self: CollectorExecutor, collector_name: str, group_id: str, ctx: PluginContext) -> CollectorOutcome:
+        notify_calls.append(group_id)
+        if len(notify_calls) == 1:
+            return CollectorOutcome(held=False, collector_name=collector_name, group_id=group_id)
+        if len(notify_calls) == 2:
+            raise _Crash("after empty group mint, before leader verdict")
+        return real_notify(self, collector_name, group_id, ctx)
+
+    monkeypatch.setattr(JSONExplode, "passes_through_input", True)
+    monkeypatch.setattr(JSONExplode, "can_drop_rows", True)
+    monkeypatch.setattr(JSONExplode, "process", emit_empty)
+    monkeypatch.setattr(CollectorExecutor, "notify_empty_group", crash_before_sweep_verdict)
+
+    with pytest.raises(_Crash, match="before leader verdict"):
+        run_pipeline(env)
+    assert _collector_group_failure_count(env) == 0
+    with env["db"].connection() as conn:
+        run_id = str(conn.execute(select(node_states_table.c.run_id).limit(1)).scalar_one())
+    opener_node_ids = tuple(str(node_id) for node_id in env["graph"].get_group_bindings().by_opener_node())
+    pending_before_resume = RecorderFactory(env["db"]).barrier_restore.pending_empty_expansion_groups(
+        run_id=run_id, opener_node_ids=opener_node_ids
+    )
+    assert len(pending_before_resume) == 1
+
+    resumed = resume_pipeline(env)
+
+    assert len(opener_calls) == 1
+    assert resumed.status is RunStatus.COMPLETED_WITH_FAILURES
+    assert resumed.rows_failed == 0
+    assert resumed.collector_groups_failed == 1
+    assert len(notify_calls) == 3
+    assert len(set(notify_calls)) == 1
+    assert _collector_group_failure_count(env) == 1
+    assert RecorderFactory(env["db"]).barrier_restore.pending_empty_expansion_groups(run_id=run_id, opener_node_ids=opener_node_ids) == ()
+
 
 _REAL_BATCH_STATS_PROCESS = BatchStats.process
 _REAL_COMPLETE_COLLECTOR_FAILURE = ExecutionRepository.complete_collector_failure
@@ -206,6 +327,11 @@ def _collector_hold_statuses(env: dict[str, Any]) -> list[str]:
     return sorted(str(status) for status, error_json in rows if error_json is None or "CollectorGroupFailure" in error_json)
 
 
+def _collector_group_failure_count(env: dict[str, Any]) -> int:
+    with env["db"].connection() as conn:
+        return int(conn.execute(select(func.count()).select_from(collector_group_failures_table)).scalar_one())
+
+
 @pytest.mark.parametrize("mode", ["returned_error", "noncanonical"])
 @pytest.mark.parametrize("window", ["after_verdict", "after_first_terminal", "before_release"])
 def test_a_recorded_collector_verdict_is_completed_on_resume_without_the_plugin(
@@ -215,6 +341,8 @@ def test_a_recorded_collector_verdict_is_completed_on_resume_without_the_plugin(
     control_calls = _flip_first_call(monkeypatch, mode)
     control = run_pipeline(control_env)
     assert control.status is RunStatus.FAILED
+    assert control.collector_groups_failed == 1
+    assert load_run_accounting_from_db(control_env["db"], landscape_run_id=control.run_id).collector_groups_failed == 1
     assert len(control_calls) == 1
 
     env = build_pipeline(tmp_path / "crashed", _COLLECTOR_PIPELINE, _DOCS)
@@ -226,12 +354,15 @@ def test_a_recorded_collector_verdict_is_completed_on_resume_without_the_plugin(
     assert fired == [window], "the injected crash must actually fire"
     # The verdict is durable whole: all three holds FAILED, none OPEN.
     assert _collector_hold_statuses(env) == [NodeStateStatus.FAILED.value] * 3
+    assert _collector_group_failure_count(env) == 1
     assert ("blocked", 3) in _journal_statuses(env)
 
     resumed = resume_pipeline(env)
 
     assert len(calls) == 1, "a recorded collector failure must not re-invoke the plugin"
     assert resumed.status is RunStatus.FAILED
+    assert resumed.collector_groups_failed == 1
+    assert load_run_accounting_from_db(env["db"], landscape_run_id=resumed.run_id).collector_groups_failed == 1
     assert terminal_counts(env["db"]) == terminal_counts(control_env["db"])
     assert _journal_statuses(env) == _journal_statuses(control_env)
     assert not env["output_path"].exists()
@@ -250,6 +381,7 @@ def test_a_crash_inside_the_verdict_leaves_no_verdict_and_the_group_is_re_flushe
     assert fired == ["inside_verdict"]
     # Nothing of the verdict survived: every member hold is still OPEN.
     assert _collector_hold_statuses(env) == [NodeStateStatus.OPEN.value] * 3
+    assert _collector_group_failure_count(env) == 0
 
     resumed = resume_pipeline(env)
 
@@ -257,6 +389,8 @@ def test_a_crash_inside_the_verdict_leaves_no_verdict_and_the_group_is_re_flushe
     assert len(calls) == 2
     assert calls[1] == calls[0]
     assert resumed.status is RunStatus.COMPLETED
+    assert resumed.collector_groups_failed == 0
+    assert load_run_accounting_from_db(env["db"], landscape_run_id=resumed.run_id).collector_groups_failed == 0
     assert env["output_path"].read_text().count("\n") == 1
 
 
@@ -288,6 +422,7 @@ def test_the_shipped_overflow_failure_survives_two_crashed_resumes(tmp_path: Pat
 
     assert len(calls) == 1
     assert resumed.status is RunStatus.FAILED
+    assert resumed.collector_groups_failed == 1
     assert terminal_counts(env["db"]) == terminal_counts(control_env["db"])
     assert _journal_statuses(env) == _journal_statuses(control_env)
 

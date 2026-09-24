@@ -3634,6 +3634,7 @@ def resume(
                             "rows_processed": result.rows_processed,
                             "rows_succeeded": result.rows_succeeded,
                             "rows_failed": result.rows_failed,
+                            "collector_groups_failed": result.collector_groups_failed,
                             "status": result.status.value,
                             "exit_code": resume_exit_code,
                         },
@@ -3646,6 +3647,7 @@ def resume(
             typer.echo(f"  Rows processed: {result.rows_processed}")
             typer.echo(f"  Rows succeeded: {result.rows_succeeded}")
             typer.echo(f"  Rows failed: {result.rows_failed}")
+            typer.echo(f"  Collector groups failed: {result.collector_groups_failed}")
             typer.echo(f"  Status: {result.status.value}")
 
         if resume_exit_code != 0:

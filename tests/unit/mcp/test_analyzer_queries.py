@@ -1170,8 +1170,53 @@ class TestGetRunSummary:
         assert result["errors"]["validation"] == 0
         assert result["errors"]["transform"] == 0
         assert result["errors"]["total"] == 0
+        assert result["counts"]["collector_groups_failed"] == 0
         distribution = {(entry["outcome"], entry["path"], entry["completed"]): entry["count"] for entry in result["outcome_distribution"]}
         assert distribution[(TerminalOutcome.SUCCESS.value, TerminalPath.DEFAULT_FLOW.value, True)] == 1
+
+    def test_summary_counts_structural_collector_failure_separately_from_row_errors(self) -> None:
+        """A failed group with no arrived members is visible without inflating row errors."""
+        setup = make_recorder_with_run(run_id="collector-summary-run", source_node_id="collector-summary-source")
+        register_test_node(
+            setup.factory.data_flow,
+            setup.run_id,
+            "collector-summary-node",
+            node_type=NodeType.COLLECTOR,
+            plugin_name="collector",
+        )
+        _row, token = setup.factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"value": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
+        )
+        group_id = setup.factory.data_flow.record_empty_expansion(
+            TokenRef(token_id=token.token_id, run_id=setup.run_id),
+            member_token=setup.coordination_token.membership,
+        )
+        setup.factory.execution.complete_collector_failure(
+            coordination_token=setup.coordination_token,
+            group_id=group_id,
+            collector_node_id="collector-summary-node",
+            failure_reason="empty_expansion",
+            flush_state_id=None,
+            flush_error=None,
+            flush_duration_ms=None,
+            member_holds=(),
+            hold_error=ExecutionError(
+                exception="No collector members",
+                exception_type="CollectorGroupFailure",
+                phase="collector_flush",
+            ),
+        )
+
+        result = get_run_summary(setup.db, setup.factory, setup.run_id)
+
+        assert "error" not in result
+        assert result["counts"]["collector_groups_failed"] == 1
+        assert result["errors"]["total"] == 0
 
     def test_summary_token_count_is_run_scoped(self) -> None:
         """Tokens owned by another run must not be counted in the target run."""

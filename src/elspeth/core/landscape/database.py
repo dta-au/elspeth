@@ -549,6 +549,7 @@ _REQUIRED_COLUMNS += (
     ("call_verifications", "differences_json"),
     ("call_verifications", "recorded_at"),
     ("operations", "occurrence_index"),
+    *(("collector_group_failures", column.name) for column in metadata.tables["collector_group_failures"].columns),
 )
 
 # Required foreign keys for audit integrity (Tier 1 trust).
@@ -584,6 +585,8 @@ _REQUIRED_COMPOSITE_FOREIGN_KEYS: tuple[tuple[str, tuple[str, ...], str, tuple[s
     ("token_outcomes", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("node_states", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("node_states", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
+    ("collector_group_failures", ("run_id", "group_id"), "group_records", ("run_id", "group_id")),
+    ("collector_group_failures", ("collector_node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("validation_errors", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("transform_errors", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("transform_errors", ("transform_id", "run_id"), "nodes", ("node_id", "run_id")),

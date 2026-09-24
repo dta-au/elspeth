@@ -232,10 +232,18 @@ class TokenTraversalEngine:
                 # success_empty() is not an expansion and mints nothing.
                 # Idempotent per opener under re-driven claims.
                 if transform.creates_tokens:
-                    self._processor._token_manager.record_empty_expansion(
+                    group_id = self._processor._token_manager.record_empty_expansion(
                         current_token,
                         member_token=ctx.require_member_token(),
                     )
+                    binding = self._processor._opener_binding_by_node_id.get(node_id)
+                    if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
+                        # A follower cannot close a group: only the leader has
+                        # CollectorExecutor and coordination authority. Its
+                        # intake sweep discovers the durable zero-member row.
+                        executor = self._processor._collector_executor
+                        if executor is not None:
+                            executor.notify_empty_group(binding.closer_name, group_id, ctx)
                 self._processor._record_dropped_by_filter_outcome(
                     ctx=ctx,
                     token=current_token,

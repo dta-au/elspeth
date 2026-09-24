@@ -281,6 +281,17 @@ class GroupLossExportRecord(TypedDict):
     adopted_epoch: int | None
 
 
+class CollectorGroupFailureExportRecord(TypedDict):
+    """One durable failure verdict per collector group."""
+
+    record_type: Literal["collector_group_failure"]
+    run_id: str
+    group_id: str
+    collector_node_id: str
+    failure_reason: str
+    recorded_at: str
+
+
 class TokenParentExportRecord(TypedDict):
     record_type: Literal["token_parent"]
     run_id: str
@@ -525,6 +536,7 @@ ExportRecord = (
     | TokenOutcomeExportRecord
     | GroupRecordExportRecord
     | GroupLossExportRecord
+    | CollectorGroupFailureExportRecord
     | SchedulerEventExportRecord
     | NodeStateExportRecord
     | RoutingEventExportRecord

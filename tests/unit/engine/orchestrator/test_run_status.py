@@ -86,6 +86,9 @@ class _FakeRunStatusProjection:
         # reproduce. No scenario here involves a coalesce, so 0 is faithful.
         return 0
 
+    def count_failed_collector_groups(self, run_id: str) -> int:
+        return 0
+
 
 @dataclass(frozen=True, slots=True)
 class _FakeFactory:
@@ -209,7 +212,7 @@ def test_terminal_counter_parity_fields_follow_execution_counters() -> None:
     strict_fields = run_status._PARITY_STRICT_FIELDS
     excluded_fields = run_status._PARITY_EXCLUDED_FIELDS
 
-    assert excluded_fields == frozenset({"rows_coalesce_failed", "routed_destinations"})
+    assert excluded_fields == frozenset({"rows_coalesce_failed", "collector_groups_failed", "routed_destinations"})
     assert set(strict_fields).isdisjoint(excluded_fields)
     assert set(execution_counter_fields) == set(strict_fields) | excluded_fields
     assert strict_fields == tuple(field for field in execution_counter_fields if field not in excluded_fields)

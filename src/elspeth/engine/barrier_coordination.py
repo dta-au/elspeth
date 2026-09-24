@@ -46,7 +46,8 @@ from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
-from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
@@ -63,7 +64,6 @@ if TYPE_CHECKING:
     from elspeth.core.config import AggregationSettings
     from elspeth.core.landscape.data_flow_repository import DataFlowRepository
     from elspeth.core.landscape.execution_repository import ExecutionRepository
-    from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
     from elspeth.engine.clock import Clock
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
@@ -327,6 +327,11 @@ class BarrierIntakeCoordinator:
         self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
         self._collector_executor = collector_executor
         self._collector_node_ids: Mapping[CollectorName, NodeID] = collector_node_ids or {}
+        self._require_all_collector_openers: dict[str, str] = {
+            str(node_id): binding.closer_name
+            for node_id, binding in self._group_bindings.by_opener_node().items()
+            if binding.closer_kind is CloserKind.COLLECTOR and binding.policy == "require_all"
+        }
         self._complete_collector_fire = complete_collector_fire
         self._route_collector_release = route_collector_release
         self._merged_continuation_cursor = merged_continuation_cursor
@@ -480,12 +485,32 @@ class BarrierIntakeCoordinator:
 
         dispositions.extend(self._replay_group_losses(ctx))
         dispositions.extend(self._flush_restored_collector_groups(ctx))
+        self._close_pending_empty_collector_groups(ctx)
         # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
         # the SAME intake step: a note staged into the ledger THIS pass is
         # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
         # latency, spec-accepted).
         self._stage_pending_escalations()
         return BarrierIntakePassOutcome(dispositions=tuple(dispositions))
+
+    def _close_pending_empty_collector_groups(self, ctx: PluginContext) -> None:
+        """Leader-close zero-member groups minted by followers or interrupted openers.
+
+        Such a group has no child journal row to adopt. The durable group
+        record and opener node state are the only discovery path; the failure
+        marker excludes already closed groups on every later pass and resume.
+        Best-effort groups need no failure marker or child disposition.
+        """
+        if self._collector_executor is None or not self._require_all_collector_openers:
+            return
+        if not isinstance(self._barrier_restore_reads, BarrierRestoreReadModel):
+            raise OrchestrationInvariantError("Collector empty-group intake requires the barrier restore read model")
+        pending = self._barrier_restore_reads.pending_empty_expansion_groups(
+            run_id=self._run_id,
+            opener_node_ids=tuple(self._require_all_collector_openers),
+        )
+        for group_id, opener_node_id in pending:
+            self._collector_executor.notify_empty_group(self._require_all_collector_openers[opener_node_id], group_id, ctx)
 
     def _adopt_aggregation_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
         """Adopt one aggregation barrier row, then evaluate the node's trigger.

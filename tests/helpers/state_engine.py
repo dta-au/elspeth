@@ -67,6 +67,7 @@ STATE_ENGINE_TABLES: tuple[str, ...] = (
     "call_verifications",
     "calls",
     "checkpoints",
+    "collector_group_failures",
     "coalesce_effect_members",
     "coalesce_effects",
     "edges",

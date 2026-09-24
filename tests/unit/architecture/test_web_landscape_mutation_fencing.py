@@ -625,7 +625,7 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # into transform_errors (one row per member of a FAILED aggregation batch), inside its
 # own fenced_leader_transaction. Write set UNCHANGED (transform_errors/insert already
 # existed via record_transform_error). Measured by scripts/fencing_inventory.py.
-_EXPECTED_DML_COUNT = 160
+_EXPECTED_DML_COUNT = 161
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -731,7 +731,10 @@ _EXPECTED_DML_COUNT = 160
 # the COMPLETED wrapper and the new FAILED wrapper share. Measured by
 # scripts/fencing_inventory.py --json against a clean export of 2a1d93652 and the tree.
 # Re-derived on the combined K063/K056 tree with scripts/fencing_inventory.py.
-_EXPECTED_DML_INVENTORY_SHA256 = "cde69a415209183985430961899a093d07f971b6a9ad3ce1c9f957f462181ecd"
+# K063 run accounting adds one collector_group_failures INSERT to the fenced
+# ExecutionRepository.complete_collector_failure verdict. The site records a
+# failed group even when no members arrived; all prior identities remain.
+_EXPECTED_DML_INVENTORY_SHA256 = "b3c42f082c209835c4756d0cf2fa333cf7a533259da3c5b9dec7165558068755"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -753,6 +756,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("coalesce_effect_members", "update"),
         ("coalesce_effects", "insert"),
         ("coalesce_effects", "update"),
+        ("collector_group_failures", "insert"),
         ("edges", "delete"),
         ("edges", "insert"),
         ("group_losses", "insert"),
@@ -845,7 +849,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # self._execution.complete_collector_failure#1 (the lost-members arm's verdict) and
 # NodeStateGuard.complete_collector_failure -> self._execution.complete_collector_failure#1
 # (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
-_EXPECTED_CALL_COUNT = 288
+_EXPECTED_CALL_COUNT = 289
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -854,7 +858,9 @@ _EXPECTED_CALL_COUNT = 288
 # R4: 6c2ff337… -> 0478b37d…, the one caller added above.
 # CODEX-R2: 0478b37d… -> 9e7698c9… on the donor, the caller exchange above.
 # Re-derived for the combined K063/K056 tree after the caller exchange.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "f7a7a51f1c07dbf941e97c40571436b092e633adf6aa755c7799e90f2295885d"
+# K063 run accounting adds CollectorExecutor.notify_empty_group's direct
+# complete_collector_failure call for a zero-arrival group.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "ca9daf80dbf50d8c27cf8ca06d51603ec0ba58ebd6db99e27f0844f93f86cbb9"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -7809,7 +7815,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # database construction and deadline guard installation are unchanged.
     # K056 adds schema checks for run lineage, call verification, and
     # operation occurrence without changing the deadline issuance path.
-    "src/elspeth/core/landscape/database.py": "ab066128381ea24d2799479e20e80985190da4bf8847bbe093985d59c6ae54f4",
+    # K063 adds required collector-group failure columns and the group/node
+    # composite foreign keys; neither changes construction or clock issuance.
+    "src/elspeth/core/landscape/database.py": "b7e3deff933e74a190e466ac608f4f7d7fa6ed042e3c7f493887745e67d13678",
 }
 
 

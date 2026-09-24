@@ -80,6 +80,7 @@ def counter_reconciliation_pairs(uninterrupted: RunResult, resumed: RunResult) -
         ("rows_forked", uninterrupted.rows_forked, resumed.rows_forked),
         ("rows_coalesced", uninterrupted.rows_coalesced, resumed.rows_coalesced),
         ("rows_coalesce_failed", uninterrupted.rows_coalesce_failed, resumed.rows_coalesce_failed),
+        ("collector_groups_failed", uninterrupted.collector_groups_failed, resumed.collector_groups_failed),
         ("rows_expanded", uninterrupted.rows_expanded, resumed.rows_expanded),
         ("rows_buffered", uninterrupted.rows_buffered, resumed.rows_buffered),
         ("rows_diverted", uninterrupted.rows_diverted, resumed.rows_diverted),

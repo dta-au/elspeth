@@ -195,7 +195,7 @@ class _EnvExecutor:
         )
 
     def notify_empty_group(self, collector_name: str, group_id: str) -> CollectorOutcome:
-        return self._executor.notify_empty_group(collector_name, group_id)
+        return self._executor.notify_empty_group(collector_name, group_id, self._default_ctx)
 
     def has_recorded_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
         return self._executor.has_recorded_member_loss(collector_name, group_id, member_key)
@@ -964,6 +964,9 @@ class TestFlush:
             assert env.transform.call_count == 0
             assert outcome.closed_without_plugin == "empty_expansion"
             assert (outcome.failure_reason == "empty_expansion") is expect_failure
+            assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == int(expect_failure)
+            env.executor.notify_empty_group("stitch", group_id)
+            assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == int(expect_failure)
 
     def test_all_members_lost_best_effort_closes_without_plugin(self, best_effort_env: _CollectorEnv) -> None:
         env = best_effort_env
@@ -973,6 +976,15 @@ class TestFlush:
         assert outcome is not None
         assert outcome.closed_without_plugin == "all_members_lost"
         assert env.transform.call_count == 0
+
+    def test_all_members_lost_require_all_records_one_group_failure(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        assert env.executor.notify_member_lost("stitch", group_id, members[0].token_id, "quarantined") is None
+        outcome = env.executor.notify_member_lost("stitch", group_id, members[1].token_id, "quarantined")
+        assert outcome is not None and outcome.failure_reason == "collector_missing_members"
+        assert outcome.consumed_tokens == ()
+        assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == 1
 
     def test_plugin_emitting_zero_rows_flushes_the_contract_guard_and_mints_an_empty_release_durably(
         self, collector_env: _CollectorEnv

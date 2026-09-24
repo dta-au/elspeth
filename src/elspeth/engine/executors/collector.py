@@ -521,7 +521,7 @@ class CollectorExecutor:
             return self._close_group(collector_name, key, pending, ctx)
         return None
 
-    def notify_empty_group(self, collector_name: str, group_id: str) -> CollectorOutcome:
+    def notify_empty_group(self, collector_name: str, group_id: str, ctx: PluginContext) -> CollectorOutcome:
         """Close a member_count=0 group (spec §6.4): no plugin, ever.
 
         require_all -> group failure 'empty_expansion'; best_effort -> silent
@@ -541,11 +541,26 @@ class CollectorExecutor:
         # _execute_flush) — an M=0 group has an empty roster so nothing
         # should ever populate self._pending[key] for it, but a stray entry
         # from a future code path must not be left behind silently.
-        if key in self._pending:
-            del self._pending[key]
-        self._mark_completed(key)
         scope = self._scopes[collector_name]
         if scope.policy == "require_all":
+            self._execution.complete_collector_failure(
+                coordination_token=ctx.require_coordination_token(),
+                group_id=group_id,
+                collector_node_id=str(self._node_ids[collector_name]),
+                failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
+                flush_state_id=None,
+                flush_error=None,
+                flush_duration_ms=None,
+                member_holds=(),
+                hold_error=ExecutionError(
+                    exception="Empty collector group failed under require_all",
+                    exception_type="CollectorGroupFailure",
+                    phase="collector_flush",
+                ),
+            )
+            if key in self._pending:
+                del self._pending[key]
+            self._mark_completed(key)
             return CollectorOutcome(
                 held=False,
                 collector_name=collector_name,
@@ -553,6 +568,9 @@ class CollectorExecutor:
                 failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
                 closed_without_plugin=GroupSettlementReason.EMPTY_EXPANSION.value,
             )
+        if key in self._pending:
+            del self._pending[key]
+        self._mark_completed(key)
         return CollectorOutcome(
             held=False,
             collector_name=collector_name,
@@ -888,24 +906,24 @@ class CollectorExecutor:
         """Fail the group as a whole without a flush: the ``collector_missing_members`` arm.
 
         ``_close_group``: a ``require_all`` roster closed with members lost.
-        The plugin is never invoked (spec §6.4), so no flush state exists;
-        the verdict is every arrived member's hold FAILED in one transaction
-        (``complete_collector_failure``). With every member lost nothing
-        arrived and there is no hold to record: the group's failure is then
-        carried by its durable losses alone, which resume replays to the same
-        verdict. The plugin arms go through :meth:`_fail_group_after_flush`.
+        The plugin is never invoked (spec §6.4), so no flush state exists.
+        The verdict atomically marks every arrived member's hold FAILED and
+        records one group failure row. With every member lost, that row still
+        records the failed group despite there being no hold. The plugin arms
+        go through :meth:`_fail_group_after_flush`.
         """
         member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
-        if member_holds:
-            self._execution.complete_collector_failure(
-                coordination_token=coordination_token,
-                collector_node_id=str(self._node_ids[collector_name]),
-                flush_state_id=None,
-                flush_error=None,
-                flush_duration_ms=None,
-                member_holds=member_holds,
-                hold_error=hold_error,
-            )
+        self._execution.complete_collector_failure(
+            coordination_token=coordination_token,
+            group_id=key[1],
+            collector_node_id=str(self._node_ids[collector_name]),
+            failure_reason=failure_reason,
+            flush_state_id=None,
+            flush_error=None,
+            flush_duration_ms=None,
+            member_holds=member_holds,
+            hold_error=hold_error,
+        )
         return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
 
     def _fail_group_after_flush(
@@ -939,7 +957,9 @@ class CollectorExecutor:
         member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
         guard.complete_collector_failure(
             coordination_token=coordination_token,
+            group_id=key[1],
             collector_node_id=str(self._node_ids[collector_name]),
+            failure_reason=failure_reason,
             flush_error=flush_error,
             duration_ms=flush_duration_ms,
             member_holds=member_holds,

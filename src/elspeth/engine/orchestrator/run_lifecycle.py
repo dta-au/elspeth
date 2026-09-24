@@ -724,6 +724,7 @@ class RunLifecycleCoordinator:
                 rows_routed_success=result.rows_routed_success,
                 rows_routed_failure=result.rows_routed_failure,
                 routed_destinations=result.routed_destinations,
+                collector_groups_failed=result.collector_groups_failed,
             )
 
             return result

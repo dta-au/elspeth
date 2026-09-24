@@ -2196,7 +2196,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 44
+### Landscape schema epoch 45
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2256,14 +2256,16 @@ Epoch 44 records run mode and source-run lineage, links replayed calls to their
 source calls, stores verification decisions, and assigns fenced occurrence
 indices to operations created under the run leader. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
+Epoch 45 adds an immutable collector-group failure verdict per group so the
+run result can count structural failures independently of failed rows.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-44, either automatically at startup or through an operator migration command.
+45, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-44 database.
+an older epoch must not be rolled back over an epoch-45 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

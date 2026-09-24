@@ -683,6 +683,7 @@ def test_cli_resume_reissues_admission_for_post_resume_live_mode(tmp_path: Path)
             rows_processed=0,
             rows_succeeded=0,
             rows_failed=0,
+            collector_groups_failed=0,
             status=RunStatus.COMPLETED,
         )
 
@@ -793,6 +794,7 @@ def test_cli_resume_exit_code_reflects_terminal_status(
             rows_processed=2,
             rows_succeeded=1,
             rows_failed=1,
+            collector_groups_failed=0,
             status=RunStatus(terminal_status),
         )
 
