@@ -130,5 +130,9 @@ def test_non_live_run_with_real_sink_records_virtual_effect_without_touching_tar
         (effect,) = factory.execution.sink_effects.get_effects_for_run(run_id)
         assert effect.publication_performed is False
         assert effect.publication_evidence_kind == "virtual"
+        (operation,) = factory.execution.get_operations_for_run(run_id)
+        assert operation.operation_type == "sink_write"
+        assert operation.sink_effect_id == effect.effect_id
+        assert operation.status == "completed"
     finally:
         db.close()

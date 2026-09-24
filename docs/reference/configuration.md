@@ -107,12 +107,36 @@ sequence, disposition, and payload hash; this does not compare serialized sink
 bytes or external artifacts. A mismatch makes verify fail with exit code 2
 and a `verification_mismatch` event. Replay and verify must run with
 `concurrency.max_workers: 1`; the source live run may use a different worker
-count, including the default of 4. Verification ignores LLM response IDs,
-creation timestamps, and HTTP Date headers. For POST `/chat/completions`
-responses with a choices array, it compares parsed JSON without `id` and
-`created` and excludes the corresponding wire body bytes, body size, and
-Content-Length. All other response fields are compared, and both complete raw
-responses remain in the audit trail. Dependency runs, collection probes,
+count, including the default of 4.
+
+Verification uses a fixed, non-configurable response comparison policy. It
+ignores only these fields:
+
+| Call evidence | Fields excluded from comparison |
+|---------------|---------------------------------|
+| LLM | `raw_response.id` and `raw_response.created` |
+| HTTP and HTTP redirect | `Date` headers, matched case-insensitively in both `headers` and `transport.headers` |
+| HTTP POST to a path ending in `/chat/completions`, with a parsed JSON body containing a `choices` array | In addition to `Date`: `body.id`, `body.created`, `body_size`, `transport.body_b64`, and case-insensitive `Content-Length` headers in both header representations |
+
+All other response fields are compared, including `x-request-id`, `Set-Cookie`,
+`cf-ray`, rate-limit headers, and `system_fingerprint`. Changes to these fields
+produce a mismatch even when the returned content is unchanged. Generic HTTP
+JSON responses retain `id`, `created`, body size, body bytes, and `Content-Length`
+in the comparison. Both complete raw responses remain in the audit trail;
+inspect them to distinguish metadata drift from content changes. The call
+verification mismatch error also states this policy (in the `error` field of
+the JSON `verification_mismatch` event).
+
+Replay and verify retain `sink_write` operations as durable records of virtual
+sink processing. The operation name does not imply external publication. Its
+sink effect records `descriptor_mode: no_publication`,
+`publication_performed: false`, and `publication_evidence_kind: virtual`.
+The effect's member records retain the rows used for the sink-boundary
+comparison. Any virtual artifact descriptor identifies audit evidence, not a
+file written to the configured sink. Read the effect's publication fields
+alongside the operation when determining whether a sink wrote externally.
+
+Dependency runs, collection probes,
 commencement gates, audit export, remote telemetry, and remote Key Vault
 secrets are refused in these modes until they have an explicit replay or verify
 contract.
