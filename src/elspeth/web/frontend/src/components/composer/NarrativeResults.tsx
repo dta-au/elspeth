@@ -59,7 +59,8 @@
  *
  * **Download affordance (plan 19b:342).** Alongside the narrative
  * summary, the panel exposes a "Download full output" affordance against
- * the selected run's first downloadable file artifact. The backend
+ * the selected run's first downloadable file artifact whose preview
+ * passed the backend's content verification. The backend
  * `/content` endpoint requires `Authorization: Bearer` (api/client.ts
  * lines 877-883) so the affordance is a button that invokes
  * `downloadRunOutputContent` and triggers a synthetic anchor — not a
@@ -93,22 +94,6 @@ interface NarrativeResultsProps {
    *  in Task 8 where the run results live in a frozen blob. ``null`` means
    *  "explicitly no summary"; ``undefined`` means "fall back to live mode." */
   summaryOverride?: string | null;
-}
-
-/** Pick the first file artifact whose `downloadable` flag is not
- *  explicitly false. ``downloadable === undefined`` means a pre-rollout
- *  backend; api/client docstring at types/index.ts:715-720 documents the
- *  "missing → caller treats as optimistic show-the-button" semantic.
- *  Returns null when no candidate exists. */
-function pickDownloadableFileArtifact(
-  artifacts: ReadonlyArray<RunOutputArtifact>,
-): RunOutputArtifact | null {
-  for (const a of artifacts) {
-    if (a.artifact_type !== "file") continue;
-    if (a.downloadable === false) continue;
-    return a;
-  }
-  return null;
 }
 
 /** Walk every row in a JSONL or JSON preview, return the rows whose
@@ -170,7 +155,7 @@ function extractSummariesFromPreviewText(
 
 interface LiveOutputsState {
   runId: string;
-  /** First downloadable file artifact (for the Download affordance). */
+  /** First downloadable file whose preview passed backend verification. */
   downloadArtifact: RunOutputArtifact | null;
   /** Concatenated non-empty `summary` strings extracted from the previews
    *  of every file artifact in the manifest. ``null`` until the fetch
@@ -232,13 +217,19 @@ export function NarrativeResults({ runId, summaryOverride }: NarrativeResultsPro
         return;
       }
 
-      const downloadArtifact = pickDownloadableFileArtifact(artifacts);
+      let downloadArtifact: RunOutputArtifact | null = null;
 
       const summaries: string[] = [];
       for (const artifact of artifacts) {
         if (artifact.artifact_type !== "file") continue;
         try {
           const preview = await fetchRunOutputPreview(runId, artifact.artifact_id);
+          // A cumulative sink may overwrite an earlier publication's URI.
+          // The manifest preserves both descriptors; successful preview
+          // verifies these exact bytes before we offer that artifact.
+          if (downloadArtifact === null && artifact.downloadable) {
+            downloadArtifact = artifact;
+          }
           summaries.push(
             ...extractSummariesFromPreviewText(
               preview.preview_text,
@@ -324,7 +315,7 @@ export function NarrativeResults({ runId, summaryOverride }: NarrativeResultsPro
   // Download affordance source: when the frozen-blob inspect view (Task 8)
   // mounts NarrativeResults, there is no live executionStore run to fetch
   // outputs from — the affordance is suppressed. Live mode surfaces the
-  // first downloadable file artifact from the just-fetched manifest.
+  // first downloadable file artifact with a verified preview.
   const downloadArtifact: RunOutputArtifact | null =
     summaryOverride !== undefined
       ? null

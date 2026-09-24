@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { NarrativeResults } from "./NarrativeResults";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -382,6 +382,61 @@ describe("NarrativeResults", () => {
 
     createSpy.mockRestore();
     revokeSpy.mockRestore();
+  });
+
+  it("downloads the verified publication when an earlier cumulative artifact has drifted", async () => {
+    // Measured battery shape: one URI had a historical 24-byte descriptor
+    // and a current 34-byte publication. Existence and allowlist eligibility
+    // marked both downloadable, but only the latter passed the hash guard.
+    const historical = fileArtifact({ artifact_id: "historical", size_bytes: 24 });
+    const current = fileArtifact({ artifact_id: "current", size_bytes: 34 });
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([historical, current]));
+    vi.mocked(fetchRunOutputPreview).mockImplementation(async (_runId, artifactId) => {
+      if (artifactId === "historical") {
+        throw { status: 409, error_type: "artifact_content_drift" };
+      }
+      return jsonlPreview([{ summary: "Current publication summary." }], { artifact_id: "current" });
+    });
+    vi.mocked(downloadRunOutputContent).mockRejectedValue(new Error("download probe"));
+
+    render(<NarrativeResults runId="run-1" />);
+    await screen.findByText("Current publication summary.");
+    fireEvent.click(screen.getByTestId("narrative-results-download-link"));
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(downloadRunOutputContent).toHaveBeenCalledWith("run-1", "current");
+  });
+
+  it("offers no download when every artifact preview fails integrity verification", async () => {
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([
+      fileArtifact({ artifact_id: "historical", size_bytes: 24 }),
+      fileArtifact({ artifact_id: "current", size_bytes: 34 }),
+    ]));
+    vi.mocked(fetchRunOutputPreview).mockRejectedValue({ status: 409, error_type: "artifact_content_drift" });
+
+    await act(async () => { render(<NarrativeResults runId="run-1" />); });
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId("narrative-results-download-link")).toBeNull();
+    expect(downloadRunOutputContent).not.toHaveBeenCalled();
+  });
+
+  it("keeps the first verified downloadable file when independent outputs both verify", async () => {
+    vi.mocked(fetchRunOutputs).mockResolvedValue(outputsResponse([
+      fileArtifact({ artifact_id: "first", path_or_uri: "file:///data/outputs/first.jsonl" }),
+      fileArtifact({ artifact_id: "second", path_or_uri: "file:///data/outputs/second.jsonl" }),
+    ]));
+    vi.mocked(fetchRunOutputPreview).mockImplementation(async (_runId, artifactId) =>
+      jsonlPreview([{ summary: `${artifactId} summary.` }], { artifact_id: artifactId }),
+    );
+    vi.mocked(downloadRunOutputContent).mockRejectedValue(new Error("download probe"));
+
+    render(<NarrativeResults runId="run-1" />);
+    await screen.findByText("second summary.");
+    fireEvent.click(screen.getByTestId("narrative-results-download-link"));
+
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+    expect(downloadRunOutputContent).toHaveBeenCalledWith("run-1", "first");
   });
 
   it("AC3: hides the download affordance when no terminal run is active (no activeRunId)", () => {
