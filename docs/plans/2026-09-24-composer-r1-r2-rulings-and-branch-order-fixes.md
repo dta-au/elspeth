@@ -244,16 +244,37 @@ cd $W && $PY -m pytest -n 0 -p no:cacheprovider -o "pythonpath=$W/src $W/elspeth
    - a state dict whose `sources` map has a single entry.
 
    Print `composer_authority_canonical_json` of the first two, and the `composition_content_hash` of a
-   `CompositionState` built from the third. Log to `$L/t0-golden.log`. The row_union and singular-`source` canonicals
-   become byte pins in T3 and T4: they prove those preimages did not move.
-5. **Scope check for T4, by walking the registry (not by grep).** Walk the registered loop tool schemas (the same
-   authority `$L/probes/maps.py` used) and list every tool whose **top-level** properties include `sources`.
+   `CompositionState` built from the third. Log to `$L/t0-golden.log`.
+   - The row_union and singular-`source` canonicals become byte pins in T3 and T4. They prove those preimages did not
+     move.
+   - The single-entry `sources` hash is the **known positive for D3**. T4 must change it from the T0 value, which
+     proves that single-entry maps are projected too. Record both values in the T4 log.
+5. **Scope check for T4, by walking the registry (not by grep).** Write a fresh `$L/t0_sources_scope.py` that walks
+   the registered loop tool schemas through `_registered_tool_schema`, the authority the transcript reader used. Its
+   `maps.py` probe was not preserved in `$L/probes/`. List every tool whose **top-level** properties include `sources`.
    - Expected: `set_pipeline` only.
    - Positive control: `set_pipeline` must be found.
    - Negative control: the walk must not list `set_source`.
    - If any other tool has a top-level `sources` property, **stop**. `tool_batch.py:577` hashes every tool's audit
      arguments through the projection, so T4 would silently give another tool's field topology meaning.
-6. **Finalization-path fixture for T2.** Find a compose-loop test that drives `finalization.changed` at
+6. **Attribute the two base reds that are not pin drift (this decides E1's wording).** Eight of the 10 are epoch or
+   line-pin drift. The other two are:
+   - `p5_budget_exhaustion`, with a `for_graph` mismatch;
+   - `test_composer_bedrock::test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides`, which fails
+     with `_MalformedLLMResponseError` ("tool_calls is neither absent nor a sequence", `service.py:706`). That is the
+     shape an S1 admission or wire-decode change would produce on a fake message.
+
+   Run both at the pre-S1 base `85ebf2739`:
+   - export the tree with `git archive 85ebf2739 | tar -x -C $L/base-85ebf2739`;
+   - set `PYTHONPATH` to the export's `src` and `elspeth-lints/src`;
+   - check `elspeth.__file__`;
+   - log to `$L/t0-pre-s1-reds.log`.
+
+   If either passes at `85ebf2739`, S1 introduced it. E1 must then say so plainly, and the lead tells John that it
+   shipped in the S1 merge. Fixing it is not in this plan's scope.
+7. **Read the p5 test before T5.** Decide whether its `for_graph` expectation is a literal pin or a comparison of two
+   computed values, and record which in the T0 log. T5 uses the answer.
+8. **Finalization-path fixture for T2.** Find a compose-loop test that drives `finalization.changed` at
    `tool_batch.py:1373` or `:1477`. Candidates are `tests/unit/web/composer/test_required_control_autowire.py` and
    `tests/integration/web/composer/test_freeform_required_controls.py`. Confirm the fixture reaches that branch by
    instrumenting a copy in `$L`, not by reading the test name.
@@ -267,7 +288,7 @@ with the changes below. Re-anchor every OLD string first, because the line numbe
 
 | Edit | Where | Change from the draft |
 |---|---|---|
-| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. Because `c4c52c110` already contains S1, this matches known reds but does not prove they predate S1. Still owed: attributing them to a pre-S1 commit, the CHANGELOG line, and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
+| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. Because `c4c52c110` already contains S1, this matches known reds but does not prove they predate S1. State the result of T0 step 6 here: whether `p5_budget_exhaustion` and `test_composer_bedrock` pass at the pre-S1 base `85ebf2739`. If either passes there, say plainly that S1 introduced it. Still owed: the CHANGELOG line and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
 | E2 | new opening paragraph of §1 | as drafted |
 | E3 | §1.1 "delivered as" | as drafted |
 | E4 | §1.2 bullets | as drafted |
@@ -302,7 +323,9 @@ script would also fail its own `sql != verbatim_sql` assert (`:228`).
    - Known negative: point its "corrected" source at `$L/master-plan-base.md` as well. It must fail at the
      `sql != verbatim_sql` assert, which proves the copy really reads two different files.
 2. Run `$L/t1_dbs_check.py` over `$DBS`. It must show `corrected == tool_rows` for all 13 DBs, `verbatim=26` against
-   `corrected=14` in db10, and parity `496 = 496`.
+   `corrected=14` in db10, and parity `496 = 496`. `$DBS` is a per-session scratch directory and may be gone. If it
+   is, step 1 is the sufficient control (the T12 fixture, including its fork phase), and the T1 log records step 2 as
+   not re-run.
 3. Run `$PY -m pytest $W/tests/unit/docs/test_agent_docs_privacy.py $W/tests/unit/docs/test_deleted_ci_script_references.py $W/tests/unit/web/composer/test_tool_argument_error_category.py -n 0 -p no:cacheprovider`. The last test cites §4 S0 and §5.2, and neither heading may change.
 4. Search the edited plan for home-directory paths (`grep -nE '/(home|Users)/'`). Expect no output. For the positive
    control, run the same grep on `$L/understand-docs.md`, which contains such a path.
@@ -340,7 +363,7 @@ Add one sentence to the docstring: the transcript keeps the model's key order, b
    `_replace_llm_tool_call_arguments` mutates `function["arguments"]` in place (`understand-transcript.md` §4 trap).
    - Assert that turn 2's replayed `set_pipeline` keeps `zeta, alpha` for coalesce, row_union and `sources`.
    - **RED reason:** it is sorted.
-3. **Compose-loop test, finalization path (callers `:1377`/`:1481`).** Use the T0 step 6 fixture, with a coalesce
+3. **Compose-loop test, finalization path (callers `:1377`/`:1481`).** Use the T0 step 8 fixture, with a coalesce
    whose branches are reversed.
    - Assert the order on the provider turn after finalization.
    - **This is the one path whose order preservation has not been executed.** `wire_required_controls` and
@@ -516,7 +539,10 @@ or its unit sibling.
 
 **Re-run:** `tests/unit/web/sessions/test_completion_gate_roundtrip.py`, `tests/unit/web/execution/test_routes.py`,
 `test_compose_loop_interpretation_review_dispatch.py`, and every file that `grep -rln "for_graph" tests/` finds.
-The p5 test stays red. Record its new hash pair against the T0 log.
+The p5 test depends on the T0 step 7 finding:
+- **If its `for_graph` is a literal pin,** T5 re-pins it: it is the fingerprint's own test, and T5 changes the
+  fingerprint's producer. If the test is still red after the re-pin, record the remaining cause against the T0 log.
+- **If it compares computed values,** it stays red for its base reason. Record its new hash pair against the T0 log.
 
 **Gates:** the every-task set.
 
