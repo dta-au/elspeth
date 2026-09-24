@@ -38,8 +38,9 @@ reinstated as planned work, done in the small steps below. This plan is the S2 r
 
 - **Start condition.** Codebase stability, which is John's call. It is not the data-driven reopen trigger of
   2026-09-24, which is no longer a precondition (§7.2, R-G). Two further preconditions come from the S1 live
-  regression (§2, principle 9): the S1 zero-property fix has landed, and a live window shows the 22 remaining strict
-  tools healthy.
+  regression (§2, principle 9): the S1 zero-property fix has landed, and a live window shows the 32 strict tools
+  healthy, including the ten marker-framed parameterless tools. The 4/4 codec probe and isolated session replay
+  do not satisfy that broader window; the ten-case battery and healthy live window remain pending.
 - **Tier M, measurement (M1a, M1b, M2 to M6), and Tier A, wire-neutral surface cleanups (A1 to A5, A7, A8; A6 is
   withdrawn, §8), can proceed as soon as John says the codebase is stable enough.** Tier M is the instrument every
   flip's acceptance reads (master plan §5.4). M1a, M1b and M5 together close ticket `elspeth-a1864430a1`; they need
@@ -98,8 +99,14 @@ is cleaned up one surface per step, before the flip that would otherwise contrad
   `encode_semantic_arguments`, the ledger, `wire_conformant`, `strict_transport.py`, `strict_profile.py`, the
   `composer_strict_tools` setting and the repair signal. S1's owed dev deployment acceptance is a prerequisite for the
   baseline round (M6).
-- **S1's live regression** (found 2026-09-25; master plan §4 S1): the 10 zero-property tools S1 sends `strict:true`
-  fail on every call on the deployed route. Its fix is a precondition for this plan (§1.1, §2 principle 9).
+- **S1's live regression** (found 2026-09-25; master plan §4 S1): parameterless calls failed on the deployed route.
+  The repair retains the 32/10 partition and adds `EmptyArgumentsMarker` wire framing to ten tools. The production
+  codec passed 4/4 live preview/blob-discovery calls. The isolated replay's unchanged second prompt produced a
+  pipeline that validated and executed all six rows; a subsequent real-loop preview passed without state changes.
+  Its first turn produced prose without a persisted source, prompting a separate bounded retry repair whose fresh
+  live acceptance remains pending. See the [session report](../reviews/2026-09-25-composer-session-convergence.md#full-live-replay).
+  Landing the fix and the healthy live window remain preconditions (§1.1, §2 principle 9); this does not claim
+  deployment or release merge.
 - **S3** (the planner terminal) is reinstated with S2 and follows F5. It is independent of every step here as long as
   each step changes W only. §6 says what S3 needs after F5.
 
@@ -161,16 +168,28 @@ its "family alternative".
    SHA pins, the boot probe) are necessary but not sufficient. This comes from S1's live regression (found 2026-09-25,
    session `ed3c015b-a2f7-4322-9f39-1716541c5796`; master plan §4 S1): the 10 zero-property tools S1 sends `strict:true`
    (`list_blobs`, `list_composer_blobs`, `list_sources`, `get_expression_grammar`, `get_audit_info`,
-   `preview_pipeline`, `diff_pipeline`, `list_transforms`, `list_sinks`, `list_secret_refs`) fail on every call on the
-   deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together). `preview_pipeline` went from 36 of 36
+   `preview_pipeline`, `diff_pipeline`, `list_transforms`, `list_sinks`, `list_secret_refs`) share the affected schema.
+   On the deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together), `preview_pipeline` went from 36 of 36
    OK before S1 to 0 of 9 after it, and `list_blobs` from 19 of 19 to 0 of 1. Each rejected call carries exactly one
-   stray key (`field_count` 1), and the planner looped 10 times on the bare "got invalid_schema" because S1's repair
-   signal was absent. S1's offline gates (the loopback fidelity matrix, and a 16-token boot probe that makes no tool
-   call) could not see it.
-   **S2 does not start until that regression's fix has landed** (defect 0 in
-   `docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md`, in the main checkout and untracked when this was
-   written: stamp the zero-property tools `strict:false`, partition 32/10 → 22/20) **and a live window shows the 22
-   remaining strict tools healthy.** Until then the mitigation is `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
+   stray key (`field_count` 1): ten argument rejections in the session, comprising nine preview calls and one blob
+   discovery call. T9's `validation_errors` reached the active LLM; the root-level feedback was "Unexpected value"
+   at an empty location. The persisted rejection projection omitted that payload and retained the bare
+   "got invalid_schema" message. That stored projection does not prove absent active feedback or explain the
+   retry loop by itself. S1's offline gates (the loopback fidelity matrix, and a 16-token boot probe that makes no
+   tool call) could not expose the provider's empty-object generation failure.
+   Live controls rejected the initial `strict:false`/22/20 proposal and mixed stamp omission. The implemented fix
+   retains **32/10**: strict parameterless tools send exactly `{"_elspeth_no_arguments": true}`, which the validated
+   codec maps to semantic `{}`. NONE and MCP schemas remain unchanged. The production codec passed **4/4 live
+   calls** (two preview, two blob discovery) using the full 42-tool list on a frozen production tree. The
+   [isolated session replay](../reviews/2026-09-25-composer-session-convergence.md#full-live-replay) subsequently
+   built from the unchanged second prompt, validated after three genuine review approvals, executed all six rows
+   with the expected category/SLA output, and passed a separate real-loop preview with unchanged state. Its first
+   turn returned prose without a persisted source; that measured failure prompted a separate bounded retry repair
+   whose fresh live acceptance remains pending. No deployment or release merge is asserted here.
+   **S2 does not start until that regression's fix has landed and a live window shows all 32 strict tools healthy,
+   including the ten marker-framed tools.** Four codec calls and one isolated replay do not meet that broader
+   acceptance condition; the ten-case battery and healthy live window remain pending. Until then the rollback
+   setting is `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
 
 ---
 
@@ -207,7 +226,7 @@ its "family alternative".
 | 24-28 | F6 `set_output`, F7 `set_source_from_blob`, F8 `splice_transform`, F9 `set_source`, F10 `set_source_from_blobs` | F | S each | yes | yes (no traffic to measure; acceptance basis per R-G) |
 
 Nothing starts before the start condition in §1.1: John's call that the codebase is stable enough, the S1
-zero-property fix landed, and a healthy live window on the 22 remaining strict tools (principle 9). R1 no longer gates
+zero-property fix landed, and a healthy live window on all 32 strict tools (principle 9). R1 no longer gates
 any row. Tier M and Tier A can then proceed in parallel. The ordering constraints that matter:
 
 - M1b needs M1a only as a merge convenience (both touch `turn_audit.py`); M5 needs M1b and M2. M3 is independent of
@@ -634,8 +653,9 @@ grammar and is not a step.
       `patch`);
     - the tool's scripted-provider compose tests under `openai_strict`.
 
-    The counts of 32 above are the S1 figures measured at `1f500c6ae`. After the S1 zero-property fix (a precondition,
-    principle 9) they read 22, and the line numbers move with that fix; re-anchor with `grep -n` before F1.
+    The counts of 32 above remain correct with the parameterless marker fix (a precondition, principle 9); the
+    discarded strict-false proposal would have reduced them to 22. Re-measure the live registry and re-anchor line
+    numbers before F1.
 
     `test_error_code_redaction.py:398` (`_OPTION_TOOLS`) is S-scoped and stays.
 
@@ -994,7 +1014,7 @@ not merely ignored.
 | R-G | **Moot as a reopen basis. It is replaced by a per-flip acceptance rule.** | A flip needs John's stability call, its prerequisites landed, a live canary before and after, and no tripwire firing, and every call is read by hand for the first K calls. F6 to F10 have no organic traffic, so they need more seeded scenarios than one each |
 | R-H | **State it:** "no dual acceptance" is read per (tool, dialect route). The route is the dialect, not the served endpoint | Pin a maximum length for the mixed-form window, and pause only at family boundaries, so "one at a time" cannot stretch the mixed window into months |
 | R-I | **Allow** M1a/M1b to change the ARG_ERROR `planner_payload` | Sequenced after the defect-0b fix (`docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md`), which touches the same payload path |
-| R-J | **Adopt and freeze the turn-cost definition now** | Add reasoning-token totals and burst length. The live 10-retry burst of 2026-09-25 is a test case. Changing the definition later breaks comparison with windows already recorded |
+| R-J | **Adopt and freeze the turn-cost definition now** | Add reasoning-token totals and burst length. The session's ten argument rejections on 2026-09-25 (nine preview calls and one blob-discovery call) are a test case; measure bursts from their actual turn boundaries. Changing the definition later breaks comparison with windows already recorded |
 | R-K | **Group:** focused tests and the affected whole-tree gates on each commit, one full-suite gate per tranche | The full suite cannot see the defect class that matters here; the canary can |
 | R-L | **Option (a):** repair suggestions are rendered through `encode` for each route (P4) | Add a test of a copied-then-edited carrier, because copy-then-edit brings back the escaping hazard. Option (b) would teach a form that R-A rejects |
 | R-M | **A hierarchy of evidence, never pooled:** canary and battery rounds may accept a flip; organic traffic may only revert one, and one real failure is enough | The fast sources carry acceptance, because organic data takes months. Synthetic clearance never stands in for real validation |
@@ -1012,8 +1032,8 @@ not merely ignored.
    a time, and check that the model recovers on the next turn. Re-run it whenever a new endpoint appears.
 2. Take the M6 baseline only after the defect-0 and 0b fixes are deployed. Otherwise the preview and list loops
    distort every turn metric.
-3. Once defect 0 lands, every "32 strict tools" count is re-anchored to the partition that actually lands (the fix
-   brief proposes 22/20).
+3. Once defect 0 lands, re-anchor every strict-tool count to the live registry. The marker implementation retains
+   32/10; the fix brief's earlier 22/20 proposal failed live controls and was discarded.
 
 **The options as weighed (kept for the record):**
 
@@ -1127,7 +1147,7 @@ lane (`$L/revise-dispositions.md`), which is lost with the worktree; this sectio
   (§5.3 benefit read) instead of a gate, and the former per-tool reopen trigger into a measurement read at each flip;
 - adds principle 9 and Tier F item 13, the live tool-calling canary per schema shape and per `provider_served`
   endpoint, from S1's zero-property regression (session `ed3c015b-a2f7-4322-9f39-1716541c5796`), and makes that
-  regression's fix plus a healthy live window on the 22 remaining strict tools a precondition for starting;
+  regression's fix plus a healthy live window on all 32 strict tools a precondition for starting;
 - rewords R1, R-G and R-M in §7.2 (R1 ruled; R-G becomes the per-flip acceptance rule; R-M asks about acceptance
   evidence), renames the §3.1 gating column, and reinstates S3 after F5 (§1.4, §6).
 

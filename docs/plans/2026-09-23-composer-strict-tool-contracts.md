@@ -8,8 +8,16 @@ missing, extra or differently typed marker values before returning semantic
 the deployed DeepSeek/Together route showed that changing only their strict
 stamp to false or omitting that stamp while other tools remained strict did
 not repair empty-object calls. The full 42-tool marker control succeeded for
-both preview and blob discovery. This supersedes the original assumption that
-strict parameterless calls can be emitted as `{}`. No model-authored key names
+both preview and blob discovery: the production codec passed **4/4** calls
+(two per tool), using the full 42-tool list with **32 strict / 10 non-strict**
+on a frozen production tree. An isolated replay then built and executed the
+pipeline from the unchanged second prompt and passed a real-loop preview.
+Its first turn returned prose without a persisted source; that measured failure
+prompted a separate bounded retry repair whose fresh live acceptance is pending.
+The [session report](../reviews/2026-09-25-composer-session-convergence.md#full-live-replay)
+records the outcomes and limits. The broader ten-case battery and healthy live
+window remain pending; no deployment or release merge is asserted here. This supersedes the
+original assumption that strict parameterless calls can be emitted as `{}`. No model-authored key names
 are persisted. Rollback remains `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
 
 - **Date:** 2026-09-23
@@ -1144,26 +1152,44 @@ bullets above, this paragraph is the current state. The task-level plan is
   `parallel_tool_calls`, no gateway change, no DDL and no epoch bump; the only new provider call is the boot-time
   `hatch_terminal` probe request.
 
-**S1 live regression: zero-property tools (found 2026-09-25, open).** A live composer run (session
-`ed3c015b-a2f7-4322-9f39-1716541c5796`) showed that the 10 tools with no properties which S1 sends `strict:true`
-fail on every call on the deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together): `list_blobs`,
+**S1 live regression: zero-property tools (found 2026-09-25; marker codec and isolated real-loop preview verified).**
+A live composer run (session `ed3c015b-a2f7-4322-9f39-1716541c5796`) exposed failures of parameterless calls on
+the deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together). Ten tools share the affected
+zero-property strict schema: `list_blobs`,
 `list_composer_blobs`, `list_sources`, `get_expression_grammar`, `get_audit_info`, `preview_pipeline`,
 `diff_pipeline`, `list_transforms`, `list_sinks` and `list_secret_refs`.
 - `preview_pipeline` was 0 of 9 OK after S1, against 36 of 36 before it; `list_blobs` 0 of 1, against 19 of 19.
 - Every rejected call carries exactly one stray key (`field_count` 1).
-- The planner looped 10 times in one turn, because the rejection text was the bare "got invalid_schema": S1's
-  repair signal (T9) was absent from these rejections.
+- The session contains ten argument rejections: nine `preview_pipeline` calls and one `list_blobs` call.
+  T9's `validation_errors` reached the active LLM, but its root-level rejection only said "Unexpected value"
+  at an empty location. The persisted rejection projection retained the bare "got invalid_schema" message
+  without that repair payload. The stored text therefore does not establish that T9 was absent from the active
+  planner, or that missing feedback caused the repeated calls.
 - S1's offline gates could not see it. The wire fidelity matrix is a loopback recorder, and the boot probe that
   sends the stamped list runs with a 16-token budget and makes no tool call, so it proves acceptance of the list, not
   that a call against it succeeds.
 
-The fix is tracked in `docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md` (in the main checkout,
-untracked when this was written), defect 0: stamp the zero-property tools explicit `strict:false` and move the
-partition from 32/10 to 22/20, with every pinned count. The counts elsewhere in this section are the measured S1
-figures and are not rewritten. Mitigation until the fix lands: `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`, which
-restores the pre-S1 tool bytes. The lesson is carried into the S2 plan as a principle: every wire flip needs a live
-tool-calling canary on the deployed route for each schema shape it changes, and S2 does not start until this fix has
-landed and a live window shows the 22 remaining strict tools healthy.
+Defect 0's initial proposal was explicit `strict:false` on the zero-property tools, changing the partition to
+22/20. Live controls disproved that proposal and also disproved omitting only those tools' strict stamps while
+other tools remained strict. The implemented repair keeps **32/10** and gives each parameterless strict tool the
+exact wire object `{"_elspeth_no_arguments": true}`. `EmptyArgumentsMarker` rejects every other framing and
+decodes the valid object to semantic `{}`; its encoder performs the inverse. NONE-route bytes and MCP schemas
+remain unchanged.
+
+The production codec passed **4/4 live calls**, two each for `preview_pipeline` and `list_blobs`, with the full
+42-tool list and Together pinned. Every response was wire-conformant and decoded to a conformant empty semantic
+object; the production tree was frozen across the probe. This establishes the narrow codec result. The subsequent
+[isolated session replay](../reviews/2026-09-25-composer-session-convergence.md#full-live-replay) built the pipeline
+from the unchanged second prompt, passed validation after three genuine review approvals, and executed all six
+rows successfully with the expected category/SLA output. A third, read-only request exercised the strict marker
+inside the real preview loop successfully without changing pipeline state. The first prompt instead produced
+prose and no persisted source: a measured failure that prompted a separate bounded neutral retry repair, whose
+fresh live acceptance remains pending. The broader ten-case battery and healthy live window are still pending;
+this entry does not claim deployment or merge to the release branch. Operator rollback
+remains `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`, restoring pre-S1 tool bytes. The S2 start condition is unchanged:
+the fix must land and a healthy live window must cover the **32 strict tools, including the ten marker-framed
+tools**, in addition to John's codebase-stability decision. Four codec calls and one isolated replay do not satisfy
+that broader window.
 
 ### S2 — Options carrier and structure maps (reinstated 2026-09-25: R1 yes, deferred)
 
@@ -1374,7 +1400,7 @@ per-`provider_served` split in the table below needs that join first.
 | When | What to read | Decision it feeds |
 |---|---|---|
 | After S0 | Per option tool, the §5.4 split: wrong-type options/patch + other-field shape (`wire_*`, `missing_required_path`, `schema_shape`, `model_validation`), which a grammar or carrier could affect, versus inside-options content (`plugin_options_invalid`) + other rules (`schema_bound`, `semantic_rule`, other codes, uncoded), which it could not | The per-flip acceptance read for S2 (S2 plan §5.3). It was the R1 reopen trigger until the 2026-09-25 reversal (§6.3); R1 was first ruled on the historical store (§2.3) |
-| After S1 | On the 32 (22 after the zero-property fix): the `wire_conformant=False` rate per `provider_served` (a high rate on endpoints that advertise structured outputs means strict is being ignored); change in `schema_shape`; first-call latency | S4 worth building; R5 |
+| After S1 | On the 32, including the ten marker-framed parameterless tools: the `wire_conformant=False` rate per `provider_served` (a high rate on endpoints that advertise structured outputs means strict is being ignored); change in `schema_shape`; first-call latency | S4 worth building; R5 |
 | After each S2 flip | Per flipped tool, the S2 plan §5.3 reads: the live canary per schema shape, the tool's non-ok rate against its paired control, the legacy-form rejection rate, the §5.4 split, split by `provider_served` | keep the flip, or revert it (S2 plan §5.3) |
 
 Sample size. The 2026-09-24 R1 ruling did not need a new window: content errors are already a majority of the 30
@@ -1480,8 +1506,9 @@ Two further limits:
      flip lands, it stays `strict:false` with S as its contract. The "not strings containing JSON" guidance stands (the
      S2 plan's R-D says what it means for a flipped tool).
    - **Start condition.** Codebase stability, which is John's call, not a data-driven trigger. S2 also does not start
-     until the S1 zero-property fix (§4 S1, "S1 live regression") has landed and a live window shows the 22 remaining
-     strict tools healthy.
+     until the S1 zero-property fix (§4 S1, "S1 live regression") has landed and a live window shows the 32 strict
+     tools healthy, including the ten marker-framed tools. The 4/4 codec probe and isolated replay do not constitute
+     that broader live window.
    - **Per flip, not per reopen.** The flips proceed in the S2 plan's order without a per-tool reopen ruling. Each flip
      needs a live tool-calling canary on the deployed route for every schema shape it changes, measured per
      `provider_served` endpoint before and after the flip, and the S2 plan's open Tier R rulings (its §7.2) before the
