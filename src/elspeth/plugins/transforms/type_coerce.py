@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -280,7 +281,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:96417ef64dbb534f"
+    source_file_hash: str | None = "sha256:9c6541f5f66f1bcb"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -491,27 +492,27 @@ class TypeCoerce(BaseTransform):
         contract: SchemaContract,
         conversion_targets: dict[str, Literal["int", "float", "bool", "str"]],
     ) -> SchemaContract:
-        """Return an aligned output contract whose field types match the emitted row."""
-        if not conversion_targets:
-            return self._align_output_contract(contract)
+        """Apply output declarations without losing observed types or header aliases.
 
+        Observed sources infer optional fields. This transform's explicit
+        input schema validates its declared fields before processing, and its
+        output schema declares their post-conversion presence/nullability.
+        Those declarations belong to this output even when the upstream
+        contract carried weaker metadata.
+        """
+        output_schema_config = self._output_schema_config
+        assert output_schema_config is not None, "TypeCoerce initializes its output schema before processing"
+        declared_fields = {field.name: field for field in output_schema_config.fields or ()}
         changed = False
         output_fields: list[FieldContract] = []
         for field in contract.fields:
             target_type_name = conversion_targets.get(field.normalized_name)
-            if target_type_name is None:
-                output_fields.append(field)
-                continue
-
-            target_type = _TARGET_TYPES[target_type_name]
-            new_field = FieldContract(
-                normalized_name=field.normalized_name,
-                original_name=field.original_name,
-                python_type=target_type,
-                required=field.required,
-                source=field.source,
-                nullable=False,
-            )
+            new_field = field
+            if target_type_name is not None:
+                new_field = replace(field, python_type=_TARGET_TYPES[target_type_name], nullable=False)
+            if field.normalized_name in declared_fields:
+                declaration = declared_fields[field.normalized_name]
+                new_field = replace(new_field, required=declaration.required, nullable=declaration.nullable, source="declared")
             output_fields.append(new_field)
             if new_field != field:
                 changed = True
