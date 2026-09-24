@@ -815,7 +815,10 @@ class TestProfilingInstrumentation:
                     ctx = make_context(state_id=f"timing-{i}", token=token)
                     transform.accept(make_pipeline_row(row), ctx)
 
-                transform.flush_batch_processing(timeout=30.0)
+                # Eighty queries also launch bounded template workers. Under
+                # the parallel suite, worker startup can exceed 30 seconds;
+                # this test measures mock response delays, not wall time.
+                transform.flush_batch_processing(timeout=120.0)
 
                 assert len(collector.results) == 20
                 assert call_count[0] == 80  # 20 rows x 4 queries
