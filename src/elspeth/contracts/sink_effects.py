@@ -995,7 +995,7 @@ def _verify_content_bytes(content: object, expected_hash: str, expected_size: in
         "TypeError when a manifest field has the wrong exact type; never accepts a manifest it cannot verify"
     ),
     test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_signed_manifest_bytes_rejects_non_dict_json",
-    test_fingerprint="3bd157d4f24dc84a3eb08d513c06f71987484dd8d5ad0fa4424f6cda9a8a59a3",
+    test_fingerprint="dadcc96c98b9a10e70a0a07b7fed5ad86b568d2121bc531ab4cb34b0070229d9",
 )
 def _verify_signed_manifest_bytes(
     content: bytes,

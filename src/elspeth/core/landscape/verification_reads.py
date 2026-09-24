@@ -89,7 +89,7 @@ def _call_owner(
     run_id = state_run_id if state_id is not None else operation_run_id
     if type(run_id) is not str or not run_id:
         raise AuditIntegrityError(f"verification call {call_id!r} has no owning run")
-    if not isinstance(call_type, str):
+    if type(call_type) is not str:
         raise AuditIntegrityError(f"verification call {call_id!r} has an invalid call type")
     try:
         parsed_type = CallType(call_type)
