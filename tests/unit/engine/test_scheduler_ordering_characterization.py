@@ -203,7 +203,7 @@ def test_claim_ready_order_is_global_ingest_sequence_not_enqueue_order() -> None
 
 def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_id() -> None:
     """Within one ingest_sequence, claim order is step_index, then created_at, then the
-    deterministic work_item_id last-resort tiebreaker (filigree elspeth-6cb89db535)."""
+    deterministic work_item_id last-resort tiebreaker (archived issue elspeth-6cb89db535)."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
     now = landscape_database_now(engine)

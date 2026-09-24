@@ -264,7 +264,7 @@ ChatMessageWriterPrincipal = Literal[
 # mirrors the CHECK declaration (models.py L257) for visual diff clarity.
 # Adding a value is a governance action — see the dormant-value friction
 # block at the ``composition_states_table`` definition for the activation
-# contract (spec amendment + integration test + Filigree ticket).
+# contract (spec amendment + integration test + GitHub issue).
 CompositionStateProvenance = Literal[
     "tool_call",
     "convergence_persist",

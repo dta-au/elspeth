@@ -3,7 +3,7 @@
 > **Historical assessment artifact for commit
 > `0dcd61acaa44082d93ec205683700e798748ee6d`. Do not execute this as the
 > current work plan. Use the live [proof matrix](../../proof-matrix.md) for
-> evidence state and Filigree for current work.** Recover the exact map used by
+> evidence state and legacy issue tracker for current work.** Recover the exact map used by
 > this assessment with:
 > `git show 0dcd61acaa44082d93ec205683700e798748ee6d:docs/architecture/token-scheduler-state-engine.md`.
 
@@ -23,7 +23,7 @@ cross-transaction crash and registered-process suites before declaring any
 architectural guarantee.
 
 **Tech Stack:** Python 3.13, pytest, SQLAlchemy, SQLite `BEGIN IMMEDIATE`, real
-Elspeth plugin fixtures, multiprocessing, Filigree, Loomweave, Markdown, Mermaid.
+Elspeth plugin fixtures, multiprocessing, legacy issue tracker, retired code index, Markdown, Mermaid.
 
 ---
 
@@ -31,7 +31,7 @@ Elspeth plugin fixtures, multiprocessing, Filigree, Loomweave, Markdown, Mermaid
 
 Apply this loop to every task:
 
-1. Start or confirm the exact Filigree owner before editing.
+1. Start or confirm the exact legacy issue tracker owner before editing.
 2. Add the smallest test that expresses the missing proof or reproduced defect.
 3. Run the exact node in isolation and retain its result.
 4. If the test fails, capture the full durable before/after image before changing
@@ -41,7 +41,7 @@ Apply this loop to every task:
    reproduced.
 6. Run the package suite, adjacent state-machine/property suites, and
    `git diff --check`.
-7. Update the next dated assessment and Filigree only after the evidence is
+7. Update the next dated assessment and legacy issue tracker only after the evidence is
    reviewed. Do not rewrite this assessment.
 8. Commit one coherent proof/fix package at a time.
 
@@ -445,7 +445,7 @@ Intentionally absent with an accepted decision and regression.
 Require every TS/AUX/PB/RM/F row to show production entry, success, refusal,
 rollback, concurrency/plugin evidence, exact command, and final verdict.
 
-- [ ] **Step 2: Reconcile Filigree**
+- [ ] **Step 2: Reconcile legacy issue tracker**
 
 Deduplicate all confirmed gaps, close only issues whose exact regressions pass,
 and record operator/policy blockers explicitly rather than coding around them.

@@ -3,7 +3,7 @@
 
 Pins the CURRENT observable behavior of the durable scheduler claim/drain
 loop at the RowProcessor surface BEFORE the SchedulerDrain extraction
-(filigree elspeth-c49f33d6e4, component 3). Every test here must pass
+(archived issue elspeth-c49f33d6e4, component 3). Every test here must pass
 unchanged against both the pre-move and post-move trees:
 
 1. Recovery-drain ordering (``drain_scheduled_work``): durable PENDING_SINK

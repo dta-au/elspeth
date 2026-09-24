@@ -1,6 +1,6 @@
 """TokenTraversalEngine: the per-token DAG traversal state machine.
 
-Extracted from ``RowProcessor`` (filigree elspeth-c49f33d6e4, component 4 — the
+Extracted from ``RowProcessor`` (archived issue elspeth-c49f33d6e4, component 4 — the
 final slice of the god-class split). Owns ``process_single_token`` (the per-token
 DAG traversal loop) and its transform / gate / terminal handler family.
 
@@ -665,7 +665,7 @@ class TokenTraversalEngine:
             # The tuple is deliberately TWO-way where process_single_token's
             # entry check is three-way (it also covers collector). The two
             # sites have different threat models, so the asymmetry is
-            # justified rather than merely harmless (filigree
+            # justified rather than merely harmless (archived issue
             # elspeth-494491978d):
             #
             #   - The entry check validates an ARBITRARY work item's starting
@@ -1146,7 +1146,7 @@ class TokenTraversalEngine:
                     f"Inner traversal exceeded {max_inner_iterations} iterations for token "
                     f"{token.token_id}. Possible cycle in node_to_next map."
                 )
-            # Refresh active scheduler lease (filigree elspeth-ddde8144b6).
+            # Refresh active scheduler lease (archived issue elspeth-ddde8144b6).
             # No-op when no claim is active. Raises SchedulerLeaseLostError
             # when the lease was reaped by a peer — propagates up to
             # ``_drain_scheduler_claims`` which catches it specifically and

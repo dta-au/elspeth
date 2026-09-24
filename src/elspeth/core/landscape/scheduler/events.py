@@ -4,7 +4,7 @@ Writes one ``scheduler_events`` audit row per state transition on the
 caller's connection. Every scheduler component records through ONE shared
 ``SchedulerEventStore`` instance (composed by the facade), so a test can
 intercept the whole event plane at a single seam. Extracted from
-``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
+``TokenSchedulerRepository`` (archived issue elspeth-ef9c36d767).
 
 Row identity and replay order are the database-assigned ``seq`` (epoch 38);
 ``event_id`` is a content digest of the transition that excludes

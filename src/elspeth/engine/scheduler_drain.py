@@ -323,7 +323,7 @@ class SchedulerDrainCoordinator:
         self._live_barrier_holds = live_barrier_holds
         self._pending_group_losses = pending_group_losses
         # Active scheduler claim state for in-loop heartbeat refresh
-        # (ADR-026 RC6 multi-worker, filigree elspeth-ddde8144b6). These
+        # (ADR-026 RC6 multi-worker, archived issue elspeth-ddde8144b6). These
         # fields are non-None only inside ``drain_claims`` between
         # ``claim_ready``/``claim_pending_sink`` and the terminal ``mark_*``.
         # ``_process_single_token`` calls the processor's
@@ -443,7 +443,7 @@ class SchedulerDrainCoordinator:
         (``_make_checkpoint_after_sink_factory`` in orchestrator/core.py).
         Re-claiming them here would emit a duplicate
         ``row_result_from_pending_sink`` for the same token_id. See
-        filigree elspeth-5c5e88b071 (G3).
+        archived issue elspeth-5c5e88b071 (G3).
 
         Note: if a prior worker's lease on a sink-bound row is still active
         (not yet expired), ``claim_pending_sink`` won't find it (status is
@@ -616,7 +616,7 @@ class SchedulerDrainCoordinator:
                 item = self._work_codec.work_item_from_scheduler(claimed)
             claimed_lease_owner = self._claimed_scheduler_lease_owner(claimed)
             # Mark this claim active so ``_process_single_token``'s per-node
-            # heartbeat refreshes the right lease (filigree elspeth-ddde8144b6).
+            # heartbeat refreshes the right lease (archived issue elspeth-ddde8144b6).
             # Initial last_heartbeat_at is now: claim_ready just set
             # lease_expires_at = now + lease_seconds, so the first heartbeat
             # only needs to fire once heartbeat_seconds has elapsed.
@@ -936,7 +936,7 @@ class SchedulerDrainCoordinator:
             # The parking disposition always persists the originating error
             # hash for routed failures, so its absence is audit corruption —
             # refuse to replay with a recomputed (synthetic) hash
-            # (filigree elspeth-d74d19f901).
+            # (archived issue elspeth-d74d19f901).
             raise AuditIntegrityError(
                 f"Scheduler pending sink work_item_id={scheduled.work_item_id!r} is ON_ERROR_ROUTED but carries no "
                 "pending_error_hash; the replayed outcome cannot preserve the originally-audited error hash."
@@ -1075,7 +1075,7 @@ class SchedulerDrainCoordinator:
         Called (via the processor's ``_heartbeat_active_claim`` delegate) from
         ``_process_single_token`` on every node-iteration boundary and by the
         drain immediately after traversal returns or raises (ADR-026 RC6
-        multi-worker, filigree elspeth-ddde8144b6 and elspeth-51a4b5c771).
+        multi-worker, archived issue elspeth-ddde8144b6 and elspeth-51a4b5c771).
         The actual DB write fires at most once per
         ``scheduler_heartbeat_seconds`` so fast plugin chains do not incur a
         write per node.

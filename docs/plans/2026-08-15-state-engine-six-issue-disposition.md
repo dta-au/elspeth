@@ -122,7 +122,7 @@ assessment, **and tracker** do not contradict one another", and claims all 73 le
 as affected. But the assessment's `tracker_snapshot` is a three-field prose stub:
 
 ```json
-{"provider": "Filigree issue tracker (local database) at evidence-capture time",
+{"provider": "legacy issue tracker (local database) at evidence-capture time",
  "captured_at": "2026-08-15T09:00:40.134138+10:00",
  "limitation": "Live-lane gap owners remain open by design until the operator
                 restores AWS and fires the protected workflow."}
@@ -174,7 +174,7 @@ because it mirrors a judgement they have already made once:
 
 Both restore the correct `blocked_by` edge on `f89d82e925`, so **gating is right
 either way**. What differs is how the tree reads. Under (b),
-`filigree plan elspeth-4b3d734e3a` keeps printing
+archived tool command for `elspeth-4b3d734e3a` keeps printing
 `[x] elspeth-f227dd8d2f …` and "2/5 steps complete" — the exact false-green this
 finding is about survives at a glance, with the truth one comment-click away.
 
@@ -192,13 +192,7 @@ Do **not** force-transition it unilaterally either way.
 
 ### Step 2 — Release the seven stale claims (cheap, unambiguous)
 
-```bash
-cd "$(git rev-parse --show-toplevel)"   # CLI from repo root, per the MCP-write-conflict rule
-R="claim expired; claimant branch/worktree deleted 2026-08-13 (work patch-contained on release/0.7.2)"
-for i in cc0b256aca eefd990b46 c0d4a28e11 2e66723070 9cd07962c7 2aba594afb 6f6bbbec00; do
-  filigree --actor claude release "elspeth-$i" --reason "$R"
-done
-```
+> Retired tool command example omitted. The original is preserved in the local tool-retirement archive.
 
 Then, for each of the five wave-1 tasks, check whether its **specific** assertions
 landed in the merged tree (the branches were patch-contained, so the code did —
@@ -350,19 +344,19 @@ over `completed` deliberately: the v2 completion this tree described never happe
   `Cannot operate on <id>: assigned to '<agent>'` on any claimed issue. Releasing
   the 7 stale claims was a *prerequisite*, not the hygiene step §3 called it.
   Release also resets `in_progress` → `pending`, which is the honest state.
-- **`filigree create --json` prints `warning: ACTOR_MISMATCH` to stdout before the
+- **archived tool command prints `warning: ACTOR_MISMATCH` to stdout before the
   JSON**, so `json.load(stdin)` crashes. Seek to the first `{`. A crashed parser
   reads as "the create failed" — it did not, and a duplicate epic
   (`f872ee9eee`) was created and later deleted.
-- **`filigree list --type epic --limit 20` is priority-sorted**, so a new open P1
+- **archived tool command is priority-sorted**, so a new open P1
   epic can fall outside the window. It is not an existence check. Search by title.
-- **`filigree plan` is milestone-only** — `Error: Issue … is not a milestone`.
-  Cancelling the milestone costs that rollup; use `filigree list --parent <epic>`.
+- **archived tool command is milestone-only** — `Error: Issue … is not a milestone`.
+  Cancelling the milestone costs that rollup; use archived tool command.
   No loss here: the old `plan` view was printing `[x] elspeth-f227dd8d2f`.
 - **Type is immutable** (`update` has no `--type`), so the cohort steps keep
   `step` type under an epic. Re-parenting preserved comments and every
   dependency edge — verified: `f89d82e925` is still blocked by all four cohorts.
-- **A phase's `[DONE] … (2/2)` in `filigree plan` describes its children, not
+- **A phase's `[DONE] … (2/2)` in archived tool command describes its children, not
   itself.** `977b1a2283` was still `pending`; the manifest was corrected.
 
 ## 5. What this plan deliberately does not do

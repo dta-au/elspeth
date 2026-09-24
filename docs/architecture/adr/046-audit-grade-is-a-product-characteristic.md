@@ -12,8 +12,7 @@ fail-closed gates, honest statuses, signed allowlists, an append-only
 Landscape trail, and a two-actor judge-signature seam. Those properties are
 what the *product* guarantees to the people who run pipelines with it.
 
-The project also carries a great deal of development tooling: the Filigree
-issue tracker and its SQLite store, the Loomweave code map, session and git
+The project also carries development tooling: issue tracking, code inspection, session and git
 hooks, scan caches, uv-installed helpers, and — until the tooling decision in
 [ADR-043](043-project-tooling.md) — three Weft-suite tools that arrived by
 installer rather than by decision. While retiring them, the same

@@ -24,16 +24,12 @@ definition in `.claude/agents/red-team.md` — commissioned 2026-09-02.
   `ELSPETH_RED_TEAM_DISABLE=1`). Classification is synchronous and cheap;
   agents launch detached.
 
-## Findings routing (precision over recall)
+## Local findings for triage
 
-- severity ∈ {critical, high} **and** confidence == `confirmed`
-  → auto-filed as a Filigree bug (`--label red-team`, actor `red-team`),
-  priority critical→P0, high→P1, with reproduction steps in the body.
-- everything else — including unknown severity/confidence vocabulary —
-  → appended to `.claude/red-team/review-log.md` (gitignored).
-
-The auto-file path only fires on values it positively recognises; a
-malformed agent output can never create tracker noise.
+All findings, at every severity and confidence, and parsing errors append to
+`.claude/red-team/review-log.md` (gitignored). Raw agent output remains under
+`.claude/red-team/runs/`. The operator triages these reports before deciding
+which findings to publish to GitHub Issues; automatic review never publishes.
 
 ## Usage
 
@@ -41,7 +37,7 @@ malformed agent output can never create tracker noise.
 # Is this commit seam-relevant? (exit 0 = yes, 3 = no)
 .venv/bin/python -m scripts.red_team.trigger classify --commit HEAD
 
-# Full run against a commit (spawns agents, files/logs findings)
+# Full run against a commit (spawns agents, logs findings locally)
 .venv/bin/python -m scripts.red_team.trigger run --commit HEAD
 .venv/bin/python -m scripts.red_team.trigger run --commit HEAD --dry-run
 

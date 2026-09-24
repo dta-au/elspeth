@@ -1,6 +1,6 @@
 """LeaderDrainCoordinator: fresh-run phase sequencing for the leader worker.
 
-Extracted from ``Orchestrator._execute_run`` (filigree elspeth-9e71ae82a4).
+Extracted from ``Orchestrator._execute_run`` (archived issue elspeth-9e71ae82a4).
 The facade keeps a thin ``_execute_run`` delegator (characterization tests
 drive it directly) and injects ``register_graph_nodes_and_edges`` per call as
 a bound method, so tests that stub that method on the orchestrator instance

@@ -12,7 +12,7 @@ Two LLM batch transforms have shipped in `src/elspeth/plugins/transforms/llm/`:
 - `azure_batch_llm` (1,662 LOC) — uses Azure OpenAI's true async batch API. Submits a job, persists `batch_id`, returns `BatchPendingError` to the orchestrator, and resumes hours later via a checkpoint stored in `PluginAuditContext._batch_checkpoints`.
 - `openrouter_batch_llm` (909 LOC) — issues a buffered set of HTTP calls in parallel via `ThreadPoolExecutor`. Synchronous from the engine's POV but bypasses the per-row dispatch contract because the engine receives a list of rows, not a single row.
 
-A 2026-05-06 dogfood-run (filigree `elspeth-2799f6ec22`) confirmed both transforms hard-fail at config-instantiation in the current `RC5-UX` codebase. Two `*_batched.yaml` examples raise:
+A 2026-05-06 dogfood-run (legacy issue tracker `elspeth-2799f6ec22`) confirmed both transforms hard-fail at config-instantiation in the current `RC5-UX` codebase. Two `*_batched.yaml` examples raise:
 
 ```
 FrameworkBugError: Transform 'openrouter_batch_llm' declares declared_input_fields [...]
@@ -120,7 +120,7 @@ These retain a clear conops mapping: `batch_replicate` and `batch_stats` are syn
 
 ## References
 
-- Filigree ticket: `elspeth-2799f6ec22` (P1 task — Retire batch-LLM transforms)
+- legacy issue tracker ticket: `elspeth-2799f6ec22` (P1 task — Retire batch-LLM transforms)
 - Historical implementation plan overview and per-phase plans are retained in
   git history, not active docs.
 - Dogfood run that surfaced the violation: 2026-05-06 session, observed in `examples/openrouter_sentiment/settings_batched.yaml` and `examples/template_lookups/settings_batched.yaml`

@@ -4,7 +4,7 @@ Deterministic work-item identity, ``RowMapping`` -> ``TokenWorkItem``
 hydration, READY-row value construction, Tier-1 insert helpers, and
 cross-table reference validation. Module-level functions over a
 caller-supplied connection; no single component owns them. Extracted from
-``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
+``TokenSchedulerRepository`` (archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations

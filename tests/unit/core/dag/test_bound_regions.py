@@ -1153,7 +1153,7 @@ def _build_gate_in_collector_scope(*, escape: str) -> ExecutionGraph:
     Pins why ``handle_gate_node``'s post-JUMP barrier re-validation
     (``token_traversal.py``) needs no collector arm: a gate jump past a
     collector barrier cannot be authored, because rule 4 refuses the escape
-    at build time (filigree elspeth-494491978d).
+    at build time (archived issue elspeth-494491978d).
 
     ``escape="control"``: a genuine TWO-TARGET jump gate. The routes land on
     two DISTINCT in-region legs which converge on the collector through a
@@ -1328,7 +1328,7 @@ def _build_gate_in_collector_scope(*, escape: str) -> ExecutionGraph:
 def _build_collector_region_gate_leg_without_path_to_closer(*, dead_end: bool) -> None:
     """Rule 4's NO-PATH-TO-CLOSER limb, in a COLLECTOR-bound EXPAND region.
 
-    This is the guard that actually holds the line (filigree elspeth-494491978d).
+    This is the guard that actually holds the line (archived issue elspeth-494491978d).
     An adversarial mutation that neutered BOTH the duplicate-producer check and
     rule 4's sink-inside limb still saw every gate escape from a collector scope
     refused — by THIS limb. It was pinned nowhere: the sibling tests in this
@@ -1531,7 +1531,7 @@ class TestSESEWalk:
             _build_onehop_queue_backdoor()
 
     def test_gate_inside_collector_scope_builds(self) -> None:
-        # CONTROL for the escapes below (filigree elspeth-494491978d).
+        # CONTROL for the escapes below (archived issue elspeth-494491978d).
         # A genuine TWO-TARGET jump gate inside a collector-bound EXPAND
         # region is legal, so the rejections that follow track the ESCAPE and
         # not gates-in-scopes as a class. The two-target shape is the whole
@@ -1592,7 +1592,7 @@ class TestSESEWalk:
         # duplicate-producer check and the sink-inside limb neutered, this limb
         # still refuses every gate escape from a collector-bound region — and
         # until now nothing pinned it for an EXPAND/collector region
-        # (filigree elspeth-494491978d). Assert the limb's own message, not the
+        # (archived issue elspeth-494491978d). Assert the limb's own message, not the
         # sink text its siblings assert, so a future change that collapses the
         # two limbs into one cannot pass this silently.
         with pytest.raises(GraphValidationError, match="has no success path to") as exc_info:

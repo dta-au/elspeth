@@ -1,6 +1,6 @@
 """Tests for session DB engine PRAGMA discipline and schema-epoch guard.
 
-Phase 5b Task 1.5 (filigree elspeth-6815a49a7d). Mechanically enforces
+Phase 5b Task 1.5 (archived issue elspeth-6815a49a7d). Mechanically enforces
 the operator-delete-DB policy: WAL mode, busy_timeout, FK enforcement,
 and a schema-version sentinel that produces an actionable crash when an
 operator forgets to delete a stale session DB across a schema-bumping

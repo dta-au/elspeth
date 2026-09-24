@@ -9,7 +9,7 @@
 
 ADR-018 (2026-05-02, Accepted) codified producer-site outcome discrimination: every
 producer-known terminal circumstance gets its own `RowOutcome` enum variant.
-Filigree ticket `elspeth-d376b8e681` (2026-05-03) surfaced a question ADR-018
+legacy issue tracker ticket `elspeth-d376b8e681` (2026-05-03) surfaced a question ADR-018
 defers: when a gate-routed row durably reaches a sink, ADR-018 records its
 audit terminal as `ROUTED`, never `COMPLETED`. The ticket's user-stated
 invariant — "successfully sunk tokens must be COMPLETED, not sunk — otherwise
@@ -681,9 +681,9 @@ are insufficient when the claim references audit-table sequencing.
   non-resumable dead runs; the terminal mapping table above is unchanged.
 - **Supersedes:** ADR-018 (Producer-Site Outcome Discrimination, 2026-05-02)
 - ADR-004: Explicit Sink Routing
-- Filigree issue `elspeth-d376b8e681`: the deferred Path B question that
+- legacy issue tracker issue `elspeth-d376b8e681`: the deferred Path B question that
   motivated this ADR.
-- Filigree issue `elspeth-5069612f3c`: the rows-routed counter split that
+- legacy issue tracker issue `elspeth-5069612f3c`: the rows-routed counter split that
   motivated ADR-018.
 
 ## Implementation Notes

@@ -158,7 +158,7 @@ SELECT session_id, actor, route_name, created_at
 
 This repository currently has telemetry documentation and runbooks, but no
 deployable Alertmanager/Grafana dashboard configuration under `config/` or
-`infra/` for this PR to patch. These Filigree tasks must be resolved before
+`infra/` for this PR to patch. These legacy issue tracker tasks must be resolved before
 Phase 3 ships to production:
 
 - `elspeth-6e55a05547` — alert route for compose-loop Tier-1 audit failures.

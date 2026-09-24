@@ -511,7 +511,7 @@ gap in plugin code.
   [ADR-025 §Decision 4](../architecture/adr/025-multi-source-ingestion.md)
   and [ADR-026 §Decision 3](../architecture/adr/026-durable-token-scheduler.md).
 - A lint rule that detects `source_row_index = row_index` and similar
-  fabricating patterns in Source plugin code is tracked under filigree
+  fabricating patterns in Source plugin code is tracked under legacy issue tracker
   `elspeth-92afea0d23`; until it lands, this contract is the
   authoritative discoverable statement of the rule.
 

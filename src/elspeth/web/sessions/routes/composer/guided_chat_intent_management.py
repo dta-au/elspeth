@@ -457,7 +457,7 @@ def _model_catalog_identity_chat(*, user_message: str, intent_id: UUID, latency_
 
     The message is COMPOSED, not selected: a shared frame open; at most one
     plugin-free clause plus the collector and aggregation clauses when the
-    message names those kinds; and a shared frame close (filigree
+    message names those kinds; and a shared frame close (archived issue
     elspeth-270e81443d, review comment 7977 §7.1). A message naming a collector
     AND a structural node gets BOTH clauses, and the frame is emitted once
     either way. Three reasons the collector teaching composes rather than

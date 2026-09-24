@@ -7,7 +7,7 @@
 **Supersedes:** (partial, clause-level) — see "Supersession map" below
 **Tags:** framework, declaration-contract, audit-evidence, tier-1, registry, audit-integrity
 **Review date:** 2026-10-19 (six months from acceptance; ADR-010 §Consequences must be re-evaluated against observed 2B/2C experience by that date)
-**Filigree epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
+**legacy issue tracker epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
 
 ---
 
@@ -27,7 +27,7 @@
 > Three passages below still read as though ADR-009 §Clause 3's empty-emission
 > carve-out were the live posture: the §Supersession map row for **ADR-009
 > §Clause 3 (empty-emission carve-out + 90-day SLA)** ("Remains normative. The
-> Track 2 filigree epic (ref above) anchors the SLA."); the §Consequences →
+> Track 2 legacy issue tracker epic (ref above) anchors the SLA."); the §Consequences →
 > §Negative bullet ("The v0 empty-emission carve-out (ADR-009 §Clause 3) still
 > stands; ADR-010 does not tighten it. The 90-day SLA trigger (2026-07-18)
 > remains the safeguard for moving to `can_drop_rows` …"); and the §References
@@ -56,7 +56,7 @@ This ADR amends (not replaces) the single-declaration pattern from 007/008/009:
 | ADR-008 §Explicit scope boundary | Normatively remains; ADR-010 provides the framework each future declaration adopts, but each new declaration still requires its own ADR. |
 | ADR-009 §Clause 1 (shared propagation primitives) | Remains normative. ADR-010 does NOT include `static_check` in the 2A protocol — the walker refactor is deferred entirely to Phase 2B. |
 | ADR-009 §Clause 2 (runtime cross-check batch path) | Remains normative. ADR-010's dispatcher preserves the single-token and batch-flush call sites. |
-| ADR-009 §Clause 3 (empty-emission carve-out + 90-day SLA) | Remains normative. The Track 2 filigree epic (ref above) anchors the SLA. |
+| ADR-009 §Clause 3 (empty-emission carve-out + 90-day SLA) | Remains normative. The Track 2 legacy issue tracker epic (ref above) anchors the SLA. |
 | ADR-009 §Clause 4 (invariant harness) | ADR-010 extends — harness iterates registered contracts and exercises every `negative_example`. |
 
 ## Context
@@ -183,7 +183,7 @@ Considered seriously in review. Rejected because: (a) the nominal `AuditEvidence
 - Predecessor ADRs: 007 (pass-through propagation), 008 (runtime cross-check), 009 (pathway fusion)
 - Successor ADRs (Phase 2B/2C): each declaration gets its own ADR per §Supersession map ADR-008 reference
 - docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model, §Plugin Ownership: System Code, Not User Code, §The Defensive Programming Prohibition; and the frozen-dataclass immutability rule (`frozen=True` leaves container contents mutable through the attribute reference, so container fields are deep-frozen in `__post_init__`; scalar-only records need no guard)
-- Track 2 filigree epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
+- Track 2 legacy issue tracker epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
 - H2 cluster landing (2026-04-20): `elspeth-425047a599` (H2), `elspeth-10dc0b747f` (N1), `elspeth-60890a7388` (N3), `elspeth-f52d7c5a47` (F2), `elspeth-5fc876138d` (F3), `elspeth-b513c01cff` (F4), `elspeth-121b268aec` (F5), `elspeth-5dae105959` (H1 amendment)
 - H2 implementation and amendment record: commit `009b6009c`
 - H2 decision anchor: comment #417 on `elspeth-425047a599` — ADR-010 §Semantics audit-complete decision record

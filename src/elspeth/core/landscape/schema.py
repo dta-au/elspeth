@@ -726,7 +726,7 @@ edges_table = Table(
 
 # === Source Rows ===
 #
-# Audit-DB invariants for the rows table (filigree elspeth-56c3cda89b,
+# Audit-DB invariants for the rows table (archived issue elspeth-56c3cda89b,
 # ADR-bundle systems-thinker Finding 5, "Tragedy of the Commons"). The shared
 # resource is the audit database's invariant surface; the actors are 25+
 # downstream consumers (audit-readiness panel, ``elspeth explain``, MCP
@@ -757,14 +757,14 @@ edges_table = Table(
 #    these values are not explicitly provided ("Do not fabricate
 #    source_row_index or ingest_sequence from row_index"), but the
 #    prohibition lives in an exception string at one write boundary.
-#    Tracked under filigree elspeth-92afea0d23
+#    Tracked under archived issue elspeth-92afea0d23
 #    (elspeth-lints rule with the same enforcement status as
 #    ``trust_tier.tier_model``).
 #
 # B. Scheduler lease-ownership transitions (G29). ``token_work_items``
 #    carries the current lease state but not its transition history; a
 #    lease-expiry event during multi-worker execution leaves no per-worker
-#    audit attribution. Tracked under filigree elspeth-9030f34c32
+#    audit attribution. Tracked under archived issue elspeth-9030f34c32
 #    (``scheduler_events`` table).
 
 rows_table = Table(
@@ -932,7 +932,7 @@ token_work_items_table = Table(
     # ``recover_expired_leases`` sweep's OR-NULL predicate (elspeth-28aaa36a62)
     # treats ``lease_owner=NULL`` as a recoverable wedge, so the CHECK closes
     # the structural gap by preventing the wedge from being written in the
-    # first place (filigree elspeth-9990c81e14, embedded-database-reviewer).
+    # first place (archived issue elspeth-9990c81e14, embedded-database-reviewer).
     # The literal MUST match ``TokenWorkStatus.LEASED.value`` exactly — the
     # enum is a ``StrEnum`` whose ``.value`` is lowercase ``"leased"`` and
     # every write site persists ``.value`` (e.g. ``scheduler_repository.py``
@@ -964,7 +964,7 @@ Index(
 # index. Bounded by run-LEASED rows today, but the RC6 multi-worker target
 # runs the sweep per-worker-per-iteration: O(workers²) per drain wave. The
 # wider index puts ``lease_owner`` into the seek key so the sweep is index-
-# only (filigree elspeth-9990c81e14, embedded-database-reviewer MED).
+# only (archived issue elspeth-9990c81e14, embedded-database-reviewer MED).
 Index(
     "ix_token_work_items_recovery",
     token_work_items_table.c.run_id,

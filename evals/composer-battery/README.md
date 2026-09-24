@@ -182,7 +182,7 @@ themselves mark the firing degraded.
 `case_flags` — it re-derives the per-case exclusion streak and the 15%
 exclusion flag from the captured bytes, which is the stronger reading.
 `firing.json` remains the record of what the driver saw as it fired.
-Triage reads the ledger; kit defects become Filigree issues by hand.
+Triage reads the ledger; kit defects become GitHub Issues by hand.
 
 `--compare <prev>` prints `compare.recorded_deltas` — a dict keyed by
 recorded-identity field, **`composer_skill_hash` always first**, then every

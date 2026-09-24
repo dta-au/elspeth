@@ -84,10 +84,10 @@
   "structure_snapshot": {
     "provider": "Parent v2 assessment plus direct current source and test inspection",
     "captured_at": "2026-08-12T04:27:48.907577+10:00",
-    "limitation": "No new Loomweave or Warpline claim is made by this focused delta; the parent snapshot remains historical context and executable reporter-bound tests are the only promoted evidence."
+    "limitation": "No new retired code index or Warpline claim is made by this focused delta; the parent snapshot remains historical context and executable reporter-bound tests are the only promoted evidence."
   },
   "tracker_snapshot": {
-    "provider": "Filigree 3.1.0 exact show records for the three Task 5 owners",
+    "provider": "legacy issue tracker 3.1.0 exact show records for the three Task 5 owners",
     "captured_at": "2026-08-12T04:39:42+10:00",
     "limitation": "The three sequential live reads showed all owners in_progress; none is closed because required PostgreSQL and SQLite follower profile cells remain unknown."
   },

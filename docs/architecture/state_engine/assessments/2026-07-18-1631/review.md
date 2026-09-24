@@ -25,7 +25,7 @@ no repository edits and created no document-package unit tests.
 | Architecture | The transaction-boundary table omitted sink reservation, inspection, plan, publication/response, finalization/response, and callback seams | Accepted. Expanded the table and linked the exhaustive PB-07 cases in `architecture.md`. |
 | Evidence | The proof-matrix family counts contradicted the manifest | Accepted. The current matrix derives 68 legs, 44 gaps, and 24 unknowns; the validator checks every family row and the total row against the manifest. |
 | Evidence | Literal commands and retained evidence were insufficiently reproducible | Accepted. Replaced the unavailable `python -m pip` command with `uv pip freeze`; created artifact directories before writes; parameterized assessment paths; recorded relative cwd, timeout, safe environment, resources, exact coverage tuples, node indexes and hashes, result counts, limitations, and reproducibility class. |
-| Evidence | Dirty overlays and structural/history requirements could not be reconstructed literally | Accepted. Moved overlay capture outside the worktree, retained patches plus an untracked archive/path list, narrowed Loomweave retention to load-bearing claims, and split strict v1 reruns from legacy best-effort reconstruction. |
+| Evidence | Dirty overlays and structural/history requirements could not be reconstructed literally | Accepted. Moved overlay capture outside the worktree, retained patches plus an untracked archive/path list, narrowed retired code index retention to load-bearing claims, and split strict v1 reruns from legacy best-effort reconstruction. |
 | Future agent | Profiles, initializer, delta encoding, evidence promotion, N/A, tracker ownership, and historical reruns were underspecified | Accepted. Added closed execution profiles and per-family dimension contracts, a full initializer, fully materialized deltas with parent identity and changed tuples, catalog-owned N/A validation, coherent-theme tracker ownership, and two historical rerun paths. |
 | Future agent | The package still had an integrated-review placeholder | Accepted by replacing it with this challenge record and requesting fresh re-review after the changes. |
 
@@ -63,7 +63,7 @@ review-path enforcement; the future-agent reader verified initialization,
 validation, evidence capture, and strict historical rerun instructions.
 
 The branch moved from `36146eac4` to `422415009` during final review through
-two documentation-only commits. Git proved no non-document diff, Loomweave
+two documentation-only commits. Git proved no non-document diff, retired code index
 reported no modified indexed files, and EV-001 through EV-003 were recaptured
 at the final baseline. Final direct validation records 68 legs, 44 gaps, 24
 unknowns, ten open hard gates, 114 exact collected/passing nodes, nine retained

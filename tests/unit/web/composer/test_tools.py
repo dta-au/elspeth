@@ -18251,7 +18251,7 @@ class TestPreviewProofStep:
         preview artefact), so a test asserting `is_valid` would pass against the
         defect. Before the fix the collector arm emitted ZERO diagnostics while
         the aggregation arm emitted this one — a blocking export diagnostic
-        silently lost to a `node_type` gate (filigree elspeth-1016a47e8f).
+        silently lost to a `node_type` gate (archived issue elspeth-1016a47e8f).
         """
         with _blob_operation(self.engine, self.session_id) as (authority, context):
             diagnostics = self._proof_codes(

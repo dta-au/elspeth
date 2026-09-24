@@ -534,7 +534,7 @@ type DerivedAuditCharacteristics = tuple[AuditCharacteristic, ...]
 #   (a) a spec amendment documenting the new modality and its audit
 #       semantics;
 #   (b) an integration test exercising the new write/read path;
-#   (c) a Filigree ticket linking the change back to this enum.
+#   (c) a GitHub issue linking the change back to this enum.
 #
 # An auditor calling ``explain(recorder, run_id, token_id)`` reaches the
 # originating blob row's ``creation_modality`` field through the

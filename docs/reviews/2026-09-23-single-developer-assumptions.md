@@ -1,9 +1,13 @@
 # Single-developer assumptions audit
 
+> Historical report: retired tool names, paths, and command examples were
+> generalized or removed on 2026-09-25. Quoted excerpts below are reading copies;
+> exact original quotations are preserved in the local tool-retirement archive.
+
 **Date:** 2026-09-23
 **Scope:** repository-wide sweep for assumptions that hold only while one person
 works on ELSPETH, ahead of (a) graduating to multiple developers and (b)
-migrating work tracking from Filigree onto GitHub Issues.
+migrating work tracking from legacy issue tracker onto GitHub Issues.
 **Posture:** read-only. No file was edited and no test was run.
 
 ## Citation basis (read this before checking a line number)
@@ -173,7 +177,7 @@ Gaps by theme, and why the step-up misses each:
 - **Tracker (F-27–F-33, 7 gaps).** GOVERNANCE.md predates the GitHub Issues
   migration; `GOVERNANCE.md:30` still says only "the project issue tracker". None
   of the six controls touches the tracker, the 301 dangling ids, or the tracked
-  skills that drive agents to Filigree.
+  skills that drive agents to legacy-tracker.
 - **Onboarding (F-20–F-26, 7 gaps).** Platform review settings do not fix a
   tracked `SessionStart` hook that fails on a fresh clone (F-20), an undefined
   security channel (F-24), or a `CONTRIBUTING.md` with no PR section (F-11).
@@ -440,8 +444,8 @@ without being invoked deliberately.
 `.mcp.json.example:24-25` (tracked):
 
 > ```
->     "filigree": { "type": "stdio", "command": "filigree-mcp", "args": [] },
->     "loomweave": { "type": "stdio", "command": "loomweave", "args": ["serve"] }
+>     "legacy issue tracker": { "type": "stdio", "command": "legacy-tracker-mcp", "args": [] },
+>     "retired code index": { "type": "stdio", "command": "retired code index", "args": ["serve"] }
 > ```
 
 **Why it breaks.** `ADR-043` (title, line 1) is explicit that these are
@@ -776,12 +780,12 @@ and scope it to shared checkouts as in F-15.
 >         "hooks": [
 >           {
 >             "type": "command",
->             "command": "filigree session-context",
+>             "command": "legacy issue tracker session-context",
 >             "timeout": 5
 >           },
 >           {
 >             "type": "command",
->             "command": "filigree ensure-dashboard",
+>             "command": "legacy issue tracker ensure-dashboard",
 >             "timeout": 5
 >           }
 >         ]
@@ -790,7 +794,7 @@ and scope it to shared checkouts as in F-15.
 >         "hooks": [
 >           {
 >             "type": "command",
->             "command": "loomweave hook session-start --path \"${CLAUDE_PROJECT_DIR}\""
+>             "command": "retired code index hook session-start --path \"${CLAUDE_PROJECT_DIR}\""
 >           }
 >         ]
 >       }
@@ -810,7 +814,7 @@ it directly contradicts the covenant split that ADR-043 performed:
 
 The split moved the *prose* out of AGENTS.md but left the *executable* form tracked.
 
-**Recommendation.** Move the filigree/loomweave hooks to
+**Recommendation.** Move the legacy-tracker/retired-code-index hooks to
 `.claude/settings.local.json` (already gitignored and already used for local
 overrides). Keep in the tracked file only what is genuinely project-wide — the
 `ruff format` PostToolUse hook at `:48-57` and the dangerous-command PreToolUse
@@ -966,7 +970,7 @@ staging directory, a house style with redaction rules, a fail-closed
 pre-publication gate, and an importer. Its README states the premise of this
 entire audit independently — `docs/github-issues/README.md:3-5`:
 
-> "ELSPETH tracked its work in **filigree**, an agent-native issue tracker with a local
+> "ELSPETH tracked its work in **legacy issue tracker**, an agent-native issue tracker with a local
 > database. That fitted a project with one developer and a fleet of agents. It does not fit
 > a project with several developers, so GitHub Issues becomes the system of record."
 
@@ -981,13 +985,13 @@ tracker findings — the AGENTS.md installer block (F-27), the atomic-claim rule
 (F-29), and the tracked skills (F-30) — are **not** in that migration's scope,
 because it stages *issues*, not the repository's standing agent instructions.
 
-### F-27 — The covenant names Filigree as the system of record. MUST CHANGE
+### F-27 — The covenant names legacy issue tracker as the system of record. MUST CHANGE
 
 `AGENTS.md:377-379`:
 
-> "`filigree` tracks this project's work. Use it to find, claim, update and close
-> issues: `filigree session-context` at session start, then
-> `filigree start-next-work --assignee <name>`."
+> "`legacy-tracker` tracks this project's work. Use it to find, claim, update and close
+> issues: archived tool command at session start, then
+> archived tool command."
 
 **Why it breaks.** This is the covenant — the file every agent and contributor
 reads first — asserting that the retired tracker is authoritative. After the
@@ -997,19 +1001,19 @@ be trusted without checking.
 **Note on mechanics.** This block is installer-managed. `AGENTS.md:373-374`:
 
 > ```
-> <!-- filigree:instructions:v3.1.0:c1c023c3 -->
-> <!-- filigree:last-writer:filigree install -->
+> <!-- legacy-tracker:instructions:v3.1.0:c1c023c3 -->
+> <!-- legacy-tracker:last-writer:legacy-tracker install -->
 > ```
 
 and `docs/maintainer/toolchain.md:13-17` warns:
 
-> "The Filigree and Loomweave blocks
+> "The legacy issue tracker and retired code index blocks
 > below are installer-written mirrors: their installers rewrite the block
 > between the `<!-- <tool>:instructions -->` markers on every run."
 
-So deleting the block is not enough — a later `filigree install` would restore it.
+So deleting the block is not enough — a later archived tool command would restore it.
 
-**Recommendation.** Uninstall Filigree's AGENTS.md integration (its own uninstall
+**Recommendation.** Uninstall legacy issue tracker's AGENTS.md integration (its own uninstall
 verb, per `AGENTS.md:305-307` on tool hygiene) rather than hand-deleting the block,
 then replace the section with a GitHub Issues pointer. `ADR-043` requires that
 adding or removing a tool carrying standing agent instructions is a recorded
@@ -1035,7 +1039,7 @@ ids** in tracked Markdown, excluding `docs-archive/`, `notes/`, `CHANGELOG.md`,
 > "  parallelism (elspeth-0077cb7789): two runs of identical code produced"
 
 **Why it breaks.** These are load-bearing citations — the evidence for why a rule
-exists. Once Filigree is gone, a reader who wants to check a claim hits an
+exists. Once legacy issue tracker is gone, a reader who wants to check a claim hits an
 identifier with no resolver. That is worse than no citation, because it looks
 verifiable.
 
@@ -1044,13 +1048,13 @@ migration writes `.import-state.jsonl` mapping every slug to its issue number
 (`docs/github-issues/README.md:85-88`), which is the resolver substrate. Build on
 it rather than duplicating it: (a) extend that state file, or a note beside it, to
 carry the **old `elspeth-<hex>` id** alongside the slug, so the 301 in-tree
-citations resolve forward; (b) preserve a read-only export of the Filigree
+citations resolve forward; (b) preserve a read-only export of the legacy issue tracker
 database for the ids that are never migrated — the 72 in ADR-025 and 50 in ADR-026
 are closed history and will have no issue number; (c) rewrite ids in prose only in
 the small set of living documents — `AGENTS.md`, `CONTRIBUTING.md`, and any ADR
 still being amended. Historical ADR citations should stay as history.
 
-**Timing matters.** Step (b) must happen before the Filigree database is
+**Timing matters.** Step (b) must happen before the legacy issue tracker database is
 decommissioned. Once it is gone, the ~300 ids that were never imported become
 permanently unresolvable, and that is the irreversible half of this finding.
 
@@ -1063,7 +1067,7 @@ permanently unresolvable, and that is the irreversible half of this finding.
 > 1. Claim atomically: `work_start` / `work_start_next` (MCP) or `start-work` /
 >    `start-next-work` (CLI). Never chain a claim with a separate status update;
 >    that two-step form races other agents.
-> 2. On `SCHEMA_MISMATCH` the installed filigree is older than the project
+> 2. On `SCHEMA_MISMATCH` the installed legacy issue tracker is older than the project
 >    database. Surface it to the user; do not retry."
 
 **Why it breaks.** The race this prevents is real and becomes *more* likely with
@@ -1078,24 +1082,24 @@ before starting. Preserving the *warning* matters more than preserving the verb.
 
 ### F-30 — Tracked skills teach the retired tracker. MUST CHANGE
 
-Both `.agents/skills/filigree-workflow/` and `.claude/skills/filigree-workflow/`
-are tracked, with five reference files each. `.agents/skills/filigree-workflow/SKILL.md:15`:
+Both archived tool reference and archived tool reference
+are tracked, with five reference files each. archived tool reference:
 
 > "project. This skill is procedural knowledge for using it well — as a solo agent"
 
 `.agents/skills/cicd-allowlist-audit/SKILL.md` and
-`.agents/skills/bug-sweep/SKILL.md` also depend on Filigree for lodging findings —
+`.agents/skills/bug-sweep/SKILL.md` also depend on legacy issue tracker for lodging findings —
 `.agents/skills/bug-sweep/SKILL.md:9`:
 
 > "  what you find", or any large read-only review that must scale past one agent."
 
 **Why it breaks.** These are invoked by name and will drive agents to a tracker
 that no longer exists. `bug-sweep` in particular is structured around "lodge
-verified findings in Filigree under one sweep tag" — its whole reconciliation step
+verified findings in legacy issue tracker under one sweep tag" — its whole reconciliation step
 breaks.
 
 **Recommendation.** Retarget `bug-sweep` and `cicd-allowlist-audit` at GitHub
-Issues (labels replace sweep tags naturally). Retire `filigree-workflow` or rewrite
+Issues (labels replace sweep tags naturally). Retire `legacy-tracker-workflow` or rewrite
 it as `github-issues-workflow`. Note the "solo agent" phrasing at `:15` should go
 regardless.
 
@@ -1105,7 +1109,7 @@ regardless.
 
 > "# Tracker label vocabulary (`p1-class:*`, `lane:*`)
 >
-> Filigree label namespaces whose meaning lives only in the tracker database.
+> legacy issue tracker label namespaces whose meaning lives only in the tracker database.
 > Written 2026-08-17 because the vocabulary had no definition anywhere in the
 > tree, so every session re-derived it by sampling issues."
 
@@ -1167,7 +1171,7 @@ unambiguous when there was one tracker and one user.
 > **Internal governance** — the trust-tier allowlist burn-downs, judge-signing tooling, the
 > lint gate's own internals, and the agent tooling. These are the project's own machinery
 > rather than product defects, and they mean nothing to an outside contributor. They keep
-> the `exclude:gh-migration` label in filigree."
+> the `exclude:gh-migration` label in legacy-tracker."
 
 **The ruling is reasonable on its own terms.** Lint-gate internals and agent
 tooling genuinely mean nothing to an outside contributor, and ADR-046 already
@@ -1176,10 +1180,10 @@ says project tooling is not product. Nothing here argues with that.
 **Why it breaks anyway.** Two consequences follow that the ruling does not appear
 to have weighed:
 
-1. **Filigree is not actually retired.** It remains the system of record for one
+1. **legacy issue tracker is not actually retired.** It remains the system of record for one
    class of work. So the project is heading for a **two-tracker state** — GitHub
    for product defects, a local private database for governance — which no
-   document currently describes. `AGENTS.md:377` ("`filigree` tracks this
+   document currently describes. `AGENTS.md:377` ("`legacy-tracker` tracks this
    project's work") becomes half-true rather than false, and a new developer has
    no way to learn which half.
 2. **The category is drawn in the wrong place for this transition.** Judge-signing
@@ -1223,7 +1227,7 @@ and **F-22**.
 > "- For reproducible defects, open a GitHub issue with version, commit, command,
 >   expected behaviour, actual behaviour, and relevant logs."
 
-while `AGENTS.md:377` (F-27) directs agents to Filigree.
+while `AGENTS.md:377` (F-27) directs agents to legacy-tracker.
 
 **Why it breaks.** Contributors file in one system, the maintainer's agents work
 another, and nothing reconciles them. With one person bridging both, nothing is
@@ -1389,17 +1393,17 @@ superseded in practice, not only in filing. Leave the sibling citations alone.
 **Before the tracker migration cuts over:**
 
 4a. **F-41** — decide where governance work is tracked. The operator ruling at
-   `docs/github-issues/README.md:55-60` keeps it in filigree, which would put
+   `docs/github-issues/README.md:55-60` keeps it in legacy issue tracker, which would put
    F-01's remediation in a private local database a second developer cannot read.
    This decision gates items 1–4 above, so make it first.
-5. **F-27 / F-30** — uninstall the Filigree AGENTS.md block (via its own uninstall
+5. **F-27 / F-30** — uninstall the legacy issue tracker AGENTS.md block (via its own uninstall
    verb, not by hand) and retarget the tracked skills; record it as an ADR-043
    amendment. Note this is only correct if F-41 resolves toward a single tracker;
-   if filigree is retained for governance, the block needs rewriting rather than
+   if legacy issue tracker is retained for governance, the block needs rewriting rather than
    removing.
 6. **F-31** — create the GitHub labels from the existing vocabulary document
    *before* migrating issues, or the classification is lost in transit.
-7. **F-28** — commit a read-only Filigree export plus a resolver note, and carry
+7. **F-28** — commit a read-only legacy issue tracker export plus a resolver note, and carry
    old ids into migrated issue bodies. Do this before the database goes away.
 8. **F-29** — replace the atomic-claim rule with a GitHub-shaped convention that
    preserves the warning.
@@ -1407,7 +1411,7 @@ superseded in practice, not only in filing. Leave the sibling citations alone.
 **Before the first external contribution:**
 
 9. **F-11** — a "Proposing a change" section in CONTRIBUTING.md.
-10. **F-20** — move the filigree/loomweave session hooks out of the tracked
+10. **F-20** — move the legacy-tracker/retired-code-index session hooks out of the tracked
     `.claude/settings.json`.
 11. **F-24** — publish a security contact and name who monitors it.
 12. **F-12** — issue and PR templates.

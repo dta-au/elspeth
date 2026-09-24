@@ -112,7 +112,7 @@
     "limitation": "No SQLite follower deployment or live AWS composition claim is made by this delta."
   },
   "tracker_snapshot": {
-    "provider": "Filigree comments 7488, 7489, and 7490 plus current Task 6 issue dispositions",
+    "provider": "legacy issue tracker comments 7488, 7489, and 7490 plus current Task 6 issue dispositions",
     "captured_at": "2026-08-12T06:03:08.956246+10:00",
     "limitation": "Broad owners remain open; elspeth-2aba594afb retains the production BranchLossSpec process residual."
   },

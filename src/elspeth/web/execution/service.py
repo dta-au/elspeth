@@ -315,7 +315,7 @@ def _proof_component_type(code: str, evidence: Mapping[str, Any]) -> str:
     than guessed back out of the diagnostic code. The code-keyed fallbacks below
     survive only for detectors that do not (yet) record it; guessing was how a
     collector-hosted batch plugin got labelled "aggregation" on a user-facing
-    blocker (filigree elspeth-1016a47e8f).
+    blocker (archived issue elspeth-1016a47e8f).
 
     NOT the same question as the node-kind reads in the path-allowlist and
     managed-identity loops further down this file (elspeth-df8082552d), which

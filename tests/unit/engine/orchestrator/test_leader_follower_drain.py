@@ -1,5 +1,5 @@
 # tests/unit/engine/orchestrator/test_leader_follower_drain.py
-"""Characterization net for LeaderFollowerDrain (filigree elspeth-6630fb3e31).
+"""Characterization net for LeaderFollowerDrain (archived issue elspeth-6630fb3e31).
 
 Pins the bounded peer-lease wait and follower pending-sink drain loops extracted
 from Orchestrator._execute_run. Drives the coordinator with a fake processor and

@@ -1,7 +1,7 @@
 """GraphRegistrationService: GRAPH-phase node/edge registration + validation.
 
 Extracted from ``Orchestrator._register_graph_nodes_and_edges`` and
-``Orchestrator._record_declared_sources_ready`` (filigree elspeth-9e71ae82a4).
+``Orchestrator._record_declared_sources_ready`` (archived issue elspeth-9e71ae82a4).
 The facade keeps a thin ``_register_graph_nodes_and_edges`` delegator so tests
 that stub the method on the orchestrator instance keep working.
 

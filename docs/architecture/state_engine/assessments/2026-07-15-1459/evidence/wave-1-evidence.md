@@ -63,7 +63,7 @@ Key conclusions:
 
 ## Confirmed Wave 1 ownership
 
-| Scope | Filigree issue |
+| Scope | legacy issue tracker issue |
 | --- | --- |
 | TS-00/01 refusal, replay, atomicity | `elspeth-c0d4a28e11` |
 | TS-02/PB-01 ingress and scheduler exclusion | `elspeth-9cd07962c7` |

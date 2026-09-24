@@ -3224,7 +3224,7 @@ ToolDeclaration model in Step 3 — its per-call kwarg surface differs from
 the synchronous ``ToolContext`` (9 extra kwargs: session_id,
 composition_state_id, tool_call_id, now, per_term_cap, per_session_day_cap,
 model_identifier, model_version, provider, composer_skill_hash, plus two
-``Awaitable`` callbacks). The migration is captured in filigree ticket
+``Awaitable`` callbacks). The migration is captured in archived issue
 elspeth-f5da936747 (P3, parent elspeth-6c9972ccbf); option-A requires
 widening the ``ToolHandler`` alias to a sync-or-async union and adding an
 escape hatch on ``ToolDeclaration`` for the extra kwargs. The inline schema

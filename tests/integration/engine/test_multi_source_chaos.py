@@ -1,5 +1,5 @@
 # tests/integration/engine/test_multi_source_chaos.py
-"""Multi-source scheduler chaos proofs (filigree elspeth-7bb7124e8f).
+"""Multi-source scheduler chaos proofs (archived issue elspeth-7bb7124e8f).
 
 Deterministic failure injection against REAL multi-source pipelines — real
 Orchestrator runs and follower traversal, SQLite LandscapeDB, durable scheduler —

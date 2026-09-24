@@ -4,7 +4,7 @@ Pluggable SSO, identity substrate, approval, review, shared library, per-person 
 
 **Archived 2026-09-23: this programme is complete.** It is kept for the record rather than as
 live planning, and the GitHub issue that pointed here has been closed. This folder is the
-detail: the programme's scope as it stood in the filigree tracker on 2026-09-23, captured
+detail: the programme's scope as it stood in the legacy issue tracker on 2026-09-23, captured
 verbatim before those rows were closed, plus the delivery status measured the day it finished.
 
 The quoted tracker rows below are **not** updated for the move. One of them cites
@@ -16,7 +16,7 @@ tracker said, and repairing a link inside a quotation would make it no longer a 
 
 GitHub has no `milestone` / `phase` / `step` issue type. Operator ruling 2026-09-23 (John):
 *"for the epics, a single ticket pointing to a folder with the details"*. So the container rows
-below were closed in filigree and their content lives here. The tracker rows are preserved
+below were closed in legacy issue tracker and their content lives here. The tracker rows are preserved
 verbatim in `tracker-rows.json` alongside this file — nothing was summarised away.
 
 ## Documents of record
@@ -103,7 +103,7 @@ anything was dropped. Every other row's description and notes are reproduced in 
 
 ## A note on the `elspeth-…` identifiers
 
-The identifiers below are rows from **filigree**, the internal tracker ELSPETH used
+The identifiers below are rows from **legacy issue tracker**, the internal tracker ELSPETH used
 before moving to GitHub Issues. They are opaque local ids: they name nothing outside that
 tracker, and the tracker is being retired.
 

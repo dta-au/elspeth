@@ -1,6 +1,7 @@
 # Tracker label vocabulary (`p1-class:*`, `lane:*`)
 
-Filigree label namespaces whose meaning lives only in the tracker database.
+Historical label namespaces from the archived issue database. These are migration
+reference material; GitHub labels are the live vocabulary after triage.
 Written 2026-08-17 because the vocabulary had no definition anywhere in the
 tree, so every session re-derived it by sampling issues.
 
@@ -63,11 +64,9 @@ workstreams appear. Current: `analyzer`, `attribute-contracts`, `composer`,
 Use `p1-class:*` to decide *whether* to work something and `lane:*` to decide
 *where it belongs*. They are orthogonal: a `quiet-bug` can sit in any lane.
 
-## Keeping this current
+## Using this during migration
 
-`filigree labels --namespace p1-class --top 0` (MCP: `label_list`) prints live
-counts including values used only on closed issues — a value absent from open
-work is still part of the vocabulary. To find issues missing the namespace
-entirely, use MCP `issue_list(not_label="p1-class:")`; the trailing colon makes
-it a prefix exclusion. Update this file when a value's meaning shifts, an
-adjudication lands, or a namespace is added.
+Use this vocabulary to interpret archived issues during triage. Inspect the
+repository's GitHub labels before applying any labels to new issues; do not
+assume historical namespaces have been imported. Record deliberate vocabulary
+changes here when migration decisions are made.

@@ -168,7 +168,7 @@ not evidence that the defects are fixed. No full suite or new browser test was
 run. Detailed lane reports and terminal logs are under
 `.claude/lanes/composer-investigation-20260915/`.
 
-Loomweave's existing index was failed/never analyzed. A refresh was requested
+retired code index's existing index was failed/never analyzed. A refresh was requested
 and cancelled before completion once direct investigation finished; no
 index-derived structural claim is used in this report. All code findings use
 direct source evidence.

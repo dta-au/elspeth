@@ -2,7 +2,7 @@
 
 Date: 2026-09-07. Source baseline: `6623010fda6bdf395d2f5d659d0aa5feb5d382cd`, `release/0.8.0`.
 
-Closeout HEAD: `a1451bf6363a0c748419f8ce2c9cd11ad0cbb168`. The intervening change only updates the Filigree skill; investigated product files are unchanged.
+Closeout HEAD: `a1451bf6363a0c748419f8ce2c9cd11ad0cbb168`. The intervening change only updates the legacy issue tracker skill; investigated product files are unchanged.
 
 The follow-up [preliminary file ownership list](05-file-ownership.md) assigns exact tracked paths and identifies responsibilities to deconflict.
 

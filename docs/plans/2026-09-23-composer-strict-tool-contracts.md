@@ -15,9 +15,16 @@
     S1;
   - the `p5_budget_exhaustion` advisor-gate test already fails at the S0 merge `85ebf2739`, so it predates S1.
 
-  Still owed for S1: the CHANGELOG line and dev deployment acceptance. **R1 and R2 were ruled on 2026-09-24 (§1,
-  §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional.** The branch-order defects the R1/R2 panel found are handled
-  in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`.
+  Still owed for S1: the CHANGELOG line and dev deployment acceptance. **S1 has a known live regression** (found
+  2026-09-25): the 10 zero-property tools it sends `strict:true` fail on every call on the deployed route (see "S1 live
+  regression: zero-property tools" at the end of §4 S1). Mitigation until the fix lands:
+  `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`.
+
+  **R1 and R2 were ruled on 2026-09-24 (§1, §6.3). R1 was ruled no that day and reversed on 2026-09-25: R1 is now yes,
+  deferred.** S2 and S3 are reinstated as planned work, in small steps, per
+  `docs/plans/2026-09-25-composer-strict-contracts-s2-plan.md`. They start when John judges the codebase stable enough,
+  and not before the S1 zero-property fix has landed. S4 and S5 stay optional. The branch-order defects the R1/R2
+  panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`.
 - **Code base the citations use:** `path:line` citations were measured at `6d8f7f729`. The branch
   `design/strict-tool-contracts` was then fast-forwarded to `release/0.8.1` at `c6e12fc44`. **Python `src` changes**
   in `6d8f7f729..c6e12fc44` are limited to `control_messages.py`, `sessions/models.py` and `sessions/schema.py`, so
@@ -38,12 +45,14 @@
 
 ## 1. Decision summary
 
-**Rulings of 2026-09-24 (John: "lets lock it in").**
+**Rulings of 2026-09-24 (John: "lets lock it in").** R1 was reversed on 2026-09-25 (§6.3).
 
-- **R1 no.** The 10 option-bearing tools and the pipeline-planner terminal stay `strict:false` permanently, with S as
-  their contract. S2 and S3 are withdrawn; S4 and S5 stay optional. R1 reopens only per tool, on the trigger in
-  §6.3.
-- **R2 yes**, under the five conditions in §6.3. It has no immediate use and is recorded for future per-tool use.
+- **R1 yes, deferred** (John, 2026-09-25; it supersedes the 2026-09-24 no, which had kept the 10 option-bearing tools
+  and the pipeline-planner terminal `strict:false` permanently and withdrawn S2 and S3). S2 and S3 are reinstated as
+  planned work, done in small steps (`docs/plans/2026-09-25-composer-strict-contracts-s2-plan.md`). The start
+  condition is codebase stability, which is John's call, not a data trigger. Until the steps land, the 11 stay
+  `strict:false` with S as their contract. S4 and S5 stay optional.
+- **R2 yes**, under the five conditions in §6.3. Its first use is F4 (`upsert_node`) in the S2 plan.
 - **The goal, as adopted:** "a strict contract for every tool call" means that every call is admitted only by the
   closed server contract S and classified against the wire form it was sent in; grammar-enforced strict is used
   where it measurably pays.
@@ -75,9 +84,10 @@ There are two layers, and only one of them decides admission.
 
 - every call is admitted only by a closed S;
 - every call is classified against the W it was sent under;
-- grammar-enforced `strict: true` is sent where it measurably pays: the 32 mechanical tools, from S1. The 10
-  option-bearing tools and the pipeline-planner terminal stay `strict: false` permanently (R1, §6.3). For them the
-  strict contract is S, which the server enforces on every route.
+- grammar-enforced `strict: true` is sent where it measurably pays: the 32 mechanical tools, from S1 (22 once the
+  zero-property fix lands; see "S1 live regression" in §4 S1). The 10 option-bearing tools and the pipeline-planner
+  terminal stay `strict: false` until the S2 and S3 steps flip them one at a time (R1 yes, deferred, §6.3). Until a
+  tool is flipped, its strict contract is S, which the server enforces on every route.
 
 ### 1.2 Options strategy
 
@@ -87,11 +97,13 @@ The 10 option-bearing tools are `set_source`, `patch_source_options`, `set_sourc
 mode both require `additionalProperties:false` on every object, so these 10 tools **cannot be strict in any
 dialect as they are shaped today**. The pipeline-planner terminal `emit_pipeline_proposal` has the same problem.
 
-- All 11 are sent with an explicit `strict: false` on routes that recognise the key, **permanently** (R1 ruled no
-  on 2026-09-24, §6.3). Their contract is S, which is closed and enforced on the server.
-- **Why there is no carrier.** The candidate carrier was `options_json`/`patch_json` JSON text plus pair-encoded
-  structure maps (S2, now withdrawn). It was refused on the historical data rather than on a new window, for three
-  reasons:
+- All 11 are sent with an explicit `strict: false` on routes that recognise the key until their S2 or S3 step
+  flips them. Their contract is S, which is closed and enforced on the server. (R1 was ruled no on 2026-09-24, which
+  made this permanent; John reversed it on 2026-09-25 to yes, deferred, §6.3.)
+- **Why the carrier was refused on 2026-09-24.** The carrier is `options_json`/`patch_json` JSON text plus
+  pair-encoded structure maps (S2). It was refused on the historical data rather than on a new window, for three
+  reasons. They stay recorded as context, and since the 2026-09-25 reversal they are measurement input for each S2
+  flip (what the flip can and cannot be expected to change), not a gate:
   - The unredacted rejection store (`composition_rejection_events`, §2.3) holds 30 unique option-tool failures:
     10 shape, 18 content and 2 ambiguous. That is a shape share of 0.33, Wilson 95% [0.19, 0.51]. Content errors are
     the majority, and no grammar reaches them.
@@ -100,8 +112,9 @@ dialect as they are shaped today**. The pipeline-planner terminal `emit_pipeline
   - Options-as-string has already swung twice on this seam. `a5d9e5414` (2026-05-29) tolerated it with a boundary
     coercion, after 24 of 84 calls on the then-deployed `gpt-5.4-mini` stringified options. `e50604428`
     (2026-09-12) rejected it at admission. A carrier would be a third swing.
-- **Reopen trigger.** R1 reopens per tool only, on the trigger in §6.3. Its inputs are defined in §5.4, and none of
-  them is measurable yet.
+- **Per-flip measurement, not a reopen trigger.** The 2026-09-24 per-tool reopen trigger (§6.3) is no longer a
+  precondition. Its inputs (§5.4) become a measurement read at each flip: a flip that shows no benefit or a
+  regression is reverted per the S2 plan. None of those inputs is measurable yet; S2 Tier M builds them.
 
 ### 1.3 Why this shape
 
@@ -412,7 +425,8 @@ Anthropic-shaped dialect is S5.
    pass null)"), `get_pipeline_state.component` ("omit component"), `request_interpretation_review.llm_draft` ("OMIT
    this when…"). S2 positions with the same problem include `upsert_node` `trigger`/`on_success`/`on_error`/
    `output_mode`/`policy`/`merge`/`expected_output_count` (and its tool description) and `set_pipeline`
-   `nodes[].on_success`/`on_error`/`expected_output_count` (regex hits; S2 is withdrawn (§6.3)). The
+   `nodes[].on_success`/`on_error`/`expected_output_count` (regex hits; they are handled in the S2 plan's F4 and F5
+   flips). The
    projection rewrites "omit X" into "pass null for X"
    (or appends that sentence where a rewrite is ambiguous), pinned per dialect; `none` keeps today's text.
 4. **Keyword allowlist, fail-closed.** Kept: `type, properties, required, additionalProperties(false), items, enum,
@@ -686,8 +700,8 @@ implementing; where this differs from the bullets above, this paragraph is the c
   `ToolArgumentError` (`tool_batch._pre_dispatch_argument_error`) and record its class and category; the text sent
   to the planner is unchanged. The advisor prompt-budget cap does the same. The advisor validator now returns an
   owned `AdvisorArgumentRejection` (error, class, category) instead of a `dict[str, Any]`.
-- **`wire_decode` is not defined in S0.** It has no producer: S2 is withdrawn (§6.3). Leaving the member out keeps S0
-  free of a category nothing emits.
+- **`wire_decode` is not defined in S0.** It has no producer until S2's first flip, F1 in the S2 plan, which adds the
+  member. Leaving it out keeps S0 free of a category nothing emits.
 - **`ToolArgumentError.category`.** Keyword-only. When omitted it is derived: `semantic_rule` with no code, or the
   1:1 category of `DISCOVERY_ONLY` / `DUPLICATE_RESOLVED_INTERPRETATION` / the two rate caps. `SCHEMA_VALIDATION`
   must name `schema_shape` or `schema_bound`. A category that disagrees with its code raises. The 14 pydantic-wrap
@@ -1118,12 +1132,36 @@ bullets above, this paragraph is the current state. The task-level plan is
   `parallel_tool_calls`, no gateway change, no DDL and no epoch bump; the only new provider call is the boot-time
   `hatch_terminal` probe request.
 
-### S2 — Options carrier and structure maps (WITHDRAWN 2026-09-24: R1 ruled no)
+**S1 live regression: zero-property tools (found 2026-09-25, open).** A live composer run (session
+`ed3c015b-a2f7-4322-9f39-1716541c5796`) showed that the 10 tools with no properties which S1 sends `strict:true`
+fail on every call on the deployed route (`openrouter/deepseek/deepseek-v4.1-flash`, served by Together): `list_blobs`,
+`list_composer_blobs`, `list_sources`, `get_expression_grammar`, `get_audit_info`, `preview_pipeline`,
+`diff_pipeline`, `list_transforms`, `list_sinks` and `list_secret_refs`.
+- `preview_pipeline` was 0 of 9 OK after S1, against 36 of 36 before it; `list_blobs` 0 of 1, against 19 of 19.
+- Every rejected call carries exactly one stray key (`field_count` 1).
+- The planner looped 10 times in one turn, because the rejection text was the bare "got invalid_schema": S1's
+  repair signal (T9) was absent from these rejections.
+- S1's offline gates could not see it. The wire fidelity matrix is a loopback recorder, and the boot probe that
+  sends the stamped list runs with a 16-token budget and makes no tool call, so it proves acceptance of the list, not
+  that a call against it succeeds.
 
-**Withdrawn.** John ruled R1 no on 2026-09-24 (§6.3), so nothing in this section is to be implemented. It stays as
-the design of record in case R1 reopens. A reopen happens per tool only, on the trigger in §6.3, and would re-derive
-this content for that one tool rather than take the section whole. R2 was ruled yes, but its only carrier was this
-slice, so it has no use until a reopen. The content as originally planned:
+The fix is tracked in `docs/plans/2026-09-25-composer-live-run-defects-fix-prompt.md` (in the main checkout,
+untracked when this was written), defect 0: stamp the zero-property tools explicit `strict:false` and move the
+partition from 32/10 to 22/20, with every pinned count. The counts elsewhere in this section are the measured S1
+figures and are not rewritten. Mitigation until the fix lands: `ELSPETH_WEB__COMPOSER_STRICT_TOOLS=off`, which
+restores the pre-S1 tool bytes. The lesson is carried into the S2 plan as a principle: every wire flip needs a live
+tool-calling canary on the deployed route for each schema shape it changes, and S2 does not start until this fix has
+landed and a live window shows the 22 remaining strict tools healthy.
+
+### S2 — Options carrier and structure maps (reinstated 2026-09-25: R1 yes, deferred)
+
+**Reinstated, in small steps.** John ruled R1 no on 2026-09-24 and withdrew this section; on 2026-09-25 he reversed
+that to yes, deferred (§6.3). The rollout is no longer one slice: `docs/plans/2026-09-25-composer-strict-contracts-s2-plan.md`
+replaces it with small steps (Tier M measurement, Tier A wire-neutral cleanups, Tier P preparation, then one tool per
+flip in Tier F). That plan is the current rollout. This section stays the design of record for what each flip
+contains, and the S2 plan's §7.4 lists where it corrects this text. The start condition is codebase stability (John's
+call) plus the S1 zero-property fix and a healthy live window (S1 above). R2's first use is the S2 plan's F4. The
+content as originally planned:
 
 - The 13 option/patch positions become `options_json`/`patch_json` strings, nullable where the flat field is
   optional.
@@ -1182,11 +1220,12 @@ Gates: as S1, plus the deliberate pin moves in the blast-radius list above, and 
 --check` if any teaching surface changes. Run the full-suite gate before merge: this changes the teaching and
 planner-facing surface.
 
-### S3 — Pipeline-planner terminal (WITHDRAWN 2026-09-24: R1 ruled no)
+### S3 — Pipeline-planner terminal (reinstated 2026-09-25: R1 yes, deferred)
 
-**Withdrawn with S2.** The terminal carries the same open option objects, so it stays `strict:false` permanently
-(§1.2, §6.3). The `capability_skill.py` manifest-hash change below is therefore not needed. The content as
-originally planned:
+**Reinstated with S2.** It was withdrawn with S2 on 2026-09-24 and reinstated with it on 2026-09-25 (§6.3). The
+terminal carries the same open option objects, so it can go strict only after S2's `set_pipeline` flip (F5 in the S2
+plan) and reuses F5's rules; the S2 plan's §6 says what S3 needs after F5. Until then the terminal stays
+`strict:false`. The start condition and the live-canary rule are the same as S2's. The content as originally planned:
 
 `emit_pipeline_proposal` is projected by the same compiler: the set_pipeline W plus `claimed_deferred_intent_ids`,
 promoted and nullable, with `uniqueItems` moved to the ledger.
@@ -1225,7 +1264,8 @@ Gates: as S2.
 Acceptance: compare the planner `rejection_codes` distribution and the first-turn success rate on an empty state
 with the S1 window.
 
-R1 was refused on 2026-09-24, so the terminal stays `strict:false` permanently (§6.3).
+R1 was refused on 2026-09-24 and reversed to yes, deferred, on 2026-09-25 (§6.3). The terminal stays `strict:false`
+until S3 lands after F5.
 
 ### S4 — Enforcement proof on the deployed route (optional; blocked on a measurement and on R5)
 
@@ -1292,7 +1332,7 @@ It is value-free, and it is persisted on every ARG_ERROR alongside `field_count`
 | `wire_json_bounds` | wire | `JsonBoundaryError` |
 | `wire_not_object` | wire | `tool_batch.py:929` (was `"TypeError"`) |
 | `wire_envelope` | wire | `tool_batch.py:967/987/994` in S0 (was `"TypeError"`); from S1, decode's `ENVELOPE_UNWRAP` node |
-| `wire_decode` | wire | no producer: it belonged to S2, which is withdrawn, and it is not a member of the enum. It would return only with a per-tool R1 reopen (duplicate pair key, or carrier text that is not JSON or not an object) |
+| `wire_decode` | wire | no producer yet, and not a member of the enum. S2's first flip (F1 in the S2 plan) adds it: a duplicate pair key, carrier text that is not JSON or not an object, or the S-form key at a carrier position |
 | `canonicalization` | semantic | compose loop: `IntegerDomainError`, an integer outside the I-JSON range (non-finite numbers never get past the decoder); MCP sidecar: `canonical_json`'s `ValueError` on a non-finite float, which the MCP SDK's decoder admits |
 | `missing_required_path` | semantic | required-paths walker (was `MissingRequiredPaths`) |
 | `schema_shape` | semantic | S Draft 2020-12 failure whose `validator` keyword **is** in `WIRE_KEYWORD_ALLOWLIST`, so a grammar should have prevented it |
@@ -1321,20 +1361,22 @@ per-`provider_served` split in the table below needs that join first.
 
 | When | What to read | Decision it feeds |
 |---|---|---|
-| After S0 | Per option tool, the §5.4 split: wrong-type options/patch + other-field shape (`wire_*`, `missing_required_path`, `schema_shape`, `model_validation`), which a grammar or carrier could affect, versus inside-options content (`plugin_options_invalid`) + other rules (`schema_bound`, `semantic_rule`, other codes, uncoded), which it could not | R1 reopen trigger (§6.3); R1 itself was ruled on the historical store (§2.3) |
-| After S1 | On the 32: the `wire_conformant=False` rate per `provider_served` (a high rate on endpoints that advertise structured outputs means strict is being ignored); change in `schema_shape`; first-call latency | S4 worth building; R5 |
-| After S2 | Withdrawn with S2 (§6.3) | — |
+| After S0 | Per option tool, the §5.4 split: wrong-type options/patch + other-field shape (`wire_*`, `missing_required_path`, `schema_shape`, `model_validation`), which a grammar or carrier could affect, versus inside-options content (`plugin_options_invalid`) + other rules (`schema_bound`, `semantic_rule`, other codes, uncoded), which it could not | The per-flip acceptance read for S2 (S2 plan §5.3). It was the R1 reopen trigger until the 2026-09-25 reversal (§6.3); R1 was first ruled on the historical store (§2.3) |
+| After S1 | On the 32 (22 after the zero-property fix): the `wire_conformant=False` rate per `provider_served` (a high rate on endpoints that advertise structured outputs means strict is being ignored); change in `schema_shape`; first-call latency | S4 worth building; R5 |
+| After each S2 flip | Per flipped tool, the S2 plan §5.3 reads: the live canary per schema shape, the tool's non-ok rate against its paired control, the legacy-form rejection rate, the §5.4 split, split by `provider_served` | keep the flip, or revert it (S2 plan §5.3) |
 
-Sample size. R1 did not need a new window: content errors are already a majority of the 30 unique historical
-option-tool failures (§2.3). The reopen trigger is counted in **failures per tool**, not calls: at least about 50.
-52 failures separate a true shape share of 0.33 from 0.5 at one-sided α=.05 and power .8 (R1/R2 panel, `power.py`).
-At the measured organic rate, about 4.9 option calls a day on the dev deployment over 2026-09-07..21, that is months
-per tool. `set_source` and `set_source_from_blobs` have never been called. The earlier "at least 200 calls per option
-tool" is withdrawn as unreachable.
+Sample size. The 2026-09-24 R1 ruling did not need a new window: content errors are already a majority of the 30
+unique historical option-tool failures (§2.3). That ruling's reopen trigger was counted in **failures per tool**, not
+calls: at least about 50. 52 failures separate a true shape share of 0.33 from 0.5 at one-sided α=.05 and power .8
+(R1/R2 panel, `power.py`). At the measured organic rate, about 4.9 option calls a day on the dev deployment over
+2026-09-07..21, that is months per tool. `set_source` and `set_source_from_blobs` have never been called. The earlier
+"at least 200 calls per option tool" is withdrawn as unreachable. Since the 2026-09-25 reversal the figure is no
+longer a precondition. It states how much traffic a per-tool reading of the benefit direction needs; each flip is
+gated on not regressing, as the S2 plan's §5.2 sets out.
 
-### 5.4 Option-tool split (inputs to the R1 reopen trigger)
+### 5.4 Option-tool split (per-flip measurement input; formerly the R1 reopen trigger's inputs)
 
-Each non-ok call to an option tool falls in exactly one class. Only the first two count as "shape" for the trigger.
+Each non-ok call to an option tool falls in exactly one class. Only the first two count as "shape".
 
 | Class | Rule | Read from |
 |---|---|---|
@@ -1349,15 +1391,16 @@ Each non-ok call to an option tool falls in exactly one class. Only the first tw
   does not write the `arg_error_payload` the planner saw (`tool_batch.py:2555-2569`).
 
 Until one of the two persists the closed `(loc, code)` pairs, the wrong-type options/patch class, the
-options-versus-other-fields split and the reopen trigger cannot be read. Persisting the pairs is redaction-safe: they
-are value-free by construction (S1 C10: a model-authored key becomes `field`/`item`, and the codes are a closed enum).
-Separating options sent as a string from other wrong types also needs the sent JSON type, which is value-free too.
-This is owed before any reopen read, and it is not scheduled in this plan.
+options-versus-other-fields split and the per-flip measurement cannot be read. Persisting the pairs is
+redaction-safe: they are value-free by construction (S1 C10: a model-authored key becomes `field`/`item`, and the
+codes are a closed enum). Separating options sent as a string from other wrong types also needs the sent JSON type,
+which is value-free too. This is owed before the first flip's read, and it is scheduled in the S2 plan as M1b
+(Tier M).
 
 Two further limits:
 - `validation_errors` is capped at eight entries plus one `truncated` entry, so a signature past the cap is lost.
-- The trigger's other two inputs have no instrument yet: planner-turn cost, and the enforcement fraction, which needs
-  the `provider_served` join that Appendix A does not make.
+- The measurement's other two inputs have no instrument yet: planner-turn cost (S2 plan M5), and the enforcement
+  fraction, which needs the `provider_served` join that Appendix A does not make (S2 plan M2).
 
 ---
 
@@ -1366,11 +1409,14 @@ Two further limits:
 ### 6.1 Risks
 
 1. **S1 may change nothing measurable.** The 32 tools rarely fail, and 2 of the 4 archived errors were on
-   set_pipeline, which stays non-strict (R1 ruled no, §6.3). Mitigation: S0 comes first, and §5.3 says what to read.
+   set_pipeline, which stays non-strict until S2's F5 (R1 yes, deferred, §6.3). Mitigation: S0 comes first, and §5.3
+   says what to read.
 2. **Silent non-enforcement on the deployed route.** 10 of the 24 deepseek endpoints do not advertise structured
    outputs, including the first-party one, and `require_parameters` does not select on tool-level strict. The boot
    probe detects rejection, not ignoring. `wire_conformant` split by `provider_served` is the detector. Claiming
-   enforcement needs S4.
+   enforcement needs S4. The boot probe also makes no tool call, so it cannot see an endpoint that accepts a strict
+   list and then fails every call against it: that is how the S1 zero-property regression reached production (§4
+   S1). Every later wire flip needs a live tool-calling canary on the deployed route (S2 plan §2).
 3. **The Responses bridge with an explicit `false`.** Today's omitted key arrives as `strict:null` and may be
    normalised by OpenAI. S1 sends `true` on the 32 and `false` on the 10.
    - Open objects cannot be put into strict form, so the 10 should not have been strict-normalised before. By
@@ -1406,25 +1452,44 @@ Two further limits:
   any non-OpenRouter api_base, with an `openai/` or a bare model name, resolves to `NONE` (today's bytes) unless the
   operator sets `forward_to_endpoint`, and then the boot probe decides.
 - **Escape hatch:** the pipeline planner's hatch route (advisor model + advisor endpoint) is resolved on its own
-  (S1). Its terminal stays `strict:false` permanently (R1, §6.3).
+  (S1). Its terminal stays `strict:false` until S3; S3 sends a strict terminal only to a hatch route that a boot
+  probe and a live canary have exercised with it (R1 yes, deferred, §6.3).
 
 ### 6.3 Open decisions for John
 
-1. **R1 — options carrier. RULED NO (John, 2026-09-24, "lets lock it in").** The 10 option-bearing tools and the
-   pipeline-planner terminal stay `strict:false` permanently, with S as their contract. S2 and S3 are withdrawn; S4
-   and S5 stay optional. The "not strings containing JSON" guidance stands.
-   - Evidence:
+1. **R1 — options carrier. RULED YES, DEFERRED (John, 2026-09-25; supersedes the 2026-09-24 no).** John's words:
+   "lets prepare this package on the assumption that the answer is yet (because it has to be) because the answer is
+   going to be no until its yes (i.e. we do want this, but the codebase is very volatile right now because we just
+   landed a dozen massive fixes across different subsystems)", and "include it in small steps, we'll clean up those
+   surfaces one at a time".
+   - **What it means.** S2 and S3 are reinstated as planned work. They are executed in small steps, the tiers of
+     `docs/plans/2026-09-25-composer-strict-contracts-s2-plan.md`: Tier M measurement, Tier A wire-neutral cleanups,
+     Tier P preparation, then one tool per flip in Tier F, with S3 after F5. S4 and S5 stay optional. Until a tool's
+     flip lands, it stays `strict:false` with S as its contract. The "not strings containing JSON" guidance stands (the
+     S2 plan's R-D says what it means for a flipped tool).
+   - **Start condition.** Codebase stability, which is John's call, not a data-driven trigger. S2 also does not start
+     until the S1 zero-property fix (§4 S1, "S1 live regression") has landed and a live window shows the 22 remaining
+     strict tools healthy.
+   - **Per flip, not per reopen.** The flips proceed in the S2 plan's order without a per-tool reopen ruling. Each flip
+     needs a live tool-calling canary on the deployed route for every schema shape it changes, measured per
+     `provider_served` endpoint before and after the flip, and the S2 plan's open Tier R rulings (its §7.2) before the
+     flips they gate. A flip that shows no benefit or a regression is reverted, per the S2 plan (§5.3 there).
+   - **The ruling of 2026-09-24, kept as history.** R1 was ruled no on 2026-09-24 (John, "lets lock it in"): the 10
+     option-bearing tools and the pipeline-planner terminal were to stay `strict:false` permanently, with S as their
+     contract, and S2 and S3 were withdrawn. The evidence it rested on stays recorded. Since the reversal it is
+     context and per-flip acceptance and measurement input, not a gate:
      - the unredacted store (§2.3) holds 30 unique option-tool failures: 10 shape, 18 content and 2 ambiguous
-       (shape share 0.33, Wilson 95% [0.19, 0.51]);
+       (shape share 0.33, Wilson 95% [0.19, 0.51]), so a flip should not be expected to reach the content errors;
      - `strict` on an `options_json` string constrains nothing inside it;
-     - options-as-string has already swung twice on this seam (`a5d9e5414`, `e50604428`).
-   - **Reopen trigger (per tool).** R1 reopens for one specific tool only when both of these hold:
-     - its shape errors, weighted by planner-turn cost, exceed 50% of its failures over at least about 50 failures;
-     - enough of that tool's traffic reaches endpoints that enforce strict.
-
-     "Shape" means the first two classes of §5.4. None of the trigger's inputs is measurable yet (§5.4).
-   - Release notes: "a strict contract for every tool call" is met for these 11 by the server contract S, not by
-     grammar.
+     - options-as-string has already swung twice on this seam (`a5d9e5414`, `e50604428`), so each flip's rounds read
+       the stringification signature.
+   - **The former reopen trigger, now a per-flip measurement.** The 2026-09-24 ruling allowed a reopen for one tool
+     only when its shape errors, weighted by planner-turn cost, exceeded 50% of its failures over at least about 50
+     failures, and enough of that tool's traffic reached endpoints that enforce strict. "Shape" means the first two
+     classes of §5.4. This is no longer a precondition. The same quantities are read at each flip (§5.3), and none of
+     them is measurable until S2 Tier M lands (§5.4).
+   - Release notes: until a tool is flipped, "a strict contract for every tool call" is met for it by the server
+     contract S, not by grammar.
 2. **R2 — map transcoding. RULED YES (John, 2026-09-24).** Pair-array ↔ map transcoding at the web wire boundary
    is representation, not server authoring, under five conditions:
    1. the round trip is lossless;
@@ -1436,7 +1501,8 @@ Two further limits:
    5. `branches` (`list[str] | dict[str,str]`) is decoded by element type (string or pair object), and an empty
       `[]` is rejected.
 
-   R2 has no immediate use, because its only carrier was S2. It is recorded for future per-tool use.
+   Its first use is F4 (`upsert_node`) in the S2 plan (§3.6 there turns the five conditions into tests). While R1
+   was no (2026-09-24 to 2026-09-25) it had no use.
 3. **R3 — `error_class` and the epoch.**
    - Option (a): keep `error_class` as the honest exception class and add `error_category`. The keys are additive
      JSON, so no DDL is needed, provided S0 confirms no reader rejects unknown keys.

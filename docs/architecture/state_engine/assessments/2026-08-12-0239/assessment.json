@@ -49,14 +49,14 @@
     "sensitive_environment_captured": false
   },
   "structure_snapshot": {
-    "provider": "Loomweave linked-worktree run 1aa9de74-7763-44a5-98e6-07cc88ff0d66 and Warpline 1.3.0 snapshot 1",
+    "provider": "retired code index linked-worktree run 1aa9de74-7763-44a5-98e6-07cc88ff0d66 and Warpline 1.3.0 snapshot 1",
     "captured_at": "2026-08-12T03:22:20+10:00",
-    "limitation": "Loomweave persisted a completed 71,628-entity/152,366-edge structural run at the exact commit with seven resolution warnings, but its CLI was timeboxed after 45 minutes during post-analysis embeddings and no project_status_get response was retained. Warpline could not consume the linked-worktree index: the full capture is SKIPPED/no_index, changed returns an empty local set, and reverify is NO_SNAPSHOT with graph_fresh=false. These are unavailable/partial states, not clean or unreachability evidence."
+    "limitation": "retired code index persisted a completed 71,628-entity/152,366-edge structural run at the exact commit with seven resolution warnings, but its CLI was timeboxed after 45 minutes during post-analysis embeddings and no project_status_get response was retained. Warpline could not consume the linked-worktree index: the full capture is SKIPPED/no_index, changed returns an empty local set, and reverify is NO_SNAPSHOT with graph_fresh=false. These are unavailable/partial states, not clean or unreachability evidence."
   },
   "tracker_snapshot": {
-    "provider": "Filigree 3.1.0 exact JSON captures",
+    "provider": "legacy issue tracker 3.1.0 exact JSON captures",
     "captured_at": "2026-08-12T03:14:26+10:00",
-    "limitation": "Three complete has_more=false snapshots are retained: 18 state-engine search results, 832 ready issues, and 43 blocked issues. Exact show records for the milestone, phases, steps, six linked dependencies, and Python 3.14 blocker were captured separately at 2026-08-12T03:33:21+10:00. Filigree is live mutable state and the commands were sequential, not one atomic transaction. The phase-0 catalog step is completed; the assessment step remains ready until this package commit exists."
+    "limitation": "Three complete has_more=false snapshots are retained: 18 state-engine search results, 832 ready issues, and 43 blocked issues. Exact show records for the milestone, phases, steps, six linked dependencies, and Python 3.14 blocker were captured separately at 2026-08-12T03:33:21+10:00. legacy issue tracker is live mutable state and the commands were sequential, not one atomic transaction. The phase-0 catalog step is completed; the assessment step remains ready until this package commit exists."
   },
   "evidence": [],
   "legs": [
@@ -1576,7 +1576,7 @@
     "The four current PostgreSQL 16 checks cover selected lease and coordination behavior, not every PB-11 case or dimension.",
     "Plain frozen environment synchronization selected Python 3.14.3 and exposed nine Runtime-VAL member_descriptor failures; the reproducible green assessment baseline uses Python 3.13.1 and the 3.14 defect remains tracked as elspeth-61350c4744.",
     "No provider credentials were available or captured; real-provider plugin acceptance remains unknown rather than mocked.",
-    "Filigree query responses are complete but sequential and therefore are not one atomic cross-query snapshot.",
+    "legacy issue tracker query responses are complete but sequential and therefore are not one atomic cross-query snapshot.",
     "Structural and temporal tools are advisory; no downstream unreachability claim is made from exclusions, warnings, or missing enrichment.",
     "The full CI-equivalent pytest suite is deferred to the final pre-merge gate under the explicit wall-time constraint."
   ],

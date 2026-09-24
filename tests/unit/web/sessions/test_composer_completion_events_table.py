@@ -9,7 +9,7 @@ The table is append-only from day 1: both BEFORE UPDATE and BEFORE DELETE
 triggers unconditionally ABORT. Unlike ``interpretation_events_table`` —
 which permits DELETE on PENDING rows for orphan recovery — completion
 events have no recovery path; both triggers are unconditional ABORT,
-correcting the Phase 18 omission tracked at filigree elspeth-9aba8da942.
+correcting the Phase 18 omission tracked at archived issue elspeth-9aba8da942.
 
 Tests use ``create_session_engine`` + ``initialize_session_schema`` so the
 full production bootstrap (PRAGMAs, trigger DDL, schema validator) is

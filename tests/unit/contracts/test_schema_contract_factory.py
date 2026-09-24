@@ -16,7 +16,7 @@ class TestExpectedRuntimeOutputContract:
     Both the producer alignment (BaseTransform._align_output_contract) and the
     engine verifier (verify_schema_config_mode) must derive expected mode/lock
     from this helper — never re-encode the mapping locally
-    (filigree elspeth-986cfb43e5).
+    (archived issue elspeth-986cfb43e5).
     """
 
     @pytest.mark.parametrize(

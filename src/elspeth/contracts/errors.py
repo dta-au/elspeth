@@ -1041,7 +1041,7 @@ class PipelineLoweringError(ValueError):
 # specifically and skips both the result emission and the failure write.
 # Distinct from ``AuditIntegrityError`` because it represents legitimate
 # coordination under multi-worker N>1 (alive-but-slow worker reaped by peer),
-# not framework corruption. See filigree elspeth-ddde8144b6.
+# not framework corruption. See archived issue elspeth-ddde8144b6.
 # TIER-2: Legitimate multi-worker coordination — a peer reaped/reassigned the lease; the drain loop manages it cleanly, not audit corruption.
 class SchedulerLeaseLostError(Exception):
     """Raised when a heartbeat or transition discovers the lease was reaped.

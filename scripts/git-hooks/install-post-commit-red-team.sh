@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Install the red-team post-commit trigger as a managed block in
-# .git/hooks/post-commit, following the same managed-block convention as the
-# Loomweave hook. Idempotent: re-running replaces the existing block.
+# .git/hooks/post-commit. Idempotent: re-running replaces the existing block.
 
 set -euo pipefail
 
