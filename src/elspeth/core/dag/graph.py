@@ -44,6 +44,7 @@ from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
     BranchInfo,
+    EdgeContractError,
     GraphValidationError,
     GraphValidationWarning,
     NodeConfig,
@@ -1509,7 +1510,31 @@ class ExecutionGraph:
         (PHASE 2 cross-plugin validation: edges, coalesce branches, sink
         required fields).
         """
-        schema_validation.validate_edge_compatibility(self)
+        try:
+            schema_validation.validate_edge_compatibility(self)
+        except EdgeContractError as exc:
+            exc.from_config_name = self._config_name_for_node_id(exc.from_node_id)
+            exc.to_config_name = self._config_name_for_node_id(exc.to_node_id)
+            raise
+
+    def _config_name_for_node_id(self, node_id: str) -> str | None:
+        """Recover an authored identity without parsing a compiled node ID."""
+        info = self.get_node_info(node_id)
+        if info.node_type == NodeType.SOURCE:
+            return cast(str, info.config["source_name"]) if "source_name" in info.config else None
+        for mapping in (
+            self._transform_name_id_map,
+            self._config_gate_id_map,
+            self._aggregation_id_map,
+            self._coalesce_id_map,
+            self._row_union_id_map,
+            self._collector_id_map,
+            self._sink_id_map,
+        ):
+            for name, compiled_id in mapping.items():
+                if compiled_id == node_id:
+                    return str(name)
+        return None
 
     def warn_divert_coalesce_interactions(
         self,
