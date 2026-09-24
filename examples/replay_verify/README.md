@@ -135,8 +135,15 @@ Verify makes the three requests again. Each call gets one verdict row in the
 
 ### Where the verdicts land
 
-No `elspeth explain` view or MCP tool shows verdicts yet. Query the table
-directly, or use the read-only `query` tool of the `elspeth-mcp` server:
+`elspeth explain --run <verify-run> --token <token-id> --json --database
+examples/replay_verify/runs/audit.db` includes that token's
+`verification_decisions`; `--no-tui` prints MATCH, MISMATCH or UNAVAILABLE.
+The interactive TUI shows all run verdicts when its Run summary is selected.
+The read-only Landscape MCP `list_verification_decisions` tool returns all
+verdicts for a run, including operation-scoped calls. Audit exports include
+`call_verification` records under serialization version `audit-export-v3`.
+`run.sh` asserts the explain and export results as well as the stored rows.
+For direct inspection, use SQL or the read-only `query` tool:
 
 ```sql
 -- The replay/verify runs and the run they came from
@@ -197,11 +204,14 @@ Everything else must match exactly. That list is a fixed set of named fields, so
 
 These describe how the code behaves today.
 
-1. **`elspeth validate` does not check `replay_from`.** It checks only the shape of the settings and exits 0 for a `replay_from` that names no run. The refusal comes at `elspeth run` (refusal a above).
-2. **The verdicts are reachable only by SQL.** Neither `elspeth explain`, the TUI nor the Landscape MCP tools read `call_verifications`, and the audit export does not include it. `run.sh` queries the table directly.
-3. **Replay and verify runs record a `sink_write` operation** even though they never write the configured sinks (the sink payload is compared, not written). `output/pages.jsonl` is unchanged by them, which `run.sh` checks by hash.
-4. **Verify's list of ignored fields is fixed** (see the section above). Against a real web origin or LLM provider that varies other response fields, verify reports mismatches even when the content is the same.
-5. An all-digit run ID must be quoted in YAML (`replay_from: "12345"`); unquoted it is read as a number and refused with `Replay/verify requires a literal replay_from run ID`.
+1. **Verify's list of ignored fields is fixed** (see [Run Modes](../../docs/reference/configuration.md#run-modes)). Other varying response fields still report mismatches, even when the content is the same. Call-comparison mismatch diagnostics state the exact policy.
+2. An all-digit run ID must be quoted in YAML (`replay_from: "12345"`); unquoted it is read as a number and refused with `Replay/verify requires a literal replay_from run ID`.
+Both `validate` and `run` now refuse a missing source run, including an absent
+Landscape database, before resolving secrets or constructing plugins.
+Replay and verify retain `sink_write` operations as durable records of the
+virtual sink comparison. Their effect evidence says `virtual` with
+`publication_performed=false`; these records do not claim that a file was
+written. `run.sh` checks that evidence and that the live output hash is unchanged.
 
 Earlier drafts of this example listed four more limitations. They were fixed in `release/0.8.1`, and this example asserts the fixed behaviour: OpenRouter/gateway LLM replay now matches its recording; verify ignores `Date`, `id` and `created`; a live run made with the default worker count can be replayed; and a verify mismatch exits 2 with `VerificationMismatchError` instead of a FATAL exit 4.
 
