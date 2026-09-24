@@ -100,7 +100,9 @@ Replay and verify require a completed, compatible source run with retained
 payloads and call evidence. The runtime rejects missing or ambiguous evidence,
 changed graph or plugin implementations, and capabilities it cannot safely
 run in the selected mode. Both modes write a new Landscape audit run. They
-compare canonical rows at each sink boundary, including node, role, ingest
+require `replay_from` to be a string; quote an all-digit run ID in YAML so the
+YAML parser does not turn it into an integer. They compare canonical rows at
+each sink boundary, including node, role, ingest
 sequence, disposition, and payload hash; this does not compare serialized sink
 bytes or external artifacts. A mismatch makes verify fail with exit code 2
 and a `verification_mismatch` event. Replay and verify must run with

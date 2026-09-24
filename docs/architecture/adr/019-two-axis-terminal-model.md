@@ -117,6 +117,13 @@ mapping table below.
 | `CONSUMED_IN_BATCH` | `True` | `TRANSIENT` | `BATCH_CONSUMED` | (deferred — counted at flush) | N/A — flush-time outcome carries the predicate role |
 | `BUFFERED` | `False` | `NULL` | `BUFFERED` | `rows_buffered` (structural, non-terminal) | No |
 
+Collector-group failure has no row outcome or terminal path, including when
+the group has no arrived members. It is recorded as a structural group verdict
+and counted in `collector_groups_failed`, separate from `rows_failed`. The run
+failure predicate includes either counter, so a group failure with zero failed
+rows still yields `completed_with_failures`. This group-level rule sits outside
+the row mapping above and must be applied in live and resumed run accounting.
+
 **Note on `COALESCED`.**
 A consumed member of a closer's release — a coalesce branch input, and (META-32, 2026-08-25) a collector member consumed into its group's release — also carries `(SUCCESS, COALESCED)` but with `sink_name` NULL, and is deliberately uncounted (`is_counted_coalesced_output`); a collector's released output is an ordinary `(SUCCESS, DEFAULT_FLOW)` row, so a collector-only run leaves `rows_coalesced` at 0.
 
