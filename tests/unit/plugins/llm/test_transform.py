@@ -3864,6 +3864,23 @@ class TestSingleQueryStructuredOutputExecution:
         # Raw content retained for audit traceability
         assert result.row["llm_response"] == '{"score": 42, "label": "pass"}'
         assert result.row["llm_response_model"] == "gpt-4o"
+        assert {"score", "label"} <= transform.declared_output_fields
+
+        plain_transform, plain_provider = _make_transform_with_mock_provider(_make_config())
+        plain_provider.execute_query.return_value = mock_provider.execute_query.return_value
+        plain_result = plain_transform._process_row(_make_row(), _make_ctx())
+        assert plain_result.row is not None
+        assert "score" not in plain_result.row
+        assert "score" not in plain_transform.declared_output_fields
+        assert plain_result.row["llm_response"] == result.row["llm_response"]
+
+        assistance = transform.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "Prompt wording alone does not create separate JSON fields" in hints
+        assert "output_fields" in hints
+        assert "no downstream parser is needed" in hints
+        assert "unless another transform parses them" not in hints
 
     def test_missing_output_field_returns_error(self) -> None:
         transform, mock_provider = self._make_structured_transform()

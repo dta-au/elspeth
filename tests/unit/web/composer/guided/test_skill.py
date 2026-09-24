@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,56 @@ def test_step_chat_skills_are_scoped() -> None:
         text = load_step_chat_skill(step)
         assert marker in text
         assert all(other_marker not in text for other_step, other_marker in markers.items() if other_step is not step)
+
+
+@pytest.mark.parametrize("routing", ["quarantine", "discard"])
+def test_step_1_fixed_schema_guidance_matches_source_row_rejection(tmp_path: Path, routing: str) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.sources.csv_source import CSVSource
+    from tests.fixtures.factories import make_source_context
+
+    path = tmp_path / "extra-column.csv"
+    path.write_text("id,extra\na,kept\n")
+    fixed = CSVSource({"path": str(path), "schema": {"mode": "fixed", "fields": ["id: str"]}, "on_validation_failure": routing})
+    rejected = list(fixed.load(make_source_context(plugin_name="csv")))
+    if routing == "quarantine":
+        assert len(rejected) == 1
+        assert rejected[0].is_quarantined
+        assert rejected[0].quarantine_destination == "quarantine"
+        assert rejected[0].row == {"id": "a", "extra": "kept"}
+    else:
+        assert rejected == []
+
+    observed = CSVSource({"path": str(path), "schema": {"mode": "observed"}, "on_validation_failure": routing})
+    accepted = list(observed.load(make_source_context(plugin_name="csv")))
+    assert len(accepted) == 1
+    assert not accepted[0].is_quarantined
+    assert accepted[0].row == {"id": "a", "extra": "kept"}
+    with pytest.raises(PluginConfigError, match="on_validation_failure"):
+        CSVSource({"path": str(path), "schema": {"mode": "observed"}})
+
+    assistance = CSVSource.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "Set on_validation_failure deliberately" in hints
+    assert "Raw CSV config requires it" in hints
+    assert "silently drops rows" not in hints
+    assert "Default is 'discard'" not in hints
+    post_call_hints = CSVSource.get_post_call_hints(
+        tool_name="set_source", config_snapshot={"schema": {"mode": "fixed"}, "on_validation_failure": routing}
+    )
+    assert len(post_call_hints) == 1
+    assert "rejects nonconforming rows" in post_call_hints[0]
+    assert "quarantine" in post_call_hints[0] and "discard" in post_call_hints[0]
+    assert "drops every row" not in post_call_hints[0]
+    assert CSVSource.get_post_call_hints(tool_name="set_source", config_snapshot={"schema": {"mode": "observed"}}) == ()
+
+    for overlay in (load_step_chat_skill(GuidedStep.STEP_1_SOURCE), load_step_planner_skill(GuidedStep.STEP_1_SOURCE)):
+        text = " ".join(overlay.split())
+        assert "fixed` rejects rows with unexpected fields" in text
+        assert "on_validation_failure" in text
+        assert "quarantine" in text and "discard" in text
+        assert "silently *drops*" not in text
 
 
 def test_sample_row_projection_redacts_values() -> None:

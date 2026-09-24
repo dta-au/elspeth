@@ -289,7 +289,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f2e3eb37507d53e0"
+    source_file_hash: str | None = "sha256:7ad819d762287fcb"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -1150,7 +1150,7 @@ class DataverseSource(BaseSource):
                 composer_hints=(
                     "Tier-3 boundary: record what Dataverse provided. Don't infer absent fields from siblings — record None and let consumers decide.",
                     "Authentication is per-environment via DataverseAuthConfig — credentials wire through the secrets store, never inline in YAML.",
-                    "Choose query_mode 'fetchxml' for complex filters, 'odata' for simple field selection.",
+                    "Choose exactly one of entity (structured OData) or fetch_xml (FetchXML); select/filter/orderby/top require entity and cannot accompany fetch_xml.",
                     "The audit trail records the exact OData/FetchXML query, page count, and quarantine count — verify these are visible before declaring success.",
                     "If you have been asked to generate source rows yourself, do not pick `dataverse` — this source queries a live Microsoft Dataverse environment. Switch to a local-blob source (`csv`, `json`, or `text`) via `create_blob` plus `set_source_from_blob`.",
                     "Never synthesise an `environment_url`, entity name, OData filter, or FetchXML for content you authored — Dataverse is the source of truth for the queried entity and the audit row must point at a real environment, not invented identifiers.",

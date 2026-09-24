@@ -1207,7 +1207,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0e4ac5f1088d3fcf"
+    source_file_hash: str | None = "sha256:329d3e09a48c25a4"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1991,10 +1991,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Interpolate every row field your prompt needs with `{{ row.<field> }}`. A template naming no varying field sends identical input to every row and identical output; to score, classify, or summarize content, inject the content field (e.g. `{{ row.content }}`), not an identifier.",
                     "Never ask the model to judge a page or record from its URL or identifier alone — with no content interpolated it fabricates a plausible answer instead of reading anything. When the judgement needs fetched text, interpolate the fetch/scrape field into the prompt_template.",
                     "Identical answers across rows are only wrong when the inputs genuinely differ. A discriminating prompt injects the per-row data; do not pad prompts for artificial variety. The defect to avoid is one that CANNOT discriminate because it never interpolated the per-row field.",
-                    "If you create a prompt template from the user's goal, data, or prose instead of copying it verbatim, stage an llm_prompt_template review for the authored prompt text.",
+                    "The backend automatically stages and surfaces llm_prompt_template reviews; do not author or request that review. Keep the authored prompt exact for user review.",
                     "When you author LLM judgment semantics — a scoring scale, rubric, category meaning, threshold, signal weighting, cutoff, comparison set, or subjective criterion definition — stage a vague_term review on the LLM node before set_pipeline.",
                     "Measurable adjectives are not exempt: if the user gives the metric/cutoff, use it; if you choose a cutoff such as 'over 6 ft' or a ranking rule such as 'top quartile', review that authored threshold semantics.",
-                    "Prompt-template review is not enough for authored judgment semantics: put both interpretation_requirements in the LLM node options before set_pipeline — one vague_term for the rubric/definition/threshold/category semantics and one llm_prompt_template for the raw prompt.",
+                    "Prompt-template review is not enough for authored judgment semantics: put the vague_term requirement in interpretation_requirements before set_pipeline for the rubric, definition, threshold, or category semantics; the backend owns the raw-prompt review.",
                     "Use a stable user_term preserving the user's criterion phrase, not the whole task phrase; for an adjective embedded in prose, use the adjective or noun phrase that names the criterion.",
                     "llm_draft must equal the semantics you wrote; only an llm_prompt_template review is incomplete.",
                     "When repairing or upserting an LLM node, repeat the review preflight; carry forward existing pending LLM interpretation requirements and add missing vague_term or prompt shield requirements before stopping.",
@@ -2004,7 +2004,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
-                    "Single-query LLM output is written to response_field. Prompt-requested JSON keys are not separate pipeline fields unless another transform parses them; preserve response_field through cleanup instead of invented prompt-internal keys.",
+                    "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
+                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
                     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",
@@ -2012,7 +2013,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Stage a pipeline_decision review on the LLM node with user_term prompt_injection_shield_recommendation whenever no authorized shield is upstream (State B/C). Skip it only when an authorized shield is already wired upstream (State A).",
                     "Pick the state-appropriate draft: State B (an authorized shield is available in this deployment) recommends wiring it in; State C (no shield available) is the high-risk reconsider advisory. Default to the State-C draft when availability is unknown.",
                     "LLM-node reviews stack: an authored web-content scoring prompt can need llm_prompt_template, vague_term, and prompt_injection_shield_recommendation requirements on the same LLM node.",
-                    "Interpretation reviews are not transform stages. Do not create passthrough, review, recommendation, or placeholder nodes for LLM reviews; put the review objects in this LLM node's interpretation_requirements list.",
+                    "Interpretation reviews are not transform stages. Do not create passthrough, review, recommendation, or placeholder nodes for LLM reviews; put caller-owned review objects in this LLM node's interpretation_requirements list.",
                     "For prompt-injection shielding recommendations, do not add passthrough, placeholder, no-op, or renamed utility nodes to imply protection; recommendation prose is not a graph step.",
                     "This is prompt-injection defense; do not substitute azure_content_safety. Use azure_content_safety only for harmful-content moderation or safety classification.",
                     "Concurrency is pool_size (1 = sequential, no pooling). Tune dispatch pacing with min_dispatch_delay_ms / max_dispatch_delay_ms and bound capacity retries with max_capacity_retry_seconds; there is no max_concurrency or per_minute_rate_limit field.",

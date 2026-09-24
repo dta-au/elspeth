@@ -708,7 +708,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # Persisted node execution order for replay admission changes only the 52
 # sequence_in_pipeline values in exact node audit records and the dependent
 # terminal-resume full-history hash; frozen runtime surfaces remain unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "d52a2dc82028dc62dd155ad4b43dc93f4b55ff64ce03e58b9640a5a058112a4d"
+# CSV source teaching now names the required raw validation-failure route:
+# its source hash rotates d8a9c799bf5895c0 -> 5d131927c2baea3a in 15 node
+# records. The production reopen-resume harness then rotates its full-history
+# pin 59a0d994... -> bd33669a...; runtime semantics and frozen oracles stay fixed.
+EXPECTED_CASE_REGISTRY_SHA256 = "732c07703dcec71a48ee224e59ebf441e85e9c3b9c9a8ccc743590d095da0b3d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

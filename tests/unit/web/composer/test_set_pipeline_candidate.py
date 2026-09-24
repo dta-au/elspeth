@@ -2142,6 +2142,17 @@ def test_candidate_matches_executor_semantic_failures_without_side_effects(tmp_p
     assert state.to_dict() == before
 
 
+def test_set_pipeline_defaults_omitted_source_validation_routing_to_discard(tmp_path: Path) -> None:
+    """Composer's source wrapper supplies the option raw CSV config requires."""
+    args = _linear_args(tmp_path)
+    del args["source"]["on_validation_failure"]
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is True
+    assert result.updated_state.sources["source"].on_validation_failure == "discard"
+
+
 def test_current_executor_can_return_success_with_invalid_graph_candidate(tmp_path: Path) -> None:
     """The handler reports constructed state separately from acceptability.
 
