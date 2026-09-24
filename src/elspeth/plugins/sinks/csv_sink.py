@@ -597,7 +597,7 @@ class CSVSink(BaseSink):
                 composer_hints=(
                     "delimiter (default ',', single character) is an operator concern — pick for the consuming tool (Excel: ','; analytics tools may prefer '\\t'). Quoting is fixed (standard csv quoting); only delimiter and encoding are configurable.",
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
-                    "Header row is written once at start. Resume appends must use the same column order; pin headers explicitly with headers when schema can evolve.",
+                    "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
                     "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name so per-row write errors don't crash the run; omitting it fails validation.",
                 ),
             )

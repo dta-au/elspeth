@@ -9,7 +9,7 @@
     }
   ],
   "turns": [
-    "Read orders.csv as strings. Coerce qty to integer and price to integer with type_coerce; these prices are whole currency units. Send rows with failed conversion unchanged to quarantine.csv; do not drop them or invent defaults. For valid rows use value_transform to calculate total=qty*price. Route totals at least 20 to large.csv and the rest to small.csv. Use field_mapper to output only id,qty,price,total in that order on success; retain exactly id,qty,price on quarantine. Validate and preview."
+    "Read orders.csv as strings. Coerce qty to integer and price to integer with type_coerce; these prices are whole currency units. Send rows with failed conversion unchanged to quarantine.csv; do not drop them or invent defaults. For valid rows use value_transform to calculate total=qty*price. Route totals at least 20 to large.csv and the rest to small.csv. Use field_mapper to output only id,qty,price,total in that order on success; retain exactly id,qty,price in that order on quarantine. Validate and preview."
   ],
   "expected_plugins": {
     "source": [
