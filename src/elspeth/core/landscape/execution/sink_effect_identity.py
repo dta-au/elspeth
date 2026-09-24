@@ -129,6 +129,45 @@ def _labeled_hash(tag: str, payload: object) -> str:
     return sha256(canonical_json({"payload": payload, "schema": tag}).encode("utf-8")).hexdigest()
 
 
+class _LineageQueryCache:
+    """Reuse source reads within one member batch, without sharing limit state."""
+
+    def __init__(self, query: _LineageQuery) -> None:
+        self._query = query
+        self._tokens: dict[str, _Token | None] = {}
+        self._parents: dict[str, tuple[_Parent, ...]] = {}
+        self._rows: dict[str, _Row | None] = {}
+
+    def get_token(self, token_id: str) -> _Token | None:
+        if token_id not in self._tokens:
+            self._tokens[token_id] = self._query.get_token(token_id)
+        return self._tokens[token_id]
+
+    def get_tokens_by_ids(self, token_ids: Sequence[str]) -> list[_Token]:
+        missing = tuple(token_id for token_id in token_ids if token_id not in self._tokens)
+        fetched = self._query.get_tokens_by_ids(missing) if missing else []
+        for token in fetched:
+            self._tokens[token.token_id] = token
+        resolved: list[_Token] = []
+        for token_id in token_ids:
+            if token_id in self._tokens:
+                cached_token = self._tokens[token_id]
+                if cached_token is not None:
+                    resolved.append(cached_token)
+        resolved.extend(token for token in fetched if token.token_id not in token_ids)
+        return resolved
+
+    def get_token_parents(self, token_id: str) -> list[_Parent]:
+        if token_id not in self._parents:
+            self._parents[token_id] = tuple(self._query.get_token_parents(token_id))
+        return list(self._parents[token_id])
+
+    def get_row(self, row_id: str) -> _Row | None:
+        if row_id not in self._rows:
+            self._rows[row_id] = self._query.get_row(row_id)
+        return self._rows[row_id]
+
+
 class _BoundedLineageResolver:
     """Per-member resolver state; never shared across identity candidates."""
 
@@ -197,7 +236,7 @@ def resolve_sink_effect_members(
     candidates: Iterable[SinkEffectMemberCandidate],
 ) -> tuple[SinkEffectMember, ...]:
     """Resolve, validate, bound, and densely order exact sink-boundary rows."""
-    query = source.query
+    query = _LineageQueryCache(source.query)
     candidate_tuple = tuple(candidates)
     if not candidate_tuple:
         raise ValueError("sink effect members must be non-empty")

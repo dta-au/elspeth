@@ -11,8 +11,9 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from hashlib import sha256
+from types import MappingProxyType
 
-from elspeth.contracts.enums import CallType, NodeType, RunMode
+from elspeth.contracts.enums import CallType, NodeType, RunMode, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -24,6 +25,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectAttemptState,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
+    SinkEffectInputKind,
     SinkEffectInspection,
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
@@ -43,6 +45,7 @@ class VirtualReplaySinkEffect:
     """Finalize the exact sink-boundary members without external publication."""
 
     effect_call_type = CallType.FILESYSTEM
+    _DISPOSITION_CACHE_LIMIT = 4
 
     def __init__(
         self, *, factory: RecorderFactory, source_run_id: str, sink_node_id: str, role: SinkEffectRole = SinkEffectRole.PRIMARY
@@ -52,15 +55,58 @@ class VirtualReplaySinkEffect:
         self._sink_node_id = sink_node_id
         self._role = role
 
-    def _source_dispositions(self) -> dict[tuple[int, str, str], tuple[str, str | None, str | None]]:
-        """Bind outcomes and attribution to stable member identity across runs."""
-        repository = self._factory.execution.sink_effects
-        dispositions: dict[tuple[int, str, str], tuple[str, str | None, str | None]] = {}
-        for effect in repository.get_effects_for_run(self._source_run_id):
-            if effect.sink_node_id != self._sink_node_id or effect.role is not self._role:
+    def _source_dispositions(self) -> Mapping[tuple[int, str, str], tuple[str, str | None, str | None]]:
+        """Reuse validated source outcomes across this factory's virtual effects."""
+        scope = (self._sink_node_id, self._role)
+        with self._factory._replay_sink_dispositions_lock:
+            cache = self._factory._replay_sink_dispositions
+            if self._source_run_id in cache:
+                cached = cache[self._source_run_id]
+                cache.move_to_end(self._source_run_id)
+                if scope in cached:
+                    return cached[scope]
+                return {}
+            source = self._factory.run_lifecycle.get_run(self._source_run_id)
+            dispositions = self._read_run_dispositions(self._factory, self._source_run_id)
+            # Only terminal runs are immutable source evidence. Direct callers
+            # can inspect an active run, but may not cache a moving ledger.
+            if (
+                source is not None
+                and source.completed_at is not None
+                and source.status
+                in (
+                    RunStatus.COMPLETED,
+                    RunStatus.COMPLETED_WITH_FAILURES,
+                    RunStatus.EMPTY,
+                )
+            ):
+                cached = MappingProxyType({key: MappingProxyType(members) for key, members in dispositions.items()})
+                cache[self._source_run_id] = cached
+                if len(cache) > self._DISPOSITION_CACHE_LIMIT:
+                    cache.popitem(last=False)
+                if scope in cached:
+                    return cached[scope]
+                return {}
+            if scope in dispositions:
+                return dispositions[scope]
+            return {}
+
+    @staticmethod
+    def _read_run_dispositions(
+        factory: RecorderFactory, run_id: str
+    ) -> dict[tuple[str, SinkEffectRole], dict[tuple[int, str, str], tuple[str, str | None, str | None]]]:
+        """Validate every pipeline effect once and index its member evidence."""
+        repository = factory.execution.sink_effects
+        dispositions_by_scope: dict[tuple[str, SinkEffectRole], dict[tuple[int, str, str], tuple[str, str | None, str | None]]] = {}
+        for effect in repository.get_effects_for_run(run_id):
+            if effect.input_kind is not SinkEffectInputKind.PIPELINE_MEMBERS:
                 continue
             if effect.state is not SinkEffectState.FINALIZED:
                 raise AuditIntegrityError("replay source run contains a non-finalized sink effect")
+            scope = (effect.sink_node_id, effect.role)
+            if scope not in dispositions_by_scope:
+                dispositions_by_scope[scope] = {}
+            dispositions = dispositions_by_scope[scope]
             attribution: dict[int, tuple[str, str]] = {}
 
             def merge_attribution(evidence: Mapping[str, object], attribution: dict[int, tuple[str, str]]) -> None:
@@ -113,7 +159,7 @@ class VirtualReplaySinkEffect:
                 if key in dispositions and dispositions[key] != disposition:
                     raise AuditIntegrityError("source sink members have ambiguous dispositions")
                 dispositions[key] = disposition
-        return dispositions
+        return dispositions_by_scope
 
     def inspect_effect(self, request: SinkEffectInspectionRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectInspection:
         del request, ctx
@@ -220,3 +266,12 @@ def verify_virtual_sink_members(factory: RecorderFactory, *, source_run_id: str,
         if mode is RunMode.VERIFY:
             raise VerificationMismatchError("Verify sink output differs from the source run")
         raise OrchestrationInvariantError("replay sink output differs from the source run")
+
+    # Rebuild from durable evidence at the terminal boundary. This also
+    # detects source attribution changed after an earlier cached preparation.
+    source_dispositions = VirtualReplaySinkEffect._read_run_dispositions(factory, source_run_id)
+    current_dispositions = VirtualReplaySinkEffect._read_run_dispositions(factory, current_run_id)
+    if source_dispositions != current_dispositions:
+        if mode is RunMode.VERIFY:
+            raise VerificationMismatchError("Verify sink disposition evidence differs from the source run")
+        raise OrchestrationInvariantError("replay sink disposition evidence differs from the source run")

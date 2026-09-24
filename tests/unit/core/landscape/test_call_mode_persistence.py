@@ -283,3 +283,62 @@ def test_state_lookup_binds_node_and_source_row_then_exposes_source_token() -> N
         "state-source-call",
         source_operation_call.call_id,
     }
+
+
+def test_exact_state_call_lookup_loads_only_requested_occurrence(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    for run_id in ("source", "current"):
+        register_test_node(factory.data_flow, run_id, "transform", plugin_name="transform")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source-node",
+            0,
+            {"value": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+        factory.execution.begin_node_state(
+            token.token_id,
+            "transform",
+            0,
+            {"value": 1},
+            state_id=f"{run_id}-state",
+            member_token=leader_coordination_token(factory, run_id).membership,
+        )
+    count = 16
+    request_hash = stable_hash({"url": "https://example.test/a"})
+    with factory._db.write_connection() as conn:
+        for index in range(count):
+            conn.execute(
+                calls_table.insert().values(
+                    call_id=f"source-call-{index}",
+                    state_id="source-state",
+                    operation_id=None,
+                    call_index=index,
+                    call_type=CallType.HTTP.value,
+                    status=CallStatus.SUCCESS.value,
+                    request_hash=request_hash,
+                    created_at=datetime.now(UTC),
+                )
+            )
+    loader = factory.execution.calls._call_loader
+    original_load = loader.load
+    loaded = 0
+
+    def counted_load(row):
+        nonlocal loaded
+        loaded += 1
+        return original_load(row)
+
+    monkeypatch.setattr(loader, "load", counted_load)
+    for index in range(count):
+        found = factory.execution.find_call_for_current_parent(
+            source_run_id="source",
+            call_type=CallType.HTTP,
+            request_hash=request_hash,
+            current_state_id="current-state",
+            current_operation_id=None,
+            current_call_index=index,
+        )
+        assert found is not None and found.call_id == f"source-call-{index}"
+    assert loaded == count
