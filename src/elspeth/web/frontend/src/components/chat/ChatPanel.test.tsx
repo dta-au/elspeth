@@ -9000,6 +9000,43 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
   // Spec lines 768-774: "Got it — using your interpretation of *<user_term>*."
   // — pure UI nudge, NOT persisted to the audit trail (which already
   // recorded the resolved interpretation_event row).
+  it("offers one explicit planner repair when resolving a review reveals a graph error", async () => {
+    resetStore(useExecutionStore);
+    useExecutionStore.setState({ validate: useExecutionStore.getInitialState().validate });
+    useSessionStore.setState({ applyResolvedInterpretation: useSessionStore.getInitialState().applyResolvedInterpretation });
+    const event = makeInterpretationEvent({ user_term: "category" });
+    vi.spyOn(apiClient, "listInterpretationEvents").mockResolvedValue([]);
+    const message = "Edge contract violation: attach_sla emits Any but tidy_columns requires str for category.";
+    const suggestion = "Declare the preserved category field in attach_sla's output schema.";
+    vi.spyOn(apiClient, "resolveInterpretation").mockResolvedValue({
+      event: { ...event, choice: "accepted_as_drafted" },
+      new_state: makeComposition(8, { is_valid: false }),
+    });
+    vi.spyOn(apiClient, "validatePipeline").mockResolvedValue({
+      is_valid: false, checks: [], warnings: [],
+      errors: [{ component_id: "tidy_columns", component_type: "transform", message, suggestion }],
+      readiness: {
+        authoring_valid: true, execution_ready: false, completion_ready: false,
+        blockers: [{ code: "graph_structure", component_id: "tidy_columns", component_type: "transform", detail: "Graph validation failed.", suggestion: null, note: null }],
+      },
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id, sessions: [sessionFixture], messages: [],
+      compositionState: makeComposition(7), composeTimeoutReady: true,
+    });
+    useInterpretationEventsStore.getState().addPendingEvent(sessionFixture.id, event);
+    render(<ChatPanel />);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /Acknowledge the LLM's interpretation/i })));
+
+    const repair = await screen.findByRole("button", { name: "Ask composer to repair" });
+    expect(useComposer().sendMessage).not.toHaveBeenCalled();
+    fireEvent.click(repair);
+    expect(useComposer().sendMessage).toHaveBeenCalledOnce();
+    expect(useComposer().sendMessage).toHaveBeenCalledWith(expect.stringContaining(message));
+    expect(useComposer().sendMessage).toHaveBeenCalledWith(expect.stringContaining(suggestion));
+    expect(useComposer().sendMessage).toHaveBeenCalledWith(expect.stringContaining("Repair the pipeline"));
+  });
+
   it("refreshes freeform readiness when resolving after exiting guided", async () => {
     const event = makeInterpretationEvent({ user_term: "cool" });
     const next = makeComposition(2);

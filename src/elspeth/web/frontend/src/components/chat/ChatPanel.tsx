@@ -93,7 +93,7 @@ import { ApprovalReadinessRow } from "@/components/workflow/ApprovalReadinessRow
 import { DecisionPanel, DecisionPanelLiveRegion } from "./DecisionPanel";
 import { projectDecisionRows } from "./decisionPanelRows";
 import { useExecutionStore } from "@/stores/executionStore";
-import { applySuggestionPrompt, askAboutBlockerDraft } from "@/lib/suggestionPrompts";
+import { applySuggestionPrompt, askAboutBlockerDraft, repairGraphPrompt } from "@/lib/suggestionPrompts";
 import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import {
   COMPOSE_CONNECTING_MESSAGE,
@@ -2071,6 +2071,10 @@ export function ChatPanel({
     },
     [sendMessage],
   );
+  const handleRepairGraph = useCallback(() => {
+    if (decisionApplyDisabled || validationResult === null) return;
+    void sendMessage(repairGraphPrompt(validationResult.errors));
+  }, [decisionApplyDisabled, sendMessage, validationResult]);
   // Ruling D4: a blocker row DRAFTS a question; the user sends it. ChatPanel
   // owns the freeform draft, so it sets it directly (the catalog's prefill
   // event exists for surfaces that do not). The draft REPLACES the input, so
@@ -2351,6 +2355,7 @@ export function ChatPanel({
         stepLabelFor={decisionStepLabelFor}
         onApplySuggestion={handleApplySuggestion}
         onAskAboutBlocker={guidedDecisionMode ? undefined : handleAskAboutBlocker}
+        onRepairGraph={guidedDecisionMode ? undefined : handleRepairGraph}
         askDisabledReason={decisionAskDisabledReason}
         onOpenChecks={handleOpenChecks}
         onAcceptProposal={acceptProposal}
