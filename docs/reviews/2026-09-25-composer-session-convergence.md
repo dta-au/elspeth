@@ -108,7 +108,11 @@ precedence. Greetings add no call; eligible turns add at most one.
 
 154 affected tests and 16 final controls passed. Disabling recovery and allowing
 an extra retry independently failed the controls. Fresh live acceptance of this
-additional repair is pending.
+additional repair produced the requested six-row generated CSV, persisted and
+bound to the source with matching downloaded-content hashes. That sample used
+tools on its first call, so it does not prove that the new retry fired. Seven
+audited provider calls cost $0.1105702636; three interpretation reviews remained
+pending. Explanation and revocation live controls remain pending.
 
 ### Explicit repair after review resolution
 
@@ -166,6 +170,24 @@ LLM calls succeeded (six row calls and one operation-scoped preflight), with
 experiments used 21 calls and reported $0.033576972. These figures are measured
 subtotals, not a complete billing total. Production source hashes were unchanged
 throughout the replay, and its isolated service was stopped cleanly.
+
+## Expanded live acceptance
+
+At `4c4294399`, the full-palette AUTO Together canary passed all ten parameterless
+tools. Its production and harness fingerprint remained unchanged; ten physical
+provider requests reported $0.006701724. This is a wire-contract check, separate
+from executing pipelines.
+
+The ten-workflow runner's first attempt exposed an isolated-service configuration
+gap: six optional transform plugins were disabled by the default Web policy.
+The first cleanup case completed but correctly failed its output oracle for
+untruncated notes and the missing `truncate` transform. The second case was
+stopped after its in-flight turn finished. These are not acceptance passes.
+The original artifacts remain under `live-battery-final` in the lane. That
+service stopped cleanly with a frozen source fingerprint; its 44 total requests
+reported $0.355126269, including the canary and rootless probe above. The revised
+test service explicitly enables the required optional plugins, retaining the
+same global provider ledger across the restart. No deployed policy changed.
 
 ## Scope and deployment
 

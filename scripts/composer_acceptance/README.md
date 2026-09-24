@@ -4,6 +4,8 @@ Ten synthetic workflows exercise ordinary Composer authoring, edits, interpretat
 
 The separate parameterless-tool canary calls every production zero-argument tool using the full tool list, AUTO selection, Together routing and the production wire decoder. It proves wire conformance, not pipeline execution.
 
+The isolated service enables the six optional transforms required by these fixtures: `batch_top_k`, `json_explode`, `keyword_filter`, `truncate`, `type_coerce`, and `value_transform`. All other fixture plugins use the standard mandatory Web policy. This allowlist is recorded in the service configuration and checked against the actual registry and fixtures before boot provider calls. The deployed plugin policy is never changed.
+
 Run from the task checkout with both source roots so editable installs cannot silently test the main checkout:
 
 ```bash

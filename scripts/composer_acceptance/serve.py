@@ -10,12 +10,45 @@ import secrets
 import subprocess
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import dotenv_values
 from pydantic import SecretBytes
 
 from scripts.composer_acceptance.budget import ProviderBudget, observe_provider_requests
+
+if TYPE_CHECKING:
+    from elspeth.web.config import WebSettings
+
+ACCEPTANCE_PLUGIN_ALLOWLIST = (
+    "transform:batch_top_k",
+    "transform:json_explode",
+    "transform:keyword_filter",
+    "transform:truncate",
+    "transform:type_coerce",
+    "transform:value_transform",
+)
+
+
+def check_fixture_availability(settings: WebSettings, scenarios: Path) -> None:
+    """Fail before provider calls if the fixture requests disabled plugins."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.models import PluginId
+    from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
+
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=RuntimeWebPluginConfig.from_settings(settings))
+    needed = {
+        PluginId.parse(f"{category}:{name}")
+        for path in scenarios.glob("*.json")
+        for category, names in json.loads(path.read_text())["expected_plugins"].items()
+        for name in names
+    }
+    if not needed:
+        raise ValueError("Acceptance fixtures declare no plugins")
+    missing = sorted(map(str, needed - policy.authorized))
+    if missing:
+        raise ValueError("Acceptance fixture plugins are disabled: " + ", ".join(missing))
 
 
 def load_authorized_key(path: Path) -> None:
@@ -99,6 +132,7 @@ def main() -> None:
         "planner": args.planner,
         "advisor": args.advisor,
         "runtime_model": args.runtime_model,
+        "plugin_allowlist": list(ACCEPTANCE_PLUGIN_ALLOWLIST),
         "max_provider_calls": args.max_provider_calls,
         "max_known_cost": args.max_known_cost,
         "base_url": f"http://127.0.0.1:{args.port}",
@@ -135,6 +169,7 @@ def main() -> None:
         composer_planner_max_cumulative_provider_cost=str(args.max_known_cost),
         composer_rate_limit_per_minute=100,
         composer_strict_tools="preferred",
+        plugin_allowlist=ACCEPTANCE_PLUGIN_ALLOWLIST,
         secret_key=secret_path.read_text(),
         shareable_link_signing_key=SecretBytes(hashlib.sha256(secret_path.read_bytes()).digest()),
         server_secret_allowlist=("OPENROUTER_API_KEY",),
@@ -153,6 +188,7 @@ def main() -> None:
         ),
         registration_mode="open",
     )
+    check_fixture_availability(settings, root / "tests/fixtures/composer_convergence")
     before = fingerprint(root)
     (output / "source-before.json").write_text(json.dumps(before, indent=2) + "\n")
     (output / "service-config.json").write_text(json.dumps(config, indent=2) + "\n")

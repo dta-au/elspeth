@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from scripts.composer_acceptance import runner
 from scripts.composer_acceptance.runner import ApiClient, _preview_seen, compose, run_case
 from scripts.composer_acceptance.runner import assert_frozen as measured_assert_frozen
 from scripts.composer_acceptance.runner import runtime_evidence as measured_runtime_evidence
-from scripts.composer_acceptance.serve import validate_resume
+from scripts.composer_acceptance.serve import ACCEPTANCE_PLUGIN_ALLOWLIST, check_fixture_availability, validate_resume
 
 from tests.unit.scripts.test_composer_convergence_checks import CASES, _evidence, _positive
 
@@ -206,6 +207,32 @@ def test_resume_cannot_change_service_model(tmp_path: Path) -> None:
     validate_resume(tmp_path, config, source)
     with pytest.raises(ValueError, match="configuration changed"):
         validate_resume(tmp_path, {**config, "planner": "other"}, source)
+
+
+def test_fixture_policy_requires_every_requested_plugin() -> None:
+    from pydantic import SecretBytes
+
+    from elspeth.web.config import WebSettings
+
+    scenarios = Path(__file__).resolve().parents[2] / "fixtures/composer_convergence"
+    settings = WebSettings(
+        plugin_allowlist=ACCEPTANCE_PLUGIN_ALLOWLIST,
+        composer_max_composition_turns=12,
+        composer_max_discovery_turns=6,
+        composer_timeout_seconds=900,
+        composer_transport_idle_ceiling_seconds=960,
+        composer_rate_limit_per_minute=100,
+        shareable_link_signing_key=SecretBytes(secrets.token_bytes(32)),
+        secret_key=secrets.token_urlsafe(48),
+    )
+    check_fixture_availability(settings, scenarios)
+    without_truncation = settings.model_copy(
+        update={"plugin_allowlist": tuple(p for p in ACCEPTANCE_PLUGIN_ALLOWLIST if p != "transform:truncate")}
+    )
+    with pytest.raises(ValueError, match="transform:truncate"):
+        check_fixture_availability(without_truncation, scenarios)
+    with pytest.raises(ValueError, match="disabled"):
+        check_fixture_availability(settings.model_copy(update={"plugin_allowlist": ()}), scenarios)
 
 
 def test_custom_fixture_mutation_during_execution_cannot_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
