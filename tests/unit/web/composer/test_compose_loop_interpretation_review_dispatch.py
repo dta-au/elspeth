@@ -4227,6 +4227,7 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     narration: str | None,
 ) -> None:
     """A staged review gets a fresh visible answer without repeating tool narration."""
+    from elspeth.web.composer.progress import ComposerProgressRegistry
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.models import chat_messages_table
     from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
@@ -4234,8 +4235,11 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
     composer = _build_composer(tmp_path, sessions_service)
     completed_results: list[ComposerResult] = []
     original_loop = composer._compose_loop
+    progress_registry = ComposerProgressRegistry()
+    progress_sink = progress_registry.bind_request(session_id="reply-progress", request_id="request-1", user_id="alice")
 
     async def capture_result(*args: Any, **kwargs: Any) -> ComposerResult:
+        kwargs["progress"] = progress_sink
         completed = await original_loop(*args, **kwargs)
         completed_results.append(completed)
         return completed
@@ -4276,8 +4280,15 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         ]
     )
 
+    async def observed_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+        if not tools:
+            snapshot = await progress_registry.get_latest("reply-progress")
+            assert snapshot.phase == "calling_model"
+            assert "reply" in snapshot.headline
+        return await llm(messages, tools)
+
     result = await composer._run_one_turn_for_test(
-        llm=llm,
+        llm=observed_llm,
         session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",

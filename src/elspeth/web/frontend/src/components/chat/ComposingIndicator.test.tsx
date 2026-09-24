@@ -253,6 +253,32 @@ describe("ComposingIndicator elapsed-time readout", () => {
     const { container } = render(<ComposingIndicator composerProgress={progress} />);
     expect(container.querySelector(".composing-elapsed")).toBeNull();
   });
+
+  it("times the current model call from server progress across remounts and new calls", () => {
+    vi.setSystemTime(new Date("2026-09-25T00:01:05Z"));
+    const progress: ComposerProgressSnapshot = {
+      session_id: "session-1",
+      request_id: "message-1",
+      phase: "calling_model",
+      headline: "I'm asking the model to prepare your reply.",
+      evidence: [],
+      likely_next: null,
+      reason: null,
+      updated_at: "2026-09-25T00:00:00Z",
+    };
+    const first = render(<ComposingIndicator composerProgress={progress} />);
+    expect(screen.getByText("Waiting for model response")).toBeInTheDocument();
+    expect(first.container.querySelector(".composing-elapsed")?.textContent).toBe("01:05");
+    act(() => vi.advanceTimersByTime(1000));
+    expect(first.container.querySelector(".composing-elapsed")?.textContent).toBe("01:06");
+    first.unmount();
+    const recovered = render(<ComposingIndicator composerProgress={progress} />);
+    expect(recovered.container.querySelector(".composing-elapsed")?.textContent).toBe("01:06");
+    recovered.rerender(
+      <ComposingIndicator composerProgress={{ ...progress, updated_at: "2026-09-25T00:01:06Z" }} />,
+    );
+    expect(recovered.container.querySelector(".composing-elapsed")?.textContent).toBe("00:00");
+  });
 });
 
 describe("formatElapsed", () => {

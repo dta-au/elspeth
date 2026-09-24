@@ -5964,6 +5964,15 @@ class ComposerServiceImpl:
                 )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
                 if remaining > 0:
+                    await emit_progress(
+                        progress,
+                        ComposerProgressEvent(
+                            phase="calling_model",
+                            headline="I'm asking the model to prepare your reply.",
+                            evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
+                            likely_next="ELSPETH will save the reply and show the current review and validation status.",
+                        ),
+                    )
                     try:
                         completion = await self._call_llm_with_audit(reply_messages, [], timeout=remaining, recorder=recorder)
                     except provider_failures:
