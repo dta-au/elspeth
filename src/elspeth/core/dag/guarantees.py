@@ -687,10 +687,24 @@ def _resolve_guaranteed_field_type_uncached(
         and field_name not in node_info.removed_input_fields
         and (config is None or config.allows_extra_fields)
     )
+    # Selection can retain one known field without forwarding the whole row.
+    # Its input requirement and output guarantee prove same-name presence;
+    # preservation proves the value survives. Created/renamed targets cannot
+    # borrow the type of an unrelated upstream field with the same name.
+    selects_field_unchanged = (
+        node_info.node_type is NodeType.TRANSFORM
+        and node_info.preserves_input_values
+        and field_name in node_info.declared_input_fields
+        and field_name not in node_info.declared_output_fields
+        and field_name not in node_info.removed_input_fields
+        and config is not None
+        and field_name in (config.guaranteed_fields or ())
+    )
     recurses = (
         node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE)
         or node_info.passes_through_input
         or forwards_field_unchanged
+        or selects_field_unchanged
     )
     if not recurses:
         return None
