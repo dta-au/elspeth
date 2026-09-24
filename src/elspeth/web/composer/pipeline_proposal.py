@@ -780,8 +780,9 @@ class PipelineProposal:
 def composition_content_hash(state: CompositionState) -> str:
     """Hash authored composition content, excluding version and guided metadata.
 
-    Non-row-union content retains the historical preimage. Row-union branches
-    use the Composer authority projection so authored order remains bound.
+    The preimage is the Composer authority projection: mapping-form row_union
+    and coalesce branches are hashed as ordered pair arrays, so their
+    authored order remains bound. List-form branches are already ordered.
 
     Memoized on the instance's ``_content_hash_memo`` slot: ``state`` is
     frozen (content identity cannot change) and every mutation constructor

@@ -33,7 +33,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.service import SessionServiceImpl, _pipeline_private_arguments_hash
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -213,6 +213,33 @@ def _row_union_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
                 "options": {},
                 "branches": {alias: connections[alias] for alias in branch_order},
                 "timeout_seconds": 30.0,
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+def _coalesce_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
+    connections = {
+        "a": "a_in",
+        "b": "b_in",
+        "c": "c_in",
+    }
+    return {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "cases.csv"}, "on_validation_failure": "discard"},
+        "nodes": [
+            {
+                "id": "merge",
+                "node_type": "coalesce",
+                "plugin": None,
+                "input": "a_in",
+                "on_success": "merge_out",
+                "on_error": None,
+                "options": {},
+                "branches": {alias: connections[alias] for alias in branch_order},
+                "policy": "require_all",
+                "merge": "union",
             }
         ],
         "edges": [],
@@ -558,6 +585,76 @@ async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_
         )
 
     with pytest.raises(AuditIntegrityError, match="private arguments binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            reviewed_facts={},
+        )
+
+
+async def _create_coalesce_proposal(service, session_id: UUID, pipeline: dict[str, object]):
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        return await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(pipeline=pipeline),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry()),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_non_first_coalesce_order_tampering(service) -> None:
+    """A row-only reorder of coalesce map branches is caught by the first re-derived binding.
+
+    ``_pipeline_private_arguments_hash`` is checked before the row's
+    ``tool_arguments_hash``, and both go through the authority projection.
+    """
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    row = await _create_coalesce_proposal(service, session_id, _coalesce_pipeline(("a", "b", "c")))
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == str(row.id))
+            .values(arguments_json=_coalesce_pipeline(("a", "c", "b")))
+        )
+
+    with pytest.raises(AuditIntegrityError, match="private arguments binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            reviewed_facts={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_coalesce_reorder_against_the_row_tool_arguments_hash(service) -> None:
+    """With the event's private-arguments hash re-sealed, the row ``tool_arguments_hash`` still binds order."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    row = await _create_coalesce_proposal(service, session_id, _coalesce_pipeline(("a", "b", "c")))
+    tampered = _coalesce_pipeline(("a", "c", "b"))
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(arguments_json=tampered)
+        )
+        event = conn.execute(select(proposal_events_table).where(proposal_events_table.c.proposal_id == str(row.id))).one()
+        payload = dict(event.payload)
+        payload["private_arguments_hash"] = _pipeline_private_arguments_hash(tampered)
+        conn.execute(update(proposal_events_table).where(proposal_events_table.c.id == event.id).values(payload=payload))
+
+    with pytest.raises(AuditIntegrityError, match="pipeline proposal row arguments hash mismatch"):
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,

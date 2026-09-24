@@ -26,7 +26,7 @@ from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_commit
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.authority_hashing import project_composer_authority_payload
+from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, PreparedPipelineCommit, prepare_pipeline_proposal_commit
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -281,6 +281,62 @@ async def test_other_sessions_live_operation_cannot_prepare_this_proposal(propos
     try:
         with pytest.raises(AuditIntegrityError, match="does not match the proposal session"):
             await _prepare(proposal, context)
+    finally:
+        operations.release(context)
+
+
+def _coalesce_arguments(branch_order: tuple[str, ...]) -> dict[str, Any]:
+    connections = {"a": "a_in", "b": "b_in", "c": "c_in"}
+    return {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "cases.csv"}, "on_validation_failure": "discard"},
+        "nodes": [
+            {
+                "id": "merge",
+                "node_type": "coalesce",
+                "plugin": None,
+                "input": "a_in",
+                "on_success": "merge_out",
+                "on_error": None,
+                "options": {},
+                "branches": {alias: connections[alias] for alias in branch_order},
+                "policy": "require_all",
+                "merge": "union",
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_proposal_whose_coalesce_order_differs_from_the_row(proposal: _Proposal) -> None:
+    """The row's ``tool_arguments_hash`` binds coalesce map order at commit preparation."""
+    row_arguments = _coalesce_arguments(("a", "b", "c"))
+    reordered = _coalesce_arguments(("a", "c", "b"))
+    authority = replace(
+        proposal.authority,
+        row=replace(proposal.authority.row, tool_arguments_hash=composer_authority_hash(row_arguments)),
+        proposal=PipelineProposal.create(
+            pipeline=reordered,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("test-skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+    )
+    operations = proposal.service.session_operation_authority
+    context = operations.acquire(
+        session_id=proposal.authority.row.session_id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=proposal.service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    try:
+        with pytest.raises(AuditIntegrityError, match="authoritative pipeline arguments do not match the proposal row"):
+            await _prepare(replace(proposal, authority=authority), context)
     finally:
         operations.release(context)
 
