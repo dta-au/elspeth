@@ -58,7 +58,7 @@ from elspeth.engine.orchestrator.outcomes import (
 from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
-from elspeth.engine.orchestrator.source_replay import AuditedSource
+from elspeth.engine.orchestrator.source_replay import AuditedSource, replay_source_rows
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
@@ -566,7 +566,7 @@ class SourceIterationDriver:
                 raise OrchestrationInvariantError(f"{ctx.run_mode.value} source {active_source_name!r} has no audited source evidence")
             audited_source = candidate
             if ctx.run_mode is RunMode.REPLAY:
-                source_rows = iter(audited_source.rows)
+                source_rows = replay_source_rows(audited_source, ctx)
             else:
                 if ctx.verified_sources is None or active_source_name not in ctx.verified_sources:
                     raise OrchestrationInvariantError(f"Verify source {active_source_name!r} has no completely verified live snapshot")

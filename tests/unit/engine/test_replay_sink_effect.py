@@ -27,7 +27,7 @@ from tests.unit.plugins.sinks.test_remote_object_sink_effects import _s3, _S3Sto
 @pytest.mark.parametrize("current_payloads", [[{"value": 1}], [{"value": 2}], [{"value": 1}, {"value": 1}]])
 @pytest.mark.parametrize("run_mode", (RunMode.REPLAY, RunMode.VERIFY))
 def test_virtual_sink_effect_compares_complete_member_set_without_publication(
-    current_payloads: list[dict[str, object]], run_mode: RunMode
+    tmp_path: Path, current_payloads: list[dict[str, object]], run_mode: RunMode
 ) -> None:
     db = make_landscape_db()
     try:
@@ -36,23 +36,24 @@ def test_virtual_sink_effect_compares_complete_member_set_without_publication(
         current_run_id, current_sink_id, current_members = _members_with_payloads(factory, current_payloads)
         assert source_sink_id == current_sink_id
 
-        for run_id, sink_id, members in (
-            (source_run_id, source_sink_id, source_members),
-            (current_run_id, current_sink_id, current_members),
-        ):
-            adapter = VirtualReplaySinkEffect(source_run_id=source_run_id, sink_node_id=sink_id)
-            result = SinkEffectCoordinator(
-                factory=factory,
-                worker_id=f"virtual:{run_id}",
-                coordination_token=leader_token_for(db, run_id),
-            ).execute(_execution_request(run_id, sink_id, members), adapter)
-            assert result.effect.state is SinkEffectState.FINALIZED
-            assert result.effect.publication_performed is False
-            assert result.effect.publication_evidence_kind == "virtual"
-            assert result.artifact.publication_performed is False
-            assert {attempt.action for attempt in factory.execution.sink_effects.get_attempts_for_run(run_id)} <= {
-                SinkEffectAttemptAction.INSPECT
-            }
+        SinkEffectCoordinator(
+            factory=factory,
+            worker_id="source",
+            coordination_token=leader_token_for(db, source_run_id),
+        ).execute(_execution_request(source_run_id, source_sink_id, source_members), _json_sink(tmp_path / "source.jsonl"))
+        adapter = VirtualReplaySinkEffect(factory=factory, source_run_id=source_run_id, sink_node_id=current_sink_id)
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id=f"virtual:{current_run_id}",
+            coordination_token=leader_token_for(db, current_run_id),
+        ).execute(_execution_request(current_run_id, current_sink_id, current_members), adapter)
+        assert result.effect.state is SinkEffectState.FINALIZED
+        assert result.effect.publication_performed is False
+        assert result.effect.publication_evidence_kind == "virtual"
+        assert result.artifact.publication_performed is False
+        assert {attempt.action for attempt in factory.execution.sink_effects.get_attempts_for_run(current_run_id)} <= {
+            SinkEffectAttemptAction.INSPECT
+        }
 
         if current_payloads == [{"value": 1}]:
             verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=current_run_id, mode=run_mode)

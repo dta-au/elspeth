@@ -10,12 +10,12 @@ from __future__ import annotations
 import copy
 import itertools
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import SourceRow
-from elspeth.contracts.audit import NodeStateFailed
+from elspeth.contracts.audit import NodeStateFailed, ValidationErrorRecord
 from elspeth.contracts.enums import NodeType, RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.freeze import freeze_fields
@@ -47,9 +47,40 @@ class AuditedSource:
     source_schema_json: str
     field_resolution: Mapping[str, str] | None
     normalization_version: str | None
+    validation_discards: tuple[ValidationErrorRecord, ...] = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "field_resolution")
+
+
+def _discard_signature(error: ValidationErrorRecord) -> tuple[str | None, ...]:
+    """Compare retained decisions independently of run-local IDs and timestamps."""
+    return (
+        error.row_hash,
+        error.row_data_json,
+        error.error,
+        error.schema_mode,
+        error.destination,
+        error.violation_type,
+        error.original_field_name,
+        error.normalized_field_name,
+        error.expected_type,
+        error.actual_type,
+    )
+
+
+def replay_source_rows(audited: AuditedSource, ctx: PluginContext) -> Iterator[SourceRow]:
+    """Restore admitted discard decisions without executing source plugin code."""
+    for error in audited.validation_discards:
+        if error.row_data_json is None:
+            raise AuditIntegrityError(f"Source replay validation error {error.error_id}: payload missing")
+        ctx.record_validation_error(
+            row=json.loads(error.row_data_json),
+            error=error.error,
+            schema_mode=error.schema_mode,
+            destination=error.destination,
+        )
+    yield from audited.rows
 
 
 def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedSource) -> tuple[SourceRow, ...]:
@@ -120,6 +151,13 @@ def prepare_verified_sources(
             ) as operation:
                 ctx.operation_id = operation.operation.operation_id
                 verified[name] = _verified_rows(source, ctx, audited)
+                live_discards = tuple(
+                    error
+                    for error in factory.data_flow.get_validation_errors_for_run(run_id)
+                    if error.node_id == source_id and error.destination == "discard"
+                )
+                if tuple(map(_discard_signature, live_discards)) != tuple(map(_discard_signature, audited.validation_discards)):
+                    raise VerificationMismatchError(f"Verify source {name!r}: validation discards differ from audited run")
             ctx.operation_id = None
     finally:
         ctx.node_id = saved_node_id
@@ -137,10 +175,19 @@ def _quarantine_details(
         for state in factory.query.get_node_states_for_token(token.token_id)
         if type(state) is NodeStateFailed and state.node_id == source_node_id and state.step_index == 0
     ]
-    outcomes = factory.data_flow.get_token_outcomes_for_row(run_id, row_id)
-    quarantined = [outcome for outcome in outcomes if outcome.path is TerminalPath.QUARANTINED_AT_SOURCE]
     if not source_failures:
         return None
+    if len(source_failures) != 1:
+        raise AuditIntegrityError(f"Source replay row {row_id}: source validation error evidence missing")
+    source_failure = source_failures[0]
+    if source_failure.error_json is None:
+        raise AuditIntegrityError(f"Source replay row {row_id}: source validation error evidence missing")
+    outcomes = factory.data_flow.get_token_outcomes_for_row(run_id, row_id)
+    quarantined = [
+        outcome
+        for outcome in outcomes
+        if outcome.path is TerminalPath.QUARANTINED_AT_SOURCE and outcome.token_id == source_failure.token_id
+    ]
     if not quarantined:
         raise AuditIntegrityError(f"Source replay row {row_id}: failed source state has no quarantine outcome")
     if len(quarantined) != 1 or len(outcomes) != 1:
@@ -148,9 +195,7 @@ def _quarantine_details(
     outcome = quarantined[0]
     if outcome.sink_name is None:
         raise AuditIntegrityError(f"Source replay row {row_id}: quarantine destination missing")
-    if len(source_failures) != 1 or source_failures[0].error_json is None:
-        raise AuditIntegrityError(f"Source replay row {row_id}: source validation error evidence missing")
-    error_record = json.loads(source_failures[0].error_json)
+    error_record = json.loads(source_failure.error_json)
     if type(error_record) is not dict or "exception" not in error_record:
         raise AuditIntegrityError(f"Source replay row {row_id}: malformed source validation error evidence")
     exception = error_record["exception"]
@@ -230,6 +275,34 @@ def prepare_audited_sources(
             f"Source replay run {replay_from}: source order differs from audited run (audited={ordered_names}, configured={list(sources)})"
         )
     node_name = {record.source_node_id: name for name, record in by_name.items()}
+    discards_by_source: dict[str, list[ValidationErrorRecord]] = {name: [] for name in sources}
+    for error in factory.data_flow.get_validation_errors_for_run(replay_from):
+        if error.node_id not in node_name:
+            raise AuditIntegrityError(f"Source replay validation error {error.error_id}: undeclared source node {error.node_id}")
+        if error.destination != "discard":
+            continue
+        if error.row_id is not None or error.row_data_json is None:
+            raise AuditIntegrityError(f"Source replay validation error {error.error_id}: discard payload or linkage is invalid")
+        if any(
+            value is not None
+            for value in (
+                error.violation_type,
+                error.original_field_name,
+                error.normalized_field_name,
+                error.expected_type,
+                error.actual_type,
+            )
+        ):
+            raise AuditIntegrityError(f"Source replay validation error {error.error_id}: structured violation cannot be reconstructed")
+        try:
+            restored_hash = stable_hash(json.loads(error.row_data_json))
+        except (ValueError, TypeError) as exc:
+            raise AuditIntegrityError(f"Source replay validation error {error.error_id}: discard payload cannot be reconstructed") from exc
+        if restored_hash != error.row_hash:
+            raise AuditIntegrityError(
+                f"Source replay validation error {error.error_id}: discard payload hash mismatch or noncanonical evidence"
+            )
+        discards_by_source[node_name[error.node_id]].append(error)
     for batch in factory.query.iter_rows_for_run(replay_from):
         for row in batch:
             if row.source_node_id not in node_name:
@@ -294,5 +367,6 @@ def prepare_audited_sources(
             source_schema_json=schema_json_by_source[name],
             field_resolution=resolution.resolution_mapping if resolution is not None else None,
             normalization_version=record.normalization_version,
+            validation_discards=tuple(discards_by_source[name]),
         )
     return result

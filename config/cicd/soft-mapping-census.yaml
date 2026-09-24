@@ -255,6 +255,9 @@ files:
   src/elspeth/engine/executors/aggregation.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 4
+  src/elspeth/engine/executors/replay_sink_effect.py:
+    Mapping[str, object]: 1
+    dict[str, object]: 1
   src/elspeth/engine/executors/sink.py:
     dict[str, object]: 9
   src/elspeth/engine/executors/sink_effects.py:
@@ -1070,9 +1073,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 930
-  Mapping[str, object]: 310
+  Mapping[str, object]: 311
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1180
-  dict[str, object]: 409
-  soft: 2842
+  dict[str, object]: 410
+  soft: 2844
