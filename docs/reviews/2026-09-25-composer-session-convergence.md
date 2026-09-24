@@ -516,3 +516,59 @@ static guidance/assistance checks 217. Negative controls reproduced the stale
 fixtures, invalid binding behavior, stale inventory locations, and misplaced
 plugin teaching. Independent review approved each scoped correction. These are
 focused repair results, not a replacement for the final canonical gate.
+
+
+## Final verification record
+
+The final tested candidate is `1ef793a887f06f29feb11db3afc7762aad4f0448`.
+Its fresh live battery passed all ten workflows; the reviewed runner and service
+both exited 0. Source content remained
+`8c2025f2e0ebbf4eba01dd9269c9f06e4243d26dc58dd7a5df1ec4dda1c05f63`.
+All 88 workflow planner requests were served by Together. All 106 strict calls
+were conformant, all 35 parameterless calls succeeded, and all nine row-bound
+Sonnet calls succeeded. Six semantic authoring errors were corrected inside the
+planner loops. One ordinary user repair corrected contradictory prompt-format
+wording before its exact replacement card was approved; complaint meanings,
+profile and supplied data stayed unchanged. The original SLA edit still ran and
+produced all six correct output rows. Every workflow closed its audit accounting.
+
+The earlier ten-case pass at `72170c2` remains independent evidence. The cumulative
+ledger across preserved attempts reached 774 completed dispatches, zero active
+calls and $4.2417953430 known cost, with one historical unpriced timeout. No key
+or deployed environment was persisted in these reports.
+
+Verification is composed from explicitly separate runs:
+
+- The frozen six-stage `72170c2` gate: ruff, mypy and contracts passed; default
+  pytest reported 58,075 passes and the 54 diagnosed failures; PostgreSQL passed
+  571 tests with one skip. Its original `RESULT=FAIL` is preserved.
+- Every original failed ID was rerun on frozen `1ef793a`: **54 passed**, zero
+  failures or skips, exit 0. The selected IDs exactly match completed JUnit
+  failure evidence; an invalid-module control rejects an invalid selection.
+  The larger affected-module and mutation results are recorded above.
+- The final canonical static gate on frozen `1ef793a` passed ruff, mypy and
+  contracts and reported `RESULT=PASS`. Lints exited 1/nonfatal with 2,362
+  findings: the same normalized corpus as `72170c2`, seven classified policy or
+  binding findings above the clean-release baseline of 2,355. No judge signatures
+  were edited, and this is not a claim of trusted signature verification.
+
+Independent review approved bounded revalidation: the follow-up changes comprise
+review documents, eight test modules and one generic shared-guidance Markdown row,
+with no runtime Python, schema, configuration or shared-test-helper change.
+The repository's reach-based testing rule supports completed broad runtime and
+PostgreSQL coverage plus exact failure closure, affected whole-tree checks and
+fresh live acceptance. This does not invoke the separate "full suite already
+passed" exception: the earlier full suite failed. No second full-suite pass is
+claimed. Host contention did not determine that verification recommendation.
+
+Canonical summaries and exact closure evidence are retained under the ignored
+session lane in `final-integrated-gate/`, `final-repaired-static-gate/`,
+`final54-restored.log` and `final54-junit.xml`; read-only audit and per-defect
+reports retain raw attribution and negative-control evidence. The final source
+is ready for the authorized local `release/0.8.1` integration; branch containment
+and preservation of unrelated main-checkout changes are checked at that transition.
+No push, deployment or production service restart is included. Session/coordination
+epoch 68 and the rebuilt frontend remain deployment consequences. Refresh survival
+stays parked for the streaming UI rewrite. The original-header write-target and
+numeric-admission limitations documented above remain open; the ten passing
+workflows are not an exhaustive claim over all plugin combinations.

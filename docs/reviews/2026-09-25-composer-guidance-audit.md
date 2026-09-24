@@ -180,3 +180,17 @@ data, and establish conversion explicitly when required. Both pre-existing
 shared-prompt boundary tests stay unchanged; restoring the offending row makes
 both fail. The restored affected run passed 217 tests. This correction preserves
 the distinction between generic Composer rules and installed-plugin facts.
+
+
+### Final parent verification
+
+All nine confirmed corrections were implemented by separately assigned lanes,
+reviewed by the parent and independently checked; the Sol auditor remained
+report-only. Two complete ten-workflow real-provider batteries passed after the
+runtime repairs. The final one includes the generic shared-prompt placement
+correction and is bound to `1ef793a887f06f29feb11db3afc7762aad4f0448`.
+All formerly failing tests passed in an exact 54-ID rerun on that candidate;
+static checks and unchanged lint-corpus accounting are detailed in the
+[convergence report](2026-09-25-composer-session-convergence.md).
+The documented `list_models` wording ambiguity and stated audit coverage limits
+remain; this report does not promote them into confirmed runtime defects.
