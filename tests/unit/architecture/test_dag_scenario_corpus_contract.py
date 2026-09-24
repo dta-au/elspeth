@@ -757,6 +757,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 3
 # literals reproduces the prior manifest byte for byte. No resume digest moved
 # and no oracle_freeze snapshot moved.
+# Rotated 2026-09-24 (elspeth-5887fb7928, R6): a PLUGIN PROVENANCE rotation, not
+# a semantic one. json_explode's docstrings and comments were corrected to the
+# behaviour ac97b3265 shipped (a wrong-typed or empty array_field is a returned,
+# routed error); its code is AST-identical once docstrings are neutralised. Its
+# source_file_hash moved (36c7c718e2cee382 -> 8ad41f481a0a1400, the one manifest
+# pin in the json-explode-parent-child case), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting that literal
+# reproduces the prior manifest byte for byte. No resume digest moved and no
+# oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
