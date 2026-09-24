@@ -15,8 +15,9 @@
   - `$DBS` is the directory of read-only session-DB copies named in the lane brief. Open them only as
     `sqlite file:...?mode=ro`.
   - Do not write `$L`, `$DBS` or any user-home path into a tracked file.
-- **Citations:** every `path:line` was measured in `$W` at `c4c52c110`. Lines drift as tasks land, so re-anchor each
-  one with `grep -n` before editing. Evidence is marked as follows:
+- **Citations:** every `path:line` was measured in `$W` at `c4c52c110`, and re-checked by two read-only critiques at
+  `41125ac74` (§8). Lines drift as tasks land, so re-anchor each one with `grep -n` before editing. Evidence is marked
+  as follows:
   - **M:** measured by running code. The log is in `$L`.
   - **R:** read from the source.
   - **I:** inferred, not run.
@@ -36,8 +37,10 @@ Three work items, in this order:
    alphabetical order. Fix it so the transcript keeps the model's key order.
 3. **Defect B (T3 to T6).** The composer authority hashes are blind to the order of coalesce mapping-form branches and
    of the multi-source `sources` map, and so is the advisor sign-off fingerprint. Both maps are order-semantic at
-   runtime. Bind their order the way the row_union precedent does. This changes persisted hash preimages that are
-   re-verified with a hard failure, so it ends with a session schema epoch bump, as the last commit.
+   runtime. Bind their order the way the row_union precedent does. Restore is narrowed to check only the
+   projection's own structure, which also fixes a base defect in the row_union arm (D11). This changes persisted hash
+   preimages that are re-verified with a hard failure (every stored composition content hash moves), so it ends with
+   a session schema epoch bump, as the last commit.
 
 ### 1.2 Rulings recorded (John, 2026-09-24)
 
@@ -70,15 +73,17 @@ Three work items, in this order:
 | # | Decision | Why |
 |---|---|---|
 | D1 | **Defect A's fix is to drop `sort_keys=True` at `tool_batch.py:498` and nothing else.** Keep the compact separators. | That keyword is the whole cause. A mutation that removes only it restores the model's order in the unit probe and in the end-to-end compose-loop probe (M, `understand-transcript.md` §1). All 7 callers go through that one `json.dumps` (§2 of the same report). |
-| D2 | **Every other site that re-serialises planner-authored arguments is left alone.** §3.2 of this plan gives the table. | The only other site that sorts arguments the model sees is `pipeline_planner.py:3870`. It is inert today, because the planner only runs on an empty pipeline. Every other sorted site is an audit, cache or dedupe key that is sorted by design. Order is bound separately by the authority projection, which T3 to T5 extend. |
-| D3 | **`sources` is part of Defect B**, with its own schema tag. It is projected unconditionally (every dict, including a one-entry dict). The singular `source` field is untouched. | The brief says "any other order-semantic map found". `sources` order decides ingest order (`leader_drain.py:192-203`) and the "first source" (`run_lifecycle.py:207`, `processor_factory.py:430`) (R, `understand-transcript.md` §7). The hash reader's objection was that the engine topology hash does not bind it either. That is equally true of coalesce's gap in the composer, so the objection is recorded in §1.4 as a separate engine defect rather than as a reason to leave the composer blind. The alternative, projecting only when there are two or more entries, is rejected: the preimage shape would then depend on the count, and restore would have to accept two forms. |
-| D4 | **The coalesce projection does not depend on `merge` or `policy`.** | The engine already carries `branch_order` unconditionally (`builder.py:545-557`). Binding `select` as well is harmless, and it keeps the rule to one line (R, `understand-hash.md` §2). |
+| D2 | **Every other site that re-serialises planner-authored arguments is left alone.** §3.2 of this plan gives the table. | The only other site that sorts arguments the model sees is `pipeline_planner.py:3870` (the planner's `current_state`, serialised with `canonical_json`). It is inert on **freeform only**: freeform reaches the planner through `_plan_and_stage_empty_pipeline` (`service.py:5289`, gated on `state_is_empty` at `:4180-4191`). **Guided-full still reaches it with a non-empty state**: `plan_guided_full_pipeline` (`composer/service.py:4381`) passes `project_server_owned_option_metadata(current_state.to_dict())` at `:4435` with no emptiness gate (R). It is left alone because guided mode is being removed (John, 2026-09-22) and no further investment goes into the guided lane; it is recorded as §1.4 item 5. Every other sorted site is an audit, cache or dedupe key that is sorted by design. Order is bound separately by the authority projection, which T3 to T5 extend. |
+| D3 | **`sources` is part of Defect B**, with its own schema tag. It is projected unconditionally (every dict, including `{}` and a one-entry dict). The singular `source` field is untouched. | The brief says "any other order-semantic map found". `sources` order decides ingest order (`leader_drain.py:192-203`) and the "first source" (`run_lifecycle.py:207`, `processor_factory.py:430`) (R, `understand-transcript.md` §7). The hash reader's objection was that the engine topology hash does not bind it either. That is equally true of coalesce's gap in the composer, so the objection is recorded in §1.4 as a separate engine defect rather than as a reason to leave the composer blind. Two alternatives are rejected. Projecting only when there are two or more entries makes the preimage shape depend on the count. Excluding only `{}` means restore must accept both a plain `{}` and a `{schema, items}` envelope for the same field, which is dual acceptance. **Consequence, measured:** `CompositionState.to_dict()` always emits `"sources"` (`state.py:7286`), and the constructor folds a singular `source` into `sources` (`state.py:7170`), so after T4 **every** `composition_content_hash` moves, including an empty state's (M, `$L/critique-1/probe_sources_always.log`: "empty-state content hash moves under a T4-shaped projection: True"). Raw `set_pipeline` arguments that use the singular `source` and carry no `sources` key do not move. |
+| D4 | **The coalesce projection does not depend on `merge` or `policy`.** | The engine already carries `branch_order` unconditionally (`builder.py:545-557`). Binding `select` as well is harmless, and it keeps the rule to one line (R, `understand-hash.md` §2). Note on the collision rule: `policy` is the **arrival** policy (`require_all`, `quorum`, `best_effort`, `first`; `core/config.py:1015`). Field collisions are governed by `union_collision_policy` (`config.py:1023`, default `last_wins`), which the composer cannot set: `yaml_importer._UNSUPPORTED_COALESCE_FIELDS` lists it (`yaml_importer.py:35-41`) and `NodeSpec.from_dict` drops it (M, `$L/critique0/policy_probe.log`). So every composer coalesce with `merge=union` runs under `last_wins`, and its branch order decides the collision winner. |
 | D5 | **Every new projection has its own schema tag. The row_union tag stays byte-identical.** Tags: `composer.coalesce-ordered-branches.v1` and `composer.ordered-sources.v1`. | Row_union preimages must not move (T3 pins them with a golden). A projection of one kind can then never be restored as another. |
 | D6 | **`_DRAFT_HASH_SCHEMA` stays `...envelope.v3`, and `_FINGERPRINT_SCHEMA` stays `elspeth.completion_gate_graph.v2`.** | Each changed part of a preimage now carries its own schema tag, so the change separates its own domain. The epoch cut in T6 deletes every stored row, so no v3 or v2 preimage from before the change survives to collide. The cost of choosing otherwise: a v4 draft envelope moves every `draft_hash` literal, including single-`source` pipelines that T3 to T5 leave unchanged. Precedents in the other direction are `49825dd86` (draft v2→v3) and `d7541609c` (fingerprint v1→v2). If the lead prefers to mirror them, the bump goes into T4 for the draft hash and T5 for the fingerprint. |
 | D7 | **`completion_gate_fingerprint` is routed through the projection (T5).** | It is the same class of gap: the advisor's sign-off is carried forward onto a graph whose merge order or ingest order changed (`completion_gates.py:166`, `advisor_block_covers_unchanged_graph` at `:383`). The epoch cut in T6 is being paid anyway, so the fix is almost free. Leaving it out would be the kind of debt John has ruled against. |
 | D8 | **The epoch bump is 66 → 67. It is the last commit (T6) and touches 10 files (§5).** | Stored hashes are recomputed on read and fail hard with `AuditIntegrityError` (§5.1). John's no-tech-debt rule forbids dual acceptance or a legacy hash path. |
 | D9 | **Appendix A joins on `(session_id, call_id)`**, not on `parent_assistant_id`. | The brief names the session-scoped join. It gives the same counts as the parent join on all 13 DB copies (M, `understand-docs.md` §1.2). The parent join is mentioned in the appendix as the tighter alternative. |
-| D10 | **The status line in T1 cites the S1 gate record as it stands.** At `d5f8c5aac` the result was FAIL, with 10 failures and `frozen=yes`. | All 10 red ids also fail at `c4c52c110` (M, §2). That commit already contains S1, so this shows the 10 are the lane's known base-red set. It does **not** show that they predate S1. The plan text must say exactly that. |
+| D10 | **The status line in T1 cites the S1 gate record as it stands, with the measured attribution of the two non-drift reds.** At `d5f8c5aac` the result was FAIL, with 10 failures and `frozen=yes`. | All 10 red ids also fail at `c4c52c110` (M, §2). The tree immediately before S1 is `c4c52c110^1` = **`e69498f6c`**, not the S0 merge `85ebf2739`: `34f0fed73`, the S1 branch's root commit, has parent `e69498f6c`, and `git merge-base c4c52c110^1 c4c52c110^2` is `e69498f6c`. Measured on `git archive` exports with `elspeth.__file__` inside each export: `test_composer_bedrock` **passes at `85ebf2739` and fails at `e69498f6c`** with the same `_MalformedLLMResponseError`, so it was introduced by `e69498f6c` ("fix(composer): reject malformed advisor checkpoint envelopes"), a direct `release/0.8.1` commit that is **not part of S1**. `p5_budget_exhaustion` already fails at `85ebf2739`, so it predates S0 and S1 (M, `$L/rev-85ebf2739.log`, `$L/rev-e69498f6c.log`, `$L/critique0/pre-s1-*.log`, `$L/critique-1/crit1-reds-*.log`). The other 8 are epoch and line-pin drift. No red in the set is attributable to S1. |
+| D11 | **Restore checks only the projection's own structure. The value position accepts any JSON value, for row_union, coalesce and `sources` alike.** Restore still rejects: a plain map where a projection must be, a missing or foreign schema tag, extra envelope keys, a non-list `items`, an item that is not a 2-list, a non-`str` key, and a duplicate key. The row_union error strings stay byte-identical. | The dispatch audit is opened before any schema gate, and a malformed `set_pipeline` is still projected (`tool_batch.py:1120-1135`, `audit.py:639-640`). Persistence then restores it (`audit_storage.py:103`). Today the row_union arm's `type(item[1]) is not str` check turns an ordinary planner argument error into `AuditIntegrityError` at persistence: M, `$L/critique0/probe_malformed_e2e.log` through the real compose loop ("row_union_int_connection: status=arg_error ... AuditIntegrityError"), and `$L/critique0/probe_malformed_roundtrip.log` for `{'a': 1}` and `{'a': None}`. Extending that check to coalesce and `sources` would spread the defect, and it breaks R2 condition 1 (lossless), because restore would reject its own projection's output. The value check was never what guards integrity: both restore callers compare `primitive_canonical_json(restored)` with the stored generic `arguments_canonical` (`pipeline_commit.py:112`, `audit_storage.py:106`), which catches any value tamper. No preimage changes, because `project` is untouched. T3 therefore fixes the row_union arm as well. |
+| D12 | **The frontend content-equality check is recorded, not changed** (§1.4 item 10). | It is a UI freshness heuristic, not a hash consumer; the server re-runs preflight at execute. It already disagrees with the backend on row_union order since `49825dd86`. Changing it adds a frontend rebuild and a surface the brief does not name. The lead or John decides whether to widen scope. |
 
 ### 1.4 Out of scope: recorded here, not fixed
 
@@ -95,8 +100,9 @@ The lead files them.**
    - Measured on `examples/fork_coalesce/settings_union_last_wins.yaml`: the authored order `[path_b, path_a]` is
      restored as `[path_a, path_b]`, and the collision winner flips from `path_a` to `path_b` (M,
      `$L/probes/probe_envelope_order.log`).
-   - Nothing detects it, because `validate_run_execution_input` (`envelope.py:559`) and the digests compare without
-     regard to order.
+   - Nothing detects it, because `validate_run_execution_input` (`envelope.py:599`), the restore-path comparison
+     `payload.executable_config != deep_thaw(frozen.executable_config)` (`envelope.py:559`) and the digests all
+     compare without regard to order.
    - Fixing it touches the persisted `run_execution_inputs.envelope`, so it raises the same epoch question as
      Defect B. It needs John's decision and its own ticket. **Until it lands, the order that T3 to T5 bind at approval
      is not the order that durable web runs execute.** The handover must say this plainly.
@@ -107,11 +113,12 @@ The lead files them.**
    `set_pipeline` only (`audit.py:639-640`). The `arguments_hash` of an `upsert_node` that carries coalesce or row_union
    `branches` is RFC 8785 and blind to their order. The state it produces is bound by `composition_content_hash`
    after T3. The per-call audit hash is not, and it is never re-derived from stored rows. Record it; do not fix it here.
-4. **`_pending_interpretation_validation_candidate_digest`** (`sessions/pending_interpretation.py:1560`) is an
+4. **`_pending_interpretation_validation_candidate_digest`** (`sessions/pending_interpretation.py:1561`) is an
    order-blind raw hash over nodes. Resolving an interpretation does not reorder branches, so the gap is practically
    unreachable. Low priority.
-5. **`pipeline_planner.py:3870` sorts the planner's `current_state`.** It is inert today (D2). If the planner ever
-   receives a non-empty state, it becomes a second Defect-A site.
+5. **`pipeline_planner.py:3870` sorts the planner's `current_state`.** It is inert on freeform, which only plans an
+   empty pipeline. Guided-full still sends it a non-empty state (`composer/service.py:4435`), so on guided-full it is
+   a live second Defect-A site (D2). Guided mode is being removed; if it is not, this needs its own fix.
 6. **The table comment on `composition_rejection_events` is false for ARG_ERROR rows.** The comment is at
    `sessions/models.py:1679` and says the table holds the "EXACT serialized tool response the planner saw". For those
    rows the table holds `{error_class, error_message}`, and its `error_code` column holds the exception class
@@ -122,13 +129,21 @@ The lead files them.**
 8. **Six epoch doc, website and receipt pins already fail on base (65 against 66).** The brief forbids editing them.
    After T6 they will expect 67; their count does not change.
 9. **Planner-turn cost has no adopted definition.** `understand-docs.md` §3 proposes one, for John to accept.
+10. **The frontend content-equality check stays order-blind (D12).** `frontend/src/lib/compositionContent.ts:17-22`
+    says its field set is the one the backend hashes into `composition_content_hash` and must be kept in step, but its
+    `deepEqual` (`:40-66`) ignores object key order. `stores/subscriptions.ts:70` uses it to skip the clear and
+    re-validate on a version bump. After T3 and T4 the backend treats a reorder of coalesce branches or of `sources`
+    as a content change; the frontend keeps the old verdict on screen. That is already true of row_union order today.
+    The run gate is unaffected (the server re-runs preflight at execute). Fixing it is a small frontend change plus a
+    rebuild.
 
 ### 1.5 The ordering rule (hard)
 
 The tasks run T1 → T2 → T3 → T4 → T5 → T6. **T6 (the epoch) is the last commit**, and T3 to T6 land and deploy
 together:
 - after T3, an epoch-66 store cannot read its own coalesce-map proposals or dispatch envelopes;
-- after T4, it cannot read any row whose pipeline carries a `sources` map.
+- after T4, it cannot read any row that carries a composition content hash (every proposal with a present base,
+  whatever its pipeline shape; D3), nor any row whose arguments carry a `sources` map.
 
 No commit between T3 and T6 may be merged or deployed on its own.
 
@@ -158,7 +173,11 @@ cd $W && $PY -m pytest -n 0 -p no:cacheprovider -o "pythonpath=$W/src $W/elspeth
 | Persistence keeps key order | `nodes`, `arguments_json` and `arguments_redacted_json` are SQLAlchemy `JSON`, not JSONB, and no serializer is overridden in `src/elspeth/web` | R, `understand-hash.md` §4 |
 | Execution envelope alphabetises (out of scope, §1.4 item 1) | admitted `zeta,alpha`; restored `alpha,zeta`; the `last_wins` winner flips | `$PY $L/probes/probe_envelope_order.py` → `probes/probe_envelope_order.log` (M) |
 | Epoch | `SESSION_SCHEMA_EPOCH = 66` (`sessions/models.py:362`), `_COORDINATION_HARD_CUT_EPOCH = 66` (`sessions/schema.py:39`), and exact equality is enforced at `schema.py:534`. No other worktree is at 67 | R; worktree loop over `*/src/elspeth/web/sessions/models.py` (M, 2026-09-24) |
-| **Base-red set (10 ids)** | 6 epoch doc, website and receipt pins (65 against 66): `test_release_site_contract::test_get_started_has_runnable_cli_and_complete_composer_paths`, `test_release_version_surfaces::{test_operator_schema_version_examples_match_live_constants, test_scenario_b_runbook_record_matches_live_release_derivation}`, `test_readme_release_surface::test_readme_operational_cutover_states_the_live_schema_epochs`, `test_azure_container_apps_runbook_contract::{test_compatibility_record_is_byte_bound_to_the_live_derivation, test_every_epoch_literal_matches_the_live_constants}`. 2 line-pinned: `test_session_db_mutation_authority::{test_live_connection_domain_classification_is_exact, test_session_schema_authority_is_exact_contained_and_bidirectional}`. Plus `test_compose_loop_interpretation_review_dispatch::test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion` and `test_composer_bedrock::test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides` (`_MalformedLLMResponseError`). **These are exactly the 10 FAILED ids of the S1 gate at `d5f8c5aac`** | `understand-hash-epochpins.log`, `probes/p5_base.log`, `plan-bedrock-base.log` (M); the S1 gate's `pytest.log` |
+| **Base-red set (10 ids)** | 6 epoch doc, website and receipt pins (65 against 66): `tests/unit/website/test_release_site_contract.py::test_get_started_has_runnable_cli_and_complete_composer_paths`, `tests/unit/docs/test_release_version_surfaces.py::test_operator_schema_version_examples_match_live_constants`, `tests/unit/docs/test_release_version_surfaces.py::test_scenario_b_runbook_record_matches_live_release_derivation`, `tests/unit/docs/test_readme_release_surface.py::test_readme_operational_cutover_states_the_live_schema_epochs`, `tests/unit/web/test_azure_container_apps_runbook_contract.py::test_compatibility_record_is_byte_bound_to_the_live_derivation`, `tests/unit/web/test_azure_container_apps_runbook_contract.py::test_every_epoch_literal_matches_the_live_constants`. 2 line-pinned: `tests/unit/architecture/test_session_db_mutation_authority.py::test_live_connection_domain_classification_is_exact`, `tests/unit/architecture/test_session_db_mutation_authority.py::test_session_schema_authority_is_exact_contained_and_bidirectional`. Plus `tests/unit/web/composer/test_compose_loop_interpretation_review_dispatch.py::test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion` and `tests/unit/web/test_composer_bedrock.py::test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides` (`_MalformedLLMResponseError`). **These are exactly the 10 FAILED ids of the S1 gate at `d5f8c5aac`.** Re-run at `41125ac74`: 10 failed, 3 passed, and the failing ids are exactly these 10 | `understand-hash-epochpins.log`, `probes/p5_base.log`, `plan-bedrock-base.log`, `critique0/base-red-rerun.log` (M); the S1 gate record is `summary.txt` and `pytest.log` under `.claude/worktrees/strict-tool-contracts-s1/.claude/lanes/s1/gate/20260923T221535Z-strict-tool-contracts-s1-2552647/`, relative to the main checkout root (gitignored lane state, so it may be gone) |
+| **Attribution of the two non-drift reds** | The tree before S1 is `c4c52c110^1` = `e69498f6c` (the parent of S1's root commit `34f0fed73`). `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`: it was introduced by `e69498f6c`, outside S1. `p5_budget_exhaustion` fails at `85ebf2739`, `e69498f6c` and `c4c52c110` with the same hash pair. Its assertion compares two computed values (`result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state))`, `test_compose_loop_interpretation_review_dispatch.py:3773`), not a literal pin | `$L/rev-85ebf2739.log` (1 passed), `$L/rev-e69498f6c.log` (1 failed), each with `ELSPETH_FILE` inside its export; `critique0/pre-s1-*.log`; `critique-1/crit1-reds-*.log` (M) |
+| Restore rejects non-string row_union branch values (base defect, D11) | A planner `set_pipeline` whose row_union branch value is an int or null is an argument error in the loop, then `AuditIntegrityError` at persistence. Coalesce and `sources` with such values persist today | `critique0/probe_malformed_e2e.log` (real compose loop, 4 passed), `critique0/probe_malformed_roundtrip.log` (M) |
+| A reorder inside a stored dispatch envelope is accepted by construction | Reordering the projected row_union `items` and recomputing the envelope hash is ACCEPTED at base; a connection tamper is REJECTED, for coalesce too. Both restore callers compare against the RFC 8785 generic canonical, which sorts keys | `critique-1/probe_tamper.log` (M) |
+| Every content hash moves under T4 | The empty state's `to_dict()` has `sources: {}`, and its content hash moves under a T4-shaped projection. A test builder with `sources: {}` moves its authority canonical too | `critique-1/probe_sources_always.log`, `probe_golden_moves.log`, `probe_listform_pin.log` (M) |
 | Epoch docs that pass on base and must move with the constant | `docs/runbooks/staging-session-db-recreation.md` and `CHANGELOG.md:9-10`, both pinned by `tests/unit/docs/test_staging_session_recreation_policy.py` | R, and M in `understand-hash-epochpins.log` |
 | Appendix A fork fix | Corrected total = tool rows in all 13 DB copies. The old join gives 26 against 14 in db10. Per-(tool, outcome) totals equal `census.py`: 496 = 496 | `docs_appendix_a_corrected_dbs.py` → `docs-appendix-a-corrected-dbs.log` (M) |
 | T12 fixture on the corrected SQL | 8 groups unchanged, both negative controls unchanged. Fork phase: corrected n=2, old n=4, and removing the session condition restores the over-count | `docs_t12_corrected_test.py` → `docs-t12-corrected.log` (M, 1 passed) |
@@ -235,46 +254,44 @@ cd $W && $PY -m pytest -n 0 -p no:cacheprovider -o "pythonpath=$W/src $W/elspeth
    - the masquerade `--check` count;
    - `check_contracts` exit code;
    - `generate_skill_inventory.py --check` exit code.
-3. Re-run the base-red set from §2 as one house-pytest invocation → `$L/t0-base-red.log`.
+3. Re-run the base-red set from §2 as one house-pytest invocation, using the full node ids from §2 →
+   `$L/t0-base-red.log`.
    - Record the 10 failing ids and their assertion messages.
    - Later tasks diff failure sets and messages against this log. Counts alone are not enough.
 4. **Golden capture for T3 and T4.** Build three fixed payloads with a small script, `$L/t0_golden.py`:
-   - a row_union pipeline with map branches;
-   - a pipeline using the singular `source` field with a list-form coalesce;
+   - a row_union `set_pipeline` argument payload with map branches, using the singular `source` field and **no
+     `sources` key**;
+   - a `set_pipeline` argument payload using the singular `source` field, **no `sources` key**, and a list-form
+     coalesce;
    - a state dict whose `sources` map has a single entry.
+
+   Do **not** copy `_pipeline` from `test_row_union_authority_hashing.py:44-60` for the first two: it carries
+   `"sources": {}`, which T4 projects (D3), so a golden built from it moves at T4 by design (M,
+   `$L/critique-1/probe_golden_moves.log`).
 
    Print `composer_authority_canonical_json` of the first two, and the `composition_content_hash` of a
    `CompositionState` built from the third. Log to `$L/t0-golden.log`.
-   - The row_union and singular-`source` canonicals become byte pins in T3 and T4. They prove those preimages did not
-     move.
+   - The two argument canonicals become byte pins in T3 (test 9) and T4 (test 3). They prove that the row_union
+     branch projection and a `sources`-free payload did not move.
    - The single-entry `sources` hash is the **known positive for D3**. T4 must change it from the T0 value, which
-     proves that single-entry maps are projected too. Record both values in the T4 log.
+     proves that single-entry maps are projected too. Record both values in the T4 log. The 4 literal pins in
+     `test_state_serialisation_contract.py::test_persisted_shape_content_hashes_are_pinned` (`:155-181`) are a second
+     known positive for T4 and a known negative for T3 (their coalesce and row_union shapes are list-form).
 5. **Scope check for T4, by walking the registry (not by grep).** Write a fresh `$L/t0_sources_scope.py` that walks
    the registered loop tool schemas through `_registered_tool_schema`, the authority the transcript reader used. Its
    `maps.py` probe was not preserved in `$L/probes/`. List every tool whose **top-level** properties include `sources`.
-   - Expected: `set_pipeline` only.
+   - Expected: `set_pipeline` only (already measured: 42 tools, one hit, `$L/critique0/sources_scope.log`).
    - Positive control: `set_pipeline` must be found.
    - Negative control: the walk must not list `set_source`.
-   - If any other tool has a top-level `sources` property, **stop**. `tool_batch.py:577` hashes every tool's audit
-     arguments through the projection, so T4 would silently give another tool's field topology meaning.
-6. **Attribute the two base reds that are not pin drift (this decides E1's wording).** Eight of the 10 are epoch or
-   line-pin drift. The other two are:
-   - `p5_budget_exhaustion`, with a `for_graph` mismatch;
-   - `test_composer_bedrock::test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides`, which fails
-     with `_MalformedLLMResponseError` ("tool_calls is neither absent nor a sequence", `service.py:706`). That is the
-     shape an S1 admission or wire-decode change would produce on a fake message.
-
-   Run both at the pre-S1 base `85ebf2739`:
-   - export the tree with `git archive 85ebf2739 | tar -x -C $L/base-85ebf2739`;
-   - set `PYTHONPATH` to the export's `src` and `elspeth-lints/src`;
-   - check `elspeth.__file__`;
-   - log to `$L/t0-pre-s1-reds.log`.
-
-   If either passes at `85ebf2739`, S1 introduced it. E1 must then say so plainly, and the lead tells John that it
-   shipped in the S1 merge. Fixing it is not in this plan's scope.
-7. **Read the p5 test before T5.** Decide whether its `for_graph` expectation is a literal pin or a comparison of two
-   computed values, and record which in the T0 log. T5 uses the answer.
-8. **Finalization-path fixture for T2.** Find a compose-loop test that drives `finalization.changed` at
+   - This is a cheap control, not a live guard. Every projection caller is either gated on
+     `tool_name == "set_pipeline"` (`audit.py:639-640`, `:730-731`) or given a pipeline or state dict; `tool_batch.py:577`
+     is inside the `set_pipeline` required-control finalization (`:565-590`). If the walk finds another tool with a
+     top-level `sources` property, **stop and report**: a future caller could then give that field topology meaning.
+6. **Attribution of the two non-drift base reds: answered, no run needed** (§2, D10). `test_composer_bedrock` was
+   introduced by `e69498f6c`, outside S1; `p5_budget_exhaustion` predates S0. The implementer may re-confirm with a
+   `git archive c4c52c110^1` export (check `elspeth.__file__`), logging to `$L/t0-pre-s1-reds.log`. The comparison
+   point is **`c4c52c110^1` (`e69498f6c`)**, never `85ebf2739`. E1 records the answer (T1).
+7. **Finalization-path fixture for T2.** Find a compose-loop test that drives `finalization.changed` at
    `tool_batch.py:1373` or `:1477`. Candidates are `tests/unit/web/composer/test_required_control_autowire.py` and
    `tests/integration/web/composer/test_freeform_required_controls.py`. Confirm the fixture reaches that branch by
    instrumenting a copy in `$L`, not by reading the test name.
@@ -288,18 +305,18 @@ with the changes below. Re-anchor every OLD string first, because the line numbe
 
 | Edit | Where | Change from the draft |
 |---|---|---|
-| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. Because `c4c52c110` already contains S1, this matches known reds but does not prove they predate S1. State the result of T0 step 6 here: whether `p5_budget_exhaustion` and `test_composer_bedrock` pass at the pre-S1 base `85ebf2739`. If either passes there, say plainly that S1 introduced it. Still owed: the CHANGELOG line and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
+| E1 | status line (lines 5-8) | Use **variant B**. S1 is merged as `c4c52c110` and is on `origin/release/0.8.1`. **Replace "one commit per task on `85ebf2739`"**: the S1 branch is rooted on `e69498f6c` (= `c4c52c110^1`, the parent of S1's root commit `34f0fed73`), which is the S0 merge `85ebf2739` plus `e69498f6c` "fix(composer): reject malformed advisor checkpoint envelopes". Its full-suite gate at `d5f8c5aac` recorded `RESULT=FAIL`: 10 failed, 56,862 passed, `frozen=yes`. All 10 failed ids also fail at `c4c52c110`, where they form this lane's base-red set. Six are the epoch-66 doc, website and receipt drift, two are line-pinned `test_session_db_mutation_authority`, and the last two are the `p5_budget_exhaustion` advisor-gate test and `test_composer_bedrock`. State the measured attribution (D10): `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`, so it came in with `e69498f6c`, not with S1; `p5_budget_exhaustion` already fails at `85ebf2739`, so it predates S0 and S1; none of the 10 is attributable to S1. Do not write that S1 introduced any of them. Still owed: the CHANGELOG line and dev deployment acceptance. Add: "R1 and R2 were ruled on 2026-09-24 (§1, §6.3): S2 and S3 are withdrawn; S4 and S5 stay optional. The branch-order defects the panel found are handled in `docs/plans/2026-09-24-composer-r1-r2-rulings-and-branch-order-fixes.md`." |
 | E2 | new opening paragraph of §1 | as drafted |
 | E3 | §1.1 "delivered as" | as drafted |
 | E4 | §1.2 bullets | as drafted |
-| E5 | §2.3 last row, replaced by three rows | as drafted. This is the correction to "shape and value cannot be told apart", and the citation of `composition_rejection_events` as the unredacted store |
+| E5 | §2.3 last row, replaced by three rows | As drafted, with one citation fix: write "`persist_compose_turn` (`sessions/service.py:6650`; the `record_composition_rejection` call is at `:6862`)", not `:6862` alone. This is the correction to "shape and value cannot be told apart", and the citation of `composition_rejection_events` as the unredacted store |
 | E6, E7 | S2 and S3 headings, openings and closing line | as drafted (withdrawn, with the reopen trigger) |
 | E8 | §5.3 table rows 1 and 3 | as drafted |
 | E9 | §5.3 sample-size paragraph, plus a new **§5.4 Option-tool split** | As drafted. It defines the options-as-string signature, other-field shape, inside-options content and other rules, and says plainly that the first two classes are not measurable until the `(loc, code)` pairs are persisted (§1.4 item 7). |
 | E10 | §6.1 risk 1 | as drafted |
 | E11 | §5.2 `wire_decode` row | as drafted |
 | E12 | §6.3 items 1-2 | as drafted (R1 ruled no with the trigger; R2 ruled yes with the five conditions) |
-| E13 | "S1 as implemented" bullet | **Required, not optional.** Map each pre-merge hash to its hash on `release/0.8.1`, and drop "the merge on John's word" from the owed list |
+| E13 | "S1 as implemented" bullet | **Required, not optional.** Map each pre-merge hash to its hash on `release/0.8.1`, and drop "the merge on John's word" from the owed list. Also correct "based on `85ebf2739`" (master plan line 1008) to "based on `e69498f6c` (`c4c52c110^1`: the S0 merge `85ebf2739` plus the advisor checkpoint envelope fix)". Leave the T11 byte comparison at line 1066 ("a clean export of `85ebf2739`") as recorded: that comparison was made against `85ebf2739`, and the `src` changes in `e69498f6c` are the advisor envelope parsing in `web/composer/service.py` and a `RecursionError` catch in `plugins/infrastructure/clients/json_utils.py`, neither of which declares a tool (`git show --stat e69498f6c`) |
 | E14 | Appendix A SQL and a new "Session-scoped join (corrected 2026-09-24)" bullet | As drafted. Also add one sentence saying that `c.msg_id = t.parent_assistant_id` is the tighter alternative and gives the same counts today. |
 | E15 | §6.2 escape-hatch bullet | as drafted |
 | E16 | line 656 ("no producer until S2") and lines 380-382 ("confirm each by reading before S2") | Replace with "S2 is withdrawn (§6.3)". Leave the rest of the wording as it is |
@@ -363,7 +380,7 @@ Add one sentence to the docstring: the transcript keeps the model's key order, b
    `_replace_llm_tool_call_arguments` mutates `function["arguments"]` in place (`understand-transcript.md` §4 trap).
    - Assert that turn 2's replayed `set_pipeline` keeps `zeta, alpha` for coalesce, row_union and `sources`.
    - **RED reason:** it is sorted.
-3. **Compose-loop test, finalization path (callers `:1377`/`:1481`).** Use the T0 step 8 fixture, with a coalesce
+3. **Compose-loop test, finalization path (callers `:1377`/`:1481`).** Use the T0 step 7 fixture, with a coalesce
    whose branches are reversed.
    - Assert the order on the provider turn after finalization.
    - **This is the one path whose order preservation has not been executed.** `wire_required_controls` and
@@ -420,45 +437,72 @@ full suite covers it.
   `branches` is a `dict`, replace `branches` with `{"schema": <that node type's tag>, "items": [[alias, connection], ...]}`.
   List branches pass through unchanged. Do not read `merge` or `policy` (D4).
 - **`restore_composer_authority_payload`:** for the same node types, a `dict` `branches` must be exactly the
-  projection carrying **that node type's** tag. Each item is a 2-list of `str` with no duplicate alias. Anything else
-  raises `ValueError`.
+  projection carrying **that node type's** tag. Each item is a 2-list whose first element is a `str` alias, with no
+  duplicate alias. **The second element may be any JSON value (D11).** Anything else raises `ValueError`.
+  - This removes today's `type(item[1]) is not str` check from the row_union arm too. That is a **base defect fix**:
+    today a planner row_union branch value that is an int or null is an argument error in the loop but
+    `AuditIntegrityError` at persistence (§2). Integrity does not depend on the check: both restore callers compare
+    the restored payload with the stored generic canonical (`pipeline_commit.py:112`, `audit_storage.py:106`).
   - Keep the row_union error strings byte-identical ("row-union authority projection branches are malformed" and
     "...branch item is malformed"). Use "coalesce authority projection ..." for coalesce.
-  - This is R2 conditions 1 to 4 on an audit-internal surface.
+  - This is R2 conditions 1 to 4 on an audit-internal surface. Condition 5 (reject an empty `[]`) is a wire-decode
+    rule and does **not** apply here: restore of `items: []` gives `{}` today and must keep doing so, because an
+    empty map is a legal projected value (M, `$L/critique-1/probe_listform_pin.log`).
+- **Order inside a stored dispatch envelope is bound only by the envelope's own hash, by design.** Both restore
+  callers check that the restored payload's RFC 8785 canonical equals the stored generic canonical (key order is
+  lost there) and that re-projecting it reproduces the stored authority canonical. A reorder of the projected
+  `items` with a recomputed envelope hash therefore passes, at base for row_union too (M,
+  `$L/critique-1/probe_tamper.log`). Order is bound where a stored hash is compared with one recomputed from an
+  order-preserving copy: `sessions/service.py:2373` (`row.tool_arguments_hash != composer_authority_hash(row.arguments_json)`)
+  and `pipeline_commit.py:413`. Test 6 targets those.
 - **Docstrings:** update the module docstring, both function docstrings, and `pipeline_proposal.composition_content_hash`.
-  Its sentence "Non-row-union content retains the historical preimage" becomes false and must change.
+  Its sentence "Non-row-union content retains the historical preimage" becomes false and must change. The module
+  docstring states the order-binding note above.
 - Record the pre-existing latent ambiguity in the module docstring; do not fix it. A real branch map whose keys are
   literally `schema` and `items` would look like a projection. It is harmless, because restore runs only on stored
   projections, and a real map with those keys is itself projected before it is stored.
+- **Composer coalesce always runs under the default `union_collision_policy=last_wins`** (D4); the tests say so in
+  their docstring rather than pretending to vary it.
 
 **New test file:** `tests/unit/web/composer/test_coalesce_authority_hashing.py`. Mirror
 `test_row_union_authority_hashing.py`, which came in with `49825dd86`. Copy its small builders locally instead of
-importing a private helper across test modules.
+importing a private helper across test modules, but **build argument payloads with the singular `source` field and no
+`sources` key** (T0 step 4), so that T4 does not move this file's canonicals. `CompositionState`-based tests are
+comparative (two states that differ only in order) and are unaffected by T4.
 
 | # | Test | RED expectation |
 |---|---|---|
-| 1 | Reordering a non-first coalesce map changes `composition_content_hash`, parametrised over `merge=union` with `policy` `last_wins` and `first_wins`, `merge=nested`, and `merge=select` | equal hashes (the gap) |
+| 1 | Reordering a non-first coalesce map changes `composition_content_hash`, parametrised over the arrival `policy` ∈ {`require_all`, `best_effort`, `first`} crossed with `merge` ∈ {`union`, `nested`, `select`}. `policy` is the arrival policy, not the collision rule (D4); do not put `last_wins`/`first_wins` in it | equal hashes (the gap) |
 | 2 | ... changes `pipeline_draft_hash` | equal |
 | 3 | ... changes `composer_authority_hash`, `_pipeline_private_arguments_hash`, `_pipeline_audit_payload_hash` and `_composition_state_data_content_hash` | equal |
 | 4 | ... changes the `set_pipeline` dispatch binding (`begin_dispatch` authority canonical and hash) without mutating the arguments | equal |
 | 5 | Redacted storage keeps the tool's map shape in the generic canonical, and the authority canonical is the projection (`audit_storage.py:250`) | the authority canonical is still a map |
-| 6 | A persisted binding whose authority members were reordered or tampered with is rejected (`pipeline_commit._validate_pipeline_authority_binding`, `audit_storage._validated_invocation_arguments`) | accepted |
-| 7 | Restore rejects: a plain dict on coalesce, the row_union tag on a coalesce node, the coalesce tag on a row_union node, a duplicate alias, a non-`str` connection, and a 3-item entry | the plain dict passes through |
-| 8 | **Characterization:** list-form coalesce gives `arguments_canonical == authority_arguments_canonical`, byte for byte | green on arrival |
-| 9 | **Characterization:** the row_union canonical equals the T0 golden byte for byte | green on arrival |
+| 6a | **Characterization:** a content tamper on the projected coalesce items (a changed connection, envelope hash recomputed) is rejected by `PipelineDispatchAuditBinding.from_persisted_envelope` | green on arrival: already rejected at base via the generic canonical (M, `probe_tamper.log`) |
+| 6b | **Reorder detection where it exists:** a proposal row whose `arguments_json` has its coalesce branches reordered, against the original `tool_arguments_hash`, is rejected with "pipeline proposal row arguments hash mismatch" (`sessions/service.py:2373`); mirror it at `pipeline_commit.py:413` ("authoritative pipeline arguments do not match the proposal row") | accepted (the two hashes are equal at base) |
+| 7 | Restore rejects: a plain dict on coalesce, the row_union tag on a coalesce node, a duplicate alias, a non-`str` alias, a non-list item and a 3-item entry | the plain dict and the row_union tag pass through a coalesce node unchanged |
+| 7c | **Characterization:** restore rejects the coalesce tag on a row_union node | green on arrival: the row_union arm already rejects any foreign tag (`authority_hashing.py:74`) |
+| 8 | **Characterization:** list-form coalesce in a `sources`-free payload gives `arguments_canonical == authority_arguments_canonical`, byte for byte | green on arrival |
+| 9 | **Characterization:** the row_union argument canonical equals the T0 golden byte for byte | green on arrival |
 | 10 | **Characterization of R2 conditions 1-2:** `restore(project(p)) == p`, with coalesce key order preserved (compare `list(...)`, not `==`) | green on arrival |
 | 11 | The runtime preflight cache key (`RuntimePreflightKey.state_content_hash`) differs for two states that differ only in coalesce order | equal (I, confirm in RED) |
+| 12 | **Base defect (D11):** restore accepts a non-`str` branch value (int, null, object) for row_union and for coalesce, and `restore(project(p)) == p` for it | row_union raises `ValueError` |
+| 13 | **Base defect (D11), end to end:** an argument-error `set_pipeline` whose row_union branch value is `1`, and one whose coalesce branch value is `null`, both go through `redacted_tool_invocation_content_and_envelope` without error, and `from_persisted_envelope` round-trips them. Lift `$L/critique0/test_probe_malformed_e2e.py` (real compose loop, run with `-p tests.unit.web.composer.conftest`) | the row_union case raises `AuditIntegrityError` (the coalesce case is green at base and must stay green) |
 
 **Mutation controls:**
-- Remove `"coalesce"` from the map. Tests 1 to 7 and 11 must go RED.
+- Remove `"coalesce"` from the map. Tests 1 to 5, 6b, the RED sub-cases of 7, and 11 must go RED. (6a and 7c stay
+  green by construction; say so in the log.)
 - Change one character of the row_union tag. Test 9 must go RED.
 - In restore, drop the duplicate-alias check. The duplicate case of test 7 must go RED.
-- In `project`, iterate over `sorted(branches.items())`. Tests 1 to 4 and 10 must go RED.
+- In restore, put back `type(item[1]) is not str`. Tests 12 and 13 must go RED.
+- In `project`, iterate over `sorted(branches.items())`. Tests 1 to 4, 6b and 10 must go RED.
+
+**Known negative:** `test_state_serialisation_contract.py::test_persisted_shape_content_hashes_are_pinned` pins 4
+content hashes whose coalesce and row_union shapes are list-form (`:120-133`, `:155-181`). T3 must **not** move them.
 
 **Re-run** (they build coalesce nodes and touch hashes):
 - `test_row_union_authority_hashing.py`, `test_sparse_argument_presence.py`, `test_owned_composition_state_authority.py`,
   `test_pipeline_commit_operation_authority.py`, `test_compose_loop_persistence.py`, `test_state.py`,
-  `test_state_serialisation_contract.py` and `test_pipeline_planner.py`;
+  `test_state_serialisation_contract.py` (all 4 pins unchanged) and `test_pipeline_planner.py`;
 - `tests/unit/web/sessions/test_tool_invocation_redaction.py`, `test_composer_proposals.py` and `test_routes.py`;
 - `tests/integration/web/composer/test_pipeline_proposal_lifecycle.py`;
 - the `guided/` set in `understand-hash.md` §7.
@@ -469,7 +513,9 @@ coalesce is a **stop condition**.
 
 **Gates:** the every-task set.
 
-**Commit:** `fix(composer): bind coalesce mapping-branch order in the authority projection (Defect B)`.
+**Commit:** `fix(composer): bind coalesce mapping-branch order in the authority projection (Defect B)`. The body
+states that restore now accepts any JSON branch value for row_union too (D11), which fixes the base
+`AuditIntegrityError` on a persisted argument error, and that no preimage moves for list-form or row_union payloads.
 
 ### T4 — Defect B, part 2: bind multi-source `sources` order
 
@@ -477,35 +523,70 @@ coalesce is a **stop condition**.
 - **`project`:** if the top-level `sources` is a `dict`, replace it with
   `{"schema": "composer.ordered-sources.v1", "items": [[name, spec], ...]}`. This applies to every dict, including
   `{}` and single-entry maps (D3). A top-level `source` is untouched.
-- **`restore`:** a top-level `dict` `sources` must be exactly that projection. Each item is a 2-list of a `str` name
-  and a `dict` spec, with no duplicate name. Anything else raises `ValueError`.
-- The T0 step 5 scope check must have passed. **Every** projection caller passes a flat pipeline or state dict:
-  `service.py:575/593/646/682`, `pipeline_planner.py:3427/3454/3533`, `pipeline_custody.py:263`, `redaction.py:2515`,
-  `audit.py:639`, and `pipeline_proposal.py:610/797`.
+- **`restore`:** a top-level `dict` `sources` must be exactly that projection. Each item is a 2-list whose first
+  element is a `str` name, with no duplicate name. **The spec position accepts any JSON value (D11)**: a planner
+  `sources: {"main": null}` or `{"main": "csv"}` is an argument error in the loop, and it must still persist (M, both
+  persist today: `$L/critique0/probe_malformed_e2e.log` "sources_non_dict_spec ... OK",
+  `probe_malformed_roundtrip.log`). Anything else raises `ValueError`. `items: []` restores to `{}`.
+- The T0 step 5 scope check must have passed. **Every** caller of the four authority functions, from
+  `grep -rn "project_composer_authority_payload\|restore_composer_authority_payload\|composer_authority_hash\|composer_authority_canonical_json" src/elspeth`
+  (imports excluded; positive control: the grep must hit `audit.py:639`), passes a flat pipeline or state dict or is
+  gated on `set_pipeline`: `audit.py:639/640/730/731`, `audit_storage.py:103/108/250`, `tool_batch.py:577`,
+  `pipeline_commit.py:109/114/413`, `pipeline_planner.py:3427/3454/3533`, `pipeline_custody.py:263`,
+  `pipeline_proposal.py:610/797`, `redaction.py:2499/2515`, and `sessions/service.py:575/593/646/682/2373/7735/11882/12571`
+  (M, 40 hits outside `authority_hashing.py` at `41125ac74`: 13 import lines and the 27 call sites listed).
 
 **New test file:** `tests/unit/web/composer/test_sources_authority_hashing.py`.
 
 1. Reordering a two-entry `sources` map changes `composition_content_hash`, the draft hash, the private-arguments hash
    and the dispatch binding. RED expectation: equal.
-2. Restore rejects: a plain dict, a wrong tag (including either branch tag), a duplicate name, a non-object spec, and a
-   3-item entry. RED expectation: the plain dict passes.
-3. **Characterization:** a pipeline using singular `source` has a canonical byte-equal to the T0 golden.
-4. **Characterization:** `restore(project(p)) == p`, with order preserved.
+2. Restore rejects: a plain dict, a wrong tag (including either branch tag), a duplicate name, a non-`str` name, a
+   non-list item and a 3-item entry. RED expectation: the plain dict passes.
+3. **Characterization:** a `sources`-free payload using the singular `source` has a canonical byte-equal to the T0
+   golden.
+4. **Characterization:** `restore(project(p)) == p`, with order preserved, including `{}` and a single entry.
+5. **Characterization, end to end (D11):** an argument-error `set_pipeline` with `sources: {"main": null}` goes through
+   `redacted_tool_invocation_content_and_envelope` and `from_persisted_envelope` without error. It is green at base
+   and must stay green; the mutation below proves it guards something.
+6. **Known positive for D3:** the single-entry `sources` content hash from T0 step 4 differs from its T0 value.
 
 **Mutation controls:**
-- Remove the `sources` arm. Tests 1 and 2 must go RED.
+- Remove the `sources` arm. Tests 1, 2 and 6 must go RED.
 - Project with `sorted(...)`. Test 1 must go RED.
+- In restore, require a `dict` spec. Test 5 must go RED.
 
-**Expected pin moves.** Every `CompositionState` has a `sources` dict, so **every** `composition_content_hash` moves,
-and so does every draft hash whose pipeline uses the `sources` map.
+**Expected changes.** Every `CompositionState` has a `sources` dict (D3), so **every** `composition_content_hash`
+moves, and so does every argument canonical, draft hash and dispatch binding whose payload carries a `sources` map
+(including `sources: {}`).
+
+- **`tests/unit/web/composer/test_state_serialisation_contract.py::test_persisted_shape_content_hashes_are_pinned`**:
+  all 4 literals (`:159`, `:164`, `:169`, `:174`) move. Re-pin them in this commit. The test's own failure message
+  says "Re-pin only after deciding what happens to already-persisted states"; the answer is T6 (epoch cut, stores
+  recreated), and the commit body says so.
+- **`tests/unit/web/composer/test_row_union_authority_hashing.py::test_set_pipeline_list_branches_round_trips_through_generic_and_authority_audit_pairs`**
+  (`:316`) asserts `persisted["arguments_canonical"] == persisted["authority_arguments_canonical"]` over a payload
+  with `sources: {}`. It goes red at T4 (M, `$L/critique-1/probe_listform_pin.log`). Rewrite it, do not weaken it:
+  assert that the list-form `branches` are identical in both canonicals, that the authority `sources` is the
+  `composer.ordered-sources.v1` projection, and that
+  `canonical_json(restore_composer_authority_payload(json.loads(authority_canonical))) == arguments_canonical`.
+  That is the only test in `tests/` asserting generic == authority canonical (R, grep for both orders of the
+  comparison; `test_owned_composition_state_authority.py:228` compares with a projection it computes, so it follows
+  the change without edits).
+- The other tests in `test_row_union_authority_hashing.py` build `sources: {}` too; they compare two reorders, or
+  compute their expectation through the projection, and should stay green (I, from reading `:138-310`). Any that
+  does not is a stop condition.
 
 - **Frontend fixture:** `src/elspeth/web/frontend/src/api/__fixtures__/gateProposalProjection.json:9` pins a
   `draft_hash`. The pipeline it is built from uses `sources: {"primary": ...}`
   (`tests/unit/web/composer/guided/test_gate_projection_fixture.py:90-97`), so the fixture **will** regenerate (I).
-  Confirm that it goes red, then regenerate it by the method that test documents.
-- Then run the frontend test that reads the fixture:
-  `cd $W/src/elspeth/web/frontend && npx vitest run src/api/guidedDecoder.gate.test.ts`. No frontend source changes,
-  so no frontend rebuild or deploy step is needed.
+  Confirm that it goes red, then regenerate it by the method that test documents (`json.dumps(..., indent=2,
+  sort_keys=True)`, per its docstring at `:17-19`).
+- Then run the frontend test that reads the fixture. The worktree has no `node_modules` (the main checkout does), so
+  install first: `cd $W/src/elspeth/web/frontend && npm ci > $L/t4-npm-ci.log 2>&1; echo exit=$?`, then
+  `npx vitest run src/api/guidedDecoder.gate.test.ts > $L/t4-vitest.log 2>&1; echo exit=$?`. `node_modules` is
+  excluded through `.git/info/exclude`, so it cannot be staged. Do not symlink the main checkout's `node_modules`:
+  vitest writes its cache under it. If `npm ci` cannot run (no network), record that and stop the frontend step; the
+  lead runs it. No frontend source changes, so no frontend rebuild or deploy step is needed.
 - Every other moved literal must trace to a payload with a `sources` map or a `CompositionState`. Regenerate it by its
   producer's method and list it in the commit body.
 - `test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion` is already red on its `for_graph`
@@ -515,7 +596,8 @@ and so does every draft hash whose pipeline uses the `sources` map.
 
 **Gates:** the every-task set.
 
-**Commit:** `fix(composer): bind multi-source ingest order in the authority projection (Defect B)`.
+**Commit:** `fix(composer): bind multi-source ingest order in the authority projection (Defect B)`. The body lists
+every re-pinned literal and rewritten assertion, each traced to a payload or state that carries `sources`.
 
 ### T5 — Defect B, part 3: the advisor sign-off fingerprint binds the same order
 
@@ -539,10 +621,11 @@ or its unit sibling.
 
 **Re-run:** `tests/unit/web/sessions/test_completion_gate_roundtrip.py`, `tests/unit/web/execution/test_routes.py`,
 `test_compose_loop_interpretation_review_dispatch.py`, and every file that `grep -rln "for_graph" tests/` finds.
-The p5 test depends on the T0 step 7 finding:
-- **If its `for_graph` is a literal pin,** T5 re-pins it: it is the fingerprint's own test, and T5 changes the
-  fingerprint's producer. If the test is still red after the re-pin, record the remaining cause against the T0 log.
-- **If it compares computed values,** it stays red for its base reason. Record its new hash pair against the T0 log.
+The p5 test is **not** a literal pin: it asserts
+`result.advisor_gate_decision == AdvisorGatePassed(completion_gate_fingerprint(state))`
+(`test_compose_loop_interpretation_review_dispatch.py:3773`), comparing the pre-turn state's fingerprint with the
+decision taken after the turn's `set_metadata` renamed the pipeline (the fingerprint binds metadata since
+`d7541609c`). T5 cannot re-pin it. It stays red for its base reason; record its new hash pair against the T0 log.
 
 **Gates:** the every-task set.
 
@@ -581,12 +664,17 @@ number.
    - `:204` "session-epoch-66/Landscape-epoch-43 record" → 67;
    - `:822` "# expect 66 (== SESSION_SCHEMA_EPOCH)" → 67.
 
-   `test_staging_session_recreation_policy.py:31-35` pins each of these.
+   `test_staging_session_recreation_policy.py:31-35` pins each of these except line 7 ("from 53 to 66"), which no
+   test pins; change it anyway.
 10. `CHANGELOG.md:9-10`, in the 0.8.1 section:
     - `` `SESSION_SCHEMA_EPOCH` advances from 53\nto 66 `` → `to 67`. **The line break between "53" and "to" is part
       of the asserted string (`test_replica_schema_cutover_belongs_to_0_8_1`).**
     - Add "ordered coalesce branches and source order in composer authority hashes" to the epoch's reason list.
     - Add one "Fixed" line for Defect A (the transcript keeps planner key order) and one for Defect B.
+    - **Also `CHANGELOG.md:55-59`**, two present-tense statements that no test pins (a grep over `tests/` for
+      `session 66|below epoch|including epoch` finds nothing), so nothing turns red if they go stale:
+      - `:55-56` "Session databases below epoch 66 (including epoch 65)" → "below epoch 67 (including epoch 66)";
+      - `:59` "(session 66, Landscape 43)" → "(session 67, Landscape 43)".
     - The target version is 0.8.1. The base is `release/0.8.1`, and the test pins the clause to the 0.8.1 section.
 
 **Do not touch** the 6 base-red doc, website and receipt pins (§2). After T6 they fail against 67 instead of 66. That
@@ -597,7 +685,12 @@ is the same ids, with a new expected value.
 - `tests/unit/docs/test_staging_session_recreation_policy.py`, which must pass;
 - the base-red set, where the failure-set diff against `$L/t0-base-red.log` must show the same 10 ids;
 - `tests/unit/architecture/test_session_db_mutation_authority.py`. It is line-pinned and already red. The comment in
-  `schema.py` shifts lines, so diff its messages and do not re-pin it.
+  `schema.py` shifts lines, so diff its messages and do not re-pin it;
+- the stale-epoch refusals, which prove the operational claim that an epoch-66 store is refused at 67:
+  `tests/unit/web/sessions/test_engine.py::test_initialize_session_schema_rejects_stale_user_version` (sets
+  `PRAGMA user_version = SESSION_SCHEMA_EPOCH - 1`, `:218`) and
+  `tests/unit/web/sessions/test_schema.py::test_previous_epoch_rejection_does_not_rewrite_store` (`:519`). Both must
+  pass. Their PostgreSQL siblings are testcontainer ids and run in the lead's §6 stage.
 
 There is no RED/GREEN cycle here: the pins are the tests. As the mutation control, set only `models.py` to 67. Every
 session-DB test must then fail at `schema.py:534` ("coordination schema epoch mismatch"), which proves item 2 is
@@ -613,12 +706,17 @@ names the deploy obligation from §5.2.
 ## 4. Invariants to prove (in the handover)
 
 1. **The transcript keeps the model's order.** T2 tests 1 to 4, with the mutation log.
-2. **Row_union and singular-`source` preimages did not move.** The T3 test 9 and T4 test 3 goldens, captured at base
-   in T0.
+2. **The row_union branch projection did not move, and a `sources`-free payload using the singular `source` did not
+   move.** The T3 test 9 and T4 test 3 goldens, captured at base in T0 from payloads with no `sources` key. (A payload
+   that carries `sources`, even `{}`, moves at T4 by design, D3.)
 3. **Each order-semantic map is bound by every stored hash that re-derives it.** This covers content, draft,
    private-arguments, audit-payload, state-data, dispatch binding and fingerprint (T3, T4, T5).
-4. **Restore is strict.** The tag for one kind is not accepted for another, duplicates are rejected, and a
-   non-projection map is rejected (T3 test 7, T4 test 2).
+4. **Restore is strict about structure and lossless about values.** The tag for one kind is not accepted for
+   another, duplicate keys are rejected, and a non-projection map is rejected (T3 tests 7 and 7c, T4 test 2). Any JSON
+   value survives the round trip, so a planner argument error persists instead of raising `AuditIntegrityError` (T3
+   tests 12 and 13, T4 test 5).
+7. **Order inside a stored dispatch envelope is bound only by the envelope's own hash** (by design, T3). Reorder
+   detection happens where a stored hash meets an order-preserving copy (T3 test 6b).
 5. **The trust-tier corpus is unchanged** (G-tier diff), except for lines that are accounted for.
 6. **No tool, schema or wire byte changed.** G-wire and G-skill stay green, and no test file of tool declarations is
    edited.
@@ -634,13 +732,31 @@ These stored hashes are recomputed from stored payloads and compared, and a mism
 - `tool_arguments_hash` (`service.py:2373`, `pipeline_commit.py:413`);
 - the dispatch-binding restore and its byte-equality check (`pipeline_commit.py:109-115`, read at `service.py:895` and
   `:13427`);
-- `semantic_redacted_pipeline_arguments_hash` (`redaction.py:2513`).
+- `semantic_redacted_pipeline_arguments_hash` (`redaction.py:2513`);
+- **the stored `PresentBase.composition_content_hash`** of a proposal, re-derived from the base state record and
+  compared at `sessions/service.py:2620`, `:2622`, `:2788` and `:2908` (`AuditIntegrityError`), at `:3329` and
+  `:8071` (`StaleComposeStateError`), and at `pipeline_commit.py:405` (`BASE_CONFLICT`);
+- the executor content hash persisted in the dispatch result (`pipeline_content_hash`, `audit_storage.py:236`),
+  recovered through `PipelineDispatchRecovery` (`service.py:911`) and compared with the recomputed state hash at
+  `service.py:7881` ("pipeline candidate/executor/state content hash mismatch").
 
-After T3 and T4, every stored row whose payload contains a mapping-form coalesce or a `sources` map fails one of these
-(`understand-hash.md` §4-5). The no-tech-debt rule forbids a legacy path, so the store is recreated.
+After T4, **every** stored row that carries a composition content hash fails one of these, whatever its pipeline
+shape, because every state's `to_dict()` has a `sources` map (D3; M, `$L/critique-1/probe_sources_always.log`). So
+does every row whose arguments contain a mapping-form coalesce (T3) or a `sources` map (T4). An operator must not
+reason "no coalesce maps in our store, so the recreate can wait": every pending proposal with a present base becomes
+unreadable. The advisor `for_graph` fingerprint (T5) also moves; a stored one no longer matches, and the fact is
+downgraded to pending (a soft failure). The no-tech-debt rule forbids a legacy path, so the store is recreated.
+
+**Why the row_union precedent took no epoch and this change does.** `49825dd86` introduced the row_union projection
+and moved `_DRAFT_HASH_SCHEMA` from v2 to v3, and `SESSION_SCHEMA_EPOCH` was 40 both before and after it (M:
+`git show 49825dd86^:src/elspeth/web/sessions/models.py` and `git show 49825dd86:...` both give 40). The commit
+message records no reason. Whether that was right then is not this plan's question. Today, §5.1 names stored hashes
+that are re-derived and fail hard, and John's rule forbids a legacy path, so the epoch is taken.
 
 Consumers that are **not** reasons for the epoch:
-- the frontend, where the hashes are opaque;
+- the frontend, where the hashes are opaque. Its content-equality check mirrors the hashed field set but is
+  order-blind, so it diverges from the backend on a reorder (§1.4 item 10); that is a UI freshness issue, not a
+  stored-hash failure;
 - Landscape, which never receives them. There is no Landscape epoch change;
 - the process-local preflight cache;
 - custody `creating_arguments_hash`, which is compared row against snapshot and never re-derived.
@@ -648,7 +764,8 @@ Consumers that are **not** reasons for the epoch:
 ### 5.2 Deploy obligation (for the lead's handover)
 
 - **Session DB rename on deploy.** The epoch-66 `sessions.db` must be moved aside, and the service starts on a fresh
-  epoch-67 store. The served config is `deploy/elspeth-web.env`.
+  epoch-67 store. The served config is `deploy/elspeth-web.env`. This applies to every store, not only ones holding
+  coalesce maps or multi-source pipelines (§5.1).
 - **Then run `elspeth composer users bootstrap-admin local <user> --note ...`** for every local account. Identities
   live in the session DB, so a rename leaves local accounts pending (401).
 - No Landscape epoch change, and no frontend rebuild (T4 changes a test fixture only).
@@ -664,7 +781,11 @@ Consumers that are **not** reasons for the epoch:
    - Read the `stages :` launch line; the default is only ruff and pytest.
    - Wait on the `.done` artefact, never with a `pgrep -f` loop.
    - Read `summary.txt`, and require `frozen=yes`.
-   - **Testcontainer is included**, because T6 changes the session schema epoch.
+   - **Testcontainer is included**, because T6 changes the session schema epoch. The stale-epoch refusals it must
+     show green are
+     `tests/testcontainer/web/test_external_deployment_postgres.py::test_validate_only_startup_rejects_missing_and_stale_schema_without_leaking_credentials`
+     and the `session`/`schema_epoch` case of
+     `tests/testcontainer/web/test_schema_probe_postgres.py::test_postgres_schema_identity_drift_is_stale_and_not_repaired`.
 2. **Attribute every red.** Re-run each failing id with `-n 0`.
    - Diff the failure set against the 10-id base-red set (§2) and its messages (`$L/t0-base-red.log`).
    - The p5 test and the 6 doc pins are expected, with new hash or epoch values.
@@ -676,7 +797,8 @@ Consumers that are **not** reasons for the epoch:
    - the §4 evidence;
    - the pin moves (T3, T4, T5, T6);
    - the §5.2 deploy obligation;
-   - the §1.4 tickets owed. Item 1, the execution envelope, is the one to raise first.
+   - the §1.4 tickets owed. Item 1, the execution envelope, is the one to raise first;
+   - the attribution of the two non-drift base reds (D10): `test_composer_bedrock` came in with `e69498f6c`, not S1.
 
    Merge only on John's word, after running `git merge-tree` against the current `release/0.8.1` tip and
    `scripts/branch-safety-check.sh --intent merge`. Push only when asked.
@@ -685,9 +807,14 @@ Consumers that are **not** reasons for the epoch:
 
 ### 7.1 Risks
 
-- **Many hash pins move in T4.** `sources` is always a dict on a state, so every content hash moves. This is honest
-  churn under an epoch cut, and John's standing rule is to take the churn rather than reshape behaviour to avoid it.
-  The control is attribution: every moved literal must trace to a payload that holds `sources`.
+- **Many hash pins move in T4.** `sources` is always a dict on a state, so every content hash moves, including an
+  empty state's and a singular-`source` state's (D3). Every argument canonical over a payload with `sources`, even
+  `{}`, moves too, and one existing equality assertion is rewritten (T4). This is honest churn under an epoch cut,
+  and John's standing rule is to take the churn rather than reshape behaviour to avoid it. The control is
+  attribution: every moved literal must trace to a payload or state that holds `sources`.
+- **T3 widens what restore accepts in the value position (D11).** This is not dual acceptance: there is still one
+  stored form per field, and the generic-canonical comparison still rejects any value tamper (T3 test 6a). It removes
+  a check that turned planner argument errors into persistence crashes.
 - **The finalization path may reorder on its own** (T2 test 3). If it does, that is a second Defect-A site: stop and
   report.
 - **The approval binds an order that the runtime does not yet honour** (§1.4 item 1). T3 to T5 are still correct, but
@@ -700,10 +827,54 @@ Consumers that are **not** reasons for the epoch:
 - T0 step 5 finds a non-`set_pipeline` tool with a top-level `sources` property.
 - T2 test 3 is still sorted after the fix.
 - A moved hash pin in T3 or T4 cannot be traced to a payload holding the projected map.
+- T3 moves any of the 4 list-form pins in `test_state_serialisation_contract.py`.
+- The T0 goldens (built without `sources`) move in T3 or T4.
 - The G-tier diff has an unaccounted `>` line.
 - `release/0.8.1` is no longer at epoch 66 when T6 starts.
 - Any change would need a suppression, a compatibility shim, dual acceptance or a legacy hash path.
 
 ## 8. Plan review
 
-This section is filled in by the review and fix cycle (Codex), in the same way as the S1 plan's §9.
+Two critiques were run against the first draft of this plan at `41125ac74` (base `c4c52c110`): a reality check of
+every citation, premise and count (critique 0), and a tests-and-risk review (critique 1). Both were read-only: they
+re-ran the plan's probes and wrote their own, but neither executed T0, so the implementer's T0 is the first execution
+evidence for this plan. Each finding was re-checked against the code before it was applied. Of 19 findings, 3
+repeated another critic's finding (the pre-S1 base, the `tool_batch.py:577` premise and the stale CHANGELOG lines),
+leaving 16 distinct ones. All 16 held up and were applied; none was rejected. Where a finding offered alternatives,
+the plan picked one and says why: the row_union restore defect is fixed in T3 rather than ticketed (D11); `{}` stays
+projected, because excluding it would need dual acceptance in restore (D3); and the frontend order-blind equality is
+recorded as a ticket, not added as a task (D12). A fourth overlap, critique 0's answer to the old T0 step 7 (the p5
+test compares computed values), matched a note in critique 1's "checked and found sound" list. The dispositions,
+with the evidence used for each, are in the lane (`$L/revise-dispositions.md`).
+
+What changed:
+
+- **A false attribution that would have reached John.** The tree before S1 is `c4c52c110^1` = `e69498f6c`, not the S0
+  merge `85ebf2739`. `test_composer_bedrock` passes at `85ebf2739` and fails at `e69498f6c`, so it came in with the
+  advisor checkpoint envelope fix, outside S1; the old T0 step 6 rule would have written "S1 introduced it". The
+  revision re-ran it on fresh `git archive` exports (M, `$L/rev-*.log`). D10, §2, T0 step 6 and E1/E13 now state the
+  measured answer and correct the master plan's "on `85ebf2739`".
+- **A restore rule that would have spread a persistence crash.** A value-typed restore turns a planner argument error
+  into `AuditIntegrityError` at persistence; row_union already does this at base (measured through the real compose
+  loop). Restore now checks only the projection's own structure (D11), T3 fixes the row_union arm, and T3 tests 12-13
+  and T4 test 5 pin the round trip.
+- **Tests that could not pass or did not test what they named.** T3 test 6 could never go green: a reorder inside a
+  stored envelope is accepted by construction, and the tamper half is already rejected at base. It is split into a
+  characterization (6a) and a real RED at the stored-hash comparisons (6b). T3 test 1 varied the arrival `policy` as if
+  it were the collision rule; it now crosses real arrival policies with `merge`, and D4 records that composer coalesce
+  always runs under `union_collision_policy=last_wins`. Test 7's foreign-tag case on a row_union node is marked as a
+  characterization, and the mutation claims now name only tests that can go red.
+- **Goldens that D3 would have moved.** The T0 goldens and T3 tests 8-9 now use payloads with no `sources` key. T4
+  lists the expected changes: the 4 content-hash pins in `test_state_serialisation_contract.py` (also a known negative
+  for T3) and the rewritten equality assertion in `test_row_union_authority_hashing.py:316`.
+- **The epoch's blast radius.** §5.1 now names the `PresentBase.composition_content_hash` and executor-hash
+  re-verification sites and says plainly that after T4 every stored proposal with a present base is unreadable,
+  whatever its shape. It also records that the row_union precedent took no epoch, without guessing why.
+- **Smaller corrections.** T0 step 5's stated reason and T4's caller list (27 call sites, from a named grep); D2 and
+  §1.4 item 5 (guided-full still reaches `pipeline_planner.py:3870` with a non-empty state); the CHANGELOG `:55-59`
+  present-tense epoch lines in T6; the stale-epoch refusal tests in T6 and §6; `npm ci` before the T4 vitest step;
+  the frontend equality divergence in §1.4 item 10 and §5.1; the old T0 step 7 answered in T5; and six citations
+  (`envelope.py:599`/`:559`, `service.py:6650`/`:6862`, `pending_interpretation.py:1561`, full node ids for the base
+  reds, the S1 gate record path, and the runbook line 7 that no test pins).
+
+The review and fix cycle with Codex adds its own subsection here, in the same way as the S1 plan's §9.
