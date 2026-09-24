@@ -12,10 +12,12 @@ import pytest
 import yaml
 
 from elspeth.config_loading import load_settings
-from elspeth.contracts.audit import NodeStateCompleted
+from elspeth.contracts.audit import NodeStateCompleted, NodeStateFailed
 from elspeth.contracts.enums import CallStatus, CallType, NodeStateStatus, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.config import resolve_config
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState, RowDataResult, RowDataState
 from elspeth.core.replay_payload_store import SourceBoundPayloadStore, collect_source_payload_refs
@@ -218,7 +220,9 @@ def test_payload_collector_binds_row_token_and_pdf_receipt_refs() -> None:
     output_bytes = b"rendered page"
     source_ref = hashlib.sha256(source_bytes).hexdigest()
     output_ref = hashlib.sha256(output_bytes).hexdigest()
-    token_bytes = json.dumps({"blob_ref": source_ref}).encode()
+    token_bytes = checkpoint_dumps(
+        {"data": {"blob_ref": source_ref}, "contract": SchemaContract(mode="OBSERVED", fields=(), locked=False).to_checkpoint_format()}
+    ).encode()
     token_ref = hashlib.sha256(token_bytes).hexdigest()
     store = _MemoryStore({source_ref: source_bytes, output_ref: output_bytes, token_ref: token_bytes})
     state = NodeStateCompleted(
@@ -269,6 +273,111 @@ def test_payload_collector_binds_row_token_and_pdf_receipt_refs() -> None:
     query.get_all_calls_for_run = lambda run_id: []
     with pytest.raises(AuditIntegrityError, match="without typed render receipts"):
         collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields={"blob_ref"})
+
+
+def test_payload_collector_reads_blob_ref_from_token_envelope() -> None:
+    body = b"expanded token input"
+    ref = hashlib.sha256(body).hexdigest()
+    token_bytes = checkpoint_dumps(
+        {"data": {"blob_ref": ref}, "contract": SchemaContract(mode="OBSERVED", fields=(), locked=False).to_checkpoint_format()}
+    ).encode()
+    token_ref = hashlib.sha256(token_bytes).hexdigest()
+    store = _MemoryStore({ref: body, token_ref: token_bytes})
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda _run_id: [],
+            get_all_tokens_for_run=lambda _run_id: [SimpleNamespace(token_id="child", token_data_ref=token_ref)],
+            get_all_node_states_for_run=lambda _run_id: [],
+            get_all_calls_for_run=lambda _run_id: [],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda _run_id: []),
+    )
+
+    refs = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields={"blob_ref"})
+
+    assert refs.input_refs == {ref}
+
+
+def test_payload_collector_reads_configured_image_ref_list() -> None:
+    images = [b"image one", b"image two"]
+    refs = [hashlib.sha256(body).hexdigest() for body in images]
+    store = _MemoryStore(dict(zip(refs, images, strict=True)))
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda _run_id: [[SimpleNamespace(row_id="row")]],
+            get_row_data=lambda _row_id: RowDataResult(state=RowDataState.AVAILABLE, data={"photos": refs}),
+            get_all_tokens_for_run=lambda _run_id: [],
+            get_all_node_states_for_run=lambda _run_id: [],
+            get_all_calls_for_run=lambda _run_id: [],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda _run_id: []),
+    )
+
+    collected = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), image_ref_fields={"photos"})
+
+    assert collected.input_refs == set(refs)
+
+
+def test_payload_collector_accepts_failed_pdf_state_with_refusal_receipt() -> None:
+    now = datetime.now(UTC)
+    state = NodeStateFailed(
+        state_id="pdf-failed",
+        token_id="token",
+        node_id="pdf-node",
+        step_index=1,
+        attempt=0,
+        status=NodeStateStatus.FAILED,
+        input_hash="0" * 64,
+        started_at=now,
+        completed_at=now,
+        duration_ms=1.0,
+        error_json='{"exception":"refused"}',
+    )
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda _run_id: [],
+            get_all_tokens_for_run=lambda _run_id: [],
+            get_all_node_states_for_run=lambda _run_id: [state],
+            get_all_calls_for_run=lambda _run_id: [
+                SimpleNamespace(call_id="pdf-call", call_type=CallType.FILESYSTEM, status=CallStatus.SUCCESS, state_id=state.state_id)
+            ],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda _run_id: [SimpleNamespace(node_id="pdf-node", plugin_name="pdf_rasterize")]),
+        execution=SimpleNamespace(
+            get_call_response_data=lambda _call_id: CallDataResult(
+                state=CallDataState.AVAILABLE,
+                data={
+                    "format": "pdf_rasterize/v1",
+                    "renderer_identity": "a" * 64,
+                    "outcome_kind": "document_refusal",
+                    "result_status": "error",
+                    "rows": [],
+                    "rendered": [],
+                },
+            )
+        ),
+    )
+
+    refs = collect_source_payload_refs(factory, "source-run", source_store=_MemoryStore(), blob_ref_fields=())
+
+    assert refs.input_refs == frozenset()
+
+
+def test_payload_collector_refuses_receipt_on_unfinished_pdf_state() -> None:
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda _run_id: [],
+            get_all_tokens_for_run=lambda _run_id: [],
+            get_all_node_states_for_run=lambda _run_id: [SimpleNamespace(state_id="open", node_id="pdf-node")],
+            get_all_calls_for_run=lambda _run_id: [
+                SimpleNamespace(call_id="pdf-call", call_type=CallType.FILESYSTEM, status=CallStatus.SUCCESS, state_id="open")
+            ],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda _run_id: [SimpleNamespace(node_id="pdf-node", plugin_name="pdf_rasterize")]),
+    )
+
+    with pytest.raises(AuditIntegrityError, match=r"PDF call.*nonterminal"):
+        collect_source_payload_refs(factory, "source-run", source_store=_MemoryStore(), blob_ref_fields=())
 
 
 def test_payload_collector_authorizes_only_audited_web_output_hash() -> None:

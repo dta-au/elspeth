@@ -15,10 +15,11 @@ from elspeth.contracts import PluginSchema, SourceRow
 from elspeth.contracts.audit import NodeStateFailed
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, NodeType, RunMode, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
 from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
@@ -74,6 +75,7 @@ def _source_audit(*, payload: dict[str, object] | None = None) -> tuple[MagicMoc
         source_node_id="source-old",
         source_row_index=5,
         source_data_hash=stable_hash(payload),
+        source_contract_json=checkpoint_dumps(contract.to_checkpoint_format()),
     )
     factory.query.iter_rows_for_run.return_value = [[row]]
     factory.query.get_row_data.return_value = RowDataResult(state=RowDataState.AVAILABLE, data=payload)
@@ -162,6 +164,18 @@ def test_replay_refuses_failed_source_state_without_quarantine_outcome() -> None
         prepare_audited_sources(factory, "previous-run", {"primary": source})
 
 
+def test_replay_keeps_valid_source_row_discarded_by_transform() -> None:
+    factory, source, _row = _source_audit()
+    factory.data_flow.get_token_outcomes_for_row.return_value = [
+        SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name=None)
+    ]
+
+    plan = prepare_audited_sources(factory, "previous-run", {"primary": source})
+
+    assert len(plan["primary"].rows) == 1
+    assert not plan["primary"].rows[0].is_quarantined
+
+
 def test_verify_detects_source_row_drift_before_returning_snapshot() -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
@@ -171,7 +185,7 @@ def test_verify_detects_source_row_drift_before_returning_snapshot() -> None:
     )
     ctx = PluginContext(run_id="verify-run", config={})
 
-    with pytest.raises(AuditIntegrityError, match="differs from audited run"):
+    with pytest.raises(VerificationMismatchError, match="differs from audited run"):
         _verified_rows(source, ctx, audited)
 
     source.load.assert_called_once_with(ctx)
@@ -234,7 +248,7 @@ def test_verify_late_source_drift_refuses_complete_preload() -> None:
     token = CoordinationToken(run_id="verify-run", worker_id="worker:verify-run:test", leader_epoch=1)
     with (
         patch("elspeth.engine.orchestrator.source_replay.track_operation", side_effect=audited_operation),
-        pytest.raises(AuditIntegrityError, match="differs from audited run"),
+        pytest.raises(VerificationMismatchError, match="differs from audited run"),
     ):
         prepare_verified_sources(
             factory,

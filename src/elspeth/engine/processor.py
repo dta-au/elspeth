@@ -155,7 +155,7 @@ from elspeth.contracts.scheduler import (
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
-from elspeth.core.checkpoint.serialization import checkpoint_loads
+from elspeth.core.checkpoint.serialization import checkpoint_dumps, checkpoint_loads
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.core.ids import generate_id
@@ -2755,6 +2755,7 @@ class RowProcessor:
         source_row_index: int,
         ingest_sequence: int,
         data: Mapping[str, object],
+        source_contract_json: str,
     ) -> TokenWorkItem:
         """Drive the fenced leader INGEST verb for one source row (§C.4 row 9).
 
@@ -2774,6 +2775,7 @@ class RowProcessor:
                 source_node_id=str(source_node_id),
                 row_index=row_index,
                 data=data,
+                source_contract_json=source_contract_json,
                 source_row_index=source_row_index,
                 ingest_sequence=fields.ingest_sequence,
                 row_id=fields.row_id,
@@ -2918,6 +2920,7 @@ class RowProcessor:
             source_row_index=source_row_index,
             ingest_sequence=ingest_sequence,
             data=pipeline_row.to_dict(),
+            source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
         )
         return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)
 

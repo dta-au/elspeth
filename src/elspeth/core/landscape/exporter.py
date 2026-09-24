@@ -1059,6 +1059,7 @@ class LandscapeExporter:
                 "source_node_id": row.source_node_id,
                 "source_data_hash": row.source_data_hash,
                 "source_data_ref": row.source_data_ref,
+                "source_contract_json": row.source_contract_json,
                 "created_at": row.created_at.isoformat(),
             }
             yield row_record

@@ -37,6 +37,17 @@ def test_invocation_fields_are_excluded_but_execution_drift_is_refused() -> None
         admit_source_configuration(factory, source_run_id="source", config=config, canonical_version="v1")
 
 
+def test_replay_serial_worker_setting_can_differ_from_parallel_source() -> None:
+    factory = Mock(spec=RecorderFactory)
+    source_settings = {"sources": {}, "concurrency": {"max_workers": 4}}
+    factory.run_lifecycle.get_run.return_value = SimpleNamespace(
+        settings_json=canonical_json(source_settings), config_hash=stable_hash(source_settings), canonical_version="v1"
+    )
+    config = SimpleNamespace(config={"sources": {}, "concurrency": {"max_workers": 1}, "run_mode": "replay", "replay_from": "source"})
+
+    admit_source_configuration(factory, source_run_id="source", config=config, canonical_version="v1")
+
+
 def test_source_settings_hash_and_canonical_version_are_checked() -> None:
     factory = Mock(spec=RecorderFactory)
     source = _run_record()

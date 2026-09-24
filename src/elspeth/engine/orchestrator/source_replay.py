@@ -17,11 +17,12 @@ from typing import TYPE_CHECKING, Any
 from elspeth.contracts import SourceRow
 from elspeth.contracts.audit import NodeStateFailed
 from elspeth.contracts.enums import NodeType, RunMode, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import sanitize_for_canonical, stable_hash
+from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.landscape.row_data import RowDataState
 from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.core.operations import track_operation
@@ -57,7 +58,7 @@ def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedS
     missing = object()
     for ordinal, (live, recorded) in enumerate(itertools.zip_longest(source.load(ctx), audited.rows, fillvalue=missing)):
         if live is missing or recorded is missing:
-            raise AuditIntegrityError(f"Verify source {audited.name!r}: row count differs at ordinal {ordinal}")
+            raise VerificationMismatchError(f"Verify source {audited.name!r}: row count differs at ordinal {ordinal}")
         if type(live) is not SourceRow or type(recorded) is not SourceRow:
             raise OrchestrationInvariantError(f"Verify source {audited.name!r}: source yielded a non-SourceRow value")
         if (
@@ -69,7 +70,7 @@ def _verified_rows(source: SourceProtocol, ctx: PluginContext, audited: AuditedS
             or (live.contract.version_hash() if live.contract is not None else None)
             != (recorded.contract.version_hash() if recorded.contract is not None else None)
         ):
-            raise AuditIntegrityError(f"Verify source {audited.name!r}: row {ordinal} differs from audited run")
+            raise VerificationMismatchError(f"Verify source {audited.name!r}: row {ordinal} differs from audited run")
         # SourceRow is frozen, but its payload may be a mutable object reused
         # by the source generator. Preserve the exact value we compared before
         # advancing the generator to its next yield.
@@ -138,10 +139,10 @@ def _quarantine_details(
     ]
     outcomes = factory.data_flow.get_token_outcomes_for_row(run_id, row_id)
     quarantined = [outcome for outcome in outcomes if outcome.path is TerminalPath.QUARANTINED_AT_SOURCE]
-    if not quarantined:
-        if source_failures:
-            raise AuditIntegrityError(f"Source replay row {row_id}: failed source state has no quarantine outcome")
+    if not source_failures:
         return None
+    if not quarantined:
+        raise AuditIntegrityError(f"Source replay row {row_id}: failed source state has no quarantine outcome")
     if len(quarantined) != 1 or len(outcomes) != 1:
         raise AuditIntegrityError(f"Source replay row {row_id}: ambiguous quarantine outcomes")
     outcome = quarantined[0]
@@ -267,9 +268,15 @@ def prepare_audited_sources(
                     if by_name[row_source_name].source_schema_json is None:
                         raise AuditIntegrityError(f"Source replay run {replay_from}: source {row_source_name!r} has no schema record")
                     schema_by_source[row_source_name] = reconstruct_schema_from_json(json.loads(schema_json_by_source[row_source_name]))
-                contract = contract_by_source[row_source_name]
-                if contract is None:
+                if row.source_contract_json is None:
                     raise AuditIntegrityError(f"Source replay row {row.row_id}: source contract missing")
+                try:
+                    contract_data = checkpoint_loads(row.source_contract_json)
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: malformed source contract") from exc
+                if type(contract_data) is not dict:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: malformed source contract")
+                contract = SchemaContract.from_checkpoint(contract_data)
                 validated = schema_by_source[row_source_name].model_validate(data).to_row()
                 if stable_hash(validated) != row.source_data_hash:
                     raise AuditIntegrityError(f"Source replay row {row.row_id}: restored payload hash mismatch")

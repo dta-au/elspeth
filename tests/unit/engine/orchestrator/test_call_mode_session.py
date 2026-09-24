@@ -9,7 +9,7 @@ import pytest
 
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
 from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
@@ -113,7 +113,96 @@ def test_verify_persists_mismatch_and_refuses_success() -> None:
     assert recorded["current_call_id"] == "current-call"
     assert recorded["source_call_id"] == "source-call"
     assert recorded["is_match"] is False
-    with pytest.raises(AuditIntegrityError, match="failed decisions"):
+    with pytest.raises(VerificationMismatchError, match="1 mismatches"):
+        session.assert_complete()
+
+
+@pytest.mark.parametrize(
+    ("call_type", "recorded", "live"),
+    [
+        (
+            CallType.LLM,
+            {"content": "answer", "model": "model", "raw_response": {"id": "first", "created": 100, "choices": [{"text": "answer"}]}},
+            {"content": "answer", "model": "model", "raw_response": {"id": "second", "created": 200, "choices": [{"text": "answer"}]}},
+        ),
+        (
+            CallType.HTTP,
+            {
+                "status_code": 200,
+                "headers": {"date": "Mon, 01 Jan 2024 00:00:00 GMT", "content-type": "text/plain"},
+                "transport": {"body_b64": "b2s=", "headers": [["date", "Mon, 01 Jan 2024 00:00:00 GMT"]]},
+            },
+            {
+                "status_code": 200,
+                "headers": {"date": "Tue, 02 Jan 2024 00:00:00 GMT", "content-type": "text/plain"},
+                "transport": {"body_b64": "b2s=", "headers": [["date", "Tue, 02 Jan 2024 00:00:00 GMT"]]},
+            },
+        ),
+    ],
+)
+def test_verify_ignores_response_generated_identity_and_date(call_type: CallType, recorded: dict, live: dict) -> None:
+    factory, call = _factory()
+    call.call_type = call_type
+    factory.execution.get_call_response_data.return_value = CallDataResult(state=CallDataState.AVAILABLE, data=recorded)
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
+    session.admit_verify_call(
+        call_type=call_type,
+        request_data={"method": "GET", "url": "https://example.org/"},
+        current_state_id="current-state",
+        current_operation_id=None,
+        current_call_index=0,
+    )
+
+    decision = session.verify_call(
+        call_type=call_type,
+        request_data={"method": "GET", "url": "https://example.org/"},
+        current_state_id="current-state",
+        current_operation_id=None,
+        current_call_index=0,
+        current_call_id="current-call",
+        live_status=CallStatus.SUCCESS,
+        live_response_data=live,
+        live_error_data=None,
+    )
+
+    assert decision.is_match is True
+    session.assert_complete()
+
+
+def test_verify_keeps_generic_http_json_identity_material() -> None:
+    factory, _ = _factory()
+    factory.execution.get_call_response_data.return_value = CallDataResult(
+        state=CallDataState.AVAILABLE,
+        data={"status_code": 200, "headers": {"content-type": "application/json"}, "body_size": 14, "body": {"id": "first"}},
+    )
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
+    request = {"method": "GET", "url": "https://example.org/items/1"}
+    session.admit_verify_call(
+        call_type=CallType.HTTP,
+        request_data=request,
+        current_state_id="current-state",
+        current_operation_id=None,
+        current_call_index=0,
+    )
+
+    decision = session.verify_call(
+        call_type=CallType.HTTP,
+        request_data=request,
+        current_state_id="current-state",
+        current_operation_id=None,
+        current_call_index=0,
+        current_call_id="current-call",
+        live_status=CallStatus.SUCCESS,
+        live_response_data={"status_code": 200, "headers": {"content-type": "application/json"}, "body_size": 14, "body": {"id": "other"}},
+        live_error_data=None,
+    )
+
+    assert decision.is_match is False
+    with pytest.raises(VerificationMismatchError, match="1 mismatches"):
         session.assert_complete()
 
 

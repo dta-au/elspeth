@@ -218,6 +218,7 @@ class RowLoader:
             source_data_hash=row.source_data_hash,
             created_at=row.created_at,
             source_data_ref=row.source_data_ref,
+            source_contract_json=row.source_contract_json,
         )
 
 

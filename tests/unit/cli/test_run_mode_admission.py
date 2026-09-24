@@ -103,6 +103,25 @@ def test_keyvault_refused_before_any_secret_or_plugin_work(tmp_path: Path, mode:
     loader.assert_not_called()
 
 
+@pytest.mark.parametrize("authority", ["uppercase_yaml", "mixed_case_env"])
+def test_nonlive_keyvault_refused_before_secrets_with_case_variant_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    settings_path = _settings_path(tmp_path, mode="replay" if authority == "uppercase_yaml" else "live", keyvault=True)
+    if authority == "uppercase_yaml":
+        raw = yaml.safe_load(settings_path.read_text())
+        raw["RUN_MODE"] = raw.pop("run_mode")
+        settings_path.write_text(yaml.safe_dump(raw))
+    else:
+        monkeypatch.setenv("ELSPETH_run_mode", "replay")
+    with patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets:
+        result = CliRunner().invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute"])
+
+    assert result.exit_code == 1, result.output
+    assert "run_mode" in result.output or "Key Vault" in result.output
+    secrets.assert_not_called()
+
+
 @pytest.mark.parametrize("mode", ["replay", "verify"])
 def test_valid_source_keyvault_refused_before_remote_secret_or_constructor(tmp_path: Path, mode: str) -> None:
     settings_path = _settings_path(tmp_path, mode=mode, keyvault=True)
@@ -320,6 +339,23 @@ def test_resume_refuses_persisted_replay_run_before_secrets_or_plugins(tmp_path:
     secrets.assert_not_called()
     loader.assert_not_called()
     construct.assert_not_called()
+
+
+@pytest.mark.parametrize("authority", ["uppercase_yaml", "mixed_case_env"])
+def test_resume_refuses_case_variant_nonlive_mode_before_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str) -> None:
+    settings_path = _settings_path(tmp_path, mode="replay" if authority == "uppercase_yaml" else "live", keyvault=True)
+    if authority == "uppercase_yaml":
+        raw = yaml.safe_load(settings_path.read_text())
+        raw["RUN_MODE"] = raw.pop("run_mode")
+        settings_path.write_text(yaml.safe_dump(raw))
+    else:
+        monkeypatch.setenv("ELSPETH_run_mode", "replay")
+    with patch("elspeth.cli.load_secrets_from_config", side_effect=AssertionError("Key Vault contacted")) as secrets:
+        result = CliRunner().invoke(app, ["--no-dotenv", "resume", "run-id", "--settings", str(settings_path), "--execute"])
+
+    assert result.exit_code == 1, result.output
+    assert "run_mode" in result.output or "cannot be resumed" in result.output
+    secrets.assert_not_called()
 
 
 def test_live_mode_remains_outside_nonlive_capability_gate(tmp_path: Path) -> None:

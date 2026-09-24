@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
@@ -14,6 +15,18 @@ if TYPE_CHECKING:
 
 
 _INVOCATION_FIELDS = frozenset({"run_mode", "replay_from"})
+
+
+def _first_different_setting(source: Any, current: Any, path: str = "settings") -> str:
+    if type(source) in (dict, MappingProxyType) and type(current) in (dict, MappingProxyType):
+        for key in sorted(source.keys() | current.keys()):
+            if key not in source or key not in current:
+                return f"{path}.{key}"
+            different = _first_different_setting(source[key], current[key], f"{path}.{key}")
+            if different:
+                return different
+        return ""
+    return path if stable_hash(source) != stable_hash(current) else ""
 
 
 def admit_source_configuration(
@@ -46,8 +59,17 @@ def admit_source_configuration(
             del source_settings[field]
         if field in current_settings:
             del current_settings[field]
+    source_concurrency = source_settings["concurrency"] if "concurrency" in source_settings else None
+    current_concurrency = current_settings["concurrency"] if "concurrency" in current_settings else None
+    if type(source_concurrency) in (dict, MappingProxyType) and type(current_concurrency) in (dict, MappingProxyType):
+        source_options = cast("dict[str, Any] | MappingProxyType[str, Any]", source_concurrency)
+        current_options = cast("dict[str, Any] | MappingProxyType[str, Any]", current_concurrency)
+        if "max_workers" in current_options and current_options["max_workers"] == 1:
+            source_settings["concurrency"] = {key: value for key, value in source_options.items() if key != "max_workers"}
+            current_settings["concurrency"] = {key: value for key, value in current_options.items() if key != "max_workers"}
     if stable_hash(source_settings) != stable_hash(current_settings):
-        raise AuditIntegrityError("Replay execution settings differ from the source run")
+        path = _first_different_setting(source_settings, current_settings)
+        raise AuditIntegrityError(f"Replay execution settings differ from the source run at {path}")
 
 
 def admit_registered_graph(factory: RecorderFactory, *, source_run_id: str, current_run_id: str) -> None:

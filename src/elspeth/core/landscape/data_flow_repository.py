@@ -180,6 +180,7 @@ class DataFlowRepository:
         ingest_sequence: int | None,
         row_id: str | None,
         quarantined: bool,
+        source_contract_json: str | None = None,
     ) -> Row:
         return self.tokens._prepare_source_row_record(
             run_id=run_id,
@@ -190,6 +191,7 @@ class DataFlowRepository:
             ingest_sequence=ingest_sequence,
             row_id=row_id,
             quarantined=quarantined,
+            source_contract_json=source_contract_json,
         )
 
     @staticmethod
@@ -207,6 +209,7 @@ class DataFlowRepository:
         row_id: str | None = None,
         token_id: str | None = None,
         quarantined: bool = False,
+        source_contract_json: str | None = None,
         coordination_token: CoordinationToken,
     ) -> tuple[Row, Token]:
         """Create a source row and its initial token in one audit transaction."""
@@ -219,6 +222,7 @@ class DataFlowRepository:
             row_id=row_id,
             token_id=token_id,
             quarantined=quarantined,
+            source_contract_json=source_contract_json,
             coordination_token=coordination_token,
         )
 
@@ -272,6 +276,7 @@ class DataFlowRepository:
         row_id: str | None = None,
         token_id: str | None = None,
         quarantined: bool = False,
+        source_contract_json: str | None = None,
     ) -> tuple[Row, Token]:
         """Connection-accepting rows+tokens insert: composes into the caller's transaction."""
         return self.tokens.insert_row_with_token_on(
@@ -285,6 +290,7 @@ class DataFlowRepository:
             row_id=row_id,
             token_id=token_id,
             quarantined=quarantined,
+            source_contract_json=source_contract_json,
         )
 
     def create_token(

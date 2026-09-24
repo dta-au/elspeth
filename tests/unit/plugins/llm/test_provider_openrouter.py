@@ -18,6 +18,7 @@ import pytest
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.call_mode import ReplayCallEvidence
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
@@ -92,6 +93,29 @@ def test_replay_semantic_llm_record_binds_source_call() -> None:
     )
 
     assert recorder.operation_calls[0]["source_call_id"] == "original-semantic-call"
+
+
+def test_replay_semantic_llm_record_accepts_frozen_nested_response() -> None:
+    response = RawCallPayload({"content": "answer", "raw_response": {"choices": [{"message": {"content": "answer"}}]}})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence("source-call", CallStatus.SUCCESS, response.to_dict(), None, 1.0)
+
+    recorder = FakeAuditRecorder()
+    LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN).record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    assert recorder.operation_calls[0]["source_call_id"] == "source-call"
 
 
 def test_replay_semantic_llm_row_record_keeps_claim_authority() -> None:

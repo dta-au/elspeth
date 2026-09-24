@@ -236,6 +236,7 @@ class RowExportRecord(TypedDict):
     source_node_id: str
     source_data_hash: str | None
     source_data_ref: str | None
+    source_contract_json: str | None
     created_at: str
 
 

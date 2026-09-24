@@ -244,6 +244,7 @@ class Row:
     source_row_index: int
     ingest_sequence: int
     source_data_ref: str | None = None  # None when payload stored inline
+    source_contract_json: str | None = None  # Exact contract at source-row ingestion
 
     def __post_init__(self) -> None:
         """Validate int fields - Tier 1 crash on invalid types."""

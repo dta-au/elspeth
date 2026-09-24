@@ -875,8 +875,11 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "ca9daf80dbf50d8c27cf8ca06d51603ec0ba58ebd6
 # complete_node_states_completed_many and complete_node_states_failed_many ->
 # NodeStateRepository._complete_node_states_many (the shared bulk UPDATE, fed owned
 # _BulkStateCompletion rows).
+# Replay source-contract retention leaves the 146 edges intact. Three call
+# fingerprints change as source_contract_json is forwarded from the scheduler
+# through DataFlowRepository and RowTokenRepository.
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 146
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "d86b459406b192b8421605f22d7e967e4504f1c99685be646de7bb95752303d2"
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "af506ca081699fb18d407b758118fc082d44bfc01dffd8d9093ec4fc5eb9ac45"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -7817,7 +7820,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # operation occurrence without changing the deadline issuance path.
     # K063 adds required collector-group failure columns and the group/node
     # composite foreign keys; neither changes construction or clock issuance.
-    "src/elspeth/core/landscape/database.py": "b7e3deff933e74a190e466ac608f4f7d7fa6ed042e3c7f493887745e67d13678",
+    # Replay source-contract retention adds a required rows column; deadline
+    # guard installation and clock issuance are unchanged.
+    "src/elspeth/core/landscape/database.py": "7202f715df9e24fa649c2c9831d95b737212e43a4d1ff87d3b091abb09eca900",
 }
 
 

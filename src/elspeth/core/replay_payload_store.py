@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
-from elspeth.contracts.audit import NodeStateCompleted
+from elspeth.contracts.audit import NodeStateCompleted, NodeStateFailed
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadStore
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.landscape.row_data import CallDataState, RowDataState
 
 if TYPE_CHECKING:
@@ -42,13 +44,22 @@ def _audited_ref(value: object, *, location: str) -> str:
     return value
 
 
-def _row_refs(row: object, *, fields: frozenset[str], location: str) -> Iterable[str]:
+def _row_refs(row: object, *, fields: frozenset[str], image_fields: frozenset[str], location: str) -> Iterable[str]:
     if type(row) not in (dict, MappingProxyType):
         raise AuditIntegrityError(f"{location}: audited row is not an object")
     row = cast("dict[str, object] | MappingProxyType[str, object]", row)
     for field_name in fields:
         if field_name in row:
             yield _audited_ref(row[field_name], location=f"{location}.{field_name}")
+    for field_name in image_fields:
+        if field_name not in row or row[field_name] is None:
+            continue
+        value = row[field_name]
+        if type(value) in (list, tuple):
+            for index, ref in enumerate(cast("list[object] | tuple[object, ...]", value)):
+                yield _audited_ref(ref, location=f"{location}.{field_name}[{index}]")
+        else:
+            yield _audited_ref(value, location=f"{location}.{field_name}")
 
 
 def collect_source_payload_refs(
@@ -57,6 +68,7 @@ def collect_source_payload_refs(
     *,
     source_store: PayloadStore,
     blob_ref_fields: Collection[str],
+    image_ref_fields: Collection[str] = (),
 ) -> SourcePayloadRefs:
     """Collect explicit blob refs from a source run and prove retained bytes.
 
@@ -66,11 +78,13 @@ def collect_source_payload_refs(
     receipts. Each discovered blob must still exist with its matching hash.
     """
     fields = frozenset(blob_ref_fields)
-    if any(type(field_name) is not str or not field_name for field_name in fields):
-        raise ValueError("blob_ref_fields must contain admitted field names")
+    image_fields = frozenset(image_ref_fields)
+    if any(type(field_name) is not str or not field_name for field_name in fields | image_fields):
+        raise ValueError("payload ref fields must contain admitted field names")
     input_refs: set[str] = set()
     output_refs: set[str] = set()
     pdf_node_ids = {node.node_id for node in factory.data_flow.get_nodes(source_run_id) if node.plugin_name == "pdf_rasterize"}
+    pdf_states: dict[str, NodeStateCompleted | NodeStateFailed] = {}
     pdf_state_ids: set[str] = set()
     pdf_completed_states: set[str] = set()
     pdf_receipt_states: set[str] = set()
@@ -80,23 +94,29 @@ def collect_source_payload_refs(
             data = factory.query.get_row_data(row.row_id)
             if data.state is not RowDataState.AVAILABLE or data.data is None:
                 raise AuditIntegrityError(f"Source run {source_run_id}: row {row.row_id} payload unavailable")
-            input_refs.update(_row_refs(data.data, fields=fields, location=f"row {row.row_id}"))
+            input_refs.update(_row_refs(data.data, fields=fields, image_fields=image_fields, location=f"row {row.row_id}"))
 
     for token in factory.query.get_all_tokens_for_run(source_run_id):
         if token.token_data_ref is None:
             continue
         token_data = source_store.retrieve(token.token_data_ref)
         try:
-            decoded = json.loads(token_data)
+            decoded = checkpoint_loads(token_data.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise AuditIntegrityError(f"Source run {source_run_id}: token {token.token_id} payload is invalid JSON") from exc
-        input_refs.update(_row_refs(decoded, fields=fields, location=f"token {token.token_id}"))
+            raise AuditIntegrityError(f"Source run {source_run_id}: token {token.token_id} payload is invalid checkpoint JSON") from exc
+        if type(decoded) is not dict or set(decoded) != {"data", "contract"} or type(decoded["contract"]) is not dict:
+            raise AuditIntegrityError(f"Source run {source_run_id}: token {token.token_id} has no data/contract envelope")
+        SchemaContract.from_checkpoint(decoded["contract"])
+        input_refs.update(_row_refs(decoded["data"], fields=fields, image_fields=image_fields, location=f"token {token.token_id}"))
 
     for state in factory.query.get_all_node_states_for_run(source_run_id):
         if state.node_id in pdf_node_ids:
             pdf_state_ids.add(state.state_id)
         if type(state) is NodeStateCompleted and state.node_id in pdf_node_ids:
+            pdf_states[state.state_id] = state
             pdf_completed_states.add(state.state_id)
+        elif type(state) is NodeStateFailed and state.node_id in pdf_node_ids:
+            pdf_states[state.state_id] = state
         reason_json = state.success_reason_json if type(state) is NodeStateCompleted else None
         if reason_json is None:
             continue
@@ -115,6 +135,8 @@ def collect_source_payload_refs(
     for call in factory.query.get_all_calls_for_run(source_run_id):
         if call.state_id not in pdf_state_ids:
             continue
+        if call.state_id not in pdf_states:
+            raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} belongs to a nonterminal node state")
         if call.call_type is not CallType.FILESYSTEM or call.status is not CallStatus.SUCCESS:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} is not a successful filesystem receipt")
         response = factory.execution.get_call_response_data(call.call_id)
@@ -135,6 +157,9 @@ def collect_source_payload_refs(
             or type(receipt["rows"]) is not list
         ):
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} has no typed result")
+        pdf_state = pdf_states[call.state_id]
+        if (type(pdf_state) is NodeStateCompleted) != (receipt["result_status"] == "success"):
+            raise AuditIntegrityError(f"Source run {source_run_id}: PDF call {call.call_id} result contradicts node state")
         if call.state_id in pdf_receipt_states:
             raise AuditIntegrityError(f"Source run {source_run_id}: PDF state {call.state_id} has multiple render receipts")
         if call.state_id is not None:
@@ -149,7 +174,7 @@ def collect_source_payload_refs(
                 continue
             output_refs.add(_audited_ref(page["page_ref"], location=f"PDF call {call.call_id} page {index}"))
 
-    if pdf_completed_states != pdf_receipt_states:
+    if not pdf_completed_states <= pdf_receipt_states:
         raise AuditIntegrityError(
             f"Source run {source_run_id}: completed PDF states without typed render receipts: {sorted(pdf_completed_states - pdf_receipt_states)}"
         )

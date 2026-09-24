@@ -69,7 +69,13 @@ Comparisons are exact by default. Narrow adapter-specific identities, such as
 Azure managed-identity Authorization rotation, compare all execution-relevant
 non-authentication fields and record the current credential fingerprint
 separately; they never claim that a source-run credential was reacquired.
-There is no general ignored-path setting.
+There is no general ignored-path setting. Verification excludes generated LLM
+`id` and `created` fields and HTTP Date. For OpenAI-compatible POST
+`/chat/completions` responses with a choices array, the parsed body is compared
+without those two fields; its raw wire bytes, body size, and Content-Length are
+excluded from the comparison because they change with the generated fields.
+The full response remains recorded in each run. Other response fields remain
+material to the verdict.
 
 ## Sources, sinks, and preflight
 

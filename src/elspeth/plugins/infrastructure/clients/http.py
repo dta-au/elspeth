@@ -395,7 +395,13 @@ class AuditedHTTPClient(AuditedClientBase):
         return call
 
     def _restore_replay_response(
-        self, evidence: ReplayCallEvidence, *, method: str, expected_url: str | None, request_headers: dict[str, str]
+        self,
+        evidence: ReplayCallEvidence,
+        *,
+        method: str,
+        expected_url: str | None,
+        request_headers: dict[str, str],
+        redirect_hop: bool = False,
     ) -> httpx.Response:
         """Parse retained transport as untrusted audit data before any egress."""
         payload = evidence.response_data
@@ -440,7 +446,9 @@ class AuditedHTTPClient(AuditedClientBase):
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has unsafe transport URL")
         request = httpx.Request(method, recorded_url, headers=request_headers)
         response = httpx.Response(status_code, headers=headers, content=body, request=request)
-        expected_status = CallStatus.SUCCESS if (200 <= status_code < 300 or 300 <= status_code < 400) else CallStatus.ERROR
+        expected_status = (
+            CallStatus.SUCCESS if (200 <= status_code < 300 or (redirect_hop and 300 <= status_code < 400)) else CallStatus.ERROR
+        )
         if evidence.status is not expected_status:
             raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has contradictory status")
         return response
@@ -602,7 +610,9 @@ class AuditedHTTPClient(AuditedClientBase):
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
             last_hop_url = archived_hop_url
             last_hop_transport_url = hop_url
-            self._restore_replay_response(hop_evidence, method=hop_method, expected_url=hop_url, request_headers=request_headers)
+            self._restore_replay_response(
+                hop_evidence, method=hop_method, expected_url=hop_url, request_headers=request_headers, redirect_hop=True
+            )
             hop_audit_request: Mapping[str, Any] = hop_request
             if self._archived_auth_for_replay:
                 if "headers" not in hop_request:

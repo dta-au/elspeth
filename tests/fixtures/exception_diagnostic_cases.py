@@ -248,6 +248,7 @@ def _inherited_cases() -> tuple[DiagnosticCase, ...]:
         DiagnosticCase(exception, frozenset(), "inherited", explanation, partial(_exercise_inherited_args, exception))
         for exception in (
             errors.SinkEffectCapabilityError,
+            errors.VerificationMismatchError,
             errors.GuidedCustodyIntegrityError,
             errors.PipelineLoweringError,
             errors.OrchestrationInvariantError,

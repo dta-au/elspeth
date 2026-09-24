@@ -50,6 +50,7 @@ class SourceIngestSpec:
     row_id: str
     token_id: str
     data: Mapping[str, object]
+    source_contract_json: str | None = None
 
     def __post_init__(self) -> None:
         require_int(self.row_index, "row_index", min_value=0)

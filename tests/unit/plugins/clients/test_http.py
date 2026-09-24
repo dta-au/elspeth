@@ -317,6 +317,35 @@ def test_http_replay_restores_exact_response_without_network_client(mock_executi
     assert mock_execution.record_call.call_args[1]["source_call_id"] == "source-call"
 
 
+def test_http_replay_accepts_unfollowed_redirect_recorded_as_parent_error(mock_execution, mock_telemetry_emit):
+    payload = {
+        "status_code": 302,
+        "body_size": 0,
+        "transport": {"body_b64": "", "headers": [["location", "/next"]], "request_url": "https://api.example.com/raw"},
+    }
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+        source_run_id = "source-run"
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence("source-call", CallStatus.ERROR, payload, None, 1.0)
+
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+        response = client.get("https://api.example.com/raw")
+
+    assert response.status_code == 302
+    assert mock_execution.record_call.call_args[1]["status"] is CallStatus.ERROR
+
+
 def test_ssrf_http_replay_uses_archived_pin_without_network_client(mock_execution, mock_telemetry_emit):
     payload = {
         "status_code": 200,

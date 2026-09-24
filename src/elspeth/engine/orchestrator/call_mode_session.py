@@ -18,7 +18,7 @@ from elspeth.contracts.call_mode import (
     VerificationDecision,
 )
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape.row_data import CallDataState
@@ -30,6 +30,48 @@ if TYPE_CHECKING:
 
 
 _FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
+
+
+def _verification_response(call_type: CallType, response: Mapping[str, Any] | None, *, chat_completion_request: bool = False) -> object:
+    """Compare stable response evidence while preserving full raw audit payloads."""
+    if response is None:
+        return None
+    comparable = deep_thaw(response)
+    if call_type is CallType.LLM:
+        raw = comparable["raw_response"] if "raw_response" in comparable else None
+        if type(raw) is dict:
+            for key in ("id", "created"):
+                if key in raw:
+                    del raw[key]
+    if call_type in (CallType.HTTP, CallType.HTTP_REDIRECT):
+        body = comparable["body"] if "body" in comparable else None
+        chat_completion = (
+            chat_completion_request
+            and call_type is CallType.HTTP
+            and type(body) is dict
+            and "choices" in body
+            and type(body["choices"]) is list
+        )
+        excluded_headers = {"date", "content-length"} if chat_completion else {"date"}
+        headers = comparable["headers"] if "headers" in comparable else None
+        if type(headers) is dict:
+            comparable["headers"] = {name: value for name, value in headers.items() if name.lower() not in excluded_headers}
+        transport = comparable["transport"] if "transport" in comparable else None
+        if type(transport) is dict and "headers" in transport and type(transport["headers"]) is list:
+            transport["headers"] = [
+                pair
+                for pair in transport["headers"]
+                if type(pair) is not list or len(pair) != 2 or type(pair[0]) is not str or pair[0].lower() not in excluded_headers
+            ]
+        if chat_completion and type(body) is dict:
+            for key in ("id", "created"):
+                if key in body:
+                    del body[key]
+            if "body_size" in comparable:
+                del comparable["body_size"]
+            if type(transport) is dict and "body_b64" in transport:
+                del transport["body_b64"]
+    return comparable
 
 
 def _require_archived_dns_pin(data: Mapping[str, Any]) -> None:
@@ -623,10 +665,20 @@ class AuditedCallModeSession:
             if not differences:
                 if call.status is not live_status:
                     differences["status"] = {"source": call.status.value, "current": live_status.value}
-                if stable_hash(recorded_response) != stable_hash(live_response_data):
+                method = request_data["method"] if "method" in request_data else None
+                url = request_data["url"] if "url" in request_data else None
+                chat_completion_request = (
+                    call_type is CallType.HTTP
+                    and method == "POST"
+                    and type(url) is str
+                    and urlsplit(url).path.endswith("/chat/completions")
+                )
+                recorded_comparison = _verification_response(call_type, recorded_response, chat_completion_request=chat_completion_request)
+                live_comparison = _verification_response(call_type, live_response_data, chat_completion_request=chat_completion_request)
+                if stable_hash(recorded_comparison) != stable_hash(live_comparison):
                     differences["response_hash"] = {
-                        "source": stable_hash(recorded_response),
-                        "current": stable_hash(live_response_data),
+                        "source": stable_hash(recorded_comparison),
+                        "current": stable_hash(live_comparison),
                     }
                 if stable_hash(recorded_error) != stable_hash(live_error_data):
                     differences["error_hash"] = {
@@ -656,8 +708,10 @@ class AuditedCallModeSession:
     def assert_complete(self) -> None:
         """Require every state call and runtime-preflight call to be consumed."""
         missing = self._required - self._consumed
-        if missing or self._failed_decisions or self._verify_admissions:
+        if missing or self._verify_admissions:
             raise AuditIntegrityError(
                 f"{self._mode.value} call verification incomplete: {len(missing)} unconsumed source calls, "
                 f"{len(self._failed_decisions)} failed decisions, {len(self._verify_admissions)} unsettled admissions"
             )
+        if self._failed_decisions:
+            raise VerificationMismatchError(f"Verify call results differ from source run: {len(self._failed_decisions)} mismatches")

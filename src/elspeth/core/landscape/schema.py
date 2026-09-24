@@ -453,7 +453,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #  45 → One immutable collector-group failure verdict per group, including
 #        groups with no arrived members. The run result counts these separately
 #        from failed rows. Populated epoch-44 stores require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 45
+#  46 → Valid source rows retain their exact source contract for sparse-stream
+#        replay and verify. Populated epoch-45 stores require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 46
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -776,6 +778,7 @@ rows_table = Table(
     Column("ingest_sequence", Integer, nullable=False),
     Column("source_data_hash", String(64), nullable=False),
     Column("source_data_ref", String(256)),
+    Column("source_contract_json", Text),
     Column("created_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("row_id", "run_id"),
     UniqueConstraint("run_id", "source_node_id", "source_row_index"),

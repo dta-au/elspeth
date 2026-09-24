@@ -21,6 +21,7 @@ from elspeth.contracts.identity import LineageFrame, innermost_own_frame, trunca
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 
@@ -178,6 +179,7 @@ class TokenManager:
             source_row_index=source_row_index,
             ingest_sequence=ingest_sequence,
             data=pipeline_row.to_dict(),
+            source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
             row_id=row_id,
             token_id=token_id,
             coordination_token=coordination_token,

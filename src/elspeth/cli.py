@@ -33,6 +33,7 @@ from elspeth.contracts.errors import (
     GracefulShutdownError,
     IncompleteSourceResumeError,
     RunWorkerEvictedError,
+    VerificationMismatchError,
     WriteLockHeldError,
 )
 from elspeth.contracts.preflight import PreflightResult
@@ -520,14 +521,7 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
 
     raw_config = _load_raw_yaml(settings_path)
-    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
-    try:
-        mode = RunMode(raw_mode)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
-    env_mode = os.environ.get("ELSPETH_RUN_MODE")
-    if env_mode is not None and env_mode != mode.value:
-        raise ValueError("run_mode environment override must match the literal YAML value before execution")
+    mode = _raw_run_mode_before_secrets(raw_config)
     if mode is RunMode.LIVE:
         return mode, frozenset(), None
 
@@ -622,12 +616,8 @@ def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str |
     from elspeth.engine.orchestrator.run_modes import refuse_nonlive_resume
 
     raw_config = _load_raw_yaml(settings_path)
-    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
-    try:
-        mode = RunMode(raw_mode)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Unsupported run_mode before resume secret resolution: {raw_mode!r}") from exc
-    if mode is not RunMode.LIVE or os.environ.get("ELSPETH_RUN_MODE", RunMode.LIVE.value) != RunMode.LIVE.value:
+    mode = _raw_run_mode_before_secrets(raw_config)
+    if mode is not RunMode.LIVE:
         raise ValueError("Replay/verify runs cannot be resumed until mode-aware resume is implemented")
     raw_landscape = raw_config.get("landscape", {})
     landscape = LandscapeSettings.model_validate(raw_landscape)
@@ -725,6 +715,22 @@ def _load_raw_yaml(config_path: Path) -> dict[str, Any]:
     return raw_config
 
 
+def _raw_run_mode_before_secrets(raw_config: Mapping[str, Any]) -> RunMode:
+    """Resolve mode with the same case-insensitive key semantics as settings loading."""
+    mode_keys = [key for key in raw_config if type(key) is str and key.casefold() == "run_mode"]
+    if len(mode_keys) > 1:
+        raise ValueError("Ambiguous run_mode keys before secret resolution")
+    raw_mode = raw_config[mode_keys[0]] if mode_keys else RunMode.LIVE
+    try:
+        mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    env_modes = [value for key, value in os.environ.items() if key.casefold() == "elspeth_run_mode"]
+    if len(env_modes) > 1 or (env_modes and env_modes[0] != mode.value):
+        raise ValueError("run_mode environment override must match the literal YAML value before execution")
+    return mode
+
+
 def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
     """Extract and validate the literal ``secrets`` block from raw (unexpanded) YAML.
 
@@ -785,11 +791,7 @@ def _load_settings_with_secrets(
     # A non-live run must never contact Key Vault before mode admission. The
     # raw mode is literal here: secret expansion has not happened yet, and an
     # unknown value cannot safely be treated as live for this early boundary.
-    raw_mode = raw_config.get("run_mode", RunMode.LIVE)
-    try:
-        run_mode = RunMode(raw_mode)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    run_mode = _raw_run_mode_before_secrets(raw_config)
     if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
         raise ValueError("Replay/verify cannot fetch Key Vault secrets")
 
@@ -1166,6 +1168,14 @@ def run(
     except SchemaCompatibilityError as e:
         _emit_schema_compatibility_error(e, output_format, operation="pipeline execution")
         raise typer.Exit(1) from None
+    except VerificationMismatchError as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(json_mod.dumps({"event": "verification_mismatch", "error": str(e), "error_type": type(e).__name__}), err=True)
+        else:
+            typer.echo(f"Verification mismatch: {e}", err=True)
+        raise typer.Exit(2) from None
     except contract_errors.TIER_1_ERRORS as e:
         # Tier 1 violations and framework bugs MUST be clearly distinguishable
         # from config errors. These indicate database corruption, tampering,

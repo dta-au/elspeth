@@ -5380,7 +5380,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # commit guard; three advisory lease readers use the fresh clock helper.
     # Those four function fingerprints and fourteen source-only line shifts
     # are re-bound below. Domains, escape flags and acquisition counts remain
-    # unchanged; these entries grant no new Sessions authority.
+    # unchanged; these entries grant no new Sessions authority. Replay source
+    # contract retention adds one required column above the later database.py
+    # acquisition sites, shifting their source lines by one without changing
+    # fingerprints, domains, escape flags or acquisition counts.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "verify_sqlite_tier1_pragmas",
@@ -5399,7 +5402,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=859,
+        line=860,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
     # to ``read_schema_identities`` behind a plain import, whose body executes
@@ -5412,7 +5415,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=884,
+        line=885,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5422,7 +5425,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=982,
+        line=983,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5432,7 +5435,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1202,
+        line=1203,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5442,7 +5445,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1347,
+        line=1348,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -5455,7 +5458,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1368,
+        line=1369,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -5468,7 +5471,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "91a7ddcfb7d2279c",
         1,
         None,
-        line=1381,
+        line=1382,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5479,7 +5482,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1408,
+        line=1409,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5489,7 +5492,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "a6bc0744250eff32",
         1,
         None,
-        line=1667,
+        line=1668,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -5499,7 +5502,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2152,
+        line=2153,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5510,7 +5513,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2134,
+        line=2135,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -18764,7 +18767,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1420,
+            line=1421,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",

@@ -363,7 +363,7 @@ class LeaderDrainCoordinator:
                     source_run_id = loop_ctx.ctx.replay_from
                     if source_run_id is None:
                         raise OrchestrationInvariantError("replay sink verification requires a source run")
-                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id)
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id, mode=loop_ctx.ctx.run_mode)
                     if loop_ctx.ctx.call_mode_session is None:
                         raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
                     loop_ctx.ctx.call_mode_session.assert_complete()

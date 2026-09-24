@@ -322,6 +322,7 @@ class RowTokenRepository:
         ingest_sequence: int | None,
         row_id: str | None,
         quarantined: bool,
+        source_contract_json: str | None,
     ) -> Row:
         row_id = row_id or generate_id()
         missing_identity_fields = []
@@ -370,6 +371,7 @@ class RowTokenRepository:
             ingest_sequence=ingest_sequence,
             source_data_hash=data_hash,
             source_data_ref=final_payload_ref,
+            source_contract_json=source_contract_json,
             created_at=timestamp,
         )
 
@@ -386,6 +388,7 @@ class RowTokenRepository:
             "ingest_sequence": row.ingest_sequence,
             "source_data_hash": row.source_data_hash,
             "source_data_ref": row.source_data_ref,
+            "source_contract_json": row.source_contract_json,
             "created_at": row.created_at,
         }
 
@@ -400,6 +403,7 @@ class RowTokenRepository:
         row_id: str | None = None,
         token_id: str | None = None,
         quarantined: bool = False,
+        source_contract_json: str | None = None,
         coordination_token: CoordinationToken,
     ) -> tuple[Row, Token]:
         """Create a source row and its initial token in one audit transaction.
@@ -423,6 +427,7 @@ class RowTokenRepository:
                 row_id=row_id,
                 token_id=token_id,
                 quarantined=quarantined,
+                source_contract_json=source_contract_json,
             )
 
     def insert_row_with_token_on(
@@ -438,6 +443,7 @@ class RowTokenRepository:
         row_id: str | None = None,
         token_id: str | None = None,
         quarantined: bool = False,
+        source_contract_json: str | None = None,
     ) -> tuple[Row, Token]:
         """Connection-accepting rows+tokens insert: composes into the caller's transaction.
 
@@ -461,6 +467,7 @@ class RowTokenRepository:
             ingest_sequence=ingest_sequence,
             row_id=row_id,
             quarantined=quarantined,
+            source_contract_json=source_contract_json,
         )
         token = Token(
             token_id=token_id or generate_id(),

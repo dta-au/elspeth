@@ -109,6 +109,50 @@ def test_cli_live_replay_verify_preserves_sink_artifact(tmp_path: Path) -> None:
     assert sink_path.read_bytes() == artifact
 
 
+def test_verify_accepts_sparse_json_source_contract_growth(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = cast("dict[str, object]", settings["sources"])["primary"]
+    source = cast("dict[str, object]", source)
+    source["plugin"] = "json"
+    options = cast("dict[str, object]", source["options"])
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"value":7},{"value":8,"extra":"x"}]', encoding="utf-8")
+    options["path"] = str(input_path)
+    settings_path = tmp_path / "settings.yaml"
+    runner = CliRunner()
+
+    def invoke() -> object:
+        settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+        return runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    live = invoke()
+    assert live.exit_code == 0, live.output
+    settings["run_mode"] = "verify"
+    settings["replay_from"] = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+
+    verify = invoke()
+
+    assert verify.exit_code == 0, verify.output
+
+
+def test_replay_accepts_live_run_with_default_worker_count(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.pop("concurrency")
+    settings_path = tmp_path / "settings.yaml"
+    runner = CliRunner()
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    live = runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+    assert live.exit_code == 0, live.output
+    settings["run_mode"] = "replay"
+    settings["replay_from"] = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    settings["concurrency"] = {"max_workers": 1}
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    replay = runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    assert replay.exit_code == 0, replay.output
+
+
 def test_verify_rejects_late_source_drift_before_transform_start(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     sources = cast("dict[str, object]", settings["sources"])
@@ -141,6 +185,25 @@ def test_verify_rejects_late_source_drift_before_transform_start(tmp_path: Path)
     assert result.exit_code != 0, result.output
     assert "source" in result.output.lower()
     startup.assert_not_called()
+
+
+def test_verify_source_drift_has_distinct_nonfatal_cli_verdict(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    runner = CliRunner()
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    live = runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+    assert live.exit_code == 0, live.output
+    settings["run_mode"] = "verify"
+    settings["replay_from"] = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    (tmp_path / "input.csv").write_text("value\n7\n99\n", encoding="utf-8")
+    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    verify = runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    assert verify.exit_code == 2, verify.output
+    assert '"event": "verification_mismatch"' in verify.output
+    assert '"traceback"' not in verify.output
 
 
 def test_cli_http_replay_has_no_network_and_verify_persists_mismatch(tmp_path: Path) -> None:
@@ -311,6 +374,94 @@ def test_cli_replay_refuses_sensitive_query_without_exact_transport(tmp_path: Pa
     assert replay.exit_code != 0, replay.output
     assert "lacks transport" in replay.output
     assert (tmp_path / "output.json").read_bytes() == artifact
+
+
+def test_cli_openrouter_replay_and_verify_ignore_response_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "openrouter-replay-test-key")
+    settings = _settings(tmp_path)
+    (tmp_path / "input.csv").write_text("value\n7\n")
+    settings["transforms"] = [
+        {
+            "name": "answer",
+            "plugin": "llm",
+            "input": "source_out",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o",
+                "api_key": "test-key",
+                "prompt_template": "Answer the question.",
+                "temperature": 0.0,
+                "schema": {"mode": "observed"},
+            },
+        }
+    ]
+    settings_path = tmp_path / "settings.yaml"
+    runner = CliRunner()
+
+    def invoke() -> object:
+        settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+        return runner.invoke(app, ["--no-dotenv", "run", "--settings", str(settings_path), "--execute", "--format", "json"])
+
+    def completion(response_id: str, created: int, content: str, date: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": response_id,
+                "created": created,
+                "model": "openai/gpt-4o",
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+            headers={"date": date},
+        )
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    with respx.mock(assert_all_mocked=True) as router:
+        route = router.post(url).mock(return_value=completion("first", 100, "answer", "Mon, 01 Jan 2024 00:00:00 GMT"))
+        live = invoke()
+    assert live.exit_code == 0, live.output
+    assert route.call_count >= 1
+    source_run_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    artifact = (tmp_path / "output.json").read_bytes()
+
+    settings["run_mode"] = "replay"
+    settings["replay_from"] = source_run_id
+    with (
+        patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("replay opened HTTP client")),
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("replay published sink")),
+    ):
+        replay = invoke()
+    assert replay.exit_code == 0, replay.output
+    assert (tmp_path / "output.json").read_bytes() == artifact
+
+    settings["run_mode"] = "verify"
+    with (
+        respx.mock(assert_all_mocked=True) as router,
+        patch.object(JSONSink, "commit_effect", side_effect=AssertionError("verify published sink")),
+    ):
+        route = router.post(url).mock(return_value=completion("second-longer", 200, "answer", "Tue, 02 Jan 2024 00:00:00 GMT"))
+        verify = invoke()
+    assert verify.exit_code == 0, verify.output
+    assert route.call_count >= 1
+    verify_run_id = json.loads(verify.output.strip().splitlines()[-1])["run_id"]
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        decisions = (
+            connection.execute(
+                select(call_verifications_table.c.is_match).where(call_verifications_table.c.current_run_id == verify_run_id)
+            )
+            .scalars()
+            .all()
+        )
+    assert len(decisions) >= 2 and all(decisions)
+    assert (tmp_path / "output.json").read_bytes() == artifact
+
+    with respx.mock(assert_all_mocked=True) as router:
+        router.post(url).mock(return_value=completion("third", 300, "changed answer", "Wed, 03 Jan 2024 00:00:00 GMT"))
+        mismatch = invoke()
+    assert mismatch.exit_code == 2, mismatch.output
+    assert "verification_mismatch" in mismatch.output
 
 
 def test_cli_llm_replay_skips_sdk_and_verify_persists_mismatch(tmp_path: Path) -> None:

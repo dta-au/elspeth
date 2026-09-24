@@ -11,8 +11,8 @@ from __future__ import annotations
 from collections import Counter
 from hashlib import sha256
 
-from elspeth.contracts.enums import CallType, NodeType
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.enums import CallType, NodeType, RunMode
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -90,7 +90,7 @@ class VirtualReplaySinkEffect:
         raise OrchestrationInvariantError("virtual replay sink cannot reconcile publication")
 
 
-def verify_virtual_sink_members(factory: RecorderFactory, *, source_run_id: str, current_run_id: str) -> None:
+def verify_virtual_sink_members(factory: RecorderFactory, *, source_run_id: str, current_run_id: str, mode: RunMode) -> None:
     """Require exact source/current sink-boundary membership before run success.
 
     Ingest sequence ties duplicate payloads to source rows; payload hashes are
@@ -125,4 +125,6 @@ def verify_virtual_sink_members(factory: RecorderFactory, *, source_run_id: str,
     source_members = identity(source_run_id)
     current_members = identity(current_run_id)
     if source_members != current_members:
+        if mode is RunMode.VERIFY:
+            raise VerificationMismatchError("Verify sink output differs from the source run")
         raise OrchestrationInvariantError("replay sink output differs from the source run")

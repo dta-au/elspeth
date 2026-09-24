@@ -40,12 +40,13 @@ from __future__ import annotations
 from typing import Any, cast
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, assume, given, settings
 
 from elspeth.contracts.declaration_contracts import (
     DeclarationContract,
     registered_declaration_contracts,
 )
+from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -396,8 +397,19 @@ def test_non_pass_through_transforms_do_drop_fields(
     )
     def _sweep(probe: PipelineRow) -> None:
         nonlocal probes_preserved, probe_count
-        probe_count += 1
         probe_rows = transform.backward_invariant_probe_rows(probe)
+        # A transform may forbid an input field that it creates. Such a row is
+        # not a valid witness for whether the transform drops an input field.
+        assume(
+            all(
+                not detect_field_collisions(
+                    set(input_row.to_dict()) - transform.removed_input_fields,
+                    transform.declared_output_fields,
+                )
+                for input_row in probe_rows
+            )
+        )
+        probe_count += 1
         result = transform.execute_backward_invariant_probe(
             probe_rows,
             _probe_context(transform),

@@ -431,6 +431,7 @@ class TestRowLoader:
             "source_data_hash": "hash123",
             "created_at": NOW,
             "source_data_ref": "ref://payload/abc",
+            "source_contract_json": "{}",
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -447,6 +448,7 @@ class TestRowLoader:
         assert result.ingest_sequence == 17
         assert result.source_data_hash == "hash123"
         assert result.source_data_ref == "ref://payload/abc"
+        assert result.source_contract_json == "{}"
 
     def test_valid_load_with_none_ref(self) -> None:
         sa_row = self._make_row_row(source_data_ref=None)

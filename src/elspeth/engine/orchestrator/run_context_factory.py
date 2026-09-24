@@ -18,7 +18,7 @@ Dependencies held by the factory:
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import (
@@ -75,6 +75,28 @@ def build_agg_transform_lookup(config: PipelineConfig) -> dict[str, AggNodeEntry
             if t.is_batch_aware and t.node_id is not None and t.node_id in config.aggregation_settings:
                 agg_transform_lookup[t.node_id] = AggNodeEntry(transform=t, node_id=NodeID(t.node_id))
     return agg_transform_lookup
+
+
+def _configured_replay_blob_fields(transforms: Sequence[TransformProtocol]) -> tuple[set[str], set[str]]:
+    """Resolve admitted scalar and image-list payload columns from plugin config."""
+    scalar_fields: set[str] = set()
+    image_fields: set[str] = set()
+    for transform in transforms:
+        if transform.name in {"blob_csv_expand", "blob_json_expand", "blob_text_expand", "pdf_rasterize", "aws_textract_inline_analysis"}:
+            source = transform.config["source"] if "source" in transform.config else None
+            if transform.name == "blob_csv_expand" and source == "field":
+                continue
+            field_name = transform.config["blob_ref_field"] if "blob_ref_field" in transform.config else "blob_ref"
+            if type(field_name) is not str or not field_name:
+                raise RuntimeError(f"Invalid blob_ref_field for {transform.name}")
+            scalar_fields.add(field_name)
+        if transform.name == "llm":
+            image_inputs = transform.config["image_inputs"] if "image_inputs" in transform.config else None
+            for spec in image_inputs or ():
+                if type(spec) is not dict or "field" not in spec or type(spec["field"]) is not str or not spec["field"]:
+                    raise RuntimeError("Invalid image_inputs field for llm")
+                image_fields.add(spec["field"])
+    return scalar_fields, image_fields
 
 
 class RunContextFactory:
@@ -166,21 +188,13 @@ class RunContextFactory:
             if factory.audited_sources is None:
                 raise RuntimeError("Replay/verify source snapshot was not admitted before plugin startup")
             admit_registered_graph(factory, source_run_id=source_run_id, current_run_id=run_id)
-            blob_ref_fields: set[str] = set()
-            for transform in config.transforms:
-                if transform.name not in {"blob_csv_expand", "blob_json_expand", "blob_text_expand", "pdf_rasterize"}:
-                    continue
-                if transform.name == "blob_csv_expand" and "source" in transform.config and transform.config["source"] == "field":
-                    continue
-                field_name = transform.config["blob_ref_field"] if "blob_ref_field" in transform.config else "blob_ref"
-                if type(field_name) is not str or not field_name:
-                    raise RuntimeError(f"Invalid blob_ref_field for {transform.name}")
-                blob_ref_fields.add(field_name)
+            blob_ref_fields, image_ref_fields = _configured_replay_blob_fields(config.transforms)
             refs = collect_source_payload_refs(
                 factory,
                 source_run_id,
                 source_store=payload_store,
                 blob_ref_fields=blob_ref_fields,
+                image_ref_fields=image_ref_fields,
             )
             plugin_payload_store = SourceBoundPayloadStore(
                 mode=runtime_mode.mode,

@@ -8,7 +8,7 @@ method: |-
   Every dict/Dict/Mapping/MutableMapping[str, Any|object] subscript occurring anywhere inside an annotation (unions, Optional and container wrappers included, each occurrence counted) on any function parameter (positional-only, ordinary, *args, keyword-only, **kwargs), any return, and any AnnAssign at module, class or function scope, in every parseable .py file under src/elspeth including contracts/; module-level dict[str, Any] aliases resolved by import through DictAliasIndex. A parameter named as source_param by a @trust_boundary decorator on the same function counts in the 'boundary' column (a boundary conversion scores as a removal), not in its form column. Measured 2,739 soft + 63 boundary occurrences across 386 files at release/0.8.0@e8998f20a, six of them reached only through alias resolution; the 2,162 quoted by the 2026-09-04 scope statement used a narrower rule that could not be recovered and is NOT this census.
 files:
   src/elspeth/cli.py:
-    Mapping[str, Any]: 1
+    Mapping[str, Any]: 2
     dict[str, Any]: 3
   src/elspeth/cli_plugins.py:
     dict[str, object]: 2
@@ -273,7 +273,7 @@ files:
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/call_mode_session.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 16
     dict[str, Any]: 1
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
@@ -1069,10 +1069,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 928
+  Mapping[str, Any]: 930
   Mapping[str, object]: 310
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1180
   dict[str, object]: 409
-  soft: 2840
+  soft: 2842

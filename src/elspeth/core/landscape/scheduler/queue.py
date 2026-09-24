@@ -417,6 +417,7 @@ class SchedulerQueueRepository:
                 source_node_id=source.source_node_id,
                 row_index=source.row_index,
                 data=source.data,
+                source_contract_json=source.source_contract_json,
                 source_row_index=source.source_row_index,
                 ingest_sequence=source.ingest_sequence,
                 row_id=source.row_id,

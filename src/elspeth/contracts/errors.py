@@ -41,6 +41,11 @@ class SinkEffectCapabilityError(ValueError):
     """A sink cannot safely participate in recoverable effect publication."""
 
 
+# TIER-2: An expected negative verify verdict over intact evidence; no integrity failure occurred.
+class VerificationMismatchError(Exception):
+    """A live verify input or result differs from intact source-run evidence."""
+
+
 def _scrub_traceback_for_audit(traceback_text: str) -> str:
     """Scrub traceback lines independently so safe frame diagnostics survive."""
     lines = traceback_text.splitlines(keepends=True)

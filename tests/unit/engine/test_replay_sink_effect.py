@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts import PendingOutcome, RunMode, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectState
 from elspeth.engine.executors.replay_sink_effect import VirtualReplaySinkEffect, verify_virtual_sink_members
@@ -25,7 +25,10 @@ from tests.unit.plugins.sinks.test_remote_object_sink_effects import _s3, _S3Sto
 
 
 @pytest.mark.parametrize("current_payloads", [[{"value": 1}], [{"value": 2}], [{"value": 1}, {"value": 1}]])
-def test_virtual_sink_effect_compares_complete_member_set_without_publication(current_payloads: list[dict[str, object]]) -> None:
+@pytest.mark.parametrize("run_mode", (RunMode.REPLAY, RunMode.VERIFY))
+def test_virtual_sink_effect_compares_complete_member_set_without_publication(
+    current_payloads: list[dict[str, object]], run_mode: RunMode
+) -> None:
     db = make_landscape_db()
     try:
         factory = make_factory(db)
@@ -52,10 +55,11 @@ def test_virtual_sink_effect_compares_complete_member_set_without_publication(cu
             }
 
         if current_payloads == [{"value": 1}]:
-            verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=current_run_id)
+            verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=current_run_id, mode=run_mode)
         else:
-            with pytest.raises(OrchestrationInvariantError, match="sink output differs"):
-                verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=current_run_id)
+            error_type = VerificationMismatchError if run_mode is RunMode.VERIFY else OrchestrationInvariantError
+            with pytest.raises(error_type, match="sink output differs"):
+                verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=current_run_id, mode=run_mode)
     finally:
         db.close()
 

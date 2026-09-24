@@ -31,6 +31,7 @@ from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -176,7 +177,9 @@ class LLMAuditParent:
             )
             actual_response = None if response_data is None else response_data.to_dict()
             actual_error = None if error is None else error.to_dict()
-            if evidence.status is not status or evidence.response_data != actual_response or evidence.error_data != actual_error:
+            recorded_response = None if evidence.response_data is None else deep_thaw(evidence.response_data)
+            recorded_error = None if evidence.error_data is None else deep_thaw(evidence.error_data)
+            if evidence.status is not status or recorded_response != actual_response or recorded_error != actual_error:
                 raise AuditIntegrityError("Replayed semantic LLM response differs from its source call")
             source_call_id = evidence.source_call_id
         if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
