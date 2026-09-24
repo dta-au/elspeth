@@ -1,5 +1,6 @@
 """Tests for shared template infrastructure."""
 
+import multiprocessing
 import pickle
 import threading
 import time
@@ -477,6 +478,53 @@ def test_a_broken_jinja_undefined_contract_escapes_render_unrouted(monkeypatch: 
     template = SandboxedTemplate("{{ row.missing }}")
     with pytest.raises(RuntimeError, match="unexpected exception type TemplateRuntimeError"):
         template.render(row={})
+
+
+def _render_with_a_foreign_undefined_exception(connection: object, source: str, payload: bytes) -> None:
+    """Spawn target: the real worker, with jinja2's sandbox building an Undefined around a foreign exception type.
+
+    Module-level so the spawned child can import it; the patch lives only in the child.
+    """
+    from jinja2 import TemplateRuntimeError
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    def undefined_with_foreign_exc(self: ImmutableSandboxedEnvironment, obj: object, attribute: str) -> object:
+        return self.undefined(obj=obj, name=attribute, exc=TemplateRuntimeError)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ImmutableSandboxedEnvironment, "getattr", undefined_with_foreign_exc)
+        template_infrastructure._template_worker(connection, source, payload, True)
+
+
+def test_the_worker_reports_a_broken_undefined_contract_under_its_own_status() -> None:
+    """The worker half of the broken-contract guard: it is not a routable render failure.
+
+    The render runs in a spawned worker, so the parent-side test above cannot
+    reach the worker's own catch arm. Without that arm the RuntimeError would
+    escape the worker, and the parent would see a stopped worker, which it
+    reports as an ordinary (routable) TemplateError.
+    """
+    process_context = multiprocessing.get_context("spawn")
+    parent, child = process_context.Pipe(duplex=False)
+    payload = pickle.dumps(template_infrastructure._pack_context_value({"row": {}}), protocol=5)
+    process = process_context.Process(
+        target=_render_with_a_foreign_undefined_exception,
+        args=(child, "{{ row.missing }}", payload),
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(60), "the worker sent nothing"
+        status, message = parent.recv()
+    finally:
+        parent.close()
+        process.join(60)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+    assert status == "undefined_contract"
+    assert "unexpected exception type TemplateRuntimeError" in message
 
 
 def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None:
