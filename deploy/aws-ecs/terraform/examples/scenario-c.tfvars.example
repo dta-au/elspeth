@@ -82,13 +82,14 @@ gateway_upstream_origin = "https://REPLACE_WITH_AGENCY_UPSTREAM_ORIGIN"
 gateway_oauth_token_url = "https://REPLACE_WITH_TOKEN_ENDPOINT/oauth2/token"
 gateway_oauth_auth_method = "client_secret_basic"
 
-# Positive request bounds required by the gateway. Review these against the
-# agency upstream's limits and the workload before deploying.
+# Bounds exercised by the Composer gateway integration tests: boot submits
+# the complete tool schemas, and sessions include the rendered system prompt.
+# Review these against the agency upstream's limits and workload before deploying.
 gateway_max_messages     = 50
-gateway_max_tools        = 10
-gateway_max_string_chars = 10000
+gateway_max_tools        = 60
+gateway_max_string_chars = 131072
 gateway_max_schema_bytes = 65536
-gateway_max_schema_depth = 10
+gateway_max_schema_depth = 15
 
 # alias => adapter-defined mapping object; must cover both composer models.
 gateway_model_mappings_json = <<JSON
