@@ -1,10 +1,13 @@
 """Call parents bind to durable expansion positions, including corrupt evidence."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Barrier, Event, Lock, local
 
 import pytest
 from sqlalchemy import delete, event, update
 
+import elspeth.core.landscape.execution.calls as calls_module
 from elspeth.contracts import CallStatus, CallType, RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import AuditIntegrityError
@@ -263,4 +266,189 @@ def test_source_parent_index_eviction_reloads_completed_source_row() -> None:
         lookup(0)
         assert len(parent_queries) == 18
     finally:
+        event.remove(factory._db.engine, "before_cursor_execute", count_parent_queries)
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_completed_source_parent_index_build_is_single_flight_and_retryable(fail_first: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    with factory._db.write_connection() as conn:
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.run_id == "source")
+            .values(status=RunStatus.COMPLETED.value, completed_at=datetime.now(UTC))
+        )
+    repository = factory.execution.calls
+    second_miss_finished = Event()
+    first_query_started = Event()
+
+    class NotifyingLock:
+        def __init__(self) -> None:
+            self.lock = Lock()
+            self.local = local()
+            self.entries = 0
+
+        def __enter__(self):
+            self.lock.acquire()
+            self.entries += 1
+            self.local.entry = self.entries
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            entry = self.local.entry
+            self.lock.release()
+            if entry == 2:
+                second_miss_finished.set()
+
+    monkeypatch.setattr(repository, "_source_parent_index_lock", NotifyingLock())
+    original_fetchall = repository._ops.execute_fetchall
+    parent_queries = 0
+    count_lock = Lock()
+
+    def counted_fetchall(query):
+        nonlocal parent_queries
+        if "node_states.state_id, node_states.token_id, tokens.row_id" in str(query):
+            with count_lock:
+                parent_queries += 1
+                query_number = parent_queries
+            if query_number == 1:
+                first_query_started.set()
+                assert second_miss_finished.wait(timeout=5), "second lookup did not reach the cache miss"
+                if fail_first:
+                    raise RuntimeError("injected source index read failure")
+        return original_fetchall(query)
+
+    monkeypatch.setattr(repository._ops, "execute_fetchall", counted_fetchall)
+    kwargs = {
+        "source_run_id": "source",
+        "node_id": "transform",
+        "step_index": 0,
+        "attempt": 0,
+        "source_node_id": "source-node",
+        "source_row_index": 0,
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(repository._source_parent_index, **kwargs)
+        assert first_query_started.wait(timeout=5), "first lookup did not start its source scan"
+        second = pool.submit(repository._source_parent_index, **kwargs)
+        if fail_first:
+            for lookup in (first, second):
+                with pytest.raises(RuntimeError, match="injected source index read failure"):
+                    lookup.result(timeout=5)
+            assert parent_queries == 1
+            assert repository._source_parent_index(**kwargs) == {}
+            assert parent_queries == 2
+            assert not repository._source_parent_builds
+        else:
+            assert first.result(timeout=5) == {}
+            assert second.result(timeout=5) == {}
+            assert parent_queries == 1
+            assert not repository._source_parent_builds
+
+
+def test_completed_source_parent_index_builds_distinct_rows_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    with factory._db.write_connection() as conn:
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.run_id == "source")
+            .values(status=RunStatus.COMPLETED.value, completed_at=datetime.now(UTC))
+        )
+    repository = factory.execution.calls
+    original_fetchall = repository._ops.execute_fetchall
+    both_queries = Barrier(2)
+
+    def synchronized_fetchall(query):
+        if "node_states.state_id, node_states.token_id, tokens.row_id" in str(query):
+            both_queries.wait(timeout=5)
+        return original_fetchall(query)
+
+    monkeypatch.setattr(repository._ops, "execute_fetchall", synchronized_fetchall)
+    kwargs = {
+        "source_run_id": "source",
+        "node_id": "transform",
+        "step_index": 0,
+        "attempt": 0,
+        "source_node_id": "source-node",
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(repository._source_parent_index, **kwargs, source_row_index=0)
+        second = pool.submit(repository._source_parent_index, **kwargs, source_row_index=1)
+        assert first.result(timeout=6) == {}
+        assert second.result(timeout=6) == {}
+        assert not repository._source_parent_builds
+
+
+def test_completed_source_parent_waiter_survives_lru_eviction_during_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory, _source_operation, _current_operation = _two_runs()
+    with factory._db.write_connection() as conn:
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.run_id == "source")
+            .values(status=RunStatus.COMPLETED.value, completed_at=datetime.now(UTC))
+        )
+    repository = factory.execution.calls
+    publish_started = Event()
+    release_publish = Event()
+    second_attached = Event()
+    caller = local()
+    first_future = True
+    original_future = calls_module.Future
+
+    class PausingFuture(original_future):
+        def __init__(self) -> None:
+            nonlocal first_future
+            super().__init__()
+            self.pause = first_future
+            first_future = False
+
+        def set_result(self, result) -> None:
+            if self.pause:
+                publish_started.set()
+                assert release_publish.wait(timeout=10), "first builder was not released"
+            super().set_result(result)
+
+        def result(self, timeout=None):
+            if self.pause and caller.is_second:
+                second_attached.set()
+            return super().result(timeout)
+
+    monkeypatch.setattr(calls_module, "Future", PausingFuture)
+    parent_queries = []
+
+    def count_parent_queries(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "node_states.state_id, node_states.token_id, tokens.row_id" in statement:
+            parent_queries.append(statement)
+
+    event.listen(factory._db.engine, "before_cursor_execute", count_parent_queries)
+    kwargs = {
+        "source_run_id": "source",
+        "node_id": "transform",
+        "step_index": 0,
+        "attempt": 0,
+        "source_node_id": "source-node",
+    }
+
+    def second_lookup():
+        caller.is_second = True
+        return repository._source_parent_index(**kwargs, source_row_index=0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(repository._source_parent_index, **kwargs, source_row_index=0)
+            assert publish_started.wait(timeout=5), "first build did not reach result publication"
+            for row_index in range(1, 17):
+                assert repository._source_parent_index(**kwargs, source_row_index=row_index) == {}
+            assert len(parent_queries) == 17
+            second = pool.submit(second_lookup)
+            try:
+                assert second_attached.wait(timeout=5), "same-key waiter rebuilt after LRU eviction"
+                assert len(parent_queries) == 17
+            finally:
+                release_publish.set()
+            assert first.result(timeout=5) == {}
+            assert second.result(timeout=5) == {}
+            assert not repository._source_parent_builds
+    finally:
+        release_publish.set()
         event.remove(factory._db.engine, "before_cursor_execute", count_parent_queries)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
+from concurrent.futures import Future
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -120,6 +121,7 @@ class CallAuditRepository:
         # validated source-row indexes across sibling call lookups; live runs
         # are never cached. The limit bounds repository lifetime memory.
         self._source_parent_indices: OrderedDict[tuple[str, str, int, int, str, int], dict[str, tuple[str, ...]]] = OrderedDict()
+        self._source_parent_builds: dict[tuple[str, str, int, int, str, int], Future[dict[str, tuple[str, ...]]]] = {}
         self._source_parent_index_lock = Lock()
         self._source_parent_index_limit = 16
 
@@ -1114,46 +1116,63 @@ class CallAuditRepository:
             }
             and run.completed_at is not None
         )
+        pending: Future[dict[str, tuple[str, ...]]] | None = None
+        build_here = True
         if completed:
             with self._source_parent_index_lock:
                 cached = self._source_parent_indices.get(key)
                 if cached is not None:
                     self._source_parent_indices.move_to_end(key)
                     return cached
+                pending = self._source_parent_builds.get(key)
+                if pending is None:
+                    pending = Future()
+                    self._source_parent_builds[key] = pending
+                else:
+                    build_here = False
+            if not build_here:
+                return pending.result()
 
-        parent_query = (
-            select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
-            .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
-            .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
-            .where(
-                node_states_table.c.run_id == source_run_id,
-                node_states_table.c.node_id == node_id,
-                node_states_table.c.step_index == step_index,
-                node_states_table.c.attempt == attempt,
-                rows_table.c.source_node_id == source_node_id,
-                rows_table.c.source_row_index == source_row_index,
-                rows_table.c.run_id == source_run_id,
+        try:
+            parent_query = (
+                select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
+                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+                .where(
+                    node_states_table.c.run_id == source_run_id,
+                    node_states_table.c.node_id == node_id,
+                    node_states_table.c.step_index == step_index,
+                    node_states_table.c.attempt == attempt,
+                    rows_table.c.source_node_id == source_node_id,
+                    rows_table.c.source_row_index == source_row_index,
+                    rows_table.c.run_id == source_run_id,
+                )
             )
-        )
-        source_parents = self._ops.execute_fetchall(parent_query)
-        evidence_cache: dict[str, _LineageEvidence] = {}
-        token_hashes = {
-            parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id, evidence_cache=evidence_cache)
-            for parent in {parent.token_id: parent for parent in source_parents}.values()
-        }
-        grouped: dict[str, list[str]] = {}
-        for parent in source_parents:
-            grouped.setdefault(token_hashes[parent.token_id], []).append(parent.state_id)
-        index = {lineage: tuple(state_ids) for lineage, state_ids in grouped.items()}
+            source_parents = self._ops.execute_fetchall(parent_query)
+            evidence_cache: dict[str, _LineageEvidence] = {}
+            token_hashes = {
+                parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id, evidence_cache=evidence_cache)
+                for parent in {parent.token_id: parent for parent in source_parents}.values()
+            }
+            grouped: dict[str, list[str]] = {}
+            for parent in source_parents:
+                grouped.setdefault(token_hashes[parent.token_id], []).append(parent.state_id)
+            index = {lineage: tuple(state_ids) for lineage, state_ids in grouped.items()}
+        except BaseException as exc:
+            if pending is not None:
+                pending.set_exception(exc)
+                with self._source_parent_index_lock:
+                    self._source_parent_builds.pop(key)
+            raise
         if completed:
             with self._source_parent_index_lock:
-                existing = self._source_parent_indices.get(key)
-                if existing is not None:
-                    self._source_parent_indices.move_to_end(key)
-                    return existing
                 self._source_parent_indices[key] = index
                 if len(self._source_parent_indices) > self._source_parent_index_limit:
                     self._source_parent_indices.popitem(last=False)
+            if pending is not None:
+                pending.set_result(index)
+                with self._source_parent_index_lock:
+                    self._source_parent_builds.pop(key)
         return index
 
     def list_source_calls_for_current_parent(
