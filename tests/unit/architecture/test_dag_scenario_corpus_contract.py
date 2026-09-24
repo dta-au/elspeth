@@ -705,7 +705,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # resumed_full_projection_sha256 (4947c833... -> 188207f6..., captured from the
 # production harness's own failure output), then this digest. No oracle_freeze
 # snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "2b88d01f41aeaefa1a9b9c4cfe3b72eeeddbb48d032f65e5d2be835e235b0a68"
+# Persisted node execution order for replay admission changes only the 52
+# sequence_in_pipeline values in exact node audit records and the dependent
+# terminal-resume full-history hash; frozen runtime surfaces remain unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "d52a2dc82028dc62dd155ad4b43dc93f4b55ff64ce03e58b9640a5a058112a4d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
