@@ -5551,7 +5551,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1c6421f624ce29f0",
         1,
         None,
-        line=903,
+        line=929,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/execution/calls.py",
@@ -5561,7 +5561,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "11b88ebda65aecee",
         1,
         None,
-        line=907,
+        line=933,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5572,7 +5572,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d33078db9d910df0",
         1,
         None,
-        line=911,
+        line=937,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/leases.py",
