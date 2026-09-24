@@ -8,6 +8,24 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-24 — no bare `TypeError` may escape a plugin's `process` path** (elspeth-5887fb7928, lane
+  fix/5887-batch-row-quarantine)
+  Twelve sites in eleven batch plugins raised `TypeError(... "This indicates an upstream validation bug" ...)` on a
+  wrongly-typed row value. Nothing in the engine converts a bare `TypeError`, so each one aborted the run (exit 4, zero
+  terminal outcomes) where the operator ruling (elspeth-d5034647f0) requires the whole batch to fail with a value-free
+  reason and route via `on_error`. The convention spread by copying: two type-enforcement commits (28be95bf0,
+  0733b3d51) seeded it, every new plugin family copied it, one plan cited a sibling as precedent, and the doctrine
+  sentence "wrong type at Transform: upstream bug, should crash" (`plugin-protocol.md`, the data-trust guide, the
+  tier-model skill, README, the website) read as authority. The sites now raise `BatchRowTypeError` from their
+  helpers and `process()` converts it once, and the docs say "rejected by a RETURNED error; at a batch node the whole
+  batch fails". The gate `tests/unit/plugins/test_process_path_type_error_gate.py` (class-scoped reachability from
+  `process`, expected set empty) flagged exactly those twelve at base 74c0ce0db and nothing else. It is scoped to
+  `TypeError` on purpose: widening to `ValueError`/`KeyError`/`RuntimeError`/`NotImplementedError` adds only
+  lifecycle and self-consistency invariants whose conditions read no row value. Its anti-vacuity floor
+  (`MIN_PROCESS_ROOTS`) exists because a copy of the tree under a gitignored path, or a nonexistent root, scans as
+  zero roots and zero findings, exactly what a clean tree reports.
+  See [CONTRIBUTING: Gate: no bare TypeError on a plugin process path](../../CONTRIBUTING.md#gate-no-bare-typeerror-on-a-plugin-process-path).
+
 - **2026-09-24 — the wire fidelity matrix pins LiteLLM's strict-tool wire per route, and the root conftest now fixes
   the cost map on purpose** (composer strict tool contracts S1, task T11; branch `feat/strict-tool-contracts-s1`).
   `tests/unit/web/composer/test_wire_fidelity_matrix.py` records what LiteLLM 1.102 transmits (loopback

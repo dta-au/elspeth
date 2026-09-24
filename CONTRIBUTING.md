@@ -425,6 +425,37 @@ asserts the widened arm.
 [Convention: repository and process hygiene](#convention-repository-and-process-hygiene));
 a count that transiently matches a sibling branch's plugin set was never real.
 
+### Gate: no bare TypeError on a plugin process path
+
+**Pins:** that no `raise TypeError` can escape a plugin's `process` method.
+For each class under `src/elspeth/plugins`, the gate starts at `process` and
+follows every reference to a method of the class or a same-module base
+(`self.`/`cls.`/`ClassName.`, called or passed as a callback) and to a
+module-level function; a `raise TypeError` reached that way fails unless a
+`try` on the path catches it without re-raising. The reviewed expected set is
+empty.
+
+```bash
+.venv/bin/python -m pytest tests/unit/plugins/test_process_path_type_error_gate.py -n 0
+```
+
+**Why.** A bare `TypeError` matches no conversion in the engine, so it aborts
+the run instead of routing the row; twelve batch plugins copied that
+convention for wrongly-typed row values from one another (elspeth-5887fb7928).
+A wrongly-typed row value returns `TransformResult.error(...)` naming the field,
+the expected and found type and the row index, never the value; in a batch
+helper that returns a value, raise `BatchRowTypeError`
+(`plugins/transforms/_batch_row_types.py`) and convert it once in `process()`.
+
+**Escape hatch.** When a `TypeError`'s condition genuinely reads no row value,
+prefer raising a Tier-1 exception class. Otherwise add a reviewed entry to
+`REVIEWED_PROCESS_PATH_TYPE_ERRORS` in the gate file in the same change, with
+a comment saying why. The key is `<path>::<function>::TypeError`, never a
+line, and each key admits one site. There is no inline suppression. The gate
+also asserts it rooted at no fewer than `MIN_PROCESS_ROOTS` process methods,
+because a scan that stopped seeing the plugin tree reports the same empty set
+a clean tree does.
+
 ### Gate: runtime-rejection parity
 
 **Pins:** every `raise` under `src/elspeth/core/dag/` and
@@ -543,8 +574,11 @@ most:
   Tier-1 nominal invariant must raise; do not soften it to a warning.
 - **Tier 2 (user data):** quarantine the row, never the run. A transform that
   cannot produce a row returns `TransformResult.error(...)` so the row leaves
-  through `on_error`; a caught exception's tier is the discriminator, and the
-  cheapest way to say so is a narrowed parameter type.
+  through `on_error` (at a batch node the whole batch fails); a caught
+  exception's tier is the discriminator, and the cheapest way to say so is a
+  narrowed parameter type. A wrongly-typed row value is rejected the same way,
+  never coerced and never raised on — see
+  [Gate: no bare TypeError on a plugin process path](#gate-no-bare-typeerror-on-a-plugin-process-path).
 - **Tier 3 (external input):** parse at one declared boundary and construct an
   owned type. Read foreign data through a single named accessor per module
   (for example `_node_str_option(node, key)` in `interpretation_state.py`,
