@@ -614,17 +614,32 @@ row-error path.
 
 ```yaml
 transforms:
-  - plugin: price_calculator
-    options:
-      on_error: failed_calculations    # Optional
+  - name: price_calculator
+    plugin: custom_transform
+    input: validated
+    on_success: priced
+    on_error: failed_calculations    # Required: a sink name or "discard"
 ```
 
+`on_error` is a required top-level field of every transform (a config that
+omits it fails settings validation before the graph is built). Inside a bound
+region it may instead name that region's closer (spec §7 rule 9).
+
 When a transform returns `TransformResult.error(...)`:
-1. Engine checks `on_error` config for this transform
-2. If configured: token routed via DIVERT edge to error sink
-3. If `"discard"`: token dropped (audit event still recorded)
-4. If not configured: `ConfigurationError` — pipeline crashes
-5. `TransformErrorEvent` recorded in audit trail
+1. The transform's node state is completed as `FAILED` and a
+   `transform_errors` row records the reason.
+2. A named sink: the token travels the transform's structural DIVERT edge to
+   that sink and records `(failure, on_error_routed)` once the sink write is
+   durable.
+3. `"discard"`, or the enclosing region's closer: the token records
+   `(failure, quarantined_at_source)` with an `error_hash`; no sink write.
+4. Only that row is affected; processing continues for the others.
+
+An exception that escapes `process()` is not this path. Apart from the few
+the engine converts (retryable, transport and capacity errors, a shutdown
+interruption, and a Tier-2 `PluginContractViolation`), it aborts the run: a
+wrongly-typed row value must be rejected by returning an error, never by
+raising.
 
 ### Aggregation Batch Errors
 

@@ -19,7 +19,10 @@ the same commit; the rules live there, the history lives here.
   tier-model skill, README, the website) read as authority. The sites now raise `BatchRowTypeError` from their
   helpers and `process()` converts it once, and the docs say "rejected by a RETURNED error; at a batch node the whole
   batch fails". The gate `tests/unit/plugins/test_process_path_type_error_gate.py` (class-scoped reachability from
-  `process`, expected set empty) flagged exactly those twelve at base 74c0ce0db and nothing else. It is scoped to
+  `process`, expected set empty) flagged exactly those twelve at base 74c0ce0db and nothing else. It did NOT flag the
+  RAG query builder's two live-abort sites (`transforms/rag/query.py`, fixed separately in 11f5475d8): a helper object
+  composed from another module, under a `process` six registered transforms inherit from another module, is outside
+  its reach, so a green gate does not prove a plugin cannot abort. It is scoped to
   `TypeError` on purpose: widening to `ValueError`/`KeyError`/`RuntimeError`/`NotImplementedError` adds only
   lifecycle and self-consistency invariants whose conditions read no row value. Its anti-vacuity floor
   (`MIN_PROCESS_ROOTS`) exists because a copy of the tree under a gitignored path, or a nonexistent root, scans as

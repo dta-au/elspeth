@@ -442,8 +442,13 @@ once in `process()`: the built-in batch transforms raise `BatchRowTypeError`
 is the pattern) and return `TransformResult.error(exc.as_reason(), retryable=False)`.
 A bare `raise TypeError(...)` is the defect this replaces: nothing in the engine
 converts it, so it ends the run with a traceback and no terminal outcomes.
-`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on a
-`raise TypeError` that can escape a plugin's `process` path.
+`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on an
+explicit `raise TypeError` that a plugin class's own `process` reaches through
+its methods, same-module bases and module functions. It does not follow helper
+objects the class composes or code in another module, so a green gate is not
+proof that a plugin cannot abort
+([CONTRIBUTING](CONTRIBUTING.md#gate-no-bare-typeerror-on-a-plugin-process-path)
+lists its blind spots).
 
 </details>
 

@@ -427,13 +427,25 @@ a count that transiently matches a sibling branch's plugin set was never real.
 
 ### Gate: no bare TypeError on a plugin process path
 
-**Pins:** that no `raise TypeError` can escape a plugin's `process` method.
-For each class under `src/elspeth/plugins`, the gate starts at `process` and
-follows every reference to a method of the class or a same-module base
+**Pins:** that no explicit `raise TypeError` is reachable, uncaught, from a
+plugin class's `process` through the class's own code.
+For each class under `src/elspeth/plugins` whose `process` is defined in its
+own module (on the class or a same-module base), the gate starts at `process`
+and follows every reference to a method of the class or a same-module base
 (`self.`/`cls.`/`ClassName.`, called or passed as a callback) and to a
-module-level function; a `raise TypeError` reached that way fails unless a
-`try` on the path catches it without re-raising. The reviewed expected set is
-empty.
+module-level function of that module; a `raise TypeError` reached that way
+fails unless a `try` on the path catches it without re-raising. The reviewed
+expected set is empty.
+
+**Does not see.** A class that inherits `process` from another module is never
+a root (6 of the 38 registered transforms: the Bedrock and Azure safety
+transforms, Azure AI Search and RAG retrieval). The gate does not follow a
+composed helper object (`self._builder.build(...)`) or anything imported from
+another module, and it does not see implicit raises. The RAG query builder's
+two `raise TypeError` sites (`transforms/rag/query.py`), which aborted runs
+until 11f5475d8 fixed them, were outside its reach at 74c0ce0db. Passing
+the gate does not prove a plugin cannot abort the run; the docstring lists
+every blind spot.
 
 ```bash
 .venv/bin/python -m pytest tests/unit/plugins/test_process_path_type_error_gate.py -n 0

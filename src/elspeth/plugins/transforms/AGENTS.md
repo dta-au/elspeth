@@ -22,9 +22,13 @@ upstream checked it.
   (`batch_threshold_summary.py` is the pattern). Use `type(x) not in (...)`,
   not `isinstance`: `bool` is an `int`.
 
-`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on a
-`raise TypeError` that can escape a `process` path. Its escape hatch is a
-reviewed entry in that file, never a suppression.
+`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on an
+explicit `raise TypeError` that a class's own `process` reaches through its
+methods, same-module bases and module functions. It does not follow composed
+helper objects (`self._builder.build(...)`) or code in another module, and it
+never roots a transform that inherits `process` from another module (the RAG,
+Azure and Bedrock families here), so it cannot vouch for those. Its escape
+hatch is a reviewed entry in that file, never a suppression.
 
 ## The Decision Test
 

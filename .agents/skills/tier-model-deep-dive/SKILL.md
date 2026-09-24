@@ -79,7 +79,10 @@ a batch node (aggregation or collector) one such row fails the WHOLE batch;
 the aggregation's `on_error` routes every buffered row. A batch helper that
 returns a value raises `BatchRowTypeError` (`plugins/transforms/_batch_row_types.py`)
 and `process()` converts it once. `tests/unit/plugins/test_process_path_type_error_gate.py`
-refuses a `raise TypeError` that can escape a `process` path.
+refuses an explicit `raise TypeError` that a class's own `process` reaches through
+its methods, same-module bases and module functions; it does not follow composed
+helper objects or code in another module, so a green gate does not prove the
+transform cannot abort.
 
 ## Operation Wrapping Rules
 
