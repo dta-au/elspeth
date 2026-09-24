@@ -1075,9 +1075,8 @@ class CallAuditRepository:
             if current.row_run_id != current.run_id:
                 raise AuditIntegrityError("current call parent has a cross-run source row")
             current_lineage = self._token_lineage_hash(current.token_id, current.run_id, current.row_id)
-            query = (
-                select(calls_table, tokens_table.c.token_id.label("parent_token_id"), tokens_table.c.row_id.label("parent_row_id"))
-                .join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+            parent_query = (
+                select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
                 .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
                 .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
                 .where(
@@ -1090,6 +1089,19 @@ class CallAuditRepository:
                     rows_table.c.run_id == source_run_id,
                 )
             )
+            source_parents = self._ops.execute_fetchall(parent_query)
+            source_lineages = {
+                parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id)
+                for parent in {parent.token_id: parent for parent in source_parents}.values()
+            }
+            matching_parents = [parent for parent in source_parents if source_lineages[parent.token_id] == current_lineage]
+            # Identity is a property of the parent, independent of whether its
+            # calls have the requested type, request hash or local index.
+            if len(matching_parents) > 1:
+                raise AuditIntegrityError("ambiguous source call parent token lineage")
+            if not matching_parents:
+                return []
+            query = select(calls_table).where(calls_table.c.state_id == matching_parents[0].state_id)
         else:
             current = self._ops.execute_fetchone(
                 select(
@@ -1116,12 +1128,6 @@ class CallAuditRepository:
         candidates = self._ops.execute_fetchall(
             query.where(calls_table.c.call_type == call_type).order_by(calls_table.c.call_index, calls_table.c.call_id)
         )
-        if current_state_id is not None:
-            source_lineages = {
-                (row.parent_token_id, row.parent_row_id): self._token_lineage_hash(row.parent_token_id, source_run_id, row.parent_row_id)
-                for row in {row.parent_token_id: row for row in candidates}.values()
-            }
-            candidates = [row for row in candidates if source_lineages[row.parent_token_id, row.parent_row_id] == current_lineage]
         return [self._call_loader.load(row) for row in candidates]
 
     def find_call_for_current_parent(
