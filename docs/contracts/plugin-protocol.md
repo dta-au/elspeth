@@ -188,7 +188,8 @@ If a transform receives `"42"` when its `input_schema` says `int`, that's a bug 
 |------|----------|---------------|----------------|
 | **Their Data Values** | Row value causes operation error | Catch, return error result | Quarantine row, continue |
 | **Their Data Types** | Wrong type at Source boundary | Coerce if possible, else error | Quarantine row, continue |
-| **Their Data Types** | Wrong type at Transform/Sink | — | This is an upstream bug, should crash |
+| **Their Data Types** | Wrong type in a row a Transform receives | Do not coerce; return `TransformResult.error(...)` naming the field, expected and found type (never the value) | Route the row via the transform's `on_error`, continue. At a batch node the whole batch fails ([Aggregation](#aggregation-token-batching)) |
+| **Their Data Types** | Wrong type at Sink | — | This is an upstream bug, should crash |
 | **Our Code** | Internal state causes error | Let it crash | Record in audit, halt pipeline |
 | **Lifecycle** | `on_start`/`on_complete`/`close` fails | Let it crash | Halt pipeline (config/code bug) |
 
@@ -197,7 +198,7 @@ If a transform receives `"42"` when its `input_schema` says `int`, that's a bug 
 - Sources MAY coerce source input; transforms MAY coerce fresh external responses they fetch; transforms and sinks MUST NOT coerce already-validated pipeline rows
 - Plugins MUST NOT wrap operations on internal state - let bugs surface
 - If you're tempted to add `try/except` around your own logic, you have a bug to fix
-- If a transform receives wrong types, that's an upstream bug to fix, not something to coerce
+- If a transform receives a wrong type, fix the upstream plugin or schema, never the value: do not coerce it. Reject that row by RETURNING an error. Never raise a bare `TypeError` (or any exception the engine does not convert): it escapes `process()` and aborts the whole run instead of routing one row ([ADR-008](../architecture/adr/008-runtime-contract-cross-check.md) §"TIER_1 registration is load-bearing"). `tests/unit/plugins/test_process_path_type_error_gate.py` refuses a `raise TypeError` that can escape a plugin's `process` path
 
 ### 4. Forced Pass for Lifecycle Hooks
 
@@ -558,7 +559,19 @@ class JSONExplode(BaseTransform):
     # ...
 
     def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
-        items = row["items"]  # Trust: source validated this is a list
+        items = row["items"]
+        # Row data the source types `any`: check it, never coerce or raise.
+        # PipelineRow deep-freezes a list into a tuple.
+        if type(items) not in (list, tuple):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": "items",
+                    "error_type": "wrong_type",
+                    "error": f"must be a list, got {type(items).__name__}",
+                },
+                retryable=False,
+            )
         output_rows = []
         for i, item in enumerate(items):
             output = {**row.to_dict(), "item": item, "item_index": i}
@@ -616,10 +629,28 @@ class SummaryTransform(BaseTransform):
         rows: list[PipelineRow],
         ctx: PluginContext,
     ) -> TransformResult:
-        total = float(sum(r["value"] for r in rows))
+        values: list[int | float] = []
+        for index, row in enumerate(rows):
+            value = row["value"]
+            # Row data: never coerced, never raised. `type()`, not isinstance:
+            # bool is an int. The reason names the row index, field and type,
+            # never the value.
+            if type(value) not in (int, float):
+                return TransformResult.error(
+                    {
+                        "reason": "invalid_input",
+                        "error_type": "wrong_type",
+                        "field": "value",
+                        "expected": "int or float",
+                        "actual_type": type(value).__name__,
+                        "error": f"must be int or float, got {type(value).__name__} in row {index}",
+                    },
+                    retryable=False,
+                )
+            values.append(value)
         return TransformResult.success(
             PipelineRow(
-                {"total": total, "count": len(rows)},
+                {"total": float(sum(values)), "count": len(rows)},
                 self._aggregate_output_contract,
             ),
             success_reason={"action": "aggregated", "batch_size": len(rows)},
@@ -631,7 +662,14 @@ class SummaryTransform(BaseTransform):
 1. Transform is configured at an aggregation node (see "Aggregation" below)
 2. Engine buffers rows until trigger fires (count, timeout, condition)
 3. Engine calls `transform.process(rows: list[PipelineRow], ctx)` with the batch
-4. Transform returns aggregated result
+4. Transform returns the aggregated result, or `TransformResult.error(...)` when
+   any buffered row cannot be processed. One bad row fails the WHOLE batch: a
+   reductive result over the rows that happened to be good would describe a set
+   nobody asked for. A check inside a helper that returns a value raises a
+   plugin-owned exception that `process()` catches once and converts; the
+   built-in batch transforms use `BatchRowTypeError`
+   (`plugins/transforms/_batch_row_types.py`, `as_reason()` renders the
+   value-free reason)
 
 > **Implementation note:** Batch-aware transforms implement `BatchTransformProtocol` — a separate protocol from `TransformProtocol`. The key difference is the `process()` signature: `BatchTransformProtocol.process(rows: list[PipelineRow], ctx)` receives a list of `PipelineRow`, while `TransformProtocol.process(row: PipelineRow, ctx)` receives a single row. Both protocols share most attributes (`name`, `input_schema`, `output_schema`, `is_batch_aware`, `creates_tokens`, `declared_output_fields`, and `_output_schema_config`).
 
@@ -641,21 +679,25 @@ class SummaryTransform(BaseTransform):
 - The engine decides when to batch based on pipeline configuration
 - `declared_input_fields` is a single-row precondition surface today; batch-aware transforms must leave it empty until a batch pre-emission contract exists
 
-#### Optional Configuration
+#### Error Routing (`on_error`)
 
 ```yaml
 transforms:
-  price_calculator:
-    type: custom_transform
-    # OPTIONAL: Where do rows go when transform returns error?
+  - name: price_calculator
+    plugin: custom_transform
+    input: validated
+    on_success: priced
+    # REQUIRED: where rows go when the transform returns an error
     on_error: failed_calculations  # Sink name, or "discard"
 ```
 
-**`on_error`** (OPTIONAL):
+**`on_error`** (REQUIRED on every transform and aggregation):
 - Specifies destination for rows where transform returns `TransformResult.error()`
-- Value must be a sink name or `"discard"` for explicit drop
-- If omitted and transform returns an error → `ConfigurationError` (pipeline crashes)
-- Even when `"discard"`, a `TransformErrorEvent` is recorded in the audit trail
+- Value must be a sink name or `"discard"` for explicit drop (inside a bound
+  region a transform may also name that region's closer)
+- A routed row is recorded as `(failure, on_error_routed)` at the named sink;
+  under `"discard"` it is `(failure, quarantined_at_source)`. Either way the
+  node_state is FAILED and a `transform_errors` row records the reason
 
 **Error vs Bug distinction:**
 
@@ -823,7 +865,19 @@ from elspeth.contracts.contract_propagation import propagate_contract
 
 # Deaggregation: 1 input → N outputs
 def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
-    items = row["items"]  # Trust: source validated this is a list
+    items = row["items"]
+    # Row data the source types `any`: check it, never coerce or raise.
+    # PipelineRow deep-freezes a list into a tuple.
+    if type(items) not in (list, tuple):
+        return TransformResult.error(
+            {
+                "reason": "invalid_input",
+                "field": "items",
+                "error_type": "wrong_type",
+                "error": f"must be a list, got {type(items).__name__}",
+            },
+            retryable=False,
+        )
     output_rows = []
     for i, item in enumerate(items):
         output = {**row.to_dict(), "item": item, "item_index": i}
@@ -1454,29 +1508,31 @@ Merged Token (T5)
 
 **Architecture:** Aggregation is **fully structural** - the engine owns the buffer and decides when to flush. There is no plugin-level aggregation protocol. When you need batch processing:
 
-1. Configure an aggregation node in the pipeline
-2. Use a batch-aware transform (`is_batch_aware = True`) at that node
+1. Configure an aggregation node in the pipeline's `aggregations:` list
+2. Name a batch-aware transform (`is_batch_aware = True`) as its `plugin`
 3. Engine buffers rows and calls `transform.process(rows: list[PipelineRow], ctx)` when trigger fires
 
 #### Configuration
 
 ```yaml
-pipeline:
-  - source: events
-
-  # Aggregation configuration
-  aggregations:
-    - node_id: batch_stats      # Links to transform below
-      trigger:
-        count: 100              # Fire after 100 rows
-        timeout_seconds: 3600   # Or after 1 hour
-        # condition: "row['type'] == 'flush_signal'"  # Optional: trigger on special row
-
-  transforms:
-    - plugin: summary_transform
-      node_id: batch_stats      # Same as aggregation node_id
-      # Transform must have is_batch_aware = True
+aggregations:
+  - name: event_stats
+    plugin: batch_stats         # must be batch-aware
+    input: events               # an upstream on_success connection
+    on_success: stats_out
+    on_error: quarantine        # required: a sink name, or "discard"
+    trigger:
+      count: 100                # Fire after 100 rows
+      timeout_seconds: 3600     # Or after 1 hour
+      # condition: "row['type'] == 'flush_signal'"  # Optional: trigger on special row
+    options:
+      schema: {mode: observed}
+      value_field: amount
 ```
+
+`elspeth validate` refuses a batch-aware plugin under `transforms:` (it would be
+handed one row where it expects a list) unless the plugin also declares
+`supports_row_mode_when_batch_aware = True`.
 
 #### Output Mode
 
@@ -1484,7 +1540,8 @@ Aggregation supports two output modes that determine how batch results are handl
 
 ```yaml
 aggregations:
-  - node_id: batch_stats
+  - name: event_stats
+    # ... plugin, input, on_success, on_error, options as above ...
     trigger: { count: 100 }
     output_mode: transform          # default: N inputs → M outputs
     expected_output_count: 1        # optional: validate N→1 cardinality
@@ -1501,7 +1558,19 @@ aggregations:
 
 - **`passthrough`**: Batch enrichment. N rows become N enriched rows with the same token IDs. Buffered tokens get `BUFFERED` (non-terminal) while waiting, then reappear as `COMPLETED` on flush. Transform must return `success_multi()` with exactly N rows.
 
-**Error handling:** All modes are atomic - if the transform returns `error`, ALL buffered rows fail together.
+**Error handling:** All modes are atomic. If the transform returns `error` (for
+example because one buffered row carries a wrongly-typed value), ALL buffered
+rows fail together, and the aggregation's `on_error` decides where they go:
+every buffered row, with its original values, to the named sink as
+`(failure, on_error_routed)`, or `(failure, quarantined_at_source)` under
+`discard`. The batch's FAILED node_state records the reason the plugin returned,
+which names the field, the expected and found type and the batch row index,
+never the value. A raised Tier-2 `PluginContractViolation` fails the batch the
+same way; any other exception from the plugin aborts the run. At a collector
+(a scope's closer, which has no `on_error`) the same returned error fails the
+group. Full mechanics, resume included:
+[Execution Graph — Aggregation Batch Errors](execution-graph.md#aggregation-batch-errors)
+and [Collector Group Failures](execution-graph.md#collector-group-failures).
 
 #### Trigger Types
 
@@ -1696,6 +1765,7 @@ Plugins make calls; the engine throttles them.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.13 | 2026-09-24 | A wrongly-typed row value at a transform is rejected by a RETURNED error, never a raise (the Contract table no longer tells transforms to "crash"; Sink unchanged); batch-aware example rejects a wrong type instead of summing it; aggregation `on_error` routes the whole failed batch; aggregation config examples brought to the `name`/`plugin`/`input`/`on_error` shape (elspeth-5887fb7928) |
 | 1.12 | 2026-05-07 | Accuracy pass for current runtime contracts — documented required `SourceRow.valid(..., contract=...)`, `TransformResult` `PipelineRow`-only outputs, `SinkWriteResult` sink returns, dynamic built-in discovery, `config_model`/`source_file_hash` identity surfaces, and transform-side external Tier 3 boundaries |
 | 1.11 | 2026-04-20 | Added `declared_input_fields`, `declared_output_fields`, and `can_drop_rows` transform declarations; documented `TransformResult.success_empty()` and `DROPPED_BY_FILTER` zero-emission semantics |
 | 1.10 | 2026-02-13 | RC-3 alignment — Fixed stale "(config OR plugin)" gate description to "(config-driven)" (gate plugins removed 2026-02-11). Corrected gate key property to reflect routing-only behavior (no row modification). |

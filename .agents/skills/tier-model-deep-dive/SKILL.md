@@ -66,9 +66,20 @@ def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
 | Plugin Type | Coercion Allowed? | Rationale |
 |-------------|-------------------|-----------|
 | **Source** | Yes | Normalizes external data at ingestion boundary |
-| **Transform (on row)** | No | Receives validated data; wrong types = upstream bug |
+| **Transform (on row)** | No | Receives validated data; wrong types = upstream bug. Rejected by a RETURNED `TransformResult.error(...)` routed via `on_error`, never raised |
 | **Transform (on external call)** | Yes | External response is Tier 3 - validate/coerce immediately |
 | **Sink** | No | Receives validated data; wrong types = upstream bug |
+
+**Wrongly-typed row value at a transform.** Under an `observed` schema (or a
+field typed `any`) the type is row data. Do not coerce it and do not raise on
+it: a bare `TypeError` escaping `process()` matches no engine conversion and
+aborts the run. Return `TransformResult.error({...}, retryable=False)` naming
+the field, the expected and found type and the row index, never the value. At
+a batch node (aggregation or collector) one such row fails the WHOLE batch;
+the aggregation's `on_error` routes every buffered row. A batch helper that
+returns a value raises `BatchRowTypeError` (`plugins/transforms/_batch_row_types.py`)
+and `process()` converts it once. `tests/unit/plugins/test_process_path_type_error_gate.py`
+refuses a `raise TypeError` that can escape a `process` path.
 
 ## Operation Wrapping Rules
 

@@ -417,7 +417,7 @@ never block Run.
 
 **Slide 30 — Trust tiers: what happens when data is wrong.**
 - **Tier 3 — anything from outside** (your CSV, an API, an LLM's reply): zero trust; source validation follows its configured quarantine/discard route so other rows can continue
-- **Tier 2 — your rows once a source has validated them**: types are trusted downstream; a wrong type there is an upstream bug to fix
+- **Tier 2 — your rows once a source has validated them**: types are trusted downstream and never coerced; a wrong type there is an upstream bug to fix, and meanwhile it fails that row (at a batch node, the whole batch) through `on_error` rather than stopping the run
 - **Tier 1 — ELSPETH's own audit records**: fully trusted, so any anomaly *crashes* — "silently coercing bad audit data would be evidence tampering"
 - "A CSV with garbage in row 500 should not crash a 10,000-row pipeline. A corrupted audit record should crash immediately." — README
 

@@ -573,8 +573,10 @@ every stage of the pipeline:
 
 Coercion is only allowed at trust boundaries: sources ingesting external data,
 and transforms receiving LLM/API responses. Once data enters the pipeline with
-valid types, downstream transforms trust those types. Wrong types downstream are
-upstream bugs to fix, not data quality issues to handle gracefully.
+valid types, downstream transforms trust those types and never coerce them. A
+wrong type downstream is an upstream bug to fix; meanwhile it fails that row, or
+at a batch node that whole batch, with a recorded reason and routes it through
+`on_error` instead of stopping the run.
 
 This means a CSV with garbage in row 500 should not crash a 10,000-row pipeline
 (Tier 3: quarantine the row, keep processing). A corrupted audit record should

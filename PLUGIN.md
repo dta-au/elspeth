@@ -88,10 +88,24 @@ class DoubleValueTransform(BaseTransform):
         if self._field not in row:
             return TransformResult.error({"reason": "missing_field", "field": self._field})
 
-        try:
-            result = row[self._field] * 2
-        except TypeError as e:
-            return TransformResult.error({"reason": "invalid_input", "error": str(e)})
+        # Under an observed schema the value's type is row data. Check it: never
+        # coerce it, and never raise (a raise ends the run; a returned error
+        # routes this one row). `"12.5" * 2` is "12.512.5", not a TypeError, so
+        # catching TypeError around the operation would miss it. `type()`, not
+        # isinstance: bool is an int. Name the field and type, never the value.
+        value = row[self._field]
+        if type(value) not in (int, float):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "error_type": "wrong_type",
+                    "field": self._field,
+                    "expected": "int or float",
+                    "actual_type": type(value).__name__,
+                },
+                retryable=False,
+            )
+        result = value * 2
 
         output = row.to_dict()
         output[self._field] = result
@@ -231,14 +245,24 @@ class MyTransform(BaseTransform):
                 "field": self._target_field,
             })
 
-        # Wrap operations on row values (their data can fail)
-        try:
-            result = row[self._target_field] * self._multiplier
-        except TypeError as e:
-            return TransformResult.error({
-                "reason": "invalid_input",
-                "error": str(e),
-            })
+        # A row value's type is row data under an observed schema: check it,
+        # never coerce it, never raise. Catching TypeError around the operation
+        # is not a check: `"12.5" * 2` succeeds and yields "12.512.5".
+        value = row[self._target_field]
+        if type(value) not in (int, float):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "error_type": "wrong_type",
+                    "field": self._target_field,
+                    "expected": "int or float",
+                    "actual_type": type(value).__name__,
+                },
+                retryable=False,
+            )
+        # Wrap operations on row values that can still fail on a valid type
+        # (division by zero, a date that does not parse) and return an error.
+        result = value * self._multiplier
 
         output = row.to_dict()
         output[self._target_field] = result
@@ -346,7 +370,27 @@ class BatchStatsTransform(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "invalid_input", "error": "empty batch"})
 
-        total = float(sum(r["value"] for r in rows))
+        values: list[int | float] = []
+        for index, row in enumerate(rows):
+            value = row["value"]
+            # Row data: never coerced, never raised. `type()`, not isinstance:
+            # bool is an int. The reason names the row index, field and type,
+            # never the value.
+            if type(value) not in (int, float):
+                return TransformResult.error(
+                    {
+                        "reason": "invalid_input",
+                        "error_type": "wrong_type",
+                        "field": "value",
+                        "expected": "int or float",
+                        "actual_type": type(value).__name__,
+                        "error": f"must be int or float, got {type(value).__name__} in row {index}",
+                    },
+                    retryable=False,
+                )
+            values.append(value)
+
+        total = float(sum(values))
         return TransformResult.success(
             PipelineRow(
                 {"count": len(rows), "sum": total, "mean": total / len(rows)},
@@ -384,6 +428,23 @@ declaring it reaches `row[...]` as a `KeyError` that ends the run.
 built-in batch transform to this. A column you read only when present
 (`if field in row`) is optional and is not declared.
 
+**Reject a wrongly-typed value by returning an error, never by raising.** Under
+an `observed` schema (or a field the schema leaves untyped) a value's type is
+row data, so a batch transform must check it, as the example does, and must
+not coerce it. One bad row fails the WHOLE batch: a sum or a statistic over the
+rows that happened to be good would describe a set nobody asked for. The
+aggregation's `on_error` then routes every buffered row, with its original
+values, to the named sink, or records them as discarded; at a collector the
+group fails. When the check sits in a helper that returns a value rather than a
+`TransformResult`, raise a plugin-owned exception from the helper and convert it
+once in `process()`: the built-in batch transforms raise `BatchRowTypeError`
+(`src/elspeth/plugins/transforms/_batch_row_types.py`; `batch_threshold_summary.py`
+is the pattern) and return `TransformResult.error(exc.as_reason(), retryable=False)`.
+A bare `raise TypeError(...)` is the defect this replaces: nothing in the engine
+converts it, so it ends the run with a traceback and no terminal outcomes.
+`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on a
+`raise TypeError` that can escape a plugin's `process` path.
+
 </details>
 
 <details>
@@ -402,7 +463,21 @@ class ExpandItemsTransform(BaseTransform):
     declared_output_fields = frozenset({"item", "item_index"})
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
-        items = row["items"]  # Trust: source validated this is a list
+        items = row["items"]
+        # A list-shaped field is typed `any` by the source, which validates
+        # nothing, so check it here. PipelineRow deep-freezes row data, so a
+        # list arrives as a tuple. Never coerce and never raise: iterating a
+        # str or a dict would fabricate rows, and a raise aborts the run.
+        if type(items) not in (list, tuple):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": "items",
+                    "error_type": "wrong_type",
+                    "error": f"must be a list, got {type(items).__name__}",
+                },
+                retryable=False,
+            )
 
         output_rows = []
         for i, item in enumerate(items):

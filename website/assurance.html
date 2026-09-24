@@ -147,7 +147,7 @@ Completed: True
     <div class="section-head">
       <span class="eyebrow">Data trust model</span>
       <h2>Three tiers, one rule: coerce only at the boundary.</h2>
-      <p>Once data enters the pipeline with valid types, downstream transforms trust those types. Wrong types downstream are upstream bugs to fix — not data-quality issues to handle gracefully.</p>
+      <p>Once data enters the pipeline with valid types, downstream transforms trust those types and never coerce them. A wrong type downstream is an upstream bug to fix — until it is, the row, or at a batch node the whole batch, fails with a recorded reason and routes through its error route instead of stopping the run.</p>
     </div>
     <div class="tiers">
       <div class="tier">

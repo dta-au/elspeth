@@ -57,6 +57,7 @@ if node_id is None:
 - Values might still cause operation failures (division by zero, invalid date formats, etc.)
 - Transforms/sinks **expect conformance** - if types are wrong, that's an upstream plugin bug
 - **No coercion** at transform/sink level - if a transform receives `"42"` when it expected `int`, that's a bug in the source or upstream transform
+- Types are only as trustworthy as the schema that checked them. A field a fixed schema declares was type-checked at the source; a field an `observed` schema, or a schema that leaves the field untyped, carries was not, so its type is row data. Either way the row is **rejected, not coerced and not raised on**: a transform returns `TransformResult.error(...)` and the row leaves through its `on_error`; at a batch node (aggregation or collector) one such row fails the WHOLE batch. The reason names the field, the expected and found type and the row index, never the value. A raised `TypeError` does not reject a row: nothing in the engine converts it, so it aborts the run
 
 **Why plugins don't coerce:**
 
@@ -273,11 +274,11 @@ From this point forward, `extracted` is treated as Tier 2 pipeline data. No more
 | Plugin Type | Coercion Allowed? | Rationale |
 |-------------|-------------------|-----------|
 | **Source** | ✅ Yes | Normalizes external data at ingestion boundary |
-| **Transform (on row data)** | ❌ No | Receives validated data; wrong types = upstream bug |
+| **Transform (on row data)** | ❌ No | Receives validated data; wrong types = upstream bug. Rejected by a RETURNED `TransformResult.error(...)`; the row routes via `on_error`. Never raised |
 | **Transform (on external call response)** | ✅ Yes | External response is Tier 3 - validate/coerce immediately |
 | **Sink** | ❌ No | Receives validated data; wrong types = upstream bug |
-| **Gate** | ❌ No | Receives validated data; wrong types = upstream bug |
-| **Aggregation** | ❌ No | Receives validated data; wrong types = upstream bug |
+| **Gate** | ❌ No | Receives validated data. A condition that fails on a row routes it via the gate's `on_error`; with no `on_error` the run stops |
+| **Aggregation** | ❌ No | Receives validated data. A wrongly-typed row is rejected by a RETURNED error, which fails the WHOLE batch: every buffered row routes via the aggregation's `on_error` (a sink, or `discard`). Never raised |
 
 ## Operation Wrapping Rules
 
