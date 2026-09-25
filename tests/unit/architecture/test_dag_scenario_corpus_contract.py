@@ -802,6 +802,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # moved d87d0325cdeb243f -> e424629ddeb631e4 (recomputed with
 # scripts/cicd/plugin_hash.py::compute_source_file_hash); no manifest literal,
 # resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-25 (elspeth-5887fb7928, S1a fix round 2, review-S1a-r2 F1):
+# a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper now carries
+# an identity mapping by original header, so its source_file_hash moved
+# e424629ddeb631e4 -> a45ae2bec03f6d88 (same tool); no manifest literal,
+# resume digest, registry digest or oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "767f95459978d3ae4885e8681a405d84ad6acc88c58b694c7e894868a9a0af54"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
