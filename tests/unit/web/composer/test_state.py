@@ -7121,10 +7121,10 @@ class TestSchemaContractValidation:
         assert result.is_valid, result.errors
 
     def test_union_coalesce_rejects_unproven_expression_output_type(self) -> None:
-        """An expression target's input declaration is not proof of its output type."""
+        """An expression target the branch does not type is ``any``: the arriving int is no proof of its output type."""
         state = self._make_coalesce_schema_mode_state(
             source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
-            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: any"]},
             branch_plugin="value_transform",
         )
 
@@ -7135,6 +7135,18 @@ class TestSchemaContractValidation:
         assert entry.coalesce_union_type is not None
         assert entry.coalesce_union_type.field == "value"
         assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"int", "any"}
+
+    def test_union_coalesce_accepts_a_typed_expression_target_as_its_declared_type(self) -> None:
+        """A target the branch TYPES is the operator's output declaration, enforced by value_transform's pin (ADR-050)."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            branch_plugin="value_transform",
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
 
     def test_union_coalesce_type_check_abstains_on_unresolved_branch(self) -> None:
         """One resolvable branch is not enough to prove a conflict."""

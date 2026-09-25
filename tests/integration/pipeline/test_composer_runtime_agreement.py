@@ -5784,13 +5784,16 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
             graph.validate_edge_compatibility()
 
     def test_both_reject_computed_unknown_against_a_concrete_type(self, tmp_path: Path) -> None:
-        """A computed target has no concrete output proof even with a typed input."""
+        """A computed target the node's schema does not type is ``any``: no concrete output proof."""
         csv_path, output_path = self._paths(tmp_path)
         schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        # 'price' is read and overwritten, and the label branch declares it
+        # 'any': the arriving int proves nothing about the computed value.
+        label_schema = {"mode": "fixed", "fields": ["id: int", "price: any"]}
         result = self._composer_state(
             csv_path=csv_path,
             output_path=output_path,
-            label_schema=schema,
+            label_schema=label_schema,
             price_schema=schema,
             label_plugin="value_transform",
         ).validate()
@@ -5806,12 +5809,41 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
                 self._runtime_settings(
                     csv_path=csv_path,
                     output_path=output_path,
-                    label_schema=schema,
+                    label_schema=label_schema,
                     price_schema=schema,
                     label_plugin="value_transform",
                 )
             )
             graph.validate_edge_compatibility()
+
+    def test_both_accept_a_typed_computed_target_as_its_declared_type(self, tmp_path: Path) -> None:
+        """A computed target the node's schema TYPES is the operator's output declaration (ADR-050).
+
+        value_transform pins it: a row whose computed value breaks the type is
+        that row's routed ``type_mismatch`` error, so ``price: int`` on the
+        branch is an enforced proof and both surfaces accept the int/int union.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=schema,
+            price_schema=schema,
+            label_plugin="value_transform",
+        ).validate()
+
+        assert result.is_valid, result.errors
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                label_schema=schema,
+                price_schema=schema,
+                label_plugin="value_transform",
+            )
+        )
+        graph.validate_edge_compatibility()
 
 
 class TestComposerRuntimeCoalescePolicyDefaultAgreement:

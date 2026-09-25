@@ -33,7 +33,8 @@ def _csv_row(tmp_path: Path, *, declared: bool = False, numeric: bool = False) -
     return PipelineRow(row.row, row.contract)
 
 
-def _verify(transform: ValueTransform, row: PipelineRow) -> None:
+def _verify_declaration_only(transform: ValueTransform, row: PipelineRow) -> None:
+    """The ADR-014 output-declaration check alone."""
     assert transform._output_schema_config is not None
     verify_schema_config_mode(
         output_schema_config=transform._output_schema_config,
@@ -44,6 +45,10 @@ def _verify(transform: ValueTransform, row: PipelineRow) -> None:
         row_id="row",
         token_id="token",
     )
+
+
+def _verify(transform: ValueTransform, row: PipelineRow) -> None:
+    _verify_declaration_only(transform, row)
     assert row.contract.validate(row.to_dict()) == []
 
 
@@ -73,12 +78,19 @@ def test_csv_forwarded_fields_reconcile_declarations_without_losing_aliases(tmp_
         assert result.row[original] == row[original]
 
 
-@pytest.mark.parametrize("expression, expected, expected_type", [("row['X'] > 0", True, bool), ("None", None, type(None))])
-def test_computed_target_declares_presence_and_keeps_actual_runtime_type(tmp_path, expression, expected, expected_type):
+@pytest.mark.parametrize("expression, expected", [("row['X'] > 0", True), ("None", None)])
+def test_untyped_computed_target_declares_presence_as_any_before_row_one(tmp_path, expression, expected):
+    """The arriving int is not an output proof: an untyped target is declared ``any``, never typed by a row.
+
+    ADR-050 (reconciled with 63a2e1825): the declaration is fixed before the
+    first row, so the recorded contract is ``object``/``declared``/nullable on
+    every row whatever the expression computes; the value is written as
+    computed.
+    """
     row = _csv_row(tmp_path, declared=True, numeric=True)
     transform = ValueTransform(
         {
-            "schema": {"mode": "flexible", "fields": ["id: str", "x: int"]},
+            "schema": {"mode": "flexible", "fields": ["id: str"]},
             "operations": [{"target": "x", "expression": expression}],
         }
     )
@@ -89,16 +101,48 @@ def test_computed_target_declares_presence_and_keeps_actual_runtime_type(tmp_pat
     assert result.row["x"] is expected
     assert result.row["X"] is expected
     field = result.row.contract.get_field("x")
-    assert field.python_type is expected_type
+    assert field.python_type is object
+    assert field.source == "declared"
     assert field.original_name == "X"
     assert field.required is True
-    assert field.nullable is (expected is None)
+    assert field.nullable is True
     output = transform._output_schema_config
     assert output is not None and output.fields is not None
     declared = next(field for field in output.fields if field.name == "x")
     assert declared.field_type == "any"
     assert declared.required is True
     assert declared.nullable is True
+    assert "x" in output.get_effective_guaranteed_fields()
+
+
+@pytest.mark.parametrize("expression, actual", [("row['X'] > 0", "bool"), ("None", "NoneType")])
+def test_typed_computed_target_is_pinned_to_the_operators_declaration(tmp_path, expression, actual):
+    """A target the node's schema TYPES is the operator's output declaration (ADR-050: operator > plugin > any).
+
+    The projection keeps ``x: int``, and a computed value of another type is
+    that row's routed ``type_mismatch`` error — value-free — never a record
+    that advertises ``int`` over a ``bool``.
+    """
+    row = _csv_row(tmp_path, declared=True, numeric=True)
+    transform = ValueTransform(
+        {
+            "schema": {"mode": "flexible", "fields": ["id: str", "x: int"]},
+            "operations": [{"target": "x", "expression": expression}],
+        }
+    )
+    transform.input_schema.model_validate(row.to_dict(), strict=True)
+    result = transform.process(row, make_context())
+    assert result.status == "error"
+    assert result.row is None
+    assert result.reason is not None
+    assert result.reason["reason"] == "type_mismatch"
+    assert result.reason["field"] == "x"
+    assert result.reason["expected"] == "int"
+    assert result.reason["actual"] == actual
+    output = transform._output_schema_config
+    assert output is not None and output.fields is not None
+    declared = next(field for field in output.fields if field.name == "x")
+    assert declared.field_type == "int"
     assert "x" in output.get_effective_guaranteed_fields()
     assert transform.input_schema.model_fields["x"].annotation is int
 
@@ -136,7 +180,7 @@ def test_nullable_forwarded_declaration_survives_nonnull_observation(tmp_path):
 
 
 @pytest.mark.parametrize("value", [2, 2.0, "2"])
-def test_forwarded_numeric_type_remains_truthful_after_float_input_validation(value):
+def test_forwarded_float_declaration_is_stamped_and_never_aborts(value):
     row = PipelineRow(
         {"x": value},
         SchemaContract(
@@ -160,19 +204,39 @@ def test_forwarded_numeric_type_remains_truthful_after_float_input_validation(va
     assert type(validated.model_dump()["x"]) is float
     result = transform.process(row, make_context())
     assert result.row is not None
+    # The value is never coerced: the executor forwards the original payload.
     assert type(result.row["x"]) is type(value)
-    assert result.row.contract.get_field("x").python_type is type(value)
-    assert result.row.contract.validate(result.row.to_dict()) == []
+    # ADR-050 D7: the operator's declaration of a forwarded field is stamped on
+    # the emitted contract, so the ADR-014 check passes and the run does not
+    # abort on a row the strict input check admitted (63a2e1825 left this int
+    # case raising SchemaConfigModeViolation, a Tier-1 abort).
+    field = result.row.contract.get_field("x")
+    assert field.python_type is float
+    assert field.source == "declared"
+    _verify_declaration_only(transform, result.row)
     if isinstance(value, int):
-        # Pydantic admits int as float, but the executor uses the original row.
-        # Keep the existing declaration mismatch visible without falsifying it.
-        with pytest.raises(SchemaConfigModeViolation, match="field metadata mismatches for \\['x'\\]"):
-            _verify(transform, result.row)
+        # Named residual (ADR-050 §Negative): pydantic admits an int for a
+        # float declaration, the exact-type SchemaContract.validate does not.
+        # The unchanged value is not re-adjudicated (ADR-050 Decision 5), so
+        # the admission/declaration split 63a2e1825 recorded as open stays
+        # visible here rather than being resolved by coercion or an abort.
+        assert [violation.normalized_name for violation in result.row.contract.validate(result.row.to_dict())] == ["x"]
     else:
-        _verify(transform, result.row)
+        assert result.row.contract.validate(result.row.to_dict()) == []
 
 
-def _graph(tmp_path: Path, *, normalize: bool) -> ExecutionGraph:
+_TYPED_TARGET_FIELDS = ("id: str", "x: int")
+_UNTYPED_TARGET_FIELDS = ("id: str",)
+
+
+def _calculate_options(fields: tuple[str, ...]) -> dict[str, object]:
+    return {
+        "schema": {"mode": "flexible", "fields": list(fields)},
+        "operations": [{"target": "x", "expression": "row['x'] > 0"}],
+    }
+
+
+def _graph(tmp_path: Path, *, normalize: bool, calculate_fields: tuple[str, ...] = _TYPED_TARGET_FIELDS) -> ExecutionGraph:
     transforms = [
         {
             "name": "calculate",
@@ -180,10 +244,7 @@ def _graph(tmp_path: Path, *, normalize: bool) -> ExecutionGraph:
             "input": "raw",
             "on_success": "calculated" if normalize else "output",
             "on_error": "discard",
-            "options": {
-                "schema": {"mode": "flexible", "fields": ["id: str", "x: int"]},
-                "operations": [{"target": "x", "expression": "row['x'] > 0"}],
-            },
+            "options": _calculate_options(calculate_fields),
         }
     ]
     if normalize:
@@ -241,11 +302,45 @@ def _graph(tmp_path: Path, *, normalize: bool) -> ExecutionGraph:
     )
 
 
-def test_computed_type_cannot_reuse_stale_input_type_as_output_proof(tmp_path):
+def test_untyped_computed_target_cannot_reuse_the_arriving_type_as_output_proof(tmp_path):
+    """The arriving ``x: int`` (source-declared) proves nothing about the computed ``x``: the edge refuses at build."""
     with pytest.raises(EdgeContractError) as raised:
-        _graph(tmp_path, normalize=False)
+        _graph(tmp_path, normalize=False, calculate_fields=_UNTYPED_TARGET_FIELDS)
     assert raised.value.compatibility_result.type_mismatches == (("x", "int", "typing.Any | None"),)
+
+
+def test_typed_computed_target_is_the_output_proof_the_pin_enforces(tmp_path):
+    """A target the node's schema types is the output declaration (ADR-050), so the typed edge builds.
+
+    The proof is honest because it is enforced: the same node returns a row
+    whose computed value breaks the declaration as a routed ``type_mismatch``
+    error instead of emitting it under ``int``.
+    """
+    _graph(tmp_path, normalize=False)
+
+    transform = ValueTransform(_calculate_options(_TYPED_TARGET_FIELDS))
+    row = PipelineRow(
+        {"id": "a", "x": 2},
+        SchemaContract(
+            mode="FIXED",
+            fields=(
+                FieldContract("id", "id", str, required=True, source="declared", nullable=False),
+                FieldContract("x", "x", int, required=True, source="declared", nullable=False),
+            ),
+            locked=True,
+        ),
+    )
+    result = transform.process(row, make_context())
+    assert result.status == "error"
+    assert result.reason is not None
+    assert (result.reason["reason"], result.reason["field"], result.reason["expected"], result.reason["actual"]) == (
+        "type_mismatch",
+        "x",
+        "int",
+        "bool",
+    )
 
 
 def test_explicit_type_coerce_establishes_computed_output_type(tmp_path):
     _graph(tmp_path, normalize=True)
+    _graph(tmp_path, normalize=True, calculate_fields=_UNTYPED_TARGET_FIELDS)

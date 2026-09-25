@@ -7,6 +7,7 @@
 **Tags:** schema-contract, transform, source, sink, coalesce, audit-integrity, tier-1, tier-2, declaration-contract
 **Depends on:** [ADR-011](011-declared-output-fields-contract.md), [ADR-014](014-schema-config-mode-contract.md), [ADR-032](032-validate-by-trust-domain.md)
 **Amends:** invariant 6 of [docs/contracts/execution-graph.md](../../contracts/execution-graph.md) ("schema contracts are frozen after first row"), which now applies to sources only
+**Builds on / supersedes (release/0.8.1):** `63a2e1825` value_transform computed output contracts (projection and presence kept; per-row runtime typing, the forwarded-field presence-only reconcile and the "a typed target is input-only" reading superseded), `7fc149014` type_coerce declared presence metadata (same doctrine in that plugin's own builder), `93ad3e148` build-time type proof across unchanged selected fields (orthogonal, kept) — see [Reconciliation with release/0.8.1](#reconciliation-with-release081)
 
 ## Context
 
@@ -190,7 +191,13 @@ rows meet.**
     `nullable=False` (D4: `any` is nullable). No composer reader of the
     projection consumes `nullable` (`web/composer/state.py`,
     `tools/generation.py` read names and `field_type`), and the
-    composer/runtime agreement test is unchanged.
+    composer/runtime agreement test is unchanged. value_transform's
+    projection already agrees with the stamp on release/0.8.1 (`63a2e1825`):
+    a target the operator did not type is projected `any`, required and
+    nullable, and its `output_schema` is built from that projection, so a
+    typed consumer of an untyped target is refused at build time; a target
+    the operator typed keeps its type in the projection because it is the
+    output declaration the pin enforces.
 11. **Batch-aware transforms declare too.** A reductive batch output (a
     statistics row, a comparison, an assembled report) builds its contract
     with `BaseTransform._batch_output_contract`, which puts every emitted key
@@ -272,6 +279,16 @@ rows meet.**
   a database write error that the sink's write-failure path owns;
   `dataverse` and `chroma` write to schemas their own config fixes. JSON and
   CSV are tested end to end; none crashes unrouted.
+- The numeric admission split stays open, now without an abort. Pydantic's
+  strict input check admits an `int` (or a `Decimal`) for a `float`
+  declaration; `SchemaContract.validate` compares exact types. A forwarded
+  field the operator declared `float` that arrives as an `int` is stamped
+  `float, declared` (Decision 2) and passed through unchanged (Decision 5
+  does not re-adjudicate it), so its row contract's own `validate()` names
+  that field. Before this ADR the same row ended the run with a Tier-1
+  `SchemaConfigModeViolation` (`63a2e1825` recorded the split as open and
+  kept the abort). The value is never coerced. Pinned, as a visible residual,
+  by `tests/unit/plugins/transforms/test_value_transform_contract_metadata.py::test_forwarded_float_declaration_is_stamped_and_never_aborts`.
 
 ### Neutral
 
@@ -282,6 +299,75 @@ rows meet.**
   returns wrong type" is ROUTE-as-PCV (with `declared_by` and `authorship`), and "plugin
   emits a field it never declared" is CRASH.
 - `EXPECTED_CONTRACT_SITES` gains `output_declaration_completeness`.
+
+## Reconciliation with release/0.8.1
+
+Three commits that landed on release/0.8.1 on 2026-09-25, alongside this
+decision, work on the same contracts. None records an operator ruling; each
+came from a defect investigation
+(`docs/reviews/2026-09-25-composer-session-convergence.md`, "Runtime producer
+contracts found by the expanded battery", "Selected-field type proof"). Where
+they agree with this ADR one implementation is kept; where they conflict the
+2026-09-25 S1 ruling decides (operator > plugin > `any`, fixed before row 1,
+value-checked, the recorded contract never changes type).
+
+- **`63a2e1825` value_transform "preserve truthful computed output
+  contracts".**
+  - *Agrees, kept (upstream's code):* computed targets guarantee presence and
+    their type is not inferred from the expression — the projection declares
+    an untyped target `any`, required, nullable, and `output_schema` is built
+    from that projection rather than an observed model, so a typed consumer of
+    an untyped target is refused at the edge (the `type_coerce` teaching
+    hint stays).
+  - *Conflict 1, resolved for the ruling:* upstream kept each row's runtime
+    type on the emitted contract (`_retype_contract_field`, and
+    `with_field` typing a new target from its value; its test pinned
+    `bool`/`NoneType`, `nullable = value is None`). That is per-emission
+    inference: the node record would change type between rows (the
+    `ContractMergeError` abort this ADR removes). Superseded by the stamp:
+    every target is `object`, `declared`, nullable on every row
+    (Decisions 1–2); `_retype_contract_field` stays deleted.
+  - *Conflict 2, resolved for the ruling:* upstream rewrote EVERY configured
+    target to `any` in the projection, including one the operator typed
+    (`fields: ["x: int"]`, `target: x`), reading the node's schema as
+    input-only for targets. Under that builder the stamp sees no operator
+    declaration and the value_transform pin (R3, a ruled prerequisite of S1)
+    silently pins nothing — measured: re-applying upstream's loop turns 19
+    pin tests red. Resolved: only targets the operator left untyped (or typed
+    `any`) are rewritten; an operator-typed target keeps its type in the
+    projection and is enforced per row as a routed `type_mismatch`. The
+    typed edge therefore builds, and the proof is honest because it is
+    enforced.
+  - *Conflict 3, resolved for the ruling:* upstream's
+    `_reconcile_forwarded_contract` copied only the declared
+    required/nullable onto forwarded fields and kept the arriving type, so an
+    `int` under a `float` declaration still ended the run at the ADR-014
+    check. Superseded by the one stamp (Decision 2 / spec D7); the residual
+    is the numeric admission split named under Negative.
+  - Upstream tests re-pinned accordingly (each re-pin keeps upstream's
+    intent for the case upstream meant — an untyped computed target is not
+    proved by the arriving type — and adds the operator-typed case):
+    `test_value_transform_contract_metadata.py` (three functions renamed and
+    re-pinned, two added for the typed target),
+    `test_composer_runtime_agreement.py::…::test_both_reject_computed_unknown_against_a_concrete_type`
+    and `test_state.py::…::test_union_coalesce_rejects_unproven_expression_output_type`
+    (both now use an untyped branch; an accepting twin covers the typed
+    branch).
+- **`7fc149014` type_coerce "reconcile declared output presence
+  metadata".** Agrees: a transform's validated declaration of a field it
+  forwards or converts belongs to its output (`source="declared"`, the
+  declared presence and nullability, the converted type). Kept as upstream
+  wrote it, in type_coerce's own `_build_output_contract`; type_coerce does
+  not call the shared stamp, and routing it through the one stamp is left to
+  the concrete-type sweep (unit S1b).
+- **`93ad3e148` "preserve type proof across unchanged selected fields".**
+  Orthogonal: a build-time type-resolution rule in `core/dag/guarantees.py`
+  (a same-name field a transform selects, requires and guarantees keeps its
+  upstream type). No runtime contract changes; kept.
+- **`f0322045c` "reject container group keys consistently".** Not a design
+  overlap: the lane's group-key fix had already been dropped as
+  patch-equivalent to upstream in the first rebase; the batch plugins
+  conflicted only on `source_file_hash` lines.
 
 ## Alternatives Considered
 
