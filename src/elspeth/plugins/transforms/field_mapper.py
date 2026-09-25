@@ -313,7 +313,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e424629ddeb631e4"
+    source_file_hash: str | None = "sha256:a45ae2bec03f6d88"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -466,11 +466,22 @@ class FieldMapper(BaseTransform):
         value check sees it (ADR-050). A source-declared rename stays carried:
         the strict input check admitted the value under the declaration the
         target inherits.
+
+        An identity mapping by an unresolved original header
+        (``{"Name": "Name"}``) is carried too: ``process`` deletes the
+        normalized key (``name``) and writes the literal header key, a key the
+        input row never had, holding the source's value under the source's
+        contract (``narrow_contract_to_output`` resolves it). Only a
+        normalized identity rewrites a key the input already carries, so only
+        it is left out. Such a target is not in ``declared_output_fields``,
+        the collision surface, which excludes every identity mapping.
         """
         return frozenset(
             target
             for source, target in self._mapping.items()
-            if "." not in source and source != target and target not in self._flat_renames_declared_on_target
+            if "." not in source
+            and (source != target or self._is_unresolved_original_source(source))
+            and target not in self._flat_renames_declared_on_target
         )
 
     @staticmethod

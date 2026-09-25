@@ -950,6 +950,72 @@ class TestOutputSchemaConfig:
 
         assert transform.carried_output_fields() == carried
 
+    @pytest.mark.parametrize(
+        ("mapping", "carried"),
+        [
+            pytest.param({"Name": "Name"}, {"Name"}, id="case-variant-header-identity-is-carried"),
+            pytest.param({"First Name": "First Name"}, {"First Name"}, id="messy-header-identity-is-carried"),
+            pytest.param({"name": "name"}, set(), id="normalized-identity-rewrites-an-input-key-and-is-not-carried"),
+        ],
+    )
+    def test_an_identity_mapping_by_original_header_is_carried(self, mapping: dict[str, str], carried: set[str]) -> None:
+        """An identity mapping by an original header writes a NEW key holding the source's value (review-S1a-r2 F1).
+
+        ``process`` deletes the normalized key and writes the literal header
+        key, so the emitted key is absent from the input row. Unless it is
+        carried, the ADR-050 completeness contract reads it as a created field
+        nobody declared and ends the run Tier-1 on valid data. A normalized
+        identity rewrites a key the input already carries: nothing is created.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"mapping": mapping, "schema": {"mode": "observed"}})
+
+        assert transform.carried_output_fields() == carried
+
+    @pytest.mark.parametrize("select_only", [True, False], ids=["select_only", "forwarding"])
+    def test_an_identity_mapping_by_original_header_passes_the_completeness_contract(self, select_only: bool) -> None:
+        """The emitted literal header key carries the source's contract and passes ADR-050 completeness (review-S1a-r2 F1).
+
+        Measured on cf9750351 through ``elspeth run``: ``{"ID": "ID", "Name":
+        "Name"}`` over a CSV header ``ID,Name`` ended the run with
+        ``UndeclaredOutputFieldsViolation`` (exit 4); the pre-ADR-050 tree
+        delivered both rows.
+        """
+        from elspeth.engine.executors.output_declaration import verify_output_declaration_completeness
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"mapping": {"ID": "ID", "Name": "Name"}, "select_only": select_only, "schema": {"mode": "observed"}})
+        row = PipelineRow(
+            {"id": "1", "name": "Ann"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("id", str, original_name="ID", required=True, source="inferred"),
+                    make_field("name", str, original_name="Name", required=True, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"ID": "1", "Name": "Ann"}
+        emitted = result.row.contract.get_field("Name")
+        assert emitted is not None
+        assert (emitted.python_type, emitted.source) == (str, "inferred")
+        verify_output_declaration_completeness(
+            plugin=transform,
+            emitted_rows=(result.row,),
+            effective_input_fields=frozenset(row.to_dict()),
+            node_id="field_mapper-1",
+            run_id="run-1",
+            row_id="row-1",
+            token_id="token-1",
+        )
+
     def test_rename_collision_is_described_by_the_source_that_lands_there(self) -> None:
         """Projection describes the attempted value even though runtime rejects it.
 

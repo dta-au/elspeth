@@ -468,6 +468,55 @@ def test_an_undeclared_observed_rename_keeps_the_source_fields_contract(tmp_path
     assert (b_contract["python_type"], b_contract["source"]) == ("str", "inferred")
 
 
+@pytest.mark.parametrize(
+    ("header", "mapping", "select_only", "expected"),
+    [
+        pytest.param(
+            "ID,Name",
+            {"ID": "ID", "Name": "Name"},
+            True,
+            [{"ID": "1", "Name": "Ann"}, {"ID": "2", "Name": "Bob"}],
+            id="select-by-case-variant-header",
+        ),
+        pytest.param(
+            "id,First Name",
+            {"First Name": "First Name"},
+            False,
+            [{"First Name": "Ann", "id": "1"}, {"First Name": "Bob", "id": "2"}],
+            id="identity-by-messy-header",
+        ),
+    ],
+)
+def test_an_identity_mapping_by_original_header_delivers_under_the_source_contract(
+    header: str, mapping: dict[str, str], select_only: bool, expected: list[dict[str, str]], tmp_path: Path
+) -> None:
+    """Keeping a column by its CSV header spelling completes, as it did before ADR-050 (review-S1a-r2 F1).
+
+    ``process`` writes the literal header key, which the input row (keyed by
+    normalized name) never had. On cf9750351 the completeness contract read
+    it as an undeclared created field: ``UndeclaredOutputFieldsViolation``,
+    exit 4, run failed. The key carries the source field's inferred contract.
+    """
+    (tmp_path / "in.csv").write_text(f"{header}\n1,Ann\n2,Bob\n")
+    source = {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": {"path": str(tmp_path / "in.csv"), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+    }
+    transform = _fm(schema=OBSERVED, mapping=mapping)
+    transform["options"]["select_only"] = select_only
+    result = _run(_settings(tmp_path, sources={"src": source}, transforms=[transform]))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == expected
+    assert _transform_error_reasons(tmp_path) == []
+    assert _outcomes(tmp_path) == {("success", "default_flow"): 2}
+    [recorded] = _transform_node_contracts(tmp_path).values()
+    by_name = {field["normalized_name"]: field for field in json.loads(recorded)["fields"]}
+    for key in mapping:
+        assert (by_name[key]["python_type"], by_name[key]["source"]) == ("str", "inferred")
+
+
 class TestNulls:
     """T6: None is presence, not a type — the declaration decides."""
 

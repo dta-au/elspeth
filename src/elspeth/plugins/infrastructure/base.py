@@ -938,14 +938,17 @@ class BaseTransform(ABC):
         return ()
 
     def carried_output_fields(self) -> frozenset[str]:
-        """``declared_output_fields`` names whose VALUE this transform copies from an input field.
+        """Emitted names whose VALUE this transform copies from an input field.
 
         A carried field is not created: its value is an upstream field's value
         under that field's contract — a source-locked or upstream-declared
         type that is the same on every row — so the stamp must not rewrite it
         to ``any``. The one shipped case is a field_mapper rename whose
         target inherits the source field's contract through
-        ``narrow_contract_to_output``. A dotted extraction is NOT carried: its
+        ``narrow_contract_to_output``, including an identity mapping by an
+        original header, which writes the literal header key under the
+        normalized field's contract and so is carried without being a
+        ``declared_output_fields`` name. A dotted extraction is NOT carried: its
         value's type is not in any contract, so it is created (``any``). Nor
         is a rename the operator declared by its TARGET name alone: that
         declaration is not the source field's contract, and no input check
