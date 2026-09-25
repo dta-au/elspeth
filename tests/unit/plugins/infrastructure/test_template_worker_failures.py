@@ -633,6 +633,67 @@ def test_the_first_worker_a_process_starts_holds_a_stop_too(stop: signal.Signals
     assert (result.returncode, result.stdout, result.stderr) == (0, "x\nNone\n", "")
 
 
+# --- interpreter exit: no worker starts after the exit handler -----------------
+#
+# A worker ignores SIGTERM. multiprocessing's exit handler SIGTERMs every live
+# daemon child and then joins it, so a worker started after the templates exit
+# handler (by a thread still rendering at exit) made the process hang forever.
+
+_LATE_RENDER_PROBE = """
+import atexit
+import multiprocessing.util  # registers multiprocessing's exit handler first: it runs last
+
+
+def render_late():
+    from elspeth.plugins.infrastructure import templates
+    try:
+        print(templates.SandboxedTemplate("{{ row.q }}").render(row={"q": "late"}))
+    except Exception as exc:
+        print(type(exc).__name__, exc)
+
+
+if __name__ == "__main__":
+    atexit.register(render_late)  # runs after the templates exit handler, before multiprocessing's
+    from elspeth.plugins.infrastructure import templates
+    print(templates.SandboxedTemplate("{{ row.q }}").render(row={"q": "x"}))
+"""
+
+
+def test_a_render_after_the_exit_handler_is_refused_and_the_process_exits(tmp_path: Path) -> None:
+    source_root = Path(templates.__file__).parents[3]
+    probe = tmp_path / "late_render_probe.py"
+    probe.write_text(_LATE_RENDER_PROBE)
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (
+        0,
+        "x\nFrameworkBugError A template render started after the interpreter began to exit\n",
+        "",
+    )
+
+
+@pytest.mark.usefixtures("one_fresh_worker")
+def test_the_exit_handler_stops_the_workers_and_refuses_new_ones(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(templates, "_INTERPRETER_EXITING", threading.Event())
+    template = SandboxedTemplate("{{ row.q }}")
+    assert template.render(row={"q": "x"}) == "x"
+    entry = templates._WORKERS[0]
+    assert entry is not None
+    templates._stop_template_workers_at_exit()
+    assert templates._WORKERS == [None]
+    assert not entry[0].is_alive()
+    with pytest.raises(FrameworkBugError) as caught:
+        template.render(row={"q": "y"})
+    assert str(caught.value) == "A template render started after the interpreter began to exit"
+    assert templates._WORKERS == [None]
+
+
 # --- the Undefined contract tripwire, end to end ------------------------------
 
 

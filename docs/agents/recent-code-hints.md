@@ -37,7 +37,11 @@ the same commit; the rules live there, the history lives here.
   that spawns `_template_worker` itself and talks to the pipe must read that message first (`_await_ready` in
   `test_template_worker_failures.py`), or it takes `ready` for the request's reply. The worker ignores SIGTERM as well
   as SIGINT, because systemd's default stop sends SIGTERM to every process in the unit and the run stops gracefully on
-  it. A worker ended by any other signal raises the retryable `TemplateWorkerLostError`, which is a
+  it. Ignoring SIGTERM has a cost at interpreter exit: multiprocessing's own exit handler SIGTERMs every live daemon
+  child and then joins it, so a worker started after the templates exit handler (by a thread still rendering at
+  exit) hung the process for good (measured: a probe timed out at 30 s). The exit handler now sets
+  `_INTERPRETER_EXITING` under `_WORKER_SPAWN_LOCK`, and `_start_worker` refuses a later start as a
+  `FrameworkBugError`. A worker ended by any other signal raises the retryable `TemplateWorkerLostError`, which is a
   `PluginRetryableError` and not a `TemplateError`. SIGXCPU is the row's only while a request renders. All workers
   busy is backpressure, not an error: `_WORKER_SLOTS.acquire()` has blocked since 313a85bb1.
   See [CONTRIBUTING: Gate: template renderers and the Tier-1 process-boundary latch](../../CONTRIBUTING.md#gate-template-renderers-and-the-tier-1-process-boundary-latch).

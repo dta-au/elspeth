@@ -92,6 +92,9 @@ _AVAILABLE_WORKERS: queue.SimpleQueue[int] = queue.SimpleQueue()
 for _worker_index in range(_WORKER_COUNT):
     _AVAILABLE_WORKERS.put(_worker_index)
 _WORKERS: list[tuple[multiprocessing.Process, Any] | None] = [None] * _WORKER_COUNT
+# Set by the exit handler (``_stop_template_workers_at_exit``); no worker starts after it.
+_WORKER_SPAWN_LOCK = threading.Lock()
+_INTERPRETER_EXITING = threading.Event()
 
 
 def _charge_row_export(value: Any, budget: list[int], *, depth: int = 0) -> None:
@@ -478,7 +481,22 @@ def _stop_template_workers() -> None:
         _retire_worker(index)
 
 
-register_exit(_stop_template_workers)
+def _stop_template_workers_at_exit() -> None:
+    """Stop the workers at interpreter exit, and start none after that.
+
+    multiprocessing's own exit handler runs after this one (it was registered
+    first). It SIGTERMs every live daemon child and then waits for it. A
+    worker ignores SIGTERM, so one started after this point by a thread still
+    rendering at exit would make that wait endless. The flag is set under the
+    spawn lock: a start already under way registers its worker before this
+    handler stops them, and any later start is refused.
+    """
+    with _WORKER_SPAWN_LOCK:
+        _INTERPRETER_EXITING.set()
+    _stop_template_workers()
+
+
+register_exit(_stop_template_workers_at_exit)
 
 
 def _worker_death(process: Any, *, rendering: bool) -> Exception:
@@ -522,17 +540,22 @@ def _start_worker(index: int) -> tuple[Any, Any]:
     # process's first spawn and unblocks SIGINT and SIGTERM in this thread
     # afterwards (bpo-33613), so it is started before the block, never inside it.
     resource_tracker.ensure_running()
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _RUN_STOP_SIGNALS)
-    try:
-        process.start()
-    except BaseException:
-        parent.close()
+    with _WORKER_SPAWN_LOCK:
+        if _INTERPRETER_EXITING.is_set():
+            parent.close()
+            child.close()
+            raise FrameworkBugError("A template render started after the interpreter began to exit")
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _RUN_STOP_SIGNALS)
+        try:
+            process.start()
+        except BaseException:
+            parent.close()
+            child.close()
+            raise
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         child.close()
-        raise
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-    child.close()
-    _WORKERS[index] = (process, parent)
+        _WORKERS[index] = (process, parent)
     try:
         if not parent.poll(_WORKER_START_TIMEOUT_SECONDS):
             raise FrameworkBugError(f"Template worker did not become ready within {_WORKER_START_TIMEOUT_SECONDS:g} s")
