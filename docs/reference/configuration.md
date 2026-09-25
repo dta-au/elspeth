@@ -1147,11 +1147,15 @@ render only, never to waiting for or starting a worker:
   `Template exceeded the execution time limit`.
 - **Worker lost.** A worker ended by a signal the row did not cause (the
   kernel's out-of-memory killer, an operator's `kill`, a crash) raises a
-  retryable error, `Template worker was stopped by signal N`. The run's
-  [retry settings](#retry-settings) retry the row on a new worker, and a pooled
-  multi-query LLM node retries the one query within `max_capacity_retry_seconds`.
-  Only when the retries are used up does the row go to `on_error`. A worker
-  that exits with no signal and no reply stops the run as an ELSPETH failure.
+  retryable error, `Template worker was stopped by signal N`. In `elspeth run`
+  the run's [retry settings](#retry-settings) retry the row on a new worker,
+  and the row goes to `on_error` only when the retries are used up. A follower
+  started with `elspeth join` applies no retry settings, so a row it processes
+  goes to `on_error` after the first lost worker, as it does for any other
+  retryable error there. A multi-query LLM node with a `pool_size` above 1
+  retries the one query itself within `max_capacity_retry_seconds`, in either
+  process. A worker that exits with no signal and no reply stops the run as an
+  ELSPETH failure.
 
 Stopping a run with Ctrl-C (SIGINT) or SIGTERM lets a template render already
 in progress finish. systemd's default stop sends SIGTERM to every process in
