@@ -115,6 +115,30 @@ def test_untyped_computed_target_declares_presence_as_any_before_row_one(tmp_pat
     assert "x" in output.get_effective_guaranteed_fields()
 
 
+def test_an_operator_authored_any_target_is_projected_as_a_guaranteed_nullable_any():
+    """A target the operator declared ``any`` (or ``any?``) is written on every row and may compute None.
+
+    The projection therefore records it required AND nullable whatever
+    presence the author wrote, and the node's output schema (the producer
+    side of every build-time edge) carries ``Any | None``, required. A target
+    absent from ``schema.fields`` never reaches this rewrite —
+    ``declare_missing_guaranteed_fields`` already yields ``any``, required,
+    nullable — so only an authored ``any`` observes it (review-REBASE2 L1).
+    """
+    transform = ValueTransform(
+        {
+            "schema": {"mode": "flexible", "fields": ["id: str", "x: any", "y: any?"]},
+            "operations": [{"target": "x", "expression": "1"}, {"target": "y", "expression": "None"}],
+        }
+    )
+    output = transform._output_schema_config
+    assert output is not None and output.fields is not None
+    projected = {field.name: (field.field_type, field.required, field.nullable) for field in output.fields}
+    assert projected == {"id": ("str", True, False), "x": ("any", True, True), "y": ("any", True, True)}
+    produced = {name: (str(info.annotation), info.is_required()) for name, info in transform.output_schema.model_fields.items()}
+    assert produced["x"] == produced["y"] == ("typing.Any | None", True)
+
+
 @pytest.mark.parametrize("expression, actual", [("row['X'] > 0", "bool"), ("None", "NoneType")])
 def test_typed_computed_target_is_pinned_to_the_operators_declaration(tmp_path, expression, actual):
     """A target the node's schema TYPES is the operator's output declaration (ADR-050: operator > plugin > any).
