@@ -10,7 +10,10 @@ reply, and the parent maps it:
   aborts; any other failure is this row's, routed by its class name only.
 - A missing reply is a worker death, classified by exit status: RLIMIT_CPU's
   SIGXCPU is the row's template running out of CPU; another signal keeps its
-  own reason; an exit without a signal is a framework bug.
+  own reason; an exit without a signal is a framework bug. A worker that dies
+  with the request unread is a death too, whatever the socket reports.
+- The worker ignores SIGINT: an operator's interrupt is the run's to handle,
+  from the moment the worker's interpreter starts.
 
 No exception but ``SystemExit`` leaves the worker, so nothing it prints can
 carry row data to the process's stderr.
@@ -26,9 +29,13 @@ import os
 import pickle
 import queue
 import signal
+import subprocess
+import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -140,6 +147,24 @@ def _worker_killed_by_signal(connection: Any) -> None:
     connection.recv()
     os.kill(os.getpid(), signal.SIGTERM)
     time.sleep(60)
+
+
+def _worker_killed_before_reading(connection: Any) -> None:
+    """Dies with the parent's request still unread: the parent's read is reset, not closed."""
+    time.sleep(0.5)
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(60)
+
+
+def _worker_whose_render_raises_a_base_exception(connection: Any) -> None:
+    """A BaseException that is not SystemExit leaves the render (KeyboardInterrupt, which the worker no longer receives as a signal)."""
+
+    def interrupting_getattr(self: object, obj: object, attribute: str) -> object:
+        raise KeyboardInterrupt(_SENTINEL)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(templates._LocalSandboxedEnvironment, "getattr", interrupting_getattr)
+        templates._template_worker(connection)
 
 
 def _worker_exiting_without_reply(connection: Any) -> None:
@@ -309,6 +334,13 @@ def test_a_worker_stopped_by_another_signal_names_the_signal_only() -> None:
     assert str(caught.value) == f"Template worker was stopped by signal {int(signal.SIGTERM)}"
 
 
+def test_a_worker_that_dies_before_reading_its_request_is_classified_as_a_death() -> None:
+    """The unread request makes the parent's read fail as a reset, not EOF (S3 fix round 1, F3)."""
+    with _serving(_worker_killed_before_reading), pytest.raises(TemplateError) as caught:
+        SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    assert str(caught.value) == f"Template worker was stopped by signal {int(signal.SIGTERM)}"
+
+
 def test_a_worker_ending_without_a_reply_or_a_signal_is_a_framework_bug() -> None:
     with _serving(_worker_exiting_without_reply), pytest.raises(FrameworkBugError) as caught:
         SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
@@ -324,10 +356,135 @@ def test_a_malformed_request_ends_the_worker_quietly_with_status_1(capfd: pytest
     assert capfd.readouterr().err == ""
 
 
+def test_a_base_exception_leaving_the_render_ends_the_worker_quietly_with_status_1(capfd: pytest.CaptureFixture[str]) -> None:
+    """Only SystemExit leaves the worker: any other BaseException exits 1 without printing its message."""
+    with _serving(_worker_whose_render_raises_a_base_exception), pytest.raises(FrameworkBugError) as caught:
+        SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    assert str(caught.value) == "Template worker ended without a reply (exit status 1)"
+    time.sleep(0.5)
+    err = capfd.readouterr().err
+    assert "Traceback" not in err
+    assert _SENTINEL not in err
+
+
 def test_a_non_string_ok_reply_is_a_protocol_fault() -> None:
     with _serving(_worker_replying_a_non_string), pytest.raises(FrameworkBugError) as caught:
         SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
     assert str(caught.value) == "Template worker returned a non-string result"
+
+
+# --- an operator's interrupt is the run's, not the worker's -------------------
+#
+# Ctrl-C signals the run's whole process group. The orchestrator lets in-flight
+# work finish (engine/orchestrator/shutdown.py); a worker that took the
+# interrupt itself ended with status 1 and the run aborted as a framework bug
+# (S3 fix round 1, F1).
+
+
+def test_an_interrupt_does_not_end_a_serving_worker() -> None:
+    with _serving(templates._template_worker) as process:
+        template = SandboxedTemplate("{{ row.q }}")
+        assert template.render(row={"q": "x"}) == "x"
+        assert process.pid is not None
+        os.kill(process.pid, signal.SIGINT)
+        process.join(1.0)
+        assert process.exitcode is None
+        assert template.render(row={"q": "y"}) == "y"
+
+
+def test_an_interrupt_mid_render_lets_the_render_finish() -> None:
+    template = SandboxedTemplate("{% for i in range(row.n) %}{% for j in range(300) %}{{ '' }}{% endfor %}{% endfor %}done")
+    outcome: dict[str, object] = {}
+
+    def render() -> None:
+        try:
+            outcome["result"] = template.render(row={"n": 40000})  # about 0.9 s of CPU
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    with _serving(templates._template_worker) as process:
+        assert template.render(row={"n": 1}) == "done"
+        assert process.pid is not None
+        thread = threading.Thread(target=render)
+        thread.start()
+        time.sleep(0.3)
+        os.kill(process.pid, signal.SIGINT)
+        thread.join(60)
+    assert outcome == {"result": "done"}
+
+
+@pytest.mark.parametrize("in_thread", [False, True], ids=["main-thread", "render-thread"])
+def test_an_interrupt_while_a_worker_starts_waits_until_the_worker_ignores_it(monkeypatch: pytest.MonkeyPatch, in_thread: bool) -> None:
+    """The spawned interpreter takes about half a second to reach the worker's
+    own code; an interrupt in that window must not end it either."""
+    templates._stop_template_workers()
+    original_start = _SPAWN.Process.start
+    started: list[multiprocessing.process.BaseProcess] = []
+
+    def start_then_interrupt(self: multiprocessing.process.BaseProcess) -> None:
+        original_start(self)
+        started.append(self)
+        assert self.pid is not None
+        os.kill(self.pid, signal.SIGINT)
+
+    monkeypatch.setattr(_SPAWN.Process, "start", start_then_interrupt)
+    outcome: dict[str, object] = {}
+
+    def render() -> None:
+        outcome["mask_before"] = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        try:
+            outcome["result"] = SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+        except BaseException as exc:
+            outcome["error"] = exc
+        outcome["mask_after"] = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+    try:
+        if in_thread:
+            thread = threading.Thread(target=render)
+            thread.start()
+            thread.join(60)
+        else:
+            render()
+        # The block covers the spawn only: the rendering thread can take
+        # SIGINT again afterwards (and could before).
+        assert outcome == {"mask_before": set(), "result": "x", "mask_after": set()}
+        assert len(started) == 1
+        assert started[0].exitcode is None
+    finally:
+        templates._stop_template_workers()
+
+
+_FIRST_SPAWN_PROBE = """
+import multiprocessing, os, signal
+from elspeth.plugins.infrastructure import templates
+
+process_class = multiprocessing.get_context("spawn").Process
+original_start = process_class.start
+
+def start_then_interrupt(self):
+    original_start(self)
+    os.kill(self.pid, signal.SIGINT)
+
+process_class.start = start_then_interrupt
+print(templates.SandboxedTemplate("{{ row.q }}").render(row={"q": "x"}))
+print(templates._WORKERS[0][0].exitcode)
+"""
+
+
+def test_the_first_worker_a_process_starts_holds_an_interrupt_too() -> None:
+    """A process's first spawn also starts multiprocessing's resource tracker,
+    which unblocks SIGINT behind it. Only a fresh interpreter has not started
+    that tracker yet, so the probe runs in one, importing this same tree."""
+    source_root = Path(templates.__file__).parents[3]
+    result = subprocess.run(
+        [sys.executable, "-c", _FIRST_SPAWN_PROBE],
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, "x\nNone\n", "")
 
 
 # --- the Undefined contract tripwire, end to end ------------------------------

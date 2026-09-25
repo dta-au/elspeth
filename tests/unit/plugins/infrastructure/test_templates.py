@@ -591,6 +591,18 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() arguments can never be satisfied: expected length >= 3, got -3",
             id="truncate-inside-if",
         ),
+        # Literals of the wrong type fail Jinja's truncate with a TypeError, not
+        # an assertion; they are refused the same way (S3 fix round 1, F2).
+        pytest.param(
+            "{{ row.q | truncate(5, end=None) }}",
+            "truncate() arguments can never be satisfied: object of type 'NoneType' has no len()",
+            id="truncate-end-none",
+        ),
+        pytest.param(
+            "{{ row.q | truncate('abc') }}",
+            "truncate() arguments can never be satisfied: '>=' not supported between instances of 'str' and 'int'",
+            id="truncate-length-str",
+        ),
     ],
 )
 def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, message: str) -> None:

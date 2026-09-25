@@ -25,6 +25,7 @@ import threading
 from atexit import register as register_exit
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from multiprocessing import resource_tracker
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -316,7 +317,16 @@ def _template_worker(connection: Any) -> None:
     after a ``setup_failed`` reply the worker exits. A failure of the pipe
     protocol itself exits with status 1 and no reply, which the parent treats
     as a framework bug.
+
+    The worker ignores SIGINT. A terminal's Ctrl-C goes to the run's whole
+    process group, and the interrupt is the run's to handle: the orchestrator
+    lets in-flight work finish (``engine/orchestrator/shutdown.py``). The
+    worker's own lifetime is the pipe (EOF ends it) and the parent's kill. The
+    parent spawns it with SIGINT blocked, so an interrupt that arrives while
+    the interpreter starts stays pending until the ``SIG_IGN`` here discards it.
     """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
     try:
         try:
             _limit_worker_address_space()
@@ -335,9 +345,8 @@ def _template_worker(connection: Any) -> None:
     except SystemExit:
         raise
     except BaseException:
-        # The pipe itself failed (a malformed request, an unsendable reply,
-        # an interrupt). Leave without printing: the parent reads EOF and an
-        # exit status of 1.
+        # The pipe itself failed (a malformed request, an unsendable reply).
+        # Leave without printing: the parent reads EOF and an exit status of 1.
         raise SystemExit(1) from None
     finally:
         connection.close()
@@ -446,7 +455,9 @@ def _worker_death(process: Any) -> Exception:
     template running out of its CPU seconds. Another signal (the kernel's OOM
     killer, an operator's kill) says nothing about the row; how such a death
     should be handled is a separate decision, so it keeps the routed outcome
-    under its own reason. An exit with no signal is ELSPETH's bug.
+    under its own reason. An exit with no signal is ELSPETH's bug: the worker
+    ignores SIGINT, the one signal Python turns into an exception, so no
+    signal can end it with a status.
     """
     process.join(_WORKER_TIMEOUT_SECONDS)
     exitcode = process.exitcode
@@ -470,12 +481,22 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
             parent, child = process_context.Pipe(duplex=True)
             process = cast("Any", process_context).Process(target=_template_worker, args=(child,))
             process.daemon = True
+            # The child inherits this thread's signal mask: an interrupt
+            # during its interpreter start stays pending until the worker
+            # ignores SIGINT (``_template_worker``). multiprocessing starts
+            # its resource tracker on a process's first spawn and unblocks
+            # SIGINT in this thread afterwards (bpo-33613), so it is started
+            # before the block, never inside it.
+            resource_tracker.ensure_running()
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
             try:
                 process.start()
             except BaseException:
                 parent.close()
                 child.close()
                 raise
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             child.close()
             _WORKERS[index] = (process, parent)
             entry = (process, parent)
@@ -486,7 +507,9 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
                 raise TemplateError("Template exceeded the execution time limit")
             status, value = parent.recv()
             response_received = True
-        except (EOFError, BrokenPipeError) as exc:
+        except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
+            # A worker that ended with the request still unread resets the
+            # socket instead of closing it; either way it is a death.
             raise _worker_death(process) from exc
         if status == "setup_failed":
             # The worker exits after this reply; do not hand its slot on.
