@@ -6245,6 +6245,15 @@ class TestReRaiseGuardPattern:
     # thread, NOT fail closed); check_and_raise() re-raises the latched
     # exception verbatim at the next drain boundary (elspeth-d0ce4e12af).
     _HANDLER_ALLOWLIST = frozenset({"cli.py", "sink.py", "heartbeat.py"})
+    # Handlers that hand a Tier-1 failure across a process boundary, keyed by
+    # (path under src/, enclosing function) so no other handler in the file
+    # shares the exemption. The template render worker is a spawned child: an
+    # exception escaping it cannot reach the parent's stack and is printed,
+    # message and all, to the inherited stderr, where a message can quote row
+    # data. So it replies ``render_tier1`` with the class name only, and the
+    # parent (``_run_template_worker``) raises FrameworkBugError — heartbeat's
+    # latch, across a pipe (elspeth-5887fb7928 S3).
+    _PROCESS_BOUNDARY_LATCHES = frozenset({("elspeth/plugins/infrastructure/templates.py", "_serve_request")})
 
     def test_all_reraise_guards_have_bare_raise(self) -> None:
         """A TIER_1_ERRORS handler may never swallow or substitute the failure.
@@ -6284,11 +6293,20 @@ class TestReRaiseGuardPattern:
 
         src_root = Path("src/elspeth")
         violations: list[str] = []
+        latched: set[tuple[str, str]] = set()
 
         for parsed in iter_gate_sources(src_root):
             py_file = parsed.path
             if py_file.name in self._HANDLER_ALLOWLIST:
                 continue
+            # The innermost function around each handler: ast.walk visits an
+            # outer function before the functions nested in it.
+            enclosing: dict[int, str] = {}
+            for function in ast.walk(parsed.tree):
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for inner in ast.walk(function):
+                        if isinstance(inner, ast.ExceptHandler):
+                            enclosing[id(inner)] = function.name
 
             for node in ast.walk(parsed.tree):
                 if not isinstance(node, ast.ExceptHandler):
@@ -6296,6 +6314,11 @@ class TestReRaiseGuardPattern:
 
                 # Match: except TIER_1_ERRORS / except contract_errors.TIER_1_ERRORS
                 if not _is_framework_audit_handler(node):
+                    continue
+
+                latch = (py_file.relative_to("src").as_posix(), enclosing.get(id(node), ""))
+                if latch in self._PROCESS_BOUNDARY_LATCHES:
+                    latched.add(latch)
                     continue
 
                 where = f"{py_file.relative_to('src')}:{node.lineno}"
@@ -6354,6 +6377,10 @@ class TestReRaiseGuardPattern:
                     )
 
         assert not violations, f"Re-raise guard violations found ({len(violations)}):\n" + "\n".join(f"  - {v}" for v in violations)
+        # A latch entry that no longer matches a handler is stale, not harmless.
+        assert latched == set(self._PROCESS_BOUNDARY_LATCHES), (
+            f"stale process-boundary latch entries: {set(self._PROCESS_BOUNDARY_LATCHES) - latched}"
+        )
 
     def test_minimum_reraise_guard_count(self) -> None:
         """Verify the expected number of re-raise guards exist (drift detection).

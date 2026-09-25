@@ -580,6 +580,22 @@ where the architectural fix landed:
   kind checks), and the collector arm of ``_batch_aware_placement_error``
   mirrors the second one on every mutation boundary. Pinned by
   ``TestComposerRuntimeBatchPlacementAgreement``.
+* Shape 30 — a template whose own literals fail on every row (elspeth-5887fb7928
+  S3, measured with ``elspeth run --execute`` in the lane's S3 CLI repros).
+  An unknown filter or test inside ``{% if %}`` or an inline ``if``, a literal
+  filter or test name given to ``map`` / ``select`` / ``reject`` /
+  ``selectattr`` / ``rejectattr``, and a literal ``truncate`` argument that
+  breaks its preconditions (``length >= len(end)``, ``leeway >= 0``) passed
+  construction, so ``elspeth validate`` exited 0 and every row was routed at
+  run time. Before the fix the composer ADMITTED all of them for both
+  ``llm`` and ``rag_retrieval``, and ``rag_retrieval`` admitted even a
+  malformed ``query_template`` (its config model never compiled it; only
+  plugin construction did). Closed for both plugins: the bounded template
+  environment refuses them at parse (``_check_configuration_literals``), and
+  ``RetrievalOutputConfig.validate_query_template`` compiles the query
+  template at config time as ``LLMConfig`` does its prompt. A literal the
+  row decides (``truncate(row.n)``) still builds and routes per row. Pinned
+  by ``TestComposerRuntimeTemplateLiteralAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -614,6 +630,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -7563,3 +7580,107 @@ class TestComposerRuntimeBatchPlacementAgreement:
         assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
         assert composer.is_valid, composer.errors
         self._runtime_instantiate(state)
+
+
+class TestComposerRuntimeTemplateLiteralAgreement:
+    """Shape 30 — a template whose own literals fail on every row (elspeth-5887fb7928 S3).
+
+    The composer side is its mutation gate (``_prevalidate_transform``, what
+    upsert_node / set_pipeline run); the runtime side is plugin instantiation
+    from settings, as ``elspeth validate`` does. Both must refuse the same
+    template text with the same template message, for ``llm`` and
+    ``rag_retrieval``; a template whose failure depends on the row is admitted
+    by both.
+
+    Bug verification protocol: removing the ``_check_configuration_literals``
+    call from ``_BoundedEnvironment.parse`` makes every rejection case fail on
+    both sides (the composer returns None, the runtime DID NOT RAISE);
+    removing ``RetrievalOutputConfig.validate_query_template`` fails the
+    ``rag_retrieval`` composer assertions only (the runtime still refuses at
+    QueryBuilder construction) — the pre-fix disagreement.
+    """
+
+    _REFUSED = (
+        pytest.param(
+            "{{ row.q | truncate(2) }}", "truncate() arguments can never be satisfied: expected length >= 3, got 2", id="truncate"
+        ),
+        pytest.param("{% if row.q %}{{ row.q | no_such_filter }}{% endif %}", "No filter named 'no_such_filter'.", id="filter-in-if"),
+        pytest.param("{% if row.q is no_such_test %}x{% endif %}", "No test named 'no_such_test'.", id="test-in-if"),
+        pytest.param("{{ [row.q] | map('no_such_filter') | join }}", "No filter named 'no_such_filter'.", id="map-filter-name"),
+        pytest.param("{{ row.q | }}", "expected token 'name', got 'end of print statement'", id="malformed"),
+    )
+
+    @staticmethod
+    def _options(plugin: str, template: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """(composer options, runtime options) for one template."""
+        if plugin == "llm":
+            common: dict[str, Any] = {
+                "provider": "openrouter",
+                "model": "openai/gpt-4.1-nano",
+                "prompt_template": template,
+                "required_input_fields": ["q", "n"],
+                "schema": {"mode": "observed"},
+            }
+            return {**common, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**common, "api_key": "sk-test-key"}
+        rag = {
+            "query_field": "q",
+            "query_template": template,
+            "output_prefix": "sci",
+            "provider": "chroma",
+            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
+            "schema": {"mode": "observed"},
+        }
+        return rag, rag
+
+    @staticmethod
+    def _runtime(tmp_path: Path, plugin: str, options: dict[str, Any]) -> None:
+        csv_path = tmp_path / "in.csv"
+        csv_path.write_text("q,n\nhello,1\n", encoding="utf-8")
+        config = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="t1",
+                    options={
+                        "path": str(csv_path),
+                        "schema": {"mode": "observed", "guaranteed_fields": ["q", "n"]},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[TransformSettings(name="t1", plugin=plugin, input="t1", on_success="main", on_error="discard", options=options)],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv", on_write_failure="discard", options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}}
+                )
+            },
+        )
+        instantiate_plugins_from_config(config)
+
+    @pytest.mark.parametrize("plugin", ["llm", "rag_retrieval"])
+    @pytest.mark.parametrize(("template", "message"), _REFUSED)
+    def test_both_refuse_a_template_its_literals_fail(self, tmp_path: Path, plugin: str, template: str, message: str) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(plugin, template)
+        composer = _prevalidate_transform(plugin, composer_options)
+        assert composer is not None
+        assert message in composer, composer
+        with pytest.raises(PluginConfigError, match=re.escape(message)):
+            self._runtime(tmp_path, plugin, runtime_options)
+
+    @pytest.mark.parametrize("plugin", ["llm", "rag_retrieval"])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{{ row.q | truncate(row.n) }}", id="truncate-length-from-the-row"),
+            pytest.param("{% if row.q %}{{ row.q | truncate(3) }}{% endif %}", id="valid-literal-inside-if"),
+        ],
+    )
+    def test_both_admit_a_template_whose_failure_depends_on_the_row(self, tmp_path: Path, plugin: str, template: str) -> None:
+        """Control: the row decides these, so they build and any failure routes per row."""
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(plugin, template)
+        assert _prevalidate_transform(plugin, composer_options) is None
+        self._runtime(tmp_path, plugin, runtime_options)

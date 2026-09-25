@@ -188,16 +188,38 @@ class TestTemplateMode:
     def test_a_template_runtime_error_is_a_row_error(self):
         """The catch list is SandboxedTemplate's, which includes a bare TemplateRuntimeError.
 
-        An unknown filter inside a conditional compiles and raises only when
-        the branch runs; RAG's own catch list used to omit it, so the run aborted.
+        A filter named by the row is looked up only when the template runs;
+        Jinja's message quotes that name (the row's value), so only the class
+        is kept. RAG's own catch list used to omit the class, so the run aborted.
         """
-        builder = QueryBuilder(query_field="topic", query_template="{% if query %}{{ query | no_such_filter }}{% endif %}")
-        result = builder.build({"topic": "t"})
+        builder = QueryBuilder(query_field="topic", query_template="{{ [query] | map(query) | list }}")
+        result = builder.build({"topic": "SENTINEL-rag-map"})
         assert result.error == {
             "reason": "template_rendering_failed",
             "error": "Template rendering failed: TemplateRuntimeError (message withheld: it can quote row data)",
             "field": "topic",
         }
+
+    @pytest.mark.parametrize(
+        ("template", "message"),
+        [
+            pytest.param(
+                "{% if query %}{{ query | no_such_filter }}{% endif %}",
+                "No filter named 'no_such_filter'.",
+                id="unknown-filter-inside-if",
+            ),
+            pytest.param(
+                "{{ query | truncate(2) }}",
+                "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+                id="literal-truncate",
+            ),
+        ],
+    )
+    def test_a_template_that_fails_every_row_is_refused_when_built(self, template: str, message: str) -> None:
+        """A configuration error is refused at construction, never routed once per row."""
+        with pytest.raises(TemplateError) as excinfo:
+            QueryBuilder(query_field="topic", query_template=template)
+        assert str(excinfo.value) == f"Invalid query template syntax: {message}"
 
 
 # =============================================================================

@@ -1118,6 +1118,21 @@ Pipeline Jinja templates reject power expressions (`**`). An `{% autoescape %}`
 block accepts only a literal `true` or `false`; an expression in that position
 is rejected during configuration validation.
 
+Configuration validation also rejects a template whose own text makes it fail
+on every row, so `elspeth validate` and the composer report it instead of the
+run failing each row: an unknown filter or test name, including one inside
+`{% if %}` or an inline `if` and one given by name to `map`, `select`,
+`reject`, `selectattr` or `rejectattr`; and `truncate` arguments written as
+literals that break its preconditions (a `length` shorter than `end`, a
+negative `leeway`). The same checks apply to a RAG `query_template`.
+
+A template failure that depends on the row fails that row with
+`template_rendering_failed`. The reason names only the kind of failure, for
+example `Template rendering failed: KeyError (message withheld: it can quote
+row data)`, because Python's and Jinja's own messages can quote row values. A
+template that uses up its CPU allowance fails the row with `Template exceeded
+the CPU limit`.
+
 **Template variables.** A `prompt_template` sees two variables, `row` and
 `lookup` (the configured lookup mapping). `row` holds the row's field values
 and nothing else:

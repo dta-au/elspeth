@@ -461,11 +461,14 @@ def test_withheld_error_detail_keeps_only_the_class() -> None:
 def test_the_value_free_undefined_refuses_an_exception_type_jinja_never_passes() -> None:
     from jinja2 import TemplateRuntimeError
 
-    from elspeth.plugins.infrastructure.templates import _value_free_undefined
+    from elspeth.contracts.errors import TIER_1_ERRORS
+    from elspeth.plugins.infrastructure.templates import _UndefinedContractError, _value_free_undefined
 
     undefined_type = _value_free_undefined(frozenset())
-    with pytest.raises(RuntimeError, match="unexpected exception type TemplateRuntimeError"):
+    with pytest.raises(_UndefinedContractError, match="unexpected exception type TemplateRuntimeError") as caught:
         undefined_type(name="x", exc=TemplateRuntimeError)
+    # A framework fault, so Tier-1: no ``on_error`` can route it.
+    assert isinstance(caught.value, TIER_1_ERRORS)
 
 
 def test_a_broken_jinja_undefined_contract_escapes_render_unrouted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -477,7 +480,7 @@ def test_a_broken_jinja_undefined_contract_escapes_render_unrouted(monkeypatch: 
 
     monkeypatch.setattr(template_infrastructure, "_run_template_worker", broken_worker)
     template = SandboxedTemplate("{{ row.missing }}")
-    with pytest.raises(RuntimeError, match="unexpected exception type TemplateRuntimeError"):
+    with pytest.raises(_UndefinedContractError, match="unexpected exception type TemplateRuntimeError"):
         template.render(row={})
 
 
@@ -535,6 +538,91 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
         SandboxedTemplate("{% if unclosed")
     with pytest.raises(TemplateSyntaxError):
         SandboxedTemplate("{{ x | no_such_filter }}")
+
+
+# ---------------------------------------------------------------------------
+# A template whose own literals make it fail on every row is a configuration
+# error (elspeth-5887fb7928 S3): it is refused when built, never routed once per
+# row. Jinja defers an unknown filter or test inside ``{% if %}`` or an inline
+# ``if`` to render time, and ``truncate`` asserts its arguments at render.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        pytest.param("{% if row.q %}{{ row.q | no_such_filter }}{% endif %}", "No filter named 'no_such_filter'.", id="filter-in-if"),
+        pytest.param("{% if row.q is no_such_test %}x{% endif %}", "No test named 'no_such_test'.", id="test-in-if"),
+        pytest.param("{% if row.q %}{{ row.q is no_such_test }}{% endif %}", "No test named 'no_such_test'.", id="test-in-if-body"),
+        pytest.param("{{ (row.q | no_such_filter) if row.q else '' }}", "No filter named 'no_such_filter'.", id="filter-in-condexpr"),
+        pytest.param(
+            "{% if row.q %}{% filter no_such_filter %}x{% endfilter %}{% endif %}", "No filter named 'no_such_filter'.", id="filter-block"
+        ),
+        pytest.param("{{ row.l | map('no_such_filter') | list }}", "No filter named 'no_such_filter'.", id="map-filter-name"),
+        pytest.param("{{ row.l | select('no_such_test') | list }}", "No test named 'no_such_test'.", id="select-test-name"),
+        pytest.param("{{ row.l | reject('no_such_test') | list }}", "No test named 'no_such_test'.", id="reject-test-name"),
+        pytest.param("{{ row.l | selectattr('a', 'no_such_test') | list }}", "No test named 'no_such_test'.", id="selectattr-test-name"),
+        pytest.param("{{ row.l | rejectattr('a', 'no_such_test') | list }}", "No test named 'no_such_test'.", id="rejectattr-test-name"),
+        pytest.param(
+            "{{ row.q | truncate(2) }}", "truncate() arguments can never be satisfied: expected length >= 3, got 2", id="truncate-length"
+        ),
+        pytest.param(
+            "{{ row.q | truncate(length=2) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+            id="truncate-length-keyword",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(4, row.k, '.....') }}",
+            "truncate() arguments can never be satisfied: expected length >= 5, got 4",
+            id="truncate-end-positional",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(end='abcd', length=3) }}",
+            "truncate() arguments can never be satisfied: expected length >= 4, got 3",
+            id="truncate-end-keyword",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10, leeway=-1) }}",
+            "truncate() arguments can never be satisfied: expected leeway >= 0, got -1",
+            id="truncate-negative-leeway",
+        ),
+        pytest.param(
+            "{% if row.q %}{{ row.q | truncate(-3) }}{% endif %}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got -3",
+            id="truncate-inside-if",
+        ),
+    ],
+)
+def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, message: str) -> None:
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate
+
+    with pytest.raises(TemplateSyntaxError) as caught:
+        SandboxedTemplate(source)
+    assert str(caught.value) == message
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("{{ row.q | truncate(row.n) }}", id="truncate-length-from-the-row"),
+        pytest.param("{{ row.q | truncate(5, end=row.e) }}", id="truncate-end-from-the-row"),
+        pytest.param("{{ row.q | truncate(3) }}", id="truncate-length-equal-to-end"),
+        pytest.param("{{ row.q | truncate(10, leeway=0) }}", id="truncate-zero-leeway"),
+        pytest.param("{{ row.q | truncate(*row.args) }}", id="truncate-splat"),
+        pytest.param("{{ row.q | truncate(1, False, '', 0, 9) }}", id="truncate-arity-left-to-render"),
+        pytest.param("{{ row.l | map(attribute='a') | list }}", id="map-attribute"),
+        pytest.param("{{ row.l | map('upper') | list }}", id="map-known-filter"),
+        pytest.param("{{ row.l | map(row.f) | list }}", id="map-filter-from-the-row"),
+        pytest.param("{{ row.l | select | list }}", id="select-truthiness"),
+        pytest.param("{{ row.l | select('odd') | list }}", id="select-known-test"),
+        pytest.param("{{ row.l | selectattr('a') | list }}", id="selectattr-truthiness"),
+        pytest.param("{% if row.q is defined %}{{ row.q | upper }}{% endif %}", id="known-names-in-if"),
+    ],
+)
+def test_a_template_whose_failure_depends_on_the_row_is_built(source: str) -> None:
+    from elspeth.plugins.infrastructure.templates import SandboxedTemplate
+
+    SandboxedTemplate(source)
 
 
 # ---------------------------------------------------------------------------

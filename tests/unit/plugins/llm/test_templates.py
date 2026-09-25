@@ -25,7 +25,8 @@ class TestPromptTemplate:
 
     def test_nested_no_output_loops_are_bounded_at_render(self) -> None:
         template = PromptTemplate("{% for a in range(100000) %}{% for b in range(100000) %}{% set x = a + b %}{% endfor %}{% endfor %}")
-        with pytest.raises(TemplateError, match=r"worker stopped|execution time limit"):
+        # RLIMIT_CPU (2 s) normally ends it; the 5 s wall clock only on a starved host.
+        with pytest.raises(TemplateError, match=r"^Template exceeded the (CPU|execution time) limit$"):
             template.render({})
 
     def test_simple_variable_substitution(self) -> None:

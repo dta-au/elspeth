@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 import structlog
+from jinja2 import TemplateSyntaxError
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism, TransformResult, propagate_contract
@@ -39,6 +40,7 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError
 from elspeth.plugins.transforms.rag.formatter import format_context
 from elspeth.plugins.transforms.rag.query import QueryBuilder
 
@@ -132,6 +134,23 @@ class RetrievalOutputConfig(TransformDataConfig):
         if self.query_template and self.query_pattern:
             raise ValueError("query_template and query_pattern are mutually exclusive")
         return self
+
+    @field_validator("query_template")
+    @classmethod
+    def validate_query_template(cls, v: str | None) -> str | None:
+        """Compile the query template at config time, as the LLM config does its prompt.
+
+        A template the runtime would refuse to build (malformed, an unknown
+        filter or test, a literal argument that fails every row) is refused
+        here too, so ``elspeth validate``, the composer and the run agree.
+        """
+        if v is None:
+            return None
+        try:
+            SandboxedTemplate(v)
+        except (TemplateSyntaxError, TemplateError) as exc:
+            raise ValueError(f"Invalid query template: {exc}") from exc
+        return v
 
     @field_validator("query_pattern")
     @classmethod

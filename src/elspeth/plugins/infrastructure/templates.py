@@ -19,6 +19,7 @@ import os
 import pickle
 import queue
 import resource
+import signal
 import sys
 import threading
 from atexit import register as register_exit
@@ -30,12 +31,14 @@ from typing import Any, cast
 
 from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
 from jinja2.compiler import CodeGenerator
-from jinja2.exceptions import SecurityError, TemplateRuntimeError, UndefinedError
+from jinja2.exceptions import SecurityError, TemplateAssertionError, TemplateRuntimeError, UndefinedError
 from jinja2.meta import TrackingCodeGenerator
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.utils import missing, object_type_repr
 from jinja2.visitor import NodeVisitor
 
+from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.templates import validate_jinja_source
 
@@ -203,7 +206,6 @@ def _pack_context_value(
     arrives as a ``TemplateRow``: the contract never reaches the render worker.
     A contract object anywhere in a template context is a caller bug.
     """
-    from elspeth.contracts.errors import FrameworkBugError
     from elspeth.contracts.freeze import FrozenJsonArray
     from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 
@@ -305,32 +307,72 @@ def _check_template_source(source: str) -> None:
 
 
 def _template_worker(connection: Any) -> None:
-    """Serve bounded renders until the parent closes the pipe or retires us."""
+    """Serve bounded renders until the parent closes the pipe or retires us.
+
+    No exception but ``SystemExit`` leaves this function. multiprocessing's
+    bootstrap prints any other escaping exception, message and traceback
+    included, to the inherited stderr, and a render failure's message can
+    quote row data. So every request ends in one reply (``_serve_request``);
+    after a ``setup_failed`` reply the worker exits. A failure of the pipe
+    protocol itself exits with status 1 and no reply, which the parent treats
+    as a framework bug.
+    """
     try:
-        baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
-        max_address_space = baseline_pages * os.sysconf("SC_PAGE_SIZE") + _MAX_WORKER_ADDRESS_GROWTH
-        resource.setrlimit(resource.RLIMIT_AS, (max_address_space, max_address_space))
+        try:
+            _limit_worker_address_space()
+        except Exception as exc:
+            connection.send(("setup_failed", type(exc).__name__))
+            raise SystemExit(1) from None
         while True:
             try:
                 source, payload, value_free = connection.recv()
             except EOFError:
                 raise SystemExit(0) from None
-            # RLIMIT_CPU is cumulative over a process lifetime. Give each
-            # request two more CPU seconds, keeping the inherited hard bound.
-            _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
-            connection.send(_render_in_worker(source, payload, value_free))
+            reply = _serve_request(source, payload, value_free)
+            connection.send(reply)
+            if reply[0] == "setup_failed":
+                raise SystemExit(1)
+    except SystemExit:
+        raise
+    except BaseException:
+        # The pipe itself failed (a malformed request, an unsendable reply,
+        # an interrupt). Leave without printing: the parent reads EOF and an
+        # exit status of 1.
+        raise SystemExit(1) from None
     finally:
         connection.close()
 
 
-def _render_in_worker(source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
+def _limit_worker_address_space() -> None:
+    baseline_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[0])
+    max_address_space = baseline_pages * os.sysconf("SC_PAGE_SIZE") + _MAX_WORKER_ADDRESS_GROWTH
+    resource.setrlimit(resource.RLIMIT_AS, (max_address_space, max_address_space))
+
+
+def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
+    """One request, in two phases; every failure becomes the reply.
+
+    SETUP is everything before the template meets the row: the CPU limit,
+    unpickling and restoring the context the parent packed, and building the
+    template the parent already compiled. A failure there is ELSPETH's own
+    (``setup_failed``, which the parent turns into a ``FrameworkBugError``).
+
+    RENDER is the template meeting the row. A Tier-1 error there is ELSPETH's
+    bug too: the template sees only plain row values (``TemplateRow``), never
+    owned framework API, so it cannot come from row data (``render_tier1``).
+    Any other failure is this row's and is reported by its class alone,
+    whatever ``value_free`` says, because its message can quote row data.
+    """
     try:
+        # RLIMIT_CPU is cumulative over a process lifetime. Give each
+        # request two more CPU seconds, keeping the inherited hard bound.
+        _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
         context = pickle.loads(payload)
         if type(context) is not dict or any(type(key) is not str for key in context):
-            raise TemplateError("Template worker received an invalid context")
+            raise FrameworkBugError("Template worker received an invalid context")
         context = _restore_context_value(context)
         undefined = StrictUndefined
         if value_free:
@@ -338,6 +380,9 @@ def _render_in_worker(source: str, payload: bytes, value_free: bool) -> tuple[st
             undefined = _value_free_undefined(_template_literals(parser.parse(source)))
         environment = _LocalSandboxedEnvironment(undefined=undefined, autoescape=False, optimized=False)
         template = environment.from_string(source)
+    except Exception as exc:
+        return "setup_failed", type(exc).__name__
+    try:
         pieces: list[str] = []
         size = 0
         for piece in template.generate(**context):
@@ -352,6 +397,8 @@ def _render_in_worker(source: str, payload: bytes, value_free: bool) -> tuple[st
         return "safe_security", str(exc)[:1024]
     except _UndefinedContractError as exc:
         return "undefined_contract", str(exc)[:1024]
+    except contract_errors.TIER_1_ERRORS as exc:
+        return "render_tier1", type(exc).__name__
     except (
         TemplateError,
         TemplateSyntaxError,
@@ -365,6 +412,8 @@ def _render_in_worker(source: str, payload: bytes, value_free: bool) -> tuple[st
     ) as exc:
         # Keep the protocol bounded and do not pickle a third-party exception.
         return type(exc).__name__, type(exc).__name__ if value_free else str(exc)[:1024]
+    except Exception as exc:
+        return type(exc).__name__, type(exc).__name__
 
 
 def _retire_worker(index: int) -> None:
@@ -386,6 +435,26 @@ def _stop_template_workers() -> None:
 
 
 register_exit(_stop_template_workers)
+
+
+def _worker_death(process: Any) -> Exception:
+    """Classify a worker that closed the pipe without replying, by how it ended.
+
+    The worker replies to every request it can (``_template_worker``), so a
+    missing reply means the process ended. Only its exit status says why, and
+    the text names that status alone. RLIMIT_CPU's SIGXCPU is this row's
+    template running out of its CPU seconds. Another signal (the kernel's OOM
+    killer, an operator's kill) says nothing about the row; how such a death
+    should be handled is a separate decision, so it keeps the routed outcome
+    under its own reason. An exit with no signal is ELSPETH's bug.
+    """
+    process.join(_WORKER_TIMEOUT_SECONDS)
+    exitcode = process.exitcode
+    if exitcode == -signal.SIGXCPU:
+        return TemplateError("Template exceeded the CPU limit")
+    if exitcode is not None and exitcode < 0:
+        return TemplateError(f"Template worker was stopped by signal {-exitcode}")
+    return FrameworkBugError(f"Template worker ended without a reply (exit status {exitcode})")
 
 
 def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
@@ -418,10 +487,18 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
             status, value = parent.recv()
             response_received = True
         except (EOFError, BrokenPipeError) as exc:
-            raise TemplateError("Template worker stopped before completing") from exc
+            raise _worker_death(process) from exc
+        if status == "setup_failed":
+            # The worker exits after this reply; do not hand its slot on.
+            _retire_worker(index)
+            raise FrameworkBugError(f"Template worker setup failed: {value}")
+        if status == "render_tier1":
+            _retire_worker(index)
+            raise FrameworkBugError(f"Template rendering raised a Tier-1 error: {value}")
         if status == "ok":
             if type(value) is not str:
-                raise TemplateError("Template worker returned a non-string result")
+                # The worker only ever sends a joined string: the protocol is broken.
+                raise FrameworkBugError("Template worker returned a non-string result")
             return value
         if value_free:
             if status == "safe_undefined":
@@ -485,10 +562,17 @@ class _BoundedEnvironment(_LocalSandboxedEnvironment):
     def parse(self, source: str, name: str | None = None, filename: str | None = None) -> nodes.Template:
         _check_template_source(source)
         try:
-            ast = super().parse(source, name=name, filename=filename)
+            return super().parse(source, name=name, filename=filename)
         except RecursionError as exc:
             raise TemplateError("Template expression nesting exceeds the parser limit") from exc
+
+    def _parse(self, source: str, name: str | None, filename: str | None) -> nodes.Template:
+        # Jinja's parse() wraps this method and hands a TemplateSyntaxError
+        # raised here to its own error handling, so a configuration-literal
+        # rejection reads exactly as Jinja's compile-time rejection does.
+        ast = super()._parse(source, name, filename)
         _check_template_ast(ast)
+        _check_configuration_literals(ast, self)
         return ast
 
     def from_string(
@@ -533,6 +617,90 @@ def _check_template_ast(ast: nodes.Template) -> None:
             raise TemplateError("Template autoescape requires a literal boolean")
 
 
+# The filters that take a filter or test NAME as a positional argument, and
+# its position after the filtered value (jinja2 ``prepare_map`` /
+# ``prepare_select_or_reject``).
+_NAME_ARGUMENT_FILTERS: Mapping[str, tuple[str, int]] = MappingProxyType(
+    {
+        "map": ("filter", 0),
+        "select": ("test", 0),
+        "reject": ("test", 0),
+        "selectattr": ("test", 1),
+        "rejectattr": ("test", 1),
+    }
+)
+
+
+def _check_configuration_literals(ast: nodes.Template, environment: ImmutableSandboxedEnvironment) -> None:
+    """Reject a template the operator's own literals make fail on every row.
+
+    Such a failure is a configuration error, not a fact about a row, so it is
+    refused when the template is built (``elspeth validate``, the composer,
+    run start) instead of being routed once per row:
+
+    - An unknown filter or test name. Jinja rejects one at compile time, but
+      only outside ``{% if %}`` and inline ``if`` expressions; inside them it
+      defers the error to render. The same holds for a literal name given to
+      ``map``, ``select``, ``reject``, ``selectattr`` and ``rejectattr``.
+    - ``truncate`` arguments whose literal values break its preconditions
+      (``length >= len(end)``, ``leeway >= 0``). An argument computed from the
+      row is decided at render and routes.
+
+    The messages quote only template text.
+    """
+    for test in ast.find_all(nodes.Test):
+        if test.name not in environment.tests:
+            raise TemplateAssertionError(f"No test named {test.name!r}.", test.lineno)
+    for node in ast.find_all(nodes.Filter):
+        if node.name not in environment.filters:
+            raise TemplateAssertionError(f"No filter named {node.name!r}.", node.lineno)
+        if node.name in _NAME_ARGUMENT_FILTERS:
+            named_kind, position = _NAME_ARGUMENT_FILTERS[node.name]
+            if len(node.args) > position:
+                argument = node.args[position]
+                named_registry = environment.filters if named_kind == "filter" else environment.tests
+                if type(argument) is nodes.Const and type(argument.value) is str and argument.value not in named_registry:
+                    raise TemplateAssertionError(f"No {named_kind} named {argument.value!r}.", node.lineno)
+        elif node.name == "truncate":
+            _check_truncate_literals(node, environment)
+
+
+def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxedEnvironment) -> None:
+    """Evaluate ``truncate``'s preconditions when every argument they read is a literal.
+
+    Runs Jinja's own filter on an empty string: its assertions run before it
+    reads the string, and an empty string then returns unchanged, so this
+    evaluates exactly those preconditions on the operator's literals.
+    """
+    if node.dyn_args is not None or node.dyn_kwargs is not None or len(node.args) > 4:
+        return
+    # truncate(s, length=255, killwords=False, end='...', leeway=None)
+    arguments: dict[str, nodes.Expr] = dict(zip(("length", "killwords", "end", "leeway"), node.args, strict=False))
+    for keyword in node.kwargs:
+        # Jinja's parser builds a call's keyword arguments as Keyword nodes
+        # with a str key (its annotations say Pair); anything else is left to render.
+        key: object = keyword.key
+        if type(key) is not str or key in arguments or key not in ("length", "killwords", "end", "leeway"):
+            return
+        arguments[key] = keyword.value
+    literals: dict[str, int | float | str | None] = {}
+    for name in ("length", "end", "leeway"):
+        if name not in arguments:
+            continue
+        argument = arguments[name]
+        # Jinja parses ``-1`` as Neg(Const(1)).
+        if type(argument) is nodes.Neg and type(argument.node) is nodes.Const and type(argument.node.value) in (int, float):
+            literals[name] = -argument.node.value
+        elif type(argument) is nodes.Const and (type(argument.value) in (int, float, str) or argument.value is None):
+            literals[name] = argument.value
+        else:
+            return
+    try:
+        environment.filters["truncate"](environment, "", **literals)
+    except (AssertionError, TypeError) as exc:
+        raise TemplateAssertionError(f"truncate() arguments can never be satisfied: {exc}", node.lineno) from exc
+
+
 def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:
     """Create an ImmutableSandboxedEnvironment with StrictUndefined.
 
@@ -560,6 +728,9 @@ def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandbo
 # OverflowError and ZeroDivisionError are ArithmeticErrors.
 _RENDER_FAILURES = (TemplateSyntaxError, TemplateRuntimeError, ArithmeticError, TypeError, ValueError)
 
+# int() refuses a decimal string longer than this (0: no limit).
+_INT_DIGIT_LIMIT = sys.get_int_max_str_digits()
+
 # Stands in for a lookup key the template does not spell out, i.e. one computed
 # at render time (``row[row.k]``, ``attr(row.k)``, ``row.items[row.i]``).
 _UNSPELLED_KEY = "<a key the template does not spell out>"
@@ -573,8 +744,13 @@ class _ValueFreeUnsafeAccessError(SecurityError):
     """A sandbox-refused attribute lookup whose message ELSPETH built, naming no row value."""
 
 
-class _UndefinedContractError(RuntimeError):
-    """The installed Jinja2 no longer uses its documented undefined contract."""
+class _UndefinedContractError(FrameworkBugError):
+    """The installed Jinja2 no longer uses its documented undefined contract.
+
+    A framework fault, never a row fault: every template that looks a key up
+    would fail the same way. As a ``FrameworkBugError`` it is Tier-1, so the
+    run aborts instead of routing every row.
+    """
 
 
 def withheld_error_detail(exc: BaseException) -> str:
@@ -611,9 +787,16 @@ def _template_literals(ast: nodes.Template) -> frozenset[str | int]:
     for const in ast.find_all(nodes.Const):
         value = const.value
         if type(value) is str:
-            # A dotted literal (``map(attribute='a.b')``) is looked up part by part.
+            # A dotted literal (``map(attribute='a.b')``) is looked up part by
+            # part, and Jinja looks a digit part up as an int (``'a.0'`` reads
+            # element 0). A part int() refuses (a non-decimal digit such as
+            # '²', or more digits than Python converts) fails Jinja's own int()
+            # before any lookup, so it can never be a key.
             literals.add(value)
-            literals.update(value.split("."))
+            for part in value.split("."):
+                literals.add(part)
+                if part.isdecimal() and (_INT_DIGIT_LIMIT == 0 or len(part) <= _INT_DIGIT_LIMIT):
+                    literals.add(int(part))
         elif type(value) is int:
             # ``items[-1]`` parses as Neg(Const(1)).
             literals.update((value, -value))
@@ -696,9 +879,14 @@ class SandboxedTemplate:
             TemplateError: A per-row operational failure, prefixed by its kind
                 (``Undefined variable``, ``Sandbox violation``, ``Template
                 rendering failed``) with a value-free detail.
+            FrameworkBugError: ELSPETH's own failure (packing the context,
+                preparing the worker, a broken worker protocol or Jinja
+                contract). Tier-1: it aborts the run, never becomes a row error.
         """
         try:
             return self._template.render(**context)
+        except contract_errors.TIER_1_ERRORS:
+            raise
         except _ValueFreeUndefinedError as exc:
             raise TemplateError(f"Undefined variable: {exc}") from exc
         except _ValueFreeUnsafeAccessError as exc:
