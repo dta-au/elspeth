@@ -1153,9 +1153,8 @@ render only, never to waiting for or starting a worker:
   started with `elspeth join` applies no retry settings, so a row it processes
   goes to `on_error` after the first lost worker, as it does for any other
   retryable error there. A multi-query LLM node with a `pool_size` above 1
-  retries the one query itself within `max_capacity_retry_seconds`, in either
-  process. A worker that exits with no signal and no reply stops the run as an
-  ELSPETH failure.
+  retries the one query itself within `max_capacity_retry_seconds`. A worker
+  that exits with no signal and no reply stops the run as an ELSPETH failure.
 
 Stopping a run with Ctrl-C (SIGINT) or SIGTERM lets a template render already
 in progress finish. systemd's default stop sends SIGTERM to every process in
