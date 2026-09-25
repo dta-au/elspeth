@@ -186,6 +186,17 @@ def _worker_never_ready(connection: Any) -> None:
     time.sleep(60)
 
 
+def _worker_whose_memory_limit_fails(connection: Any) -> None:
+    """The real worker, with RLIMIT_AS refused (a hard limit already below the one it asks for)."""
+
+    def refuse_limit() -> None:
+        raise OSError("RLIMIT_AS refused")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(templates, "_limit_worker_address_space", refuse_limit)
+        templates._template_worker(connection)
+
+
 def _worker_replying_before_ready(connection: Any) -> None:
     """A first message that is a render reply: were it read as one, a row would get it."""
     connection.send(("ok", "not this row's"))
@@ -414,11 +425,33 @@ def test_a_slow_worker_start_is_not_charged_to_the_render(monkeypatch: pytest.Mo
 
 @pytest.mark.usefixtures("one_fresh_worker")
 def test_a_worker_that_never_becomes_ready_aborts_and_is_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retired means killed, not only unlisted: the worker is registered
+    before the ready wait, so the failed start's cleanup kills it. A worker
+    left running ignores the SIGTERM that multiprocessing's exit handler
+    sends and then waits on, so the process would never exit."""
     monkeypatch.setattr(templates, "_template_worker", _worker_never_ready)
     monkeypatch.setattr(templates, "_WORKER_START_TIMEOUT_SECONDS", 0.5)
+    children_before = set(multiprocessing.active_children())
     with pytest.raises(FrameworkBugError) as caught:
         SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    left_running = [child for child in multiprocessing.active_children() if child not in children_before]
+    for child in left_running:
+        child.kill()
+        child.join()
     assert str(caught.value) == "Template worker did not become ready within 0.5 s"
+    assert templates._WORKERS == [None]
+    assert left_running == []
+
+
+@pytest.mark.usefixtures("one_fresh_worker")
+def test_a_worker_whose_memory_limit_fails_at_start_aborts_naming_the_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real worker's start: setting RLIMIT_AS fails, so it replies
+    ``setup_failed`` with the exception's class and exits. That is ELSPETH's
+    own setup, so the run aborts, and the abort names the class."""
+    monkeypatch.setattr(templates, "_template_worker", _worker_whose_memory_limit_fails)
+    with pytest.raises(FrameworkBugError) as caught:
+        SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    assert str(caught.value) == "Template worker setup failed: OSError"
     assert templates._WORKERS == [None]
 
 
