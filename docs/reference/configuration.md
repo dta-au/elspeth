@@ -1125,19 +1125,29 @@ and nothing else:
 - `row.name` and `row['name']` read a field by its normalized name, and
   `row['Original Header']` reads it by the source's original header.
 - `row.get('name')` returns the field, or `None` when the row does not carry it.
-- `'name' in row`, `{% for name in row %}`, `row | length` and `row | dictsort`
-  see the normalized field names.
+- `'name' in row`, `{% for name in row %}` and `row | length` see the
+  normalized field names only.
 
 Every other attribute or item lookup on `row` reads a field of that name:
 `row.keys` and `row.items` are fields, not methods. The row object, its schema
 contract and their methods are not reachable from a template. A lookup of a
 field the row does not carry fails that row with `template_rendering_failed`.
-Configuration validation still treats `row.contract`, `row.to_dict` and
-`row.to_checkpoint_format` as dynamic row access (see `required_input_fields`),
-so read a column with one of those names as `row['contract']`.
+
+Configuration validation rejects a template that reads fields it does not name,
+because those reads cannot be checked against `required_input_fields`: a
+computed key (`row[k]`, `row.get(k)`, `row | attr(k)`), and a whole row used as
+a value, such as `row | items`, `row | dictsort`, `dict(row)`,
+`'%(name)s' % row`, `'{0[name]}'.format(row)` or `row == {...}`. The same
+applies through an alias (`{% set r = row %}`), a list, dict or `namespace`
+holding the row, and a macro argument. Set `required_input_fields: []` to opt
+out and accept that the node's input contract is not checked. Configuration
+validation also treats `row.contract`, `row.to_dict` and
+`row.to_checkpoint_format` as dynamic row access, so read a column with one of
+those names as `row['contract']`.
 
 In a multi-query template, `row` holds the query's `input_fields` variables and
-`row.source_row`, which is the same field-only view of the whole row.
+`row.source_row`, which is the same field-only view of the whole row. The same
+rules apply to reads through `row.source_row`.
 
 `provider: azure` adds:
 

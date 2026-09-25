@@ -567,6 +567,9 @@ class LLMConfig(TransformDataConfig):
                 # the constructor advertises, not a raw jinja2 exception.
                 raise TemplateError(f"Invalid template syntax in {label}: {e}") from e
             dynamic_accesses.extend(extraction.dynamic_accesses)
+            if self.queries is not None:
+                # A query renders with the row at row.source_row; judge reads through it the same way.
+                dynamic_accesses.extend(extract_jinja2_field_usage(template, row_attribute="source_row").dynamic_accesses)
 
         if not dynamic_accesses:
             return self
@@ -578,6 +581,7 @@ class LLMConfig(TransformDataConfig):
             "item": "row[expr]",
             "map(attribute)": "map(attribute=expr)",
             "row-api": "row API",
+            "whole-row": "a whole-row operand such as row|items or dict(row)",
         }
         access_examples = ", ".join(access_examples_by_kind[kind] for kind in access_kinds)
         raise ValueError(

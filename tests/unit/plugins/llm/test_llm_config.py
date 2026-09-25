@@ -201,6 +201,43 @@ class TestLLMConfigBase:
         assert "dynamic row field access" in message
         assert "map(attribute=expr)" in message
 
+    @pytest.mark.parametrize(
+        "template",
+        (
+            "{{ row.note }} {{ row | dictsort }}",
+            "{% for k, v in row | items %}{{ v }}{% endfor %}{{ row.note }}",
+            "{{ row.note }} {{ dict(row) }}",
+            "{{ row.note }} {{ '%(secret)s' % row }}",
+            "{{ row.note }} {{ '{0[secret]}'.format(row) }}",
+            "{% set c = [row] %}{{ row.note }} {{ c | map('dictsort') | list }}",
+        ),
+    )
+    def test_whole_row_value_rejected_even_with_declared_fields(self, template: str) -> None:
+        """A whole row used as a value sends every column, so a declared contract cannot vouch for it (S0 fix round 1)."""
+        with pytest.raises(ValidationError) as exc_info:
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+        message = str(exc_info.value)
+        assert "dynamic row field access (whole-row via a whole-row operand such as row|items or dict(row))" in message
+        assert "options.required_input_fields: []" in message
+
+    def test_whole_row_value_admitted_with_explicit_opt_out(self) -> None:
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template="{{ row.note }} {{ row | dictsort }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=[],
+        )
+
+        assert config.required_input_fields == []
+
     def test_row_derived_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """Declaring the selector field is not enough when it chooses another field."""
         with pytest.raises(ValidationError) as exc_info:

@@ -632,10 +632,26 @@ def test_the_template_row_keeps_every_documented_row_form() -> None:
     template = create_sandboxed_environment().from_string(
         "{{ row.amount_usd }}|{{ row['Amount USD'] }}|{{ row.get('Amount USD') }}|{{ row.get('absent') is none }}|"
         "{{ 'Amount USD' in row }}|{{ 'absent' in row }}|{% for k in row %}{{ k }},{% endfor %}|{{ row | length }}|"
-        "{{ row | dictsort | map('first') | join(',') }}|{{ row.blob.data == row['blob']['data'] }}|{{ row.q.upper() }}|"
+        "{{ row | list | join(',') }}|{{ row.blob.data == row['blob']['data'] }}|{{ row.q.upper() }}|"
         "{{ row | attr('q') }}"
     )
-    assert template.render(row=_owned_api_row()) == ("5|5|5|True|True|False|amount_usd,q,blob,|3|amount_usd,blob,q|True|HELLO|hello")
+    assert template.render(row=_owned_api_row()) == ("5|5|5|True|True|False|amount_usd,q,blob,|3|amount_usd,q,blob|True|HELLO|hello")
+
+
+@pytest.mark.parametrize("source", ["{{ row | dictsort }}", "{{ row | items | list }}", "{{ dict(row) }}", "{{ '%(q)s' % row }}"])
+def test_a_whole_row_value_renders_every_field_so_configuration_treats_it_as_dynamic(source: str) -> None:
+    """The row is a Mapping of field values: whole-row forms read fields the template does not name.
+
+    That is why configuration refuses them unless ``required_input_fields: []``
+    (``core.templates`` classifies each as ``whole-row``). A node that opts out
+    gets exactly the row's values, never framework objects.
+    """
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    assert "whole-row" in extract_jinja2_field_usage(source).dynamic_accesses
+    rendered = create_sandboxed_environment().from_string(source).render(row=_owned_api_row())
+    assert "hello" in rendered
+    assert "Contract" not in rendered
 
 
 def test_row_values_render_exactly_as_the_frozen_pipeline_row_rendered_them() -> None:

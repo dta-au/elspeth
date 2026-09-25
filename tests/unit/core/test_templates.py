@@ -1047,6 +1047,144 @@ class TestExtractJinja2Fields:
         )
 
 
+class TestWholeRowAccess:
+    """A whole row used as a value reads fields the template never names (elspeth-5887fb7928 S0 fix round 1).
+
+    The template row is a Mapping of field values, so ``row|items`` and
+    ``row|dictsort`` render every column; ``dict(row)``, ``namespace(**row)``,
+    ``'%(x)s' % row`` and ``'{0[x]}'.format(row)`` did so before it. Each is
+    classified ``whole-row`` so a node declaring ``required_input_fields`` is
+    refused rather than sending undeclared columns to the provider.
+    """
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{{ row | dictsort }}",
+            "{{ row | items | list }}",
+            "{% for k, v in row | items %}{{ v }}{% endfor %}",
+            "{{ row | tojson }}",
+            "{{ row | urlencode }}",
+            "{{ row | map('upper') | list }}",
+            "{{ dict(row) }}",
+            "{{ dict(**row) }}",
+            "{{ namespace(row) }}",
+            "{{ namespace(**row) }}",
+            "{{ '%(secret)s' % row }}",
+            "{{ '{0[secret]}'.format(row) }}",
+            "{{ '{r[secret]}'.format(r=row) }}",
+            "{{ '{0[0][secret]}'.format([row]) }}",
+            "{{ row == {} }}",
+            "{{ {} != row }}",
+            "{{ row in [] }}",
+            "{{ row is eq({}) }}",
+            "{{ -row }}",
+            "{{ row ~ '' }}",
+            "{{ lookup[row] }}",
+            "{{ [row] | map('dictsort') | list }}",
+            "{{ [row] | first | dictsort }}",
+            "{{ [row] | sort | map('dictsort') | list }}",
+            "{{ [row] | selectattr('x') | map('dictsort') | list }}",
+            "{{ [row][0] | dictsort }}",
+            "{{ {'a': row}['a'] | dictsort }}",
+            "{{ {'a': {'b': row}}['a']['b'] | dictsort }}",
+            "{{ namespace(r=row).r | dictsort }}",
+            "{{ (row or none) | dictsort }}",
+            "{{ (row if true else none) | dictsort }}",
+            "{{ row | default(none) | dictsort }}",
+            "{{ none | default(row) | dictsort }}",
+            "{% set r = row %}{{ r | dictsort }}",
+            "{% set c = [row] %}{{ c | map('dictsort') | list }}",
+            "{% set c = [row] %}{{ c[0] | dictsort }}",
+            "{% set d = {'a': {'b': row}} %}{{ d.a.b | dictsort }}",
+            "{% set ns = namespace() %}{% set ns.r = row %}{{ ns.r | dictsort }}",
+            "{% for r in [row] %}{{ r | dictsort }}{% endfor %}",
+            "{% with r = row %}{{ r | dictsort }}{% endwith %}",
+            "{% macro m(r) %}{{ r | dictsort }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ kwargs }}{% endmacro %}{{ m(**row) }}",
+            "{% macro m() %}{{ kwargs }}{% endmacro %}{{ m(**{'r': row}['r']) }}",
+            "{{ namespace(**{'r': row}['r']) }}",
+            "{% macro m(r) %}{{ caller(r) }}{% endmacro %}{% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
+        ],
+    )
+    def test_a_whole_row_used_as_a_value_is_dynamic_access(self, template: str) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert "whole-row" in extract_jinja2_field_usage(template).dynamic_accesses
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{{ row }}",
+            "{% if row %}x{% endif %}",
+            "{{ not row }}",
+            "{{ 'q' in row }}",
+            "{{ 'q' not in row }}",
+            "{% for name in row %}{{ name }}{% endfor %}",
+            "{{ row | length }}",
+            "{{ row | list | join(',') }}",
+            "{{ row is defined }}",
+            "{{ row is mapping }}",
+            "{{ row.q | upper }}",
+            "{{ (row.a * 100) | round }}",
+            "{{ (row.a ~ row.b) | lower }}",
+            "{{ row.a == 'x' }}",
+            "{{ row.meta | dictsort }}",
+            "{{ row.q if row else '' }}",
+            "{{ [row] | map(attribute='q') | join(',') }}",
+            "{% set c = [row] %}{{ c | length + 1 }}",
+            "{% set c = [row] %}{{ c[0].q | upper }}",
+            "{% set ns = namespace(r=row) %}{{ ns.r.q | upper }}",
+            "{% set d = {'a': row, 'n': 1} %}{{ d.a.q }}{{ d.n + 1 }}",
+            "{% for r in [row] %}{{ r.q | upper }}{% endfor %}",
+            "{% macro m(r) %}{{ r.q | upper }}{% endmacro %}{{ m(row) }}",
+        ],
+    )
+    def test_names_repr_truthiness_and_carriers_are_not_whole_row_access(self, template: str) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert "whole-row" not in extract_jinja2_field_usage(template).dynamic_accesses
+
+    def test_the_whole_row_kind_joins_other_kinds_without_duplication(self) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage("{{ row.note }} {{ row | dictsort }} {{ row | items | list }} {{ row[k] }}")
+
+        assert result.fields == frozenset({"note"})
+        assert result.dynamic_accesses == ("item", "whole-row")
+
+
+class TestNestedRowRoot:
+    """``row_attribute`` analyses ``<namespace>.<attribute>`` as the row (multi-query ``row.source_row``)."""
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            ("{{ row.source_row | dictsort }}", ("whole-row",)),
+            ("{{ row['source_row'] | items | list }}", ("whole-row",)),
+            ("{% set s = row.source_row %}{{ s | dictsort }}", ("whole-row",)),
+            ("{{ dict(row.source_row) }}", ("whole-row",)),
+            ("{{ row.source_row[row.k] }}", ("item",)),
+            ("{{ row.source_row.get(row.k) }}", ("get",)),
+        ],
+    )
+    def test_reads_through_the_nested_row_are_classified(self, template: str, expected: tuple[str, ...]) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert extract_jinja2_field_usage(template, row_attribute="source_row").dynamic_accesses == expected
+
+    def test_literal_reads_through_the_nested_row_are_its_fields(self) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(
+            "{{ row.text }} {{ row.source_row.title }} {{ row['source_row']['body'] }} {{ row.source_row.get('kind') }} {{ row.source_row }}",
+            row_attribute="source_row",
+        )
+
+        assert result.fields == frozenset({"title", "body", "kind"})
+        assert result.dynamic_accesses == ()
+
+
 class TestExtractJinja2FieldsWithDetails:
     """Tests for extract_jinja2_fields_with_details function."""
 
