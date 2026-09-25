@@ -806,7 +806,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper now carries
 # an identity mapping by original header, so its source_file_hash moved
 # e424629ddeb631e4 -> a45ae2bec03f6d88 (same tool); no manifest literal,
-# resume digest, registry digest or oracle_freeze snapshot moved.
+# resume digest, registry digest or oracle_freeze snapshot moved. The same
+# round then un-carried a declared header literal on such a mapping:
+# a45ae2bec03f6d88 -> df53a6bf11f5e647, likewise unpinned.
 EXPECTED_CASE_REGISTRY_SHA256 = "767f95459978d3ae4885e8681a405d84ad6acc88c58b694c7e894868a9a0af54"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
