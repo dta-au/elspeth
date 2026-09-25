@@ -973,6 +973,21 @@ class TestOutputSchemaConfig:
 
         assert transform.carried_output_fields() == carried
 
+    def test_an_identity_mapping_whose_header_literal_is_declared_is_not_carried(self) -> None:
+        """``{"Name": "Name"}`` with ``Name: int?`` is the operator's declaration of the emitted key (ADR-050 Decision 5).
+
+        The input row is keyed ``name``, so no input check held the value to
+        the ``Name`` declaration: like a rename declared by its target name
+        alone, it is not carried. An undeclared literal stays carried.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        declared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["Name: int?"]}})
+        undeclared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["id: int"]}})
+
+        assert declared.carried_output_fields() == frozenset()
+        assert undeclared.carried_output_fields() == frozenset({"Name"})
+
     def test_a_header_spelled_source_is_never_matched_to_its_normalized_declaration(self) -> None:
         """``{"First Name": "given"}`` abstains from reading ``first_name: str`` as the source's declaration (review-S1a-r2 F2).
 

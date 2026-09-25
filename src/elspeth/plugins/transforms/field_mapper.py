@@ -313,7 +313,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a45ae2bec03f6d88"
+    source_file_hash: str | None = "sha256:df53a6bf11f5e647"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -362,10 +362,18 @@ class FieldMapper(BaseTransform):
         # A flat rename whose declaration the author wrote against the EMITTED
         # name carries the operator's contract, not the source field's, so it
         # is not a carried field: the engine must check its value (ADR-050).
+        # So is an identity mapping by an original header whose literal the
+        # author declared ({"Name": "Name"} with ``Name: int?``): the input
+        # row is keyed ``name``, so no input check held the value to the
+        # ``Name`` declaration either.
         self._flat_renames_declared_on_target = frozenset(
             target
             for source, target in cfg.mapping.items()
-            if "." not in source and self._declaration_is_authored_on_target(source, target, authored_names)
+            if "." not in source
+            and (
+                self._declaration_is_authored_on_target(source, target, authored_names)
+                or (source == target and self._is_unresolved_original_source(source) and target in authored_names)
+            )
         )
 
         # Rename targets are created here, never required on input. Requiring
@@ -474,7 +482,9 @@ class FieldMapper(BaseTransform):
         contract (``narrow_contract_to_output`` resolves it). Only a
         normalized identity rewrites a key the input already carries, so only
         it is left out. Such a target is not in ``declared_output_fields``,
-        the collision surface, which excludes every identity mapping.
+        the collision surface, which excludes every identity mapping. When the
+        author declared the header literal itself, that declaration is the
+        target's and is not carried, like any target-declared rename.
         """
         return frozenset(
             target
