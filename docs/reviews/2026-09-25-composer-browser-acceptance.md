@@ -14,7 +14,7 @@ The prior session store was at epoch 67. With operator approval, its database
 and sidecars were archived under
 `data/archives/local-refresh-epoch67-20260924T234903Z/` before epoch 68 was
 created. The credential store `data/auth.db` was preserved, and the existing
-`dta_user` local account was readmitted as an active administrator. The old two
+`<staging-user>` local account was readmitted as an active administrator. The old two
 sessions remain in the archive, outside the live UI. Six optional transforms
 used by the battery were added to the operator-local plugin allowlist:
 `batch_top_k`, `json_explode`, `keyword_filter`, `truncate`, `type_coerce`, and
