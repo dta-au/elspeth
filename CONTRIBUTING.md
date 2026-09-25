@@ -468,6 +468,39 @@ also asserts it rooted at no fewer than `MIN_PROCESS_ROOTS` process methods,
 because a scan that stopped seeing the plugin tree reports the same empty set
 a clean tree does.
 
+### Gate: template renderers and the Tier-1 process-boundary latch
+
+**Pins:** which code can render a row through Jinja. Over every gate-visible
+file under `src/elspeth`, `tests/unit/plugins/infrastructure/test_template_call_sites.py`
+asserts the exact sets of (a) modules importing a Jinja environment or
+`Template` class (the template infrastructure, `core/templates.py`, which only
+parses, and the S3 key template); (b) `SandboxedTemplate(...)` construction
+sites (the LLM and RAG renderers, and RAG's config-time compile); and (c)
+`create_sandboxed_environment()` calls without `value_free=True`, per file,
+with every `render`/`generate`/`stream` call in those files passing only
+`run_id`/`timestamp`.
+
+```bash
+.venv/bin/python -m pytest tests/unit/plugins/infrastructure/test_template_call_sites.py -n 0
+.venv/bin/python -m pytest "tests/unit/engine/test_executors.py::TestReRaiseGuardPattern" -n 0
+```
+
+**Why.** Only `SandboxedTemplate` withholds a row value from a render failure;
+Jinja's and Python's own messages quote it. A new renderer is a new place a row
+value can reach an audit reason, so it is judged, not inherited. Render a row
+through `SandboxedTemplate`; a path or key template that renders run-level
+names only may use `create_sandboxed_environment()` and must be added to the
+expected set in the same change.
+
+**The latch.** `TestReRaiseGuardPattern` refuses an `except TIER_1_ERRORS`
+handler that returns. The template render worker is a spawned child, which
+cannot raise into the parent, and an exception escaping it is printed to the
+inherited stderr. So its render arm replies `render_tier1` with the class name
+and the parent raises `FrameworkBugError`. That handler is exempt through
+`_PROCESS_BOUNDARY_LATCHES`, keyed by `(path, enclosing function)`, never
+through the file-name `_HANDLER_ALLOWLIST`. An entry that no longer matches a
+handler fails the gate.
+
 ### Gate: runtime-rejection parity
 
 **Pins:** every `raise` under `src/elspeth/core/dag/` and

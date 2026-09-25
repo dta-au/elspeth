@@ -8,6 +8,23 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-26 — template renderers are pinned, and a spawned worker latches a Tier-1 instead of raising it**
+  (elspeth-5887fb7928 S3, lane fix/5887-rebased)
+  The bounded template worker used to let every exception outside a fixed catch tuple escape. The child died, the
+  parent read EOF and routed every such row as the classless "Template worker stopped before completing". With the
+  parent's kill delayed, multiprocessing's bootstrap printed the child's traceback to the inherited stderr, and a
+  `.format` `KeyError` quoted the row value there (the panel's B9: 3 sentinel lines before the fix, 0 bytes after). The
+  worker now ends every request in a reply. A render failure is routed by its class alone. A Tier-1 error or a failure
+  in the worker's own setup aborts as `FrameworkBugError`. A missing reply is classified by exit status. Two whole-tree
+  checks came with it. `test_template_call_sites.py` pins the Jinja renderers. `TestReRaiseGuardPattern` gained
+  `_PROCESS_BOUNDARY_LATCHES`, because a first run found that the worker's returning `except TIER_1_ERRORS` arm
+  (by design) failed that gate. The file-name allowlist was not used because it would also have exempted
+  `core/templates.py`. Separately, `_BoundedEnvironment._parse` now refuses config-literal failures at build (an
+  unknown filter or test, including one inside `{% if %}`, a literal name given to `map`/`select`, a literal `truncate`
+  that breaks its preconditions), and RAG's config compiles its `query_template`: before this, the composer admitted
+  even a malformed RAG template.
+  See [CONTRIBUTING: Gate: template renderers and the Tier-1 process-boundary latch](../../CONTRIBUTING.md#gate-template-renderers-and-the-tier-1-process-boundary-latch).
+
 - **2026-09-24 — no bare `TypeError` may escape a plugin's `process` path** (elspeth-5887fb7928, lane
   fix/5887-batch-row-quarantine)
   Twelve sites in eleven batch plugins raised `TypeError(... "This indicates an upstream validation bug" ...)` on a

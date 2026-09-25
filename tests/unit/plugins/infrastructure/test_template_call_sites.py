@@ -51,7 +51,9 @@ _RUN_LEVEL_RENDER_NAMES = frozenset({"run_id", "timestamp"})
 
 @cache
 def _modules() -> dict[str, ast.Module]:
-    return {path.relative_to(_SRC).as_posix(): ast.parse(path.read_text(encoding="utf-8")) for path in sorted(_SRC.rglob("*.py"))}
+    from tests.helpers.tree_gate import iter_gate_sources
+
+    return {parsed.path.relative_to(_SRC).as_posix(): parsed.tree for parsed in iter_gate_sources(_SRC)}
 
 
 def _called_name(call: ast.Call) -> str | None:
