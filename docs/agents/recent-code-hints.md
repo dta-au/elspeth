@@ -23,6 +23,14 @@ the same commit; the rules live there, the history lives here.
   unknown filter or test, including one inside `{% if %}`, a literal name given to `map`/`select`, a literal `truncate`
   that breaks its preconditions), and RAG's config compiles its `query_template`: before this, the composer admitted
   even a malformed RAG template.
+  Fix round 1 (f04637c40): the worker kept Python's SIGINT handler, so a terminal Ctrl-C (sent to the run's whole
+  process group) ended it with status 1 and the run aborted as a framework bug instead of stopping gracefully. The
+  worker now ignores SIGINT and is spawned with SIGINT blocked. A stdlib trap came with it: multiprocessing starts its
+  resource tracker on a process's first spawn and unblocks SIGINT in the calling thread afterwards (bpo-33613), so a
+  mask set around `Process.start()` silently did nothing for the first worker of every process. `ensure_running()`
+  now runs before the block. A mask-leak mutant survived one test round only because random order sometimes made
+  its test the process's first spawn; only a fresh interpreter (`test_the_first_worker_a_process_starts_holds_an_interrupt_too`)
+  sees the first-spawn case.
   See [CONTRIBUTING: Gate: template renderers and the Tier-1 process-boundary latch](../../CONTRIBUTING.md#gate-template-renderers-and-the-tier-1-process-boundary-latch).
 
 - **2026-09-24 — no bare `TypeError` may escape a plugin's `process` path** (elspeth-5887fb7928, lane
