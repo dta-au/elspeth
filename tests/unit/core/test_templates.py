@@ -7,6 +7,8 @@ import textwrap
 
 import pytest
 
+from elspeth.core.templates import Jinja2FieldExtraction
+
 
 class TestExtractJinja2Fields:
     """Tests for extract_jinja2_fields function."""
@@ -1152,6 +1154,76 @@ class TestWholeRowAccess:
 
         assert result.fields == frozenset({"note"})
         assert result.dynamic_accesses == ("item", "whole-row")
+
+
+def _extract_within(template: str, seconds: float = 10.0) -> Jinja2FieldExtraction:
+    """Run the field-usage extractor on a thread; fail if it has not returned in time."""
+    import threading
+
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    outcome: list[Jinja2FieldExtraction] = []
+    worker = threading.Thread(target=lambda: outcome.append(extract_jinja2_field_usage(template)), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"alias analysis did not terminate within {seconds}s"
+    return outcome[0]
+
+
+class TestAliasAnalysisTerminates:
+    """The alias fixpoint only ever widens, and a self-holding carrier stops at the path cap (S0 fix round 2)."""
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            # A name bound to two different API carriers or kinds used to be rewritten back and forth forever.
+            ("{% set a = [row.get] %}{% set a = {'k': row.get} %}{{ a }}", ()),
+            ("{% macro m(a) %}{{ a }}{% endmacro %}{{ m([row.get]) }}{{ m({'k': row.get}) }}", ()),
+            ("{% macro m(a) %}{{ a[0]('x') }}{% endmacro %}{{ m([1, row.get]) }}{{ m([row.get]) }}", ("get",)),
+            ("{% macro m() %}{% endmacro %}{% set a = [m] %}{% set a = {'k': m} %}{{ a }}", ()),
+            ("{% macro m() %}{% endmacro %}{% macro n() %}{% endmacro %}{% set a = [m] %}{% set a = [n] %}{{ a }}", ()),
+            ("{% set g = row.get %}{% set g = row.contract %}{{ g }}", ("row-api",)),
+            ("{% set ns = namespace() %}{% set ns.a = row.get %}{% set ns.a = row.contract %}{{ ns }}", ("row-api",)),
+            ("{% for g in [row.get] %}{% endfor %}{% for g in [row.contract] %}{% endfor %}{{ g }}", ("row-api",)),
+        ],
+    )
+    def test_a_name_bound_to_conflicting_values_joins_them(self, template: str, expected: tuple[str, ...]) -> None:
+        result = _extract_within(template)
+
+        assert result.dynamic_accesses == expected
+        assert result.fields == frozenset()
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{% set a = {'k': row} %}{% set a = {'k': a} %}{{ a }}",
+            "{% set a = {'k': row} %}{% set a = {'k': a, 'j': a} %}{{ a }}",
+            "{% set a = {'k': row.get} %}{% set a = {'k': a} %}{{ a }}",
+            "{% set ns = namespace(k=row) %}{% set ns.k = ns %}{{ ns }}",
+            "{% macro m() %}{% endmacro %}{% set a = [m] %}{% set a = [a] %}{{ a }}",
+        ],
+    )
+    def test_a_carrier_that_holds_itself_reports_the_carrier_limit(self, template: str) -> None:
+        result = _extract_within(template)
+
+        assert result.dynamic_accesses == ("carrier-limit",)
+
+    def test_the_field_only_helpers_terminate_on_a_self_holding_carrier(self) -> None:
+        import threading
+
+        from elspeth.core.templates import extract_jinja2_fields, extract_jinja2_fields_with_details
+
+        template = "{% set a = {'k': row} %}{% set a = {'k': a} %}{{ a.k.note }}"
+        outcome: list[object] = []
+        worker = threading.Thread(
+            target=lambda: outcome.append((extract_jinja2_fields(template), extract_jinja2_fields_with_details(template))),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(10.0)
+
+        assert not worker.is_alive()
+        assert outcome == [(frozenset({"note"}), {"note": ["attr"]})]
 
 
 class TestNestedRowRoot:

@@ -577,6 +577,7 @@ class LLMConfig(TransformDataConfig):
         access_kinds = sorted(set(dynamic_accesses))
         access_examples_by_kind = {
             "attr": "row|attr(expr)",
+            "carrier-limit": "a variable or macro argument that holds itself, too deep to follow",
             "get": "row.get(expr)",
             "item": "row[expr]",
             "map(attribute)": "map(attribute=expr)",

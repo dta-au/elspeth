@@ -1139,8 +1139,13 @@ computed key (`row[k]`, `row.get(k)`, `row | attr(k)`), and a whole row used as
 a value, such as `row | items`, `row | dictsort`, `dict(row)`,
 `'%(name)s' % row`, `'{0[name]}'.format(row)` or `row == {...}`. The same
 applies through an alias (`{% set r = row %}`), a list, dict or `namespace`
-holding the row, and a macro argument. Set `required_input_fields: []` to opt
-out and accept that the node's input contract is not checked. Configuration
+holding the row, and a macro argument. Validation follows each variable through
+every assignment at once, not in template order, so a variable that is
+reassigned to a container holding itself (`{% set a = {'k': row} %}` then
+`{% set a = {'k': a} %}`) cannot be followed and is rejected as
+`carrier-limit`; give the second value its own name. Set
+`required_input_fields: []` to opt out and accept that the node's input
+contract is not checked. Configuration
 validation also treats `row.contract`, `row.to_dict` and
 `row.to_checkpoint_format` as dynamic row access, so read a column with one of
 those names as `row['contract']`.

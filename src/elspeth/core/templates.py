@@ -89,6 +89,16 @@ ATTR_FILTER_DYNAMIC_ACCESS = "attr"
 MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS = "map(attribute)"
 ROW_API_DYNAMIC_ACCESS = "row-api"
 WHOLE_ROW_DYNAMIC_ACCESS = "whole-row"
+CARRIER_LIMIT_DYNAMIC_ACCESS = "carrier-limit"
+
+# The alias analysis is a fixpoint over what each template name may hold. Every
+# write only ever joins (an API alias bound to two kinds is ROW_API_DYNAMIC_ACCESS,
+# carrier paths and macro names accumulate), so the analysis cannot oscillate.
+# It is flow-insensitive, so a carrier that holds itself ({% set a = {'k': a} %},
+# a recursive macro handing on its own kwargs) would grow its paths without end:
+# no alias records more than this many paths, and a template whose analysis
+# reaches the cap reports CARRIER_LIMIT_DYNAMIC_ACCESS instead of being trusted.
+_MAX_CARRIER_PATHS_PER_ALIAS = 256
 
 # What a template may do with a whole row (``row`` itself, an alias of it, or a
 # list, dict or namespace carrying one) without reading a field value the
@@ -171,7 +181,10 @@ def extract_jinja2_field_usage(
     reported separately so security-sensitive callers can fail closed instead
     of treating an empty concrete-field set as "no row fields referenced."
     So is a whole row used as a value (``row|items``, ``dict(row)``,
-    ``'%(x)s' % row``): it reads fields the template never names.
+    ``'%(x)s' % row``): it reads fields the template never names. A template
+    whose aliases hold themselves too deeply to follow (see
+    ``_MAX_CARRIER_PATHS_PER_ALIAS``) reports ``carrier-limit``: nothing read
+    through them can be named.
 
     ``row_attribute`` names where the row lives when ``namespace`` is not the
     row itself: multi-query binds ``row`` to the query's variables and the row
@@ -185,9 +198,15 @@ def extract_jinja2_field_usage(
         root = f"{namespace}.{row_attribute}"  # a dotted name no template can spell or shadow
         ast = _NestedRowRoot(namespace, row_attribute, root).visit(ast)
         namespace = root
-    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (
-        _field_extraction_context(ast, namespace)
-    )
+    (
+        namespaces,
+        api_aliases,
+        row_api_container_aliases,
+        row_value_aliases,
+        row_collection_aliases,
+        row_container_aliases,
+        carrier_limit_reached,
+    ) = _field_extraction_context(ast, namespace)
     fields: set[str] = set()
     dynamic_accesses: list[str] = []
     _walk_ast(
@@ -203,6 +222,8 @@ def extract_jinja2_field_usage(
     )
     if _template_uses_whole_row(ast, namespaces, row_collection_aliases, row_container_aliases):
         _append_dynamic_access(dynamic_accesses, WHOLE_ROW_DYNAMIC_ACCESS)
+    if carrier_limit_reached:
+        _append_dynamic_access(dynamic_accesses, CARRIER_LIMIT_DYNAMIC_ACCESS)
     return Jinja2FieldExtraction(fields=frozenset(fields), dynamic_accesses=tuple(dynamic_accesses))
 
 
@@ -269,7 +290,7 @@ def extract_jinja2_fields(
     validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
-    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (
+    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases, _ = (
         _field_extraction_context(ast, namespace)
     )
     fields: set[str] = set()
@@ -552,6 +573,61 @@ def _append_dynamic_access(dynamic_accesses: list[str], kind: str) -> None:
         dynamic_accesses.append(kind)
 
 
+def _join_api_kind(recorded: str | None, kind: str) -> str:
+    """The API alias kind a name holds once it is also bound to ``kind``."""
+    return kind if recorded is None or recorded == kind else ROW_API_DYNAMIC_ACCESS
+
+
+def _join_api_alias(api_aliases: dict[str, str], name: str, kind: str) -> bool:
+    """Join ``kind`` into what ``name`` may be; report whether that widened it."""
+    recorded = api_aliases[name] if name in api_aliases else None
+    joined = _join_api_kind(recorded, kind)
+    if joined == recorded:
+        return False
+    api_aliases[name] = joined
+    return True
+
+
+def _join_api_entries(recorded: dict[_CarrierPath, str], entries: dict[_CarrierPath, str]) -> bool:
+    """Join carrier-path API kinds into ``recorded``; report whether that widened it."""
+    widened = False
+    for path, kind in entries.items():
+        if path not in recorded and len(recorded) >= _MAX_CARRIER_PATHS_PER_ALIAS:
+            continue
+        joined = _join_api_kind(recorded[path] if path in recorded else None, kind)
+        if path not in recorded or recorded[path] != joined:
+            recorded[path] = joined
+            widened = True
+    return widened
+
+
+def _join_carrier_paths(recorded: set[_CarrierPath], paths: Iterable[_CarrierPath]) -> bool:
+    """Add row carrier paths to ``recorded`` up to the cap; report whether any was added."""
+    widened = False
+    for path in paths:
+        if path in recorded or len(recorded) >= _MAX_CARRIER_PATHS_PER_ALIAS:
+            continue
+        recorded.add(path)
+        widened = True
+    return widened
+
+
+def _join_macro_entries(recorded: dict[_CarrierPath, frozenset[str]], entries: dict[_CarrierPath, frozenset[str]]) -> bool:
+    """Join carrier-path macro names into ``recorded``; report whether that widened it."""
+    widened = False
+    for path, names in entries.items():
+        if path in recorded:
+            if names <= recorded[path]:
+                continue
+            recorded[path] = recorded[path] | names
+        elif len(recorded) >= _MAX_CARRIER_PATHS_PER_ALIAS:
+            continue
+        else:
+            recorded[path] = names
+        widened = True
+    return widened
+
+
 def _template_uses_whole_row(
     ast: Node,
     namespaces: frozenset[str],
@@ -764,7 +840,9 @@ def _field_extraction_context(
     frozenset[str],
     frozenset[str],
     dict[str, frozenset[_CarrierPath]],
+    bool,
 ]:
+    """What every name may hold, to a fixpoint; the last element is whether any alias reached the path cap."""
     namespaces = {namespace}
     api_aliases: dict[str, str] = {}
     row_api_container_aliases: dict[str, dict[_CarrierPath, str]] = {}
@@ -805,8 +883,7 @@ def _field_extraction_context(
                 namespaces.add(target_name)
                 changed = True
         for target_name, alias_kind in _for_api_alias_targets(ast, current_api_aliases, current_row_api_container_aliases):
-            if target_name not in api_aliases or api_aliases[target_name] != alias_kind:
-                api_aliases[target_name] = alias_kind
+            if _join_api_alias(api_aliases, target_name, alias_kind):
                 changed = True
         for target, value in _macro_argument_bindings(ast, macros, macro_aliases, macro_container_aliases):
             if _record_context_binding(
@@ -843,8 +920,7 @@ def _field_extraction_context(
             current_row_collection_aliases,
             current_row_container_aliases,
         ):
-            if target_name not in api_aliases or api_aliases[target_name] != alias_kind:
-                api_aliases[target_name] = alias_kind
+            if _join_api_alias(api_aliases, target_name, alias_kind):
                 changed = True
         for target, value in _callblock_argument_bindings(ast, macros, macro_aliases, macro_container_aliases):
             if _record_context_binding(
@@ -881,9 +957,12 @@ def _field_extraction_context(
             current_row_collection_aliases,
             current_row_container_aliases,
         ):
-            if target_name not in api_aliases or api_aliases[target_name] != alias_kind:
-                api_aliases[target_name] = alias_kind
+            if _join_api_alias(api_aliases, target_name, alias_kind):
                 changed = True
+    carrier_limit_reached = any(
+        len(recorded) >= _MAX_CARRIER_PATHS_PER_ALIAS
+        for recorded in (*row_container_aliases.values(), *row_api_container_aliases.values(), *macro_container_aliases.values())
+    )
     return (
         frozenset(namespaces),
         api_aliases,
@@ -891,6 +970,7 @@ def _field_extraction_context(
         frozenset(row_value_aliases),
         frozenset(row_collection_aliases),
         {name: frozenset(paths) for name, paths in row_container_aliases.items()},
+        carrier_limit_reached,
     )
 
 
@@ -937,8 +1017,7 @@ def _record_context_binding(
         current_row_collection_aliases,
         current_row_container_aliases,
     )
-    if api_container_entries and row_api_container_aliases.get(target.name) != api_container_entries:
-        row_api_container_aliases[target.name] = api_container_entries
+    if api_container_entries and _join_api_entries(row_api_container_aliases.setdefault(target.name, {}), api_container_entries):
         return True
     if _node_is_row_collection_expression(value, current_namespaces, current_row_collection_aliases, current_row_container_aliases):
         if target.name not in row_collection_aliases:
@@ -949,11 +1028,7 @@ def _record_context_binding(
         value, current_namespaces, current_row_collection_aliases, current_row_container_aliases
     )
     if row_container_entries:
-        existing_paths = row_container_aliases.setdefault(target.name, set())
-        if not row_container_entries <= existing_paths:
-            existing_paths.update(row_container_entries)
-            return True
-        return False
+        return _join_carrier_paths(row_container_aliases.setdefault(target.name, set()), row_container_entries)
     if _node_is_row_object_expression(value, current_namespaces, current_row_collection_aliases, current_row_container_aliases):
         if target.name not in namespaces:
             namespaces.add(target.name)
@@ -966,8 +1041,7 @@ def _record_context_binding(
         alias_kind = _row_api_alias_expression_kind(value, current_api_aliases, current_row_api_container_aliases)
     if alias_kind is None:
         alias_kind = _row_api_dynamic_access_kind(value, current_namespaces, current_row_collection_aliases, current_row_container_aliases)
-    if alias_kind is not None and api_aliases.get(target.name) != alias_kind:
-        api_aliases[target.name] = alias_kind
+    if alias_kind is not None and _join_api_alias(api_aliases, target.name, alias_kind):
         return True
     if (
         target.name not in namespaces
@@ -1015,22 +1089,16 @@ def _record_namespace_ref_context_binding(
     if alias_kind is not None:
         container_entries[()] = alias_kind
     prefixed_entries = {((target.attr, *path) if path else (target.attr,)): kind for path, kind in container_entries.items()}
-    if prefixed_entries:
-        existing = row_api_container_aliases.setdefault(target.name, {})
-        for path, kind in prefixed_entries.items():
-            if existing.get(path) != kind:
-                existing[path] = kind
-                changed = True
+    if prefixed_entries and _join_api_entries(row_api_container_aliases.setdefault(target.name, {}), prefixed_entries):
+        changed = True
     row_container_entries = _row_object_container_paths(
         value, current_namespaces, current_row_collection_aliases, current_row_container_aliases
     )
     if _node_is_row_object_expression(value, current_namespaces, current_row_collection_aliases, current_row_container_aliases):
         row_container_entries.add(())
     if row_container_entries:
-        existing_paths = row_container_aliases.setdefault(target.name, set())
         prefixed_paths = {((target.attr, *path) if path else (target.attr,)) for path in row_container_entries}
-        if not prefixed_paths <= existing_paths:
-            existing_paths.update(prefixed_paths)
+        if _join_carrier_paths(row_container_aliases.setdefault(target.name, set()), prefixed_paths):
             changed = True
     return changed
 
@@ -1187,8 +1255,7 @@ def _record_macro_binding(
             if not value_names <= existing:
                 existing.update(value_names)
                 changed = True
-        if container_entries and containers.get(target.name) != container_entries:
-            containers[target.name] = container_entries
+        if container_entries and _join_macro_entries(containers.setdefault(target.name, {}), container_entries):
             changed = True
         return changed
     if isinstance(target, NSRef):
@@ -1196,12 +1263,8 @@ def _record_macro_binding(
             container_entries = dict(container_entries)
             container_entries[()] = value_names
         prefixed_entries = {((target.attr, *path) if path else (target.attr,)): names for path, names in container_entries.items()}
-        if prefixed_entries:
-            existing_entries = containers.setdefault(target.name, {})
-            for path, names in prefixed_entries.items():
-                if existing_entries.get(path) != names:
-                    existing_entries[path] = names
-                    changed = True
+        if prefixed_entries and _join_macro_entries(containers.setdefault(target.name, {}), prefixed_entries):
+            changed = True
     return changed
 
 
@@ -2141,7 +2204,7 @@ def extract_jinja2_fields_with_details(
     validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
-    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases = (
+    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases, _ = (
         _field_extraction_context(ast, namespace)
     )
     fields: dict[str, list[str]] = {}
