@@ -654,6 +654,19 @@ def test_a_whole_row_value_renders_every_field_so_configuration_treats_it_as_dyn
     assert "Contract" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param("{{ row[[1]] }}", f"Undefined variable: {_ROW_TYPE} has no element {_UNSPELLED}", id="unhashable-key"),
+        pytest.param("{{ row[{}] }}", f"Undefined variable: {_ROW_TYPE} has no element {_UNSPELLED}", id="unhashable-dict-key"),
+        pytest.param("{{ row[0] }}", f"Undefined variable: {_ROW_TYPE} has no element 0", id="int-key"),
+    ],
+)
+def test_a_non_string_key_is_the_ordinary_undefined_field(source: str, expected: str) -> None:
+    """Only a str names a field. Any other key is the value-free undefined error, never a TypeError from hashing it."""
+    assert _render_error(source, row=_owned_api_row()) == expected
+
+
 def test_row_values_render_exactly_as_the_frozen_pipeline_row_rendered_them() -> None:
     """The projection carries the PipelineRow's deep-frozen values, so nested containers print as before."""
     row = make_pipeline_row({"meta": {"a": 1}, "tags": [1, 2]})
