@@ -340,10 +340,17 @@ class RunSummaryErrors(TypedDict):
     ``transform_errors`` rows, which record attempts: a resumed attempt can
     fail again (a second row) or succeed and deliver the row (a row for a
     token that did not fail).
+
+    ``collector_group`` counts tokens whose collector group FAILED as a whole,
+    each once (M in ``core/landscape/terminal_transform_failures.py``). It is
+    disjoint from ``transform`` by terminal path, so ``total`` is the sum of
+    all three. Failed GROUPS are ``counts.collector_groups_failed`` (G), a
+    different unit that no error total includes.
     """
 
     validation: int
     transform: int
+    collector_group: int
     total: int
 
 
@@ -473,12 +480,42 @@ class TransformErrorSummary(TypedDict):
     sample_details: list[dict[str, Any] | None]
 
 
+class CollectorGroupFailureGroup(TypedDict):
+    """Failed collector groups at one collector node, under one recorded reason.
+
+    ``failure_reason`` is a ``CollectorGroupFailureReason`` code. ``groups``
+    counts group verdicts; ``member_tokens`` counts the tokens those groups
+    failed, and is 0 for a group no member reached.
+    """
+
+    collector_plugin: str
+    node_id: str
+    failure_reason: str
+    groups: int
+    member_tokens: int
+
+
+class CollectorGroupFailureSummary(TypedDict):
+    """Collector group failures sub-dict in ``ErrorAnalysisReport``.
+
+    ``groups_total`` is G (failed groups) and ``member_tokens_total`` is M
+    (the tokens they failed). There are no free-text samples: the flush
+    state's text is attempt evidence, and only the recorded reason code is
+    reported.
+    """
+
+    groups_total: int
+    member_tokens_total: int
+    by_collector: list[CollectorGroupFailureGroup]
+
+
 class ErrorAnalysisReport(TypedDict):
     """Return type for ``get_error_analysis``."""
 
     run_id: str
     validation_errors: ValidationErrorSummary
     transform_errors: TransformErrorSummary
+    collector_group_failures: CollectorGroupFailureSummary
 
 
 class LLMSummary(TypedDict):

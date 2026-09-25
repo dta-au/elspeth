@@ -22,7 +22,6 @@ than re-deriving the join independently.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -43,13 +42,14 @@ from elspeth.contracts import (
     TokenOutcome,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, OutputMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, FrameKind, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids, recorded_failure_verdict_condition
+from elspeth.core.landscape.collector_group_failure_holds import RecordedCollectorGroupFailureHold, parse_collector_group_failure_hold
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
@@ -87,50 +87,6 @@ class GroupRecordRow:
     # META-38's written release fact: non-NULL only for a collector RELEASE
     # group, whose "opener" is a group member, never a declared scope opener.
     closes_group_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class RecordedCollectorGroupFailureHold:
-    """One member's hold that records its collector group's FAILED verdict."""
-
-    node_id: str
-    failure_reason: str
-
-
-_COLLECTOR_GROUP_FAILURE_TYPE = "CollectorGroupFailure"
-_SCOPE_GROUP_FAILED = GroupSettlementReason.SCOPE_GROUP_FAILED.value
-
-
-def _collector_group_failure_hold(token_id: str, node_id: str, error_json: str | None) -> RecordedCollectorGroupFailureHold | None:
-    """Parse one FAILED hold's ``error_json``: the group verdict it records, or None for any other failure.
-
-    The shape is the ``ExecutionError`` ``CollectorExecutor._fail_group``
-    writes: ``{"type": "CollectorGroupFailure", "context": {"failure_reason":
-    <str>, "member_disposition": "scope_group_failed", ...}, ...}``. A
-    group-failure hold that deviates from it is audit corruption, not a
-    shape to tolerate.
-    """
-    if error_json is None:
-        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has no error_json")
-    error = json.loads(error_json)
-    if type(error) is not dict or "type" not in error:
-        raise AuditIntegrityError(f"FAILED collector hold of token {token_id!r} at {node_id!r} has a malformed error_json")
-    if error["type"] != _COLLECTOR_GROUP_FAILURE_TYPE:
-        return None
-    context = error["context"] if "context" in error else None
-    if (
-        type(context) is not dict
-        or "failure_reason" not in context
-        or type(context["failure_reason"]) is not str
-        or not context["failure_reason"]
-        or "member_disposition" not in context
-        or context["member_disposition"] != _SCOPE_GROUP_FAILED
-    ):
-        raise AuditIntegrityError(
-            f"Collector group-failure hold of token {token_id!r} at {node_id!r} does not carry the verdict's failure_reason "
-            "and scope_group_failed disposition"
-        )
-    return RecordedCollectorGroupFailureHold(node_id=node_id, failure_reason=context["failure_reason"])
 
 
 def collector_scoped_completion_conflict(
@@ -363,7 +319,7 @@ class BarrierRestoreReadModel:
         FAILED with one ``CollectorGroupFailure`` error, in the verdict's own
         transaction. Such a hold on a member the journal still holds BLOCKED
         is a recorded verdict whose disposition the crashed process never
-        finished. Returns ``token_id -> (node_id, failure_reason)`` for those
+        finished. Returns ``token_id -> (node_id, group_id, failure_reason)`` for those
         holds at ``node_ids``. A FAILED hold of any other kind (a quarantined
         member of a successful flush) is not a group verdict and is not
         returned.
@@ -385,7 +341,7 @@ class BarrierRestoreReadModel:
                 .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
             )
             for row in self._ops.execute_fetchall(query):
-                hold = _collector_group_failure_hold(str(row.token_id), str(row.node_id), row.error_json)
+                hold = parse_collector_group_failure_hold(str(row.token_id), str(row.node_id), row.error_json)
                 if hold is None:
                     continue
                 if row.token_id in result:

@@ -59,6 +59,7 @@ from elspeth.contracts import (
 from elspeth.contracts.audit import CallVerification, TokenRef
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CollectorGroupFailureReason
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
@@ -68,6 +69,7 @@ from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids_on
+from elspeth.core.landscape.collector_group_failure_holds import COLLECTOR_GROUP_FAILURE_TYPE
 from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
@@ -1347,7 +1349,7 @@ class ExecutionRepository:
         coordination_token: CoordinationToken,
         group_id: str,
         collector_node_id: str,
-        failure_reason: str,
+        failure_reason: CollectorGroupFailureReason,
         flush_state_id: str | None,
         flush_error: ExecutionError | None,
         flush_duration_ms: float | None,
@@ -1382,7 +1384,8 @@ class ExecutionRepository:
         member order.
 
         Raises:
-            AuditIntegrityError: The group or reason is missing; members are
+            AuditIntegrityError: The group or reason is missing, or the hold
+                error does not record this group and reason; members are
                 repeated or cross the run; a flush state is named without its
                 error or vice versa; a state is missing, foreign, at another
                 node, not OPEN, or a hold does not belong to its member.
@@ -1396,6 +1399,18 @@ class ExecutionRepository:
         )
         if not group_id or not failure_reason:
             raise AuditIntegrityError(f"{subject} requires a group ID and failure reason")
+        # Every hold records the group it failed and why: the counting readers
+        # and resume cross-check each hold against this group's row.
+        hold_context = hold_error.context
+        if (
+            hold_error.exception_type != COLLECTOR_GROUP_FAILURE_TYPE
+            or hold_context is None
+            or "group_id" not in hold_context
+            or hold_context["group_id"] != group_id
+            or "failure_reason" not in hold_context
+            or hold_context["failure_reason"] != failure_reason.value
+        ):
+            raise AuditIntegrityError(f"{subject} hold error does not record group {group_id!r} and its failure reason")
         if (flush_state_id is None) != (flush_error is None) or (flush_state_id is None) != (flush_duration_ms is None):
             raise AuditIntegrityError(f"{subject} names a flush state, its error and its duration together or not at all")
         with fenced_leader_transaction(

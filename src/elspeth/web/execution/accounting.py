@@ -15,7 +15,6 @@ from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, _NON_TERMINAL_PATHS, 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
-    collector_group_failures_table,
     rows_table,
     run_sources_table,
     runs_table,
@@ -23,6 +22,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
     validation_errors_table,
 )
+from elspeth.core.landscape.terminal_transform_failures import failed_collector_groups
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.discard_summary import DISCARD_DESTINATION, _sqlite_database_file_missing, _unique_run_ids
 from elspeth.web.execution.schemas import (
@@ -366,11 +366,9 @@ def load_run_accounting_map_from_db(
         for run_id, count in conn.execute(emitted_stmt):
             emitted_tokens[str(run_id)] = int(count)
 
-        collector_failures_stmt = (
-            select(collector_group_failures_table.c.run_id, func.count().label("count"))
-            .where(collector_group_failures_table.c.run_id.in_(present_run_ids))
-            .group_by(collector_group_failures_table.c.run_id)
-        )
+        # G, the failed-group count, from the one counting authority.
+        failed_groups = failed_collector_groups(present_run_ids).subquery("failed_collector_groups")
+        collector_failures_stmt = select(failed_groups.c.run_id, func.count().label("count")).group_by(failed_groups.c.run_id)
         for run_id, count in conn.execute(collector_failures_stmt):
             collector_groups_failed[str(run_id)] = int(count)
 

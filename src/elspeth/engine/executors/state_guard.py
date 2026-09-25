@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts import ExecutionError, NodeStateOpen
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
-from elspeth.contracts.enums import NodeStateStatus, OutputMode, TriggerType
+from elspeth.contracts.enums import CollectorGroupFailureReason, NodeStateStatus, OutputMode, TriggerType
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
@@ -536,7 +536,7 @@ class NodeStateGuard:
         coordination_token: CoordinationToken,
         group_id: str,
         collector_node_id: str,
-        failure_reason: str,
+        failure_reason: CollectorGroupFailureReason,
         flush_error: ExecutionError,
         duration_ms: float,
         member_holds: Sequence[tuple[TokenRef, str, float]],

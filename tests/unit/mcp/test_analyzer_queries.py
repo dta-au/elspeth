@@ -38,10 +38,11 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.lineage import explain
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import transform_errors_table
@@ -1200,15 +1201,13 @@ class TestGetRunSummary:
             coordination_token=setup.coordination_token,
             group_id=group_id,
             collector_node_id="collector-summary-node",
-            failure_reason="empty_expansion",
+            failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
             flush_state_id=None,
             flush_error=None,
             flush_duration_ms=None,
             member_holds=(),
-            hold_error=ExecutionError(
-                exception="No collector members",
-                exception_type="CollectorGroupFailure",
-                phase="collector_flush",
+            hold_error=collector_group_failure_hold_error(
+                group_id=group_id, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION, lost_members=()
             ),
         )
 
@@ -1216,6 +1215,8 @@ class TestGetRunSummary:
 
         assert "error" not in result
         assert result["counts"]["collector_groups_failed"] == 1
+        # G counts groups; no member token failed, so no error total moves.
+        assert result["errors"]["collector_group"] == 0
         assert result["errors"]["total"] == 0
 
     def test_summary_token_count_is_run_scoped(self) -> None:

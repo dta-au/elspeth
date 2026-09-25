@@ -390,3 +390,62 @@ def test_the_latest_attempt_is_ranked_in_one_pass_whatever_order_the_indexes_wer
     reads = [plan_id for plan_id, detail in details.items() if "transform_errors" in detail]
     assert len(reads) == 1, plan
     assert not any(step.startswith("CORRELATED") for step in ancestors(reads[0])), plan
+
+
+def _collector_member_plans(created_last: str) -> tuple[list[str], list[list[str]]]:
+    """Run the member arm over a run with a collector node, and EXPLAIN every statement it sent.
+
+    Returns ``(trap, plans)``: the plan of a node-driven read (the control),
+    and the plan of each statement the arm executed that reads ``node_states``.
+    The statements are captured as the arm sent them, so a rewrite of the arm
+    is measured, not a copy of its query.
+    """
+    from sqlalchemy import event
+
+    from elspeth.core.landscape.terminal_transform_failures import deciding_collector_group_failures
+
+    column = created_last.removeprefix("ix_node_states_")
+    setup = _setup("run-1")
+    register_test_node(setup.data_flow, "run-1", "collector_x", node_type=NodeType.COLLECTOR, plugin_name="batch_stats")
+    db = setup.db
+    with db.write_connection() as conn:
+        conn.exec_driver_sql(f"DROP INDEX {created_last}")
+        conn.exec_driver_sql(f"CREATE INDEX {created_last} ON node_states ({column}_id)")
+    sent: list[tuple[str, Any]] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _executemany: bool) -> None:
+        if "node_states" in statement:
+            sent.append((statement, parameters))
+
+    with db.read_only_connection() as conn:
+        trap = [row[3] for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN SELECT state_id FROM node_states WHERE node_id = 'collector_x'")]
+        event.listen(db.engine, "before_cursor_execute", capture)
+        try:
+            assert deciding_collector_group_failures(conn, ("run-1",)) == ()
+        finally:
+            event.remove(db.engine, "before_cursor_execute", capture)
+        plans = [[row[3] for row in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)] for statement, parameters in sent]
+    return trap, plans
+
+
+@pytest.mark.parametrize("created_last", ["ix_node_states_node", "ix_node_states_token"])
+def test_the_collector_member_arm_reaches_node_states_by_token_whatever_order_the_indexes_were_created_in(created_last: str) -> None:
+    """Pin the PLAN: collector member holds are found from the runs' terminal outcomes, never by the collector node id.
+
+    Node ids are stable across runs of one pipeline, and ``node_states`` has
+    no index leading with ``run_id``. A read driven by the collector node id
+    searches ``ix_node_states_node``: every state that node ever recorded, in
+    every run the database holds (the control). The member arm must search
+    ``node_states`` by ``token_id`` for each failed token of the runs, under
+    both index creation orders.
+    """
+    trap, plans = _collector_member_plans(created_last)
+
+    assert any("ix_node_states_node" in step for step in trap), f"control: a node-driven read uses the node index: {trap}"
+    assert len(plans) == 1, plans
+    [plan] = plans
+    node_state_steps = [step for step in plan if "node_states" in step]
+    assert node_state_steps, plan
+    assert all(step.startswith("SEARCH node_states USING INDEX") and "token_id=?" in step for step in node_state_steps), plan
+    assert not any("ix_node_states_node" in step for step in plan), plan
+    assert any(step.startswith("SEARCH token_outcomes") and "run_id=?" in step for step in plan), plan

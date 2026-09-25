@@ -7824,7 +7824,11 @@ _REVIEWED_REGISTRY_MODULES = {
     # composite foreign keys; neither changes construction or clock issuance.
     # Replay source-contract retention adds a required rows column; deadline
     # guard installation and clock issuance are unchanged.
-    "src/elspeth/core/landscape/database.py": "7202f715df9e24fa649c2c9831d95b737212e43a4d1ff87d3b091abb09eca900",
+    # 7202f715… -> the value below (elspeth-5887fb7928 S2): one entry added to
+    # _REQUIRED_CHECK_CONSTRAINTS (the collector group-failure reason CHECK
+    # folded into epoch 45); the diff is that tuple row alone, so construction,
+    # guard installation and clock issuance are unchanged.
+    "src/elspeth/core/landscape/database.py": "5c51a6e6fbfd1b7009180f4db671f4aaf474b3df22a1f3345f6f5d626777caa0",
 }
 
 

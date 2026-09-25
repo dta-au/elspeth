@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -38,6 +38,12 @@ class _QueryResult:
 
     def fetchall(self) -> list[Any]:
         return list(self._fetchall_rows)
+
+    def all(self) -> list[Any]:
+        return list(self._fetchall_rows)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._fetchall_rows)
 
     def scalar(self) -> Any:
         return self._scalar_value
@@ -371,11 +377,14 @@ def _wire_conn(
     *,
     orphaned_token_count: int = 0,
 ) -> None:
-    """Wire the connection with get_error_analysis's 5 sequential queries.
+    """Wire the connection with get_error_analysis's sequential queries, for a run with no collector.
 
     In order: validation groups, the orphaned-transform-error token count
     (the corruption guard, over every row), the deciding-error groups by
-    plugin, and the two sample listings.
+    plugin, the two sample listings, then the collector arm: the failed
+    group verdicts, the authority's own verdict read and collector-node read
+    (no collector node, so it reads no member states), and the run's node
+    plugin names.
     """
     db._connection = _Connection(
         [
@@ -384,6 +393,10 @@ def _wire_conn(
             _QueryResult(fetchall_rows=trans_rows),
             _QueryResult(fetchall_rows=sample_val),
             _QueryResult(fetchall_rows=sample_trans),
+            _QueryResult(fetchall_rows=[]),
+            _QueryResult(fetchall_rows=[]),
+            _QueryResult(fetchall_rows=[]),
+            _QueryResult(fetchall_rows=[]),
         ]
     )
 

@@ -1873,6 +1873,7 @@ class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
             error = env.node_state_error_for_token(node="stitch", token_id=survivor.token_id)
             assert error["type"] == "CollectorGroupFailure"
             assert error["context"] == {
+                "group_id": group_id,
                 "failure_reason": "collector_missing_members",
                 "lost_members": [lost_key],
                 "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,

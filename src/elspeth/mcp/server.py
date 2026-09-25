@@ -149,7 +149,12 @@ _TOOLS: dict[str, _ToolDef] = {
         },
     ),
     "get_run_summary": _ToolDef(
-        description="Get summary statistics for a run: counts, durations, errors, outcome distribution",
+        description=(
+            "Get summary statistics for a run: counts, durations, errors, outcome distribution. "
+            "errors.transform and errors.collector_group count terminally failed tokens (a transform error decided "
+            "them, or their collector group failed as a whole); errors.total adds validation errors to both. "
+            "counts.collector_groups_failed counts failed groups, a different unit that no error total includes"
+        ),
         args=_ArgSpec(required_str=("run_id",)),
         handler=lambda a, args: a.get_run_summary(args["run_id"]),
         schema_properties={
@@ -447,7 +452,9 @@ _TOOLS: dict[str, _ToolDef] = {
             "Analyze errors: grouped by type, by node, with sample data for pattern matching. "
             "transform_errors.total and by_transform count terminally failed tokens; "
             "transform_errors.sample_details are raw transform-error ATTEMPT records, which include "
-            "attempts a later retry recovered, so they are never a failure count"
+            "attempts a later retry recovered, so they are never a failure count; "
+            "collector_group_failures counts failed collector groups and the member tokens they failed, "
+            "by collector node and recorded reason code"
         ),
         args=_ArgSpec(required_str=("run_id",)),
         handler=lambda a, args: a.get_error_analysis(args["run_id"]),

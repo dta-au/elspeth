@@ -35,7 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.compiler import SQLCompiler
 
-from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.types import NODE_ID_MAX_LENGTH
 from elspeth.core.schema_identity import create_schema_identity_table
@@ -452,7 +452,13 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
 #  45 → One immutable collector-group failure verdict per group, including
 #        groups with no arrived members. The run result counts these separately
-#        from failed rows. Populated epoch-44 stores require delete/recreate.
+#        from failed rows. Its failure_reason is the closed
+#        CollectorGroupFailureReason vocabulary under a CHECK, and each failed
+#        member's CollectorGroupFailure hold names its group_id (folded into
+#        45 by operator ruling 2026-09-25, no bump; a store created before the
+#        fold lacks ck_collector_group_failures_failure_reason and startup
+#        validation refuses it). Populated epoch-44 stores require
+#        delete/recreate.
 #  46 → Valid source rows retain their exact source contract for sparse-stream
 #        replay and verify. Populated epoch-45 stores require delete/recreate.
 SQLITE_SCHEMA_EPOCH = 46
@@ -1321,10 +1327,16 @@ collector_group_failures_table = Table(
     Column("run_id", String(64), primary_key=True),
     Column("group_id", String(64), primary_key=True),
     Column("collector_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    # Closed vocabulary (CollectorGroupFailureReason): an engine-authored code
+    # the counting readers render as a failure category, never row data.
     Column("failure_reason", String(64), nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     ForeignKeyConstraint(["run_id", "group_id"], ["group_records.run_id", "group_records.group_id"]),
     ForeignKeyConstraint(["collector_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(
+        _enum_in_check("failure_reason", CollectorGroupFailureReason),
+        name="ck_collector_group_failures_failure_reason",
+    ),
 )
 
 group_losses_table = Table(

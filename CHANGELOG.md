@@ -61,7 +61,10 @@ their source calls, stores verification decisions, and numbers source/preflight
 operation occurrences under the run leader.
 Epoch 45 records one durable collector-group failure verdict per group,
 including groups with no arrived members. Run results report these separately
-from failed rows.
+from failed rows. The verdict's `failure_reason` is a closed vocabulary under a
+CHECK, and each failed member's hold names its group. A Landscape store created
+from an earlier 0.8.1 pre-release build at epoch 46 lacks that CHECK and is
+refused at startup; recreate it.
 Epoch 46 records each valid source row's exact contract for replay and verify
 of sparse source streams.
 These changes share one paired cutover; the intermediate ACA epochs are not a
@@ -129,6 +132,21 @@ drained and repair this release forward.
   JSON and CSV sink bytes are unchanged (both write an integral float as an
   integer); the LLM node's recorded contract and every `contract_hash` over
   it move.
+- **Collector group failures are counted where failures are reported.** A
+  collector group that fails as a whole now shows in the web run's failure
+  categories and in MCP error analysis, one entry per failed member token
+  under the group's recorded reason code (`collector_missing_members`,
+  `collector_transform_error`, `collector_contract_violation`); before, its
+  members ended failed but the categories were empty and MCP
+  `errors.total` was 0. `get_run_summary` gains `errors.collector_group`, and
+  `errors.total` now adds it to validation and transform errors;
+  `get_error_analysis` gains `collector_group_failures` (groups and member
+  tokens per collector and reason, including a group no member reached).
+  Failed groups keep their own count, `collector_groups_failed`. Every reader
+  takes these numbers from one counting authority, and a member's hold that
+  disagrees with its group's verdict is refused as audit corruption. A
+  collector plugin's returned error is now scrubbed and stored structurally
+  on the flush state, as the aggregation seam already did.
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

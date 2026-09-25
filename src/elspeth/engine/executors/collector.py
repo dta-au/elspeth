@@ -20,7 +20,14 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import (
+    CollectorGroupFailureReason,
+    FrameKind,
+    GroupSettlementReason,
+    NodeStateStatus,
+    TerminalOutcome,
+    TerminalPath,
+)
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     ExecutionError,
@@ -30,10 +37,11 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.identity import innermost_own_frame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.secret_scrub import scrub_text_for_audit, scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import CollectorSettings, ScopeSettings
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
@@ -66,9 +74,7 @@ class CollectorOutcome:
     consumed_tokens: tuple[TokenInfo, ...] = ()
     collector_name: str | None = None
     group_id: str | None = None
-    # "collector_missing_members" | "collector_transform_error" | "collector_contract_violation"
-    # | GroupSettlementReason.EMPTY_EXPANSION | None
-    failure_reason: str | None = None
+    failure_reason: CollectorGroupFailureReason | None = None
     # GroupSettlementReason.ALL_MEMBERS_LOST | GroupSettlementReason.EMPTY_EXPANSION | None (ADR-042 closed vocabulary)
     closed_without_plugin: str | None = None
 
@@ -547,15 +553,13 @@ class CollectorExecutor:
                 coordination_token=ctx.require_coordination_token(),
                 group_id=group_id,
                 collector_node_id=str(self._node_ids[collector_name]),
-                failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
+                failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
                 flush_state_id=None,
                 flush_error=None,
                 flush_duration_ms=None,
                 member_holds=(),
-                hold_error=ExecutionError(
-                    exception="Empty collector group failed under require_all",
-                    exception_type="CollectorGroupFailure",
-                    phase="collector_flush",
+                hold_error=collector_group_failure_hold_error(
+                    group_id=group_id, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION, lost_members=()
                 ),
             )
             if key in self._pending:
@@ -565,7 +569,7 @@ class CollectorExecutor:
                 held=False,
                 collector_name=collector_name,
                 group_id=group_id,
-                failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
+                failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
                 closed_without_plugin=GroupSettlementReason.EMPTY_EXPANSION.value,
             )
         if key in self._pending:
@@ -878,7 +882,7 @@ class CollectorExecutor:
                 collector_name,
                 key,
                 pending,
-                failure_reason="collector_missing_members",
+                failure_reason=CollectorGroupFailureReason.COLLECTOR_MISSING_MEMBERS,
                 coordination_token=ctx.require_coordination_token(),
             )
         if not pending.arrived:
@@ -900,7 +904,7 @@ class CollectorExecutor:
         key: tuple[str, str],
         pending: _PendingGroup,
         *,
-        failure_reason: str,
+        failure_reason: CollectorGroupFailureReason,
         coordination_token: CoordinationToken,
     ) -> CollectorOutcome:
         """Fail the group as a whole without a flush: the ``collector_missing_members`` arm.
@@ -932,7 +936,7 @@ class CollectorExecutor:
         key: tuple[str, str],
         pending: _PendingGroup,
         *,
-        failure_reason: str,
+        failure_reason: CollectorGroupFailureReason,
         coordination_token: CoordinationToken,
         guard: NodeStateGuard,
         flush_error: ExecutionError,
@@ -968,35 +972,22 @@ class CollectorExecutor:
         return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
 
     def _group_failure_verdict(
-        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: str
+        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: CollectorGroupFailureReason
     ) -> tuple[tuple[tuple[TokenRef, str, float], ...], ExecutionError]:
         """The member holds a group failure closes, and the one error every one of them records."""
-        group_id = key[1]
         now = self._clock.monotonic()
         # I-2 (fix round 2): this serves three arms. Only the require_all-loss
         # arm guarantees a non-empty pending.lost; the two flush arms usually
-        # have none and the scope may be best_effort — so the message must not
-        # hardcode "under require_all" for a call it also serves on a
-        # different failure_reason and policy.
-        if pending.lost:
-            exception_text = f"Collector group {group_id!r} failed ({failure_reason}): lost members {sorted(pending.lost)!r}"
-        else:
-            exception_text = f"Collector group {group_id!r} failed ({failure_reason})"
+        # have none and the scope may be best_effort — so the message never
+        # hardcodes "under require_all".
         # META-40: every arrived member is a SURVIVOR of the failing group —
-        # its hold carries the group-level CAUSE (failure_reason, lost
-        # members) STRUCTURALLY beside its own settlement disposition
+        # its hold carries the group-level CAUSE (group_id, failure_reason,
+        # lost members) STRUCTURALLY beside its own settlement disposition
         # (scope_group_failed, spec §6.3), not only in the message text; the
         # settle seam writes the same disposition on the survivor's terminal.
-        hold_error = ExecutionError(
-            exception=exception_text,
-            exception_type="CollectorGroupFailure",
-            phase="collector_flush",
-            context={
-                "failure_reason": failure_reason,
-                "lost_members": sorted(pending.lost),
-                "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,
-            },
-        )
+        # The counting readers and resume parse it back with the one parser
+        # beside this builder (collector_group_failure_holds).
+        hold_error = collector_group_failure_hold_error(group_id=key[1], failure_reason=failure_reason, lost_members=pending.lost)
         # Every member's own accept()-time hold (canon item 11) closes FAILED
         # in the verdict — an audit-trail bookkeeping concern, not a
         # terminal-disposition write; the terminals are the settle seam's.
@@ -1007,7 +998,7 @@ class CollectorExecutor:
         return member_holds, hold_error
 
     def _close_failed_group(
-        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: str
+        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: CollectorGroupFailureReason
     ) -> CollectorOutcome:
         """Retire a group whose failure verdict is durable and hand its members to the settle seam."""
         consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
@@ -1164,7 +1155,7 @@ class CollectorExecutor:
                     collector_name,
                     key,
                     pending,
-                    failure_reason="collector_contract_violation",
+                    failure_reason=CollectorGroupFailureReason.COLLECTOR_CONTRACT_VIOLATION,
                     coordination_token=ctx.require_coordination_token(),
                     guard=guard,
                     flush_error=ExecutionError(
@@ -1176,16 +1167,26 @@ class CollectorExecutor:
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
                 )
             if result.status != "success":
+                if result.reason is None:
+                    raise OrchestrationInvariantError(
+                        f"Collector transform '{transform.name}' returned error but reason is None. "
+                        'Use TransformResult.error({"reason": "...", ...}) to create error results.'
+                    )
                 return self._fail_group_after_flush(
                     collector_name,
                     key,
                     pending,
-                    failure_reason="collector_transform_error",
+                    failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR,
                     coordination_token=ctx.require_coordination_token(),
                     guard=guard,
+                    # The returned reason passes the same scrub as the per-row
+                    # and aggregation seams (scrub_transform_error_reason) and is
+                    # stored structurally, never flattened into the message.
                     flush_error=ExecutionError(
-                        exception=str(result.reason) if result.reason else "Collector transform returned error",
+                        exception=f"Collector transform {transform.name!r} returned an error",
                         exception_type="TransformError",
+                        phase="collector_flush",
+                        context=scrub_transform_error_reason(result.reason),
                     ),
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
                 )

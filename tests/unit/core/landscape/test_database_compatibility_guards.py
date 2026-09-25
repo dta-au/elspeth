@@ -314,6 +314,47 @@ class TestSchemaCompatibilityGuards:
         verify_engine.dispose()
         assert epoch == 0
 
+    def test_collector_group_failure_reason_check_is_required_schema_contract(self) -> None:
+        """The closed reason vocabulary folded into epoch 45 must participate in stale-DB detection."""
+        assert ("collector_group_failures", "ck_collector_group_failures_failure_reason") in database_module._REQUIRED_CHECK_CONSTRAINTS
+
+    def test_from_url_rejects_a_collector_group_failures_table_made_before_the_reason_check(self, tmp_path: Path) -> None:
+        """A store created at the current epoch before the CHECK was folded in is refused, not silently opened.
+
+        The fold carries no epoch bump (operator ruling 2026-09-25), so the
+        epoch cannot tell such a store apart; the required CHECK does.
+        """
+        db_path = tmp_path / "pre_fold_collector_group_failures.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        _stamp_current_landscape_identity(engine)
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE collector_group_failures")
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE collector_group_failures (
+                        run_id VARCHAR(64) NOT NULL,
+                        group_id VARCHAR(64) NOT NULL,
+                        collector_node_id VARCHAR(64) NOT NULL,
+                        failure_reason VARCHAR(64) NOT NULL,
+                        recorded_at DATETIME NOT NULL,
+                        PRIMARY KEY (run_id, group_id),
+                        FOREIGN KEY(run_id, group_id) REFERENCES group_records (run_id, group_id),
+                        FOREIGN KEY(collector_node_id, run_id) REFERENCES nodes (node_id, run_id)
+                    )
+                    """
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(SchemaCompatibilityError) as exc_info:
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+
+        msg = str(exc_info.value)
+        assert "Missing check constraints:" in msg
+        assert "collector_group_failures.ck_collector_group_failures_failure_reason" in msg
+
     def test_checkpoint_sequence_uniqueness_is_required_schema_contract(self) -> None:
         """Per-run checkpoint ordering must be mechanically unique in fresh and stale DBs."""
         assert ("checkpoints", "ix_checkpoints_run_sequence_unique") in database_module._REQUIRED_INDEXES

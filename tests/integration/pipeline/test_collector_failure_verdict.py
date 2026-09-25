@@ -28,6 +28,7 @@ source is exhausted (resume refuses an incomplete source), then json_explode
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -459,7 +460,7 @@ def test_a_collector_verdict_whose_acknowledgement_is_lost_reports_the_original_
     assert ("terminal", 5) in _journal_statuses(env)
 
 
-@pytest.mark.parametrize("tamper", ["one_hold_reopened", "hold_reason_stripped"])
+@pytest.mark.parametrize("tamper", ["one_hold_reopened", "hold_reason_stripped", "hold_names_another_group"])
 def test_a_tampered_recorded_verdict_is_refused_not_re_flushed_or_stranded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
 ) -> None:
@@ -480,17 +481,23 @@ def test_a_tampered_recorded_verdict_is_refused_not_re_flushed_or_stranded(
         with pytest.raises(_Crash):
             run_pipeline(env)
     with env["db"].connection() as conn:
-        hold_id = conn.execute(
-            select(node_states_table.c.state_id)
+        hold_id, hold_error_json = conn.execute(
+            select(node_states_table.c.state_id, node_states_table.c.error_json)
             .where(node_states_table.c.node_id.like("collector_%"))
             .where(node_states_table.c.error_json.like('%"CollectorGroupFailure"%'))
             .order_by(node_states_table.c.state_id)
             .limit(1)
-        ).scalar_one()
+        ).one()
     with env["db"].engine.begin() as conn:
         if tamper == "one_hold_reopened":
             values: dict[str, Any] = {"status": NodeStateStatus.OPEN.value, "completed_at": None, "error_json": None, "duration_ms": None}
             match = "carry a group-failure verdict"
+        elif tamper == "hold_names_another_group":
+            # A well-formed hold that names a group other than its member's.
+            error = json.loads(hold_error_json)
+            error["context"]["group_id"] = "0" * 32
+            values = {"error_json": json.dumps(error)}
+            match = "naming group"
         else:
             values = {"error_json": '{"exception":"x","phase":"collector_flush","type":"CollectorGroupFailure"}'}
             match = "does not carry the verdict's failure_reason"

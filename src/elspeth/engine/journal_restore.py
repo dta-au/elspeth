@@ -33,7 +33,7 @@ import structlog
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, CoalescePendingScalars
-from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.identity import innermost_own_frame
@@ -437,7 +437,7 @@ class RestoredRecordedCollectorFailure:
 
     key: tuple[str, str]  # (collector_name, group_id)
     members: tuple[TokenInfo, ...]  # journal order; the executor orders them by opener ordinal
-    failure_reason: str
+    failure_reason: CollectorGroupFailureReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,10 +762,10 @@ class CollectorJournalRestorer:
 
         Raises:
             AuditIntegrityError: A closed group whose held members only partly
-                carry the verdict, carry divergent reasons, or carry it at a
+                carry the verdict, carry divergent reasons, carry it at a
                 node other than their own collector's (the verdict is one
-                transaction at one node); or a verdict member with no attempt
-                offset.
+                transaction at one node), or name a group other than their
+                own; or a verdict member with no attempt offset.
         """
         if not closed_group_items:
             return ()
@@ -787,11 +787,13 @@ class CollectorJournalRestorer:
             config_node_id = str(self._node_ids[collector_name])
             reasons = {holds[item.token_id].failure_reason for item in carrying}
             nodes = {holds[item.token_id].node_id for item in carrying}
-            if len(carrying) != len(group_items) or len(reasons) != 1 or nodes != {config_node_id}:
+            held_groups = {holds[item.token_id].group_id for item in carrying}
+            if len(carrying) != len(group_items) or len(reasons) != 1 or nodes != {config_node_id} or held_groups != {group_id}:
                 raise AuditIntegrityError(
                     f"Collector group {group_id!r} at {collector_name!r} (run {self._run_id!r}, resume checkpoint "
                     f"{resume_checkpoint_id!r}) holds {len(group_items)} BLOCKED member(s) of which {len(carrying)} carry a "
-                    f"group-failure verdict, reasons {sorted(reasons)!r} at node(s) {sorted(nodes)!r}; a verdict fails every "
+                    f"group-failure verdict, reasons {sorted(reasons)!r} at node(s) {sorted(nodes)!r} naming group(s) "
+                    f"{sorted(held_groups)!r}; a verdict fails every "
                     f"arrived member's hold at {config_node_id!r} in one transaction."
                 )
             members: list[TokenInfo] = []

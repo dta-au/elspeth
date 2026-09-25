@@ -159,7 +159,8 @@ class TestClientSafeFailureSummaryType:
         type, not just a call site.
         """
         field_names = {field.name for field in dataclasses.fields(ClientSafeFailureSummary)}
-        assert field_names == {"transform_id", "category", "count"}
+        # ``kind`` is a two-value Literal naming the counting arm, not text.
+        assert field_names == {"kind", "transform_id", "category", "count"}
 
     def test_sentinels_are_not_members_of_the_closed_vocabulary(self) -> None:
         """Both sentinels must stay distinguishable from a real category.
@@ -234,7 +235,7 @@ class TestLoadTopFailureCategories:
         summaries = load_top_failure_categories(db, run_id)
         rendered = format_failure_categories(summaries)
 
-        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
         for canary in (CANARY_ROW, CANARY_PROVIDER, "incorrect header check", "BadGzipFile"):
             assert canary not in rendered, rendered
             assert all(canary not in str(summary) for summary in summaries), summaries
@@ -259,7 +260,7 @@ class TestLoadTopFailureCategories:
 
         summaries = load_top_failure_categories(db, run_id)
 
-        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
 
     def test_top_n_is_taken_after_category_aggregation(self) -> None:
         """Regression: the top-N slice must not be taken over messages.
@@ -292,8 +293,8 @@ class TestLoadTopFailureCategories:
         summaries = load_top_failure_categories(db, run_id, limit=2)
 
         assert summaries == [
-            ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=4),
-            ClientSafeFailureSummary(transform_id=transform_id, category="rate_limited", count=2),
+            ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=4),
+            ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="rate_limited", count=2),
         ]
 
     def test_a_token_whose_error_a_resumed_attempt_rewrote_counts_once(self) -> None:
@@ -314,7 +315,7 @@ class TestLoadTopFailureCategories:
 
         summaries = load_top_failure_categories(db, run_id)
 
-        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
 
     def test_distinct_nodes_stay_distinct(self) -> None:
         db, run_id, first = _make_run_with_transform("fetch")
@@ -421,19 +422,23 @@ class TestFormatFailureCategories:
         assert format_failure_categories([]) == ""
 
     def test_renders_count_node_and_category(self) -> None:
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=3)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="decode_failed", count=3)]
+        )
         assert rendered == "  • 3x [fetch] decode_failed"
 
     def test_node_is_shown_even_for_a_single_node_run(self) -> None:
         """The failing node is half of what makes the category actionable."""
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="rate_limited", count=1)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="rate_limited", count=1)]
+        )
         assert "[fetch]" in rendered
 
     def test_renders_one_bullet_per_summary(self) -> None:
         rendered = format_failure_categories(
             [
-                ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=2),
-                ClientSafeFailureSummary(transform_id="summarise", category="rate_limited", count=1),
+                ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="decode_failed", count=2),
+                ClientSafeFailureSummary(kind="transform_error", transform_id="summarise", category="rate_limited", count=1),
             ]
         )
         assert rendered.splitlines() == [
@@ -441,6 +446,19 @@ class TestFormatFailureCategories:
             "  • 1x [summarise] rate_limited",
         ]
 
+    def test_a_collector_group_failure_renders_as_its_collector_node_and_reason_code(self) -> None:
+        """The collector arm goes through the same presenter: count, node, closed code, nothing else."""
+        rendered = format_failure_categories(
+            [
+                ClientSafeFailureSummary(
+                    kind="collector_group", transform_id="collector_stitch", category="collector_missing_members", count=2
+                ),
+            ]
+        )
+        assert rendered == "  • 2x [collector_stitch] collector_missing_members"
+
     def test_long_node_id_is_bounded(self) -> None:
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="n" * 200, category="decode_failed", count=1)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="n" * 200, category="decode_failed", count=1)]
+        )
         assert len(rendered) < 120

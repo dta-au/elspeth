@@ -777,6 +777,8 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("aggregation_result_members", "ck_aggregation_result_members_ordinal"),
     ("aggregation_result_members", "ck_aggregation_result_members_action"),
     ("aggregation_result_members", "ck_aggregation_result_members_error_hash_hex"),
+    # Epoch 45: the collector group-failure reason is a closed vocabulary.
+    ("collector_group_failures", "ck_collector_group_failures_failure_reason"),
 )
 
 # Required indexes (including partial unique indexes) for audit integrity.

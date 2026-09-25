@@ -11,12 +11,12 @@ from elspeth.contracts.enums import GroupSettlementReason
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.schema import (
-    collector_group_failures_table,
     node_states_table,
     nodes_table,
     token_outcomes_table,
     tokens_table,
 )
+from elspeth.core.landscape.terminal_transform_failures import failed_collector_groups
 
 
 class AuditRunStatusProjection:
@@ -26,10 +26,13 @@ class AuditRunStatusProjection:
         self._ops = ops
 
     def count_failed_collector_groups(self, run_id: str) -> int:
-        """Count immutable group-level failure verdicts, including empty groups."""
-        row = self._ops.execute_fetchone(
-            select(func.count()).select_from(collector_group_failures_table).where(collector_group_failures_table.c.run_id == run_id)
-        )
+        """Count immutable group-level failure verdicts (G), including empty groups.
+
+        G comes from the counting authority's
+        :func:`~elspeth.core.landscape.terminal_transform_failures.failed_collector_groups`,
+        the one definition the web accounting and the MCP run summary also count.
+        """
+        row = self._ops.execute_fetchone(select(func.count()).select_from(failed_collector_groups((run_id,)).subquery()))
         if row is None:
             raise AuditIntegrityError("count_failed_collector_groups returned no row for a COUNT aggregate")
         return int(row[0])

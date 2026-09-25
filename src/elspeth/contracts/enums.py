@@ -329,6 +329,34 @@ class GroupSettlementReason(StrEnum):
     ALL_MEMBERS_LOST = "all_members_lost"
 
 
+class CollectorGroupFailureReason(StrEnum):
+    """Closed vocabulary for why a collector group FAILED as a whole.
+
+    The StrEnum IS the vocabulary: ``CollectorExecutor`` names these members,
+    never string literals. ``collector_group_failures.failure_reason`` carries
+    a CHECK over exactly these values (Landscape epoch 45), each member hold's
+    ``CollectorGroupFailure`` context carries the same value, and the counting
+    readers render it as a failure category. A value is an engine-authored
+    code, never row data.
+
+    - ``COLLECTOR_MISSING_MEMBERS``: a ``require_all`` roster closed with lost
+      members; the plugin never ran.
+    - ``COLLECTOR_TRANSFORM_ERROR``: the plugin ran and returned
+      ``TransformResult.error``.
+    - ``COLLECTOR_CONTRACT_VIOLATION``: a Tier-2 ``PluginContractViolation``
+      from the plugin or the engine's pre/postflight checks.
+    - ``EMPTY_EXPANSION``: a zero-member group closed under ``require_all``.
+      It shares its value with :attr:`GroupSettlementReason.EMPTY_EXPANSION`,
+      which names the same closure as a settlement disposition
+      (``closed_without_plugin``).
+    """
+
+    COLLECTOR_MISSING_MEMBERS = "collector_missing_members"
+    COLLECTOR_TRANSFORM_ERROR = "collector_transform_error"
+    COLLECTOR_CONTRACT_VIOLATION = "collector_contract_violation"
+    EMPTY_EXPANSION = "empty_expansion"
+
+
 # Outcome exhaustiveness: every TerminalOutcome value MUST be the lifecycle
 # answer for at least one legal terminal pair.  An unused outcome would mean
 # the enum has dead values that no producer can emit — drift from the ADR.

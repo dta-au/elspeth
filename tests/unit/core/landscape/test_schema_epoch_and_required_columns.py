@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -53,6 +54,40 @@ def test_epoch_is_forty_six() -> None:
     # Epoch 46 stores each valid source row's exact contract.
     assert SQLITE_SCHEMA_EPOCH == 46
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
+
+
+def test_epoch_45_collector_group_failure_reason_is_the_closed_vocabulary() -> None:
+    """Folded into 45 (no bump): the verdict row's reason is a CollectorGroupFailureReason, enforced by a CHECK."""
+    from sqlalchemy.exc import IntegrityError
+
+    from elspeth.contracts.enums import CollectorGroupFailureReason
+    from elspeth.core.landscape.schema import collector_group_failures_table
+
+    [check] = [
+        constraint
+        for constraint in collector_group_failures_table.constraints
+        if constraint.name == "ck_collector_group_failures_failure_reason"
+    ]
+    ddl = str(CreateTable(collector_group_failures_table).compile(dialect=sqlite.dialect()))
+    for reason in CollectorGroupFailureReason:
+        assert f"'{reason.value}'" in ddl, ddl
+    assert check.name in ddl
+    assert ("collector_group_failures", "ck_collector_group_failures_failure_reason") in set(_REQUIRED_CHECK_CONSTRAINTS)
+
+    db = LandscapeDB.in_memory()
+    row = {"run_id": "r", "group_id": "g", "collector_node_id": "n", "recorded_at": datetime(2026, 9, 25, tzinfo=UTC)}
+    try:
+        with (
+            pytest.raises(IntegrityError, match="CHECK constraint failed: ck_collector_group_failures_failure_reason"),
+            db.write_connection() as conn,
+        ):
+            conn.execute(collector_group_failures_table.insert().values(**row, failure_reason="plugin said so"))
+        # Control: a vocabulary value passes the CHECK and stops only at the
+        # foreign keys this bare row does not satisfy.
+        with pytest.raises(IntegrityError, match="FOREIGN KEY constraint failed"), db.write_connection() as conn:
+            conn.execute(collector_group_failures_table.insert().values(**row, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION))
+    finally:
+        db.close()
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:

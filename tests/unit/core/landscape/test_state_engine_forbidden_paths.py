@@ -35,7 +35,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.enums import AggregationMemberAction
+from elspeth.contracts.enums import AggregationMemberAction, CollectorGroupFailureReason
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     ExecutionError,
@@ -48,6 +48,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import database as database_module
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -1468,11 +1469,8 @@ def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale:
     holds = [
         execution.begin_node_state(token_id, "collector-1", 1, {"value": 1}, member_token=member) for token_id in (first_id, second_id)
     ]
-    hold_error = ExecutionError(
-        exception="Collector group 'g-1' failed (collector_transform_error)",
-        exception_type="CollectorGroupFailure",
-        phase="collector_flush",
-        context={"failure_reason": "collector_transform_error", "lost_members": [], "member_disposition": "scope_group_failed"},
+    hold_error = collector_group_failure_hold_error(
+        group_id="g-1", failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR, lost_members=()
     )
 
     def record_verdict() -> None:
@@ -1480,7 +1478,7 @@ def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale:
             coordination_token=harness.coordination_token,
             group_id="g-1",
             collector_node_id="collector-1",
-            failure_reason="collector_transform_error",
+            failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR,
             flush_state_id=flush.state_id,
             flush_error=ExecutionError(exception="{'reason': 'deliberate'}", exception_type="TransformError"),
             flush_duration_ms=1.0,

@@ -1,4 +1,54 @@
-"""The transform error that decided each terminally failed token.
+"""The one counting authority for failed tokens and failed collector groups.
+
+It defines three quantities, and every counting reader (web run accounting and
+run status, web failure categories, the web discard summary, the MCP run
+summary and error analysis) takes them from here, never from its own query:
+
+- **Transform-decided failed tokens** (:func:`deciding_transform_errors`):
+  tokens whose terminal outcome is a failure a transform error decided.
+- **Collector member tokens, M** (:func:`deciding_collector_group_failures`):
+  tokens whose collector group FAILED as a whole, each counted once under the
+  reason its group records.
+- **Failed collector groups, G** (:func:`failed_collector_groups`): one per
+  group verdict, including groups no member reached (a ``require_all`` roster
+  whose members were all lost, or a zero-member ``empty_expansion`` group).
+
+M and G are different units: G counts groups, M counts tokens. A zero-member
+group is in G only, and G is never added to a token total.
+
+The first two are disjoint by terminal path. The transform arm admits only
+``QUARANTINED_AT_SOURCE`` and ``ON_ERROR_ROUTED``; a failed collector group's
+members all end ``(FAILURE, UNROUTED)`` (every arm, measured: missing members,
+returned error, contract violation, nested groups). UNROUTED is NOT the
+discriminator, because coalesce, row_union, escalation and unrouted crashes
+end tokens on it too. The discriminator is the member's parsed
+``CollectorGroupFailure`` hold (:mod:`collector_group_failure_holds`), cross-
+checked against its group's ``collector_group_failures`` row. A member that
+carries a transform error from an earlier node is counted once, here, because
+its terminal path is not one the transform arm admits.
+
+Collector group verdicts cannot be superseded. ``collector_group_failures`` has
+primary key ``(run_id, group_id)`` and a second record raises
+``AuditIntegrityError`` (``ExecutionRepository.complete_collector_failure``);
+member holds complete FAILED only from OPEN, in the verdict's one transaction;
+resume completes a recorded verdict without re-invoking the plugin; and
+``ix_token_outcomes_terminal_unique`` allows one terminal outcome per token.
+What CAN be superseded is the flush: when the plugin raises, the flush state
+fails, the holds stay OPEN and resume flushes again. So flush states are
+attempt evidence and this module never reads them; only a
+``CollectorGroupFailure`` hold on a token that ended UNROUTED counts.
+
+Between a committed verdict and its members' terminal outcomes (a crash in
+that window), G is 1 and M is 0 until resume writes the terminals. That is
+the terminal-outcome ruling applied, not a gap: no token has terminally
+failed yet.
+
+Coalesce and row_union group failures have the same whole-group shape and are
+NOT counted by name here. Their members fail on their own recorded reasons
+and are visible only through terminal outcomes and group losses (a named
+gap: the operator ruling covers collectors).
+
+The transform arm follows.
 
 A ``transform_errors`` row is evidence of one ATTEMPT, not an outcome. The
 table has no ``(token_id, transform_id)`` uniqueness, and an error write that
@@ -56,17 +106,38 @@ the whole run's errors: 14.4s for 10k failed tokens, against 0.02s on a
 database with the other order. It is the trap ``ix_token_outcomes_run_token``
 records in ``schema.py`` (elspeth-c675c8c2d9). The window reads the run's
 errors once, whichever order the indexes were created in.
+
+The collector member arm has the same kind of trap. ``node_states`` has no
+index that leads with ``run_id``, and node ids are stable across runs of the
+same pipeline (a hash of the node's configuration), so a collector node id
+matches that node's states in EVERY run the database holds. A query that puts
+the collector node id in SQL lets SQLite drive ``node_states`` through
+``ix_node_states_node`` and scan the node's whole history. So the member query
+drives from the runs' ``(FAILURE, UNROUTED)`` terminal outcomes and reaches
+``node_states`` by ``token_id`` only; the collector nodes are applied to the
+fetched rows. A failed token has a handful of FAILED states, so the rows read
+are bounded by the runs' failed tokens, never by history.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import Select, and_, exists, func, select
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import NodeStateStatus
-from elspeth.contracts.enums import TerminalPath
-from elspeth.core.landscape.schema import node_states_table, token_outcomes_table, transform_errors_table
+from elspeth.contracts.enums import CollectorGroupFailureReason, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.collector_group_failure_holds import parse_collector_group_failure_hold
+from elspeth.core.landscape.schema import (
+    collector_group_failures_table,
+    node_states_table,
+    nodes_table,
+    token_outcomes_table,
+    transform_errors_table,
+)
 
 TRANSFORM_ERROR_TERMINAL_PATHS: tuple[TerminalPath, ...] = (
     TerminalPath.QUARANTINED_AT_SOURCE,
@@ -130,3 +201,127 @@ def deciding_transform_errors(run_ids: Sequence[str]) -> Select[tuple[str, str, 
         .where(token_outcomes_table.c.path.in_(TRANSFORM_ERROR_TERMINAL_PATHS))
         .where(~completed_at_node)
     )
+
+
+COLLECTOR_GROUP_MEMBER_TERMINAL_PATH = TerminalPath.UNROUTED
+"""The terminal path every member of a failed collector group ends on (with ``TerminalOutcome.FAILURE``)."""
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorGroupMemberFailure:
+    """One token whose collector group FAILED, under the reason the group's verdict records."""
+
+    run_id: str
+    token_id: str
+    collector_node_id: str
+    group_id: str
+    failure_reason: CollectorGroupFailureReason
+
+
+def failed_collector_groups(run_ids: Sequence[str]) -> Select[tuple[str, str, str, str]]:
+    """Select one row per failed collector group of the runs: the group verdict.
+
+    Columns: ``run_id``, ``group_id``, ``collector_node_id`` and
+    ``failure_reason`` (a :class:`CollectorGroupFailureReason` value, held to
+    that vocabulary by a CHECK). This is the only source of G, the count of
+    failed groups. It includes a group no member reached.
+    """
+    groups = collector_group_failures_table
+    return select(groups.c.run_id, groups.c.group_id, groups.c.collector_node_id, groups.c.failure_reason).where(
+        groups.c.run_id.in_(run_ids)
+    )
+
+
+def _recorded_reason(value: str, *, run_id: str, group_id: str) -> CollectorGroupFailureReason:
+    """Parse a group row's ``failure_reason``. The CHECK admits only the vocabulary, so a miss is corruption."""
+    try:
+        return CollectorGroupFailureReason(value)
+    except ValueError as exc:
+        raise AuditIntegrityError(
+            f"collector_group_failures row for group {group_id!r} (run {run_id!r}) records a failure_reason outside "
+            "the CollectorGroupFailureReason vocabulary"
+        ) from exc
+
+
+def deciding_collector_group_failures(conn: Connection, run_ids: Sequence[str]) -> tuple[CollectorGroupMemberFailure, ...]:
+    """One entry per token of the runs whose collector group FAILED: M, the member-token count.
+
+    A token counts when it ended ``(FAILURE, UNROUTED)`` and holds a FAILED
+    state at one of its run's collector nodes whose error is a
+    ``CollectorGroupFailure`` hold. The hold names its group, and it must
+    agree with that group's ``collector_group_failures`` row on the collector
+    node and the reason. Any other FAILED state (a flush state, a quarantined
+    member of a successful flush, a failed attempt at another node) is not a
+    group verdict and does not count. See the module docstring for why the
+    query never names a node id.
+
+    Raises:
+        AuditIntegrityError: A hold that is malformed, that names a group
+            with no verdict row, that disagrees with its group's row on the
+            node or the reason, or a token holding more than one verdict.
+    """
+    groups: dict[tuple[str, str], tuple[str, CollectorGroupFailureReason]] = {
+        (str(row.run_id), str(row.group_id)): (
+            str(row.collector_node_id),
+            _recorded_reason(str(row.failure_reason), run_id=str(row.run_id), group_id=str(row.group_id)),
+        )
+        for row in conn.execute(failed_collector_groups(run_ids))
+    }
+    collector_nodes = {
+        (str(row.run_id), str(row.node_id))
+        for row in conn.execute(
+            select(nodes_table.c.run_id, nodes_table.c.node_id)
+            .where(nodes_table.c.run_id.in_(run_ids))
+            .where(nodes_table.c.node_type == NodeType.COLLECTOR.value)
+        )
+    }
+    if not collector_nodes:
+        # Exactly what the loop below would return: it keeps only states at
+        # a collector node.
+        return ()
+    failed_states = (
+        select(token_outcomes_table.c.run_id, token_outcomes_table.c.token_id, node_states_table.c.node_id, node_states_table.c.error_json)
+        .select_from(
+            token_outcomes_table.join(
+                node_states_table,
+                and_(
+                    node_states_table.c.token_id == token_outcomes_table.c.token_id,
+                    node_states_table.c.run_id == token_outcomes_table.c.run_id,
+                ),
+            )
+        )
+        .where(token_outcomes_table.c.run_id.in_(run_ids))
+        .where(token_outcomes_table.c.completed == 1)
+        .where(token_outcomes_table.c.outcome == TerminalOutcome.FAILURE.value)
+        .where(token_outcomes_table.c.path == COLLECTOR_GROUP_MEMBER_TERMINAL_PATH.value)
+        .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
+    )
+    members: dict[tuple[str, str], CollectorGroupMemberFailure] = {}
+    for row in conn.execute(failed_states):
+        run_id, token_id, node_id = str(row.run_id), str(row.token_id), str(row.node_id)
+        if (run_id, node_id) not in collector_nodes:
+            continue
+        hold = parse_collector_group_failure_hold(token_id, node_id, row.error_json)
+        if hold is None:
+            continue
+        if (run_id, token_id) in members:
+            raise AuditIntegrityError(f"Token {token_id!r} (run {run_id!r}) holds more than one collector group-failure verdict")
+        if (run_id, hold.group_id) not in groups:
+            raise AuditIntegrityError(
+                f"Collector group-failure hold of token {token_id!r} at {node_id!r} names group {hold.group_id!r}, "
+                f"which has no collector_group_failures row in run {run_id!r}"
+            )
+        recorded_node, recorded_reason = groups[(run_id, hold.group_id)]
+        if (recorded_node, recorded_reason) != (node_id, hold.failure_reason):
+            raise AuditIntegrityError(
+                f"Collector group-failure hold of token {token_id!r} at {node_id!r} records {hold.failure_reason.value!r} "
+                f"for group {hold.group_id!r}, whose verdict records {recorded_reason.value!r} at {recorded_node!r}"
+            )
+        members[(run_id, token_id)] = CollectorGroupMemberFailure(
+            run_id=run_id,
+            token_id=token_id,
+            collector_node_id=node_id,
+            group_id=hold.group_id,
+            failure_reason=hold.failure_reason,
+        )
+    return tuple(members.values())
