@@ -517,6 +517,38 @@ def test_an_identity_mapping_by_original_header_delivers_under_the_source_contra
         assert (by_name[key]["python_type"], by_name[key]["source"]) == ("str", "inferred")
 
 
+def test_a_rename_spelled_by_original_header_never_guesses_the_source_declaration(tmp_path: Path) -> None:
+    """A header-spelled source is not matched to a declaration by its normalized spelling (review-S1a-r2 F2).
+
+    ``First Name`` resolves through the source's ``field_mapping`` to
+    ``given_name``, not to ``first_name``: which field it names is known only
+    from the row's contract. Reading the operator's ``first_name: int?`` as
+    the source's declaration would carry ``given`` under ``int`` with no value
+    check. Measured on a mutant that did so: a str delivered under a recorded
+    ``given: int declared``, exit 0. The target's own ``given: str`` is the
+    declaration that stands, and it is checked.
+    """
+    (tmp_path / "in.csv").write_text("id,First Name\n1,Ann\n2,Bob\n")
+    source = {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": {
+            "path": str(tmp_path / "in.csv"),
+            "on_validation_failure": "discard",
+            "field_mapping": {"first_name": "given_name"},
+            "schema": {"mode": "observed"},
+        },
+    }
+    transform = _fm(schema={"mode": "flexible", "fields": ["first_name: int?", "given: str"]}, mapping={"First Name": "given"})
+    result = _run(_settings(tmp_path, sources={"src": source}, transforms=[transform]))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"given": "Ann", "id": "1"}, {"given": "Bob", "id": "2"}]
+    [recorded] = _transform_node_contracts(tmp_path).values()
+    [given] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "given"]
+    assert (given["python_type"], given["source"]) == ("str", "declared")
+
+
 class TestNulls:
     """T6: None is presence, not a type — the declaration decides."""
 

@@ -973,6 +973,31 @@ class TestOutputSchemaConfig:
 
         assert transform.carried_output_fields() == carried
 
+    def test_a_header_spelled_source_is_never_matched_to_its_normalized_declaration(self) -> None:
+        """``{"First Name": "given"}`` abstains from reading ``first_name: str`` as the source's declaration (review-S1a-r2 F2).
+
+        Which field an original header names is known only from the row's
+        contract: a source ``field_mapping`` can resolve ``First Name`` to
+        ``given_name``. So the target's own ``given: int`` is the declaration
+        that stands, and it is value-checked (not carried). The normalized
+        spelling ``{"first_name": "given"}`` names the declared source and
+        takes the ruled source-wins path (elspeth-a2bf676e6f); the two
+        spellings route differently only when the declarations contradict.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        schema = {"mode": "flexible", "fields": ["first_name: str", "given: int"]}
+        by_header = FieldMapper({"mapping": {"First Name": "given"}, "schema": schema})
+        by_normalized = FieldMapper({"mapping": {"first_name": "given"}, "schema": schema})
+
+        assert by_header.carried_output_fields() == frozenset()
+        assert by_normalized.carried_output_fields() == frozenset({"given"})
+        header_config = by_header._output_schema_config
+        normalized_config = by_normalized._output_schema_config
+        assert header_config is not None and normalized_config is not None
+        assert {field.name: field.field_type for field in header_config.fields or ()}["given"] == "int"
+        assert {field.name: field.field_type for field in normalized_config.fields or ()}["given"] == "str"
+
     @pytest.mark.parametrize("select_only", [True, False], ids=["select_only", "forwarding"])
     def test_an_identity_mapping_by_original_header_passes_the_completeness_contract(self, select_only: bool) -> None:
         """The emitted literal header key carries the source's contract and passes ADR-050 completeness (review-S1a-r2 F1).
