@@ -783,7 +783,20 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # and blob_csv_expand f21d43dc7385e82e -> cf7fd4418a151e3a have no manifest pin.
 # Recomputed with scripts/cicd/plugin_hash.py::compute_source_file_hash;
 # reverting the literals reproduces the prior manifest byte for byte.
-EXPECTED_CASE_REGISTRY_SHA256 = "dbb53ea153d8e9a49da8c8ed744cd2861e7894411c6ea2681aa6cf51b4cd6a14"
+# Re-derived 2026-09-25 on fix/5887-rebased rebased onto release/0.8.1 @
+# e991b35fb (the digests the entries above name were measured on the old base
+# and are superseded here). Order: (1) every manifest source_file_hash literal
+# equals its live, recomputed plugin pin (6 distinct hashes, 39 pins: csv
+# 081b2eaaf545bb99 x15, json 9773d7d4da8358a9 x1, value_transform
+# 89bb2afff7b49a6b x3, json_explode 67ab862fbd369a2b x1, and two untouched
+# upstream pins); (2) reopen-resume's resumed_full_projection_sha256
+# 9cc4101e... -> 0488ea94..., captured from the production harness's own
+# failure output; setting only the csv and json source pins back to
+# release/0.8.1's literals reproduces 9cc4101e... exactly, so the move is
+# plugin provenance, not runtime semantics; (3) this digest. The only
+# oracle_freeze snapshot that differs from release/0.8.1 is the ruled E2 move
+# (retry-quarantine-discard-routed-errors/source-quarantine-routed, one line).
+EXPECTED_CASE_REGISTRY_SHA256 = "767f95459978d3ae4885e8681a405d84ad6acc88c58b694c7e894868a9a0af54"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

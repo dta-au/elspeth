@@ -4395,7 +4395,7 @@ scenarios:
           status: completed
           output_rows: 1
           required_audit_record_types: [run]
-          resumed_full_projection_sha256: 9cc4101e7543af72b50a9610cda3b508b55dec514d7aca2740b2b4ce51deb4b8
+          resumed_full_projection_sha256: 0488ea94161de3623ef90e46bffbb296f08547f8de318576fea415fcbb01cb80
     dimensions:
       config: *config_pass
       build: *build_pass
