@@ -3,7 +3,10 @@
 Provides a sandboxed Jinja2 environment factory and the TemplateError exception.
 Used by both LLM prompt templates and RAG query templates.
 
-The sandbox prevents unsafe access. Constant folding of authored expressions
+The sandbox prevents unsafe access. A ``PipelineRow`` in a render context
+reaches the template as a ``TemplateRow``, its field values only, so no
+template can reach the row object, its schema contract or their methods.
+Constant folding of authored expressions
 is disabled during bounded-size compilation; rendering runs in a child process
 with CPU, memory, input and output ceilings.
 """
@@ -19,7 +22,7 @@ import resource
 import sys
 import threading
 from atexit import register as register_exit
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -104,14 +107,86 @@ class _NoFoldTrackingCodeGenerator(_NoFoldCodeGenerator, TrackingCodeGenerator):
         self.optimizer = None
 
 
+class TemplateRow(Mapping[str, Any]):
+    """The ``row`` a template sees: the row's field values and nothing else.
+
+    A template renders operator-authored code against row data, so it gets a
+    plain projection of the ``PipelineRow``, never the row object itself:
+    ``row.contract``, ``row.to_dict()`` and the checkpoint API are owned
+    framework surface, and one of them (``from_checkpoint``) raises a Tier-1
+    error whose message quotes row keys. ``row.name``, ``row['name']`` and
+    ``row['Original Name']`` read a field by either spelling (the resolution
+    is ``PipelineRow.name_index``). The sandbox resolves every attribute and
+    item lookup on this type to a field; the one callable it admits is
+    ``row.get(name)``. Iteration, ``in`` and ``length`` see the field names.
+    """
+
+    __slots__ = ("_names", "_values")
+
+    def __init__(self, values: Mapping[str, Any], names: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_values", values)
+        object.__setattr__(self, "_names", names)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        raise TypeError("TemplateRow is immutable")
+
+    def __delattr__(self, key: str) -> None:
+        raise TypeError("TemplateRow is immutable")
+
+    def __getitem__(self, key: str) -> Any:
+        return self._values[self._names[key]]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._names
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getattr__(self, key: str) -> Any:
+        # jinja2's ``attr`` filter asks ``hasattr`` before it defers to the
+        # sandbox's getattr, so a field must answer here as ``row.name`` does.
+        if key.startswith("_"):
+            raise AttributeError(key)
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key) from None
+
+
 class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
     code_generator_class = _NoFoldCodeGenerator
+
+    def getattr(self, obj: Any, attribute: str) -> Any:
+        if type(obj) is TemplateRow:
+            if attribute == "get":
+                return obj.get
+            if attribute.startswith("_"):
+                return self.unsafe_undefined(obj, attribute)
+            return self._row_field(obj, attribute)
+        return super().getattr(obj, attribute)
+
+    def getitem(self, obj: Any, argument: Any) -> Any:
+        if type(obj) is TemplateRow:
+            # No attribute fallback: jinja2's stock getitem would try
+            # getattr(row, key) on a miss and reach the Mapping methods.
+            return self._row_field(obj, argument)
+        return super().getitem(obj, argument)
+
+    def _row_field(self, row: TemplateRow, key: Any) -> Any:
+        if type(key) is str and key in row:
+            return row[key]
+        return self.undefined(obj=row, name=key)
 
 
 @dataclass(frozen=True)
 class _RowTransport:
+    """A PipelineRow crossing to the render worker as plain data: values and the name index."""
+
     data: bytes
-    contract: bytes
+    names: bytes
 
 
 def _pack_context_value(
@@ -122,9 +197,15 @@ def _pack_context_value(
     active: set[int] | None = None,
     budget: list[int] | None = None,
 ) -> Any:
-    """Detach frozen carriers with alias preservation and a parent work cap."""
+    """Detach frozen carriers with alias preservation and a parent work cap.
+
+    A ``PipelineRow`` crosses as plain data (its values and name index) and
+    arrives as a ``TemplateRow``: the contract never reaches the render worker.
+    A contract object anywhere in a template context is a caller bug.
+    """
+    from elspeth.contracts.errors import FrameworkBugError
     from elspeth.contracts.freeze import FrozenJsonArray
-    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 
     if depth > 64:
         raise TemplateError("Template context nesting exceeds 64 levels")
@@ -154,11 +235,13 @@ def _pack_context_value(
         if type(value) is PipelineRow:
             _charge_row_export(value._data, budget, depth=depth + 1)
             data = pickle.dumps(value.to_dict(), protocol=5)
-            contract = pickle.dumps(value.contract.to_checkpoint_format(), protocol=5)
-            budget[1] += len(data) + len(contract)
+            names = pickle.dumps(value.name_index(), protocol=5)
+            budget[1] += len(data) + len(names)
             if budget[1] > _MAX_PARENT_PACK_BYTES:
                 raise TemplateError("Template context exceeds the parent packing limit")
-            packed: Any = _RowTransport(data, contract)
+            packed: Any = _RowTransport(data, names)
+        elif type(value) in (SchemaContract, FieldContract):
+            raise FrameworkBugError(f"A template context carries a {type(value).__name__}: templates see row values only")
         elif type(value) in (dict, MappingProxyType):
             packed = {}
             for key, item in value.items():
@@ -188,7 +271,7 @@ def _pack_context_value(
 
 
 def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) -> Any:
-    from elspeth.contracts.freeze import FrozenJsonArray
+    from elspeth.contracts.freeze import FrozenJsonArray, deep_freeze
 
     if memo is None:
         memo = {}
@@ -196,9 +279,10 @@ def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) ->
     if identity in memo:
         return memo[identity]
     if type(value) is _RowTransport:
-        from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-
-        restored: Any = PipelineRow(pickle.loads(value.data), SchemaContract.from_checkpoint(pickle.loads(value.contract)))
+        # The bytes come from _pack_context_value in the parent process over
+        # this worker's own pipe, never from an external source. The values
+        # are frozen exactly as PipelineRow froze them, so a value renders as before.
+        restored: Any = TemplateRow(deep_freeze(pickle.loads(value.data)), MappingProxyType(pickle.loads(value.names)))
     elif type(value) is dict:
         restored = {key: _restore_context_value(item, memo=memo) for key, item in value.items()}
     elif type(value) is list:

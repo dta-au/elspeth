@@ -48,6 +48,11 @@ class PromptTemplate:
         - {{ row.field_name }} - access row fields
         - {{ lookup.key }} - access lookup data
 
+    A PipelineRow reaches the template as a ``TemplateRow``: its field values
+    only, readable by normalized or original name, with ``row.get(name)`` as
+    the one method. The row object, its schema contract and their API are not
+    reachable from a template.
+
     Example:
         template = PromptTemplate(
             '''

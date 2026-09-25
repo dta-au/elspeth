@@ -216,13 +216,18 @@ def extract_jinja2_fields(
     return frozenset(fields)
 
 
-# PipelineRow API names that can never be valid data field names — excluded
-# from field extraction. Only includes names that are unambiguously API:
-# - "get" is already handled as a Call pattern (row.get("field"))
-# - "contract" is a @property exposing the SchemaContract
-# - "to_dict" / "to_checkpoint_format" serialize the row payload
-# Note: "keys", "items", "values" are NOT excluded because they can be
-# legitimate column names in user data (e.g., row.items in a for loop).
+# Row names excluded from field extraction:
+# - "get" is the template row's one method, handled as a Call pattern
+#   (row.get("field")).
+# - "contract", "to_dict" and "to_checkpoint_format" are the retired PipelineRow
+#   API. A template's row is now a field-only TemplateRow, so at render time
+#   each reads a field of that name. They stay reserved here: a dot or attr
+#   read of one is classified as dynamic row access, so a template still
+#   spelling the old API fails configuration validation. A column with one of
+#   these names is read as row['contract'].
+# Note: "keys", "items", "values" are NOT excluded because they are
+# column names in user data (e.g., row.items in a for loop), which is also
+# how the template row resolves them.
 _PIPELINE_ROW_API_NAMES: frozenset[str] = frozenset(
     {
         "get",

@@ -1118,6 +1118,27 @@ Pipeline Jinja templates reject power expressions (`**`). An `{% autoescape %}`
 block accepts only a literal `true` or `false`; an expression in that position
 is rejected during configuration validation.
 
+**Template variables.** A `prompt_template` sees two variables, `row` and
+`lookup` (the configured lookup mapping). `row` holds the row's field values
+and nothing else:
+
+- `row.name` and `row['name']` read a field by its normalized name, and
+  `row['Original Header']` reads it by the source's original header.
+- `row.get('name')` returns the field, or `None` when the row does not carry it.
+- `'name' in row`, `{% for name in row %}`, `row | length` and `row | dictsort`
+  see the normalized field names.
+
+Every other attribute or item lookup on `row` reads a field of that name:
+`row.keys` and `row.items` are fields, not methods. The row object, its schema
+contract and their methods are not reachable from a template. A lookup of a
+field the row does not carry fails that row with `template_rendering_failed`.
+Configuration validation still treats `row.contract`, `row.to_dict` and
+`row.to_checkpoint_format` as dynamic row access (see `required_input_fields`),
+so read a column with one of those names as `row['contract']`.
+
+In a multi-query template, `row` holds the query's `input_fields` variables and
+`row.source_row`, which is the same field-only view of the whole row.
+
 `provider: azure` adds:
 
 | Option | Type | Required | Default | Description |

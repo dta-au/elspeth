@@ -369,6 +369,8 @@ files:
     dict[str, object]: 2
   src/elspeth/plugins/infrastructure/schema_factory.py:
     dict[str, Any]: 1
+  src/elspeth/plugins/infrastructure/templates.py:
+    Mapping[str, Any]: 1
   src/elspeth/plugins/infrastructure/utils.py:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/validation.py:
@@ -1072,10 +1074,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 930
+  Mapping[str, Any]: 931
   Mapping[str, object]: 311
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1183
   dict[str, object]: 410
-  soft: 2847
+  soft: 2848

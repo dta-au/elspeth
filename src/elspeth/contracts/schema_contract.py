@@ -715,6 +715,27 @@ class PipelineRow:
         except KeyError:
             return default
 
+    def name_index(self) -> dict[str, str]:
+        """Map every key ``row[key]`` resolves to the data key it reads.
+
+        The same resolution as ``__getitem__``: an original or normalized
+        name the contract knows, when its field is present in the data; in
+        FLEXIBLE or OBSERVED mode, also any key present in the data. A consumer
+        that must not hold the contract (the template sandbox's ``row``) uses
+        this plain index to resolve either spelling.
+        """
+        extras_readable = self._contract.mode in ("FLEXIBLE", "OBSERVED")
+        index: dict[str, str] = {}
+        candidates = [spelling for fc in self._contract.fields for spelling in (fc.normalized_name, fc.original_name)]
+        candidates.extend(self._data)
+        for key in candidates:
+            normalized = self._contract.find_name(key)
+            if normalized is not None and normalized in self._data:
+                index[key] = normalized
+            elif extras_readable and key in self._data:
+                index[key] = key
+        return index
+
     def keys(self) -> list[str]:
         """Return normalized field names (Jinja2 compatibility).
 

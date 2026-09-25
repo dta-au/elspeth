@@ -79,10 +79,6 @@ MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY: Final[str] = (
     "contract for every column the node reads."
 )
 
-# PipelineRow API names a ``row.source_row.<name>`` read resolves to a method,
-# not a column — the same set ``core.templates`` refuses to treat as fields.
-_SOURCE_ROW_API_NAMES: Final[frozenset[str]] = frozenset({"get", "contract", "to_dict", "to_checkpoint_format"})
-
 
 @observation_boundary(
     tier=3,
@@ -91,7 +87,8 @@ _SOURCE_ROW_API_NAMES: Final[frozenset[str]] = frozenset({"get", "contract", "to
     suppresses=("R5",),
     invariant=(
         "returns only literal column names read as row.source_row.<name>, row.source_row['<name>'], "
-        "row['source_row']['<name>'] or row.source_row.get('<name>'); PipelineRow API names, bare "
+        "row['source_row']['<name>'] or row.source_row.get('<name>'); the get method itself, dotted "
+        "underscore names, bare "
         "row.source_row, aliases and computed keys contribute nothing; raises only TemplateSyntaxError "
         "for text that does not parse"
     ),
@@ -119,7 +116,10 @@ def multi_query_source_row_columns(template: str) -> frozenset[str]:
     ast = create_sandboxed_environment().parse(template)
     columns: set[str] = set()
     for attr in ast.find_all(jinja_nodes.Getattr):
-        if is_source_row(attr.node) and attr.attr not in _SOURCE_ROW_API_NAMES:
+        # ``row.source_row`` renders as a field-only TemplateRow: a dotted name
+        # is a column, except ``get`` (its one method, read by the Call loop)
+        # and an underscore name (the sandbox refuses it).
+        if is_source_row(attr.node) and attr.attr != "get" and not attr.attr.startswith("_"):
             columns.add(attr.attr)
     for item in ast.find_all(jinja_nodes.Getitem):
         if is_source_row(item.node) and isinstance(item.arg, jinja_nodes.Const) and isinstance(item.arg.value, str):

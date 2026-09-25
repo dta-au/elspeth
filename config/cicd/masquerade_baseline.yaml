@@ -286,6 +286,19 @@ entries:
     OpenAI-compatible SDK usage detail objects. TokenUsage.from_dict validates the
     extracted counters as nonnegative integers excluding bool and converts missing
     or malformed values to None. Only owned TokenUsage escapes; SDK objects do not.
+- path: src/elspeth/plugins/infrastructure/templates.py
+  qualname: TemplateRow.__getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - 18f05cd7c3b5364768aabdbcfd3e001bc0844b6fc9903a3b0214129b790c0655
+  classification: data-container-api
+  justification: The template sandbox's field-only row (elspeth-5887fb7928 S0). Dot-access
+    over row DATA delegating to self[key] (a Subscript over its own name index, not
+    attribute forwarding to a foreign object), with a `_`-prefix guard; the same shape
+    as PipelineRow.__getattr__. It exists because jinja2's `attr` filter asks hasattr
+    before deferring to the sandbox, which resolves every lookup on this type to a
+    field.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr

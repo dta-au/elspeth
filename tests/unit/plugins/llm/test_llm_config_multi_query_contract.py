@@ -154,12 +154,17 @@ class TestSourceRowColumnExtraction:
         )
         assert multi_query_source_row_columns(template) == frozenset({"a", "b", "c", "d", "e", "f"})
 
-    def test_api_names_query_variables_and_computed_keys_contribute_nothing(self) -> None:
+    def test_the_get_method_query_variables_and_computed_keys_contribute_nothing(self) -> None:
         template = (
-            "{{ row.text }} {{ row.source_row.to_dict() }} {{ row['source_row'].contract }} "
+            "{{ row.text }} {{ row.source_row.get }} {{ row.source_row._data }} "
             "{{ row.source_row[key] }} {{ row['other']['x'] }} {{ row.source_row }}"
         )
         assert multi_query_source_row_columns(template) == frozenset()
+
+    def test_a_name_that_was_row_api_is_a_column_read(self) -> None:
+        """``row.source_row`` renders as a field-only TemplateRow, so these names read columns and must be declared."""
+        template = "{{ row.source_row.to_dict() }} {{ row['source_row'].contract }} {{ row.source_row.keys }}"
+        assert multi_query_source_row_columns(template) == frozenset({"to_dict", "contract", "keys"})
 
 
 class TestUndeclaredMultiQuerySuggestionNamesColumnsOnly:

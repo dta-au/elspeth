@@ -853,7 +853,7 @@ class TestTemplateTierPolicy:
         assert result.reason == {
             "reason": "template_rendering_failed",
             "error": (
-                "Undefined variable: 'elspeth.contracts.schema_contract.PipelineRow object' has no attribute "
+                "Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute "
                 "<a key the template does not spell out>"
             ),
             "template_hash": transform._template.template_hash,

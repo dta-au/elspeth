@@ -1,6 +1,7 @@
 """Tests for shared template infrastructure."""
 
 import multiprocessing
+import operator
 import pickle
 import threading
 import time
@@ -437,12 +438,12 @@ def test_a_row_value_equal_to_a_template_literal_prints_as_that_literal() -> Non
 
 
 def test_a_pipeline_row_lookup_is_rendered_value_free() -> None:
-    """Production renders a PipelineRow, whose type repr is its qualified class name."""
+    """Production renders a PipelineRow as its TemplateRow projection, whose type repr is its qualified class name."""
     from elspeth.testing import make_pipeline_row
 
     row = make_pipeline_row({"q": "x", "k": _SENTINEL})
     assert _render_error("{{ row[row.k] }}", row=row) == (
-        f"Undefined variable: 'elspeth.contracts.schema_contract.PipelineRow object' has no attribute {_UNSPELLED}"
+        f"Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute {_UNSPELLED}"
     )
 
 
@@ -534,3 +535,177 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
         SandboxedTemplate("{% if unclosed")
     with pytest.raises(TemplateSyntaxError):
         SandboxedTemplate("{{ x | no_such_filter }}")
+
+
+# ---------------------------------------------------------------------------
+# The template row is a plain projection (elspeth-5887fb7928 S0). A template is
+# operator-authored code, so it sees the row's field values and nothing else:
+# never the PipelineRow, its SchemaContract or a FieldContract. Before this,
+# ``row.contract.from_checkpoint(row.blob)`` raised AuditIntegrityError (a
+# Tier-1 class) quoting row keys from inside a template, and ``row.to_dict()``
+# / ``row.contract`` rendered framework objects into the prompt.
+# ---------------------------------------------------------------------------
+
+_ROW_TYPE = "elspeth.plugins.infrastructure.templates.TemplateRow object"
+
+
+def _owned_api_row() -> object:
+    from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+
+    fields = (
+        FieldContract("amount_usd", "Amount USD", int, True, "declared"),
+        FieldContract("q", "q", str, True, "declared"),
+        FieldContract("blob", "blob", object, False, "declared"),
+    )
+    contract = SchemaContract(mode="FIXED", fields=fields, locked=True)
+    return PipelineRow({"amount_usd": 5, "q": "hello", "blob": {_SENTINEL: 1, "data": _SENTINEL}}, contract)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param("{{ row.contract }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'", id="contract"),
+        pytest.param(
+            "{{ row.contract.from_checkpoint(row.blob) }}",
+            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'",
+            id="contract-from-checkpoint-tier1",
+        ),
+        pytest.param(
+            "{{ row.from_checkpoint(row.blob, row.contract) }}",
+            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'from_checkpoint'",
+            id="row-from-checkpoint",
+        ),
+        pytest.param("{{ row.to_dict() }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'to_dict'", id="to-dict"),
+        pytest.param(
+            "{{ row.to_checkpoint_format() }}",
+            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'to_checkpoint_format'",
+            id="to-checkpoint-format",
+        ),
+        pytest.param("{{ row.name_index() }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'name_index'", id="name-index"),
+        pytest.param("{{ row.keys() | list }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'keys'", id="keys-method"),
+        pytest.param("{{ row.items() | list }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'items'", id="items-method"),
+        pytest.param("{{ row['values'] }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'values'", id="item-no-method-fallback"),
+        pytest.param("{{ row | attr('contract') }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'", id="attr-filter"),
+        pytest.param("{{ row | attr('keys') }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'keys'", id="attr-filter-method"),
+        pytest.param("{{ row['__class__'] }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute '__class__'", id="item-dunder"),
+        pytest.param(
+            "{{ row.__class__ }}", f"Sandbox violation: access to attribute '__class__' of {_ROW_TYPE} is unsafe", id="dunder-class"
+        ),
+        pytest.param(
+            "{{ row.__class__.__mro__ }}",
+            f"Sandbox violation: access to attribute '__class__' of {_ROW_TYPE} is unsafe",
+            id="dunder-mro",
+        ),
+        pytest.param("{{ row._values }}", f"Sandbox violation: access to attribute '_values' of {_ROW_TYPE} is unsafe", id="private-slot"),
+        pytest.param("{{ row._data }}", f"Sandbox violation: access to attribute '_data' of {_ROW_TYPE} is unsafe", id="private-name"),
+    ],
+)
+def test_a_template_reaches_no_framework_api_on_the_row(source: str, expected: str) -> None:
+    """Every owned surface is a routed, value-free template error — never a Tier-1 or a framework repr.
+
+    The row is a real PipelineRow whose blob carries the sentinel as a key and a
+    value; each render goes through the bounded worker.
+    """
+    assert _render_error(source, row=_owned_api_row()) == expected
+
+
+def test_a_multi_query_source_row_reaches_no_framework_api() -> None:
+    """A PipelineRow nested in the context (multi-query ``row.source_row``) crosses as the same projection."""
+    context_row = {"text": "hello", "source_row": _owned_api_row()}
+    assert _render_error("{{ row.source_row.contract.from_checkpoint(row.source_row.blob) }}", row=context_row) == (
+        f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'"
+    )
+    assert create_sandboxed_environment().from_string("{{ row.source_row.q }}").render(row=context_row) == "hello"
+
+
+def test_a_field_named_like_a_method_reads_the_field() -> None:
+    """Dot, item and ``attr`` lookups resolve to fields: a column named ``keys`` is no longer shadowed by a method."""
+    row = make_pipeline_row({"keys": "K", "contract": "C", "items": "I", "to_dict": "D", "values": "V"})
+    template = create_sandboxed_environment().from_string(
+        "{{ row.keys }}|{{ row.contract }}|{{ row['items'] }}|{{ row.to_dict }}|{{ row | attr('values') }}"
+    )
+    assert template.render(row=row) == "K|C|I|D|V"
+
+
+def test_the_template_row_keeps_every_documented_row_form() -> None:
+    """What a template may do with ``row`` is unchanged: dual-name reads, ``get``, ``in``, iteration, filters."""
+    template = create_sandboxed_environment().from_string(
+        "{{ row.amount_usd }}|{{ row['Amount USD'] }}|{{ row.get('Amount USD') }}|{{ row.get('absent') is none }}|"
+        "{{ 'Amount USD' in row }}|{{ 'absent' in row }}|{% for k in row %}{{ k }},{% endfor %}|{{ row | length }}|"
+        "{{ row | dictsort | map('first') | join(',') }}|{{ row.blob.data == row['blob']['data'] }}|{{ row.q.upper() }}|"
+        "{{ row | attr('q') }}"
+    )
+    assert template.render(row=_owned_api_row()) == ("5|5|5|True|True|False|amount_usd,q,blob,|3|amount_usd,blob,q|True|HELLO|hello")
+
+
+def test_row_values_render_exactly_as_the_frozen_pipeline_row_rendered_them() -> None:
+    """The projection carries the PipelineRow's deep-frozen values, so nested containers print as before."""
+    row = make_pipeline_row({"meta": {"a": 1}, "tags": [1, 2]})
+    template = create_sandboxed_environment().from_string("{{ row.meta }}|{{ row.tags }}|{{ row.meta.items() | list }}")
+    assert template.render(row=row) == "{'a': 1}|(1, 2)|[('a', 1)]"
+
+
+@pytest.mark.parametrize("owned", ["contract", "field"])
+def test_a_contract_object_in_a_template_context_is_a_framework_bug(owned: str) -> None:
+    """Only row values cross to the worker; a contract object in a context is the caller's bug, not a row fault."""
+    from elspeth.contracts.errors import FrameworkBugError
+
+    row = _owned_api_row()
+    value = row.contract if owned == "contract" else row.contract.fields[0]
+    with pytest.raises(FrameworkBugError) as caught:
+        create_sandboxed_environment().from_string("{{ x }}").render(x=value)
+    assert str(caught.value) == f"A template context carries a {type(value).__name__}: templates see row values only"
+
+
+def _parity_rows() -> list[object]:
+    from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+
+    fields = (
+        FieldContract("amount_usd", "Amount USD", int, True, "declared"),
+        FieldContract("note", "Note!", str, False, "declared", nullable=True),
+    )
+    rows = []
+    for mode in ("FIXED", "FLEXIBLE", "OBSERVED"):
+        contract = SchemaContract(mode=mode, fields=fields, locked=True)
+        rows.append(PipelineRow({"amount_usd": 5}, contract))  # optional field absent from the data
+        rows.append(PipelineRow({"amount_usd": 5, "note": "n"}, contract))
+        # An extra key the contract does not name (FLEXIBLE/OBSERVED read it; FIXED does not),
+        # and one spelled as an absent field's original name.
+        rows.append(PipelineRow({"amount_usd": 5, "extra": "e", "Note!": "raw"}, contract))
+    return rows
+
+
+@pytest.mark.parametrize("row_index", range(9))
+def test_the_projection_resolves_every_key_as_the_pipeline_row_does(row_index: int) -> None:
+    """``TemplateRow`` and ``PipelineRow.__getitem__`` agree on every spelling, in every schema mode.
+
+    The projection is built by the real transport (pack in the parent, restore in the worker).
+    """
+    pipeline_row = _parity_rows()[row_index]
+    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(pipeline_row))
+    assert type(projected) is template_infrastructure.TemplateRow
+
+    for key in ("amount_usd", "Amount USD", "note", "Note!", "extra", "absent"):
+        try:
+            expected: object = pipeline_row[key]
+        except KeyError:
+            expected = KeyError
+        try:
+            actual: object = projected[key]
+        except KeyError:
+            actual = KeyError
+        assert actual == expected, key
+        assert (key in projected) is (expected is not KeyError), key
+        assert projected.get(key) == pipeline_row.get(key), key
+    assert list(projected) == list(pipeline_row)
+    assert len(projected) == len(pipeline_row.keys())
+
+
+def test_the_template_row_is_immutable() -> None:
+    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(_owned_api_row()))
+    with pytest.raises(TypeError, match="immutable"):
+        projected.q = "changed"
+    with pytest.raises(TypeError, match="immutable"):
+        del projected.q
+    with pytest.raises(TypeError):
+        operator.setitem(projected, "q", "changed")
