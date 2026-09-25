@@ -1107,6 +1107,26 @@ class TestWholeRowAccess:
             "{% macro m() %}{{ kwargs }}{% endmacro %}{{ m(**{'r': row}['r']) }}",
             "{{ namespace(**{'r': row}['r']) }}",
             "{% macro m(r) %}{{ caller(r) }}{% endmacro %}{% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
+            # S0 fix round 2: arguments Jinja hands the body as varargs / kwargs, and caller keywords and defaults.
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ m(r=row) }}",
+            "{% macro m() %}{{ varargs[0] | items | list }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ varargs[0] | xmlattr }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ dict(varargs[0]) }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ '%(x)s' % kwargs.r }}{% endmacro %}{{ m(r=row) }}",
+            "{% macro m() %}{% for v in varargs %}{{ v | dictsort }}{% endfor %}{% endmacro %}{{ m(row) }}",
+            "{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(1, row) }}",
+            "{% macro m() %}{{ caller(*varargs) }}{% endmacro %}{% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ caller(**kwargs) }}{% endmacro %}{% call(x) m(x=row) %}{{ x | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ caller(x=row) }}{% endmacro %}{% call(x) m() %}{{ x | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ caller() }}{% endmacro %}{% call(x=row) m() %}{{ x | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0] | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ caller(r=row) }}{% endmacro %}{% call m() %}{{ kwargs.r | dictsort }}{% endcall %}",
+            "{% macro m() %}{{ varargs[0][0] | dictsort }}{% endmacro %}{{ m([row]) }}",
+            "{% set c = [row] %}{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(*c) }}",
+            "{% set d = {'r': row} %}{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ m(**d) }}",
+            "{% set c = [row] %}{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(1, *c) }}",
+            "{% set c = [1, row] %}{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(*c) }}",
         ],
     )
     def test_a_whole_row_used_as_a_value_is_dynamic_access(self, template: str) -> None:
@@ -1140,6 +1160,16 @@ class TestWholeRowAccess:
             "{% set d = {'a': row, 'n': 1} %}{{ d.a.q }}{{ d.n + 1 }}",
             "{% for r in [row] %}{{ r.q | upper }}{% endfor %}",
             "{% macro m(r) %}{{ r.q | upper }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}",
+            "{% macro m() %}{{ varargs[0] | upper }}{% endmacro %}{{ m(row.q) }}",
+            "{% macro m() %}{{ varargs[0].q | upper }}{% endmacro %}{{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r.q | upper }}{% endmacro %}{{ m(r=row) }}",
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(row.meta) }}",
+            "{% macro m(a, b) %}{{ b.q }}{% endmacro %}{% set c = [row] %}{{ m(1, *c) }}",
+            # A macro that does not name varargs rejects extra arguments; its kwargs is its own, not the global.
+            "{% macro m() %}x{% endmacro %}{{ m(row) }}",
+            "{% macro a() %}x{% endmacro %}{% macro b() %}{{ varargs[0] | upper }}{% endmacro %}{{ a(row) }}{{ b(row.q) }}",
+            "{% set kwargs = {'r': row} %}{% macro m() %}{{ kwargs | length }}{% endmacro %}{{ m() }}",
         ],
     )
     def test_names_repr_truthiness_and_carriers_are_not_whole_row_access(self, template: str) -> None:
@@ -1154,6 +1184,73 @@ class TestWholeRowAccess:
 
         assert result.fields == frozenset({"note"})
         assert result.dynamic_accesses == ("item", "whole-row")
+
+
+class TestImplicitMacroArguments:
+    """Arguments Jinja hands a macro or call block beyond its declared parameters are tracked (S0 fix round 2).
+
+    Jinja binds extra positionals to the body's ``varargs`` and unmatched keywords
+    to its ``kwargs`` whenever the body names them; ``caller(...)`` binds a call
+    block's parameters by position, keyword or default the same way.
+    """
+
+    @pytest.mark.parametrize(
+        ("template", "fields", "dynamic"),
+        [
+            ("{% macro m() %}{{ varargs[0].secret }}{% endmacro %}{{ row.note }} {{ m(row) }}", {"note", "secret"}, ()),
+            ("{% macro m() %}{{ kwargs.r.secret }}{% endmacro %}{{ row.note }} {{ m(r=row) }}", {"note", "secret"}, ()),
+            ("{% macro m(a) %}{{ varargs[0]['Amount USD'] }}{% endmacro %}{{ m(1, row) }}", {"Amount USD"}, ()),
+            ("{% macro m() %}{% for v in varargs %}{{ v.secret }}{% endfor %}{% endmacro %}{{ m(row, row) }}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller(x=row) }}{% endmacro %}{% call(x) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller() }}{% endmacro %}{% call(x=row) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0].secret }}{% endcall %}", {"secret"}, ()),
+            # A tuple holding a row is a row collection, so every item may be the row: the key is whole-row too.
+            ("{% macro m() %}{{ varargs[0][varargs[1]] }}{% endmacro %}{{ m(row, row.note) }}", {"note"}, ("item", "whole-row")),
+            ("{% macro m() %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(row.get) }}", set(), ("get",)),
+            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(*c) }}", set(), ("get",)),
+            ("{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}", set(), ()),
+            ("{% macro m() %}{{ varargs[0] | upper }}{% endmacro %}{{ m(row.note) }}", {"note"}, ()),
+        ],
+    )
+    def test_reads_through_varargs_kwargs_and_caller_are_extracted(self, template: str, fields: set[str], dynamic: tuple[str, ...]) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(template)
+
+        assert result.fields == frozenset(fields)
+        assert result.dynamic_accesses == dynamic
+
+    def test_a_splat_that_starts_at_varargs_zero_is_bound_to_varargs_whole(self) -> None:
+        """``m(*c)`` into ``m()`` makes ``varargs`` the items of ``c``, so a row inside one is found by its path."""
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(
+            "{% set c = [{'a': row}] %}{% macro m() %}{{ varargs[0].a.secret }}{{ varargs[0].a | dictsort }}{% endmacro %}{{ m(*c) }}"
+        )
+
+        # 'a' is the analysis's usual over-report for a lookup on a list that holds a row somewhere below.
+        assert result.fields == frozenset({"a", "secret"})
+        assert result.dynamic_accesses == ("whole-row",)
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{% set c = [row] %}{% macro m() %}{{ varargs[1] | upper }}{% endmacro %}{{ m(1, *c) }}",
+            "{% set c = [1, row] %}{% macro m(a) %}{{ varargs[0].q }}{% endmacro %}{{ m(*c) }}",
+            "{% set c = [row] %}{% macro m() %}{{ caller(1, *c) }}{% endmacro %}{% call m() %}{{ varargs[1].q }}{% endcall %}",
+        ],
+    )
+    def test_a_row_splat_the_analysis_cannot_place_in_varargs_fails_closed(self, template: str) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert "whole-row" in extract_jinja2_field_usage(template).dynamic_accesses
+
+    def test_a_splat_of_the_row_itself_hands_on_names_only(self) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage("{% macro m(a) %}{{ varargs | join(',') }}{% endmacro %}{{ m(1, *row) }}")
+
+        assert result.dynamic_accesses == ()
 
 
 def _extract_within(template: str, seconds: float = 10.0) -> Jinja2FieldExtraction:

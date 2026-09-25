@@ -210,6 +210,9 @@ class TestLLMConfigBase:
             "{{ row.note }} {{ '%(secret)s' % row }}",
             "{{ row.note }} {{ '{0[secret]}'.format(row) }}",
             "{% set c = [row] %}{{ row.note }} {{ c | map('dictsort') | list }}",
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ row.note }} {{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ row.note }} {{ m(r=row) }}",
+            "{% macro m() %}{{ caller(*varargs) }}{% endmacro %}{{ row.note }} {% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
         ),
     )
     def test_whole_row_value_rejected_even_with_declared_fields(self, template: str) -> None:
@@ -226,6 +229,27 @@ class TestLLMConfigBase:
         message = str(exc_info.value)
         assert "dynamic row field access (whole-row via a whole-row operand such as row|items or dict(row))" in message
         assert "options.required_input_fields: []" in message
+
+    @pytest.mark.parametrize(
+        "template",
+        (
+            "{% macro m() %}{{ varargs[0].secret }}{% endmacro %}{{ row.note }} {{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r.secret }}{% endmacro %}{{ row.note }} {{ m(r=row) }}",
+            "{% macro m() %}{{ caller(x=row) }}{% endmacro %}{{ row.note }} {% call(x) m() %}{{ x.secret }}{% endcall %}",
+        ),
+    )
+    def test_field_read_through_an_implicit_macro_argument_must_be_declared(self, template: str) -> None:
+        """A field read through ``varargs``, ``kwargs`` or a ``caller`` keyword is a read of that field (S0 fix round 2)."""
+        with pytest.raises(ValidationError) as exc_info:
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+        assert "LLM prompt_template reads 'secret' under 'row'" in str(exc_info.value)
 
     def test_self_holding_carrier_rejected_even_with_declared_fields(self) -> None:
         """An alias too deep to follow cannot be audited against the declared fields (S0 fix round 2)."""

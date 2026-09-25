@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment
+from jinja2.compiler import find_undeclared
 from jinja2.nodes import (
     And,
     Assign,
@@ -59,6 +60,7 @@ from jinja2.nodes import (
     Not,
     NSRef,
     Or,
+    Pair,
     Slice,
     Test,
     Tuple,
@@ -222,6 +224,10 @@ def extract_jinja2_field_usage(
     )
     if _template_uses_whole_row(ast, namespaces, row_collection_aliases, row_container_aliases):
         _append_dynamic_access(dynamic_accesses, WHOLE_ROW_DYNAMIC_ACCESS)
+    for kind in _shifted_varargs_splat_kinds(
+        ast, namespaces, api_aliases, row_api_container_aliases, row_collection_aliases, row_container_aliases
+    ):
+        _append_dynamic_access(dynamic_accesses, kind)
     if carrier_limit_reached:
         _append_dynamic_access(dynamic_accesses, CARRIER_LIMIT_DYNAMIC_ACCESS)
     return Jinja2FieldExtraction(fields=frozenset(fields), dynamic_accesses=tuple(dynamic_accesses))
@@ -637,10 +643,13 @@ def _template_uses_whole_row(
     """Whether any expression consumes a whole row as a value (see ``_WHOLE_ROW_FILTERS``).
 
     Carriers are not consumers: ``{% set r = row %}``, ``[row]``, ``{'r': row}``,
-    ``namespace(r=row)``, a macro argument and a ``for`` loop are tracked by
-    ``_field_extraction_context``, so a read through them is judged where it
-    happens. ``{{ row }}``, ``{% if row %}``, ``'x' in row`` and
-    ``{% for name in row %}`` see the row's repr, truthiness or field names only.
+    ``namespace(r=row)``, a ``for`` loop and every argument of a macro or
+    ``caller`` call are tracked by ``_field_extraction_context``, so a read
+    through them is judged where it happens. That includes arguments beyond the
+    declared parameters, which Jinja hands the body as ``varargs`` and
+    ``kwargs`` (see ``_call_argument_bindings``). ``{{ row }}``,
+    ``{% if row %}``, ``'x' in row`` and ``{% for name in row %}`` see the row's
+    repr, truthiness or field names only.
     """
 
     def whole(node: Node | None) -> bool:
@@ -671,8 +680,9 @@ def _template_uses_whole_row(
             if (isinstance(callee, Name) and callee.name == "caller") or _macro_names_for_callee(
                 callee, macros, macro_aliases, macro_container_aliases
             ):
-                # Macro arguments bind to tracked parameters; only a splatted
-                # row (its keys become arguments) is read here.
+                # Every argument binds to a tracked parameter, ``varargs`` or
+                # ``kwargs``; only a splatted row (its keys become arguments)
+                # is read here.
                 if row_object(node.dyn_kwargs):
                     return True
                 continue
@@ -700,6 +710,35 @@ def _template_uses_whole_row(
         elif isinstance(node, Slice) and any(whole(part) for part in (node.start, node.stop, node.step)):
             return True
     return False
+
+
+def _shifted_varargs_splat_kinds(
+    ast: Node,
+    namespaces: frozenset[str],
+    api_aliases: dict[str, str],
+    row_api_container_aliases: dict[str, dict[_CarrierPath, str]],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> list[str]:
+    """Dynamic-access kinds for rows or row API handed to ``varargs`` at an offset the analysis cannot place.
+
+    A splat that carries a row is ``whole-row``; one that carries the row's
+    API reports that API's kind. A splat of the row itself hands on field names
+    only.
+    """
+    macros = {macro.name: macro for macro in ast.find_all(Macro)}
+    macro_aliases, macro_container_aliases = _macro_alias_context(ast, macros)
+    kinds: list[str] = []
+    for splat in _shifted_varargs_splats(ast, macros, macro_aliases, macro_container_aliases):
+        if _node_is_row_carrier(splat, namespaces, row_collection_aliases, row_container_aliases):
+            kinds.append(WHOLE_ROW_DYNAMIC_ACCESS)
+        api_entries = _row_api_container_entries(
+            splat, api_aliases, row_api_container_aliases, namespaces, row_collection_aliases, row_container_aliases
+        )
+        api_kind = _merge_row_api_kinds(api_entries.values())
+        if api_kind is not None:
+            kinds.append(api_kind)
+    return kinds
 
 
 def _attribute_filter_arm_owns(node: Filter) -> bool:
@@ -1367,29 +1406,116 @@ def _macro_argument_bindings(
     macro_container_aliases: _MacroContainerAliases,
 ) -> list[tuple[Name, Node]]:
     bindings: list[tuple[Name, Node]] = []
-    for node in ast.find_all(Call):
-        for macro_name in _macro_names_for_callee(node.node, macros, macro_aliases, macro_container_aliases):
-            macro = macros[macro_name]
-            explicit_kwargs: dict[str, Node] = {keyword.key: keyword.value for keyword in node.kwargs}
-            if isinstance(node.dyn_kwargs, DictNode):
-                explicit_kwargs.update(_literal_kwarg_values(node.dyn_kwargs))
-            star_values = _literal_star_values(node.dyn_args)
-            default_offset = len(macro.args) - len(macro.defaults)
-            for index, target in enumerate(macro.args):
-                if index < len(node.args):
-                    bindings.append((target, node.args[index]))
-                    continue
-                star_index = index - len(node.args)
-                if star_index < len(star_values):
-                    bindings.append((target, star_values[star_index]))
-                    continue
-                if target.name in explicit_kwargs:
-                    bindings.append((target, explicit_kwargs[target.name]))
-                    continue
-                default_index = index - default_offset
-                if default_index >= 0:
-                    bindings.append((target, macro.defaults[default_index]))
+    for macro, call in _macro_calls(ast, macros, macro_aliases, macro_container_aliases):
+        bindings.extend(_call_argument_bindings(macro, call))
     return bindings
+
+
+def _macro_calls(
+    ast: Node,
+    macros: dict[str, Macro],
+    macro_aliases: _MacroAliases,
+    macro_container_aliases: _MacroContainerAliases,
+) -> list[tuple[Macro, Call]]:
+    """Every call of a macro the callee may name, with the macro it binds."""
+    return [
+        (macros[macro_name], node)
+        for node in ast.find_all(Call)
+        for macro_name in _macro_names_for_callee(node.node, macros, macro_aliases, macro_container_aliases)
+    ]
+
+
+def _caller_calls(
+    ast: Node,
+    macros: dict[str, Macro],
+    macro_aliases: _MacroAliases,
+    macro_container_aliases: _MacroContainerAliases,
+) -> list[tuple[CallBlock, Call]]:
+    """Every ``caller(...)`` in a macro a ``{% call %}`` block invokes, with that block."""
+    return [
+        (node, caller_call)
+        for node in ast.find_all(CallBlock)
+        for macro_name in _macro_names_for_callee(node.call.node, macros, macro_aliases, macro_container_aliases)
+        for caller_call in macros[macro_name].find_all(Call)
+        if isinstance(caller_call.node, Name) and caller_call.node.name == "caller"
+    ]
+
+
+def _call_argument_bindings(scope: Macro | CallBlock, call: Call) -> list[tuple[Name, Node]]:
+    """What each parameter of a macro or call block may hold after ``call``, as Jinja binds it.
+
+    Positional arguments (explicit, then a literal ``*`` list) fill the declared
+    parameters in order, keywords (explicit, then a literal ``**`` dict) fill
+    them by name, and defaults fill the rest. A body that names ``varargs`` or
+    ``kwargs`` (``find_undeclared``, the rule Jinja compiles the body by) also
+    receives what is left over: the extra positionals as the tuple ``varargs``,
+    the unmatched keywords as the dict ``kwargs``. An opaque ``**`` splat may
+    supply any keyword, so ``kwargs`` is bound to it whole. An opaque ``*``
+    splat is bound to ``varargs`` whole, which places its items exactly only
+    when it starts at ``varargs[0]``; ``_shifted_varargs_splats`` fails closed
+    on the others.
+
+    The analysis keys aliases by name, not scope, so every macro's ``varargs``
+    is one name: a row that reaches one macro's ``varargs`` is assumed to reach
+    them all, which can only over-report.
+    """
+    bindings: list[tuple[Name, Node]] = []
+    keywords: dict[str, Node] = {keyword.key: keyword.value for keyword in call.kwargs}
+    if isinstance(call.dyn_kwargs, DictNode):
+        keywords.update(_literal_kwarg_values(call.dyn_kwargs))
+    positionals = [*call.args, *_literal_star_values(call.dyn_args)]
+    default_offset = len(scope.args) - len(scope.defaults)
+    for index, target in enumerate(scope.args):
+        if index < len(positionals):
+            bindings.append((target, positionals[index]))
+        elif target.name in keywords:
+            bindings.append((target, keywords[target.name]))
+        elif index >= default_offset:
+            bindings.append((target, scope.defaults[index - default_offset]))
+    implicit = find_undeclared(scope.body, ("varargs", "kwargs"))
+    if "varargs" in implicit:
+        varargs = Name("varargs", "param")
+        extra_positionals = positionals[len(scope.args) :]
+        if extra_positionals:
+            bindings.append((varargs, Tuple(extra_positionals, "load")))
+        if call.dyn_args is not None and _has_unknown_star_values(call.dyn_args):
+            bindings.append((varargs, call.dyn_args))
+    if "kwargs" in implicit:
+        kwargs = Name("kwargs", "param")
+        declared = {target.name for target in scope.args}
+        unmatched = [Pair(Const(key), value) for key, value in keywords.items() if key not in declared]
+        if unmatched:
+            bindings.append((kwargs, DictNode(unmatched)))
+        if call.dyn_kwargs is not None and _has_unknown_kwarg_values(call.dyn_kwargs):
+            bindings.append((kwargs, call.dyn_kwargs))
+    return bindings
+
+
+def _shifted_varargs_splats(
+    ast: Node,
+    macros: dict[str, Macro],
+    macro_aliases: _MacroAliases,
+    macro_container_aliases: _MacroContainerAliases,
+) -> list[Node]:
+    """Opaque ``*`` splats whose items land in ``varargs`` at an offset the analysis cannot place.
+
+    ``m(1, *c)`` into ``m()`` puts ``c[0]`` at ``varargs[1]``; ``m(*c)`` into
+    ``m(a)`` puts it in ``a`` and ``c[1]`` at ``varargs[0]``. The whole-splat
+    binding in ``_call_argument_bindings`` records ``c``'s items at their own
+    indexes, so a read of ``varargs[i]`` may miss them.
+    """
+    scoped_calls: list[tuple[Macro | CallBlock, Call]] = [
+        *_macro_calls(ast, macros, macro_aliases, macro_container_aliases),
+        *_caller_calls(ast, macros, macro_aliases, macro_container_aliases),
+    ]
+    return [
+        call.dyn_args
+        for scope, call in scoped_calls
+        if call.dyn_args is not None
+        and _has_unknown_star_values(call.dyn_args)
+        and len(call.args) != len(scope.args)
+        and "varargs" in find_undeclared(scope.body, ("varargs",))
+    ]
 
 
 def _macro_row_splat_targets(
@@ -1457,25 +1583,13 @@ def _callblock_argument_bindings(
     macro_aliases: _MacroAliases,
     macro_container_aliases: _MacroContainerAliases,
 ) -> list[tuple[Name, Node]]:
+    # CallBlock.args is jinja2's declared List[Name] (parser grammar): a
+    # non-Name element is parse-tree corruption that must crash via .name,
+    # never be silently unbound (an unbound target loses the security binding
+    # this analysis exists to trace).
     bindings: list[tuple[Name, Node]] = []
-    for node in ast.find_all(CallBlock):
-        for macro_name in _macro_names_for_callee(node.call.node, macros, macro_aliases, macro_container_aliases):
-            macro = macros[macro_name]
-            for caller_call in macro.find_all(Call):
-                if not isinstance(caller_call.node, Name) or caller_call.node.name != "caller":
-                    continue
-                # CallBlock.args is jinja2's declared List[Name] (parser
-                # grammar): no isinstance filters — a non-Name element is
-                # parse-tree corruption that must crash via .name, never be
-                # silently unbound (an unbound target loses the security
-                # binding this analysis exists to trace).
-                bindings.extend(zip(node.args, caller_call.args, strict=False))
-                star_values = _literal_star_values(caller_call.dyn_args)
-                explicit_count = len(caller_call.args)
-                bindings.extend(zip(node.args[explicit_count:], star_values, strict=False))
-                if isinstance(caller_call.dyn_kwargs, DictNode):
-                    dyn_kwargs = _literal_kwarg_values(caller_call.dyn_kwargs)
-                    bindings.extend((target, dyn_kwargs[target.name]) for target in node.args if target.name in dyn_kwargs)
+    for call_block, caller_call in _caller_calls(ast, macros, macro_aliases, macro_container_aliases):
+        bindings.extend(_call_argument_bindings(call_block, caller_call))
     return bindings
 
 

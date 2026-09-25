@@ -160,6 +160,15 @@ class TestSourceRowReadsWithoutAColumnName:
             ("{{ row.text }} {% for k in row.source_row %}{{ row.source_row[k] }}{% endfor %}", "item via row[expr]"),
             ("{{ row.text }} {{ row.source_row.get(row.text) }}", "get via row.get(expr)"),
             ("{% set s = row.source_row %}{{ row.text }} {{ s[row.text] }}", "item via row[expr]"),
+            # S0 fix round 2: the row handed to a macro's implicit varargs / kwargs.
+            (
+                "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ row.text }} {{ m(row.source_row) }}",
+                "whole-row via a whole-row operand such as row|items or dict(row)",
+            ),
+            (
+                "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ row.text }} {{ m(r=row.source_row) }}",
+                "whole-row via a whole-row operand such as row|items or dict(row)",
+            ),
         ],
     )
     def test_declared_contract_cannot_vouch_for_the_read(self, template: str, kind: str) -> None:

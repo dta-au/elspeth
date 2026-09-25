@@ -1139,7 +1139,9 @@ computed key (`row[k]`, `row.get(k)`, `row | attr(k)`), and a whole row used as
 a value, such as `row | items`, `row | dictsort`, `dict(row)`,
 `'%(name)s' % row`, `'{0[name]}'.format(row)` or `row == {...}`. The same
 applies through an alias (`{% set r = row %}`), a list, dict or `namespace`
-holding the row, and a macro argument. Validation follows each variable through
+holding the row, and any argument of a macro or `caller()` call: a declared
+parameter, its default, and the extra arguments a macro body reads as
+`varargs` or `kwargs`. Validation follows each variable through
 every assignment at once, not in template order, so a variable that is
 reassigned to a container holding itself (`{% set a = {'k': row} %}` then
 `{% set a = {'k': a} %}`) cannot be followed and is rejected as
