@@ -1054,6 +1054,37 @@ describe("GraphView", () => {
       expect(screen.getByTestId("edge-inferred-conn-transform1-transform2-success-success")).toBeInTheDocument();
     });
 
+    it("shows one route per connection when explicit success edges have descriptive labels", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "content_rows" },
+          },
+          nodes: [makeNode({
+            id: "split_lines",
+            plugin: "line_explode",
+            input: "content_rows",
+            on_success: "lines_out",
+          })],
+          outputs: [{ name: "lines_out", plugin: "text", options: {} }],
+          edges: [
+            makeEdge({ from_node: "source", to_node: "split_lines", label: "csv rows" }),
+            makeEdge({ from_node: "split_lines", to_node: "lines_out", label: "one line per record" }),
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      const connections = screen.getByRole("list", { name: "Pipeline branch connections" });
+
+      expect(container.querySelectorAll('[data-edge-source="source"][data-edge-target="split_lines"]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-edge-source="split_lines"][data-edge-target="lines_out"]')).toHaveLength(1);
+      expect(within(connections).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+        "source to split_lines: csv rows (success)",
+        "split_lines to lines_out: one line per record (success)",
+      ]);
+    });
+
     it("infers transform→sink edges via direct sink references", () => {
       // When on_success points directly to a sink name (not a connection point)
       useSessionStore.setState({

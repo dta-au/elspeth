@@ -1272,10 +1272,24 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     const existingConnections = new Set(
       rfEdges.map(edgeModelSemanticIdentity),
     );
+    const explicitSuccessEdgeIds = new Set(
+      rfEdges.filter((_, index) => explicitEdges[index]?.edge_type === "on_success")
+        .map((edge) => edge.id),
+    );
     function rebuildExistingConnections(): void {
       existingConnections.clear();
       for (const edge of rfEdges) {
         existingConnections.add(edgeModelSemanticIdentity(edge));
+        // An explicit on_success edge may use a descriptive display label.
+        // It still represents the success route inferred from connection names.
+        if (explicitSuccessEdgeIds.has(edge.id)) {
+          existingConnections.add(edgeSemanticIdentity(
+            edge.source,
+            edge.target,
+            "success",
+            "success",
+          ));
+        }
       }
     }
     const explicitEdgeIndexesByConnection = new Map<string, number[]>();
