@@ -29,8 +29,17 @@ the same commit; the rules live there, the history lives here.
   resource tracker on a process's first spawn and unblocks SIGINT in the calling thread afterwards (bpo-33613), so a
   mask set around `Process.start()` silently did nothing for the first worker of every process. `ensure_running()`
   now runs before the block. A mask-leak mutant survived one test round only because random order sometimes made
-  its test the process's first spawn; only a fresh interpreter (`test_the_first_worker_a_process_starts_holds_an_interrupt_too`)
+  its test the process's first spawn; only a fresh interpreter (`test_the_first_worker_a_process_starts_holds_a_stop_too`)
   sees the first-spawn case.
+  S3b (RC-9, capacity and timing): a worker's first message is now `("ready", "")`, sent once its interpreter has
+  started and its memory limit is set, and `_start_worker` waits for it (up to 60 s; a worker that never becomes ready
+  is a `FrameworkBugError`). The 5 s render clock starts after it, so a slow start is no longer charged to a row. A test
+  that spawns `_template_worker` itself and talks to the pipe must read that message first (`_await_ready` in
+  `test_template_worker_failures.py`), or it takes `ready` for the request's reply. The worker ignores SIGTERM as well
+  as SIGINT, because systemd's default stop sends SIGTERM to every process in the unit and the run stops gracefully on
+  it. A worker ended by any other signal raises the retryable `TemplateWorkerLostError`, which is a
+  `PluginRetryableError` and not a `TemplateError`. SIGXCPU is the row's only while a request renders. All workers
+  busy is backpressure, not an error: `_WORKER_SLOTS.acquire()` has blocked since 313a85bb1.
   See [CONTRIBUTING: Gate: template renderers and the Tier-1 process-boundary latch](../../CONTRIBUTING.md#gate-template-renderers-and-the-tier-1-process-boundary-latch).
 
 - **2026-09-24 — no bare `TypeError` may escape a plugin's `process` path** (elspeth-5887fb7928, lane

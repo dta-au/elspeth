@@ -8,7 +8,8 @@ reaches the template as a ``TemplateRow``, its field values only, so no
 template can reach the row object, its schema contract or their methods.
 Constant folding of authored expressions
 is disabled during bounded-size compilation; rendering runs in a child process
-with CPU, memory, input and output ceilings.
+with CPU, memory, input and output ceilings. When every worker is busy a render
+waits for one; a worker lost to a signal the row did not cause is retried.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from jinja2.utils import missing, object_type_repr
 from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.templates import validate_jinja_source
@@ -46,6 +48,21 @@ from elspeth.core.templates import validate_jinja_source
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
+
+
+class TemplateWorkerLostError(PluginRetryableError):
+    """The render worker was ended mid-request by a signal the row did not cause.
+
+    RLIMIT_CPU's SIGXCPU is the row's template running out of CPU and is a
+    ``TemplateError``. Any other signal (the kernel's OOM killer, an
+    operator's kill, a crash) says nothing about the row, so the render is
+    retried under the run's retry policy on a new worker: the engine's
+    ``RetryManager`` records each attempt, and a pooled multi-query LLM node
+    retries the one query. The message names the signal number only.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=True)
 
 
 _MAX_RENDER_BYTES = 4 * 1024 * 1024
@@ -56,14 +73,25 @@ _MAX_CONTEXT_NODES = 65536
 # mappings. Cap growth from the spawned worker's own baseline, not an absolute
 # address size that depends on which web/test modules Python imported.
 _MAX_WORKER_ADDRESS_GROWTH = 256 * 1024 * 1024
+# The render's wall clock. It starts when the request reaches a worker that
+# has reported ready, so interpreter start and imports are never charged to a row.
 _WORKER_TIMEOUT_SECONDS = 5.0
-# Two reusable workers bound CPU and memory use. An ordinary row waits for a
-# slot instead of becoming a template error when the host is busy.
-_WORKER_SLOTS = threading.BoundedSemaphore(2)
+# How long a new worker may take to report ready. Starting ELSPETH's own
+# worker is not row work: one that never becomes ready is ELSPETH's failure.
+_WORKER_START_TIMEOUT_SECONDS = 60.0
+# The signals the run handles as a graceful stop (engine/orchestrator/shutdown.py).
+# A terminal's Ctrl-C and systemd's default stop send them to every process
+# in the group or unit, render workers included; the worker ignores both.
+_RUN_STOP_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
+# Reusable workers bound CPU and memory use. _WORKER_SLOTS is the one
+# admission authority: a row waits for a slot (backpressure) instead of
+# becoming a template error when every worker is busy.
+_WORKER_COUNT = 2
+_WORKER_SLOTS = threading.BoundedSemaphore(_WORKER_COUNT)
 _AVAILABLE_WORKERS: queue.SimpleQueue[int] = queue.SimpleQueue()
-for _worker_index in range(2):
+for _worker_index in range(_WORKER_COUNT):
     _AVAILABLE_WORKERS.put(_worker_index)
-_WORKERS: list[tuple[multiprocessing.Process, Any] | None] = [None, None]
+_WORKERS: list[tuple[multiprocessing.Process, Any] | None] = [None] * _WORKER_COUNT
 
 
 def _charge_row_export(value: Any, budget: list[int], *, depth: int = 0) -> None:
@@ -318,21 +346,28 @@ def _template_worker(connection: Any) -> None:
     protocol itself exits with status 1 and no reply, which the parent treats
     as a framework bug.
 
-    The worker ignores SIGINT. A terminal's Ctrl-C goes to the run's whole
-    process group, and the interrupt is the run's to handle: the orchestrator
+    The worker's first message is ``ready``, sent once its interpreter has
+    started and its memory limit is set; the parent starts a render's wall
+    clock only after it (``_start_worker``).
+
+    The worker ignores SIGINT and SIGTERM. A terminal's Ctrl-C goes to the
+    run's whole process group, systemd's default stop sends SIGTERM to every
+    process in the unit, and the stop is the run's to handle: the orchestrator
     lets in-flight work finish (``engine/orchestrator/shutdown.py``). The
     worker's own lifetime is the pipe (EOF ends it) and the parent's kill. The
-    parent spawns it with SIGINT blocked, so an interrupt that arrives while
+    parent spawns it with both signals blocked, so a stop that arrives while
     the interpreter starts stays pending until the ``SIG_IGN`` here discards it.
     """
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+    for signum in _RUN_STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _RUN_STOP_SIGNALS)
     try:
         try:
             _limit_worker_address_space()
         except Exception as exc:
             connection.send(("setup_failed", type(exc).__name__))
             raise SystemExit(1) from None
+        connection.send(("ready", ""))
         while True:
             try:
                 source, payload, value_free = connection.recv()
@@ -446,26 +481,69 @@ def _stop_template_workers() -> None:
 register_exit(_stop_template_workers)
 
 
-def _worker_death(process: Any) -> Exception:
+def _worker_death(process: Any, *, rendering: bool) -> Exception:
     """Classify a worker that closed the pipe without replying, by how it ended.
 
     The worker replies to every request it can (``_template_worker``), so a
     missing reply means the process ended. Only its exit status says why, and
-    the text names that status alone. RLIMIT_CPU's SIGXCPU is this row's
-    template running out of its CPU seconds. Another signal (the kernel's OOM
-    killer, an operator's kill) says nothing about the row; how such a death
-    should be handled is a separate decision, so it keeps the routed outcome
-    under its own reason. An exit with no signal is ELSPETH's bug: the worker
-    ignores SIGINT, the one signal Python turns into an exception, so no
-    signal can end it with a status.
+    the text names that status alone.
+
+    - SIGXCPU while rendering is this row's template running out of its CPU
+      seconds (RLIMIT_CPU is set per request): a routed ``TemplateError``.
+    - Any other signal, or SIGXCPU before a request was rendering, says
+      nothing about the row (the kernel's OOM killer, an operator's kill, a
+      crash): ``TemplateWorkerLostError``, which the run retries. A stop the
+      run handles itself (SIGINT, SIGTERM) never ends a worker: it ignores both.
+    - An exit with no signal is ELSPETH's bug: the worker leaves only through
+      ``SystemExit``, after a reply or on EOF, so none can end it silently.
     """
     process.join(_WORKER_TIMEOUT_SECONDS)
     exitcode = process.exitcode
-    if exitcode == -signal.SIGXCPU:
+    if rendering and exitcode == -signal.SIGXCPU:
         return TemplateError("Template exceeded the CPU limit")
     if exitcode is not None and exitcode < 0:
-        return TemplateError(f"Template worker was stopped by signal {-exitcode}")
+        return TemplateWorkerLostError(f"Template worker was stopped by signal {-exitcode}")
     return FrameworkBugError(f"Template worker ended without a reply (exit status {exitcode})")
+
+
+def _start_worker(index: int) -> tuple[Any, Any]:
+    """Spawn worker ``index`` and wait until it reports ready.
+
+    The worker is registered before the wait, so a caller that fails here
+    retires it like any other worker whose exchange did not complete.
+    """
+    process_context = multiprocessing.get_context("spawn")
+    parent, child = process_context.Pipe(duplex=True)
+    process = cast("Any", process_context).Process(target=_template_worker, args=(child,))
+    process.daemon = True
+    # The child inherits this thread's signal mask: a stop signal during its
+    # interpreter start stays pending until the worker ignores it
+    # (``_template_worker``). multiprocessing starts its resource tracker on a
+    # process's first spawn and unblocks SIGINT and SIGTERM in this thread
+    # afterwards (bpo-33613), so it is started before the block, never inside it.
+    resource_tracker.ensure_running()
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _RUN_STOP_SIGNALS)
+    try:
+        process.start()
+    except BaseException:
+        parent.close()
+        child.close()
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    child.close()
+    _WORKERS[index] = (process, parent)
+    try:
+        if not parent.poll(_WORKER_START_TIMEOUT_SECONDS):
+            raise FrameworkBugError(f"Template worker did not become ready within {_WORKER_START_TIMEOUT_SECONDS:g} s")
+        status, value = parent.recv()
+    except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
+        raise _worker_death(process, rendering=False) from exc
+    if status == "setup_failed":
+        raise FrameworkBugError(f"Template worker setup failed: {value}")
+    if status != "ready":
+        raise FrameworkBugError("Template worker's first message was not ready")
+    return process, parent
 
 
 def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
@@ -477,29 +555,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         entry = _WORKERS[index]
         if entry is None or not entry[0].is_alive():
             _retire_worker(index)
-            process_context = multiprocessing.get_context("spawn")
-            parent, child = process_context.Pipe(duplex=True)
-            process = cast("Any", process_context).Process(target=_template_worker, args=(child,))
-            process.daemon = True
-            # The child inherits this thread's signal mask: an interrupt
-            # during its interpreter start stays pending until the worker
-            # ignores SIGINT (``_template_worker``). multiprocessing starts
-            # its resource tracker on a process's first spawn and unblocks
-            # SIGINT in this thread afterwards (bpo-33613), so it is started
-            # before the block, never inside it.
-            resource_tracker.ensure_running()
-            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-            try:
-                process.start()
-            except BaseException:
-                parent.close()
-                child.close()
-                raise
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-            child.close()
-            _WORKERS[index] = (process, parent)
-            entry = (process, parent)
+            entry = _start_worker(index)
         process, parent = entry
         try:
             parent.send((source, payload, value_free))
@@ -510,7 +566,7 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
             # A worker that ended with the request still unread resets the
             # socket instead of closing it; either way it is a death.
-            raise _worker_death(process) from exc
+            raise _worker_death(process, rendering=True) from exc
         if status == "setup_failed":
             # The worker exits after this reply; do not hand its slot on.
             _retire_worker(index)
@@ -902,9 +958,14 @@ class SandboxedTemplate:
             TemplateError: A per-row operational failure, prefixed by its kind
                 (``Undefined variable``, ``Sandbox violation``, ``Template
                 rendering failed``) with a value-free detail.
+            TemplateWorkerLostError: The worker was ended by a signal the row
+                did not cause. Retryable: the run retries the render.
             FrameworkBugError: ELSPETH's own failure (packing the context,
-                preparing the worker, a broken worker protocol or Jinja
-                contract). Tier-1: it aborts the run, never becomes a row error.
+                starting or preparing the worker, a broken worker protocol or
+                Jinja contract). Tier-1: it aborts the run, never becomes a row
+                error.
+
+        All workers busy is not a failure: the render waits for one.
         """
         try:
             return self._template.render(**context)

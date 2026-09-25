@@ -517,6 +517,9 @@ def test_the_worker_reports_a_broken_undefined_contract_under_its_own_status() -
     process.start()
     child.close()
     try:
+        # A worker's first message reports it ready (S3b); the request's reply follows.
+        assert parent.poll(60), "the worker never reported ready"
+        assert parent.recv() == ("ready", "")
         parent.send(("{{ row.missing }}", payload, True))
         assert parent.poll(60), "the worker sent nothing"
         status, message = parent.recv()

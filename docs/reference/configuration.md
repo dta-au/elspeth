@@ -1133,9 +1133,30 @@ example `Template rendering failed: KeyError (message withheld: it can quote
 row data)`, because Python's and Jinja's own messages can quote row values. A
 template that uses up its CPU allowance fails the row with `Template exceeded
 the CPU limit`.
-Interrupting a run (Ctrl-C) lets a template render already in progress finish:
-the render worker leaves the interrupt to the run, which stops after its
-in-flight rows.
+
+Templates render in two reusable worker processes. The limits apply to the
+render only, never to waiting for or starting a worker:
+
+- **All workers busy.** A row waits for a free worker. Waiting never fails the
+  row, however many rows are queued.
+- **Worker start.** A new worker may take up to 60 seconds to start. That time
+  is not charged to any row. A worker that does not start in time stops the
+  run as an ELSPETH failure, because starting a worker is not row work.
+- **Render time.** The 5-second wall clock starts when the row's request
+  reaches a running worker. A render that exceeds it fails the row with
+  `Template exceeded the execution time limit`.
+- **Worker lost.** A worker ended by a signal the row did not cause (the
+  kernel's out-of-memory killer, an operator's `kill`, a crash) raises a
+  retryable error, `Template worker was stopped by signal N`. The run's
+  [retry settings](#retry-settings) retry the row on a new worker, and a pooled
+  multi-query LLM node retries the one query within `max_capacity_retry_seconds`.
+  Only when the retries are used up does the row go to `on_error`. A worker
+  that exits with no signal and no reply stops the run as an ELSPETH failure.
+
+Stopping a run with Ctrl-C (SIGINT) or SIGTERM lets a template render already
+in progress finish. systemd's default stop sends SIGTERM to every process in
+the service, render workers included. The render worker ignores both signals
+and leaves the stop to the run, which stops after its in-flight rows.
 
 **Template variables.** A `prompt_template` sees two variables, `row` and
 `lookup` (the configured lookup mapping). `row` holds the row's field values
