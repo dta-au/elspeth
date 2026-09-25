@@ -1,5 +1,7 @@
 """Tests for FieldMapper transform."""
 
+from typing import Any
+
 import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
@@ -923,6 +925,30 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config is not None
         by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
         assert by_name["b"].field_type == "str", "the target's authored declaration must survive when the source carries none"
+
+    @pytest.mark.parametrize(
+        ("fields", "carried"),
+        [
+            pytest.param(["b: int"], set(), id="target-only-declaration-is-not-carried"),
+            pytest.param(["a: float"], {"b"}, id="source-declaration-is-carried"),
+            pytest.param(["a: str", "b: int"], {"b"}, id="both-declared-source-wins-and-is-carried"),
+            pytest.param(["id: int"], {"b"}, id="undeclared-rename-is-carried"),
+            pytest.param(None, {"b"}, id="observed-rename-is-carried"),
+        ],
+    )
+    def test_a_rename_is_carried_unless_only_its_target_is_declared(self, fields: list[str] | None, carried: set[str]) -> None:
+        """Only a rename whose target inherits the SOURCE's contract is carried (ADR-050, review-S1a-r1 F1).
+
+        A declaration the author wrote against the target name alone is the
+        operator's, not the input field's: no input check held the value to
+        it, so the engine must value-check it, which it skips for carried names.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        schema: dict[str, Any] = {"mode": "observed"} if fields is None else {"mode": "flexible", "fields": fields}
+        transform = FieldMapper({"mapping": {"a": "b"}, "schema": schema})
+
+        assert transform.carried_output_fields() == carried
 
     def test_rename_collision_is_described_by_the_source_that_lands_there(self) -> None:
         """Projection describes the attempted value even though runtime rejects it.

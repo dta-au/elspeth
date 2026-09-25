@@ -943,10 +943,13 @@ class BaseTransform(ABC):
         A carried field is not created: its value is an upstream field's value
         under that field's contract — a source-locked or upstream-declared
         type that is the same on every row — so the stamp must not rewrite it
-        to ``any``. The one shipped case is a field_mapper rename, whose
+        to ``any``. The one shipped case is a field_mapper rename whose
         target inherits the source field's contract through
         ``narrow_contract_to_output``. A dotted extraction is NOT carried: its
-        value's type is not in any contract, so it is created (``any``).
+        value's type is not in any contract, so it is created (``any``). Nor
+        is a rename the operator declared by its TARGET name alone: that
+        declaration is not the source field's contract, and no input check
+        held the value to it.
 
         Excluded from the ``any`` fallback in ``_stamped_output_field_contracts``,
         admitted by the post-emission completeness check as contract-carrying

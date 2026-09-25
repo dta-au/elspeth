@@ -313,7 +313,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d87d0325cdeb243f"
+    source_file_hash: str | None = "sha256:e424629ddeb631e4"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -357,6 +357,16 @@ class FieldMapper(BaseTransform):
         self._schema_config = cfg.schema_config
 
         self.declared_output_fields = self._derive_declared_output_fields(cfg)
+        authored_fields = cfg.schema_config.fields
+        authored_names = frozenset() if authored_fields is None else frozenset(field.name for field in authored_fields)
+        # A flat rename whose declaration the author wrote against the EMITTED
+        # name carries the operator's contract, not the source field's, so it
+        # is not a carried field: the engine must check its value (ADR-050).
+        self._flat_renames_declared_on_target = frozenset(
+            target
+            for source, target in cfg.mapping.items()
+            if "." not in source and self._declaration_is_authored_on_target(source, target, authored_names)
+        )
 
         # Rename targets are created here, never required on input. Requiring
         # one is the elspeth-d6eeb3a71d trap, so every non-identity target
@@ -437,7 +447,8 @@ class FieldMapper(BaseTransform):
         """A dotted extraction's target is created ``any``: the nested value's type is in no contract (ADR-050).
 
         A flat rename is NOT declared here — it carries the source field's
-        contract (``carried_output_fields``).
+        contract (``carried_output_fields``), or, when the author declared
+        only its target, the output config's projection of that declaration.
         """
         return tuple(
             FieldDefinition(name=target, field_type="any", required=True, nullable=True)
@@ -446,8 +457,32 @@ class FieldMapper(BaseTransform):
         )
 
     def carried_output_fields(self) -> frozenset[str]:
-        """A flat rename target carries the source field's contract; the stamp leaves it alone."""
-        return frozenset(target for source, target in self._mapping.items() if "." not in source and source != target)
+        """A flat rename target carries the source field's contract; the stamp leaves it alone.
+
+        Except a target the author declared by its EMITTED name while leaving
+        the source undeclared (``_declaration_is_authored_on_target``): its
+        contract is the operator's declaration of the target, which no input
+        check ever held the value to, so it is not carried and the engine's
+        value check sees it (ADR-050). A source-declared rename stays carried:
+        the strict input check admitted the value under the declaration the
+        target inherits.
+        """
+        return frozenset(
+            target
+            for source, target in self._mapping.items()
+            if "." not in source and source != target and target not in self._flat_renames_declared_on_target
+        )
+
+    @staticmethod
+    def _declaration_is_authored_on_target(source: str, target: str, authored_names: frozenset[str]) -> bool:
+        """Whether a rename's emitted declaration is the author's declaration of the TARGET, not the source's.
+
+        The one predicate behind both the output projection's fallback limb
+        (``_project_field_declarations_onto_output``) and the carried set
+        (``carried_output_fields``), so the two cannot disagree about whose
+        contract a rename target carries.
+        """
+        return source != target and source not in authored_names and target in authored_names
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
@@ -519,6 +554,7 @@ class FieldMapper(BaseTransform):
             return None
 
         authored = {field.name: field for field in fields}
+        authored_names = frozenset(authored)
         projected: dict[str, FieldDefinition] = {}
 
         # Emitted targets first, so a target that collides with an unmapped
@@ -530,12 +566,10 @@ class FieldMapper(BaseTransform):
         for source, target in cfg.mapping.items():
             if source == target:
                 declaration = authored[source] if source in authored else None
+            elif cls._declaration_is_authored_on_target(source, target, authored_names):
+                declaration = authored[target]
             else:
-                source_field = authored[source] if source in authored else None
-                if source_field is not None:
-                    declaration = replace(source_field, name=target)
-                else:
-                    declaration = authored[target] if target in authored else None
+                declaration = replace(authored[source], name=target) if source in authored else None
             if declaration is not None:
                 projected[target] = declaration
 

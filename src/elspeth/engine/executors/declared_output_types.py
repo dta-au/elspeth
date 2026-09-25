@@ -15,8 +15,11 @@ Two seams call it, and they differ ONLY in which fields count as produced:
   a resumed row legitimately carries a type-faithful ``Decimal`` under its
   ``float`` declaration. For the same reason a ``carried_output_fields()``
   name is never produced: its value is an input field's value copied under a
-  new name (a field_mapper rename), already admitted by the input check, and
-  the completeness contract exempts the same names.
+  new name and its declaration is that input field's (a field_mapper rename
+  whose target inherits the source's contract), already admitted by the input
+  check, and the completeness contract exempts the same names. A rename the
+  operator declared by its TARGET name alone is not carried — no input check
+  held the value to that declaration — so it is checked like a created field.
 * ``verify_created_output_types`` — the batch-flush seam
   (``batch_contract_validation.validate_success_outputs``, shared by the
   aggregation and collector executors). A batch output row has no single

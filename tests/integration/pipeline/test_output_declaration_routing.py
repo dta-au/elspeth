@@ -392,7 +392,7 @@ class TestValueTransformAsATypedConsumer:
 
 
 def test_a_field_mapper_rename_of_a_declared_field_is_not_re_adjudicated(tmp_path: Path) -> None:
-    """A rename target carries the input value the strict input check admitted: ``int`` under ``float`` is delivered.
+    """A rename whose target inherits the source's declaration carries the admitted value: ``int`` under ``float`` is delivered.
 
     ``carried_output_fields()`` names are never produced (``declared_output_types``):
     the projected ``total: float`` declaration and the exact-type value check
@@ -407,6 +407,65 @@ def test_a_field_mapper_rename_of_a_declared_field_is_not_re_adjudicated(tmp_pat
     assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "total": 5}, {"id": 2, "total": 7}]
     assert _transform_error_reasons(tmp_path) == []
     assert _outcomes(tmp_path) == {("success", "default_flow"): 2}
+
+
+def test_a_rename_declared_only_by_its_target_name_is_value_checked(tmp_path: Path) -> None:
+    """The operator's ``b: int`` on a rename TARGET is enforced: the str row is routed, the int row delivered.
+
+    No input check ever held ``a``'s value to a declaration written against
+    ``b`` (the source is observed and undeclared here), so the target is not a
+    ``carried_output_fields()`` name and its value is checked like a created
+    field's (review-S1a-r1 F1: on 864602c4d the str was delivered under a
+    recorded ``b: int declared``, exit 0).
+    """
+    _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": SENTINEL}, {"id": 2, "a": "x2"}])
+    transform = _fm(schema={"mode": "flexible", "fields": ["b: int"]}, mapping={"a": "b"})
+    result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+
+    assert result.exit_code == 2, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == []
+    assert len(_read_jsonl(tmp_path / "q.jsonl")) == 2
+    assert _outcomes(tmp_path) == {("failure", "on_error_routed"): 2}
+
+    reasons = _transform_error_reasons(tmp_path)
+    assert len(reasons) == 2
+    for reason in reasons:
+        assert (reason["reason"], reason["field"], reason["expected"], reason["actual"]) == ("contract_violation", "b", "int", "str")
+        assert (reason["declared_by"], reason["authorship"]) == ("operator", "computed")
+        assert SENTINEL not in json.dumps(reason)
+
+
+def test_a_rename_declared_only_by_its_target_name_delivers_a_matching_value(tmp_path: Path) -> None:
+    """The same target-only ``b: int`` delivers an int row: the check routes a wrong type, not the rename."""
+    _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 5}, {"id": 2, "a": 7}])
+    transform = _fm(schema={"mode": "flexible", "fields": ["b: int"]}, mapping={"a": "b"})
+    result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "b": 5}, {"id": 2, "b": 7}]
+    assert _transform_error_reasons(tmp_path) == []
+    [recorded] = _transform_node_contracts(tmp_path).values()
+    [b_contract] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "b"]
+    assert (b_contract["python_type"], b_contract["source"]) == ("int", "declared")
+
+
+def test_an_undeclared_observed_rename_keeps_the_source_fields_contract(tmp_path: Path) -> None:
+    """A rename nobody declared still carries the source's locked contract, not a stamped ``any``.
+
+    The control that separates "not carried when the author declared only the
+    target" from the broader "carried only when the source is declared": under
+    the broader rule an observed-mode rename target would be stamped
+    ``object``/``declared`` over the source's inferred ``str``.
+    """
+    _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": "x1"}, {"id": 2, "a": "x2"}])
+    transform = _fm(schema=OBSERVED, mapping={"a": "b"})
+    result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "b": "x1"}, {"id": 2, "b": "x2"}]
+    [recorded] = _transform_node_contracts(tmp_path).values()
+    [b_contract] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "b"]
+    assert (b_contract["python_type"], b_contract["source"]) == ("str", "inferred")
 
 
 class TestNulls:

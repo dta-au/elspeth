@@ -80,8 +80,9 @@ rows meet.**
    tuple[FieldDefinition, ...]` (created fields with the type the plugin's
    code fixes, or `any`) and `carried_output_fields() -> frozenset[str]`
    (declared names whose value is copied from an input field under that
-   field's contract — a field_mapper flat rename — which the stamp leaves
-   alone). A plugin whose created NAMES are data (blob_csv_expand's CSV
+   field's contract — a field_mapper flat rename whose target inherits the
+   source's contract, not one the operator declared by its target name
+   alone — which the stamp leaves alone). A plugin whose created NAMES are data (blob_csv_expand's CSV
    headers) passes them to the stamp per emission with the type its code
    fixes (`str`); the field set may grow row to row, the types cannot.
 4. **Completeness, Tier 1.** `OutputDeclarationCompletenessContract`
@@ -106,9 +107,13 @@ rows meet.**
    `Decimal` for `float`, where `SchemaContract.validate` compares exact
    types), and a resumed row legitimately carries a type-faithful `Decimal`
    under its `float` declaration. For the same reason a
-   `carried_output_fields()` name (a field_mapper rename target) is never
-   produced: its value is the input field's value under a new name, and the
-   completeness contract exempts the same names. A violation raises
+   `carried_output_fields()` name (a field_mapper rename whose target
+   inherits the source's contract) is never produced: its value is the input
+   field's value under a new name and that field's declaration, and the
+   completeness contract exempts the same names. A rename the operator
+   declared by its TARGET name alone is not carried — no input check held the
+   value to that declaration — so its value is checked like a created field's.
+   A violation raises
    `DeclaredOutputTypeViolation(PluginContractViolation)`, routed through
    `on_error` like every Tier-2 violation, with a reason that carries the
    field, both type names, the emitted index and two bits, never the value:
