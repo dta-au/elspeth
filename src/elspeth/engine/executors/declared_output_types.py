@@ -6,9 +6,16 @@ place the engine checks those declarations against what was actually emitted.
 Two seams call it, and they differ ONLY in which fields count as produced:
 
 * ``verify_produced_output_types`` — the per-row seam (``TransformExecutor``).
-  A field is produced when it is absent from the input row, or when the
-  transform rewrote an input field's value (a different value, or an equal
-  value of another type: ``1 == True == 1.0``). An input value passed through
+  A field is produced when its normalized name is not a key of the input
+  row's data, or when the transform rewrote an input field's value (a
+  different value, or an equal value of another type: ``1 == True == 1.0``).
+  Both rows are read in the ONE vocabulary the input check validated and the
+  completeness contract reads: normalized keys. An emitted field's
+  ``normalized_name`` is never looked up as an ``original_name`` of the input
+  row, so a field_mapper target spelled like a source header (``Name``, the
+  header of the input field ``name``) is a created field exactly as ``given``
+  would be — whether a declaration is enforced never depends on how the
+  target is spelled. An input value passed through
   unchanged is not re-adjudicated: the strict ``input_schema`` check admitted
   it under pydantic's rules, which accept an ``int`` or a ``Decimal`` for a
   ``float`` field where ``SchemaContract.validate`` compares exact types, and
@@ -48,7 +55,7 @@ never the value:
   not in this transform's stamp table). Read from
   ``output_field_declared_by()``, the same table the stamp is built from.
 * ``authorship`` — whether the transform created the field (``computed``:
-  absent from its input row; always so at the batch seam) or rewrote an input
+  not a normalized key of its input row; always so at the batch seam) or rewrote an input
   field's value (``carried``). This is about the FIELD, not the declaration,
   and it is unrelated to ``carried_output_fields()``, whose names are never
   checked at all.
@@ -68,22 +75,19 @@ from typing import Literal
 from elspeth.contracts.errors import DeclaredOutputTypeViolation, TypeMismatchViolation
 from elspeth.contracts.plugin_protocols import BatchTransformProtocol, TransformProtocol
 from elspeth.contracts.plugin_roles import OutputDeclaringPlugin, require_output_declaring_plugin
-from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.transform_contract import validate_output_against_contract
 
 
-def value_produced(input_row: PipelineRow, emitted: PipelineRow, name: str) -> bool:
-    """Whether the transform PRODUCED ``emitted[name]`` rather than passing it through.
+def value_rewritten(original: object, produced: object) -> bool:
+    """Whether the transform REWROTE an input field's value rather than passing it through.
 
-    Created (absent from the input row), or rewritten: a different value, or
-    an equal value of another type — ``1 == True == 1.0`` in Python, so an
-    input ``bool`` rewritten to ``1`` is a rewrite the type check must see.
-    Both rows hold deep-frozen values, so the comparison is like for like.
+    A different value, or an equal value of another type — ``1 == True ==
+    1.0`` in Python, so an input ``bool`` rewritten to ``1`` is a rewrite the
+    type check must see. The per-row seam passes both values from the rows'
+    ``to_dict()`` views, thawed the same way, so the comparison is like for
+    like.
     """
-    if name not in input_row:
-        return True
-    produced = emitted[name]
-    original = input_row[name]
     return produced != original or type(produced) is not type(original)
 
 
@@ -118,31 +122,37 @@ def _verify_declared_types(
     declaring = require_output_declaring_plugin(transform)
     created = declaring.declared_output_fields | frozenset(definition.name for definition in declaring.created_output_fields())
     carried = declaring.carried_output_fields()
-
-    def produced(emitted: PipelineRow, name: str) -> bool:
-        if input_row is None:
-            return name in created
-        return name not in carried and value_produced(input_row, emitted, name)
+    # Both rows are read through their to_dict() views, keyed by NORMALIZED
+    # name only. ``PipelineRow.__contains__`` / ``__getitem__`` are
+    # deliberately not used for the input row: they also resolve a key as an
+    # input field's ``original_name``, so an emitted ``Name`` would read as
+    # the input field ``name`` (header ``Name``) and a copied value would pass
+    # as unchanged, although the input check, keyed by normalized name, never
+    # held it to the ``Name`` declaration (review-S1a-r3 F1).
+    input_values = None if input_row is None else input_row.to_dict()
 
     for emitted_index, emitted in enumerate(emitted_rows):
         emitted_values = emitted.to_dict()
-        produced_fields = tuple(
-            fc
-            for fc in emitted.contract.fields
-            if fc.source == "declared"
-            and fc.python_type is not object
-            and fc.normalized_name in emitted_values
-            and produced(emitted, fc.normalized_name)
-        )
+        produced_fields: list[FieldContract] = []
+        for fc in emitted.contract.fields:
+            key = fc.normalized_name
+            if fc.source != "declared" or fc.python_type is object or key not in emitted_values:
+                continue
+            if input_values is None:
+                produced = key in created
+            else:
+                produced = key not in carried and (key not in input_values or value_rewritten(input_values[key], emitted_values[key]))
+            if produced:
+                produced_fields.append(fc)
         if not produced_fields:
             continue
-        produced_contract = SchemaContract(mode="FLEXIBLE", fields=produced_fields, locked=True)
+        produced_contract = SchemaContract(mode="FLEXIBLE", fields=tuple(produced_fields), locked=True)
         for violation in validate_output_against_contract(emitted_values, produced_contract):
             # Exact type: MissingFieldViolation on a required declared field is
             # ADR-011/ADR-014's finding, and no TypeMismatchViolation subclass exists.
             if type(violation) is TypeMismatchViolation:
                 name = violation.normalized_name
-                arrived_on_input = input_row is not None and name in input_row
+                arrived_on_input = input_values is not None and name in input_values
                 raise DeclaredOutputTypeViolation(
                     transform=transform.name,
                     field=name,

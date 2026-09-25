@@ -1826,8 +1826,9 @@ class DeclaredOutputTypeViolation(PluginContractViolation):
       why the bit is recorded now. ``upstream``: the field arrived on the
       input row under a declaration made before this transform, and the
       transform rewrote it.
-    * ``authorship`` — ``computed`` when the transform created the field (it
-      was absent from the input row, or the output is a batch flush's),
+    * ``authorship`` — ``computed`` when the transform created the field (its
+      normalized name was not a key of the input row, or the output is a
+      batch flush's),
       ``carried`` when the field arrived on the input row and the transform
       rewrote its value. An unchanged input value is never checked, and
       neither is a ``carried_output_fields()`` rename target, so ``carried``

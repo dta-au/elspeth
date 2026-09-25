@@ -322,6 +322,50 @@ def _declared_row(values: dict[str, Any], types: dict[str, type]) -> PipelineRow
     )
 
 
+class TestAFieldIsIdentifiedByItsNormalizedNameOnBothRows:
+    """review-S1a-r3 F1: an emitted name that is an input field's ORIGINAL spelling is not that field."""
+
+    def _input_row(self) -> PipelineRow:
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+        return PipelineRow(
+            {"name": SENTINEL},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(FieldContract(normalized_name="name", original_name="Name", python_type=str, required=True, source="inferred"),),
+                locked=True,
+            ),
+        )
+
+    def test_a_copied_value_under_a_header_spelled_created_name_is_checked(self) -> None:
+        """``Name`` resolves to the input field ``name`` through its original_name; the value check must not follow it.
+
+        The input check (keyed by normalized name) never held the copied value
+        to the ``Name`` declaration, so it is a created field: checked, and
+        ``authorship`` is ``computed``, exactly as for a target spelled ``given``.
+        """
+        from elspeth.contracts.errors import DeclaredOutputTypeViolation
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform = _Emitting({"schema": {"mode": "observed"}}, emit=[])
+        input_row = self._input_row()
+        assert "Name" in input_row  # the dual-name membership the check must not use
+        for target in ("Name", "given"):
+            emitted = _declared_row({target: SENTINEL}, {target: int})
+            with pytest.raises(DeclaredOutputTypeViolation) as raised:
+                verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[emitted])
+            reason = raised.value.to_transform_error_reason()
+            assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"]) == (target, "int", "str", "computed")
+            assert SENTINEL not in json.dumps(reason)
+
+    def test_an_unchanged_value_under_its_own_normalized_name_is_not_re_adjudicated(self) -> None:
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform = _Emitting({"schema": {"mode": "observed"}}, emit=[])
+        emitted = _declared_row({"name": SENTINEL}, {"name": int})
+        verify_produced_output_types(transform=transform, input_row=self._input_row(), emitted_rows=[emitted])
+
+
 class TestTheDeclarerOfAFieldOutsideTheStampTable:
     """``declared_by`` for a checked field this transform's stamp table does not hold (``declared_output_types._declarer``)."""
 

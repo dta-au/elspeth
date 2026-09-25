@@ -86,7 +86,10 @@ rows meet.**
    header (`{"Name": "Name"}`) is carried too: it writes the literal header
    key, absent from the normalized input row, under the source field's
    contract, so it is not a created field even though, as an identity, it is
-   not a `declared_output_fields` name. A plugin whose created NAMES are data (blob_csv_expand's CSV
+   not a `declared_output_fields` name. When the operator declares that
+   header literal itself (`Name: int?`), the declaration is the target's, as
+   for any rename declared by its target name alone, so it is not carried and
+   Decision 5 checks its value. A plugin whose created NAMES are data (blob_csv_expand's CSV
    headers) passes them to the stamp per emission with the type its code
    fixes (`str`); the field set may grow row to row, the types cannot.
 4. **Completeness, Tier 1.** `OutputDeclarationCompletenessContract`
@@ -103,9 +106,18 @@ rows meet.**
    completeness is enforced by the registry gate (Decision 11).
 5. **Values, Tier 2.** After the dispatched contracts, `TransformExecutor`
    validates every declared concrete-typed field whose value the transform
-   PRODUCED — a field absent from the input row, or an input field whose
-   value it rewrote (a different value, or an equal value of another type:
-   `1 == True == 1.0`) — with `validate_output_against_contract`. An input
+   PRODUCED — a field whose normalized name is not a key of the input row,
+   or an input field whose value it rewrote (a different value, or an equal
+   value of another type: `1 == True == 1.0`) — with
+   `validate_output_against_contract`. Both rows are read by normalized key
+   only, the vocabulary the strict input check validated and the
+   completeness contract (Decision 4) reads: an emitted name is never
+   resolved as an input field's `original_name`. A field_mapper target
+   spelled like a source's header (`{"name": "Name"}` over a CSV header
+   `Name`) is therefore a created field exactly as `{"name": "given"}` is,
+   and whether its declaration is enforced never depends on how it is
+   spelled (review-S1a-r3 F1: before, `Name` resolved to the input field
+   `name` and a copied str was delivered under `Name: int, declared`). An input
    value passed through unchanged is not re-adjudicated: the strict input
    check admitted it under pydantic's rules (which accept an `int` or a
    `Decimal` for `float`, where `SchemaContract.validate` compares exact
@@ -131,8 +143,9 @@ rows meet.**
      projection of the same table the stamp is built from, and it is not
      stored on `FieldContract`: the node record's shape and `version_hash`
      do not change for a bit only a violation needs.
-   - **`authorship`**: `computed` when the transform created the field,
-     `carried` when the field arrived on the input row and the transform
+   - **`authorship`**: `computed` when the transform created the field (its
+     normalized name is not a key of the input row), `carried` when the
+     field arrived on the input row and the transform
      rewrote its value. It describes the FIELD, not the declaration; an
      unchanged input value and a `carried_output_fields()` name are never
      checked, so `carried` never means "passed through".
@@ -412,7 +425,8 @@ operator's declaration, which is the row's data.
 ## Tests and gates
 
 - `tests/integration/pipeline/test_output_declaration_routing.py` (T1–T6,
-  T8, T10–T12), `tests/unit/engine/test_output_declaration_enforcement.py`
+  T8, T10–T12, and every field_mapper / original-header shape of the S1a
+  reviews as one CLI table, spelling included), `tests/unit/engine/test_output_declaration_enforcement.py`
   (D5/D6 through the Orchestrator), `tests/unit/plugins/infrastructure/test_output_declaration_stamp.py`
   (precedence, nullable, lineage, carried, dynamic, plugin hooks),
   `tests/invariants/test_output_declaration_completeness.py` (the roster

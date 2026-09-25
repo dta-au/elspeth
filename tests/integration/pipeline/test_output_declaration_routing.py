@@ -31,6 +31,7 @@ ones the elspeth-5887fb7928 R2 unit and the S1 specialist panel measured
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -547,6 +548,235 @@ def test_a_rename_spelled_by_original_header_never_guesses_the_source_declaratio
     [recorded] = _transform_node_contracts(tmp_path).values()
     [given] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "given"]
     assert (given["python_type"], given["source"]) == ("str", "declared")
+
+
+_ANN_BOB_CSV = "id,First Name\n1,Ann\n2,Bob\n"
+_ID_NAME_CSV = "ID,Name\n1,Ann\n2,Bob\n"
+_ID_NAME_SENTINEL_CSV = f"ID,Name\n1,{SENTINEL}\n2,Bob\n"
+_A_STR_JSONL = f'{{"id":1,"a":"{SENTINEL}"}}\n{{"id":2,"a":"x2"}}\n'
+_ANN_BOB = [{"given": "Ann", "id": "1"}, {"given": "Bob", "id": "2"}]
+_FIRST_NAME_ANN_BOB = [{"First Name": "Ann", "id": "1"}, {"First Name": "Bob", "id": "2"}]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MapperShape:
+    """One reviewed field_mapper run: its input, its node, and the outcome it must keep.
+
+    ``delivered`` is the sink's rows, or ``None`` when every row is routed;
+    ``reasons`` is the set of routed ``(reason, field, expected, actual,
+    declared_by, authorship)``; ``recorded`` is the node record's
+    ``(python_type, source)`` per mapping target.
+    """
+
+    input_name: str
+    text: str
+    mapping: dict[str, str]
+    fields: tuple[str, ...] | None = None
+    select_only: bool = False
+    source_schema: dict[str, Any] = dataclasses.field(default_factory=lambda: OBSERVED)
+    source_field_mapping: dict[str, str] | None = None
+    delivered: list[dict[str, Any]] | None = None
+    reasons: frozenset[tuple[str | None, ...]] = frozenset()
+    recorded: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
+
+
+def _routed(name: str) -> frozenset[tuple[str | None, ...]]:
+    """The one value-free reason a str under an operator's ``int`` routes with."""
+    return frozenset({("contract_violation", name, "int", "str", "operator", "computed")})
+
+
+# Every field_mapper and original-header shape the S1a reviews ran as real CLI
+# runs (review-S1a-r1/r2/r3 ``cfg/``), keyed by the reviewer's config name.
+_MAPPER_SHAPES: dict[str, _MapperShape] = {
+    # review-S1a-r3 F1: a rename TARGET spelled as the source's header is a
+    # created field. Before the fix the first two delivered a str under a
+    # recorded ``Name: int declared`` with exit 0: ``Name`` resolved to the
+    # input field ``name`` through its original_name and read as unchanged.
+    "r3_norm_to_hdr_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int",), reasons=_routed("Name")),
+    "r3_norm_to_hdr_intq": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
+    "hdr_name_intq": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
+    # Same root cause: this created field was recorded ``authorship: carried``.
+    "r3_id_to_hdr_int": _MapperShape(
+        "in.csv", _ID_NAME_SENTINEL_CSV, {"id": "Name"}, ("Name: int",), select_only=True, reasons=_routed("Name")
+    ),
+    # The spelling control: the same rename to a target that is no header.
+    "r3_norm_to_other_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "given"}, ("given: int",), reasons=_routed("given")),
+    # A REQUIRED header literal is missing from the normalized input row: the input check routes it.
+    "hdr_name_int": _MapperShape(
+        "in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int",), reasons=frozenset({("contract_violation", None, None, None, None, None)})
+    ),
+    # An undeclared identity by header is carried under the source's contract (review-S1a-r2 F1).
+    "hdr_caseid_select": _MapperShape(
+        "in.csv",
+        _ID_NAME_CSV,
+        {"ID": "ID", "Name": "Name"},
+        select_only=True,
+        delivered=[{"ID": "1", "Name": "Ann"}, {"ID": "2", "Name": "Bob"}],
+        recorded={"ID": ("str", "inferred"), "Name": ("str", "inferred")},
+    ),
+    "hdr_identity": _MapperShape(
+        "in.csv", _ANN_BOB_CSV, {"First Name": "First Name"}, delivered=_FIRST_NAME_ANN_BOB, recorded={"First Name": ("str", "inferred")}
+    ),
+    "hdr_identity_decl": _MapperShape(
+        "in.csv",
+        _ANN_BOB_CSV,
+        {"First Name": "First Name"},
+        ("first_name: str",),
+        delivered=_FIRST_NAME_ANN_BOB,
+        recorded={"First Name": ("object", "declared")},
+    ),
+    "hdr_rename": _MapperShape(
+        "in.csv", _ANN_BOB_CSV, {"First Name": "given"}, delivered=_ANN_BOB, recorded={"given": ("str", "inferred")}
+    ),
+    "hdr_rename_target_int": _MapperShape("in.csv", _ANN_BOB_CSV, {"First Name": "given"}, ("given: int",), reasons=_routed("given")),
+    # review-S1a-r2 F2, pinned by design (8bf33f2df): a header-spelled SOURCE is
+    # resolved only by the row's contract, which construction does not have, so
+    # it never borrows a declaration by its normalized spelling.
+    "hdr_rename_both": _MapperShape(
+        "in.csv", _ANN_BOB_CSV, {"First Name": "given"}, ("first_name: str", "given: int"), reasons=_routed("given")
+    ),
+    "hdr_rename_both_normalized": _MapperShape(
+        "in.csv",
+        _ANN_BOB_CSV,
+        {"first_name": "given"},
+        ("first_name: str", "given: int"),
+        delivered=_ANN_BOB,
+        recorded={"given": ("str", "declared")},
+    ),
+    "hdr_fieldmap_resolve": _MapperShape(
+        "in.csv",
+        _ANN_BOB_CSV,
+        {"First Name": "given"},
+        source_field_mapping={"first_name": "given_name"},
+        delivered=_ANN_BOB,
+        recorded={"given": ("str", "inferred")},
+    ),
+    "hdr_fieldmap_lie": _MapperShape(
+        "in.csv",
+        _ANN_BOB_CSV,
+        {"First Name": "given"},
+        ("first_name: int?", "given: str"),
+        source_field_mapping={"first_name": "given_name"},
+        delivered=_ANN_BOB,
+        recorded={"given": ("str", "declared")},
+    ),
+    # review-S1a-r1: normalized renames.
+    "fm_target_decl": _MapperShape("in.jsonl", _A_STR_JSONL, {"a": "b"}, ("b: int?",), reasons=_routed("b")),
+    "fm_target_decl_req": _MapperShape("in.jsonl", _A_STR_JSONL, {"a": "b"}, ("b: int",), reasons=_routed("b")),
+    "fm_target_decl_srctyped": _MapperShape(
+        "in.jsonl",
+        _A_STR_JSONL,
+        {"a": "b"},
+        ("b: int",),
+        source_schema={"mode": "flexible", "fields": ["id: int", "a: str"]},
+        reasons=_routed("b"),
+    ),
+    "fm_target_valid": _MapperShape(
+        "in.jsonl",
+        '{"id":1,"a":5}\n{"id":2,"a":7}\n{"id":3,"a":9}\n',
+        {"a": "b"},
+        ("b: int",),
+        delivered=[{"b": 5, "id": 1}, {"b": 7, "id": 2}, {"b": 9, "id": 3}],
+        recorded={"b": ("int", "declared")},
+    ),
+    "fm_target_valid_row1": _MapperShape(
+        "in.jsonl", '{"id":1,"a":5}\n', {"a": "b"}, ("b: int",), delivered=[{"b": 5, "id": 1}], recorded={"b": ("int", "declared")}
+    ),
+    "fm_both": _MapperShape(
+        "in.jsonl",
+        '{"id":1,"a":"s1"}\n{"id":2,"a":"s2"}\n',
+        {"a": "b"},
+        ("a: str", "b: int"),
+        delivered=[{"b": "s1", "id": 1}, {"b": "s2", "id": 2}],
+        recorded={"b": ("str", "declared")},
+    ),
+    "fm_neither": _MapperShape(
+        "in.jsonl",
+        '{"id":1,"a":"s1"}\n{"id":2,"a":"s2"}\n',
+        {"a": "b"},
+        ("id: int",),
+        delivered=[{"b": "s1", "id": 1}, {"b": "s2", "id": 2}],
+        recorded={"b": ("object", "declared")},
+    ),
+    "fm_rename_float": _MapperShape(
+        "in.jsonl",
+        '{"id": 1, "amount": 5}\n{"id": 2, "amount": 7}\n',
+        {"amount": "total"},
+        ("id: int", "amount: float"),
+        delivered=[{"id": 1, "total": 5}, {"id": 2, "total": 7}],
+        recorded={"total": ("float", "declared")},
+    ),
+    "fm_rename_hdr": _MapperShape(
+        "in.jsonl",
+        '{"id":1,"amount":5.5}\n{"id":2,"amount":7.5}\n',
+        {"amount": "total"},
+        ("id: int", "amount: float"),
+        delivered=[{"id": 1, "total": 5.5}, {"id": 2, "total": 7.5}],
+        recorded={"total": ("float", "declared")},
+    ),
+    "fm_str_observed": _MapperShape(
+        "in.jsonl",
+        f'{{"id": 1, "meta": {{"copies": 2}}}}\n{{"id": 2, "meta": {{"copies": "{SENTINEL}"}}}}\n',
+        {"meta.copies": "copies"},
+        delivered=[{"copies": 2, "id": 1, "meta": {"copies": 2}}, {"copies": SENTINEL, "id": 2, "meta": {"copies": SENTINEL}}],
+        recorded={"copies": ("object", "declared")},
+    ),
+    "fm_str_observed_row1": _MapperShape(
+        "in.jsonl",
+        '{"id": 1, "meta": {"copies": 2}}\n',
+        {"meta.copies": "copies"},
+        delivered=[{"copies": 2, "id": 1, "meta": {"copies": 2}}],
+        recorded={"copies": ("object", "declared")},
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MAPPER_SHAPES))
+def test_every_reviewed_field_mapper_shape_keeps_its_outcome_whatever_the_spelling(shape: str, tmp_path: Path) -> None:
+    """Real ``elspeth run`` over every field_mapper and original-header shape of reviews S1a r1 to r3.
+
+    Enforcement never depends on how a name is spelled: the value check reads
+    the input and emitted rows by NORMALIZED key only (ADR-050 Decision 5),
+    so a target spelled like a source header is a created field exactly as a
+    target spelled ``given`` is. A routed reason never carries the row value.
+    """
+    case = _MAPPER_SHAPES[shape]
+    (tmp_path / case.input_name).write_text(case.text)
+    is_csv = case.input_name.endswith(".csv")
+    options: dict[str, Any] = {"path": str(tmp_path / case.input_name), "on_validation_failure": "discard", "schema": case.source_schema}
+    if not is_csv:
+        options["format"] = "jsonl"
+    if case.source_field_mapping is not None:
+        options["field_mapping"] = case.source_field_mapping
+    source = {"plugin": "csv" if is_csv else "json", "on_success": "rows", "options": options}
+    schema = OBSERVED if case.fields is None else {"mode": "flexible", "fields": list(case.fields)}
+    transform = _fm(schema=schema, mapping=case.mapping)
+    transform["options"]["select_only"] = case.select_only
+    result = _run(_settings(tmp_path, sources={"src": source}, transforms=[transform]))
+
+    rows = len(case.text.splitlines()) - (1 if is_csv else 0)
+    reasons = _transform_error_reasons(tmp_path)
+    assert {
+        (r["reason"], r.get("field"), r.get("expected"), r.get("actual"), r.get("declared_by"), r.get("authorship")) for r in reasons
+    } == case.reasons
+    assert all(SENTINEL not in json.dumps(reason) for reason in reasons)
+    if case.delivered is None:
+        assert result.exit_code == 2, result.output
+        assert _read_jsonl(tmp_path / "out.jsonl") == []
+        assert len(_read_jsonl(tmp_path / "q.jsonl")) == len(reasons) == rows
+        assert _outcomes(tmp_path) == {("failure", "on_error_routed"): rows}
+    else:
+        assert result.exit_code == 0, result.output
+        assert _read_jsonl(tmp_path / "out.jsonl") == case.delivered
+        assert _outcomes(tmp_path) == {("success", "default_flow"): rows}
+    recorded = {
+        contract_field["normalized_name"]: (contract_field["python_type"], contract_field["source"])
+        for text in _transform_node_contracts(tmp_path).values()
+        if text
+        for contract_field in json.loads(text)["fields"]
+        if contract_field["normalized_name"] in case.mapping.values()
+    }
+    assert recorded == case.recorded
 
 
 class TestNulls:
