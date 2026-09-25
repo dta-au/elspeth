@@ -13,10 +13,10 @@ plugins' ``_apply_declared_output_field_contracts`` call).
 Every case is a real ``elspeth run --execute`` (in-process CLI) whose batch
 plugin emits the WRONG type for a field it declares ``int``: a sentinel
 string. A plugin whose declaration is correct never violates it, so the fault
-is injected into the plugin's computation. The shipped by-construction case
-is ``batch_replicate``'s ``copy_index`` (``int``); the reductive case uses
-``batch_stats`` with its ``count`` declaration made concrete for the test
-(the concrete-type sweep over the batch plugins is unit S1b). In every case
+is injected into the plugin's computation. The passthrough case is
+``batch_replicate``'s ``copy_index`` (``int``); the reductive case is
+``batch_stats``'s ``count`` (``int`` in its shipped ``created_output_fields()``
+table). In every case
 the violation fails the WHOLE batch — every buffered row follows the
 aggregation's ``on_error``, or the collector group records a
 ``collector_contract_violation`` verdict — with a reason naming the field,
@@ -41,7 +41,6 @@ from typing import Any
 import pytest
 import yaml
 
-from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.batch_replicate import BatchReplicate
@@ -60,15 +59,11 @@ from tests.integration.pipeline.test_output_declaration_routing import (
 SENTINEL = "SENTINEL_ADR050_BATCH_VALUE"
 
 _REAL_AGGREGATE_GROUP = BatchStats._aggregate_group
-_REAL_STATS_CREATED = BatchStats.created_output_fields
 _REAL_REPLICATE_PROCESS = BatchReplicate.process
 
 
-def _declare_and_fault_batch_stats_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    """batch_stats declares ``count: int`` and computes it as the sentinel string."""
-
-    def created_output_fields(self: BatchStats) -> tuple[FieldDefinition, ...]:
-        return (*_REAL_STATS_CREATED(self), FieldDefinition("count", "int"))
+def _fault_batch_stats_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """batch_stats computes ``count`` (declared ``int`` by its own ``created_output_fields()``) as the sentinel string."""
 
     def aggregate_group(self: BatchStats, grouped_rows: Any, group_value: Any) -> Any:
         result, error = _REAL_AGGREGATE_GROUP(self, grouped_rows, group_value)
@@ -76,7 +71,6 @@ def _declare_and_fault_batch_stats_count(monkeypatch: pytest.MonkeyPatch) -> Non
             result["count"] = SENTINEL
         return result, error
 
-    monkeypatch.setattr(BatchStats, "created_output_fields", created_output_fields)
     monkeypatch.setattr(BatchStats, "_aggregate_group", aggregate_group)
 
 
@@ -155,7 +149,7 @@ def _stats_aggregation() -> dict[str, Any]:
 
 def test_an_aggregation_computing_the_wrong_type_fails_the_batch_value_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reductive aggregation: every buffered row follows on_error; authorship=computed, never the value."""
-    _declare_and_fault_batch_stats_count(monkeypatch)
+    _fault_batch_stats_count(monkeypatch)
     _write_jsonl(tmp_path / "in.jsonl", _ROWS)
     result = _run(_settings_file(tmp_path, _stats_aggregation()))
 
@@ -170,9 +164,8 @@ def test_an_aggregation_computing_the_wrong_type_fails_the_batch_value_free(tmp_
     assert _audit_cells_containing(tmp_path, SENTINEL) == []
 
 
-def test_the_same_aggregation_with_a_correct_value_completes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Control: the concrete declaration alone routes nothing — only a value that breaks it does."""
-    monkeypatch.setattr(BatchStats, "created_output_fields", lambda self: (*_REAL_STATS_CREATED(self), FieldDefinition("count", "int")))
+def test_the_same_aggregation_with_a_correct_value_completes(tmp_path: Path) -> None:
+    """Control: the shipped concrete declarations alone route nothing — only a value that breaks one does."""
     _write_jsonl(tmp_path / "in.jsonl", _ROWS)
     result = _run(_settings_file(tmp_path, _stats_aggregation()))
 
@@ -184,7 +177,7 @@ def test_the_same_aggregation_with_a_correct_value_completes(tmp_path: Path, mon
 
 def test_a_collector_computing_the_wrong_type_fails_the_group_value_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Collector: the group's recorded verdict is a contract violation naming the field, never the value."""
-    _declare_and_fault_batch_stats_count(monkeypatch)
+    _fault_batch_stats_count(monkeypatch)
     _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "items": [3, 1, 2]}])
     settings = _settings_file(
         tmp_path,

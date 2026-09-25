@@ -30,24 +30,39 @@ if TYPE_CHECKING:
 
 type BatchDistributionProfileRow = dict[str, object]
 
-_GUARANTEED_PROFILE_FIELDS = frozenset(
-    {
-        "batch_size",
-        "count",
-        "field",
-        "max",
-        "mean",
-        "median",
-        "min",
-        "missing_count",
-        "non_finite_count",
-        "p25",
-        "p75",
-        "stdev",
-        "summary",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). Only
+# int and float values reach the arithmetic (``_finite_values_for`` fails the
+# batch on any other type), so ``mean`` (true division), ``median``/``p25``/
+# ``p75`` (``_percentile`` returns ``float(...)``) and ``stdev``
+# (``statistics.stdev``) are floats whatever the input's numeric type;
+# ``stdev`` is undefined at n=1 and emitted None then. ``min`` and ``max`` are
+# the smallest and largest INPUT values, copied unconverted (an int stays an
+# int), but the plugin itself admits only finite int and float values to the
+# set they are taken from, so they are declared ``float``: an int value
+# satisfies a float declaration (ADR-050 Decision 5, ruling C3), and a value
+# of any other type would be this plugin's filter failing. ``field`` is the
+# configured value field name and ``summary`` the rendered text. The index
+# lists are written only when a row was skipped (optional) and are lists the
+# schema DSL has no type for.
+_PROFILE_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("count", "int"),
+    FieldDefinition("field", "str"),
+    FieldDefinition("max", "float"),
+    FieldDefinition("mean", "float"),
+    FieldDefinition("median", "float"),
+    FieldDefinition("min", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("p25", "float"),
+    FieldDefinition("p75", "float"),
+    FieldDefinition("stdev", "float", nullable=True),
+    FieldDefinition("summary", "str"),
+    FieldDefinition("missing_indices", "any", required=False),
+    FieldDefinition("non_finite_indices", "any", required=False),
 )
-_CONDITIONAL_PROFILE_FIELDS = frozenset({"missing_indices", "non_finite_indices"})
+_GUARANTEED_PROFILE_FIELDS = frozenset(field.name for field in _PROFILE_CREATED_FIELDS if field.required)
+_CONDITIONAL_PROFILE_FIELDS = frozenset(field.name for field in _PROFILE_CREATED_FIELDS if not field.required)
 _PROFILE_OUTPUT_KEYS = _GUARANTEED_PROFILE_FIELDS | _CONDITIONAL_PROFILE_FIELDS
 
 
@@ -109,7 +124,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a464386a4739865b"
+    source_file_hash: str | None = "sha256:798dbb2c0e48740f"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -208,15 +223,6 @@ class BatchDistributionProfile(BaseTransform):
             audit_fields=None,
         )
 
-    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """The conditional index lists, declared ``any`` and optional (ADR-050).
-
-        Written only when a row was skipped, so they are not in
-        ``declared_output_fields`` (the guarantee surface); naming them here
-        puts them through the declaration stamp with the guaranteed profile.
-        """
-        return tuple(FieldDefinition(name, "any", required=False) for name in sorted(_CONDITIONAL_PROFILE_FIELDS))
-
     @classmethod
     def get_agent_assistance(
         cls,
@@ -256,6 +262,12 @@ class BatchDistributionProfile(BaseTransform):
                 "Words like distribution, barrier counts, theme frequency, category counts, or categorical summary should map to batch_top_k unless the requested statistic is numeric.",
             ),
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above, plus ``group_by`` carrying the group's row value (``any``) when configured."""
+        if self._group_by is None:
+            return _PROFILE_CREATED_FIELDS
+        return (*_PROFILE_CREATED_FIELDS, FieldDefinition(self._group_by, "any"))
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the aggregate output path for the backward invariant."""

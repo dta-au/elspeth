@@ -18,7 +18,7 @@
     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model \u2014 don't hand-add them.",
     "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
-    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
+    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str. The raw response_field and automatic usage/model fields remain available.",
     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",
@@ -119,7 +119,7 @@
       },
       "OutputFieldConfig": {
         "additionalProperties": false,
-        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement\n    values: Required for enum type - list of allowed values",
+        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement, and the output column's row type\n        (integer -> int, number -> float, boolean -> bool, string/enum -> str)\n    values: Required for enum type - list of allowed values",
         "properties": {
           "schema": {
             "anyOf": [
@@ -142,7 +142,7 @@
           },
           "type": {
             "$ref": "#/$defs/OutputFieldType",
-            "description": "Data type for schema enforcement",
+            "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
             "title": "Type"
           },
           "values": {

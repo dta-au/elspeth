@@ -11,7 +11,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -21,21 +21,26 @@ from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 type ThresholdOperator = Literal["<", "<=", ">", ">=", "==", "!="]
 type BatchThresholdSummaryRow = dict[str, object]
 
-_THRESHOLD_OUTPUT_FIELDS = frozenset(
-    {
-        "batch_size",
-        "match_count",
-        "match_rate",
-        "missing_count",
-        "non_finite_count",
-        "non_match_count",
-        "operator",
-        "threshold",
-        "threshold_name",
-        "valid_count",
-        "value_field",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050): the
+# labels are configured strings, ``threshold`` is ``ThresholdSpec.value`` (a
+# pydantic ``float`` field, which holds a float even when the config wrote an
+# int), the counts are ints and ``match_rate`` is the true division
+# ``match_count / valid_count`` (a batch with no valid value is an error
+# before any rate is computed).
+_THRESHOLD_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("match_count", "int"),
+    FieldDefinition("match_rate", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_match_count", "int"),
+    FieldDefinition("operator", "str"),
+    FieldDefinition("threshold", "float"),
+    FieldDefinition("threshold_name", "str"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("value_field", "str"),
 )
+_THRESHOLD_OUTPUT_FIELDS = frozenset(field.name for field in _THRESHOLD_CREATED_FIELDS)
 _MAX_THRESHOLDS = 128
 
 
@@ -104,7 +109,7 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f5c5f15f82de8963"
+    source_file_hash: str | None = "sha256:6fb59bd45cd921a2"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -201,6 +206,10 @@ class BatchThresholdSummary(BaseTransform):
             required_fields=None,
             audit_fields=None,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every threshold row (ADR-050)."""
+        return _THRESHOLD_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the threshold output path for the backward invariant."""

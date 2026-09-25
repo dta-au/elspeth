@@ -28,34 +28,46 @@ from elspeth.plugins.transforms._scalar_buckets import (
 
 type BatchPairedPreferenceRow = dict[str, object]
 
-_PAIRED_OUTPUT_FIELDS = frozenset(
-    {
-        "baseline_mean",
-        "baseline_variant",
-        "batch_size",
-        "compared_pair_count",
-        "confidence_95_high",
-        "confidence_95_low",
-        "incomplete_pair_count",
-        "loss_rate",
-        "losses",
-        "mean_paired_delta",
-        "missing_score_count",
-        "non_finite_score_count",
-        "pair_field",
-        "preference_rate",
-        "score_field",
-        "standard_error_delta",
-        "tie_rate",
-        "ties",
-        "total_pair_count",
-        "variant",
-        "variant_field",
-        "variant_mean",
-        "win_rate",
-        "wins",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The
+# field names are configured strings and the counts are ints. The variant
+# labels are the values as they appear in the rows (a configured variant is
+# matched against them), carried from the data, so they are ``any``. Only int
+# and float scores reach the arithmetic (``_score_entry_for`` fails the batch on
+# any other type): each paired delta is ``float(...)``, and the means and the
+# win/loss/tie rates are true divisions, so all are floats. ``preference_rate``
+# is undefined when every pair ties, and the standard error and confidence
+# bounds when fewer than two pairs were compared — each is emitted None then,
+# never a fabricated 0.0 (B4.5). The ``incomplete_pairs`` list is written only
+# when a pair was incomplete (optional) and is a list the schema DSL has no
+# type for.
+_PAIRED_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("baseline_variant", "any"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("compared_pair_count", "int"),
+    FieldDefinition("confidence_95_high", "float", nullable=True),
+    FieldDefinition("confidence_95_low", "float", nullable=True),
+    FieldDefinition("incomplete_pair_count", "int"),
+    FieldDefinition("loss_rate", "float"),
+    FieldDefinition("losses", "int"),
+    FieldDefinition("mean_paired_delta", "float"),
+    FieldDefinition("missing_score_count", "int"),
+    FieldDefinition("non_finite_score_count", "int"),
+    FieldDefinition("pair_field", "str"),
+    FieldDefinition("preference_rate", "float", nullable=True),
+    FieldDefinition("score_field", "str"),
+    FieldDefinition("standard_error_delta", "float", nullable=True),
+    FieldDefinition("tie_rate", "float"),
+    FieldDefinition("ties", "int"),
+    FieldDefinition("total_pair_count", "int"),
+    FieldDefinition("variant", "any"),
+    FieldDefinition("variant_field", "str"),
+    FieldDefinition("variant_mean", "float"),
+    FieldDefinition("win_rate", "float"),
+    FieldDefinition("wins", "int"),
+    FieldDefinition("incomplete_pairs", "any", required=False),
 )
+_PAIRED_OUTPUT_FIELDS = frozenset(field.name for field in _PAIRED_CREATED_FIELDS if field.required)
 _MAX_BATCH_ROWS = 4096
 
 
@@ -120,7 +132,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a4217d70ba870cdc"
+    source_file_hash: str | None = "sha256:70f0b1567a78cf77"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -218,13 +230,8 @@ class BatchPairedPreference(BaseTransform):
         )
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """``incomplete_pairs``, declared ``any`` and optional (ADR-050).
-
-        Written only when a pair was incomplete, so it is not in
-        ``declared_output_fields`` (the guarantee surface); naming it here
-        puts it through the declaration stamp with the guaranteed fields.
-        """
-        return (FieldDefinition("incomplete_pairs", "any", required=False),)
+        """The typed table above: the same fields on every paired-preference row (ADR-050)."""
+        return _PAIRED_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the paired comparison output path for the backward invariant."""

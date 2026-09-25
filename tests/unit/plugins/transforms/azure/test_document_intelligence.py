@@ -18,6 +18,7 @@ from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.plugins.infrastructure.clients.http import HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -410,6 +411,15 @@ def test_lro_happy_path_enriches() -> None:
     assert out["di_tables"] == [{"rowCount": 2}]
     assert out["di_pages"] == 2
     assert out["doc_url"] == "https://x/y.pdf"
+    # ADR-050: the content and page count carry the plugin's concrete types and
+    # the engine's value check passes on the real emission; a facet list is ``any``.
+    declared = {name: contract.python_type for name, contract in t._stamped_output_field_contracts().items()}
+    assert {name: declared[name] for name in ("di_content", "di_pages", "di_tables")} == {
+        "di_content": str,
+        "di_pages": int,
+        "di_tables": object,
+    }
+    verify_produced_output_types(transform=t, input_row=_row(), emitted_rows=[result.row])
 
 
 def test_success_reason_metadata() -> None:

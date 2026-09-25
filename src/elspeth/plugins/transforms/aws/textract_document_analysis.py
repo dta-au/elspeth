@@ -38,6 +38,7 @@ from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust, WebConfigAuthority
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -73,6 +74,7 @@ from elspeth.plugins.transforms.aws.textract_config_shared import (
     TextractExtractFields,
     TextractQueryConfig,
     require_non_whitespace,
+    textract_created_output_fields,
     validate_textract_credential_fields,
 )
 from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
@@ -311,7 +313,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2911075f35dded16"
+    source_file_hash: str | None = "sha256:ea759d2fa66d9e85"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -399,6 +401,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._created_output_fields = textract_created_output_fields(
+            text_field=cfg.text_field,
+            page_count_field=cfg.page_count_field,
+            metadata_field=cfg.metadata_field,
+            result_field=cfg.result_field,
+            facet_fields=tuple(self._facet_fields.values()),
+        )
         self._reject_input_options_naming_created_fields(
             {
                 "bucket_field": cfg.bucket_field,
@@ -470,6 +479,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 relative_key = executable_key.removeprefix(f"{self._key_prefix}/")
             projected["key"] = relative_key
         return projected
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The configured output targets, typed as ``NormalizedTextractResult`` fixes them (ADR-050)."""
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)

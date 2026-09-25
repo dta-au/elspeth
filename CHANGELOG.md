@@ -107,6 +107,28 @@ drained and repair this release forward.
   type it recorded; a node whose types match continues and its record's
   `source` becomes `declared`. There is no compatibility shim (epoch 45 is
   undeployed).
+- **Plugin-computed output fields have concrete types; LLM structured output
+  types are bound (ADR-050 Decision 12).** Every shipped transform declares
+  the type its own code fixes for each field it computes — batch statistics
+  (counts `int`; sums, means, rates, test statistics and the numeric row
+  values a statistic copies `float`, None where undefined; an exact int
+  satisfies `float` and is never converted), report metadata, retrieval
+  context/score/count/sources, Textract and Document Intelligence text and
+  page counts — so the engine checks them and a plugin emitting the wrong
+  type is routed as the plugin's fault (`declared_by: plugin`). A field
+  whose value is row data of unconstrained type (group, cohort and variant
+  labels, json_explode's element) or a list/mapping stays `any`. An LLM
+  `output_fields` entry now declares its row type (`integer` → int,
+  `number` → float, `boolean` → bool, `string`/`enum` → str), and the
+  structured-output parse (LLM transform and LLM source) converts the
+  provider's JSON number into it: an `integer` returned as `5.0` arrives as
+  `5`, a `number` returned as `7` as `7.0`, and a non-integral float under
+  `integer` is still rejected. Before this, a downstream node declaring
+  `score: int` routed a `5.0` row as an upstream schema bug, and an
+  observed-mode LLM source recorded `score: float` for an `integer` field.
+  JSON and CSV sink bytes are unchanged (both write an integral float as an
+  integer); the LLM node's recorded contract and every `contract_hash` over
+  it move.
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

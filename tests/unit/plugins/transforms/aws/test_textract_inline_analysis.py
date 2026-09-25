@@ -19,6 +19,7 @@ from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_client import (
@@ -470,6 +471,20 @@ def test_all_normalized_facet_outputs_are_projected() -> None:
     assert deep_thaw(result.row["textract_forms"]) == []
     assert deep_thaw(result.row["textract_signatures"]) == []
     assert deep_thaw(result.row["textract_layout"]) == []
+    # ADR-050: the text and page count carry the plugin's concrete types and the
+    # engine's value check passes on the real emission; the provider-shaped
+    # mappings and facet lists are ``any``.
+    declared = {name: contract.python_type for name, contract in transform._stamped_output_field_contracts().items()}
+    assert {
+        name: declared[name] for name in ("textract_text", "textract_page_count", "textract_metadata", "textract_native", "textract_tables")
+    } == {
+        "textract_text": str,
+        "textract_page_count": int,
+        "textract_metadata": object,
+        "textract_native": object,
+        "textract_tables": object,
+    }
+    verify_produced_output_types(transform=transform, input_row=_row(), emitted_rows=[result.row])
 
 
 def test_missing_blob_ref_field_fails_before_any_retrieval() -> None:

@@ -3,7 +3,9 @@
 Per ELSPETH's Three-Tier Trust Model:
 - LLM responses are Tier 3 (external data) - zero trust
 - Validation must happen IMMEDIATELY at the boundary
-- Invalid responses must be caught, not silently coerced
+- Invalid responses must be caught, not silently coerced; the one
+  conversion is a structured output's JSON number parsed into the row type
+  its declared field is bound to (``parse_field_value``)
 
 This module extracts the common validation pattern from LLM transforms
 so it can be:
@@ -21,7 +23,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, assert_never
 
 from elspeth.contracts.errors import TransformErrorReason
 from elspeth.contracts.freeze import deep_freeze
@@ -37,59 +39,90 @@ def reject_nonfinite_constant(value: str) -> None:
     raise ValueError(f"Non-standard JSON constant '{value}' not allowed")
 
 
-def validate_field_value(
+def parse_field_value(
     value: Any,
     field_config: OutputFieldConfig,
-) -> str | None:
-    """Validate a parsed JSON value against its declared output field type.
+) -> tuple[Any, str | None]:
+    """Parse a JSON value from the provider INTO the row type its declared output field is bound to.
 
     Tier 3 boundary enforcement: LLM responses may contain values that parse
     as valid JSON but violate the declared schema (e.g., string where integer
-    expected, boolean where number expected, non-finite floats).
+    expected, boolean where number expected, non-finite floats). Those are
+    rejected, never coerced.
+
+    The one conversion is a numeric spelling. JSON has one number type, so a
+    provider may spell an ``integer`` as ``5.0`` or a ``number`` as ``7``.
+    Each declared type is BOUND to one row type (``_OUTPUT_FIELD_TYPE_TO_SCHEMA``:
+    ``integer`` -> ``int``, ``number`` -> ``float``) that the LLM transform
+    declares for the field and the engine enforces on the emitted value
+    (ADR-050), and that the LLM source's schema types it as, so the accepted
+    spelling is parsed into exactly that type here: an integral float
+    becomes the ``int`` it denotes, an int under ``number`` the ``float`` it
+    denotes (an int too large for a float is rejected, and one beyond 2**53
+    takes the nearest float, as any JSON number read as a float does).
+
+    The two directions exist for different reasons. Without the ``integer``
+    conversion a ``5.0`` would break the ``int`` declaration and route the
+    row as the plugin's fault. The ``number`` conversion is not needed for
+    the engine check (an ``int`` satisfies a ``float`` declaration, ADR-050
+    Decision 5), but it makes the delivered value the row type the field is
+    recorded as, so every row of the field carries one Python type whatever
+    the provider's spelling. This is the only place a structured output value changes
+    Python type; a test pins that every value it admits has exactly the row
+    type ``_OUTPUT_FIELD_TYPE_TO_SCHEMA`` binds the declared type to
+    (operator ruling 2026-09-25: bound and parsed together, never one
+    without the other). A non-integral float under ``integer`` is still an error, and a
+    bool is never a number.
 
     Args:
         value: The parsed JSON value from the LLM response
         field_config: Expected type configuration from output_fields
 
     Returns:
-        Error message string if validation fails, None if valid
+        ``(parsed value, None)`` when valid — the value in its bound row type —
+        or ``(None, error message)`` when it violates the declared type.
     """
-    expected_type = field_config.type
-
-    if expected_type == OutputFieldType.STRING:
-        if not isinstance(value, str):
-            return f"expected string, got {type(value).__name__}"
-
-    elif expected_type == OutputFieldType.INTEGER:
-        # bool is subclass of int in Python — reject explicitly
-        if isinstance(value, bool):
-            return "expected integer, got boolean"
-        if isinstance(value, float) and not math.isfinite(value):
-            return "expected finite integer, got non-finite float"
-        if isinstance(value, int) or (isinstance(value, float) and value.is_integer()):
-            pass
-        else:
-            return f"expected integer, got {type(value).__name__}"
-
-    elif expected_type == OutputFieldType.NUMBER:
-        if isinstance(value, bool):
-            return "expected number, got boolean"
-        if not isinstance(value, (int, float)):
-            return f"expected number, got {type(value).__name__}"
-        if isinstance(value, float) and not math.isfinite(value):
-            return "expected finite number, got non-finite float"
-
-    elif expected_type == OutputFieldType.BOOLEAN:
-        if not isinstance(value, bool):
-            return f"expected boolean, got {type(value).__name__}"
-
-    elif expected_type == OutputFieldType.ENUM:
-        if not isinstance(value, str):
-            return f"expected string (enum), got {type(value).__name__}"
-        if field_config.values and value not in field_config.values:
-            return f"value '{value}' not in allowed values: {field_config.values}"
-
-    return None
+    match field_config.type:
+        case OutputFieldType.STRING:
+            if not isinstance(value, str):
+                return None, f"expected string, got {type(value).__name__}"
+            return value, None
+        case OutputFieldType.INTEGER:
+            # bool is subclass of int in Python — reject explicitly
+            if isinstance(value, bool):
+                return None, "expected integer, got boolean"
+            if isinstance(value, int):
+                return value, None
+            if isinstance(value, float) and not math.isfinite(value):
+                return None, "expected finite integer, got non-finite float"
+            if isinstance(value, float) and value.is_integer():
+                return int(value), None
+            return None, f"expected integer, got {type(value).__name__}"
+        case OutputFieldType.NUMBER:
+            if isinstance(value, bool):
+                return None, "expected number, got boolean"
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None, "expected finite number, got non-finite float"
+                return value, None
+            if isinstance(value, int):
+                try:
+                    return float(value), None
+                except OverflowError:
+                    return None, "expected finite number, got an integer outside the float range"
+            return None, f"expected number, got {type(value).__name__}"
+        case OutputFieldType.BOOLEAN:
+            if not isinstance(value, bool):
+                return None, f"expected boolean, got {type(value).__name__}"
+            return value, None
+        case OutputFieldType.ENUM:
+            if not isinstance(value, str):
+                return None, f"expected string (enum), got {type(value).__name__}"
+            if field_config.values and value not in field_config.values:
+                return None, f"value '{value}' not in allowed values: {field_config.values}"
+            return value, None
+        case _:
+            assert_never(field_config.type)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,11 +268,15 @@ def extract_structured_fields(
 
     Tier 3 boundary: the response is external data — parse immediately,
     reject non-object payloads, missing declared fields, and type
-    mismatches instead of coercing. Callers wrap the returned error reason
-    with their own context (query name/index where one exists).
+    mismatches. Each accepted value is returned in the row type its declared
+    ``OutputFieldConfig.type`` is bound to (``parse_field_value``: an
+    integral float under ``integer`` as an int, an int under ``number`` as a
+    float), which is what the transform's ``created_output_fields`` declares
+    for it. Callers wrap the returned error reason with their own context
+    (query name/index where one exists).
 
     Returns:
-        (fields keyed by suffix, None) on success;
+        (fields keyed by suffix, in their bound row types, None) on success;
         ({}, error reason dict carrying at least "reason") on failure.
     """
     try:
@@ -264,7 +301,7 @@ def extract_structured_fields(
                 "field": field.suffix,
                 "available_fields": list(parsed.keys()),
             }
-        type_error = validate_field_value(parsed[field.suffix], field)
+        parsed_value, type_error = parse_field_value(parsed[field.suffix], field)
         if type_error is not None:
             return {}, {
                 "reason": "field_type_mismatch",
@@ -272,5 +309,5 @@ def extract_structured_fields(
                 "error": type_error,
                 "value": repr(parsed[field.suffix])[:200],
             }
-        extracted[field.suffix] = parsed[field.suffix]
+        extracted[field.suffix] = parsed_value
     return extracted, None

@@ -1130,12 +1130,14 @@ class TestRAGDeclaredOutputFieldContracts:
         assert context_field.nullable is True
         assert result.row.contract.get_field("policy__rag_count").python_type is int
 
-    def test_observed_mode_emission_is_stamped_declared_any(self) -> None:
-        """Observed mode declares no operator fields, so the created fields are stamped ``any`` (ADR-050).
+    def test_observed_mode_emission_is_stamped_with_the_plugin_declared_types(self) -> None:
+        """Observed mode declares no operator fields, so the created fields carry the PLUGIN's types (ADR-050).
 
         Before ADR-050 the emission stayed purely inferred (typed from this
         row's value); now every created field carries a declared contract
-        fixed before the first row.
+        fixed before the first row — the context and score nullable (the
+        ``on_no_results: continue`` shape emits None), the count an int, the
+        sources envelope a str — and the engine enforces those types.
         """
         chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
         transform, _ = _setup_transform_with_mock_provider(chunks)
@@ -1148,8 +1150,17 @@ class TestRAGDeclaredOutputFieldContracts:
         assert transform._output_schema_config is not None
         assert transform._output_schema_config.fields is None
         _run_post_emission_check(transform, result.row)
-        context_field = result.row.contract.get_field("policy__rag_context")
-        assert (context_field.source, context_field.python_type, context_field.nullable) == ("declared", object, True)
+        stamped = {
+            name: (field.source, field.python_type, field.nullable)
+            for name, field in ((fc.normalized_name, fc) for fc in result.row.contract.fields)
+            if name.startswith("policy__")
+        }
+        assert stamped == {
+            "policy__rag_context": ("declared", str, True),
+            "policy__rag_score": ("declared", float, True),
+            "policy__rag_count": ("declared", int, False),
+            "policy__rag_sources": ("declared", str, False),
+        }
 
 
 def test_plugin_discoverable():

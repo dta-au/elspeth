@@ -32,7 +32,7 @@ from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
 from elspeth.contracts.events import RAGRetrievalStatistics, TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
@@ -150,11 +150,14 @@ class RetrievalTransformBase(BaseTransform):
     Abstract: plugin discovery skips it. Uses synchronous process() since
     retrieval calls are I/O-bound but single-query-per-row.
 
-    Output fields (prefixed with output_prefix):
-        {prefix}__rag_context: Formatted text from retrieved chunks.
-        {prefix}__rag_score: Best relevance score (float, 0.0-1.0).
+    Output fields (prefixed with output_prefix), with the types the plugin
+    declares (``created_output_fields``) and the engine enforces:
+        {prefix}__rag_context: Formatted text from retrieved chunks (str;
+            None when nothing was found under on_no_results: continue).
+        {prefix}__rag_score: Best relevance score (float, 0.0-1.0; None
+            when nothing was found under on_no_results: continue).
         {prefix}__rag_count: Number of chunks retrieved (int).
-        {prefix}__rag_sources: JSON envelope with source provenance.
+        {prefix}__rag_sources: JSON envelope with source provenance (str).
     """
 
     # Every retrieval is a call to a search backend; subclasses redeclare it.
@@ -185,6 +188,19 @@ class RetrievalTransformBase(BaseTransform):
             ]
         )
         self._reject_input_options_naming_created_fields({"query_field": self._retrieval_config.query_field})
+        # The plugin's declaration of the four fields it creates (ADR-050).
+        # Every provider parses its hits into ``RetrievalChunk``, whose ``score``
+        # is a float normalized to [0.0, 1.0] at the Tier-3 boundary; the context
+        # is the formatter's text and the sources envelope is ``json.dumps``
+        # output. Under ``on_no_results: continue`` the context and score are
+        # None ("no retrieval happened", not zero relevance), so both are
+        # nullable; the count is then 0.
+        self._created_output_fields: tuple[FieldDefinition, ...] = (
+            FieldDefinition(self._field_context, "str", nullable=True),
+            FieldDefinition(self._field_score, "float", nullable=True),
+            FieldDefinition(self._field_count, "int"),
+            FieldDefinition(self._field_sources, "str"),
+        )
 
         # Schemas — RAG adds fields, so output uses observed mode
         self.input_schema, self.output_schema = self._create_schemas(
@@ -284,6 +300,10 @@ class RetrievalTransformBase(BaseTransform):
     @abstractmethod
     def _build_searcher(self, ctx: LifecycleContext) -> RetrievalSearcher:
         """Construct the search backend for this run."""
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The four retrieval fields, typed as the plugin's code fixes them (ADR-050)."""
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Capture lifecycle context and build the searcher."""

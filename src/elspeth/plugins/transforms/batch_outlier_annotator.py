@@ -15,7 +15,7 @@ from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
@@ -24,28 +24,43 @@ from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionEr
 
 type BatchOutlierAnnotationRow = dict[str, object]
 
-_ANNOTATION_FIELD_SUFFIXES = (
-    "batch_size",
-    "is_outlier",
-    "mad",
-    "mean",
-    "median",
-    "missing_count",
-    "missing_indices",
-    "non_finite_count",
-    "non_finite_indices",
-    "reason",
-    "robust_z_score",
-    "robust_z_threshold",
-    "row_index",
-    "skipped_count",
-    "stdev",
-    "valid_count",
-    "value",
-    "value_field",
-    "z_score",
-    "z_threshold",
+# Every annotation suffix with the type the plugin's code fixes (ADR-050).
+# ``value`` is the row's own ``value_field`` value copied onto the annotation
+# unconverted (an int stays an int); only finite int and float values are
+# annotated at all (``_finite_entries_for``), so it is declared ``float``: an
+# int value satisfies a float declaration (ADR-050 Decision 5, ruling C3), and
+# any other type would be this plugin's filter failing. ``value_field`` is the
+# configured name and ``reason`` the joined reason labels. Only int and float values
+# reach the arithmetic (``_finite_entries_for`` fails the batch on any other
+# type), and ``_stats_for`` converts each one with ``float(...)`` before
+# computing, so the mean, median, stdev and MAD are floats; the thresholds are
+# the config model's floats and the counts are ints. A z-score is undefined
+# when the batch has no spread (stdev, MAD and mean absolute deviation all
+# zero) and is emitted None then, never 0.0 (B4.5-c). The index lists are
+# lists the schema DSL has no type for.
+_ANNOTATION_CREATED_SUFFIXES: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("is_outlier", "bool"),
+    FieldDefinition("mad", "float"),
+    FieldDefinition("mean", "float"),
+    FieldDefinition("median", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("missing_indices", "any"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_finite_indices", "any"),
+    FieldDefinition("reason", "str"),
+    FieldDefinition("robust_z_score", "float", nullable=True),
+    FieldDefinition("robust_z_threshold", "float"),
+    FieldDefinition("row_index", "int"),
+    FieldDefinition("skipped_count", "int"),
+    FieldDefinition("stdev", "float"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("value", "float"),
+    FieldDefinition("value_field", "str"),
+    FieldDefinition("z_score", "float", nullable=True),
+    FieldDefinition("z_threshold", "float"),
 )
+_ANNOTATION_FIELD_SUFFIXES = tuple(field.name for field in _ANNOTATION_CREATED_SUFFIXES)
 _BACKWARD_INVARIANT_DROPPED_FIELD = "batch_outlier_annotator_dropped_probe_field"
 _MAX_BATCH_ROWS = 4096
 _MAX_SKIPPED_INDEX_DETAILS = 128
@@ -162,7 +177,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8365ac03597d3e0e"
+    source_file_hash: str | None = "sha256:504ed89733ba1d10"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     preserves_input_values = True
@@ -464,6 +479,13 @@ class BatchOutlierAnnotator(BaseTransform):
 
     def _field(self, suffix: str) -> str:
         return f"{self._output_prefix}_{suffix}"
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed suffix table above under the configured prefix (ADR-050)."""
+        return tuple(
+            FieldDefinition(self._field(field.name), field.field_type, required=field.required, nullable=field.nullable)
+            for field in _ANNOTATION_CREATED_SUFFIXES
+        )
 
     def _annotation_for(self, entry: _FiniteEntry, stats: _BatchStats) -> dict[str, object]:
         value = self._coerce_finite_float(entry.value, operation="float_conversion")

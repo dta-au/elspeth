@@ -240,11 +240,68 @@ rows meet.**
     plugin with conditional keys write them. Aggregation nodes still record
     no node output contract; the stamp describes their emitted rows to the
     nodes downstream.
+12. **Every plugin-computed field has a concrete type; `any` is reserved for
+    what the plugin cannot know** (ruling RC-4, 2026-09-25: the full sweep in
+    lane). Each shipped transform that creates fields declares, in
+    `created_output_fields()`, the type its own code fixes: counts, lengths
+    and indices `int`; means, rates, deviations and test statistics `float`
+    (`None`-able where the statistic can be undefined — a stdev at n=1, a
+    ratio over a zero denominator — never a fabricated 0.0); configured
+    names, labels and rendered text `str`; flags `bool`; a configured scalar
+    echoed back (`positive_label`) the configured value's type. A `float`
+    declaration is checked by the one admission rule of Decision 5, so an
+    exact `int` satisfies it and no value is converted to meet it: that is
+    what lets a statistic whose Python type follows the input's be declared
+    concretely — `batch_stats`'s `sum` (an exact int over int rows, never
+    rounded through a float), `distribution_profile`'s `min`/`max` and the
+    outlier annotator's `value` (row values, copied unconverted, but taken
+    only from the finite `int`/`float` values the plugin itself admits; each
+    batch plugin fails the batch on any other type, so no `Decimal`, `bool`
+    or `str` reaches them). `any` stays only where the value's type is
+    genuinely the data's, not the plugin's: a value carried from the rows
+    whose type the plugin does not constrain (a cohort or variant label,
+    `group_by`'s group value, `top_k`'s `group_value`, json_explode's
+    element), a list or mapping the DSL has no type for (index lists,
+    confusion matrices, `top_values`, LLM `_usage`, extraction facets and
+    provider-shaped results), and value_transform's expression targets (the
+    B7 ruling). Each plugin's declaration table states the reason for every
+    `any` beside it. The LLM transform's structured `output_fields` are
+    BOUND: each `OutputFieldConfig.type` declares one row type (`integer` →
+    `int`, `number` → `float`, `boolean` → `bool`, `string`/`enum` → `str`),
+    and the Tier-3 parse (`llm/validation.parse_field_value`, shared by the
+    LLM transform and the LLM source) converts the provider's JSON number
+    into that type — `5.0` under `integer` is the int 5 (a non-integral
+    float is still rejected), `7` under `number` the float 7.0. The binding
+    and the conversion landed together (the ruling: "bound and coerced
+    together, never one without the other"), and a test walks every
+    `OutputFieldType` to pin that each value the parse admits has exactly
+    the bound type. The two directions have different reasons: without the
+    `integer` conversion a benign `5.0` breaks the `int` declaration and
+    routes the row as the plugin's fault; the `number` conversion is not
+    needed by the value check (an `int` satisfies `float`), but it makes the
+    delivered value the row type the field is recorded as. The LLM source
+    shares the parse: before it, an observed-mode LLM source recorded
+    `score: float` for an `integer` field the provider spelled `5.0`, and a
+    downstream consumer declaring `score: int` routed the row as an upstream
+    schema bug. The governance harness
+    `tests/invariants/test_output_declared_types_conform.py` drives every
+    batch plugin's real computation over int, float, singleton, no-spread,
+    missing and grouped inputs and requires every concrete declaration to be
+    exercised; the registry gate runs the value check on every probe
+    emission, and
+    `tests/integration/pipeline/test_output_declaration_plugin_families.py`
+    breaks every plugin-declared concrete field of every registered
+    transform (and the configurations that switch further fields on) and
+    requires a value-free `declared_by: plugin` violation at the seam the
+    transform runs behind.
 
 ### What this is NOT
 
-- Not coercion. A value is written as computed; the declaration is checked
-  against it, never applied to it.
+- Not coercion of row data. A value is written as computed; the declaration
+  is checked against it, never applied to it. The one conversion is at a
+  Tier-3 parse boundary the ruling names: an LLM structured output's JSON
+  number is parsed into the row type its declared field is bound to
+  (Decision 12).
 - Not a source change. `ContractBuilder` and the source seam are untouched.
 - Not an aggregation-recording change. Aggregation and collector nodes
   still record no node output contract; their emitted rows carry the stamp
@@ -265,18 +322,29 @@ rows meet.**
 - The recorded contract is order- and scheduling-independent (two arrival
   orders and a four-worker pool record the same bytes).
 - A declared type is now a promise the engine keeps, at the node that made it.
-- The plugin-drift masking the panel named is closable: a plugin that
-  declares a concrete type gets it enforced, per row and at a batch flush.
-  Until the concrete-type sweep over the plugins (unit S1b) lands, a
-  plugin-computed field declared `any` is carried, not caught — the named
-  residual. The one concrete batch type today is batch_replicate's
-  `copy_index: int`, typed by construction before this change.
+- The plugin-drift masking the panel named is closed for every field a
+  plugin's code types: each such field is declared concretely (Decision 12)
+  and enforced per row and at a batch flush, with `declared_by: plugin` on
+  a violation. What remains `any` is named per field in the plugin's own
+  declaration table with its reason; drift there is carried, not caught,
+  because the plugin does not own that value's type.
+- An LLM structured output reaches downstream nodes in its declared type
+  (the node record says `int`/`float`, not `object`), so a typed consumer
+  can rely on it.
 
 ### Negative
 
 - `version_hash` moves for every observed-mode field-adding transform
-  (`source: declared`, `any` nullable), and the LLM prompt `contract_hash`
-  with it. Prior-run comparisons across the change differ.
+  (`source: declared`, `any` nullable, and after Decision 12 the concrete
+  plugin types), and the LLM prompt `contract_hash` with it. Prior-run
+  comparisons across the change differ.
+- An LLM structured value changes Python type where the provider's JSON
+  spelling differed from the bound type: `integer` `5.0` is delivered as
+  `5`, `number` `7` as `7.0`. The sink bytes do not change (measured with
+  a JSON and a CSV sink: both write an integral float as `5`/`7` before
+  and after); what changes is the type a downstream node receives and the
+  node records, and with it the LLM node's recorded contract and every
+  `contract_hash` computed over it.
 - A pre-change run at the same Landscape epoch that is resumed after the
   change is neither refused up front nor uniformly aborted. The node writer
   (`merge_for_node_evolution`) raises on a TYPE difference only, so it
@@ -399,8 +467,11 @@ value-checked, the recorded contract never changes type).
   forwards or converts belongs to its output (`source="declared"`, the
   declared presence and nullability, the converted type). Kept as upstream
   wrote it, in type_coerce's own `_build_output_contract`; type_coerce does
-  not call the shared stamp, and routing it through the one stamp is left to
-  the concrete-type sweep (unit S1b).
+  not call the shared stamp. It creates no field, so the created-field sweep
+  of Decision 12 does not reach it: a converted field keeps the target type
+  its own contract builder sets (`source: inferred` in observed mode, so the
+  engine's value check does not re-check the conversion). Routing its
+  conversions through the one stamp is an open follow-up, not done here.
 - **`93ad3e148` "preserve type proof across unchanged selected fields".**
   Orthogonal: a build-time type-resolution rule in `core/dag/guarantees.py`
   (a same-name field a transform selects, requires and guarantees keeps its

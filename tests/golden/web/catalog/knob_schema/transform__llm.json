@@ -125,7 +125,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -653,7 +653,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -1169,7 +1169,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -1714,7 +1714,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",

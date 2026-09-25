@@ -1593,3 +1593,81 @@ def test_structured_extraction_failure_discard_emits_nothing(
     rows = list(source.load(source_context))
 
     assert rows == []
+
+
+# The LLM source shares the transform's Tier-3 structured-output parse
+# (``extract_structured_fields``), so the binding of each ``OutputFieldConfig.type``
+# to one row type and the numeric parse INTO that type hold here too: JSON has
+# one number type, so ``5.0`` under ``integer`` is the int 5 and ``7`` under
+# ``number`` the float 7.0 (operator ruling 2026-09-25: bound and parsed
+# together). The source's schema already declares ``int`` / ``float`` for them
+# (``build_llm_source_output_schema_config``); the row now carries exactly that.
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_score", "expected_confidence"),
+    [
+        ('{"score": 5.0, "confidence": 7, "label": "pass"}', 5, 7.0),
+        ('{"score": 5, "confidence": 0.25, "label": "pass"}', 5, 0.25),
+        ('{"score": -3.0, "confidence": 1.0, "label": "fail"}', -3, 1.0),
+    ],
+    ids=["integral-float-under-integer-and-int-under-number", "int-and-float", "negative-integral-float-and-integral-float"],
+)
+def test_structured_source_parses_json_numbers_into_the_bound_row_types(
+    openrouter_config: Any,
+    source_context: PluginContext,
+    content: str,
+    expected_score: int,
+    expected_confidence: float,
+) -> None:
+    source = _structured_source(
+        openrouter_config,
+        source_context,
+        output_fields=[
+            {"suffix": "score", "type": "integer"},
+            {"suffix": "confidence", "type": "number"},
+            {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+        ],
+    )
+    provider = FakeProvider(
+        LLMQueryResult(
+            content=content,
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert len(rows) == 1
+    assert rows[0].is_quarantined is False
+    score = rows[0].row["score"]
+    confidence = rows[0].row["confidence"]
+    assert (score, type(score)) == (expected_score, int)
+    assert (confidence, type(confidence)) == (expected_confidence, float)
+
+
+def test_structured_source_rejects_a_non_integral_float_under_integer(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    """The parse converts only a spelling of the same number; ``3.5`` is not an integer and follows on_validation_failure."""
+    source = _structured_source(openrouter_config, source_context, on_validation_failure="quarantine")
+    provider = FakeProvider(
+        LLMQueryResult(
+            content='{"score": 3.5, "label": "pass"}',
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert len(rows) == 1
+    assert rows[0].is_quarantined is True
+    assert rows[0].quarantine_error is not None
+    assert "score" in rows[0].quarantine_error

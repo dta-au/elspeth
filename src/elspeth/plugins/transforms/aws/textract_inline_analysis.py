@@ -37,6 +37,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
@@ -59,6 +60,7 @@ from elspeth.plugins.transforms.aws.textract_config_shared import (
     TextractExtractFields,
     TextractQueryConfig,
     require_non_whitespace,
+    textract_created_output_fields,
     validate_textract_credential_fields,
 )
 from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
@@ -258,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3489990c6e5a9453"
+    source_file_hash: str | None = "sha256:74490c146392334b"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -343,6 +345,13 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._created_output_fields = textract_created_output_fields(
+            text_field=cfg.text_field,
+            page_count_field=cfg.page_count_field,
+            metadata_field=cfg.metadata_field,
+            result_field=cfg.result_field,
+            facet_fields=tuple(self._facet_fields.values()),
+        )
         self._reject_input_options_naming_created_fields({"blob_ref_field": cfg.blob_ref_field})
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,
@@ -362,6 +371,10 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._batch_initialized = False
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The configured output targets, typed as ``NormalizedTextractResult`` fixes them (ADR-050)."""
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)

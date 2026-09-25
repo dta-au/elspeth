@@ -98,10 +98,11 @@ class BatchStats(BaseTransform):
     when an aggregation trigger fires. Without group_by, it emits one
     aggregate row for the full batch. With group_by, it emits one aggregate
     row per distinct group value. It computes:
-    - count: Number of finite, non-missing valid numeric values
-    - sum: Sum of those finite, non-missing valid numeric values
-    - mean: Average of those values (if compute_mean=True)
-    - batch_size: Number of input rows before missing or non-finite values are skipped
+    - count: Number of finite, non-missing valid numeric values (int)
+    - sum: Sum of those finite, non-missing valid numeric values (declared
+      float: an exact int over int values, a float otherwise)
+    - mean: Average of those values, always a float (if compute_mean=True)
+    - batch_size: Number of input rows before missing or non-finite values are skipped (int)
 
     Config options:
         schema: Required. Schema for input validation
@@ -126,7 +127,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:875b1ce09351d385"
+    source_file_hash: str | None = "sha256:5c0fc24a3edacee1"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -268,20 +269,36 @@ class BatchStats(BaseTransform):
         return self._all_possible_output_keys
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """The conditional skip diagnostics, declared ``any`` and optional (ADR-050).
+        """The plugin's declaration of every field it computes (ADR-050).
 
-        They are written only when a row was skipped, so they are not in
-        ``declared_output_fields`` (the guarantee surface); naming them here
-        puts them through the declaration stamp like every other key the
-        aggregate writes. The guaranteed stat fields are stamped from
-        ``declared_output_fields``.
+        Concrete where the code fixes the type on every success path:
+        ``count`` and ``batch_size`` are lengths, ``mean`` is ``total / count``
+        (true division: a float even over int rows; a Decimal or bool never
+        reaches it, ``_aggregate_group`` fails the batch on any value whose
+        type is not exactly int or float). ``sum`` is ``sum(values)`` over
+        those same int and float values: an exact int over int rows (never
+        converted, so an integer total above 2**53 keeps every digit) and a
+        float otherwise, declared ``float`` because an int value satisfies a
+        float declaration (ADR-050 Decision 5, ruling C3: one number type).
+        ``group_by`` carries the group's row value, so its type is the data's
+        (``any``). The ``skipped_*`` diagnostics are written only when a row
+        was skipped, so they are optional: the counts are ints, the index
+        lists are lists the schema DSL has no type for.
         """
-        return (
-            FieldDefinition("skipped_missing", "any", required=False),
+        created = [
+            FieldDefinition("count", "int"),
+            FieldDefinition("sum", "float"),
+            FieldDefinition("batch_size", "int"),
+            FieldDefinition("skipped_missing", "int", required=False),
             FieldDefinition("skipped_missing_indices", "any", required=False),
-            FieldDefinition("skipped_non_finite", "any", required=False),
+            FieldDefinition("skipped_non_finite", "int", required=False),
             FieldDefinition("skipped_non_finite_indices", "any", required=False),
-        )
+        ]
+        if self._compute_mean:
+            created.append(FieldDefinition("mean", "float"))
+        if self._group_by is not None:
+            created.append(FieldDefinition(self._group_by, "any"))
+        return tuple(created)
 
     def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
         """Override (elspeth-f5f798f797): aggregation output is independent of input shape.
@@ -289,8 +306,8 @@ class BatchStats(BaseTransform):
         The user's ``schema:`` block describes the INPUT contract that batch_stats
         consumes — what fields/types upstream produces and which the consumer
         requires. The aggregation's OUTPUT is computed: stat fields plus an
-        optional group_by, declared by the plugin and stamped on the emitted
-        contract (ADR-050). It does not carry the user's input field
+        optional group_by, typed by ``created_output_fields`` and stamped on the
+        emitted contract (ADR-050). It does not carry the user's input field
         declarations.
 
         The base class implementation copies ``fields``, ``required_fields``, and

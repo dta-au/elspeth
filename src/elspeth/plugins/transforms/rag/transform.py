@@ -28,16 +28,19 @@ class RAGRetrievalTransform(RetrievalTransformBase):
     Registered as plugin name="rag_retrieval". Uses synchronous process()
     since retrieval calls are I/O-bound but single-query-per-row.
 
-    Output fields (prefixed with output_prefix):
-        {prefix}__rag_context: Formatted text from retrieved chunks.
-        {prefix}__rag_score: Best relevance score (float, 0.0-1.0).
+    Output fields (prefixed with output_prefix), with the types the plugin
+    declares and the engine enforces:
+        {prefix}__rag_context: Formatted text from retrieved chunks (str;
+            None when nothing was found under on_no_results: continue).
+        {prefix}__rag_score: Best relevance score (float, 0.0-1.0; None
+            when nothing was found under on_no_results: continue).
         {prefix}__rag_count: Number of chunks retrieved (int).
-        {prefix}__rag_sources: JSON envelope with source provenance.
+        {prefix}__rag_sources: JSON envelope with source provenance (str).
     """
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e7348a633aaa5e5b"
+    source_file_hash: str | None = "sha256:5efbc5fa533cf3ba"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True

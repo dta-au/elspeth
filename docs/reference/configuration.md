@@ -1193,8 +1193,15 @@ Each `output_fields` entry:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `suffix` | string | **Yes** | Column suffix; the output column is `<query_name>_<suffix>` |
-| `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response |
+| `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response and declared as the output column's row type |
 | `values` | list of strings | For `enum` only | Allowed values; required for `enum` and rejected for every other type |
+
+Each `type` is bound to one row type, which is the output column's declared
+type downstream: `integer` → int, `number` → float, `boolean` → bool,
+`string` and `enum` → str. JSON has one number type, so the response is parsed
+into that type: an `integer` returned as `5.0` arrives as `5` (a non-integral
+value such as `3.5` fails the row), and a `number` returned as `7` arrives as
+`7.0`. A boolean is never accepted as a number.
 
 A per-query `template` may not contain `{{interpretation:...}}` tokens —
 interpretation review rewrites only the node-level `prompt_template`, so a token

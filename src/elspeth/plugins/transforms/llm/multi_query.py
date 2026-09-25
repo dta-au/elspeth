@@ -48,7 +48,8 @@ class OutputFieldConfig(PluginConfig):
 
     Attributes:
         suffix: Column suffix in output row (e.g., "score" -> "{prefix}_score")
-        type: Data type for schema enforcement
+        type: Data type for schema enforcement, and the output column's row type
+            (integer -> int, number -> float, boolean -> bool, string/enum -> str)
         values: Required for enum type - list of allowed values
     """
 
@@ -69,7 +70,14 @@ class OutputFieldConfig(PluginConfig):
         json_schema_extra={"composer_hidden": True},
     )
     suffix: str = Field(..., description="Column suffix in output row")
-    type: OutputFieldType = Field(..., description="Data type for schema enforcement")
+    type: OutputFieldType = Field(
+        ...,
+        description=(
+            "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, "
+            "boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 "
+            "(5.5 fails the row), 7 under number as 7.0."
+        ),
+    )
     values: list[str] | None = Field(None, description="Allowed values (required for enum type)")
 
     @model_validator(mode="after")

@@ -19,7 +19,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -28,24 +28,28 @@ from elspeth.plugins.transforms._scalar_buckets import append_unique_bucket_valu
 
 type BatchDataQualityReportRow = dict[str, object]
 
-_QUALITY_OUTPUT_FIELDS = frozenset(
-    {
-        "batch_size",
-        "blank_string_count",
-        "blank_string_rate",
-        "distinct_count",
-        "duplicate_count",
-        "field",
-        "missing_count",
-        "missing_rate",
-        "non_finite_count",
-        "non_scalar_count",
-        "observed_count",
-        "observed_type_counts",
-        "valid_count",
-        "valid_rate",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050): ``field``
+# is the inspected column's configured name, the counts are ints, the rates are
+# ``count / batch_size`` true divisions (floats; an empty batch is an error
+# before any rate is computed), and ``observed_type_counts`` is a mapping the
+# schema DSL has no type for.
+_QUALITY_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("blank_string_count", "int"),
+    FieldDefinition("blank_string_rate", "float"),
+    FieldDefinition("distinct_count", "int"),
+    FieldDefinition("duplicate_count", "int"),
+    FieldDefinition("field", "str"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("missing_rate", "float"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_scalar_count", "int"),
+    FieldDefinition("observed_count", "int"),
+    FieldDefinition("observed_type_counts", "any"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("valid_rate", "float"),
 )
+_QUALITY_OUTPUT_FIELDS = frozenset(field.name for field in _QUALITY_CREATED_FIELDS)
 _MAX_INSPECT_FIELDS = 128
 
 
@@ -113,7 +117,7 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1da393ad52f7958c"
+    source_file_hash: str | None = "sha256:824cc55edc791aa8"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -204,6 +208,10 @@ class BatchDataQualityReport(BaseTransform):
             required_fields=None,
             audit_fields=None,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every quality row (ADR-050)."""
+        return _QUALITY_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the report output path for the backward invariant."""

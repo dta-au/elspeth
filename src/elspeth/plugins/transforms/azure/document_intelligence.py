@@ -41,6 +41,7 @@ from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, is
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
@@ -294,7 +295,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:2f84a868669a4ab1"
+    source_file_hash: str | None = "sha256:d2835cb27e67be69"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -383,6 +384,20 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        # The plugin's declaration of every field it creates (ADR-050):
+        # ``extract_content`` returns the document text (``str``) and
+        # ``count_pages`` the validated page count (``int``); the raw analyze
+        # result is a mapping and every facet a list, which the schema DSL has
+        # no scalar type for (``any``).
+        created: list[FieldDefinition] = []
+        if cfg.content_field is not None:
+            created.append(FieldDefinition(cfg.content_field, "str"))
+        if cfg.page_count_field is not None:
+            created.append(FieldDefinition(cfg.page_count_field, "int"))
+        if cfg.result_field is not None:
+            created.append(FieldDefinition(cfg.result_field, "any"))
+        created.extend(FieldDefinition(name, "any") for name in self._facet_fields.values())
+        self._created_output_fields: tuple[FieldDefinition, ...] = tuple(created)
         self._reject_input_options_naming_created_fields({"source_field": cfg.source_field})
 
         schema_config = cfg.schema_config
@@ -402,6 +417,10 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     def _default_request_headers(self) -> dict[str, str]:
         """Auth headers for the audited client. Isolated so AAD bearer auth is a clean later add."""
         return {"Ocp-Apim-Subscription-Key": self._api_key}
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The configured output targets, typed as the result parsers fix them (ADR-050)."""
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)

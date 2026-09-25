@@ -16,6 +16,7 @@ from elspeth.contracts.call_mode import CallModeSession, SourceCallParentIdentit
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
@@ -767,6 +768,20 @@ def test_all_configured_projections_are_emitted_only_after_complete_pagination()
     assert output["textract_metadata"]["block_count"] == 4
     assert len(output["textract_pages"]) == 2
     assert output["textract_result"]["DocumentMetadata"] == {"Pages": 2}
+    # ADR-050: the text and page count carry the plugin's concrete types and the
+    # engine's value check passes on the real emission; the provider-shaped
+    # mappings and facet lists are ``any``.
+    declared = {name: contract.python_type for name, contract in transform._stamped_output_field_contracts().items()}
+    assert {
+        name: declared[name] for name in ("textract_text", "textract_page_count", "textract_metadata", "textract_result", "textract_pages")
+    } == {
+        "textract_text": str,
+        "textract_page_count": int,
+        "textract_metadata": object,
+        "textract_result": object,
+        "textract_pages": object,
+    }
+    verify_produced_output_types(transform=transform, input_row=_row(), emitted_rows=[result.row])
     assert "opaque-pagination-secret" not in repr(output)
     assert "opaque-pagination-secret" not in repr(result.success_reason)
     assert client.get_calls == [

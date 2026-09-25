@@ -18,7 +18,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -27,18 +27,21 @@ from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 
 type ReportAssembleRow = dict[str, object]
 
-_REPORT_METADATA_FIELDS = frozenset(
-    {
-        "report_format",
-        "report_index",
-        "line_start",
-        "line_end",
-        "line_count",
-        "lines_seen_total",
-        "flush_trigger",
-        "is_end_of_source_report",
-    }
+# The pagination metadata every report row carries, with the type the plugin's
+# code fixes for each (ADR-050): the format is the configured label, and the
+# rest are copied from the engine-owned ``AggregationBatchContext`` (a str
+# trigger type, int window bounds and counters, a bool end-of-source flag).
+_REPORT_METADATA_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("report_format", "str"),
+    FieldDefinition("report_index", "int"),
+    FieldDefinition("line_start", "int"),
+    FieldDefinition("line_end", "int"),
+    FieldDefinition("line_count", "int"),
+    FieldDefinition("lines_seen_total", "int"),
+    FieldDefinition("flush_trigger", "str"),
+    FieldDefinition("is_end_of_source_report", "bool"),
 )
+_REPORT_METADATA_FIELDS = frozenset(field.name for field in _REPORT_METADATA_CREATED_FIELDS)
 
 
 # ``title`` and ``join_with`` are rendered into user-visible report output. A
@@ -99,7 +102,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8c9904b4ecaea469"
+    source_file_hash: str | None = "sha256:05824728790cda1b"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -237,6 +240,10 @@ class ReportAssemble(BaseTransform):
             return self._render_markdown(lines)
         # Literal type guarantees the only remaining value is "html_fragment".
         return self._render_html_fragment(lines)
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The rendered report (``str``, every renderer returns text) plus the metadata table above (ADR-050)."""
+        return (FieldDefinition(self._output_field, "str"), *_REPORT_METADATA_CREATED_FIELDS)
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         # Hypothesis-generated probe rows arrive without ``text_field``, so the

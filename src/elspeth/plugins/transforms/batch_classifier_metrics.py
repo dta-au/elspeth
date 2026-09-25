@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field, field_validator, model_validator
 
@@ -30,39 +30,48 @@ from elspeth.plugins.transforms._scalar_buckets import (
 type LabelValue = str | int | bool
 type BatchClassifierMetricsRow = dict[str, object]
 
-_BASE_METRIC_FIELDS = frozenset(
-    {
-        "accuracy",
-        "actual_field",
-        "batch_size",
-        "confusion_matrix",
-        "count",
-        "labels",
-        "macro_f1",
-        "macro_precision",
-        "macro_recall",
-        "micro_f1",
-        "micro_precision",
-        "micro_recall",
-        "missing_count",
-        "per_label",
-        "predicted_field",
-        "summary",
-        "weighted_f1",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The field
+# names are configured strings, the counts are ints, and every ratio metric is
+# a float or None: ``_safe_ratio`` returns ``float(...)`` or None where the
+# denominator is zero, and ``_mean_defined`` / ``_weighted_mean_defined``
+# divide floats or return None when nothing is defined (an undefined metric is
+# never fabricated as 0.0). ``labels``, ``confusion_matrix`` and ``per_label``
+# are lists the schema DSL has no type for; ``missing_indices`` is written only
+# when a row was skipped (optional).
+_BASE_METRIC_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("accuracy", "float", nullable=True),
+    FieldDefinition("actual_field", "str"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("confusion_matrix", "any"),
+    FieldDefinition("count", "int"),
+    FieldDefinition("labels", "any"),
+    FieldDefinition("macro_f1", "float", nullable=True),
+    FieldDefinition("macro_precision", "float", nullable=True),
+    FieldDefinition("macro_recall", "float", nullable=True),
+    FieldDefinition("micro_f1", "float", nullable=True),
+    FieldDefinition("micro_precision", "float", nullable=True),
+    FieldDefinition("micro_recall", "float", nullable=True),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("per_label", "any"),
+    FieldDefinition("predicted_field", "str"),
+    FieldDefinition("summary", "str"),
+    FieldDefinition("weighted_f1", "float", nullable=True),
+    FieldDefinition("missing_indices", "any", required=False),
 )
-_BINARY_METRIC_FIELDS = frozenset(
-    {
-        "binary_f1",
-        "binary_fn",
-        "binary_fp",
-        "binary_precision",
-        "binary_recall",
-        "binary_tn",
-        "binary_tp",
-        "positive_label",
-    }
+# The binary block, written only when ``positive_label`` is configured; the
+# label's own declaration is the configured value's type (``_positive_label_definition``).
+_BINARY_METRIC_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("binary_f1", "float", nullable=True),
+    FieldDefinition("binary_fn", "int"),
+    FieldDefinition("binary_fp", "int"),
+    FieldDefinition("binary_precision", "float", nullable=True),
+    FieldDefinition("binary_recall", "float", nullable=True),
+    FieldDefinition("binary_tn", "int"),
+    FieldDefinition("binary_tp", "int"),
 )
+_BASE_METRIC_FIELDS = frozenset(field.name for field in _BASE_METRIC_CREATED_FIELDS if field.required)
+_BINARY_METRIC_FIELDS = frozenset({*(field.name for field in _BINARY_METRIC_CREATED_FIELDS), "positive_label"})
+_LABEL_FIELD_TYPES: dict[type, Literal["str", "int", "bool"]] = {str: "str", int: "int", bool: "bool"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +175,7 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:88fbbec8d6c74810"
+    source_file_hash: str | None = "sha256:b17e579df62a1874"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -265,13 +274,19 @@ class BatchClassifierMetrics(BaseTransform):
         )
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """``missing_indices``, declared ``any`` and optional (ADR-050).
+        """The typed tables above; the binary block only when ``positive_label`` is configured (ADR-050).
 
-        Written only when a row was skipped, so it is not in
-        ``declared_output_fields`` (the guarantee surface); naming it here
-        puts it through the declaration stamp with the guaranteed metrics.
+        ``positive_label`` is written back exactly as configured, so its type
+        is the configured value's type (``str``, ``int`` or ``bool`` — the
+        config model admits no other), fixed before the first row.
         """
-        return (FieldDefinition("missing_indices", "any", required=False),)
+        if self._positive_label is None:
+            return _BASE_METRIC_CREATED_FIELDS
+        return (
+            *_BASE_METRIC_CREATED_FIELDS,
+            *_BINARY_METRIC_CREATED_FIELDS,
+            FieldDefinition("positive_label", _LABEL_FIELD_TYPES[type(self._positive_label)]),
+        )
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the metric output path for the backward invariant."""

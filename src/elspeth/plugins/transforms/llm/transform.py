@@ -38,6 +38,7 @@ from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -53,6 +54,8 @@ from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_
 from elspeth.plugins.infrastructure.templates import TemplateError
 from elspeth.plugins.transforms.llm import (
     _OUTPUT_FIELD_TYPE_TO_SCHEMA,
+    _SUFFIX_SCHEMA_TYPES,
+    LLM_GUARANTEED_SUFFIXES,
     _build_augmented_output_schema,
     _build_llm_output_schema_config,
     _build_multi_query_output_schema,
@@ -1182,6 +1185,18 @@ class MultiQueryStrategy:
 # ---------------------------------------------------------------------------
 
 
+def _llm_created_output_fields(
+    response_field: str,
+    prefix: str,
+    output_fields: tuple[OutputFieldConfig, ...],
+) -> tuple[FieldDefinition, ...]:
+    """The typed created fields of one query: its operational fields plus its structured fields under ``prefix``."""
+    return (
+        *(FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES),
+        *(FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in output_fields),
+    )
+
+
 class LLMTransform(BaseTransform, BatchTransformMixin):
     """Unified LLM transform with provider dispatch and strategy selection.
 
@@ -1207,7 +1222,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:329d3e09a48c25a4"
+    source_file_hash: str | None = "sha256:f2445ce8d382861d"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1564,6 +1579,13 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, prefixed_guaranteed)
+            self._created_output_fields: tuple[FieldDefinition, ...] = tuple(
+                definition
+                for spec in query_specs
+                for definition in _llm_created_output_fields(
+                    f"{spec.name}_{self._response_field}", f"{spec.name}_", spec.output_fields or ()
+                )
+            )
 
             # Pydantic output schema with prefixed LLM fields
             # Build extracted_fields mapping: query_name → (field_name, schema_type) tuples
@@ -1613,6 +1635,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
+            self._created_output_fields = _llm_created_output_fields(self._response_field, "", single_output_fields)
 
             # Pydantic output schema with unprefixed LLM fields (structured
             # fields carry their declared runtime types)
@@ -1724,6 +1747,24 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             batch_wait_timeout=float(self._max_capacity_retry_seconds),
         )
         self._batch_initialized = True
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Every field this transform creates, typed by the code that writes it (ADR-050).
+
+        The operational fields follow ``_SUFFIX_SCHEMA_TYPES`` (the response
+        content and the served model are ``str``; the usage is a mapping the
+        schema DSL has no scalar type for). Each structured ``output_fields``
+        entry is BOUND to the row type of its ``OutputFieldConfig.type`` through
+        ``_OUTPUT_FIELD_TYPE_TO_SCHEMA``, and the Tier-3 parse
+        (``validation.parse_field_value``, reached through
+        ``extract_structured_fields``) returns every value it admits in exactly
+        that type (``integer`` admits an integral float as an int, ``number``
+        an int as a float), so a value the parse admits always satisfies the
+        declaration the engine enforces. The binding and the parse landed
+        together and a test pins that they agree for every ``OutputFieldType``
+        (operator ruling 2026-09-25: never one without the other).
+        """
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Capture recorder/telemetry and create provider instance."""
@@ -2005,7 +2046,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
                     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
-                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
+                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str. The raw response_field and automatic usage/model fields remain available.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
                     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",

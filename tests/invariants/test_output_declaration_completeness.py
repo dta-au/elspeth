@@ -20,7 +20,10 @@ Two sweeps over the live transform registry, built from each plugin's
   in a run. Batch-aware transforms run through the same probe: their
   reductive outputs carry the stamp via ``_batch_output_contract`` and their
   passthrough outputs stamp the created fields, so every emitted created key
-  must be ``declared`` there too.
+  must be ``declared`` there too. The same emission then goes through the
+  engine's value check for the seam the transform runs behind (per-row or
+  batch flush), so a declared type the probe's own computation breaks is
+  caught here as well.
 
 Controls: web_scrape (a plugin that promotes observed to a typed flexible
 output) passes; the predicate itself is exercised against an in-file plugin
@@ -38,6 +41,7 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import propagate_contract
 from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.engine.executors.declared_output_types import verify_created_output_types, verify_produced_output_types
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.testing import make_pipeline_row
@@ -129,6 +133,14 @@ def test_every_emitted_created_field_carries_a_declared_contract(_transform_cls:
         f"{ {key: sorted(reasons) for key, reasons in problems.items()}!r} (ADR-050). The runtime completeness contract "
         "would end the run on the first row; declare the field or route it through the stamp."
     )
+
+    # The declared TYPES hold on the probe's emission too: the engine's value
+    # check, at the seam this transform runs behind, passes on it.
+    if transform.is_batch_aware:
+        verify_created_output_types(transform=transform, emitted_rows=emitted)
+    else:
+        [probe_input] = probe_rows
+        verify_produced_output_types(transform=transform, input_row=probe_input, emitted_rows=emitted)
 
 
 class _Probe(BaseTransform):

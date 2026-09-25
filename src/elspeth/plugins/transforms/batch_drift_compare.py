@@ -14,7 +14,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -30,41 +30,47 @@ type BatchDriftCompareRow = dict[str, object]
 type CategoricalValue = str | int | bool
 ValueType = Literal["numeric", "categorical"]
 
-_COMMON_OUTPUT_FIELDS = frozenset(
-    {
-        "baseline_cohort",
-        "baseline_count",
-        "baseline_missing_count",
-        "baseline_non_finite_count",
-        "baseline_total_count",
-        "batch_size",
-        "cohort",
-        "cohort_count",
-        "cohort_field",
-        "cohort_missing_count",
-        "cohort_non_finite_count",
-        "cohort_total_count",
-        "value_field",
-        "value_type",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050).
+# ``cohort_field`` / ``value_field`` / ``value_type`` are configured strings and
+# the counts are ints. ``baseline_cohort`` and ``cohort`` are the cohort values
+# as they appear in the rows, carried from the data, so they are ``any``. The
+# numeric statistics are floats whatever the input's numeric type (the means
+# sum ``float(value)``; the KS distance and the categorical total variation and
+# chi-square accumulate from float literals); ``category_shifts`` and
+# ``new_categories`` are lists the schema DSL has no type for.
+_COMMON_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_cohort", "any"),
+    FieldDefinition("baseline_count", "int"),
+    FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_total_count", "int"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("cohort", "any"),
+    FieldDefinition("cohort_count", "int"),
+    FieldDefinition("cohort_field", "str"),
+    FieldDefinition("cohort_missing_count", "int"),
+    FieldDefinition("cohort_non_finite_count", "int"),
+    FieldDefinition("cohort_total_count", "int"),
+    FieldDefinition("value_field", "str"),
+    FieldDefinition("value_type", "str"),
 )
-_NUMERIC_OUTPUT_FIELDS = _COMMON_OUTPUT_FIELDS | frozenset(
-    {
-        "baseline_mean",
-        "cohort_mean",
-        "ks_statistic",
-        "mean_delta",
-    }
+_NUMERIC_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    *_COMMON_CREATED_FIELDS,
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("cohort_mean", "float"),
+    FieldDefinition("ks_statistic", "float"),
+    FieldDefinition("mean_delta", "float"),
 )
-_CATEGORICAL_OUTPUT_FIELDS = _COMMON_OUTPUT_FIELDS | frozenset(
-    {
-        "category_shifts",
-        "chi_square_statistic",
-        "new_categories",
-        "new_category_count",
-        "total_variation",
-    }
+_CATEGORICAL_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    *_COMMON_CREATED_FIELDS,
+    FieldDefinition("category_shifts", "any"),
+    FieldDefinition("chi_square_statistic", "float"),
+    FieldDefinition("new_categories", "any"),
+    FieldDefinition("new_category_count", "int"),
+    FieldDefinition("total_variation", "float"),
 )
+_NUMERIC_OUTPUT_FIELDS = frozenset(field.name for field in _NUMERIC_CREATED_FIELDS)
+_CATEGORICAL_OUTPUT_FIELDS = frozenset(field.name for field in _CATEGORICAL_CREATED_FIELDS)
 _MAX_BATCH_ROWS = 4096
 
 
@@ -144,7 +150,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d9a83901a2e1c580"
+    source_file_hash: str | None = "sha256:b5e64d63d3f04c9d"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -239,6 +245,10 @@ class BatchDriftCompare(BaseTransform):
             required_fields=None,
             audit_fields=None,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table for the configured ``value_type`` (ADR-050)."""
+        return _NUMERIC_CREATED_FIELDS if self._value_type == "numeric" else _CATEGORICAL_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the drift output path for the backward invariant."""

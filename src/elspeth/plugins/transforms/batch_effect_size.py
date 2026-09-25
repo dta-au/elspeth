@@ -24,38 +24,45 @@ from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchEffectSizeRow = dict[str, object]
 
-_EFFECT_SIZE_OUTPUT_FIELDS = frozenset(
-    {
-        "baseline_count",
-        "baseline_mean",
-        "baseline_missing_count",
-        "baseline_non_finite_count",
-        "baseline_stdev",
-        "baseline_total_count",
-        "baseline_variant",
-        "batch_size",
-        "cohens_d",
-        "hedges_g",
-        "mean_delta",
-        "pooled_stdev",
-        "score_field",
-        "variant",
-        "variant_count",
-        "variant_field",
-        "variant_mean",
-        "variant_missing_count",
-        "variant_non_finite_count",
-        "variant_stdev",
-        "variant_total_count",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The
+# field names are configured strings and the counts are ints. The variant
+# labels are the values as they appear in the rows, carried from the data, so
+# they are ``any``. Only int and float scores reach the arithmetic
+# (``_stats_for_group`` fails the batch on any other type), so the means and the
+# delta are true-division floats; a standard deviation is undefined at n=1,
+# the pooled one when both groups are singletons, and Cohen's d / Hedges' g
+# whenever the pooled dispersion is undefined or zero — each is emitted None
+# then, never a fabricated 0.0 (B4.5). The ``*_indices`` lists are written
+# only when a row of that group was skipped (optional) and are lists the
+# schema DSL has no type for.
+_EFFECT_SIZE_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_count", "int"),
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_stdev", "float", nullable=True),
+    FieldDefinition("baseline_total_count", "int"),
+    FieldDefinition("baseline_variant", "any"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("cohens_d", "float", nullable=True),
+    FieldDefinition("hedges_g", "float", nullable=True),
+    FieldDefinition("mean_delta", "float"),
+    FieldDefinition("pooled_stdev", "float", nullable=True),
+    FieldDefinition("score_field", "str"),
+    FieldDefinition("variant", "any"),
+    FieldDefinition("variant_count", "int"),
+    FieldDefinition("variant_field", "str"),
+    FieldDefinition("variant_mean", "float"),
+    FieldDefinition("variant_missing_count", "int"),
+    FieldDefinition("variant_non_finite_count", "int"),
+    FieldDefinition("variant_stdev", "float", nullable=True),
+    FieldDefinition("variant_total_count", "int"),
+    FieldDefinition("baseline_missing_indices", "any", required=False),
+    FieldDefinition("baseline_non_finite_indices", "any", required=False),
+    FieldDefinition("variant_missing_indices", "any", required=False),
+    FieldDefinition("variant_non_finite_indices", "any", required=False),
 )
-# Written only when a row of that group was skipped (never guaranteed).
-_CONDITIONAL_INDEX_FIELDS = (
-    "baseline_missing_indices",
-    "baseline_non_finite_indices",
-    "variant_missing_indices",
-    "variant_non_finite_indices",
-)
+_EFFECT_SIZE_OUTPUT_FIELDS = frozenset(field.name for field in _EFFECT_SIZE_CREATED_FIELDS if field.required)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +133,7 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cb64af6a383f282f"
+    source_file_hash: str | None = "sha256:f1d2b1c59463f7fe"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
     usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
@@ -217,13 +224,8 @@ class BatchEffectSize(BaseTransform):
         )
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """The conditional index lists, declared ``any`` and optional (ADR-050).
-
-        Written only when a row was skipped, so they are not in
-        ``declared_output_fields`` (the guarantee surface); naming them here
-        puts them through the declaration stamp with the guaranteed fields.
-        """
-        return tuple(FieldDefinition(name, "any", required=False) for name in _CONDITIONAL_INDEX_FIELDS)
+        """The typed table above: the same fields on every effect-size row (ADR-050)."""
+        return _EFFECT_SIZE_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the effect-size output path for the backward invariant."""

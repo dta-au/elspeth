@@ -8,6 +8,7 @@ tracer wiring, and multi-query partial failure atomicity.
 
 from __future__ import annotations
 
+import json
 import threading
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -3993,3 +3994,214 @@ def test_effective_query_templates_execute_and_keep_their_own_audit_identity(wit
     assert metadata["own_llm_response_template_hash"] == sha256(b"Own {{ row.text_content }}").hexdigest()
     second_template = "Fallback {{ row.text_content }}" if with_fallback else "Second {{ row.text_content }}"
     assert metadata["second_llm_response_template_hash"] == sha256(second_template.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# ADR-050: every created field carries the type the PLUGIN's code fixes, and
+# each structured ``output_fields`` entry is BOUND to the row type of its
+# ``OutputFieldConfig.type``. The binding lands together with the Tier-3
+# numeric parse INTO that type (operator ruling 2026-09-25): JSON has one
+# number type, so ``5.0`` under ``integer`` reaches the row as the int 5 and
+# ``7`` under ``number`` as the float 7.0; the engine's value check then
+# enforces the declaration on every emitted value.
+# ---------------------------------------------------------------------------
+
+
+_STRUCTURED_FIELDS = [
+    {"suffix": "score", "type": "integer"},
+    {"suffix": "confidence", "type": "number"},
+    {"suffix": "approved", "type": "boolean"},
+    {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+    {"suffix": "rationale", "type": "string"},
+]
+_BOUND_TYPES = {"score": int, "confidence": float, "approved": bool, "label": str, "rationale": str}
+
+
+def _structured_query_result(content: str) -> LLMQueryResult:
+    return LLMQueryResult(content=content, usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP)
+
+
+class TestStructuredOutputTypeBinding:
+    """The declared type of every LLM-created field, and the parse that makes the emitted value satisfy it."""
+
+    def test_single_query_declares_every_created_field_with_its_bound_type(self) -> None:
+        from elspeth.contracts.schema import FieldDefinition
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        transform = LLMTransform(_make_config(output_fields=_STRUCTURED_FIELDS))
+
+        assert set(transform.created_output_fields()) == {
+            FieldDefinition("llm_response", "str"),
+            FieldDefinition("llm_response_model", "str"),
+            FieldDefinition("llm_response_usage", "any"),
+            FieldDefinition("score", "int"),
+            FieldDefinition("confidence", "float"),
+            FieldDefinition("approved", "bool"),
+            FieldDefinition("label", "str"),
+            FieldDefinition("rationale", "str"),
+        }
+        assert {definition.name for definition in transform.created_output_fields()} == set(transform.declared_output_fields)
+
+    def test_multi_query_declares_each_query_s_prefixed_fields_with_their_bound_types(self) -> None:
+        from elspeth.contracts.schema import FieldDefinition
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={
+                "quality": {"input_fields": {"text_content": "text"}, "output_fields": _STRUCTURED_FIELDS[:2]},
+                "tone": {"input_fields": {"text_content": "text"}},
+            },
+        )
+        transform = LLMTransform(config)
+
+        assert set(transform.created_output_fields()) == {
+            FieldDefinition("quality_llm_response", "str"),
+            FieldDefinition("quality_llm_response_model", "str"),
+            FieldDefinition("quality_llm_response_usage", "any"),
+            FieldDefinition("quality_score", "int"),
+            FieldDefinition("quality_confidence", "float"),
+            FieldDefinition("tone_llm_response", "str"),
+            FieldDefinition("tone_llm_response_model", "str"),
+            FieldDefinition("tone_llm_response_usage", "any"),
+        }
+        assert {definition.name for definition in transform.created_output_fields()} == set(transform.declared_output_fields)
+
+    @pytest.mark.parametrize(
+        ("score", "confidence", "expected_score", "expected_confidence"),
+        [
+            ("5.0", "7", 5, 7.0),
+            ("5", "7.0", 5, 7.0),
+            ("-2.0", "0.25", -2, 0.25),
+            ("4", "1", 4, 1.0),
+        ],
+        ids=["integral-float-and-int", "int-and-integral-float", "negative-integral-float-and-fraction", "int-and-int"],
+    )
+    def test_single_query_emits_the_bound_types_and_satisfies_its_declaration(
+        self, score: str, confidence: str, expected_score: int, expected_confidence: float
+    ) -> None:
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS))
+        provider.execute_query.return_value = _structured_query_result(
+            f'{{"score": {score}, "confidence": {confidence}, "approved": true, "label": "pass", "rationale": "ok"}}'
+        )
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        emitted = result.row
+        assert (emitted["score"], type(emitted["score"])) == (expected_score, int)
+        assert (emitted["confidence"], type(emitted["confidence"])) == (expected_confidence, float)
+        for name, python_type in _BOUND_TYPES.items():
+            field = emitted.contract.get_field(name)
+            assert field is not None
+            assert (field.source, field.python_type) == ("declared", python_type), name
+            assert type(emitted[name]) is python_type, name
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[emitted])
+
+    def test_multi_query_emits_the_bound_types(self) -> None:
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={"quality": {"input_fields": {"text_content": "text"}, "output_fields": _STRUCTURED_FIELDS[:2]}},
+        )
+        transform = LLMTransform(config)
+        provider = Mock(spec=LLMProvider)
+        provider.execute_query.return_value = _structured_query_result('{"score": 9.0, "confidence": 3}')
+        transform._provider = provider
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert (result.row["quality_score"], type(result.row["quality_score"])) == (9, int)
+        assert (result.row["quality_confidence"], type(result.row["quality_confidence"])) == (3.0, float)
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+    def test_a_non_integral_float_under_integer_is_a_row_error_not_a_conversion(self) -> None:
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 3.5, "confidence": 1}')
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert (result.reason["reason"], result.reason["field"]) == ("field_type_mismatch", "score")
+
+    def test_a_parse_that_stops_converting_is_caught_by_the_value_check_as_the_plugin_s_fault(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The binding without the parse routes a benign ``5.0`` under ``integer`` (why the ruling pairs them).
+
+        The ``number`` side is not what the value check catches: an ``int``
+        satisfies a ``float`` declaration (ADR-050 Decision 5), so the
+        unconverted ``7`` passes; the ``integer`` side is, because ``5.0`` is
+        not an int. ``declared_by`` is ``plugin`` although the operator wrote
+        ``type: integer``: the declared row type is the plugin's promise about
+        its own parser, so when the check fires the parser drifted and "fix
+        the transform" is the right message. The reason names the field and
+        both type names, never the value.
+        """
+        from elspeth.contracts.errors import DeclaredOutputTypeViolation
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm import validation
+
+        real_parse = validation.parse_field_value
+
+        def parse_without_conversion(value: Any, field_config: Any) -> tuple[Any, str | None]:
+            _parsed, error = real_parse(value, field_config)
+            return (None, error) if error is not None else (value, None)
+
+        monkeypatch.setattr(validation, "parse_field_value", parse_without_conversion)
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 5.0, "confidence": 7}')
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+        assert result.status == "success"
+        assert result.row is not None
+        assert (type(result.row["score"]), type(result.row["confidence"])) == (float, int)
+        with pytest.raises(DeclaredOutputTypeViolation) as excinfo:
+            verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+        reason = excinfo.value.to_transform_error_reason()
+        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"], reason["declared_by"]) == (
+            "score",
+            "int",
+            "float",
+            "computed",
+            "plugin",
+        )
+        assert "5.0" not in json.dumps(reason)
+
+    def test_an_unconverted_int_under_number_satisfies_the_float_declaration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control for the test above: with the parse's conversion removed, ``7`` under ``number`` alone routes nothing.
+
+        The ``number`` conversion exists so the delivered value IS the bound
+        row type (``float``), not because the engine would refuse an ``int``.
+        """
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm import validation
+
+        real_parse = validation.parse_field_value
+
+        def parse_without_conversion(value: Any, field_config: Any) -> tuple[Any, str | None]:
+            _parsed, error = real_parse(value, field_config)
+            return (None, error) if error is not None else (value, None)
+
+        monkeypatch.setattr(validation, "parse_field_value", parse_without_conversion)
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 5, "confidence": 7}')
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+        assert result.status == "success"
+        assert result.row is not None
+        assert type(result.row["confidence"]) is int
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
