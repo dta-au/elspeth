@@ -5,6 +5,9 @@ Task 4 of Phase 1: Core Contracts Implementation.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
+import numpy as np
 import pytest
 
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -514,6 +517,46 @@ class TestSchemaContractValidation:
         )
         violations = contract.validate({"count": np.int64(42)})
         assert violations == []  # np.int64 normalizes to int
+
+    @pytest.mark.parametrize(
+        ("declared", "value", "admitted"),
+        [
+            pytest.param(float, 3, True, id="int-satisfies-float"),
+            pytest.param(float, np.int64(3), True, id="numpy-int-satisfies-float"),
+            pytest.param(float, 3.5, True, id="float-satisfies-float"),
+            pytest.param(float, True, False, id="bool-never-satisfies-float"),
+            pytest.param(float, np.bool_(True), False, id="numpy-bool-never-satisfies-float"),
+            pytest.param(int, True, False, id="bool-never-satisfies-int"),
+            pytest.param(int, 3.0, False, id="float-never-satisfies-int"),
+            pytest.param(float, Decimal("1.5"), False, id="decimal-under-float-stays-open"),
+        ],
+    )
+    def test_validate_admits_an_int_for_a_float_declaration_and_nothing_else_widens(self, declared, value, admitted) -> None:
+        """The ONE admission rule (ruling 2026-09-25, C3): exact type, except an int satisfies float.
+
+        This matches pydantic strict for int; bool stays excluded (pydantic
+        strict admits numpy.bool_ for float, this rule does not), and the
+        value is never converted.
+        """
+        from elspeth.contracts.errors import TypeMismatchViolation
+        from elspeth.contracts.schema_contract import declared_type_admits
+
+        row = {"x": value}
+        contract = SchemaContract(
+            mode="FIXED",
+            fields=(make_field("x", declared, original_name="X", required=True, source="declared"),),
+            locked=True,
+        )
+        violations = contract.validate(row)
+        if admitted:
+            assert violations == []
+            assert row["x"] is value
+        else:
+            [violation] = violations
+            assert type(violation) is TypeMismatchViolation
+            assert violation.expected_type is declared
+        assert declared_type_admits(float, int) is True
+        assert declared_type_admits(int, float) is False
 
     def test_validate_none_matches_nonetype(self) -> None:
         """None value matches type(None) contract."""

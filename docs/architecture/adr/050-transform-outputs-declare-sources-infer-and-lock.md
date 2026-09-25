@@ -119,10 +119,15 @@ rows meet.**
    spelled (review-S1a-r3 F1: before, `Name` resolved to the input field
    `name` and a copied str was delivered under `Name: int, declared`). An input
    value passed through unchanged is not re-adjudicated: the strict input
-   check admitted it under pydantic's rules (which accept an `int` or a
-   `Decimal` for `float`, where `SchemaContract.validate` compares exact
-   types), and a resumed row legitimately carries a type-faithful `Decimal`
-   under its `float` declaration. For the same reason a
+   check admitted it under pydantic's rules (which also accept a `Decimal`
+   for `float`, where `SchemaContract.validate` does not), and a resumed row
+   legitimately carries a type-faithful `Decimal` under its `float`
+   declaration. The value check itself is `SchemaContract.validate`, whose
+   ONE admission rule (`declared_type_admits`) is exact type with a single
+   widening: an `int` value satisfies a `float` declaration (the numeric
+   tower; JSON has one number type), as pydantic strict admits it, and the
+   value is never converted. `bool` never satisfies `float` or `int`
+   (ruling 2026-09-25, reconciliation C3). For the same reason a
    `carried_output_fields()` name (a field_mapper rename whose target
    inherits the source's contract) is never produced: its value is the input
    field's value under a new name and that field's declaration, and the
@@ -184,7 +189,9 @@ rows meet.**
 7. **J1 at the two multi-producer seams only.** `SchemaContract.merge_for_batch`
    is now the description join `join_batch_contracts`: equal types keep
    their type, different types become `object` (`int ⊔ float` and `bool ⊔
-   int` included — `validate()` compares exact types), `object` absorbs,
+   int` included: `object` is sound for every carrier, and the join
+   describes the carriers rather than widening one of them, although an
+   `int` value satisfies a `float` declaration), `object` absorbs,
    nullable is OR, required is AND, a field some member lacks is optional and
    nullable, `original_name` falls back to the identity when carriers
    disagree, mode is the most restrictive, locked is OR. It is a lattice
@@ -301,16 +308,27 @@ rows meet.**
   a database write error that the sink's write-failure path owns;
   `dataverse` and `chroma` write to schemas their own config fixes. JSON and
   CSV are tested end to end; none crashes unrouted.
-- The numeric admission split stays open, now without an abort. Pydantic's
-  strict input check admits an `int` (or a `Decimal`) for a `float`
-  declaration; `SchemaContract.validate` compares exact types. A forwarded
-  field the operator declared `float` that arrives as an `int` is stamped
-  `float, declared` (Decision 2) and passed through unchanged (Decision 5
-  does not re-adjudicate it), so its row contract's own `validate()` names
-  that field. Before this ADR the same row ended the run with a Tier-1
-  `SchemaConfigModeViolation` (`63a2e1825` recorded the split as open and
-  kept the abort). The value is never coerced. Pinned, as a visible residual,
-  by `tests/unit/plugins/transforms/test_value_transform_contract_metadata.py::test_forwarded_float_declaration_is_stamped_and_never_aborts`.
+- The numeric admission split `63a2e1825` recorded as open is RESOLVED for
+  `int` (ruling 2026-09-25, reconciliation C3): `SchemaContract.validate`
+  now admits an `int` value for a `float` declaration, the one rule pydantic
+  strict also applies, with no value conversion and `bool` still refused. A
+  forwarded field the operator declared `float` that arrives as an `int` is
+  stamped `float, declared` and its row contract's own `validate()` is
+  empty, so the recorded declaration is true of the value (before this ADR
+  the same row ended the run with a Tier-1 `SchemaConfigModeViolation`).
+  Pinned by `tests/unit/plugins/transforms/test_value_transform_contract_metadata.py::test_forwarded_float_declaration_is_stamped_and_never_aborts`.
+  The one rule moves three observable outcomes, all measured end to end:
+  a value_transform target the operator typed `float` that computes an
+  `int`, and a json_explode `page: float` over `int` elements, are
+  delivered instead of routed (`type_mismatch` / `contract_violation`); and
+  an OBSERVED source whose first valid row locked a field `float` now
+  admits a later `int` for it instead of quarantining the row. A `float`
+  under an `int` declaration, and a `bool` under either, still route or
+  quarantine. A source DECLARING `float` is unaffected: its Tier-3
+  coercion hands `validate()` a `float` already. The split is still open
+  for `Decimal` (pydantic strict admits it for `float`, `validate()` does
+  not); it reaches a `float` field only as a resumed, type-faithful value,
+  which Decision 5 does not re-adjudicate.
 
 ### Neutral
 
@@ -364,8 +382,9 @@ value-checked, the recorded contract never changes type).
     `_reconcile_forwarded_contract` copied only the declared
     required/nullable onto forwarded fields and kept the arriving type, so an
     `int` under a `float` declaration still ended the run at the ADR-014
-    check. Superseded by the one stamp (Decision 2 / spec D7); the residual
-    is the numeric admission split named under Negative.
+    check. Superseded by the one stamp (Decision 2 / spec D7), and the
+    admission split itself is resolved for `int` by the one validation rule
+    (see Negative).
   - Upstream tests re-pinned accordingly (each re-pin keeps upstream's
     intent for the case upstream meant — an untyped computed target is not
     proved by the arriving type — and adds the operator-typed case):

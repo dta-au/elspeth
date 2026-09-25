@@ -88,7 +88,14 @@ drained and repair this release forward.
   Row-to-row type variance at a transform output no longer aborts a run, a
   declared `page: int` can no longer deliver a str, a `value_transform` typing
   a carried field no longer trips ADR-014 on a valid row, and two observed
-  sources disagreeing on a column now share a sink. The meaning of
+  sources disagreeing on a column now share a sink. Whether a declaration
+  is enforced no longer depends on spelling: a `field_mapper` target spelled
+  like a source's CSV header (`{"name": "Name"}`) is checked like any other
+  created field. An `int` value now satisfies a `float` declaration wherever
+  a declared or locked type is checked (a `bool` never does, and no value is
+  converted): an observed source that locked a field `float` admits a later
+  `int` instead of quarantining the row, and a transform output declared
+  `float` that holds an `int` is delivered instead of routed. The meaning of
   `nodes.output_contract_json` changes for transform nodes to "the declared
   output contract, field set evolving", so contract `version_hash`es and the
   LLM prompt `contract_hash` differ from earlier runs. Aggregation and

@@ -17,10 +17,10 @@ Two seams call it, and they differ ONLY in which fields count as produced:
   would be — whether a declaration is enforced never depends on how the
   target is spelled. An input value passed through
   unchanged is not re-adjudicated: the strict ``input_schema`` check admitted
-  it under pydantic's rules, which accept an ``int`` or a ``Decimal`` for a
-  ``float`` field where ``SchemaContract.validate`` compares exact types, and
-  a resumed row legitimately carries a type-faithful ``Decimal`` under its
-  ``float`` declaration. For the same reason a ``carried_output_fields()``
+  it under pydantic's rules, which also accept a ``Decimal`` for a ``float``
+  field where ``SchemaContract.validate`` does not (both accept an ``int``:
+  ``declared_type_admits``), and a resumed row legitimately carries a
+  type-faithful ``Decimal`` under its ``float`` declaration. For the same reason a ``carried_output_fields()``
   name is never produced: its value is an input field's value copied under a
   new name and its declaration is that input field's (a field_mapper rename
   whose target inherits the source's contract), already admitted by the input

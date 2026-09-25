@@ -30,6 +30,23 @@ from elspeth.contracts.type_normalization import (
 )
 
 
+def declared_type_admits(declared: type, actual: type) -> bool:
+    """Whether a value classified as ``actual`` satisfies a field declared ``declared``.
+
+    The ONE rule for checking a value against a declared contract type
+    (``SchemaContract.validate`` is its only caller; every per-row check of a
+    declared type goes through ``validate``). Exact type, with one widening:
+    an ``int`` satisfies a ``float`` declaration — the numeric tower, and JSON
+    has a single number type — which is also what pydantic's strict mode
+    admits at every input and output schema check. The value is never
+    converted. ``bool`` is not a number here: ``classify_runtime_type(True)``
+    is ``bool``, so ``True`` under ``float`` (or ``int``) is still a mismatch,
+    matching pydantic strict. Nothing else widens: a ``float`` does not
+    satisfy ``int``.
+    """
+    return actual is declared or (declared is float and actual is int)
+
+
 @dataclass(frozen=True, slots=True)
 class FieldContract:
     """A field in the schema contract.
@@ -260,7 +277,9 @@ class SchemaContract:
 
         Checks:
         1. Required fields are present
-        2. Field types match (with numpy/pandas normalization)
+        2. Field types match (with numpy/pandas normalization) under
+           ``declared_type_admits``: exact type, except that an ``int`` value
+           satisfies a ``float`` declaration (``bool`` never does)
         3. FIXED mode: No extra fields allowed
 
         Note: Fields with python_type=object ('any' type) skip type validation
@@ -304,7 +323,7 @@ class SchemaContract:
                 # of crashing the pipeline (Tier 3 data should be quarantined).
                 actual_type = classify_runtime_type(value)
                 # type(None) matches None values (for explicitly declared type(None) fields)
-                if actual_type != fc.python_type:
+                if not declared_type_admits(fc.python_type, actual_type):
                     violations.append(
                         TypeMismatchViolation(
                             normalized_name=fc.normalized_name,

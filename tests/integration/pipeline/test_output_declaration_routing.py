@@ -850,6 +850,77 @@ class TestTheSourceSeamIsUnchanged:
         assert result.exit_code == 0, result.output
         assert len(_read_jsonl(tmp_path / "out.jsonl")) == 3
 
+    def test_a_field_locked_float_admits_a_later_int_but_never_a_bool(self, tmp_path: Path) -> None:
+        """Ruling 2026-09-25 C3 at the source seam: an int value satisfies the locked ``float``; a bool does not.
+
+        Before the one admission rule the int row was quarantined too (exit 1,
+        two quarantined): the locked-contract check compared exact types.
+        """
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "score": 4.5}, {"id": 2, "score": 5}, {"id": 3, "score": True}])
+        settings = _settings(
+            tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl", on_success="out", on_validation_failure="quarantine")}
+        )
+        result = _run(settings)
+        assert result.exit_code == 1, result.output
+        assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "score": 4.5}, {"id": 2, "score": 5}]
+        assert [row["id"] for row in _read_jsonl(tmp_path / "q.jsonl")] == [3]
+
+
+class TestAnIntSatisfiesAFloatDeclaration:
+    """Ruling 2026-09-25 C3: the one admission rule, end to end at every transform-output check.
+
+    An ``int`` value satisfies a ``float`` declaration (pydantic strict
+    agrees); the value is delivered unconverted and the recorded ``float,
+    declared`` is true of it. A ``bool`` never satisfies ``float``. Before the
+    rule the int cases routed as ``type_mismatch`` / ``contract_violation``.
+    """
+
+    def test_a_typed_float_value_transform_target_delivers_a_computed_int(self, tmp_path: Path) -> None:
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 3}, {"id": 2, "a": 4}])
+        transform = _vt(
+            schema={"mode": "flexible", "fields": ["id: int", "y: float"]}, operations=[{"target": "y", "expression": "row['a'] * 2"}]
+        )
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 0, result.output
+        assert [row["y"] for row in _read_jsonl(tmp_path / "out.jsonl")] == [6, 8]
+        [recorded] = _transform_node_contracts(tmp_path).values()
+        [y] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "y"]
+        assert (y["python_type"], y["source"]) == ("float", "declared")
+
+    def test_a_typed_float_value_transform_target_routes_a_computed_bool(self, tmp_path: Path) -> None:
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 3}, {"id": 2, "a": 4}])
+        transform = _vt(
+            schema={"mode": "flexible", "fields": ["id: int", "y: float"]}, operations=[{"target": "y", "expression": "row['a'] > 3"}]
+        )
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 2, result.output
+        reasons = _transform_error_reasons(tmp_path)
+        assert [(r["reason"], r["field"], r["expected"], r["actual"]) for r in reasons] == [("type_mismatch", "y", "float", "bool")] * 2
+
+    def test_a_json_explode_float_declaration_delivers_int_elements_and_routes_a_bool(self, tmp_path: Path) -> None:
+        schema = {"mode": "flexible", "fields": ["doc: any", "pages: any", "page: float"]}
+        _write_jsonl(tmp_path / "in.jsonl", [{"doc": "D1", "pages": [1, 2.5]}, {"doc": "D2", "pages": [True]}, {"doc": "D3", "pages": [3]}])
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[_explode(schema=schema)]))
+        assert result.exit_code == 1, result.output
+        assert [(row["doc"], row["page"]) for row in _read_jsonl(tmp_path / "out.jsonl")] == [("D1", 1), ("D1", 2.5), ("D3", 3)]
+        [reason] = _transform_error_reasons(tmp_path)
+        assert (reason["reason"], reason["field"], reason["expected"], reason["actual"]) == ("contract_violation", "page", "float", "bool")
+
+    def test_a_forwarded_int_under_an_operator_float_is_delivered_under_a_true_record(self, tmp_path: Path) -> None:
+        """review-REBASE2 M1: before, exit 0 with a record whose own validate() named ``x``; now the record is true."""
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": "a", "x": 2}, {"id": "b", "x": 3}])
+        transform = _vt(schema={"mode": "flexible", "fields": ["x: float"]}, operations=[{"target": "label", "expression": "1"}])
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 0, result.output
+        delivered = _read_jsonl(tmp_path / "out.jsonl")
+        assert [row["x"] for row in delivered] == [2, 3]
+        [recorded] = _transform_node_contracts(tmp_path).values()
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        contract = SchemaContract.from_checkpoint(json.loads(recorded))
+        assert contract.get_field("x").python_type is float
+        assert all(contract.validate(row) == [] for row in delivered)
+
 
 def test_two_observed_sources_disagreeing_on_a_column_share_one_sink(tmp_path: Path) -> None:
     """T11 (panel multisrc_sink): the sink batch contract is the J1 join, so the run completes (before: exit 4 at the sink)."""

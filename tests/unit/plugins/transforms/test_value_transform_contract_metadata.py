@@ -238,15 +238,12 @@ def test_forwarded_float_declaration_is_stamped_and_never_aborts(value):
     assert field.python_type is float
     assert field.source == "declared"
     _verify_declaration_only(transform, result.row)
-    if isinstance(value, int):
-        # Named residual (ADR-050 §Negative): pydantic admits an int for a
-        # float declaration, the exact-type SchemaContract.validate does not.
-        # The unchanged value is not re-adjudicated (ADR-050 Decision 5), so
-        # the admission/declaration split 63a2e1825 recorded as open stays
-        # visible here rather than being resolved by coercion or an abort.
-        assert [violation.normalized_name for violation in result.row.contract.validate(result.row.to_dict())] == ["x"]
-    else:
-        assert result.row.contract.validate(result.row.to_dict()) == []
+    # The admission split 63a2e1825 recorded as open is resolved (ruling
+    # 2026-09-25, C3): an int value SATISFIES a float declaration under the
+    # one rule SchemaContract.validate shares with pydantic strict, so the
+    # recorded ``float, declared`` is true of the int row as well, with no
+    # value conversion.
+    assert result.row.contract.validate(result.row.to_dict()) == []
 
 
 _TYPED_TARGET_FIELDS = ("id: str", "x: int")

@@ -333,8 +333,11 @@ def join_batch_contracts(contracts: Sequence[SchemaContract]) -> SchemaContract:
 
     - a field carried with ONE type keeps that type; carried with different
       types it becomes ``object`` (``int`` and ``float`` are different, and so
-      are ``bool`` and ``int``: ``SchemaContract.validate`` compares exact
-      types); ``object`` absorbs everything;
+      are ``bool`` and ``int``); ``object`` absorbs everything. ``int`` ⊔
+      ``float`` stays ``object`` although an ``int`` value satisfies a
+      ``float`` declaration (``declared_type_admits``): ``object`` is sound
+      for both, and the join describes the carriers rather than widening
+      one of them;
     - ``nullable`` is OR across carriers, and a field some member does not
       carry is nullable (those members' rows lack it);
     - ``required`` is AND across carriers, and a field some member does not
