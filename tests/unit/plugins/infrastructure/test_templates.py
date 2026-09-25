@@ -480,10 +480,12 @@ def test_a_broken_jinja_undefined_contract_escapes_render_unrouted(monkeypatch: 
         template.render(row={})
 
 
-def _render_with_a_foreign_undefined_exception(connection: object, source: str, payload: bytes) -> None:
-    """Spawn target: the real worker, with jinja2's sandbox building an Undefined around a foreign exception type.
+def _render_with_a_foreign_undefined_exception(connection: object) -> None:
+    """Spawn target: the real serving worker, with jinja2's sandbox building an Undefined around a foreign exception type.
 
     Module-level so the spawned child can import it; the patch lives only in the child.
+    The worker serves ``(source, payload, value_free)`` requests over the pipe
+    until the parent closes it (release/0.8.1 313a85bb1 reuses render workers).
     """
     from jinja2 import TemplateRuntimeError
     from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -493,7 +495,7 @@ def _render_with_a_foreign_undefined_exception(connection: object, source: str, 
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(ImmutableSandboxedEnvironment, "getattr", undefined_with_foreign_exc)
-        template_infrastructure._template_worker(connection, source, payload, True)
+        template_infrastructure._template_worker(connection)
 
 
 def test_the_worker_reports_a_broken_undefined_contract_under_its_own_status() -> None:
@@ -505,15 +507,13 @@ def test_the_worker_reports_a_broken_undefined_contract_under_its_own_status() -
     reports as an ordinary (routable) TemplateError.
     """
     process_context = multiprocessing.get_context("spawn")
-    parent, child = process_context.Pipe(duplex=False)
+    parent, child = process_context.Pipe()
     payload = pickle.dumps(template_infrastructure._pack_context_value({"row": {}}), protocol=5)
-    process = process_context.Process(
-        target=_render_with_a_foreign_undefined_exception,
-        args=(child, "{{ row.missing }}", payload),
-    )
+    process = process_context.Process(target=_render_with_a_foreign_undefined_exception, args=(child,))
     process.start()
     child.close()
     try:
+        parent.send(("{{ row.missing }}", payload, True))
         assert parent.poll(60), "the worker sent nothing"
         status, message = parent.recv()
     finally:
