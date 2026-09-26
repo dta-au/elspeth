@@ -1,0 +1,90 @@
+# Batch Error Routing — catch the bad value one row at a time, before the batch
+#
+# THIS CONFIG ENDS PARTIAL / EXIT 1 BY DESIGN.
+#
+#   source ─(to_cents)─> [amount_in_cents] ─(batch_in)─> [batch_totals, count=3] ─┬─> totals
+#                               └─(on_error)─> failed_rows                         └─(on_error)─> failed_batches
+#
+# A value_transform converts each amount to cents ahead of the aggregation, and
+# the node's schema DECLARES the result `amount_cents: int`. A transform's
+# declared output type is checked against every value it emits (ADR-050).
+#
+# For A-008 the expression `row['amount'] * 100` does not fail: a string times
+# 100 is that string repeated 100 times. Without the declaration that string
+# would flow on as `amount_cents`, and the batch holding it would fail at the
+# aggregation, taking A-007 and A-009 with it (settings.yaml). With the
+# declaration, the str-where-int-was-declared row is routed to `failed_rows`
+# on its own, with a reason naming the field and both type names but not the
+# value. The remaining eleven orders are summed in batches of 3, 3, 3 and a
+# final 2 flushed at end of source, and `failed_batches` receives nothing.
+
+sources:
+  orders:
+    plugin: json
+    on_success: to_cents
+    options:
+      path: examples/batch_error_routing/orders.jsonl
+      format: jsonl
+      schema:
+        mode: flexible
+        fields:
+        - 'order_id: str'
+        - 'region: str'
+        - 'amount: any'
+      on_validation_failure: discard
+
+transforms:
+- name: amount_in_cents
+  plugin: value_transform
+  input: to_cents
+  on_success: batch_in
+  on_error: failed_rows
+  options:
+    schema:
+      mode: flexible
+      fields:
+      - 'amount_cents: int'
+    operations:
+    - target: amount_cents
+      expression: "row['amount'] * 100"
+
+aggregations:
+- name: batch_totals
+  plugin: batch_stats
+  input: batch_in
+  on_success: totals
+  on_error: failed_batches
+  trigger:
+    count: 3
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    value_field: amount_cents
+    compute_mean: true
+
+sinks:
+  totals:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/totals_declared.csv
+      schema:
+        mode: observed
+  failed_rows:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/failed_rows_declared.csv
+      schema:
+        mode: observed
+  failed_batches:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/failed_batches_declared.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/batch_error_routing/runs/audit_declared.db

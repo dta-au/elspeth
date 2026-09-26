@@ -1,0 +1,54 @@
+# Batch Error Routing — the same failed batch under on_error: discard
+#
+# THIS CONFIG ENDS PARTIAL / EXIT 1 BY DESIGN.
+#
+#   source (12 orders) ─(batch_in)─> [batch_totals: batch_stats, count=3] ──(on_success)─> totals
+#                                                                          (on_error: discard)
+#
+# Same data and the same aggregation as settings.yaml; only `on_error` and the
+# output paths differ. The third batch still fails as a whole. Its three rows
+# are written nowhere, but they are not lost silently: each one is recorded as
+# a failed, quarantined token with the batch's reason, and the run summary
+# counts them as quarantined, exactly as a discarded single-row failure is.
+
+sources:
+  orders:
+    plugin: json
+    on_success: batch_in
+    options:
+      path: examples/batch_error_routing/orders.jsonl
+      format: jsonl
+      schema:
+        mode: flexible
+        fields:
+        - 'order_id: str'
+        - 'region: str'
+        - 'amount: any'
+      on_validation_failure: discard
+
+aggregations:
+- name: batch_totals
+  plugin: batch_stats
+  input: batch_in
+  on_success: totals
+  on_error: discard
+  trigger:
+    count: 3
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    value_field: amount
+    compute_mean: true
+
+sinks:
+  totals:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/totals_discard.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/batch_error_routing/runs/audit_discard.db

@@ -168,6 +168,14 @@ drained and repair this release forward.
   (`output_mode: passthrough`). In `transform` mode the check cannot tie an
   output row to the row it came from, so dropping a field that only some
   buffered rows carried is not detected there.
+- **`examples/batch_error_routing`** shows a failed aggregation batch end to
+  end. One order's amount is a string, so its whole batch of three fails:
+  `settings.yaml` routes all three rows, with their original values, to the
+  `on_error` sink; `settings_discard.yaml` records them as quarantined; and
+  `settings_declared.yaml` declares a `value_transform` output `int`, which
+  routes the bad row on its own before the batch. All three end `PARTIAL`
+  (exit 1) by design. The README gives the audit queries that show the
+  outcomes, the single divert and the value-free reason.
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

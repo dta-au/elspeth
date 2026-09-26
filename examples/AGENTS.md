@@ -21,6 +21,7 @@ These run immediately with no setup:
 |---------|------|-------|
 | `audit_export` | 8 | Demonstrates audit data export |
 | `batch_aggregation` | 15 | Batch accumulation and trigger |
+| `batch_error_routing` | 12 each | A failed aggregation batch and its `on_error`; ships three `settings*.yaml` files, run one at a time, and **all three end PARTIAL/exit 1 by design**. One order's amount is a string, so its whole batch of 3 fails: `settings.yaml` routes all 3 rows, with their original values, to `failed_batches.csv` (3 totals written); `settings_discard.yaml` records the same 3 rows as quarantined and writes them nowhere; `settings_declared.yaml` declares a `value_transform` output `int` (ADR-050), so the bad value is routed on its own row before the batch and 4 totals are written. The README carries the audit queries for the outcomes, the single DIVERT and the per-row `transform_errors` |
 | `report_assemble` | 5 (3 reports) | Paginated report aggregation with count and end-of-source flushes |
 | `statistical_batch_plugins` | 8 each | Statistical batch plugin examples; run one `settings_*.yaml` file at a time |
 | `boolean_routing` | 10 | True/false gate routing |
@@ -53,7 +54,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Thirteen shipped configs end non-zero **by design**. A runner that treats any
+Sixteen shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -70,10 +71,13 @@ per config, not a blanket `-eq 0`:
 | `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
 | `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
+| `batch_error_routing/settings.yaml` | 1 | 1 wrongly typed amount fails its batch; all 3 rows of it routed to `failed_batches` |
+| `batch_error_routing/settings_discard.yaml` | 1 | the same failed batch under `on_error: discard`; its 3 rows recorded as quarantined |
+| `batch_error_routing/settings_declared.yaml` | 1 | the declared `amount_cents: int` routes the 1 bad row before the batch |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first eleven are deterministic fixtures with fixed counts. The last two
+The first fourteen are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason

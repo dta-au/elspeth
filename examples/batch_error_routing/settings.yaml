@@ -1,0 +1,73 @@
+# Batch Error Routing — a failed batch goes to on_error, every row of it
+#
+# THIS CONFIG ENDS PARTIAL / EXIT 1 BY DESIGN.
+#
+#   source (12 orders) ─(batch_in)─> [batch_totals: batch_stats, count=3] ─┬─(on_success)─> totals
+#                                                                          └─(on_error)───> failed_batches
+#
+# Twelve orders are summed three at a time. Order A-008 carries its amount as
+# the string "1,250.00" instead of a number, so the third batch (A-007, A-008,
+# A-009) cannot be summed.
+#
+# A reducer cannot drop the one bad row and publish the rest: a total over two
+# of three orders is a statistic over a set nobody asked for. So the WHOLE
+# batch fails, and aggregation `on_error` sends every one of its rows, with
+# its original values, to the `failed_batches` sink. The other three batches
+# are summed and written to `totals`.
+#
+# The recorded reason names the field, the expected type, the type found and
+# the row's index within the batch. It never records the value.
+#
+# Why `amount: any` at the source: an observed source locks each field's type
+# on the first row and rejects a later row whose type differs, so the bad
+# order would never reach the batch. Declaring the column `any` accepts the
+# feed as it arrives and leaves the type check to the aggregation.
+
+sources:
+  orders:
+    plugin: json
+    on_success: batch_in
+    options:
+      path: examples/batch_error_routing/orders.jsonl
+      format: jsonl
+      schema:
+        mode: flexible
+        fields:
+        - 'order_id: str'
+        - 'region: str'
+        - 'amount: any'
+      on_validation_failure: discard
+
+aggregations:
+- name: batch_totals
+  plugin: batch_stats
+  input: batch_in
+  on_success: totals
+  on_error: failed_batches
+  trigger:
+    count: 3
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    value_field: amount
+    compute_mean: true
+
+sinks:
+  totals:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/totals.csv
+      schema:
+        mode: observed
+  failed_batches:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_error_routing/output/failed_batches.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/batch_error_routing/runs/audit.db
