@@ -180,7 +180,13 @@ drained and repair this release forward.
   required `Name: str` under `{Name: Name}` or `{name: Name}` with "requires
   fields: [Name]" while the runtime builds the pipeline. The same holds for a
   batch aggregation declaring a field it writes (`batch_stats` with a required
-  `mean: float` behind a typed source).
+  `mean: float` behind a typed source). The composer also type-checks an
+  optional declared field when the node or sink requires nothing else, as the
+  runtime does: a `field_mapper` `{Name: Name}` declaring `Name: str` and
+  `id: int?` behind a source that types `id: str` was shown valid, and so was
+  a flexible sink declaring only `value: int?` behind `value: str`. The
+  pipeline build refuses both with an edge type mismatch, and the composer
+  now reports `edge_field_type_incompatible`.
   The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).
@@ -241,14 +247,26 @@ drained and repair this release forward.
   reads as infinity) failed every render with `NameError` wherever it sat in
   an expression (`truncate(1e400)`, `x == 1e400`). `elspeth validate` and the
   composer now refuse both, as they already refused an unknown filter name or
-  an unsatisfiable `truncate` length. The non-integer length is refused
-  whatever the other arguments are (`truncate(10.5, end=row.e)`,
-  `truncate(10.5, leeway=row.n)` built and failed rows until now), and so are
-  a unary-plus literal (`truncate(+10.5)`; `truncate(+2)` is an unsatisfiable
-  length) and a bool length (`truncate(True)`, `truncate(False)`), as is a
-  bool `end`. A length computed from the row is still decided per row, and so
-  is a constant expression such as `truncate(10 / 2)`: templates are compiled
-  without constant folding, so validation does not evaluate arithmetic.
+  an unsatisfiable `truncate` length. Each of `truncate`'s checks is now
+  decided over only the arguments it reads, so an argument taken from the row
+  no longer defers a check that does not read it; these all built and failed
+  rows until now. A literal non-integer length is refused whatever the other
+  arguments are, a row value or a `*`/`**` spread among them
+  (`truncate(10.5, end=row.e)`, `truncate(10.5, *row.args)`). So is a unary-plus
+  or bool length (`truncate(+10.5)`, `truncate(True)`, `truncate(False)`). A
+  literal length shorter than the ending is refused beside a row-derived
+  `leeway` (`truncate(2, leeway=row.n)`, `truncate(+2, leeway=row.n)`), and a
+  negative literal length beside a row-derived ending (`truncate(-5,
+  end=row.e)`). A literal ending that is not a string (`end=True`, `end=5`,
+  `end=None`) and a negative or non-numeric literal `leeway` are refused
+  whatever the length is. A call that cannot bind is refused too: more than
+  four arguments, an unknown keyword (`truncate(10, foo=1)`) or one argument
+  given twice (`truncate(10, length=5)`). A check that reads a value taken
+  from the row is still decided per row: `truncate(0, end=row.e)` builds
+  because the row's ending may be empty. So is one a `**` spread may supply
+  (`truncate(2, **row.kwargs)`), and so is a constant expression such as
+  `truncate(10 / 2)`: templates are compiled without constant folding, so
+  validation does not evaluate arithmetic.
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics
