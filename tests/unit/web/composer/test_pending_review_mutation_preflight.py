@@ -176,7 +176,10 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         preflight = feedback["runtime_preflight"]
         assert preflight["is_valid"] is False
         assert any(
-            error["component_id"] == "tidy_columns" and "producer emits 'Any'" in error["message"] for error in preflight["errors"]
+            # ADR-050 (299812eea) declares a field of unconstrained type ``any``
+            # and nullable, so the producer side reads ``Any | None``.
+            error["component_id"] == "tidy_columns" and "producer emits 'typing.Any | None'" in error["message"]
+            for error in preflight["errors"]
         ), preflight["errors"]
         if tool_name == "set_metadata":
             assert dispatch.last_runtime_preflight is not None

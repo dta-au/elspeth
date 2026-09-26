@@ -977,28 +977,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "patch_source_options(patch={'schema':{'mode':'observed','guaranteed_fields':[...]}}), a COMPLETE list. Only "
         "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
     ),
-    # Field-name spelling rule (operator ruling 2026-09-25). Precedes the
-    # schema-contract entries: its headline is its own, and a header-spelled
-    # declaration is the ROOT cause any contract verdict about the same name
-    # would report. Stage 1 (Rule S) and the runtime DAG refusal
-    # (validate_declared_field_spellings) share the headline.
-    (
-        r"field_name_header_spelling|Field name header spelling:",
-        "A declaration names a field by the HEADER spelling of a field its producer carries. Sources normalize every "
-        "external header to a lowercase identifier (spaces and punctuation to '_', a leading digit prefixed with '_', a "
-        "Python keyword suffixed with '_': 'Name' -> 'name', 'First Name' -> 'first_name'), and rows are keyed by that "
-        "normalized name. A row LOOKUP (row['Name'] in an expression or template, a field_mapper mapping source) resolves "
-        "either spelling, but a DECLARATION — a schema field, required_input_fields, a column option such as url_field, "
-        "query_field, blob_ref_field or a type_coerce conversions[].field, a sink's custom headers key, or a created name "
-        "such as a value_transform target — is compared as written, so the header spelling never meets the field. The "
-        "rejection's 'contract' facts, when present, name the consumer ('consumer') and list the header-spelled names in "
-        "'missing_fields'.",
-        "Rewrite each name in 'missing_fields' as its normalized form on the rejected consumer (patch_node_options for a "
-        "transform, aggregation or collector; patch_output_options for 'output:<sink name>'). For a created target, the "
-        "normalized name OVERWRITES the arriving field; if you meant a new field, choose a name that does not normalize "
-        "to an arriving field. Never add a field_mapper to restore the header spelling to satisfy this — declare the "
-        "normalized name instead.",
-    ),
     (
         r"schema_contract_violation|Schema contract violation:",
         "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source "
@@ -1617,7 +1595,6 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # ── Schema-contract family (2026-07-22 codeless-rejection closure) ──────
     # Edge-level members carry SchemaContractDetail facts; coalesce mode
     # conflicts carry the coalesce id and branch groups in the validation row.
-    "field_name_header_spelling",
     "schema_contract_violation",
     "sink_contract_violation",
     "locked_input_extras",
@@ -1832,6 +1809,26 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "llm_user_prompt_missing",
         _LLM_USER_PROMPT_MISSING_EXPLANATION,
         _LLM_USER_PROMPT_MISSING_FIX,
+    ),
+    # Field-name spelling rule (operator ruling 2026-09-25). A code after the
+    # historical closure, so it gets a direct record, never a legacy regex.
+    # Stage 1 (Rule S) emits the code with SchemaContractDetail facts.
+    DirectValidationGuidance(
+        "field_name_header_spelling",
+        "A declaration names a field by the HEADER spelling of a field its producer carries. Sources normalize every "
+        "external header to a lowercase identifier (spaces and punctuation to '_', a leading digit prefixed with '_', a "
+        "Python keyword suffixed with '_': 'Name' -> 'name', 'First Name' -> 'first_name'), and rows are keyed by that "
+        "normalized name. A row LOOKUP (row['Name'] in an expression or template, a field_mapper mapping source) resolves "
+        "either spelling, but a DECLARATION — a schema field, required_input_fields, a column option such as url_field, "
+        "query_field, blob_ref_field or a type_coerce conversions[].field, a sink's custom headers key, or a created name "
+        "such as a value_transform target — is compared as written, so the header spelling never meets the field. The "
+        "rejection's 'contract' facts, when present, name the upstream node ('producer') and the rejected node "
+        "('consumer') and list the header-spelled names in 'missing_fields'.",
+        "Rewrite each name in 'missing_fields' as its normalized form on the rejected consumer (patch_node_options for a "
+        "transform, aggregation or collector; patch_output_options for 'output:<sink name>'). For a created target, the "
+        "normalized name OVERWRITES the arriving field; if you meant a new field, choose a name that does not normalize "
+        "to an arriving field. Never add a field_mapper to restore the header spelling to satisfy this — declare the "
+        "normalized name instead.",
     ),
     *_direct_plugin_policy_guidance(),
 )
