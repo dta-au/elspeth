@@ -973,32 +973,57 @@ class TestOutputSchemaConfig:
 
         assert transform.carried_output_fields() == carried
 
-    def test_a_declared_header_literal_is_a_read_declaration_the_spelling_rule_governs(self) -> None:
-        """``{"Name": "Name"}`` with ``Name: int?`` declares ``Name`` as a READ (field-name spelling rule, 2026-09-25).
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            pytest.param({"Name": "Name"}, id="identity-by-header"),
+            pytest.param({"name": "Name"}, id="canonical-rename"),
+        ],
+    )
+    def test_a_declared_emitted_name_is_a_created_declaration_whatever_the_lookup_spelling(self, mapping: dict[str, str]) -> None:
+        """``{"Name": "Name"}`` and ``{"name": "Name"}`` are one shape: a rename ``name`` -> ``Name`` (P1 review r2 F1).
 
-        The mapping SOURCE ``Name`` is a lookup and resolves either spelling;
-        the schema field ``Name`` is a declaration. Behind a normalizing
-        source it is the header spelling of ``name``, so the build refuses it
-        where the upstream proves it and the executor preflight routes the row
-        otherwise — the declaration never reaches the emitted contract. The
-        carried set no longer special-cases a declared header literal (the
-        limb that did is gone): an identity mapping by a header is carried
-        whatever the schema declares.
+        The mapping SOURCE is a row lookup, which resolves either spelling
+        (operator ruling 2026-09-25), so its spelling must not decide the
+        verdict. Behind a normalizing source both emit ``Name`` and not
+        ``name``; the schema field ``Name`` declares the key the node WRITES,
+        so it is a created name, never a header-spelled read — the node
+        forwards nothing it could shadow (it removes ``name``), so no row
+        flags it. As the target's own declaration it is not carried: the
+        engine holds the emitted value to it (ADR-050). It is demoted on
+        input (elspeth-d6eeb3a71d): the row arriving keyed ``name`` never
+        carries ``Name``. An undeclared target stays carried.
         """
         from elspeth.contracts.field_spelling import DeclaredSpellings
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
-        declared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["Name: int?"]}})
-        undeclared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["id: int"]}})
+        declared = FieldMapper({"mapping": mapping, "schema": {"mode": "flexible", "fields": ["Name: str"]}})
+        undeclared = FieldMapper({"mapping": mapping, "schema": {"mode": "flexible", "fields": ["id: int"]}})
 
-        assert "Name" in declared.declared_read_fields
-        [spelling] = DeclaredSpellings.of(reads=declared.declared_read_fields, creates=declared.declared_created_fields).in_row(
-            row_keys=frozenset({"id", "name"}),
-            forwarded_keys=frozenset(),
+        assert "Name" not in declared.declared_read_fields
+        assert "Name" in declared.declared_created_fields
+        assert declared.self_created_input_fields == frozenset({"Name"})
+        assert declared.demoted_input_fields == frozenset({"Name"})
+        assert not declared.input_schema.model_fields["Name"].is_required()
+        assert (
+            DeclaredSpellings.of(reads=declared.declared_read_fields, creates=declared.declared_created_fields).in_row(
+                row_keys=frozenset({"id", "name"}),
+                forwarded_keys=frozenset({"id"}),
+            )
+            == ()
         )
-        assert (spelling.literal, spelling.canonical, spelling.kind) == ("Name", "name", "read")
-        assert declared.carried_output_fields() == frozenset({"Name"})
+        assert declared.carried_output_fields() == frozenset()
         assert undeclared.carried_output_fields() == frozenset({"Name"})
+
+    def test_a_normalized_identity_rewrites_its_own_key_and_creates_nothing(self) -> None:
+        """Control for the test above: ``{"name": "name"}`` writes the key the row already carries, so it creates nothing."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        identity = FieldMapper({"mapping": {"name": "name"}, "schema": {"mode": "flexible", "fields": ["name: str"]}})
+
+        assert identity.self_created_input_fields == frozenset()
+        assert "name" in identity.declared_read_fields
+        assert identity.carried_output_fields() == frozenset()
 
     @pytest.mark.parametrize(
         ("mapping", "shadowed"),

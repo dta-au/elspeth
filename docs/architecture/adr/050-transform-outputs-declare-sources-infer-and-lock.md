@@ -118,15 +118,18 @@ rows meet.**
    field's contract — a field_mapper flat rename whose target inherits the
    source's contract, not one the operator declared by its target name
    alone — which the stamp leaves alone). An identity mapping by an original
-   header (`{"Name": "Name"}`) is carried too: it writes the literal header
-   key, absent from the normalized input row, under the source field's
-   contract, so it is not a created field even though, as an identity, it is
-   not a `declared_output_fields` name. A schema field spelled by that header
-   literal (`Name: int?`) is not an output declaration of the target: it is a
-   READ declaration of the header spelling of `name`, which the field-name
-   spelling rule refuses (at build where a participating, closed upstream
-   proves it, per row otherwise), so the carried set no longer depends on it.
-   A plugin whose created NAMES are data (blob_csv_expand's CSV
+   header (`{"Name": "Name"}`) is carried too: its source is a row lookup, so
+   it is the rename `name` -> `Name`, writing the literal header key, absent
+   from the normalized input row, under the source field's contract; it is not
+   a created field even though, as an identity, it is not a
+   `declared_output_fields` name. When the operator declares that header
+   literal itself (`Name: str?`), the declaration is the target's, as for any
+   rename declared by its target name alone, so it is not carried and
+   Decision 5 checks its value. The field-name spelling rule reads that
+   literal the same way: it names the key the node writes, not a
+   header-spelled read of `name`, so `{"Name": "Name"}` and
+   `{"name": "Name"}` get one verdict (the spelling of a lookup decides
+   nothing). A plugin whose created NAMES are data (blob_csv_expand's CSV
    headers) passes them to the stamp per emission with the type its code
    fixes (`str`); the field set may grow row to row, the types cannot.
 4. **Completeness, Tier 1.** `OutputDeclarationCompletenessContract`

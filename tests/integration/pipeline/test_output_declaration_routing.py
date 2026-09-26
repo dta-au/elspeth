@@ -556,6 +556,7 @@ _ID_NAME_SENTINEL_CSV = f"ID,Name\n1,{SENTINEL}\n2,Bob\n"
 _A_STR_JSONL = f'{{"id":1,"a":"{SENTINEL}"}}\n{{"id":2,"a":"x2"}}\n'
 _ANN_BOB = [{"given": "Ann", "id": "1"}, {"given": "Bob", "id": "2"}]
 _FIRST_NAME_ANN_BOB = [{"First Name": "Ann", "id": "1"}, {"First Name": "Bob", "id": "2"}]
+_NAME_ANN_BOB = [{"Name": "Ann", "id": "1"}, {"Name": "Bob", "id": "2"}]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -580,9 +581,6 @@ class _MapperShape:
     recorded: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
 
 
-_HEADER_SPELLED: frozenset[tuple[str | None, ...]] = frozenset({("declared_field_is_header_spelling", None, None, None, None, None)})
-
-
 def _routed(name: str) -> frozenset[tuple[str | None, ...]]:
     """The one value-free reason a str under an operator's ``int`` routes with."""
     return frozenset({("contract_violation", name, "int", "str", "operator", "computed")})
@@ -597,20 +595,33 @@ _MAPPER_SHAPES: dict[str, _MapperShape] = {
     # input field ``name`` through its original_name and read as unchanged.
     "r3_norm_to_hdr_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int",), reasons=_routed("Name")),
     "r3_norm_to_hdr_intq": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
-    # Field-name spelling rule (operator ruling 2026-09-25): the schema field
-    # ``Name`` is a READ declaration, the header spelling of the arriving
-    # ``name``. Behind this observed source the build cannot see it, so the
-    # executor preflight routes every row with the rule's one stable reason,
-    # optional or required alike (before the rule: the value check here, the
-    # input check for the required form below).
-    "hdr_name_intq": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int?",), reasons=_HEADER_SPELLED),
+    # An identity by an original header is the same rename ``name`` -> ``Name``
+    # (P1 review r2 F1): the source is a lookup, so its spelling decides
+    # nothing, and the schema field ``Name`` declares the CREATED key, never a
+    # header-spelled read. The value check routes a str under ``int`` exactly
+    # as for ``{"name": "Name"}`` above, optional or required alike — the
+    # required form is demoted on input like any created target
+    # (elspeth-d6eeb3a71d; before, the input check routed it).
+    "hdr_name_intq": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
     # Same root cause: this created field was recorded ``authorship: carried``.
     "r3_id_to_hdr_int": _MapperShape(
         "in.csv", _ID_NAME_SENTINEL_CSV, {"id": "Name"}, ("Name: int",), select_only=True, reasons=_routed("Name")
     ),
     # The spelling control: the same rename to a target that is no header.
     "r3_norm_to_other_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "given"}, ("given: int",), reasons=_routed("given")),
-    "hdr_name_int": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int",), reasons=_HEADER_SPELLED),
+    "hdr_name_int": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int",), reasons=_routed("Name")),
+    # The valid siblings: the operator's ``str`` holds, the node emits ``Name``
+    # (not ``name``) and records the operator's declaration, byte-identical to
+    # the canonical-lookup spelling of the same rename.
+    "hdr_name_strq": _MapperShape(
+        "in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: str?",), delivered=_NAME_ANN_BOB, recorded={"Name": ("str", "declared")}
+    ),
+    "hdr_name_str": _MapperShape(
+        "in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: str",), delivered=_NAME_ANN_BOB, recorded={"Name": ("str", "declared")}
+    ),
+    "norm_to_hdr_strq": _MapperShape(
+        "in.csv", _ID_NAME_CSV, {"name": "Name"}, ("Name: str?",), delivered=_NAME_ANN_BOB, recorded={"Name": ("str", "declared")}
+    ),
     # An undeclared identity by header is carried under the source's contract (review-S1a-r2 F1).
     "hdr_caseid_select": _MapperShape(
         "in.csv",

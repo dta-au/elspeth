@@ -8044,6 +8044,24 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             merge=None,
         )
 
+    @staticmethod
+    def _field_mapper(mapping: dict[str, str], schema: dict[str, Any] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="t",
+            node_type="transform",
+            plugin="field_mapper",
+            input="t_in",
+            on_success="main",
+            on_error="discard",
+            options={"schema": schema or {"mode": "observed"}, "mapping": mapping},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
     def _state(
         self, tmp_path: Path, *, source_schema: dict[str, Any], node: NodeSpec | None, output_schema: dict[str, Any] | None = None
     ) -> CompositionState:
@@ -8151,6 +8169,50 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}),
         )
         self._assert_both_accept(state, tmp_path)
+
+    @pytest.mark.parametrize("source_mode", ["flexible", "fixed"])
+    def test_both_accept_a_rename_that_restores_the_header_spelling(self, tmp_path: Path, source_mode: str) -> None:
+        """field_mapper ``{name: Name}``: ``Name`` spells the arriving ``name``, but the node removes ``name``.
+
+        The created name can shadow only what the node forwards, so both
+        surfaces subtract the rename's removal before asking the predicate.
+        Dropping that subtraction on the composer side alone (Rule S's
+        ``forwarded=vote_fields - removed``) made Stage 1 refuse a rename the
+        runtime runs (P1 review r2 F2); this pins it.
+        """
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": source_mode, "fields": ["id: str", "name: str"]},
+            node=self._field_mapper({"name": "Name"}),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    @pytest.mark.parametrize("source_mode", ["flexible", "fixed"])
+    @pytest.mark.parametrize("mapping", [{"Name": "Name"}, {"name": "Name"}], ids=["identity-by-header", "canonical-rename"])
+    def test_both_accept_a_declared_emitted_name_whatever_the_lookup_spelling(
+        self, tmp_path: Path, source_mode: str, mapping: dict[str, str]
+    ) -> None:
+        """field_mapper ``{Name: Name}`` + ``Name: str?`` is the rename ``{name: Name}`` spelled by its lookup (P1 review r2 F1).
+
+        The schema field ``Name`` declares the key the node writes — a created
+        name — so neither surface reads it as the header spelling of ``name``;
+        the mapping source is a lookup and resolves either spelling.
+        """
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": source_mode, "fields": ["id: str", "name: str"]},
+            node=self._field_mapper(mapping, schema={"mode": "flexible", "fields": ["Name: str?"]}),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_reject_a_rename_target_spelling_a_field_the_node_keeps(self, tmp_path: Path) -> None:
+        """Control for the removal leg: ``{id: Name}`` removes ``id``, keeps ``name``, and ``Name`` would land beside it."""
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
+            node=self._field_mapper({"id": "Name"}),
+        )
+        self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of the arriving field 'name'")
 
 
 class TestComposerRuntimeRagQueryTemplateAgreement:

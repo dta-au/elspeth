@@ -164,6 +164,12 @@ drained and repair this release forward.
   now refused at build. Behaviour change: `fields: [Name]` over an observed
   source with header `Name` scanned the row through a lookup and now routes
   every row with `declared_field_is_header_spelling` — write `fields: [name]`.
+  A `field_mapper` identity by a header (`{Name: Name}` over header `Name`) is
+  the rename `name` → `Name` spelled by its lookup, so a declared `Name` is the
+  emitted field's declaration exactly as under `{name: Name}`: it is accepted,
+  the emitted value is checked against it, and a required `Name: str` is no
+  longer demanded on the input row (it was refused at build as a missing
+  field, or routed `contract_violation`, while `{name: Name}` ran).
   The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).

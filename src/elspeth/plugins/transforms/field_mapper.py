@@ -314,7 +314,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b39aa95f4046c12c"
+    source_file_hash: str | None = "sha256:45320b13b23f6e0b"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -370,9 +370,13 @@ class FieldMapper(BaseTransform):
         )
 
         # Rename targets are created here, never required on input. Requiring
-        # one is the elspeth-d6eeb3a71d trap, so every non-identity target
-        # demotes from the node's derived input requirements.
-        self._self_created_input_fields = frozenset(target for source, target in cfg.mapping.items() if source != target)
+        # one is the elspeth-d6eeb3a71d trap, so every target written under a
+        # key the input row did not carry it under demotes from the node's
+        # derived input requirements — including an identity by an original
+        # header, which writes the literal header key (``_writes_target_key``).
+        self._self_created_input_fields = frozenset(
+            target for source, target in cfg.mapping.items() if self._writes_target_key(source, target)
+        )
 
         # Field-forwarding declaration for the extras direction
         # (elspeth-15c72686f2). Without select_only, process() deep-copies the
@@ -447,9 +451,31 @@ class FieldMapper(BaseTransform):
         """
         return "." not in source and not _names_a_row_key(source)
 
+    @classmethod
+    def _writes_target_key(cls, source: str, target: str) -> bool:
+        """Whether ``process`` writes ``target`` under a key the input row did not carry it under.
+
+        Every rename does. So does an identity mapping by an unresolved
+        original header (``{"Name": "Name"}``): the source is a row LOOKUP
+        (``contract.resolve_name``), so ``process`` deletes the normalized key
+        (``name``) and writes the literal header key, one the input row never
+        had — a rename ``name`` -> ``Name`` that happens to be spelled the same
+        on both sides of the mapping. Only a normalized identity rewrites a key
+        the input already carries. The spelling of a lookup must not decide
+        whether its target is created (operator ruling 2026-09-25: lookups
+        resolve either spelling), so ``{"Name": "Name"}`` and
+        ``{"name": "Name"}`` are one shape here.
+
+        The one predicate behind the created set (``self_created_input_fields``,
+        hence the spelling rule's create surface and input demotion) and the
+        carried set (``carried_output_fields``), so the two cannot disagree
+        about which targets this node writes.
+        """
+        return source != target or cls._is_unresolved_original_source(source)
+
     @property
     def self_created_input_fields(self) -> frozenset[str]:
-        """Override: non-identity rename targets are created by this node."""
+        """Override: every target written under a new key is created by this node (``_writes_target_key``)."""
         return self._self_created_input_fields
 
     def created_output_fields(self) -> tuple[FieldDefinition, ...]:
@@ -477,36 +503,41 @@ class FieldMapper(BaseTransform):
         target inherits.
 
         An identity mapping by an unresolved original header
-        (``{"Name": "Name"}``) is carried too: ``process`` deletes the
-        normalized key (``name``) and writes the literal header key, a key the
-        input row never had, holding the source's value under the source's
-        contract (``narrow_contract_to_output`` resolves it). Only a
-        normalized identity rewrites a key the input already carries, so only
-        it is left out. Such a target is not in ``declared_output_fields``,
-        the collision surface, which excludes every identity mapping. A schema
-        field spelled by that header literal is a READ declaration, which the
-        field-name spelling rule (operator ruling 2026-09-25) refuses behind a
-        normalizing source (build or executor preflight), so it does not
-        change this set.
+        (``{"Name": "Name"}``) writes a new key (``_writes_target_key``), so it
+        is carried like any rename, holding the source's value under the
+        source's contract (``narrow_contract_to_output`` resolves it), unless
+        the author declared the header literal: that declaration is the
+        TARGET's, like any target-declared rename. Only a normalized identity
+        rewrites a key the input already carries, so only it is left out. Such
+        a target is not in ``declared_output_fields``, the collision surface,
+        which excludes every identity mapping.
         """
         return frozenset(
             target
             for source, target in self._mapping.items()
-            if "." not in source
-            and (source != target or self._is_unresolved_original_source(source))
-            and target not in self._flat_renames_declared_on_target
+            if "." not in source and self._writes_target_key(source, target) and target not in self._flat_renames_declared_on_target
         )
 
-    @staticmethod
-    def _declaration_is_authored_on_target(source: str, target: str, authored_names: frozenset[str]) -> bool:
+    @classmethod
+    def _declaration_is_authored_on_target(cls, source: str, target: str, authored_names: frozenset[str]) -> bool:
         """Whether a rename's emitted declaration is the author's declaration of the TARGET, not the source's.
 
         The one predicate behind both the output projection's fallback limb
         (``_project_field_declarations_onto_output``) and the carried set
         (``carried_output_fields``), so the two cannot disagree about whose
         contract a rename target carries.
+
+        An identity mapping by an unresolved original header whose literal the
+        author declared (``{"Name": "Name"}`` with ``Name: str?``) is one: the
+        input row is keyed ``name``, so the literal names only the key
+        ``process`` writes, and no input check held the value to it. That
+        declaration is a created name, not a header-spelled read
+        (``_writes_target_key``); the output projection reads the same
+        declaration for it either way, because both sides share one literal.
         """
-        return source != target and source not in authored_names and target in authored_names
+        if source == target:
+            return cls._is_unresolved_original_source(source) and target in authored_names
+        return source not in authored_names and target in authored_names
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
