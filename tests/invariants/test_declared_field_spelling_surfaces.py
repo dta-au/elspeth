@@ -23,11 +23,11 @@ from typing import Any, cast
 
 import pytest
 
-from elspeth.contracts.field_spelling import header_spelled_row_declarations
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
-from elspeth.web.composer.state import OutputSpec, _probe_sink_declared_read_fields
+from elspeth.web.composer.state import _probe_sink_declarations
 from tests.unit.web.composer.test_sink_required_fields_parity import _minimal_sink_configs
 
 # 'id' and 'body' keep chroma_sink constructible (its id/document fields must be declared).
@@ -61,9 +61,9 @@ def test_every_sink_exposes_its_schema_declaration(sink_name: str, tmp_path: Pat
         sink.close()
 
     assert "Name" in reads, f"{sink_name!r} declares 'Name: int?' but its declared_read_fields {sorted(reads)} omit it"
-    assert _probe_sink_declared_read_fields(OutputSpec(name="out", plugin=sink_name, options=options, on_write_failure="discard")) == reads
+    assert _probe_sink_declarations(sink_name, options).reads == reads
     [spelling] = [
-        s for s in header_spelled_row_declarations(reads=reads, creates=(), row_keys={"name"}, forwarded_keys=()) if s.literal == "Name"
+        s for s in DeclaredSpellings.of(reads=reads, creates=()).in_row(row_keys={"name"}, forwarded_keys=()) if s.literal == "Name"
     ]
     assert spelling.canonical == "name"
 

@@ -37,7 +37,7 @@ from elspeth.web.composer.state import (
     EdgeSpec,
     OutputSpec,
     SourceSpec,
-    _probe_sink_declared_required_fields,
+    _probe_sink_declarations,
 )
 
 _OBSERVED: dict[str, Any] = {"mode": "observed"}
@@ -140,8 +140,8 @@ def test_composer_requirement_equals_what_the_sink_declares(sink_name: str, tmp_
     options = _minimal_sink_configs(str(tmp_path))[sink_name]
 
     # What composer computes, exactly as ``_parse_sink_required_fields`` does.
-    composer_required = get_raw_sink_required_fields(options, owner=f"output:{sink_name}") | _probe_sink_declared_required_fields(
-        sink_name, options
+    composer_required = (
+        get_raw_sink_required_fields(options, owner=f"output:{sink_name}") | _probe_sink_declarations(sink_name, options).required
     )
 
     # What the engine will enforce, read off the constructed sink.
@@ -243,6 +243,6 @@ def test_probe_abstains_on_a_draft_sink_config() -> None:
     config-validation paths own reporting a draft config; this probe only
     abstains.
     """
-    assert _probe_sink_declared_required_fields("text", {}) == frozenset()
-    assert _probe_sink_declared_required_fields("text", {"field": "not an identifier"}) == frozenset()
-    assert _probe_sink_declared_required_fields("nosuchsinkplugin", {}) == frozenset()
+    assert _probe_sink_declarations("text", {}).required == frozenset()
+    assert _probe_sink_declarations("text", {"field": "not an identifier"}).required == frozenset()
+    assert _probe_sink_declarations("nosuchsinkplugin", {}).required == frozenset()

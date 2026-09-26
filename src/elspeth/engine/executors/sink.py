@@ -43,7 +43,7 @@ from elspeth.contracts.errors import (
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
-from elspeth.contracts.field_spelling import header_spelled_row_declarations
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
@@ -527,17 +527,11 @@ class SinkExecutor:
         no declaration spells. The sink seam routes no contract violation, so
         both callers end the run with every token's terminal recorded.
         """
-        declared_reads = sink.declared_read_fields
-        if declared_reads:
-            for row in rows:
-                spellings = header_spelled_row_declarations(
-                    reads=declared_reads,
-                    creates=(),
-                    row_keys=frozenset(row),
-                    forwarded_keys=(),
-                )
-                if spellings:
-                    raise HeaderSpelledDeclarationViolation(component=f"Sink '{sink.name}'", spellings=spellings)
+        declared_spellings = DeclaredSpellings.of(reads=sink.declared_read_fields, creates=())
+        for row in rows:
+            spellings = declared_spellings.in_row(row_keys=frozenset(row), forwarded_keys=())
+            if spellings:
+                raise HeaderSpelledDeclarationViolation(component=f"Sink '{sink.name}'", spellings=spellings)
         for row_index, (token, row) in enumerate(zip(tokens, rows, strict=True)):
             row_contract = None if row_contracts is None else row_contracts[row_index]
             run_boundary_checks(

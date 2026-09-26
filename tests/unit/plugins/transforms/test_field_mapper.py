@@ -985,16 +985,14 @@ class TestOutputSchemaConfig:
         limb that did is gone): an identity mapping by a header is carried
         whatever the schema declares.
         """
-        from elspeth.contracts.field_spelling import header_spelled_row_declarations
+        from elspeth.contracts.field_spelling import DeclaredSpellings
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         declared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["Name: int?"]}})
         undeclared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["id: int"]}})
 
         assert "Name" in declared.declared_read_fields
-        [spelling] = header_spelled_row_declarations(
-            reads=declared.declared_read_fields,
-            creates=declared.declared_created_fields,
+        [spelling] = DeclaredSpellings.of(reads=declared.declared_read_fields, creates=declared.declared_created_fields).in_row(
             row_keys=frozenset({"id", "name"}),
             forwarded_keys=frozenset(),
         )

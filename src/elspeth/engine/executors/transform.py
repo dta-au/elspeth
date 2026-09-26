@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -31,6 +32,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    HeaderSpelledDeclarationViolation,
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
@@ -40,6 +42,7 @@ from elspeth.contracts.errors import (
     SchedulerLeaseLostError,
     ZeroEmissionSuccessContractViolation,
 )
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.secret_scrub import scrub_transform_error_reason
@@ -66,6 +69,21 @@ if TYPE_CHECKING:
 
 class TransformResultError(Exception):
     """Marker for a handled TransformResult.error operation outcome."""
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeSpellingSurface:
+    """One transform's field-name spelling surface, as the preflight checks it per row.
+
+    ``spellings`` holds only the declarations the predicate can ever flag;
+    ``forwards_input`` is ``can_overwrite_input_fields`` (a created name can
+    shadow only a field the node carries forward) and ``removed_input_fields``
+    what it removes from that.
+    """
+
+    spellings: DeclaredSpellings
+    forwards_input: bool
+    removed_input_fields: frozenset[str]
 
 
 def record_transform_error_with_routing(
@@ -202,6 +220,11 @@ class TransformExecutor:
         # row-pipelined batch transform, owned by the executor (not monkey-patched
         # onto the transform instance).
         self._batch_adapters: dict[str, "SharedBatchAdapter"] = {}  # noqa: UP037 — forward ref, no __future__ annotations
+        # The field-name spelling rule's per-node surface, keyed by node_id and
+        # computed on a node's first row: its declarations are a pure function
+        # of the transform's config, fixed once construction finishes, so the
+        # preflight pays only the predicate's membership legs per row.
+        self._spelling_surfaces: dict[str, _NodeSpellingSurface] = {}
         # OpenTelemetry counter for pass-through cross-check violations now lives
         # at module scope in engine.executors.pass_through (ADR-009 §Clause 2).
         # Both this executor and the processor's batch-flush cross-check share
@@ -392,26 +415,28 @@ class TransformExecutor:
         # would reach process() and write a second key beside the field it
         # names. Raised as a Tier-2 PluginContractViolation, so it routes via
         # on_error with one stable, value-free reason.
-        from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
         from elspeth.contracts.field_collision import can_overwrite_input_fields
-        from elspeth.contracts.field_spelling import header_spelled_row_declarations
 
-        row_keys = frozenset(input_dict)
-        spellings = header_spelled_row_declarations(
-            reads=transform.declared_read_fields,
-            creates=transform.declared_created_fields,
-            row_keys=row_keys,
-            forwarded_keys=(
-                row_keys - transform.removed_input_fields
-                if can_overwrite_input_fields(
+        if node_id not in self._spelling_surfaces:
+            self._spelling_surfaces[node_id] = _NodeSpellingSurface(
+                spellings=DeclaredSpellings.of(reads=transform.declared_read_fields, creates=transform.declared_created_fields),
+                forwards_input=can_overwrite_input_fields(
                     passes_through_input=transform.passes_through_input,
                     forwards_input_fields=transform.forwards_input_fields,
-                )
-                else frozenset()
-            ),
-        )
-        if spellings:
-            raise HeaderSpelledDeclarationViolation(component=f"Transform '{transform.name}'", spellings=spellings)
+                ),
+                removed_input_fields=transform.removed_input_fields,
+            )
+        surface = self._spelling_surfaces[node_id]
+        # The usual node declares only canonical names and leaves no candidate:
+        # its rows pay nothing here.
+        if surface.spellings.reads or surface.spellings.creates:
+            row_keys = frozenset(input_dict)
+            spellings = surface.spellings.in_row(
+                row_keys=row_keys,
+                forwarded_keys=row_keys - surface.removed_input_fields if surface.forwards_input else frozenset(),
+            )
+            if spellings:
+                raise HeaderSpelledDeclarationViolation(component=f"Transform '{transform.name}'", spellings=spellings)
 
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
         # Centralized check: if this transform declares output fields AND its

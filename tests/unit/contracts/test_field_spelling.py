@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.field_spelling import (
+    DeclaredSpellings,
     HeaderSpelling,
     header_normalization_remedy,
     header_spelled_declarations,
@@ -125,3 +126,35 @@ def test_a_created_name_is_checked_against_what_the_node_forwards() -> None:
         header_spelled_declarations(reads=[], creates=["Name"], present={"id", "name"}, forwarded={"id"}, participated=True, closed=True)
         == ()
     )
+
+
+class TestDeclaredSpellings:
+    """The run-time residual: the configuration leg once per node, the membership legs per row."""
+
+    def test_canonical_declarations_leave_no_candidate(self) -> None:
+        # The usual node: every declaration canonical, so a row pays nothing.
+        surface = DeclaredSpellings.of(reads=["id", "name", "sci__rag_context"], creates=["total"])
+
+        assert surface.reads == (HeaderSpelling(literal="sci__rag_context", canonical="sci_rag_context", kind="read"),)
+        assert surface.creates == ()
+        assert surface.in_row(row_keys={"id", "name", "sci__rag_context"}, forwarded_keys={"id"}) == ()
+
+    def test_the_row_verdict_equals_the_predicate(self) -> None:
+        surface = DeclaredSpellings.of(reads=["Name", "Total"], creates=["Label", "Name"])
+        row_keys = frozenset({"name", "label", "id"})
+
+        spelled = surface.in_row(row_keys=row_keys, forwarded_keys=row_keys)
+
+        # One entry per literal; a name both read and created reports as created.
+        assert spelled == (
+            HeaderSpelling(literal="Label", canonical="label", kind="create"),
+            HeaderSpelling(literal="Name", canonical="name", kind="create"),
+        )
+        for spelling in spelled:
+            assert header_spelling_canonical(spelling.literal, row_keys) == spelling.canonical
+        assert header_spelling_canonical("Total", row_keys) is None
+
+    def test_a_created_name_is_checked_against_the_forwarded_keys_only(self) -> None:
+        surface = DeclaredSpellings.of(reads=[], creates=["Name"])
+
+        assert surface.in_row(row_keys={"id", "name"}, forwarded_keys={"id"}) == ()

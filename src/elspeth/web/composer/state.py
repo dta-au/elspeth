@@ -2180,8 +2180,22 @@ class ValidationProbeCache:
                     stack.callback(entry.instance.close)
 
 
-def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
-    """Read ``plugin``'s ``declared_required_fields`` off a constructed sink.
+class _SinkDeclarations(NamedTuple):
+    """What one constructed sink declares: its required fields and its read declarations."""
+
+    required: frozenset[str]
+    reads: frozenset[str]
+
+
+def _probe_sink_declarations(plugin: str, options: Mapping[str, Any]) -> _SinkDeclarations:
+    """Read ``plugin``'s ``declared_required_fields`` and ``declared_read_fields`` off ONE constructed sink.
+
+    ``declared_read_fields`` is Rule S's sink input (the field-name spelling
+    rule): the same property ``core/dag/builder.py`` feeds to ``NodeInfo`` for
+    ``validate_declared_field_spellings`` and ``SinkExecutor`` checks per row.
+    Both answers come off one construction, and ``_check_schema_contracts``
+    asks once per output per validate, so the second question costs no second
+    pydantic parse. The rest of this docstring is about the required half.
 
     Sink-side twin of ``_probe_transform_declared_inputs``, and for the same
     reason: a sink's requirement is not a pure function of its ``schema:``
@@ -2235,44 +2249,16 @@ def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]
     except Exception as exc:
         if not _is_sink_config_probe_exception(exc):
             raise
-        return frozenset()
+        return _SinkDeclarations(frozenset(), frozenset())
     try:
         declared = sink_declared_required_fields(sink)
+        reads = sink.declared_read_fields
     finally:
         sink.close()
     # None means "not a sink-role plugin" to the accessor's structural test.
     # Abstain rather than invent: the raw-config union at the call site keeps
     # whatever the schema block declared.
-    return declared if declared is not None else frozenset()
-
-
-def _probe_sink_declared_read_fields(output: OutputSpec) -> frozenset[str]:
-    """Read ``plugin``'s ``declared_read_fields`` off a constructed sink (field-name spelling rule).
-
-    Rule S's sink-side input, read from the same property ``core/dag/builder.py``
-    feeds to ``NodeInfo`` for ``validate_declared_field_spellings`` and
-    ``SinkExecutor`` checks per row: the schema's declared names, the declared
-    required fields and the column options a sink names (a custom ``headers``
-    key, dataverse ``field_mapping``). Constructed and abstaining exactly as
-    ``_probe_sink_declared_required_fields`` does, for the same reasons.
-    """
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-    from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
-
-    try:
-        with plugin_preflight_mode(True):
-            sink = get_shared_plugin_manager().create_sink(
-                output.plugin,
-                prepare_validation_probe_options(output.options, plugin=output.plugin),
-            )
-    except Exception as exc:
-        if not _is_sink_config_probe_exception(exc):
-            raise
-        return frozenset()
-    try:
-        return sink.declared_read_fields
-    finally:
-        sink.close()
+    return _SinkDeclarations(declared if declared is not None else frozenset(), reads)
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -6151,7 +6137,18 @@ def _check_schema_contracts(
         # accept for a new false negative. Verified across the live registry
         # that no sink's declared set is a strict subset of the raw set, which
         # is what makes union safe rather than merely conservative.
-        return raw_required | _probe_sink_declared_required_fields(output.plugin, output.options), None
+        return raw_required | _sink_declarations(output).required, None
+
+    # Keyed like ValidationProbeCache: the plugin name and the IDENTITY of the
+    # output's deep-frozen options, so two outputs never share an answer.
+    sink_declarations_by_output: dict[tuple[str, int], _SinkDeclarations] = {}
+
+    def _sink_declarations(output: OutputSpec) -> _SinkDeclarations:
+        """One sink construction per output per validate, shared by the required-field rule and Rule S."""
+        key = (output.plugin, id(output.options))
+        if key not in sink_declarations_by_output:
+            sink_declarations_by_output[key] = _probe_sink_declarations(output.plugin, output.options)
+        return sink_declarations_by_output[key]
 
     def _parse_sink_locked_input(
         output: OutputSpec,
@@ -6539,7 +6536,7 @@ def _check_schema_contracts(
         # option, so ``required_input_fields`` is empty and the ``schema:``
         # block never names it. Probed only for transforms here — a sink's
         # requirement is read by the same means on its own path, through
-        # ``_probe_sink_declared_required_fields`` in
+        # ``_probe_sink_declarations`` in
         # ``_parse_sink_required_fields``, and checked in the outputs loop
         # below. (This comment previously said sinks declare their input
         # requirements through ``get_raw_sink_required_fields``. That was the
@@ -7250,7 +7247,7 @@ def _check_schema_contracts(
             errors.append(spelling_error)
 
     for output in () if spelling_rule_abstains else outputs:
-        sink_reads = _probe_sink_declared_read_fields(output)
+        sink_reads = _sink_declarations(output).reads
         if not sink_reads:
             continue
         sink_spelling_producers = resolver.sink_producers(output.name)

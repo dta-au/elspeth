@@ -535,16 +535,18 @@ headers to lowercase identifiers (spaces and punctuation become `_`, a leading
 digit gains a `_` prefix, a Python keyword gains a `_` suffix), and
 `inspect_source`'s `observed_headers` are the RAW headers: header `Approved`
 is declared `approved`, `First Name` is `first_name`, `Price USD` is
-`price_usd`. This holds for every declaration on a transform, aggregation or
-output: schema `fields`, `required_input_fields`, any option that names an
-input column (including a conversion's field), a custom output-header key,
-and a name the node creates. A header spelling there is refused: at
-validation with `field_name_header_spelling` where the upstream's declared
-schema proves it, otherwise at run time, where every row routes to
+`price_usd`. This holds for every DECLARATION on a transform, aggregation or
+output: schema `fields`, `required_input_fields`, the input-column options a
+plugin declares it requires (its live schema and assistance name them — for
+example the column a batch statistic reads or a conversion's field), a custom
+output-header key, and a name the node creates. A header spelling there is
+refused: at validation with `field_name_header_spelling` where the upstream's
+declared schema proves it, otherwise at run time, where every row routes to
 `on_error` (reason `declared_field_is_header_spelling` or
 `target_is_header_spelling`), observed schemas included. Row LOOKUPS keep
-either spelling: an expression or template reading `row['Price USD']`, and an
-option that only locates a field to read or rename, resolve the header too.
+either spelling: an expression or template reading `row['Price USD']`, a
+rename source, and an option that only locates a field to read in place
+resolve the header too.
 
 For routing or splitting requests, choose output plugins and formats from the
 user's requested result and each policy-visible sink's live contract. Do not

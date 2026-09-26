@@ -68,7 +68,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
 from elspeth.contracts.errors import HeaderSpelledDeclarationViolation, PluginContractViolation
-from elspeth.contracts.field_spelling import header_spelled_row_declarations
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.engine.executors.declared_output_types import verify_created_output_types
 
@@ -96,7 +96,7 @@ def validate_batch_inputs(
             declares required, or fails the declared input schema.
     """
     required = transform.schema_required_input_fields()
-    declared_reads = transform.declared_read_fields
+    declared_spellings = DeclaredSpellings.of(reads=transform.declared_read_fields, creates=())
     for idx, row in enumerate(rows):
         # The field-name spelling rule's runtime residual, checked before the
         # presence check below: ``in`` on a PipelineRow resolves a header
@@ -105,12 +105,7 @@ def validate_batch_inputs(
         # the literal. Created names are not checked at a batch seam: its
         # output does not carry the buffered rows forward (the build's
         # TRANSFORM-only scope, elspeth-cfcd333f83).
-        spellings = header_spelled_row_declarations(
-            reads=declared_reads,
-            creates=(),
-            row_keys=frozenset(row.to_dict()),
-            forwarded_keys=(),
-        )
+        spellings = declared_spellings.in_row(row_keys=frozenset(row.to_dict()), forwarded_keys=())
         if spellings:
             raise HeaderSpelledDeclarationViolation(
                 component=f"{node_kind} transform '{transform.name}' (buffered row {idx})",

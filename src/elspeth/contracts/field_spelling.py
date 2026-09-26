@@ -118,6 +118,41 @@ def normalized_field_name_or_empty(raw: str) -> str:
     return normalized
 
 
+@dataclass(frozen=True, slots=True)
+class HeaderSpelling:
+    """A declared name that is not its own normalized form, with that form.
+
+    A CANDIDATE until a membership check finds it spelled: ``literal`` is the
+    operator's config spelling and ``canonical`` its normalized form. Both are
+    derived from configuration, never from a row, so either may appear in
+    audit text: the original header a row actually carried
+    (``FieldContract.original_name``) is row-derived and never does.
+    """
+
+    literal: str
+    canonical: str
+    kind: Literal["read", "create"]
+
+
+def _candidates(names: Iterable[str], *, kind: Literal["read", "create"]) -> tuple[HeaderSpelling, ...]:
+    """The predicate's configuration leg, once per name: ``normalize(T) != T`` and non-empty.
+
+    A name that is its own normalized form, or that normalizes to nothing, can
+    never be a header spelling, so it is not a candidate. Sorted by literal.
+    """
+    found = []
+    for name in sorted(set(names)):
+        canonical = normalized_field_name_or_empty(name)
+        if canonical and canonical != name:
+            found.append(HeaderSpelling(literal=name, canonical=canonical, kind=kind))
+    return tuple(found)
+
+
+def _spelled(candidates: tuple[HeaderSpelling, ...], present: Collection[str]) -> tuple[HeaderSpelling, ...]:
+    """The predicate's membership legs: the literal absent from ``present``, its normalized form in it."""
+    return tuple(candidate for candidate in candidates if candidate.literal not in present and candidate.canonical in present)
+
+
 def header_spelling_canonical(name: str, present: Collection[str]) -> str | None:
     """The canonical field ``name`` is a header spelling of, or None.
 
@@ -128,39 +163,16 @@ def header_spelling_canonical(name: str, present: Collection[str]) -> str | None
     time. A name that is present is never a header spelling (a row can carry
     ``B`` and ``b`` as two fields: a source ``field_mapping`` value bypasses
     normalization), and a name whose normalized form is absent may be a created
-    or a merely missing field, which other checks own.
+    or a merely missing field, which other checks own. Built from the same two
+    legs every other entry point uses (``_candidates``, ``_spelled``).
     """
-    if name in present:
-        return None
-    canonical = normalized_field_name_or_empty(name)
-    if not canonical or canonical == name:
-        return None
-    return canonical if canonical in present else None
-
-
-@dataclass(frozen=True, slots=True)
-class HeaderSpelling:
-    """One declared name found to be a header spelling of a present field.
-
-    ``literal`` is the operator's config spelling and ``canonical`` its
-    normalized form. Both are derived from configuration, never from a row, so
-    either may appear in audit text: the original header a row actually
-    carried (``FieldContract.original_name``) is row-derived and never does.
-    """
-
-    literal: str
-    canonical: str
-    kind: Literal["read", "create"]
+    spelled = _spelled(_candidates((name,), kind="read"), present)
+    return spelled[0].canonical if spelled else None
 
 
 def header_spelled_names(names: Iterable[str], present: Collection[str], *, kind: Literal["read", "create"]) -> tuple[HeaderSpelling, ...]:
     """Every name in ``names`` that is a header spelling of a field in ``present``, sorted by literal."""
-    found = []
-    for name in sorted(set(names)):
-        canonical = header_spelling_canonical(name, present)
-        if canonical is not None:
-            found.append(HeaderSpelling(literal=name, canonical=canonical, kind=kind))
-    return tuple(found)
+    return _spelled(_candidates(names, kind=kind), present)
 
 
 def header_spelled_declarations(
@@ -207,24 +219,35 @@ def header_spelled_declarations(
     )
 
 
-def header_spelled_row_declarations(
-    *,
-    reads: Iterable[str],
-    creates: Iterable[str],
-    row_keys: Collection[str],
-    forwarded_keys: Collection[str],
-) -> tuple[HeaderSpelling, ...]:
-    """The run-time verdict for one arriving row — the residual the build could not settle.
+@dataclass(frozen=True, slots=True)
+class DeclaredSpellings:
+    """A node's declarations reduced ONCE to the candidates the predicate can ever flag.
 
-    A row's keys are exact, so there is no participation or closedness gate:
-    ``row_keys`` answers both legs of the predicate. ``forwarded_keys`` is the
-    part of the row the node carries onto its output (empty when it forwards
-    nothing), which is what a created name can shadow.
+    The run-time residual asks the predicate of every arriving row. Its
+    configuration leg (``normalize(T) != T``) is a pure function of config, so
+    it is computed here once per node and every row pays only the membership
+    legs — nothing at all for the usual node, whose declarations are all
+    canonical and leave no candidate.
     """
-    return _merge_spellings(
-        header_spelled_names(creates, forwarded_keys, kind="create"),
-        header_spelled_names(reads, row_keys, kind="read"),
-    )
+
+    reads: tuple[HeaderSpelling, ...]
+    creates: tuple[HeaderSpelling, ...]
+
+    @classmethod
+    def of(cls, *, reads: Iterable[str], creates: Iterable[str]) -> DeclaredSpellings:
+        return cls(reads=_candidates(reads, kind="read"), creates=_candidates(creates, kind="create"))
+
+    def in_row(self, *, row_keys: Collection[str], forwarded_keys: Collection[str]) -> tuple[HeaderSpelling, ...]:
+        """The run-time verdict for one arriving row — the residual the build could not settle.
+
+        A row's keys are exact, so there is no participation or closedness
+        gate: ``row_keys`` answers both legs for a read. ``forwarded_keys`` is
+        the part of the row the node carries onto its output (empty when it
+        forwards nothing), which is what a created name can shadow.
+        """
+        if not self.reads and not self.creates:
+            return ()
+        return _merge_spellings(_spelled(self.creates, forwarded_keys), _spelled(self.reads, row_keys))
 
 
 def _merge_spellings(created: tuple[HeaderSpelling, ...], read: tuple[HeaderSpelling, ...]) -> tuple[HeaderSpelling, ...]:
@@ -255,8 +278,9 @@ def describe_header_spelling(spelling: HeaderSpelling) -> str:
 
 
 HEADER_SPELLING_RULE = (
-    "Row lookups (an expression's row['<header>'], a field_mapper source) resolve either spelling; a declaration — a schema field, a "
-    "required or column-naming option, a created target — must name the field as rows carry it."
+    "Row lookups (an expression's row['<header>'], a field_mapper source, an option that only locates a field) resolve "
+    "either spelling; a declaration — a schema field, required_input_fields, an input option the plugin declares, a "
+    "created name — must name the field as rows carry it."
 )
 """The closing sentence every refusal of the rule carries, build and run time alike."""
 

@@ -3561,14 +3561,16 @@ sites:
   message: 'Field name header spelling: {} ''{}'' (node ''{}'') declares field names its upstream ''{}''
     carries under their canonical spelling: {}. {}'
   ordinal: 0
-  disposition: mirrored
+  disposition: abstains
   counterpart:
   - field_name_header_spelling
   note: 'elspeth-5887fb7928 field-name spelling rule (operator ruling 2026-09-25, 2026-09-26 Q4 amendment).
-    Stage 1 Rule S (_check_schema_contracts) makes the SAME call as this validator, contracts.field_spelling.header_spelled_declarations,
-    on the same plugin-declared surfaces (declared_read_fields / declared_created_fields read off the
-    constructed instance), so the predicate and its participation/closedness gates cannot drift. Pinned
-    end to end by TestComposerRuntimeFieldNameSpellingAgreement (tests/integration/pipeline/test_composer_runtime_agreement.py):
+    ABSTAINS, not mirrored, for the reason its Phase-1 sibling does: Stage 1 checks the same predicate
+    on a narrower population and renders is_valid:true outside it. Stage 1 Rule S (_check_schema_contracts)
+    makes the SAME call as this validator, contracts.field_spelling.header_spelled_declarations, on the
+    same plugin-declared surfaces (declared_read_fields / declared_created_fields read off the constructed
+    instance), so the predicate and its participation/closedness gates cannot drift. Pinned end to end
+    by TestComposerRuntimeFieldNameSpellingAgreement (tests/integration/pipeline/test_composer_runtime_agreement.py):
     transform created name, transform read and sink read rejected by both with the predicate text asserted;
     controls (new capitalised name, canonical overwrite, observed upstream, open upstream) accepted by
     both. Two Stage-1 abstentions, Stage 2 (this validator) authoritative there: an AGGREGATION or COLLECTOR
