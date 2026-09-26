@@ -156,7 +156,15 @@ drained and repair this release forward.
   row carries is refused at build against a `fixed` upstream and otherwise
   ends the run as a `DeclaredRequiredInputFieldsViolation` with the row's
   outcome recorded (it was routed `missing_field`), as `web_scrape`'s
-  `url_field` always has. The normalization algorithm moved to
+  `url_field` always has. The named scan `fields` of `keyword_filter` and
+  of the Bedrock and Azure content-safety and prompt-shield guardrails are
+  declarations too: `fields: [Count]` over a source typing `count` as `int`
+  passed `elspeth validate` (while `fields: [count]` was refused as a
+  non-string scan) and then failed every row with `non_string_field`; it is
+  now refused at build. Behaviour change: `fields: [Name]` over an observed
+  source with header `Name` scanned the row through a lookup and now routes
+  every row with `declared_field_is_header_spelling` — write `fields: [name]`.
+  The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).
 - **A template sees only its node's declared fields (ADR-051).** An LLM

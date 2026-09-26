@@ -538,7 +538,8 @@ is declared `approved`, `First Name` is `first_name`, `Price USD` is
 `price_usd`. This holds for every DECLARATION on a transform, aggregation or
 output: schema `fields`, `required_input_fields`, the input-column options a
 plugin declares it requires (its live schema and assistance name them — for
-example the column a batch statistic reads or a conversion's field), a custom
+example the column a batch statistic reads, a conversion's field, or the named
+`fields` a keyword filter or content-safety / prompt-shield guardrail scans), a custom
 output-header key, and a name the node creates. A header spelling there is
 refused: at validation with `field_name_header_spelling` where the upstream's
 declared schema proves it, otherwise at run time, where every row routes to

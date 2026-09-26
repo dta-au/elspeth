@@ -1656,8 +1656,9 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
     names the field as rows carry it, and an original-header spelling is
     refused with the source's own remedy. Row lookups keep resolving either
     spelling; only names a node commits to before any row exists are checked —
-    ``NodeInfo.declared_read_fields`` (schema fields, required fields and every
-    option projected onto ``declared_input_fields``, at transforms,
+    ``NodeInfo.declared_read_fields`` (schema fields, required fields, every
+    option projected onto ``declared_input_fields`` and the string-scan fields
+    of ``declared_string_input_fields``, at transforms,
     aggregations, collectors and sinks) and ``NodeInfo.declared_created_fields``
     (the names a transform writes).
 
@@ -1778,6 +1779,11 @@ def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
 
     ``NodeInfo`` enforces the same boundary by guarding
     ``declared_string_input_fields`` to TRANSFORM nodes.
+
+    Names are compared as written. A header spelling of a scanned field
+    (``Count`` for ``count``) never reaches this check against a closed
+    upstream: the scan fields are read declarations, and
+    ``validate_declared_field_spellings`` has already refused it.
 
     Raises:
         GraphValidationError: if a transform declares a string-typed input

@@ -113,12 +113,17 @@ def test_dataverse_field_mapping_keys_are_read_declarations(tmp_path: Path) -> N
 
 @pytest.mark.parametrize("transform_cls", _registered_transforms(), ids=lambda cls: cls.name)
 def test_every_transform_reads_what_it_declares(transform_cls: type[BaseTransform]) -> None:
-    """Every declared-input and required name is a read; an authored schema field is a read or a creation."""
+    """Every declared-input, string-scan and required name is a read; an authored schema field is a read or a creation.
+
+    The string-scan limb is the only proof the Bedrock and Azure guardrails'
+    ``fields`` are seen: no local run can reach those transforms.
+    """
     config = copy.deepcopy(transform_cls.probe_config())
     transform = transform_cls(config)
 
     reads = transform.declared_read_fields
     assert transform.declared_input_fields <= reads
+    assert transform.declared_string_input_fields <= reads
     assert transform.schema_required_input_fields() <= reads
     schema_config = transform._schema_config
     assert schema_config is not None
@@ -155,3 +160,16 @@ def test_field_mapper_targets_are_created_and_sources_are_lookups() -> None:
 
     assert {"given", "Ident"} <= transform.declared_created_fields
     assert "Name" not in transform.declared_read_fields
+
+
+def test_keyword_filter_scan_fields_are_read_declarations() -> None:
+    """Named scan ``fields`` are declared string inputs, hence reads; ``all`` names nothing, so it declares nothing."""
+    from elspeth.plugins.transforms.keyword_filter import KeywordFilter
+
+    named = KeywordFilter({"schema": {"mode": "observed"}, "fields": ["Count"], "blocked_patterns": ["zzz"]})
+    every = KeywordFilter({"schema": {"mode": "observed"}, "fields": "all", "blocked_patterns": ["zzz"]})
+
+    assert named.declared_string_input_fields == frozenset({"Count"})
+    assert "Count" in named.declared_read_fields
+    assert every.declared_string_input_fields == frozenset()
+    assert every.declared_read_fields == frozenset()

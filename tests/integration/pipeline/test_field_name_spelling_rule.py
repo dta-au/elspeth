@@ -22,7 +22,10 @@ shapes of the 2026-09-26 Q4 amendment:
 - created names (S7 c): a value_transform target or a field_mapper rename
   target spelled as an arriving field's header is refused, where it crashed
   with ``Duplicate original_name`` or silently shadowed the field;
-- a batch transform's ``group_by`` spelled by header (sweep §2.8).
+- a batch transform's ``group_by`` spelled by header (sweep §2.8);
+- keyword_filter's named scan ``fields`` (``declared_string_input_fields``,
+  shared with the guardrails): a header spelling walked past the string-type
+  build check, which compares names as written.
 
 Every routed reason is one stable, value-free code carrying config literals and
 their canonical names only, and every token reaches exactly one terminal
@@ -356,6 +359,40 @@ def test_a_rag_query_field_by_header_is_refused_at_build_behind_a_closed_upstrea
     output = _refused_at_build(_settings(tmp_path, source=source, transforms=[rag]))
 
     assert "'Question' is a header spelling of 'question'" in output
+
+
+class TestStringScanFields:
+    """keyword_filter's named ``fields`` (and the guardrails' ``fields``): ``declared_string_input_fields``.
+
+    The string-type build validator compares these names to the upstream
+    schema as written, so ``fields: [Count]`` over a source that types
+    ``count`` int passed ``elspeth validate`` while ``fields: [count]`` was
+    refused — and the run then failed every row with ``non_string_field``.
+    They are read declarations; a header spelling is refused like any other.
+    """
+
+    def _keyword_filter(self, field: str) -> dict[str, Any]:
+        return _transform("keyword_filter", {"fields": [field], "blocked_patterns": ["zzz"], "schema": _OBSERVED})
+
+    @pytest.mark.parametrize("count_type", ["int", "str"])
+    def test_a_header_spelled_scan_field_is_refused_at_build_behind_a_closed_upstream(self, tmp_path: Path, count_type: str) -> None:
+        source = _csv_source(tmp_path, "ID,Count\n1,5\n2,7\n", schema={"mode": "fixed", "fields": ["id: int", f"count: {count_type}"]})
+        output = _refused_at_build(_settings(tmp_path, source=source, transforms=[self._keyword_filter("Count")]))
+
+        assert "'Count' is a header spelling of 'count'" in output
+        assert "Declare 'count'" in output
+
+    def test_a_header_spelled_scan_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Before: the lookup resolved ``Name`` and the scan delivered every row; now routed, one value-free reason."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._keyword_filter("Name")]))
+
+        _assert_routed(tmp_path, result, reason=_READ, literal="Name", canonical="name")
+
+    def test_the_canonical_scan_field_delivers(self, tmp_path: Path) -> None:
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._keyword_filter("name")]))
+
+        assert result.exit_code == 0, result.output
+        assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
 
 
 class TestTypeCoerceConversionField:

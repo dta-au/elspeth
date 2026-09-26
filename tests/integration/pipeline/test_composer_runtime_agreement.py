@@ -8026,6 +8026,24 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             merge=None,
         )
 
+    @staticmethod
+    def _keyword_filter(field: str) -> NodeSpec:
+        return NodeSpec(
+            id="t",
+            node_type="transform",
+            plugin="keyword_filter",
+            input="t_in",
+            on_success="main",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}, "fields": [field], "blocked_patterns": ["zzz"]},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
     def _state(
         self, tmp_path: Path, *, source_schema: dict[str, Any], node: NodeSpec | None, output_schema: dict[str, Any] | None = None
     ) -> CompositionState:
@@ -8093,6 +8111,21 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
             node=None,
             output_schema={"mode": "flexible", "fields": ["Name: str?"]},
+        )
+        self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
+
+    @pytest.mark.parametrize("name_type", ["int", "str"])
+    def test_both_reject_a_header_spelled_string_scan_field_behind_a_closed_upstream(self, tmp_path: Path, name_type: str) -> None:
+        """keyword_filter ``fields: [Name]``: both surfaces admitted it while refusing ``[name]`` over an int column.
+
+        The string-type rule compares scan fields to the upstream as written, so
+        the header spelling walked past it on both surfaces; the scan fields are
+        read declarations, so the spelling rule now refuses it on both first.
+        """
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: int", f"name: {name_type}"]},
+            node=self._keyword_filter("Name"),
         )
         self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
 

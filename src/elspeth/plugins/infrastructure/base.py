@@ -582,10 +582,13 @@ class BaseTransform(ABC):
     # Fail-closed string-scan declaration (elspeth-b19dfe41fb).
     # Transforms that quarantine a row when an explicitly configured scan field
     # is missing or non-string set this to those field names at construction.
-    # Consumed only at build time by
+    # Its type claim is consumed only at build time by
     # validate_transform_string_typed_input_fields, which rejects a pipeline
-    # whose producer schema provably types such a field int/float/bool. Empty
-    # frozenset means the transform makes no string-typed input claim.
+    # whose producer schema provably types such a field int/float/bool. Its
+    # names are also part of declared_read_fields, so the field-name spelling
+    # rule refuses a header spelling of one at build, in the Web Composer and
+    # per row. Empty frozenset means the transform makes no string-typed input
+    # claim.
     declared_string_input_fields: frozenset[str] = frozenset()
 
     # Runtime preflight opt-in. Transforms that need an engine-time external
@@ -1489,7 +1492,7 @@ class BaseTransform(ABC):
         governs (operator ruling 2026-09-25, ``contracts.field_spelling``): a
         name the node commits to before any row exists and that the engine
         compares to row keys as written, so a header spelling of it never meets
-        the field it means. Three surfaces:
+        the field it means. Four surfaces:
 
         - ``schema.fields`` names this transform does not create — a created
           field's declaration types an output (``declared_created_fields``);
@@ -1498,7 +1501,13 @@ class BaseTransform(ABC):
         - ``declared_input_fields``: ``required_input_fields`` plus every option
           a plugin projects onto it (``url_field``, ``query_field``,
           ``blob_ref_field``, ``key_field``, type_coerce's
-          ``conversions[].field`` ...).
+          ``conversions[].field`` ...);
+        - ``declared_string_input_fields``: the scan fields the text-scanning
+          family (keyword_filter, the content-safety and prompt-shield
+          guardrails, document intelligence's ``source_field``) requires
+          present and string-valued. The string-type build validator compares
+          them to the upstream schema as written, so a header spelling would
+          walk past it.
 
         Deliberately NOT the column-option limb of ``consumed_input_fields``:
         an option that stays off those surfaces is a row LOOKUP, resolved
@@ -1514,7 +1523,7 @@ class BaseTransform(ABC):
         authored: frozenset[str] = frozenset()
         if schema_config is not None and schema_config.fields is not None:
             authored = frozenset(field.name for field in schema_config.fields) - self.self_created_input_fields
-        return authored | self.schema_required_input_fields() | self.declared_input_fields
+        return authored | self.schema_required_input_fields() | self.declared_input_fields | self.declared_string_input_fields
 
     @property
     def declared_created_fields(self) -> frozenset[str]:

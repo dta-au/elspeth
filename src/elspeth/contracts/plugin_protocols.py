@@ -451,9 +451,11 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # Fields the transform requires to be present AND string-valued on every
     # arriving row, failing the row closed otherwise. Set at construction by
     # the text-scanning family from their own scan-field options; empty
-    # frozenset for everything else. Consumed only at build time by
-    # validate_transform_string_typed_input_fields — there is no runtime
-    # dispatch, the plugins enforce the contract in their own process paths.
+    # frozenset for everything else. The type claim is consumed only at build
+    # time by validate_transform_string_typed_input_fields — there is no
+    # runtime type dispatch, the plugins enforce it in their own process
+    # paths. The names are also read declarations (declared_read_fields), so
+    # the field-name spelling rule governs them.
     declared_string_input_fields: frozenset[str]
 
     @property
@@ -691,7 +693,8 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
     # Mirrors TransformProtocol: the batch-aware Azure safety pair populates
     # this from its named `fields` list, and the builder projects it when the
-    # plugin is wired as a row-mode transform. Build-time consumer only.
+    # plugin is wired as a row-mode transform. The type claim has a build-time
+    # consumer only; the names are read declarations (declared_read_fields).
     declared_string_input_fields: frozenset[str]
 
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
