@@ -262,6 +262,7 @@ def _guarded_state() -> CompositionState:
                 options={
                     "profile": "llm-default",
                     "prompt_template": "{{ row['prompt'] }}",
+                    "required_input_fields": ["prompt"],
                     "schema": {"mode": "observed", "fields": None},
                 },
                 condition=None,

@@ -1100,7 +1100,7 @@ transforms:
       # ... other options
 ```
 
-For template-based transforms (like LLM transforms), use `elspeth.core.templates.extract_jinja2_fields()` to discover which fields your template references:
+For template-based transforms (like LLM transforms) the declaration is also what the template can see: the template's `row` holds exactly the declared fields (see **Template variables** below). Use `elspeth.core.templates.extract_jinja2_fields()` to discover which fields your template references:
 
 ```python
 from elspeth.core.templates import extract_jinja2_fields
@@ -1196,42 +1196,66 @@ the service, render workers included. The render worker ignores both signals
 and leaves the stop to the run, which stops after its in-flight rows.
 
 **Template variables.** A `prompt_template` sees two variables, `row` and
-`lookup` (the configured lookup mapping). `row` holds the row's field values
-and nothing else:
+`lookup` (the configured lookup mapping). `row` holds the field values the node
+declares in `required_input_fields`, and nothing else
+([ADR-051](../architecture/adr/051-a-template-sees-only-its-declared-fields.md)):
 
-- `row.name` and `row['name']` read a field by its normalized name, and
-  `row['Original Header']` reads it by the source's original header.
-- `row.get('name')` returns the field, or `None` when the row does not carry it.
-- `'name' in row`, `{% for name in row %}` and `row | length` see the
-  normalized field names only.
+| `required_input_fields` | `row` holds |
+|---|---|
+| a list, e.g. `[note, amount_usd]` | exactly those fields the row carries |
+| `[]` (the opt-out) | every field of the row |
+| omitted | no field |
+
+The row is narrowed to the declaration before the template runs, so a field
+the node does not declare cannot reach the prompt through any template form.
+Within that:
+
+- `row.name` and `row['name']` read a declared field by its normalized name,
+  and `row['Original Header']` reads it by the source's original header.
+- `row.get('name')` returns a declared field, or `None` when the row does not
+  carry it; `'name' in row` is `False` then.
+- `{% for name in row %}`, `row | length`, `row | dictsort`, `row | items`,
+  `dict(row)` and `**row` see the declared fields the row carries.
 
 Every other attribute or item lookup on `row` reads a field of that name:
 `row.keys` and `row.items` are fields, not methods. The row object, its schema
 contract and their methods are not reachable from a template. A lookup of a
-field the row does not carry fails that row with `template_rendering_failed`.
+declared field the row does not carry fails that row with
+`template_rendering_failed` (`Undefined variable: ...`).
 
-Configuration validation rejects a template that reads fields it does not name,
-because those reads cannot be checked against `required_input_fields`: a
-computed key (`row[k]`, `row.get(k)`, `row | attr(k)`), and a whole row used as
-a value, such as `row | items`, `row | dictsort`, `dict(row)`,
-`'%(name)s' % row`, `'{0[name]}'.format(row)` or `row == {...}`. The same
-applies through an alias (`{% set r = row %}`), a list, dict or `namespace`
-holding the row, and any argument of a macro or `caller()` call: a declared
-parameter, its default, and the extra arguments a macro body reads as
-`varargs` or `kwargs`. Validation follows each variable through
-every assignment at once, not in template order, so a variable that is
-reassigned to a container holding itself (`{% set a = {'k': row} %}` then
+Reading a field the node does not declare fails the row with
+`template_rendering_failed` and its own reason, `Undeclared field: the template
+reads 'secret', a field this node does not declare in required_input_fields`.
+That includes `'secret' in row`, `row.get('secret', 'default')` and
+`row.secret is defined`: a template cannot test for an undeclared field, only
+for a declared field the row may not carry. The reason names the field only
+when the template spells it out.
+
+Configuration validation reports the reads it can see before the run, so they
+do not fail every row: a literal read of an undeclared field (`row.secret` with
+`required_input_fields: [note]`), and a computed key (`row[k]`, `row.get(k)`,
+`row | attr(k)`), which names no field `required_input_fields` could cover. It
+follows a row through aliases, containers, loops and macro arguments (a
+declared parameter, its default, and the extra arguments a macro body reads as
+`varargs` or `kwargs`). Validation follows each variable through every
+assignment at once, not in template order, so a variable that is reassigned to
+a container holding itself (`{% set a = {'k': row} %}` then
 `{% set a = {'k': a} %}`) cannot be followed and is rejected as
-`carrier-limit`; give the second value its own name. Set
-`required_input_fields: []` to opt out and accept that the node's input
-contract is not checked. Configuration
-validation also treats `row.contract`, `row.to_dict` and
-`row.to_checkpoint_format` as dynamic row access, so read a column with one of
-those names as `row['contract']`.
+`carrier-limit`; give the second value its own name. Configuration validation
+also treats `row.contract`, `row.to_dict` and `row.to_checkpoint_format` as
+dynamic row access, so read a column with one of those names as
+`row['contract']`. `required_input_fields: []` opts out of these checks, and
+the template then sees the whole row.
 
 In a multi-query template, `row` holds the query's `input_fields` variables and
-`row.source_row`, which is the same field-only view of the whole row. The same
-rules apply to reads through `row.source_row`.
+`row.source_row`, the same view of the row narrowed to `required_input_fields`.
+The same rules apply to reads through `row.source_row`, and a
+`row.source_row.<column>` read must be listed in `required_input_fields`
+itself: an `image_inputs` column is not in `row.source_row`.
+
+The `<response_field>_variables_hash` an LLM node records is the SHA-256 of
+what its template could see: the declared field values (for a query, its
+variables and its `row.source_row`).
 
 `provider: azure` adds:
 

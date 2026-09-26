@@ -1049,141 +1049,32 @@ class TestExtractJinja2Fields:
         )
 
 
-class TestWholeRowAccess:
-    """A whole row used as a value reads fields the template never names (elspeth-5887fb7928 S0 fix round 1).
+class TestWholeRowIsNotAConfigurationQuestion:
+    """The extractor does not judge a whole row used as a value (ADR-051).
 
-    The template row is a Mapping of field values, so ``row|items`` and
-    ``row|dictsort`` render every column; ``dict(row)``, ``namespace(**row)``,
-    ``'%(x)s' % row`` and ``'{0[x]}'.format(row)`` did so before it. Each is
-    classified ``whole-row`` so a node declaring ``required_input_fields`` is
-    refused rather than sending undeclared columns to the provider.
+    At render a template's row holds only the node's declared fields
+    (``TemplateRow.project``), so ``row|dictsort``, ``dict(row)`` or a row
+    carried through a list, loop or macro argument can only ever see declared
+    fields. That is the confidentiality guarantee, by construction; this
+    analysis is configuration's early error and does not claim it. The leak
+    corpus the retired whole-row gate chased lives on as runtime projection
+    tests (tests/unit/plugins/infrastructure/test_template_projection.py).
     """
 
     @pytest.mark.parametrize(
         "template",
         [
             "{{ row | dictsort }}",
-            "{{ row | items | list }}",
-            "{% for k, v in row | items %}{{ v }}{% endfor %}",
-            "{{ row | tojson }}",
-            "{{ row | urlencode }}",
-            "{{ row | map('upper') | list }}",
             "{{ dict(row) }}",
-            "{{ dict(**row) }}",
-            "{{ namespace(row) }}",
-            "{{ namespace(**row) }}",
             "{{ '%(secret)s' % row }}",
-            "{{ '{0[secret]}'.format(row) }}",
-            "{{ '{r[secret]}'.format(r=row) }}",
-            "{{ '{0[0][secret]}'.format([row]) }}",
-            "{{ row == {} }}",
-            "{{ {} != row }}",
-            "{{ row in [] }}",
-            "{{ row is eq({}) }}",
-            "{{ -row }}",
-            "{{ row ~ '' }}",
-            "{{ lookup[row] }}",
-            "{{ [row] | map('dictsort') | list }}",
-            "{{ [row] | first | dictsort }}",
-            "{{ [row] | sort | map('dictsort') | list }}",
-            "{{ [row] | selectattr('x') | map('dictsort') | list }}",
-            "{{ [row][0] | dictsort }}",
-            "{{ {'a': row}['a'] | dictsort }}",
-            "{{ {'a': {'b': row}}['a']['b'] | dictsort }}",
-            "{{ namespace(r=row).r | dictsort }}",
-            "{{ (row or none) | dictsort }}",
-            "{{ (row if true else none) | dictsort }}",
-            "{{ row | default(none) | dictsort }}",
-            "{{ none | default(row) | dictsort }}",
-            "{% set r = row %}{{ r | dictsort }}",
-            "{% set c = [row] %}{{ c | map('dictsort') | list }}",
-            "{% set c = [row] %}{{ c[0] | dictsort }}",
-            "{% set d = {'a': {'b': row}} %}{{ d.a.b | dictsort }}",
-            "{% set ns = namespace() %}{% set ns.r = row %}{{ ns.r | dictsort }}",
-            "{% for r in [row] %}{{ r | dictsort }}{% endfor %}",
-            "{% with r = row %}{{ r | dictsort }}{% endwith %}",
-            "{% macro m(r) %}{{ r | dictsort }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ kwargs }}{% endmacro %}{{ m(**row) }}",
-            "{% macro m() %}{{ kwargs }}{% endmacro %}{{ m(**{'r': row}['r']) }}",
-            "{{ namespace(**{'r': row}['r']) }}",
-            "{% macro m(r) %}{{ caller(r) }}{% endmacro %}{% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
-            # S0 fix round 2: arguments Jinja hands the body as varargs / kwargs, and caller keywords and defaults.
+            "{% for a, b in [(1, [row])] %}{{ b[0] | dictsort }}{% endfor %}",
             "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ m(r=row) }}",
-            "{% macro m() %}{{ varargs[0] | items | list }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ varargs[0] | xmlattr }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ dict(varargs[0]) }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ '%(x)s' % kwargs.r }}{% endmacro %}{{ m(r=row) }}",
-            "{% macro m() %}{% for v in varargs %}{{ v | dictsort }}{% endfor %}{% endmacro %}{{ m(row) }}",
-            "{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(1, row) }}",
-            "{% macro m() %}{{ caller(*varargs) }}{% endmacro %}{% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ caller(**kwargs) }}{% endmacro %}{% call(x) m(x=row) %}{{ x | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ caller(x=row) }}{% endmacro %}{% call(x) m() %}{{ x | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ caller() }}{% endmacro %}{% call(x=row) m() %}{{ x | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0] | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ caller(r=row) }}{% endmacro %}{% call m() %}{{ kwargs.r | dictsort }}{% endcall %}",
-            "{% macro m() %}{{ varargs[0][0] | dictsort }}{% endmacro %}{{ m([row]) }}",
-            "{% set c = [row] %}{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(*c) }}",
-            "{% set d = {'r': row} %}{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ m(**d) }}",
-            "{% set c = [row] %}{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(1, *c) }}",
-            "{% set c = [1, row] %}{% macro m(a) %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(*c) }}",
         ],
     )
-    def test_a_whole_row_used_as_a_value_is_dynamic_access(self, template: str) -> None:
+    def test_a_whole_row_used_as_a_value_reports_no_dynamic_access(self, template: str) -> None:
         from elspeth.core.templates import extract_jinja2_field_usage
 
-        assert "whole-row" in extract_jinja2_field_usage(template).dynamic_accesses
-
-    @pytest.mark.parametrize(
-        "template",
-        [
-            "{{ row }}",
-            "{% if row %}x{% endif %}",
-            "{{ not row }}",
-            "{{ 'q' in row }}",
-            "{{ 'q' not in row }}",
-            "{% for name in row %}{{ name }}{% endfor %}",
-            "{{ row | length }}",
-            "{{ row | list | join(',') }}",
-            "{{ row is defined }}",
-            "{{ row is mapping }}",
-            "{{ row.q | upper }}",
-            "{{ (row.a * 100) | round }}",
-            "{{ (row.a ~ row.b) | lower }}",
-            "{{ row.a == 'x' }}",
-            "{{ row.meta | dictsort }}",
-            "{{ row.q if row else '' }}",
-            "{{ [row] | map(attribute='q') | join(',') }}",
-            "{% set c = [row] %}{{ c | length + 1 }}",
-            "{% set c = [row] %}{{ c[0].q | upper }}",
-            "{% set ns = namespace(r=row) %}{{ ns.r.q | upper }}",
-            "{% set d = {'a': row, 'n': 1} %}{{ d.a.q }}{{ d.n + 1 }}",
-            "{% for r in [row] %}{{ r.q | upper }}{% endfor %}",
-            "{% macro m(r) %}{{ r.q | upper }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}",
-            "{% macro m() %}{{ varargs[0] | upper }}{% endmacro %}{{ m(row.q) }}",
-            "{% macro m() %}{{ varargs[0].q | upper }}{% endmacro %}{{ m(row) }}",
-            "{% macro m() %}{{ kwargs.r.q | upper }}{% endmacro %}{{ m(r=row) }}",
-            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(row.meta) }}",
-            "{% macro m(a, b) %}{{ b.q }}{% endmacro %}{% set c = [row] %}{{ m(1, *c) }}",
-            # A macro that does not name varargs rejects extra arguments; its kwargs is its own, not the global.
-            "{% macro m() %}x{% endmacro %}{{ m(row) }}",
-            "{% macro a() %}x{% endmacro %}{% macro b() %}{{ varargs[0] | upper }}{% endmacro %}{{ a(row) }}{{ b(row.q) }}",
-            "{% set kwargs = {'r': row} %}{% macro m() %}{{ kwargs | length }}{% endmacro %}{{ m() }}",
-        ],
-    )
-    def test_names_repr_truthiness_and_carriers_are_not_whole_row_access(self, template: str) -> None:
-        from elspeth.core.templates import extract_jinja2_field_usage
-
-        assert "whole-row" not in extract_jinja2_field_usage(template).dynamic_accesses
-
-    def test_the_whole_row_kind_joins_other_kinds_without_duplication(self) -> None:
-        from elspeth.core.templates import extract_jinja2_field_usage
-
-        result = extract_jinja2_field_usage("{{ row.note }} {{ row | dictsort }} {{ row | items | list }} {{ row[k] }}")
-
-        assert result.fields == frozenset({"note"})
-        assert result.dynamic_accesses == ("item", "whole-row")
+        assert extract_jinja2_field_usage(template).dynamic_accesses == ()
 
 
 class TestImplicitMacroArguments:
@@ -1204,8 +1095,8 @@ class TestImplicitMacroArguments:
             ("{% macro m() %}{{ caller(x=row) }}{% endmacro %}{% call(x) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
             ("{% macro m() %}{{ caller() }}{% endmacro %}{% call(x=row) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
             ("{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0].secret }}{% endcall %}", {"secret"}, ()),
-            # A tuple holding a row is a row collection, so every item may be the row: the key is whole-row too.
-            ("{% macro m() %}{{ varargs[0][varargs[1]] }}{% endmacro %}{{ m(row, row.note) }}", {"note"}, ("item", "whole-row")),
+            # A tuple holding a row is a row collection, so every item may be the row: the key is computed.
+            ("{% macro m() %}{{ varargs[0][varargs[1]] }}{% endmacro %}{{ m(row, row.note) }}", {"note"}, ("item",)),
             ("{% macro m() %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(row.get) }}", set(), ("get",)),
             ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(*c) }}", set(), ("get",)),
             ("{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}", set(), ()),
@@ -1230,20 +1121,31 @@ class TestImplicitMacroArguments:
 
         # 'a' is the analysis's usual over-report for a lookup on a list that holds a row somewhere below.
         assert result.fields == frozenset({"a", "secret"})
-        assert result.dynamic_accesses == ("whole-row",)
+        assert result.dynamic_accesses == ()
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "expected"),
         [
-            "{% set c = [row] %}{% macro m() %}{{ varargs[1] | upper }}{% endmacro %}{{ m(1, *c) }}",
-            "{% set c = [1, row] %}{% macro m(a) %}{{ varargs[0].q }}{% endmacro %}{{ m(*c) }}",
-            "{% set c = [row] %}{% macro m() %}{{ caller(1, *c) }}{% endmacro %}{% call m() %}{{ varargs[1].q }}{% endcall %}",
+            ("{% set c = [row.get] %}{% macro m() %}{{ varargs[1]('x') }}{% endmacro %}{{ m(1, *c) }}", ("get",)),
+            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('x') }}{% endmacro %}{{ m(*c) }}", ("get",)),
+            (
+                "{% set c = [row.contract] %}{% macro m() %}{{ caller(1, *c) }}{% endmacro %}{% call m() %}{{ varargs[1] }}{% endcall %}",
+                ("row-api",),
+            ),
         ],
     )
-    def test_a_row_splat_the_analysis_cannot_place_in_varargs_fails_closed(self, template: str) -> None:
+    def test_row_api_in_a_splat_the_analysis_cannot_place_in_varargs_fails_closed(self, template: str, expected: tuple[str, ...]) -> None:
         from elspeth.core.templates import extract_jinja2_field_usage
 
-        assert "whole-row" in extract_jinja2_field_usage(template).dynamic_accesses
+        assert extract_jinja2_field_usage(template).dynamic_accesses == expected
+
+    def test_a_row_in_a_splat_the_analysis_cannot_place_reports_nothing(self) -> None:
+        """Its field reads go unnamed; at render the row holds only the declared fields (ADR-051)."""
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage("{% set c = [row] %}{% macro m() %}{{ varargs[1].q }}{% endmacro %}{{ m(1, *c) }}")
+
+        assert result.dynamic_accesses == ()
 
     def test_a_splat_of_the_row_itself_hands_on_names_only(self) -> None:
         from elspeth.core.templates import extract_jinja2_field_usage
@@ -1329,12 +1231,12 @@ class TestNestedRowRoot:
     @pytest.mark.parametrize(
         ("template", "expected"),
         [
-            ("{{ row.source_row | dictsort }}", ("whole-row",)),
-            ("{{ row['source_row'] | items | list }}", ("whole-row",)),
-            ("{% set s = row.source_row %}{{ s | dictsort }}", ("whole-row",)),
-            ("{{ dict(row.source_row) }}", ("whole-row",)),
             ("{{ row.source_row[row.k] }}", ("item",)),
+            ("{{ row['source_row'][row.k] }}", ("item",)),
+            ("{% set s = row.source_row %}{{ s[row.k] }}", ("item",)),
             ("{{ row.source_row.get(row.k) }}", ("get",)),
+            ("{{ row.source_row.contract }}", ("row-api",)),
+            ("{{ row.source_row | dictsort }}", ()),
         ],
     )
     def test_reads_through_the_nested_row_are_classified(self, template: str, expected: tuple[str, ...]) -> None:

@@ -235,10 +235,11 @@ _CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
         "the control mode to 'recommend' — it is not an authoring change."
     ),
     "input_fields_unprovable": (
-        "Do not auto-wire a field-scoped control from the known field subset. Place a "
-        "blocking control after any downstream rewrites and set fields: 'all', or rewrite "
-        "the node's prompt template so every row access is static ('{{ row.field }}', "
-        "never '{{ row[key] }}') and then protect those exact fields. Validate again."
+        "Do not auto-wire a field-scoped control from a guessed field list. Place a "
+        "blocking control after any downstream rewrites and set fields: 'all', or give the "
+        "node an explicit options.required_input_fields list naming every field its prompt "
+        "reads (the template sees exactly those fields) and then protect those exact fields. "
+        "Validate again."
     ),
     "output_not_post_dominated": (
         "Wire the required control transform so it sits on every path that carries the "
@@ -326,20 +327,21 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
         if coverage.scanned_fields:
             message = (
                 f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-                f"{coverage.role.value} control upstream, but its own protected field set could not "
-                "be proven from its prompt template, so a control scoped to specific fields cannot be "
-                f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
-                f"{_field_set(coverage.scanned_fields)}. A dynamic access such as row[key] can read "
-                "outside the statically known set, so only fields: 'all' covers it."
+                f"{coverage.role.value} control upstream, but its own protected field set is not an explicit "
+                "declaration, so a control scoped to specific fields cannot be credited: protected fields "
+                f"{_field_set(coverage.protected_fields)}, control scans {_field_set(coverage.scanned_fields)}. "
+                "The prompt template sees exactly options.required_input_fields; with that list empty ([], the "
+                "whole row) or not declared, only fields: 'all' covers it."
             )
         else:
             message = (
                 f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-                f"{coverage.role.value} control, but its complete protected field set could not be "
-                f"proven from its prompt template (known fields: {_field_set(coverage.protected_fields)}). "
-                "A dynamic access such as row[key] can read outside that set, so Composer cannot safely "
-                "auto-wire a field-scoped control. Place a blocking control after any downstream rewrites "
-                "with fields: 'all', or rewrite the prompt to use only static row fields."
+                f"{coverage.role.value} control, but its protected field set is not an explicit declaration "
+                f"(known fields: {_field_set(coverage.protected_fields)}). The prompt template sees exactly "
+                "options.required_input_fields; with that list empty ([], the whole row) or not declared, "
+                "Composer cannot safely auto-wire a field-scoped control. Place a blocking control after any "
+                "downstream rewrites with fields: 'all', or declare required_input_fields as the fields the "
+                "prompt reads."
             )
     else:
         component_label = "Source" if coverage.component_type == "source" else "Node"

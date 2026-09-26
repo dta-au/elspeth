@@ -216,20 +216,21 @@ class TestLLMConfigBase:
             "{% macro m() %}{{ caller(*varargs) }}{% endmacro %}{{ row.note }} {% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
         ),
     )
-    def test_whole_row_value_rejected_even_with_declared_fields(self, template: str) -> None:
-        """A whole row used as a value sends every column, so a declared contract cannot vouch for it (S0 fix round 1)."""
-        with pytest.raises(ValidationError) as exc_info:
-            LLMConfig(
-                provider="openrouter",
-                model="anthropic/claude-sonnet-4.6",
-                prompt_template=template,
-                schema_config=_OBSERVED_SCHEMA,
-                required_input_fields=["note"],
-            )
+    def test_whole_row_value_is_not_a_configuration_question(self, template: str) -> None:
+        """A whole row used as a value holds only the declared fields at render (ADR-051), so configuration admits it.
 
-        message = str(exc_info.value)
-        assert "dynamic row field access (whole-row via a whole-row operand such as row|items or dict(row))" in message
-        assert "options.required_input_fields: []" in message
+        The runtime projection is the confidentiality guarantee
+        (tests/unit/plugins/infrastructure/test_template_projection.py); the
+        static analysis stays the early error for reads it can name.
+        """
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["note"],
+        )
+        assert config.required_input_fields == ["note"]
 
     @pytest.mark.parametrize(
         "template",

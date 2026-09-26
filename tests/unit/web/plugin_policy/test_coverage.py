@@ -287,7 +287,31 @@ def test_prompt_shield_input_coverage_requires_llm_field_scope(
     assert (control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()) is covered
 
 
-def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
+def test_prompt_shield_input_coverage_protects_every_declared_field_the_template_can_see() -> None:
+    """ADR-051: the protected set is the declaration, not what the template text happens to read.
+
+    The template reads only ``benign_label``, but the node declares
+    ``untrusted_prompt`` too, so at render the template's row holds it and a
+    template form the analysis cannot see (``row | dictsort``) would send it.
+    A shield scanning only ``benign_label`` must not be credited.
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("benign_label",)),
+        _llm(
+            prompt_fields=("benign_label",),
+            declared_prompt_fields=("benign_label", "untrusted_prompt"),
+        ),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [("judge", "input_not_dominated")]
+    assert findings[0].protected_fields == ("benign_label", "untrusted_prompt")
+
+
+def test_prompt_shield_input_coverage_ignores_a_template_read_outside_the_declaration() -> None:
+    """A read outside the declaration cannot reach the provider: at render it fails the row (ADR-051)."""
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("benign_label",)),
         _llm(
@@ -297,7 +321,27 @@ def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
         source_target="raw",
     )
 
-    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [pytest.param([], id="opt-out-whole-row"), pytest.param(None, id="omitted"), pytest.param(["", "prompt"], id="malformed")],
+)
+def test_prompt_shield_input_coverage_is_unprovable_without_an_explicit_declaration(declared: list[str] | None) -> None:
+    """``[]`` is the whole row and an omitted or malformed declaration proves nothing: only ``fields: all`` covers them."""
+    options: dict[str, object] = {"prompt_template": "{{ row.prompt }}", "response_field": "llm_response"}
+    if declared is not None:
+        options["required_input_fields"] = declared
+    llm = _node("judge", "llm", "llm_in", "main", options=options)
+
+    scoped = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
+    assert [(finding.component_id, finding.reason) for finding in control_coverage_findings(scoped, PluginCapability.PROMPT_SHIELD)] == [
+        ("judge", "input_fields_unprovable")
+    ]
+
+    everything = _state(_all_fields_shield("shield", "raw", "llm_in"), llm, source_target="raw")
+    assert control_coverage_findings(everything, PluginCapability.PROMPT_SHIELD) == ()
 
 
 def _value_transform(
@@ -439,7 +483,7 @@ def test_prompt_shield_input_coverage_fails_closed_for_dotted_mapper_source(
         "main",
         options={
             "prompt_template": prompt_template,
-            "required_input_fields": [],
+            "required_input_fields": [next(iter(mapping.values()))],
             "response_field": "llm_response",
         },
     )
@@ -480,7 +524,7 @@ def test_prompt_shield_input_coverage_tracks_dotted_literal_passthrough(
         "main",
         options={
             "prompt_template": '{{ row["meta.prompt"] }}',
-            "required_input_fields": [],
+            "required_input_fields": ["meta.prompt"],
             "response_field": "llm_response",
         },
     )
@@ -1549,10 +1593,11 @@ def _multi_query_llm(
     *,
     prompt_template: str,
     queries: dict[str, object],
+    required_input_fields: list[str],
     input_stream: str = "llm_in",
     on_success: str = "main",
 ) -> NodeSpec:
-    """A multi-query LLM whose shared template may be dead (all queries override)."""
+    """A multi-query LLM node; its declaration, not its templates, decides what the queries can see (ADR-051)."""
     return _node(
         "judge",
         "llm",
@@ -1560,28 +1605,26 @@ def _multi_query_llm(
         on_success,
         options={
             "prompt_template": prompt_template,
-            "required_input_fields": [],
+            "required_input_fields": required_input_fields,
             "response_field": "llm_response",
             "queries": queries,
         },
     )
 
 
-def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None:
-    """A node template every query overrides never renders, so it must not decide provability.
+def test_template_text_does_not_decide_multi_query_provability() -> None:
+    """A dynamic shared template cannot widen what a query sees: its ``source_row`` holds the declaration only.
 
-    ``queries.*.template`` is a per-query override (``None`` = fall back to the
-    node-level ``prompt_template`` — multi_query.py), and config validation
-    deliberately skips a shared template no query falls back to
-    (``LLMConfig._validate_template_variable_bindings``). Coverage must apply
-    the same liveness rule: with every override static, the protected set is
-    provably {prompt} and a shield scanning exactly that field is credited.
+    Required-control coverage reads the declaration plus each query's
+    ``input_fields`` values, so a shield scanning exactly that set is credited
+    whatever the template text does.
     """
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("prompt",)),
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
-            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+            required_input_fields=["prompt"],
         ),
         source_target="raw",
     )
@@ -1589,18 +1632,17 @@ def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
-def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure() -> None:
-    """With the dead template ignored, a missing shield is the wirable diagnosis.
+def test_a_declared_multi_query_node_without_a_shield_is_an_auto_wirable_topology_failure() -> None:
+    """A provable declaration makes a missing shield the wirable diagnosis.
 
     Required-control auto-wiring acts only on ``input_not_dominated``
-    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS); reporting the dead
-    template's dynamic access as ``input_fields_unprovable`` left the required
-    shield unwired and failed the gate later.
+    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS).
     """
     state = _state(
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
             queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+            required_input_fields=["prompt"],
         )
     )
 
@@ -1612,14 +1654,15 @@ def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure
     assert findings[0].protected_fields == ("prompt",)
 
 
-def test_query_fallback_keeps_node_template_in_provability() -> None:
-    """A query WITHOUT an override still pulls the shared template into the set."""
+def test_the_multi_query_protected_set_is_the_declaration_and_every_query_input() -> None:
+    """Every declared field and every query's ``input_fields`` value can reach a prompt."""
     llm = _multi_query_llm(
-        prompt_template="{{ row.shared_context }}",
+        prompt_template="{{ row.source_row.shared_context }}",
         queries={
             "q.a": {"input_fields": {"prompt": "prompt"}},
             "q.b": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"},
         },
+        required_input_fields=["shared_context"],
     )
 
     partial = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
@@ -1637,13 +1680,14 @@ def test_query_fallback_keeps_node_template_in_provability() -> None:
     assert control_coverage_findings(covered, PluginCapability.PROMPT_SHIELD) == ()
 
 
-def test_dynamic_shared_template_with_a_falling_back_query_stays_unprovable() -> None:
-    """Liveness is per-query: one fallback keeps the dynamic template authoritative."""
+def test_an_opted_out_multi_query_node_stays_unprovable() -> None:
+    """``[]`` gives every query's ``source_row`` the whole row: no field-scoped control can be credited."""
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("prompt",)),
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
             queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+            required_input_fields=[],
         ),
         source_target="raw",
     )

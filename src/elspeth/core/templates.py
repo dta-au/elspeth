@@ -40,14 +40,9 @@ from typing import TYPE_CHECKING
 from jinja2 import Environment
 from jinja2.compiler import find_undeclared
 from jinja2.nodes import (
-    And,
     Assign,
-    BinExpr,
     Call,
     CallBlock,
-    Compare,
-    Concat,
-    CondExpr,
     Const,
     Filter,
     For,
@@ -57,14 +52,9 @@ from jinja2.nodes import (
     Macro,
     Name,
     Node,
-    Not,
     NSRef,
-    Or,
     Pair,
-    Slice,
-    Test,
     Tuple,
-    UnaryExpr,
     With,
 )
 from jinja2.nodes import (
@@ -90,7 +80,6 @@ DYNAMIC_ROW_FIELD = "<dynamic-row-field>"
 ATTR_FILTER_DYNAMIC_ACCESS = "attr"
 MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS = "map(attribute)"
 ROW_API_DYNAMIC_ACCESS = "row-api"
-WHOLE_ROW_DYNAMIC_ACCESS = "whole-row"
 CARRIER_LIMIT_DYNAMIC_ACCESS = "carrier-limit"
 
 # The alias analysis is a fixpoint over what each template name may hold. Every
@@ -101,27 +90,6 @@ CARRIER_LIMIT_DYNAMIC_ACCESS = "carrier-limit"
 # no alias records more than this many paths, and a template whose analysis
 # reaches the cap reports CARRIER_LIMIT_DYNAMIC_ACCESS instead of being trusted.
 _MAX_CARRIER_PATHS_PER_ALIAS = 256
-
-# What a template may do with a whole row (``row`` itself, an alias of it, or a
-# list, dict or namespace carrying one) without reading a field value the
-# extractor cannot name. Every other filter, call, operator, comparison or test
-# that takes a whole row as an operand is WHOLE_ROW_DYNAMIC_ACCESS: ``row|items``,
-# ``row|dictsort``, ``dict(row)``, ``namespace(**row)``, ``'%(x)s' % row``,
-# ``'{0[x]}'.format(row)`` and ``row == {...}`` all read values by keys the
-# template never spells as ``row.x`` / ``row['x']``.
-# - Filters that see field names only, pass the row through, or have their own
-#   arm (``attr``; attribute-resolving filters given an ``attribute``).
-_WHOLE_ROW_FILTERS: frozenset[str] = frozenset(
-    {"attr", "count", "d", "default", "first", "join", "last", "length", "list", "random", "reverse", "sort", "unique"}
-)
-# - Tests that ask what the object is, not what it holds.
-_WHOLE_ROW_TESTS: frozenset[str] = frozenset(
-    {"callable", "defined", "iterable", "mapping", "none", "number", "sameas", "sequence", "string", "undefined"}
-)
-# - Filters whose result over a row collection is a scalar, not the rows. Any
-#   other filter but ``map`` (a consumer, or an attribute read) may hand the
-#   rows on: ``c|selectattr('x')``, ``c|sort``, ``c|batch(2)``.
-_SCALAR_RESULT_FILTERS: frozenset[str] = frozenset({"count", "join", "length", "pprint", "string", "tojson", "wordcount"})
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
@@ -182,11 +150,15 @@ def extract_jinja2_field_usage(
     resolved to a concrete field name at parse time. They are therefore
     reported separately so security-sensitive callers can fail closed instead
     of treating an empty concrete-field set as "no row fields referenced."
-    So is a whole row used as a value (``row|items``, ``dict(row)``,
-    ``'%(x)s' % row``): it reads fields the template never names. A template
-    whose aliases hold themselves too deeply to follow (see
+    A template whose aliases hold themselves too deeply to follow (see
     ``_MAX_CARRIER_PATHS_PER_ALIAS``) reports ``carrier-limit``: nothing read
     through them can be named.
+
+    This analysis is configuration's early error, not a confidentiality
+    control: what a template can read at render is the node's declaration,
+    enforced by projecting the row (ADR-051). A whole row used as a value
+    (``row|items``, ``dict(row)``) therefore holds only the declared fields
+    and is not reported here.
 
     ``row_attribute`` names where the row lives when ``namespace`` is not the
     row itself: multi-query binds ``row`` to the query's variables and the row
@@ -222,8 +194,6 @@ def extract_jinja2_field_usage(
         fields,
         dynamic_accesses,
     )
-    if _template_uses_whole_row(ast, namespaces, row_collection_aliases, row_container_aliases):
-        _append_dynamic_access(dynamic_accesses, WHOLE_ROW_DYNAMIC_ACCESS)
     for kind in _shifted_varargs_splat_kinds(
         ast, namespaces, api_aliases, row_api_container_aliases, row_collection_aliases, row_container_aliases
     ):
@@ -634,84 +604,6 @@ def _join_macro_entries(recorded: dict[_CarrierPath, frozenset[str]], entries: d
     return widened
 
 
-def _template_uses_whole_row(
-    ast: Node,
-    namespaces: frozenset[str],
-    row_collection_aliases: frozenset[str],
-    row_container_aliases: dict[str, frozenset[_CarrierPath]],
-) -> bool:
-    """Whether any expression consumes a whole row as a value (see ``_WHOLE_ROW_FILTERS``).
-
-    Carriers are not consumers: ``{% set r = row %}``, ``[row]``, ``{'r': row}``,
-    ``namespace(r=row)``, a ``for`` loop and every argument of a macro or
-    ``caller`` call are tracked by ``_field_extraction_context``, so a read
-    through them is judged where it happens. That includes arguments beyond the
-    declared parameters, which Jinja hands the body as ``varargs`` and
-    ``kwargs`` (see ``_call_argument_bindings``). ``{{ row }}``,
-    ``{% if row %}``, ``'x' in row`` and ``{% for name in row %}`` see the row's
-    repr, truthiness or field names only.
-    """
-
-    def whole(node: Node | None) -> bool:
-        return _node_is_whole_row(node, namespaces, row_collection_aliases, row_container_aliases)
-
-    def row_object(node: Node | None) -> bool:
-        return _node_is_row_object(node, namespaces, row_collection_aliases, row_container_aliases)
-
-    macros = {macro.name: macro for macro in ast.find_all(Macro)}
-    macro_aliases, macro_container_aliases = _macro_alias_context(ast, macros)
-    for node in ast.find_all((Filter, Test, Call, BinExpr, Concat, UnaryExpr, Compare, Getitem, Slice)):
-        if isinstance(node, Filter):
-            if node.name in {"default", "d"}:
-                continue  # passes its subject or its argument through; the consumer is judged
-            if whole(node.node) and node.name not in _WHOLE_ROW_FILTERS and not _attribute_filter_arm_owns(node):
-                return True
-            if any(whole(argument) for argument in _call_like_operands(node)):
-                return True
-        elif isinstance(node, Test):
-            if whole(node.node) and node.name not in _WHOLE_ROW_TESTS:
-                return True
-            if node.name != "sameas" and any(whole(argument) for argument in _call_like_operands(node)):
-                return True
-        elif isinstance(node, Call):
-            callee = node.node
-            if isinstance(callee, Getattr) and callee.attr == "get" and row_object(callee.node):
-                continue  # row.get(key): the get arm classifies the key
-            if (isinstance(callee, Name) and callee.name == "caller") or _macro_names_for_callee(
-                callee, macros, macro_aliases, macro_container_aliases
-            ):
-                # Every argument binds to a tracked parameter, ``varargs`` or
-                # ``kwargs``; only a splatted row (its keys become arguments)
-                # is read here.
-                if row_object(node.dyn_kwargs):
-                    return True
-                continue
-            if isinstance(callee, Name) and callee.name == "namespace":
-                # namespace(r=row) carries the row; namespace(row) / (**row) copies its fields.
-                if any(whole(argument) for argument in node.args) or whole(node.dyn_args) or row_object(node.dyn_kwargs):
-                    return True
-                continue
-            if any(whole(argument) for argument in _call_like_operands(node)):
-                return True
-        elif isinstance(node, (BinExpr, Concat, UnaryExpr)):
-            if isinstance(node, (And, Or, Not)):
-                continue  # truthiness, or the row passed through to a judged consumer
-            operands = node.nodes if isinstance(node, Concat) else [node.node] if isinstance(node, UnaryExpr) else [node.left, node.right]
-            if any(whole(operand) for operand in operands):
-                return True
-        elif isinstance(node, Compare):
-            if whole(node.expr):
-                return True
-            if any(whole(operand.expr) and operand.op not in {"in", "notin"} for operand in node.ops):
-                return True
-        elif isinstance(node, Getitem):
-            if whole(node.arg):
-                return True
-        elif isinstance(node, Slice) and any(whole(part) for part in (node.start, node.stop, node.step)):
-            return True
-    return False
-
-
 def _shifted_varargs_splat_kinds(
     ast: Node,
     namespaces: frozenset[str],
@@ -720,18 +612,16 @@ def _shifted_varargs_splat_kinds(
     row_collection_aliases: frozenset[str],
     row_container_aliases: dict[str, frozenset[_CarrierPath]],
 ) -> list[str]:
-    """Dynamic-access kinds for rows or row API handed to ``varargs`` at an offset the analysis cannot place.
+    """Dynamic-access kinds for row API handed to ``varargs`` at an offset the analysis cannot place.
 
-    A splat that carries a row is ``whole-row``; one that carries the row's
-    API reports that API's kind. A splat of the row itself hands on field names
-    only.
+    A splat that carries the row's API reports that API's kind. A row carried
+    there is not reported: its field reads are not named, and at render the
+    row holds only the declared fields (ADR-051).
     """
     macros = {macro.name: macro for macro in ast.find_all(Macro)}
     macro_aliases, macro_container_aliases = _macro_alias_context(ast, macros)
     kinds: list[str] = []
     for splat in _shifted_varargs_splats(ast, macros, macro_aliases, macro_container_aliases):
-        if _node_is_row_carrier(splat, namespaces, row_collection_aliases, row_container_aliases):
-            kinds.append(WHOLE_ROW_DYNAMIC_ACCESS)
         api_entries = _row_api_container_entries(
             splat, api_aliases, row_api_container_aliases, namespaces, row_collection_aliases, row_container_aliases
         )
@@ -739,134 +629,6 @@ def _shifted_varargs_splat_kinds(
         if api_kind is not None:
             kinds.append(api_kind)
     return kinds
-
-
-def _attribute_filter_arm_owns(node: Filter) -> bool:
-    """Whether ``_record_dynamic_attribute_filter_access`` classifies this filter.
-
-    An attribute-resolving filter given an attribute (literal or not), or one
-    whose arguments hide in an opaque splat, reads through that arm already.
-    """
-    if node.name not in _ATTRIBUTE_KEYWORD_FILTERS and node.name not in _ATTRIBUTE_POSITIONAL_FILTERS:
-        return False
-    return (
-        _attribute_resolving_filter_argument(node) is not None
-        or _has_unknown_star_values(node.dyn_args)
-        or _has_unknown_kwarg_values(node.dyn_kwargs)
-    )
-
-
-def _call_like_operands(node: Call | Filter | Test) -> list[Node]:
-    operands: list[Node] = [*node.args, *(keyword.value for keyword in node.kwargs)]
-    if node.dyn_args is not None:
-        operands.append(node.dyn_args)
-    if node.dyn_kwargs is not None:
-        operands.append(node.dyn_kwargs)
-    return operands
-
-
-def _node_is_row_object(
-    node: Node | None,
-    namespaces: frozenset[str],
-    row_collection_aliases: frozenset[str],
-    row_container_aliases: dict[str, frozenset[_CarrierPath]],
-) -> bool:
-    """Whether ``node`` may evaluate to a row itself (not a field of one, not a carrier)."""
-
-    def recurse(child: Node | None) -> bool:
-        return _node_is_row_object(child, namespaces, row_collection_aliases, row_container_aliases)
-
-    def carrier(child: Node | None) -> bool:
-        return _node_is_row_carrier(child, namespaces, row_collection_aliases, row_container_aliases)
-
-    if node is None:
-        return False
-    if isinstance(node, Name):
-        return node.name in namespaces
-    if isinstance(node, (Getattr, Getitem)):
-        # A lookup on a row is a field value; a lookup on a carrier may be a row.
-        if isinstance(node, Getitem) and _iter_may_yield_row_object(node.node, namespaces, row_collection_aliases, row_container_aliases):
-            return True
-        if _row_object_container_access_matches(node, row_container_aliases):
-            return True
-        # Paths into a named carrier are tracked exactly; a literal carrier is not.
-        return not isinstance(_lookup_root(node), Name) and carrier(node.node)
-    if isinstance(node, Filter):
-        if node.name in {"default", "d"}:
-            return recurse(node.node) or any(recurse(argument) for argument in node.args)
-        if node.name in {"first", "last", "random"}:
-            return _iter_may_yield_row_object(node.node, namespaces, row_collection_aliases, row_container_aliases)
-        return False
-    if isinstance(node, (And, Or)):
-        return recurse(node.left) or recurse(node.right)
-    if isinstance(node, CondExpr):
-        return recurse(node.expr1) or recurse(node.expr2)
-    return False
-
-
-def _node_is_row_carrier(
-    node: Node | None,
-    namespaces: frozenset[str],
-    row_collection_aliases: frozenset[str],
-    row_container_aliases: dict[str, frozenset[_CarrierPath]],
-) -> bool:
-    """Whether ``node`` may evaluate to a list, dict or namespace holding a row."""
-
-    def whole(child: Node | None) -> bool:
-        return _node_is_whole_row(child, namespaces, row_collection_aliases, row_container_aliases)
-
-    if node is None:
-        return False
-    if isinstance(node, Name):
-        return node.name in row_collection_aliases or node.name in row_container_aliases
-    if isinstance(node, (List, Tuple)):
-        return any(whole(item) for item in node.items)
-    if isinstance(node, DictNode):
-        return any(whole(pair.value) for pair in node.items)
-    if isinstance(node, Call) and isinstance(node.node, Name) and node.node.name == "namespace":
-        return any(whole(argument) for argument in _call_like_operands(node))
-    if isinstance(node, (Getattr, Getitem)):
-        if _iter_may_yield_row_object(node, namespaces, row_collection_aliases, row_container_aliases):
-            return True
-        return not isinstance(_lookup_root(node), Name) and _node_is_row_carrier(
-            node.node, namespaces, row_collection_aliases, row_container_aliases
-        )
-    if isinstance(node, Filter):
-        if node.name in {"default", "d"}:
-            return _node_is_row_carrier(node.node, namespaces, row_collection_aliases, row_container_aliases) or any(
-                _node_is_row_carrier(argument, namespaces, row_collection_aliases, row_container_aliases) for argument in node.args
-            )
-        if node.name == "map" or node.name in _SCALAR_RESULT_FILTERS:
-            return False
-        return _node_is_row_carrier(node.node, namespaces, row_collection_aliases, row_container_aliases)
-    if isinstance(node, (And, Or)):
-        return _node_is_row_carrier(node.left, namespaces, row_collection_aliases, row_container_aliases) or _node_is_row_carrier(
-            node.right, namespaces, row_collection_aliases, row_container_aliases
-        )
-    if isinstance(node, CondExpr):
-        return _node_is_row_carrier(node.expr1, namespaces, row_collection_aliases, row_container_aliases) or _node_is_row_carrier(
-            node.expr2, namespaces, row_collection_aliases, row_container_aliases
-        )
-    return False
-
-
-def _lookup_root(node: Node) -> Node:
-    """The expression a chain of attribute and item lookups starts from."""
-    while isinstance(node, (Getattr, Getitem)):
-        node = node.node
-    return node
-
-
-def _node_is_whole_row(
-    node: Node | None,
-    namespaces: frozenset[str],
-    row_collection_aliases: frozenset[str],
-    row_container_aliases: dict[str, frozenset[_CarrierPath]],
-) -> bool:
-    """Whether ``node`` may evaluate to a row or to a carrier of one."""
-    return _node_is_row_object(node, namespaces, row_collection_aliases, row_container_aliases) or _node_is_row_carrier(
-        node, namespaces, row_collection_aliases, row_container_aliases
-    )
 
 
 def _field_extraction_context(
@@ -1452,8 +1214,8 @@ def _call_argument_bindings(scope: Macro | CallBlock, call: Call) -> list[tuple[
     the unmatched keywords as the dict ``kwargs``. An opaque ``**`` splat may
     supply any keyword, so ``kwargs`` is bound to it whole. An opaque ``*``
     splat is bound to ``varargs`` whole, which places its items exactly only
-    when it starts at ``varargs[0]``; ``_shifted_varargs_splats`` fails closed
-    on the others.
+    when it starts at ``varargs[0]``; ``_shifted_varargs_splat_kinds`` fails
+    closed on row API carried by the others.
 
     The analysis keys aliases by name, not scope, so every macro's ``varargs``
     is one name: a row that reaches one macro's ``varargs`` is assumed to reach

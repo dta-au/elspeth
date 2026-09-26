@@ -6,6 +6,7 @@
 **Tags:** declaration-contract, transform, pre-emission, tier-1, audit-integrity
 **Supersedes:** None
 **Depends on:** [ADR-010](010-declaration-trust-framework.md)
+**Amended by:** [ADR-051](051-a-template-sees-only-its-declared-fields.md) — for a template transform (LLM, RAG) `required_input_fields` is also what the template can see: its render context holds exactly the declared fields (`[]` the whole row, omitted none)
 
 ## Context
 

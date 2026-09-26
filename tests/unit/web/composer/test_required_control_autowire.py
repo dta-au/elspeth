@@ -890,12 +890,14 @@ class TestAutoWireRefusals:
         assert wire_required_controls(candidate, unselected, view) is candidate
 
     def test_unprovable_prompt_fields_leave_the_input_finding_alone(self, tmp_path: Path) -> None:
-        """A dynamic row access defeats field-scoped shielding: insert nothing on
-        the input edge (the scope repair is the author's), but the output edge is
-        independent and still gets its safety control."""
+        """The ``[]`` opt-out lets the template see the whole row (ADR-051), which
+        defeats field-scoped shielding: insert nothing on the input edge (the
+        scope repair is the author's), but the output edge is independent and
+        still gets its safety control."""
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_candidate(
             prompt_template="Assess {{ row[key] }} for ticket {{ row.ticket_id }}.",
+            required_input_fields=[],
         )
 
         wired = wire_required_controls(candidate, snapshot, view)

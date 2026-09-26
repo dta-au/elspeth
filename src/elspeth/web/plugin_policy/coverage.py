@@ -6,13 +6,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
-from jinja2 import TemplateSyntaxError
-
 from elspeth.contracts.enums import Determinism
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.composer._producer_resolver import published_success_connection, source_producer_id
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
@@ -69,11 +66,13 @@ class ControlCoverageFinding:
     convention (``source`` or ``source:<name>``); transform ids are node ids.
 
     ``input_fields_unprovable`` is the second fully-diagnosable case: the
-    node's protected field set is not statically complete, so a control scoped
-    to a specific field list cannot be credited (only ``fields: all`` can).
-    This reason remains authoritative even when the topology is also broken:
-    ``input_not_dominated`` is auto-wirable, and auto-wiring from a known
-    subset would install a control that still cannot cover a dynamic access.
+    node's protected field set is not an explicit declaration (its
+    ``required_input_fields`` is ``[]``, the whole row, or absent), so a
+    control scoped to a specific field list cannot be credited (only
+    ``fields: all`` can). This reason remains authoritative even when the
+    topology is also broken: ``input_not_dominated`` is auto-wirable, and
+    auto-wiring from a guessed field list would install a control that still
+    cannot cover what the template sees.
     ``protected_fields`` and ``scanned_fields`` carry the two sets the message
     can name; ``scanned_fields`` is populated only when a control structurally
     dominates, is diagnosis-only, and is never a credit decision.
@@ -184,10 +183,10 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
     ``fields: all`` is decided FIRST because it is a superset of every
     protected set — provable or not — so it covers the empty set too. The
     empty-set bail-out below is the fail-closed rule for every OTHER scope: an
-    empty protected set is not proof that no field needs protecting (a dynamic
-    ``row[key]`` prompt access and a prompt with no row access at all both
-    extract to the empty set — see ``extract_jinja2_field_usage``), so a
-    control scoped to a specific field list cannot be credited against it.
+    empty protected set is not proof that no field needs protecting (an LLM
+    node whose declaration is ``[]`` sees the whole row, and one with no
+    provable declaration reads as the empty set — see ``_llm_input_fields``),
+    so a control scoped to a specific field list cannot be credited against it.
     Ordering these the other way round rejected correctly-shielded pipelines
     outright (AWS acceptance run 2, R2-F17 / elspeth-5c0c09db31).
     """
@@ -209,44 +208,43 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
 
 @observation_boundary(
     tier=3,
-    source="NodeSpec carrying web-authored LLM 'queries' options (untrusted query definitions and field names)",
+    source="NodeSpec carrying web-authored LLM options (untrusted required_input_fields and query definitions)",
     source_param="node",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns a _ProtectedFields with provable=False whenever 'queries' or any query definition, its "
-        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed "
-        "queries. ABSENT keys are the plugin defaults, not a softening: an absent 'queries' is a single-query "
-        "node (LLMConfig.queries), an absent 'prompt_template' is an unparseable template and therefore already "
-        "unprovable, and an absent per-query 'template' means that query renders the node-level one"
+        "returns a _ProtectedFields with provable=False unless 'required_input_fields' is a non-empty sequence of "
+        "non-empty strings, and whenever 'queries' or any query definition, its input_fields mapping, or a "
+        "row-field name deviates from the expected shape; never raises on malformed options. An ABSENT "
+        "'required_input_fields' is the plugin default (None: the template sees no field) and an absent 'queries' "
+        "is a single-query node (LLMConfig.queries); neither is ever credited as a provable field set"
     ),
 )
 def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
-    """Return known prompt fields without erasing whether the set is complete."""
-    prompt_fields = _template_input_fields(node.options.get("prompt_template"))
+    """The fields an LLM node's prompts can carry: its declaration, never what a template analysis found.
+
+    At render a template's ``row`` (a query's ``row.source_row``) holds exactly
+    the node's ``required_input_fields`` (ADR-051), and a query's
+    ``input_fields`` values are read into its variables in the parent. So the
+    protected set is the declaration plus every query's ``input_fields``
+    values, whatever the template text reads. ``[]`` (the whole row) and an
+    omitted or malformed declaration are not a provable set: only a control
+    scanning ``fields: all`` can cover them.
+    """
+    declared = node.options.get("required_input_fields")
+    if not isinstance(declared, Sequence) or isinstance(declared, (str, bytes)) or len(declared) == 0:
+        return _ProtectedFields(frozenset(), False)
+    if any(not isinstance(field, str) or not field.strip() for field in declared):
+        return _ProtectedFields(frozenset(), False)
+    fields = set(cast("Sequence[str]", declared))
 
     queries = node.options.get("queries")
     if queries is None:
-        return prompt_fields
+        return _ProtectedFields(frozenset(fields), True)
     if not isinstance(queries, (Mapping, Sequence)) or isinstance(queries, (str, bytes)):
-        return _ProtectedFields(prompt_fields.fields, False)
+        return _ProtectedFields(frozenset(fields), False)
     # A mapping's query definitions are its VALUES; a value that is both a
-    # Mapping and a Sequence keeps the mapping reading, as in the ordered
-    # if/elif this replaced.
+    # Mapping and a Sequence keeps the mapping reading.
     definitions = tuple(queries.values()) if isinstance(queries, Mapping) else tuple(queries)
-
-    # Each query renders its own ``template`` override when present and falls
-    # back to the node-level ``prompt_template`` otherwise (QueryDefinition,
-    # multi_query.py). A shared template every definition overrides is dead —
-    # it never renders, and config validation deliberately skips it
-    # (``LLMConfig._validate_template_variable_bindings``) — so it must not
-    # decide provability here either. Malformed definitions fail closed as
-    # live: the loop below already returns unprovable for them.
-    node_template_live = not definitions or any(
-        not isinstance(definition, Mapping) or definition.get("template") is None for definition in definitions
-    )
-    fields = set(prompt_fields.fields) if node_template_live else set()
-    provable = prompt_fields.provable if node_template_live else True
-
     for definition in definitions:
         if not isinstance(definition, Mapping):
             return _ProtectedFields(frozenset(fields), False)
@@ -257,33 +255,7 @@ def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
         if any(not isinstance(field, str) or not field.strip() for field in row_fields):
             return _ProtectedFields(frozenset(fields), False)
         fields.update(cast("tuple[str, ...]", row_fields))
-        template = definition.get("template")
-        if template is not None:
-            query_template_fields = _template_input_fields(template)
-            fields.update(query_template_fields.fields)
-            provable = provable and query_template_fields.provable
-    return _ProtectedFields(frozenset(fields), provable)
-
-
-@observation_boundary(
-    tier=3,
-    source="web-authored Jinja2 prompt template value read off NodeSpec.options (untrusted type and syntax)",
-    source_param="template",
-    suppresses=("R5",),
-    invariant=(
-        "returns a _ProtectedFields with provable=False whenever the template is not a string or does not parse; "
-        "never raises on a malformed template"
-    ),
-)
-def _template_input_fields(template: object) -> _ProtectedFields:
-    """Extract static row-field accesses; dynamic or malformed templates are unprovable."""
-    if not isinstance(template, str):
-        return _ProtectedFields(frozenset(), False)
-    try:
-        usage = extract_jinja2_field_usage(template)
-    except TemplateSyntaxError:
-        return _ProtectedFields(frozenset(), False)
-    return _ProtectedFields(usage.fields, not usage.dynamic_accesses)
+    return _ProtectedFields(frozenset(fields), True)
 
 
 def _llm_output_fields(node: NodeSpec) -> frozenset[str]:

@@ -571,7 +571,8 @@ class LLMConfig(TransformDataConfig):
                 raise TemplateError(f"Invalid template syntax in {label}: {e}") from e
             dynamic_accesses.extend(extraction.dynamic_accesses)
             if self.queries is not None:
-                # A query renders with the row at row.source_row; judge reads through it the same way.
+                # A query renders with the row at row.source_row; a computed key or
+                # row API through it is refused the same way as through row.
                 dynamic_accesses.extend(extract_jinja2_field_usage(template, row_attribute="source_row").dynamic_accesses)
 
         if not dynamic_accesses:
@@ -585,7 +586,6 @@ class LLMConfig(TransformDataConfig):
             "item": "row[expr]",
             "map(attribute)": "map(attribute=expr)",
             "row-api": "row API",
-            "whole-row": "a whole-row operand such as row|items or dict(row)",
         }
         access_examples = ", ".join(access_examples_by_kind[kind] for kind in access_kinds)
         raise ValueError(

@@ -159,36 +159,39 @@ class TestDeclaredMultiQueryColumnsMustBeCovered:
 
 
 class TestSourceRowReadsWithoutAColumnName:
-    """A read through ``row.source_row`` the extractor cannot name fails closed (S0 fix round 1).
+    """A computed key through ``row.source_row`` fails closed at configuration, as through ``row`` (S0 fix round 1).
 
-    Before, the dynamic-access gate looked at ``row`` only, which in a query is the
-    query's own variables: ``row.source_row[k]`` and ``row.source_row | dictsort``
-    validated with a declared contract and then read undeclared columns.
+    The dynamic-access gate looks at ``row`` and, in a query, at ``row.source_row``
+    too: a computed key there names no column, so configuration refuses it early.
+    A whole ``source_row`` used as a value is not a configuration question: at
+    render it holds only the declared fields (ADR-051).
     """
 
     @pytest.mark.parametrize(
         ("template", "kind"),
         [
-            ("{{ row.text }} {{ row.source_row | dictsort }}", "whole-row via a whole-row operand such as row|items or dict(row)"),
-            ("{{ row.text }} {{ dict(row['source_row']) }}", "whole-row via a whole-row operand such as row|items or dict(row)"),
             ("{{ row.text }} {% for k in row.source_row %}{{ row.source_row[k] }}{% endfor %}", "item via row[expr]"),
             ("{{ row.text }} {{ row.source_row.get(row.text) }}", "get via row.get(expr)"),
             ("{% set s = row.source_row %}{{ row.text }} {{ s[row.text] }}", "item via row[expr]"),
-            # S0 fix round 2: the row handed to a macro's implicit varargs / kwargs.
-            (
-                "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ row.text }} {{ m(row.source_row) }}",
-                "whole-row via a whole-row operand such as row|items or dict(row)",
-            ),
-            (
-                "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ row.text }} {{ m(r=row.source_row) }}",
-                "whole-row via a whole-row operand such as row|items or dict(row)",
-            ),
         ],
     )
     def test_declared_contract_cannot_vouch_for_the_read(self, template: str, kind: str) -> None:
         with pytest.raises(ValidationError) as exc_info:
             _multi({"classify": {"input_fields": {"text": "body"}, "template": template}}, required=["body"])
         assert f"dynamic row field access ({kind})" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{{ row.text }} {{ row.source_row | dictsort }}",
+            "{{ row.text }} {{ dict(row['source_row']) }}",
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ row.text }} {{ m(row.source_row) }}",
+            "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ row.text }} {{ m(r=row.source_row) }}",
+        ],
+    )
+    def test_a_whole_source_row_value_is_admitted_and_projected_at_render(self, template: str) -> None:
+        config = _multi({"classify": {"input_fields": {"text": "body"}, "template": template}}, required=["body"])
+        assert config.required_input_fields == ["body"]
 
     def test_explicit_opt_out_admits_it(self) -> None:
         config = _multi(
