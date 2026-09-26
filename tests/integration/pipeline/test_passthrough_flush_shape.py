@@ -54,6 +54,17 @@ class _DropsTheLastRow(PassthroughIdentityBatch):
         return TransformResult.success_multi(_identity_rows(self, row, ctx)[:-1], success_reason={"action": "passthrough"})
 
 
+class _DuplicatesTheLastRow(PassthroughIdentityBatch):
+    """The OVERCOUNT side of the shape rule (P5 review r1 F2): one row more than it buffered."""
+
+    name = "test_passthrough_duplicates_last_row"
+    determinism = Determinism.DETERMINISTIC
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: TransformContext) -> TransformResult:
+        rows = _identity_rows(self, row, ctx)
+        return TransformResult.success_multi([*rows, rows[-1]], success_reason={"action": "passthrough"})
+
+
 class _ReturnsOneRow(PassthroughIdentityBatch):
     name = "test_passthrough_single_row"
     determinism = Determinism.DETERMINISTIC
@@ -75,11 +86,14 @@ class _QuarantinesAnInput(PassthroughIdentityBatch):
 
 @pytest.fixture(autouse=True)
 def _shape_plugins() -> Iterator[None]:
-    """Resolve plugin names against the built-ins plus the identity plugin and the three that break it."""
+    """Resolve plugin names against the built-ins plus the identity plugin and the four that break it."""
     manager = PluginManager()
     manager.register_builtin_plugins()
     manager.register(
-        create_dynamic_hookimpl([PassthroughIdentityBatch, _DropsTheLastRow, _ReturnsOneRow, _QuarantinesAnInput], "elspeth_get_transforms")
+        create_dynamic_hookimpl(
+            [PassthroughIdentityBatch, _DropsTheLastRow, _DuplicatesTheLastRow, _ReturnsOneRow, _QuarantinesAnInput],
+            "elspeth_get_transforms",
+        )
     )
     with scoped_plugin_manager(manager):
         yield
@@ -154,6 +168,7 @@ def test_a_plugin_that_honours_the_declaration_completes_every_row(tmp_path: Pat
     ("plugin", "failure_kind", "emitted_row_count", "message"),
     [
         ("test_passthrough_drops_last_row", "row_count_mismatch", 2, "returned 2 rows but received 3 input rows"),
+        ("test_passthrough_duplicates_last_row", "row_count_mismatch", 4, "returned 4 rows but received 3 input rows"),
         ("test_passthrough_single_row", "single_row_result", 1, "requires multi-row result"),
         ("test_passthrough_quarantines", "quarantined_indices_declared", 3, "cannot declare quarantined_indices"),
     ],
