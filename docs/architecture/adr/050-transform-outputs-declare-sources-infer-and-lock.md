@@ -89,9 +89,18 @@ rows meet.**
    `tests/invariants/test_operator_declared_carried_fields.py` builds every
    registered transform with an operator schema typing two carried fields
    and requires every emission to pass the ADR-014 check and carry both
-   declarations. The stamp types only what is emitted: a plugin that drops a
-   field its declaration guarantees still ends the run (the gate's own
-   control). Every registered transform keeps an `_output_schema_config`,
+   declarations. Only the reductive batch outputs the gate names in
+   `_REDUCTIVE_OUTPUTS` are exempt, and a named one that does carry the
+   fields fails; the exemption is never read from the plugin's own output
+   config, so a carrying transform cannot drop the operator's declaration
+   and exempt itself (S7 fix round 2). A type_coerce conversion field spelled
+   by a source's original header (`Price` for the header of `price`) under a
+   declared schema still ends the run: that is a different root (the plugin
+   keys the conversion's output declaration by the config spelling, while
+   the row resolves it to the normalized name), open pending a ruling on
+   header spellings at runtime. The stamp types only what is emitted: a
+   plugin that drops a field its declaration guarantees still ends the run
+   (the gate's own control). Every registered transform keeps an `_output_schema_config`,
    and the gate fails one that does not: without it the DAG builder still
    projects the operator's schema onto the node's outgoing edge, so the
    build would check consumers against the operator's type while the

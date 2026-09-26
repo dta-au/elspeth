@@ -24,9 +24,12 @@ transform keeps an output declaration: one with ``_output_schema_config is
 None`` fails the sweep, because the DAG builder then projects the operator's
 schema onto its outgoing edge anyway, so a typed edge would sit over an
 emitted contract that is still the input's inference (the two Azure
-guardrails, until S7 fix round 1). A transform whose output config does not
-carry the operator's fields (a reductive batch output) makes no claim about
-them and is outside the sweep; each is named by the test id.
+guardrails, until S7 fix round 1). Every other transform's output
+declaration must carry the operator's fields. Only the reductive batch
+outputs named in ``_REDUCTIVE_OUTPUTS`` are outside the sweep: the set is
+named in this file rather than read from the plugin's own output config, so a
+carrying transform cannot drop the operator's declaration and skip itself
+(S7 fix round 2).
 
 Control: ``test_an_unstamped_pass_through_ends_the_run`` keeps the failure
 the sweep exists to catch — an in-file transform that emits its input
@@ -84,6 +87,29 @@ def _observed_row(data: dict[str, Any]) -> PipelineRow:
 # normalized field name when schema declares ... explicit fields").
 _FIELD_OPTION_THE_SCHEMA_MUST_NAME = {"json_explode": "array_field", "line_explode": "source_field"}
 
+# The transforms whose output is a new row shape (a batch summary or report),
+# so their output declaration carries none of the input's fields and makes no
+# claim about them. The set is named here, never computed from the plugin's
+# own output config: a carrying transform whose output config dropped the
+# operator's fields would otherwise classify itself out of the sweep. Both
+# directions are checked: a transform outside the set must carry the fields,
+# and one inside it must not (a stale entry fails until it is removed).
+_REDUCTIVE_OUTPUTS = frozenset(
+    {
+        "batch_classifier_metrics",
+        "batch_data_quality_report",
+        "batch_distribution_profile",
+        "batch_drift_compare",
+        "batch_effect_size",
+        "batch_experiment_compare",
+        "batch_paired_preference",
+        "batch_stats",
+        "batch_threshold_summary",
+        "batch_top_k",
+        "report_assemble",
+    }
+)
+
 
 def _declaring_config(transform_cls: type[BaseTransform]) -> dict[str, Any]:
     """The probe config with an operator schema typing the carried probe fields.
@@ -117,8 +143,17 @@ def test_an_operator_declared_carried_field_is_stamped_on_emission(_transform_cl
         "time while its emitted contract stays the input's inference; set _output_schema_config and stamp every emission"
     )
     declared_names = {definition.name for definition in output_schema_config.fields or ()}
-    if not {name for name, _declared, _value in _CARRIED} <= declared_names:
-        pytest.skip(f"{_transform_cls.__name__}'s output declaration does not carry the operator's fields (a reductive output)")
+    carried_names = {name for name, _declared, _value in _CARRIED}
+    if _transform_cls.name in _REDUCTIVE_OUTPUTS:
+        assert not carried_names & declared_names, (
+            f"{_transform_cls.__name__} is named a reductive output, but its output declaration carries "
+            f"{sorted(carried_names & declared_names)!r}; remove it from _REDUCTIVE_OUTPUTS so the sweep checks it"
+        )
+        pytest.skip(f"{_transform_cls.__name__}: a reductive output (named in _REDUCTIVE_OUTPUTS) makes no claim about carried fields")
+    assert carried_names <= declared_names, (
+        f"{_transform_cls.__name__}'s output declaration drops the operator's {sorted(carried_names - declared_names)!r}; "
+        "a transform that carries its input must keep the operator's declaration of a carried field (ADR-050 D2)"
+    )
 
     probe = _observed_row({"baseline": "kept"} | {name: value for name, _declared, value in _CARRIED})
     if transform.passes_through_input:
@@ -220,6 +255,7 @@ _DECLARING = {"schema": {"mode": "flexible", "fields": ["name: str", "amount: fl
 def test_the_field_option_table_names_registered_plugins() -> None:
     registered = {transform_cls.name for transform_cls in _registered_transform_classes()}
     assert set(_FIELD_OPTION_THE_SCHEMA_MUST_NAME) <= registered
+    assert registered >= _REDUCTIVE_OUTPUTS
 
 
 def test_an_unstamped_pass_through_ends_the_run() -> None:
