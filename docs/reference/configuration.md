@@ -3132,11 +3132,18 @@ wait ends, at most `max_delay_seconds` later.
 **An error that is neither retryable nor a row error.** When a transform
 raises something the row did not cause and no retry covers (a plugin bug or
 an ELSPETH failure), the run stops and that row is left without an outcome.
-The run is never recorded as completed over such a row. After fixing the
-cause, `elspeth resume` processes the row again from the node where its work
-started, under a new attempt number; a row that already has an outcome,
-including one routed to `on_error`, is not processed again. As with a
-reclaimed row, external calls the failed attempt made may be made again. See
+The run is never recorded as completed over such a row. If the run had
+finished reading its source before it stopped, then after you fix the cause,
+`elspeth resume` processes the row again from the node where its work started,
+under a new attempt number. A row that already has an outcome, including one
+routed to `on_error`, is not processed again. As with a reclaimed row,
+external calls the failed attempt made may be made again.
+
+The source has been read to the end when, for example, the error came after
+an aggregation or collector that holds rows until the end of the source, or on
+an `elspeth join` follower while the leader finished reading. If the source
+was still being read, resume refuses with `source lifecycle is incomplete`,
+because unread source rows may exist. In that case, start a fresh run. See
 [Resume Failed Run](../runbooks/resume-failed-run.md#a-row-raised-an-unexpected-error).
 
 ---

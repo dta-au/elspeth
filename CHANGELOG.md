@@ -282,14 +282,20 @@ drained and repair this release forward.
 - **`elspeth resume` finishes a row whose work died on an unexpected error.**
   When a transform raises something that is neither a row error nor
   retryable (a plugin bug or an ELSPETH failure), the row's work item is left
-  `failed` with no outcome and the run stops. Resume now returns each such
-  item to the queue, recorded as a `resume_requeue_failed` scheduler event,
-  and processes the row again from the node where its work started under a
-  new attempt number, so once the cause is fixed the run completes with every
-  row decided. Before, the row was never processed again, and resume stamped
-  the run `COMPLETED` with the row missing. A row that already has an outcome is
-  not processed again, and a failed item whose row has no outcome now keeps
-  its row data until it is decided. If the cause is not fixed, resume fails
+  `failed` with no outcome and the run stops. If the run had finished reading
+  its source before it stopped, resume now returns each such item to the
+  queue, records a `resume_requeue_failed` scheduler event for it, and
+  processes the row again from the node where its work started under a new
+  attempt number. Once the cause is fixed, the run completes with every row
+  decided. This applies, for example, to an error after an aggregation or
+  collector that holds rows until the end of the source, or to an error on an
+  `elspeth join` follower while the leader finished reading. In that shape,
+  resume used to stamp the run `COMPLETED` with the row missing and never
+  processed it again. If the source was still being read, resume refuses with
+  `source lifecycle is incomplete`, as before, and a fresh run is the way out.
+  A row that already has an outcome is not processed again, and a failed item
+  whose row has no outcome now keeps its row data until it is decided. If the
+  cause is not fixed, resume fails
   the same way and the run stays `FAILED`. The re-run is at-least-once, as a
   lease takeover already is: an external call the failed attempt made may be
   made again.

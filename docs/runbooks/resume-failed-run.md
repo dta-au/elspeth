@@ -174,6 +174,17 @@ row error. The row's work item is left `failed` with no outcome, and the run
 cannot be recorded as completed while it is: a finalization over it is
 refused with `FAILED scheduler work whose token has no terminal outcome`.
 
+Resume can process the row again only if the run had finished reading its
+source before it stopped. For example, the error came after an aggregation or
+collector that holds rows until the end of the source, or on a follower while
+the leader finished reading. If the source was still being read, as in a
+single-process run where a transform raised mid-stream, resume refuses with
+`source lifecycle is incomplete (…) — resume replays only persisted row
+payloads, so unread source rows may exist; start a fresh run`. That refusal
+comes before any row is requeued. Fix the cause and start a fresh run.
+
+Otherwise:
+
 1. Fix the cause.
 2. Run `elspeth resume <RUN_ID> --execute`. Resume returns each such row to
    the queue, records a `resume_requeue_failed` scheduler event for it, and
