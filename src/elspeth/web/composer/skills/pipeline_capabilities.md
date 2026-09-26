@@ -293,10 +293,18 @@ Declare every field the template reads or tests. Reading or testing any other
 field fails every row, including `'x' in row`, a row carried through a `set`
 or loop variable, and a multi-query `row.source_row` column. `[]` shows the
 whole row but proves nothing to a field-scoped prompt-injection control, so
-declare the fields. `row` holds fields only: `row.to_dict()`, `row.contract`,
-`row.items()`, `row.keys()` and `row.values()` read fields of those names.
-Template literals must work as written: a `truncate` length is an integer
-literal, and no number literal may overflow a float.
+declare the fields. A template that never reads `row` declares none: the query
+field reaches a retrieval template as `query` without a declaration, and a
+declaration the template cannot use is refused. `row` holds fields only:
+`row.to_dict()`, `row.contract`, `row.items()`, `row.keys()` and
+`row.values()` read fields of those names.
+Besides the names it binds itself, a template reads `row`, `lookup` in a model
+prompt and `query` (the query field's value) in a retrieval `query_template`; a
+name its render context does not define is refused. Template literals must
+work as written: every filter and test name must exist, including inside a
+condition and as the name given to `map`, `select`, `reject`, `selectattr` or
+`rejectattr`; a `truncate` length is an integer literal no shorter than its
+ending; and no number literal may overflow a float.
 
 An expression whose value is stored in a row must not produce a set, which has
 no canonical order: build a list (`[a, b]`); a set used in place

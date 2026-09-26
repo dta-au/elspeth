@@ -242,14 +242,21 @@ drained and repair this release forward.
   plain dict, so `row.items()`, `row.keys()` and `row.values()` read fields
   of those names (they were dict methods), and `{{ row }}` no longer prints
   the row. No shipped example sets `query_template`.
-- **A template number literal that fails every row is refused when the
-  template is built.** `truncate` with a non-integer length (`truncate(10.5)`)
-  built and then failed every row long enough to be cut ("slice indices must
-  be integers"), and a literal too large for a float (`1e400`, which Python
-  reads as infinity) failed every render with `NameError` wherever it sat in
-  an expression (`truncate(1e400)`, `x == 1e400`). `elspeth validate` and the
-  composer now refuse both, as they already refused an unknown filter name or
-  an unsatisfiable `truncate` length. Each of `truncate`'s checks is now
+- **A template whose own literals fail its rows is refused when the
+  template is built.** Jinja refuses an unknown filter or test name when it
+  compiles a template, except inside `{% if %}` or an inline `if`
+  (`{% if row.a %}{{ row.a | nosuchfilter }}{% endif %}`) and as the name
+  given to `map`, `select`, `reject`, `selectattr` or `rejectattr`
+  (`select('nosuchtest')`): there it looks the name up at render, so rows
+  that never reached it (a branch not taken, an empty list) were delivered
+  and the rest failed. A `truncate` length shorter than its ending
+  (`truncate(2)` under the default `...`) failed every row. `truncate` with a
+  non-integer length (`truncate(10.5)`) built and then failed every row long
+  enough to be cut ("slice indices must be integers"), and a literal too
+  large for a float (`1e400`, which Python reads as infinity) failed every
+  render with `NameError` wherever it sat in an expression
+  (`truncate(1e400)`, `x == 1e400`). `elspeth validate` and the composer now
+  refuse all of these. Each of `truncate`'s checks is now
   decided over only the arguments it reads, so an argument taken from the row
   no longer defers a check that does not read it; these all built and failed
   rows until now. A literal non-integer length is refused whatever the other
@@ -293,9 +300,10 @@ drained and repair this release forward.
   it move. An LLM transform whose own `schema.fields` types a field it
   writes as a type that value never has (`confidence: int` over `type:
   number`, or `llm_response: int`) is now refused at configuration by
-  `elspeth validate` and the composer; before, it built and then failed
-  every row. The same holds for any type but `any` on the `<response>_usage`
-  field, which carries the provider's token-usage mapping (or null). A downstream node declaring `int` for a `number` field is not
+  `elspeth validate` and the composer; before, it built and failed each row
+  whose value that type did not admit (for `confidence: int`, each answer
+  with a fraction) and delivered the rest. The same holds for any type but
+  `any` on the `<response>_usage` field, which carries the provider's token-usage mapping (or null). A downstream node declaring `int` for a `number` field is not
   caught at build and now routes every row, where a provider answering `7`
   used to deliver: declare it `float`.
 - **Collector group failures are counted where failures are reported.** A
@@ -526,7 +534,15 @@ These ran and delivered rows before:
   Before, the declaration was ignored (`value_transform` or sink `Name:
   int?`, `batch_stats` `group_by: Name`) or matched by lookup (`type_coerce`
   `field: Price`, `keyword_filter` `fields: [Count]`), and every row was
-  delivered. Declare the normalized name (`name`, `price`).
+  delivered. A `value_transform` target or `field_mapper` rename target
+  spelled by the header of a differently spelled arriving field routes every
+  row with `target_is_header_spelling` (refused with
+  `field_name_header_spelling` behind a declared upstream); before, it wrote
+  a second key beside that field (`field_mapper` `{Name: ID}` over header
+  `ID,Name` delivered `ID` beside `id`). A `field_mapper` schema that
+  declares its rename source by header (`{Name: given}` with `Name: int?`)
+  is a declaration too; before, it recorded `given: int` over a delivered
+  string. Declare the normalized name (`name`, `price`).
 - **A `type_coerce` conversion field that some rows lack** ends the run
   with `DeclaredRequiredInputFieldsViolation` at the first such row behind
   an observed source, and is refused at build behind a `fixed` one. Before,
@@ -540,15 +556,25 @@ These ran and delivered rows before:
   and `query_field` is refused at configuration, as is `row.items()`,
   `row.keys()` or `row.values()`. A `'x' in row` test there fails each row.
   Before, all of these rendered, and the undeclared columns went to the LLM
-  or search provider. On the web, an LLM node with `required_input_fields:
-  []` or none is now `input_fields_unprovable` for a field-scoped prompt
-  shield.
+  or search provider. A RAG `required_input_fields` that declares fields
+  beyond `query_field` for a `query_template` that never reads `row` is
+  refused at configuration; before, the query rendered without them. On the
+  web, an LLM node with `required_input_fields: []` or none is now
+  `input_fields_unprovable` for a field-scoped prompt shield.
+- **An unknown filter or test name that Jinja looks up at render** (the
+  template-literal bullet above): inside `{% if %}` or an inline `if`, or
+  given by name to `map`, `select`, `reject`, `selectattr` or `rejectattr`,
+  is refused at configuration. Before, rows that never reached the name (a
+  branch not taken, an empty list) were delivered and the rest failed with
+  `template_rendering_failed`.
 - **An LLM output type contradicted downstream** (the output-types bullet
   above). A `schema.fields` type that the LLM's bound output type never
   satisfies (`confidence: int` over `type: number`) is refused at
   configuration. A downstream node that declares `int` for a `number` field
   routes every row `contract_violation`. Before, both delivered while the
-  provider answered with integral numbers.
+  provider answered with integral numbers. A fractional answer failed its
+  row under the schema type, and under the downstream type ended the run
+  with `ContractMergeError`, leaving tokens without an outcome.
 - **A declared type on a created field that the value does not have**
   (ADR-050 bullet above). A `json_explode` declaring `page: int` routes a
   row whose element is a string; before, the string was delivered under an
@@ -566,15 +592,16 @@ These ran and delivered rows before:
   run with a `TypeError`. Use a list. A set consumed in place (`x in {...}`,
   `len({...})`) is unaffected.
 
-These already failed, or recorded a false type, and are now refused earlier
-or routed, with no loss:
+These already failed and are now refused earlier or routed, with no loss:
 `output_mode: passthrough` with any shipped batch plugin (ended the run with
-the batch's rows left without an outcome); a template number literal that
-overflows to infinity; a `<response>_usage` schema type other than `any`;
-a header-spelled `value_transform` or `field_mapper` target and a
-header-spelled scan field over a non-string column (each crashed the run,
-recorded a false type, or failed every row). Also refused earlier: a dynamic
-RAG `row[...]` key (failed every row). A header-spelled `web_scrape`
+the batch's rows left without an outcome); a `value_transform` target
+spelled exactly as the header of the field it would overwrite (crashed with
+`Duplicate original_name`, leaving the row without an outcome). Each of
+these failed every row: a template number literal that overflows to
+infinity; a `truncate` length shorter than its ending; a `<response>_usage`
+schema type other than `any`; a header-spelled scan field over a non-string
+column; and in a RAG `query_template`, a dynamic `row[...]` key or a
+top-level name other than `query` or `row`. A header-spelled `web_scrape`
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).
