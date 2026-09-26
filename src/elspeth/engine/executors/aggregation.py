@@ -597,18 +597,11 @@ class AggregationExecutor:
                 )
             expansion_parent_token_id = non_quarantined_tokens[0].token_id if output_rows else None
         else:
-            if quarantined_indices:
-                raise OrchestrationInvariantError("passthrough aggregation cannot declare quarantined_indices")
-            if result.rows is None:
-                raise OrchestrationInvariantError(
-                    f"Passthrough mode requires multi-row result, but transform {transform.name!r} returned single row. "
-                    "Use TransformResult.success_multi() for passthrough."
-                )
-            if output_rows and len(output_rows) != len(buffered_tokens):
-                raise OrchestrationInvariantError(
-                    f"Passthrough mode requires same number of output rows as input rows. Transform {transform.name!r} "
-                    f"returned {len(output_rows)} rows but received {len(buffered_tokens)} input rows."
-                )
+            # The PASSTHROUGH shape (a success_multi of one row per buffered
+            # token, or of none, with nothing quarantined) is enforced before
+            # this completion by the caller's validate_success cross-check
+            # (RowProcessor._cross_check_flush_output), which records every
+            # buffered token FAILED on a violation (BatchPassthroughShapeError).
             expansion_parent_token_id = None
         if result.output_hash is None:
             raise OrchestrationInvariantError("successful aggregation result lacks output_hash")

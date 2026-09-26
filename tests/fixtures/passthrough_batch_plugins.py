@@ -30,6 +30,8 @@ class PassthroughIdentityBatch(PassThrough):
 
     name = PASSTHROUGH_IDENTITY_BATCH
     determinism = Determinism.DETERMINISTIC
+    # Not the shipped passthrough's provenance: this test plugin behaves differently.
+    source_file_hash: str | None = None
     is_batch_aware = True
     flush_emits_one_row_per_buffered_row = True
 
