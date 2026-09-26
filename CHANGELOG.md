@@ -94,11 +94,13 @@ drained and repair this release forward.
   `passthrough`, `truncate`, `keyword_filter`, `type_coerce` and the AWS
   Bedrock guardrails, after an observed or a typed source) no longer ends the
   run with a Tier-1 `SchemaConfigModeViolation` on a valid row, and two observed
-  sources disagreeing on a column now share a sink. Whether a declaration
-  is enforced no longer depends on spelling: a `field_mapper` target spelled
-  like a source's CSV header (`{"name": "Name"}`) is checked like any other
-  created field. An `int` value now satisfies a `float` declaration wherever
-  a declared or locked type is checked (a `bool` never does, and no value is
+  sources disagreeing on a column now share a sink. The Azure content-safety
+  and prompt-shield guardrails record the operator's type for a field they
+  pass through, as the AWS guardrails do, instead of the upstream inference
+  under an edge the build had typed from the operator's schema. A
+  `field_mapper` target spelled like a source's CSV header (`{"name": "Name"}`)
+  is checked like any other created field. An `int` value now satisfies a
+  `float` declaration wherever a declared or locked type is checked (a `bool` never does, and no value is
   converted): an observed source that locked a field `float` admits a later
   `int` instead of quarantining the row, and a transform output declared
   `float` that holds an `int` is delivered instead of routed. The build-time
