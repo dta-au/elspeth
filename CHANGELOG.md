@@ -267,7 +267,13 @@ drained and repair this release forward.
   every output and the run finished. The same rule applies when a resumed run
   re-checks a batch output committed before a crash. In `transform` mode the
   check cannot tie an output row to the row it came from, so dropping a field
-  that only some of the emitting rows carried is not detected there.
+  that only some of the emitting rows carried is not detected there. A batch
+  transform whose quarantine record contradicts itself still ends the run
+  with `BatchQuarantineContradictionError` (a Tier-1 invariant error). This
+  covers malformed `quarantined_indices`, or rows emitted while every input
+  is claimed quarantined. Every buffered row is now recorded `failed` before
+  the run ends; before, a batch that also broke a declaration contract left
+  every row without an outcome.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

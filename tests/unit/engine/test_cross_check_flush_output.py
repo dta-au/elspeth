@@ -17,6 +17,7 @@ from elspeth.contracts import TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation, derive_effective_input_fields
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
+    BatchQuarantineContradictionError,
     OrchestrationInvariantError,
     PassThroughContractViolation,
     UnexpectedEmptyEmissionViolation,
@@ -423,6 +424,7 @@ class TestTransformModeExcludesInBatchQuarantinedInputs:
     def test_non_empty_emission_with_every_input_quarantined_is_an_invariant_violation(self) -> None:
         processor = _make_processor()
         contract, tokens = self._diluted_tokens()
+        _register_tokens(processor, tokens)
         fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
         rows = [PipelineRow({"id": 1, "tag": "x"}, contract)]
         result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(0, 1, 2))
@@ -440,6 +442,129 @@ class TestTransformModeExcludesInBatchQuarantinedInputs:
         )
         result = TransformResult.success_empty(success_reason=_quarantine_reason(0, 1, 2))
         assert processor._cross_check_flush_output(fctx, result) == frozenset({0, 1, 2})
+
+
+def _completed_outcomes(processor: Any) -> list[Any]:
+    import sqlalchemy as sa
+
+    return processor._data_flow._ops.execute_fetchall(
+        sa.text("SELECT token_id, outcome, path, error_hash, context_json FROM token_outcomes WHERE completed = 1 ORDER BY token_id")
+    )
+
+
+class TestQuarantineContradictionRecordsEveryToken:
+    """A plugin's self-contradicting quarantine record fails every buffered token.
+
+    The quarantine set is validated before the declaration dispatch, because
+    the TRANSFORM intersection is computed over it. Its two contradictions are
+    malformed metadata and a non-empty emission with every input quarantined.
+    Each one still ends in a Tier-1 ``OrchestrationInvariantError``
+    (``BatchQuarantineContradictionError``), but first every buffered token
+    reaches a recorded FAILURE / UNROUTED terminal. This matches what a
+    batch-flush declaration violation records.
+
+    Before E4, a plugin with both defects (every input claimed quarantined
+    AND an emitted row violating a declaration contract) left every token
+    without an outcome. The invariant pre-empted the dispatch, and nothing
+    recorded the tokens.
+    """
+
+    def _tokens(self) -> tuple[SchemaContract, list[TokenInfo]]:
+        contract = make_contract({"id": 1, "tag": "x", "n": 0})
+        return contract, [
+            _make_token("t0", {"id": 1, "tag": "x"}, contract),
+            _make_token("t1", {"id": 2, "tag": "y"}, contract),
+            _make_token("t2", {"id": 3, "n": 0}, contract),
+        ]
+
+    def _assert_every_token_failed(self, processor: Any, tokens: list[TokenInfo], *, failure_kind: str) -> list[dict[str, Any]]:
+        import json as _json
+
+        rows = _completed_outcomes(processor)
+        assert [row.token_id for row in rows] == sorted(token.token_id for token in tokens)
+        contexts = []
+        for row in rows:
+            assert (row.outcome, row.path) == (TerminalOutcome.FAILURE.value, TerminalPath.UNROUTED.value)
+            assert row.error_hash is not None
+            ctx = _json.loads(row.context_json)
+            assert ctx["token_id"] == row.token_id
+            assert ctx["exception_type"] == "BatchQuarantineContradictionError"
+            assert ctx["failure_kind"] == failure_kind
+            assert ctx["buffered_token_count"] == len(tokens)
+            # Value-free: the invariant's message (which may quote the plugin's
+            # metadata) is never recorded.
+            assert "message" not in ctx
+            contexts.append(ctx)
+        assert len({row.error_hash for row in rows}) == 1
+        return contexts
+
+    @pytest.mark.parametrize(
+        "emitted_payload",
+        [
+            pytest.param({"id": 1}, id="emission-also-drops-a-field"),
+            pytest.param({"id": 1, "tag": "x"}, id="emission-otherwise-honest"),
+        ],
+    )
+    def test_every_input_quarantined_with_emission_records_every_token_failed_then_raises(
+        self,
+        emitted_payload: dict[str, Any],
+    ) -> None:
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        result = TransformResult.success_multi(
+            [PipelineRow(emitted_payload, contract)],
+            success_reason=_quarantine_reason(0, 1, 2),
+        )
+
+        with pytest.raises(BatchQuarantineContradictionError, match="all 3 buffered token"):
+            processor._cross_check_flush_output(fctx, result)
+
+        contexts = self._assert_every_token_failed(processor, tokens, failure_kind="every_input_quarantined_with_emission")
+        assert {ctx["emitted_row_count"] for ctx in contexts} == {1}
+
+    @pytest.mark.parametrize("output_mode", [OutputMode.TRANSFORM, OutputMode.PASSTHROUGH])
+    def test_malformed_quarantine_metadata_records_every_token_failed_value_free_then_raises(
+        self,
+        output_mode: OutputMode,
+    ) -> None:
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=output_mode)
+        sentinel = "E4-SENTINEL-METADATA-VALUE"
+        rows = [PipelineRow({"id": 1}, contract)] * (len(tokens) if output_mode is OutputMode.PASSTHROUGH else 1)
+        result = TransformResult.success_multi(
+            rows,
+            success_reason={"action": "replicate", "metadata": {"quarantined_indices": [sentinel]}},
+        )
+
+        with pytest.raises(BatchQuarantineContradictionError, match="expected int"):
+            processor._cross_check_flush_output(fctx, result)
+
+        self._assert_every_token_failed(processor, tokens, failure_kind="quarantine_metadata_invalid")
+        assert all(sentinel not in row.context_json for row in _completed_outcomes(processor))
+
+    @pytest.mark.parametrize(
+        "success_reason",
+        [
+            pytest.param(_quarantine_reason(0, 1, 2), id="every-input-quarantined"),
+            pytest.param({"action": "replicate", "metadata": {"quarantined_indices": [7]}}, id="malformed-metadata"),
+        ],
+    )
+    def test_resume_recheck_records_nothing(self, success_reason: Any) -> None:
+        """``record_violation=False`` (the resume re-check) raises without writing outcomes."""
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        result = TransformResult.success_multi([PipelineRow({"id": 1}, contract)], success_reason=success_reason)
+
+        with pytest.raises(BatchQuarantineContradictionError):
+            processor._cross_check_flush_output(fctx, result, record_violation=False)
+
+        assert _completed_outcomes(processor) == []
 
 
 class TestEmptyEmissionGovernance:

@@ -132,6 +132,8 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchQuarantineContradictionError,
+    BatchQuarantineContradictionKind,
     CapacityError,
     ExecutionError,
     FrameworkBugError,
@@ -1431,9 +1433,13 @@ class RowProcessor:
 
         Raises:
             FrameworkBugError: A buffered token has no input contract.
-            OrchestrationInvariantError: The quarantine metadata is malformed,
-                or a TRANSFORM-mode emission is non-empty while every
-                buffered input was quarantined.
+            BatchQuarantineContradictionError: The quarantine metadata is
+                malformed, or a TRANSFORM-mode emission is non-empty while
+                every buffered input was quarantined (a Tier-1
+                ``OrchestrationInvariantError``). Both are detected before the
+                declaration dispatch, because the TRANSFORM intersection needs
+                the validated set. ``_record_flush_violation`` writes
+                per-token FAILED audit entries before re-raising.
             DeclarationContractViolation | PluginContractViolation:
                 Any batch-flush declaration contract fires.
                 ``_record_flush_violation`` writes per-token FAILED audit
@@ -1447,18 +1453,32 @@ class RowProcessor:
         else:
             emitted = []
         used_success_empty = result.rows is not None and len(result.rows) == 0
-        quarantined_indices = frozenset(
-            _validated_quarantined_indices(
-                result,
-                buffered_token_count=len(fctx.buffered_tokens),
-                aggregation_name=fctx.settings.name,
-            )
-        )
 
         identity_token = fctx.triggering_token or fctx.buffered_tokens[0]
         transform_node_id_str = str(fctx.node_id)
 
         try:
+            # The quarantine set is validated BEFORE the declaration dispatch:
+            # the TRANSFORM intersection is computed over it, so there is no
+            # honest input field set to dispatch against until it is known. Its
+            # two contradictions therefore pre-empt the dispatch, and each is
+            # recorded on every buffered token like a declaration violation.
+            try:
+                quarantined_indices = frozenset(
+                    _validated_quarantined_indices(
+                        result,
+                        buffered_token_count=len(fctx.buffered_tokens),
+                        aggregation_name=fctx.settings.name,
+                    )
+                )
+            except OrchestrationInvariantError as invariant:
+                raise self._quarantine_contradiction(
+                    fctx,
+                    str(invariant),
+                    failure_kind="quarantine_metadata_invalid",
+                    emitted_row_count=len(emitted),
+                ) from invariant
+
             # _FlushContext.__post_init__ guarantees buffered_tokens is non-empty;
             # no defensive emptiness guard (docs/guides/data-trust-and-error-handling.md
             # §The Defensive Programming Prohibition — forbidden for internal paths).
@@ -1546,9 +1566,12 @@ class RowProcessor:
                 if emitted:
                     emitting_field_sets = [fields for index, fields in enumerate(per_input_field_sets) if index not in quarantined_indices]
                     if not emitting_field_sets:
-                        raise OrchestrationInvariantError(
+                        raise self._quarantine_contradiction(
+                            fctx,
                             f"Aggregation {fctx.settings.name!r} emitted {len(emitted)} output row(s) "
-                            f"but all {len(fctx.buffered_tokens)} buffered token(s) were quarantined"
+                            f"but all {len(fctx.buffered_tokens)} buffered token(s) were quarantined",
+                            failure_kind="every_input_quarantined_with_emission",
+                            emitted_row_count=len(emitted),
                         )
                     input_fields = frozenset.intersection(*emitting_field_sets)
                 else:
@@ -1573,6 +1596,10 @@ class RowProcessor:
             if record_violation:
                 self._record_flush_violation(fctx, violation)
             raise
+        except BatchQuarantineContradictionError as contradiction:
+            if record_violation:
+                self._record_flush_violation(fctx, contradiction)
+            raise
         except DeclarationContractViolation as violation:
             if record_violation:
                 self._record_flush_violation(fctx, violation)
@@ -1585,10 +1612,32 @@ class RowProcessor:
             raise
         return quarantined_indices
 
+    def _quarantine_contradiction(
+        self,
+        fctx: _FlushContext,
+        message: str,
+        *,
+        failure_kind: BatchQuarantineContradictionKind,
+        emitted_row_count: int,
+    ) -> BatchQuarantineContradictionError:
+        """Build the flush's quarantine-contradiction error with its value-free audit identities."""
+        return BatchQuarantineContradictionError(
+            message,
+            failure_kind=failure_kind,
+            plugin=fctx.transform.name,
+            node_id=str(fctx.node_id),
+            run_id=self._run_id,
+            buffered_token_count=len(fctx.buffered_tokens),
+            emitted_row_count=emitted_row_count,
+        )
+
     def _record_flush_violation(
         self,
         fctx: _FlushContext,
-        violation: DeclarationContractViolation | PluginContractViolation | AggregateDeclarationContractViolation,
+        violation: DeclarationContractViolation
+        | PluginContractViolation
+        | AggregateDeclarationContractViolation
+        | BatchQuarantineContradictionError,
     ) -> None:
         """Record FAILED audit entries for every buffered token on flush failure.
 

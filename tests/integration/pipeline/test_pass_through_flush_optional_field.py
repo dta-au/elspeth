@@ -220,3 +220,56 @@ def test_a_field_only_some_emitting_rows_carried_is_outside_the_transform_mode_c
     assert result.exit_code == 0, result.output
     assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "copy_index": 0}, {"id": 2, "copy_index": 0}]
     assert _pass_through_violation_contexts(tmp_path) == []
+
+
+def _claim_every_input_quarantined(monkeypatch: pytest.MonkeyPatch, *, violate_declaration: bool) -> None:
+    """batch_replicate emits one row yet records every input as quarantined.
+
+    With ``violate_declaration`` the emitted row is a raw copy of input 0. That
+    copy lacks ``copy_index`` and so also breaks the plugin's declared output
+    fields: two defects in one flush. Without it, the row is the plugin's own
+    replica, so the only defect is the quarantine contradiction.
+    """
+
+    def process(self: BatchReplicate, rows: list[PipelineRow], ctx: Any) -> TransformResult:
+        if violate_declaration:
+            emitted = [PipelineRow(dict(rows[0].to_dict()), rows[0].contract)]
+        else:
+            replica = _REAL_REPLICATE_PROCESS(self, rows[:1], ctx)
+            assert replica.rows is not None
+            emitted = list(replica.rows)
+        return TransformResult.success_multi(
+            emitted,
+            success_reason={"action": "replicate", "metadata": {"quarantined_indices": list(range(len(rows)))}},
+        )
+
+    monkeypatch.setattr(BatchReplicate, "process", process)
+
+
+@pytest.mark.parametrize("violate_declaration", [True, False], ids=["also-violates-a-declaration", "contradiction-only"])
+def test_a_self_contradicting_quarantine_record_aborts_with_every_token_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, violate_declaration: bool
+) -> None:
+    """The contradiction stays a Tier-1 abort, but no buffered token is left without an outcome (E4).
+
+    The quarantine set is validated before the declaration dispatch, so the
+    contradiction pre-empts it. Before E4 the two-defect shape therefore left all
+    three tokens outcomeless, although it had recorded each one FAILED when the
+    declaration violation fired first.
+    """
+    _claim_every_input_quarantined(monkeypatch, violate_declaration=violate_declaration)
+    _write_jsonl(tmp_path / "in.jsonl", _DILUTED)
+    settings = _settings_file(tmp_path, trigger_count=len(_DILUTED))
+
+    result = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+
+    assert result.exit_code == 4, result.output
+    assert "BatchQuarantineContradictionError" in result.output
+    assert "all 3 buffered token(s) were quarantined" in result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == []
+    assert _tokens_without_exactly_one_terminal(tmp_path) == 0
+    assert _completed_outcomes(tmp_path) == {"failure/unrouted": 3}
+    kinds = {
+        json.loads(text)["failure_kind"] for (text,) in _query(tmp_path, "select context_json from token_outcomes where completed = 1")
+    }
+    assert kinds == {"every_input_quarantined_with_emission"}

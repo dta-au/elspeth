@@ -3632,10 +3632,12 @@ class TestAggregationFailureMatrix:
         """Malformed batch quarantine metadata must fail before child tokens are created.
 
         The flush cross-check is the one site that validates the metadata; routing
-        consumes the set it returns.
+        consumes the set it returns. The buffered token is recorded FAILURE /
+        UNROUTED before the Tier-1 raise, so it does not end without an outcome.
         """
-        _db, _factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
+        db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         token = make_token_info(row_id="row-a", token_id="token-a", data={"value": 1})
+        _persist_token_for_scheduler(factory, token)
         fctx = _FlushContext(
             node_id=NodeID("agg-1"),
             transform=transform,
@@ -3669,6 +3671,17 @@ class TestAggregationFailureMatrix:
             processor._cross_check_flush_output(fctx, flush_result)
 
         expand_token.assert_not_called()
+
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import token_outcomes_table
+
+        with db.connection() as conn:
+            outcomes = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == "test-run")).fetchall()
+        assert len(outcomes) == 1
+        _assert_outcome_pair(outcomes[0], TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
+        assert outcomes[0].token_id == "token-a"
+        assert json.loads(outcomes[0].context_json)["failure_kind"] == "quarantine_metadata_invalid"
 
 
 class TestTransformModeOutcomeOrdering:

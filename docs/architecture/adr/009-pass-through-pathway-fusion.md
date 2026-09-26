@@ -56,6 +56,16 @@
 > quarantined raises `OrchestrationInvariantError`; a zero-row emission keeps
 > the intersection over every buffered input (`can_drop_rows` governs it). The
 > resume re-check of a committed aggregation output applies the same rule.
+> The quarantine set has to be validated before the declaration dispatch,
+> because the intersection is computed over it. Its two contradictions
+> (malformed `quarantined_indices`, and a non-empty emission with every input
+> quarantined) therefore pre-empt any declaration violation in the same
+> output. Both raise `BatchQuarantineContradictionError`, an
+> `AuditEvidenceBase` subclass of the Tier-1 `OrchestrationInvariantError`.
+> As with a declaration violation at this site, every buffered token is first
+> recorded FAILURE / UNROUTED with its value-free `to_audit_dict` (kind,
+> identities and counts, never the metadata). The resume re-check records
+> nothing.
 > A union-existence check (every field some input carried must appear on some
 > output) was prototyped and not adopted. Taken over every buffered input it
 > has a measured Tier-1 false positive: an honest `batch_replicate` run aborts

@@ -498,6 +498,26 @@ DIAGNOSTIC_CASES = (
         },
     ),
     *_structured_cases(
+        errors.BatchQuarantineContradictionError,
+        {
+            "message": "fixed-message",
+            "failure_kind": "quarantine_metadata_invalid",
+            "plugin": "fixed-plugin",
+            "node_id": "fixed-node",
+            "run_id": "fixed-run",
+            "buffered_token_count": 3,
+            "emitted_row_count": 1,
+        },
+        {
+            "failure_kind": ("quarantine_metadata_invalid", "every_input_quarantined_with_emission"),
+            "plugin": ("plugin-alpha", "plugin-omega"),
+            "node_id": ("node-alpha", "node-omega"),
+            "run_id": ("run-alpha", "run-omega"),
+            "buffered_token_count": (1, 5),
+            "emitted_row_count": (0, 2),
+        },
+    ),
+    *_structured_cases(
         errors.DeclaredOutputTypeViolation,
         {
             "transform": "fixed-transform",

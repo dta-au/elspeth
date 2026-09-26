@@ -1354,6 +1354,73 @@ class OrchestrationInvariantError(Exception):
     pass
 
 
+BatchQuarantineContradictionKind = Literal["quarantine_metadata_invalid", "every_input_quarantined_with_emission"]
+
+
+class BatchQuarantineContradictionAudit(TypedDict):
+    """Value-free audit payload of ``BatchQuarantineContradictionError``."""
+
+    exception_type: str
+    failure_kind: BatchQuarantineContradictionKind
+    plugin: str
+    node_id: str
+    run_id: str
+    buffered_token_count: int
+    emitted_row_count: int
+
+
+@tier_1_error(
+    reason="ADR-009: a batch plugin's in-batch quarantine record contradicts itself or its emission — plugin bug at the flush cross-check",
+    caller_module=__name__,
+)
+class BatchQuarantineContradictionError(AuditEvidenceBase, OrchestrationInvariantError):
+    """A batch transform's ``quarantined_indices`` cannot be honoured.
+
+    Raised by the aggregation flush cross-check in two cases. Either the
+    metadata is malformed (not a dict or list, a non-int index, or an index out
+    of range), or a TRANSFORM-mode emission is non-empty while every buffered
+    input is claimed quarantined. The pass-through intersection is computed
+    over the validated set, so the check runs before the declaration dispatch
+    and pre-empts any declaration violation in the same output.
+
+    Like the batch-flush declaration violations, it is audit evidence. The
+    processor records every buffered token FAILURE / UNROUTED with
+    ``to_audit_dict`` and then raises it. The message may quote the plugin's
+    metadata, so it is exception text only. ``to_audit_dict`` carries the
+    kind, the identities and the counts, never the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: BatchQuarantineContradictionKind,
+        plugin: str,
+        node_id: str,
+        run_id: str,
+        buffered_token_count: int,
+        emitted_row_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind: BatchQuarantineContradictionKind = failure_kind
+        self.plugin = plugin
+        self.node_id = node_id
+        self.run_id = run_id
+        self.buffered_token_count = buffered_token_count
+        self.emitted_row_count = emitted_row_count
+
+    def to_audit_dict(self) -> BatchQuarantineContradictionAudit:
+        return {
+            "exception_type": type(self).__name__,
+            "failure_kind": self.failure_kind,
+            "plugin": self.plugin,
+            "node_id": self.node_id,
+            "run_id": self.run_id,
+            "buffered_token_count": self.buffered_token_count,
+            "emitted_row_count": self.emitted_row_count,
+        }
+
+
 # TIER-2: Operator-interpretable refuse signal — audit DB is intact and truthful (records that no rows were committed); not a corruption or framework bug. Inherits OrchestrationInvariantError so the broad catch still matches, but the semantic tier is Tier-2 (clean refuse with run_id), not Tier-1 (invariant violation).
 class EmptyResumeStateError(OrchestrationInvariantError):
     """Raised when resume is attempted for a run with no recorded work.
