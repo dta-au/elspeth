@@ -156,6 +156,33 @@ drained and repair this release forward.
   `url_field` always has. The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).
+- **A template sees only its node's declared fields (ADR-051).** An LLM
+  `prompt_template` (and a query's `row.source_row`) now renders against the
+  row narrowed to `required_input_fields` before the template runs: a list
+  holds exactly those fields (by normalized or original header spelling),
+  `[]` keeps the whole row, and an omitted declaration holds none — never the
+  whole row. Before this, what a template could read was decided by a static
+  analysis of the Jinja source, and forms it could not follow (a row carried
+  in a list or tuple and read in a loop, `d.values()`, `loop.nextitem`, macro
+  `varargs`/`kwargs`, `v[0].secret`) validated and sent every column,
+  undeclared ones included, to the provider. Reading a field the node does
+  not declare now fails the row with `template_rendering_failed` and the
+  reason `Undeclared field: the template reads 'x', a field this node does not
+  declare in required_input_fields` (the field is named only when the template
+  spells it). Behaviour changes: `'x' in row`, `row.get('x', default)` and
+  `row.x is defined` on an undeclared name fail the row instead of answering
+  `False` or the default (a declared field the row does not carry still
+  answers `False` / the default); `{% for k in row %}`, `row | length`,
+  `row | dictsort`, `row | items` and `dict(row)` see the declared fields, and
+  configuration no longer refuses those whole-row forms with a declared list;
+  a multi-query `row.source_row.<column>` read must be listed in
+  `required_input_fields` itself (an `image_inputs` column is refused there);
+  `<response_field>_variables_hash` is the hash of the declared field values
+  the template could see (unchanged under `[]`). On the web, required-control
+  coverage protects the declared fields plus each query's `input_fields`
+  values; an LLM node with `required_input_fields: []` or none is now
+  `input_fields_unprovable` for a field-scoped prompt shield — only
+  `fields: all` covers it. Shipped examples render byte-identical prompts.
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics
