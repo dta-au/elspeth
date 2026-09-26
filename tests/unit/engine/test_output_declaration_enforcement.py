@@ -366,6 +366,63 @@ class TestAFieldIsIdentifiedByItsNormalizedNameOnBothRows:
         verify_produced_output_types(transform=transform, input_row=self._input_row(), emitted_rows=[emitted])
 
 
+class TestACarriedRenameTargetIsNotReAdjudicated:
+    """``carried_output_fields()`` names are never produced (``declared_output_types``, review-S1a-r4 F1).
+
+    Ruling C3 made an ``int`` under ``float`` admissible to ``validate()``, so
+    the int-under-float rename no longer tells the exemption apart. What still
+    does is a value pydantic's strict input check admits and ``validate()``
+    refuses: a type-faithful ``Decimal`` under ``float`` (a resumed row).
+    """
+
+    def test_a_decimal_carried_under_a_float_rename_target_passes(self) -> None:
+        from decimal import Decimal
+
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+        from tests.fixtures.factories import make_context
+
+        mapper = FieldMapper({"schema": {"mode": "flexible", "fields": ["amount: float"]}, "mapping": {"amount": "total"}})
+        assert mapper.carried_output_fields() == frozenset({"total"})
+        input_row = PipelineRow(
+            {"amount": Decimal("123.456789")},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    FieldContract(normalized_name="amount", original_name="amount", python_type=float, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+        result = mapper.process(input_row, make_context())
+        assert result.row is not None
+        emitted = result.row
+        # The target is a created key (not on the input row) under the projected float declaration.
+        assert "total" not in input_row.to_dict()
+        assert [(fc.normalized_name, fc.python_type, fc.source) for fc in emitted.contract.fields] == [("total", float, "declared")]
+
+        verify_produced_output_types(transform=mapper, input_row=input_row, emitted_rows=[emitted])
+
+    def test_a_carried_field_at_the_batch_flush_is_not_re_adjudicated(self) -> None:
+        """The batch seam checks only CREATED fields: a buffered row's ``Decimal`` under its ``float`` passes through.
+
+        The buffer preflight admitted the input value; a passthrough batch
+        output carries it under the same declaration, and the flush does not
+        re-check it (review-S1a-r4 mutant M5, "every declared field counts as
+        produced", survived because only a Decimal tells the two apart).
+        """
+        from decimal import Decimal
+
+        from elspeth.engine.executors.declared_output_types import verify_created_output_types
+
+        transform = _Emitting({"schema": {"mode": "flexible", "fields": ["amount: float"]}}, emit=[])
+        assert "amount" not in transform.declared_output_fields
+        emitted = _declared_row({"amount": Decimal("123.456789")}, {"amount": float})
+
+        verify_created_output_types(transform=transform, emitted_rows=[emitted])
+
+
 class TestTheDeclarerOfAFieldOutsideTheStampTable:
     """``declared_by`` for a checked field this transform's stamp table does not hold (``declared_output_types._declarer``)."""
 
