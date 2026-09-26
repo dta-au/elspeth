@@ -7777,10 +7777,12 @@ class TestComposerRuntimeBatchPlacementAgreement:
             composer = state.validate()
             misplaced = [e for e in composer.errors if e.error_code == "batch_transform_misplaced"]
             assert len(misplaced) == 1, (name, composer.errors)
-            assert f"'{name}' does not emit exactly one row per buffered row" in misplaced[0].message
+            declaration = f"'{name}' does not declare that its flush emits exactly one row per buffered row"
+            assert declaration in misplaced[0].message
             assert "Use output_mode: transform" in misplaced[0].message
             with pytest.raises(ValueError, match=rf"Aggregation 'agg' uses transform '{name}' with output_mode: passthrough") as raised:
                 self._runtime_instantiate(state)
+            assert declaration in str(raised.value)
             assert "Use output_mode: transform" in str(raised.value)
 
     @pytest.mark.parametrize("output_mode", ["transform", None], ids=["explicit-transform", "absent-is-the-runtime-default"])

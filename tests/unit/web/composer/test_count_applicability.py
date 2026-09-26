@@ -132,7 +132,7 @@ async def test_audited_dispatch_distinguishes_structural_and_semantic_count_fail
             assert CODE not in [error.error_code for error in errors]
             rejected = [error for error in errors if error.component == "rejected_mutation"]
             assert len(rejected) == 1, errors
-            assert "'batch_stats' does not emit exactly one row per buffered row" in rejected[0].message
+            assert "'batch_stats' does not declare that its flush emits exactly one row per buffered row" in rejected[0].message
         else:
             assert outcome.result.updated_state is state
             assert [error.error_code for error in outcome.result.validation.errors] == [CODE]

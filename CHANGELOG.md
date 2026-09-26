@@ -322,7 +322,11 @@ drained and repair this release forward.
   refused it when `output_mode` was left to its default, `transform`. A
   plugin that declares the capability and then returns another shape still
   ends the run with `BatchPassthroughShapeError` (a Tier-1 invariant error),
-  but every buffered row is recorded `failed` first.
+  but every buffered row is recorded `failed` first. **Plugin authors:** a
+  custom batch plugin used under `passthrough` must now declare
+  `flush_emits_one_row_per_buffered_row = True` on its class; the default is
+  `False`, and an undeclared plugin is refused with a message naming the
+  attribute (`docs/contracts/plugin-protocol.md` § Output Mode).
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

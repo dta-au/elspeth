@@ -1783,8 +1783,8 @@ def _batch_aware_placement_error(
         )
         if plugin_name not in _known_transform_plugins_emitting_one_row_per_buffered_row():
             message += (
-                f" '{plugin_name}' does not emit exactly one row per buffered row, so give the aggregation "
-                "output_mode: transform (the default)."
+                f" '{plugin_name}' does not declare that its flush emits exactly one row per buffered row, so "
+                "give the aggregation output_mode: transform (the default)."
             )
         return message
 
@@ -1795,7 +1795,8 @@ def _batch_aware_placement_error(
     ):
         return (
             f"Node '{node_id}' uses '{plugin_name}' as an aggregation with output_mode: passthrough, but "
-            f"'{plugin_name}' does not emit exactly one row per buffered row, which is what passthrough carries. "
+            f"'{plugin_name}' does not declare that its flush emits exactly one row per buffered row, which is what "
+            "passthrough carries. "
             "Use output_mode: transform, so the rows its flush emits become new downstream tokens."
         )
 

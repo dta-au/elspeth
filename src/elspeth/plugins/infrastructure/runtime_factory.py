@@ -161,9 +161,10 @@ def instantiate_plugins_from_config(
             if agg_config.output_mode is OutputMode.PASSTHROUGH and not transform_cls.flush_emits_one_row_per_buffered_row:
                 raise ValueError(
                     f"Aggregation '{agg_config.name}' uses transform '{agg_config.plugin}' with output_mode: "
-                    f"passthrough, but '{agg_config.plugin}' does not emit exactly one row per buffered row, "
-                    f"which is what passthrough carries. Use output_mode: transform, so the rows its flush emits "
-                    f"become new downstream tokens."
+                    f"passthrough, but '{agg_config.plugin}' does not declare that its flush emits exactly one row "
+                    f"per buffered row, which is what passthrough carries. Use output_mode: transform, so the rows "
+                    f"its flush emits become new downstream tokens. A custom batch plugin whose flush does emit one "
+                    f"row per buffered row declares flush_emits_one_row_per_buffered_row = True on its class."
                 )
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success

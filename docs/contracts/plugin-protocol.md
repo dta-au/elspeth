@@ -890,7 +890,9 @@ def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
         success_reason={"action": "exploded", "output_count": len(items)},
     )
 
-# Aggregation passthrough: N inputs → N enriched outputs
+# Aggregation passthrough: N inputs → N enriched outputs. The class declares
+# flush_emits_one_row_per_buffered_row = True; without it, output_mode:
+# passthrough is refused at validate (see "Output Mode" below).
 def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
     # When is_batch_aware=True and used in aggregation, engine may pass aggregated data
     rows = row if isinstance(row, list) else [row]
@@ -1560,6 +1562,17 @@ aggregations:
 - **`transform`** (default): Batch transformation. N rows become M rows with new tokens. All input tokens are terminal (`CONSUMED_IN_BATCH`). New tokens are created via `expand_token()` with parent linkage to the triggering token. Use `expected_output_count: 1` for classic N→1 aggregation (sum, count, mean) to validate cardinality.
 
 - **`passthrough`**: Batch enrichment. N rows become N enriched rows with the same token IDs. Buffered tokens get `BUFFERED` (non-terminal) while waiting, then reappear as `COMPLETED` on flush. Transform must return `success_multi()` with exactly N rows.
+
+  Passthrough carries only a plugin that **declares** it: a batch plugin whose
+  flush emits exactly one row per buffered row sets the class attribute
+  `flush_emits_one_row_per_buffered_row = True`. The default (`False`, on
+  `BaseTransform`) is refused by `elspeth validate` and by the web composer
+  under `output_mode: passthrough`, with the remedy "Use output_mode:
+  transform"; every shipped batch plugin declares `False`, because each reduces,
+  replicates or skips rows. A plugin that declares `True` and then returns a
+  different row count, a single-row result, or `quarantined_indices` is a
+  plugin bug: every buffered token is recorded as a failure with
+  `BatchPassthroughShapeError` evidence, then the run aborts.
 
 **Error handling:** All modes are atomic. If the transform returns `error` (for
 example because one buffered row carries a wrongly-typed value), ALL buffered

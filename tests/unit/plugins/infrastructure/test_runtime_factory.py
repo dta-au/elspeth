@@ -226,3 +226,8 @@ def test_a_passthrough_aggregation_reports_the_output_mode_not_the_plugins_confi
     with pytest.raises(ValueError, match=r"Aggregation 'stats' uses transform 'batch_stats' with output_mode: passthrough") as excinfo:
         instantiate_plugins_from_config(settings, preflight_mode=True)
     assert "value_field" not in str(excinfo.value)  # the batch_stats constructor never ran
+    # The refusal states what is true of any undeclared plugin — it does not
+    # DECLARE the capability — and names the declaration a custom 1:1 plugin
+    # author sets (P5 review r1 F3).
+    assert "does not declare that its flush emits exactly one row per buffered row" in str(excinfo.value)
+    assert "declares flush_emits_one_row_per_buffered_row = True on its class" in str(excinfo.value)
