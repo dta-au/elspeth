@@ -7774,6 +7774,11 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         pytest.param(
             "{{ row.q | truncate(2) }}", "truncate() arguments can never be satisfied: expected length >= 3, got 2", id="truncate"
         ),
+        pytest.param(
+            "{{ row.q | truncate(1" + "0" * 400 + ", leeway=0.5) }}",
+            "truncate() arguments can never be satisfied: int too large to convert to float",
+            id="truncate-overflow",
+        ),
         pytest.param("{% if row.q %}{{ row.q | no_such_filter }}{% endif %}", "No filter named 'no_such_filter'.", id="filter-in-if"),
         pytest.param("{% if row.q is no_such_test %}x{% endif %}", "No test named 'no_such_test'.", id="test-in-if"),
         pytest.param("{{ [row.q] | map('no_such_filter') | join }}", "No filter named 'no_such_filter'.", id="map-filter-name"),

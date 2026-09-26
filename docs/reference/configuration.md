@@ -1179,6 +1179,12 @@ render only, never to waiting for or starting a worker:
 - **Render time.** The 5-second wall clock starts when the row's request
   reaches a running worker. A render that exceeds it fails the row with
   `Template exceeded the execution time limit`.
+- **Render CPU.** A render may use 2 CPU seconds, counted from when the worker
+  receives the row's request until it replies. The time a worker waits between
+  rows is not charged to any row. Under a finite hard CPU limit (`ulimit -t`),
+  a reused worker whose total CPU leaves less than a render's 2 seconds is
+  replaced by a new worker before the row renders. If even a new worker would
+  get less, the run stops as an ELSPETH failure.
 - **Worker lost.** A worker ended by a signal the row did not cause (the
   kernel's out-of-memory killer, an operator's `kill`, a crash) raises a
   retryable error, `Template worker was stopped by signal N`. In `elspeth run`

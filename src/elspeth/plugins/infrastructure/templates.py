@@ -485,6 +485,10 @@ def _template_worker(connection: Any) -> None:
     protocol itself exits with status 1 and no reply, which the parent treats
     as a framework bug.
 
+    After a ``worker_spent`` reply (its cumulative CPU leaves no room for a
+    render's budget under the hard limit) the worker exits too, and the parent
+    starts a fresh one.
+
     The worker's first message is ``ready``, sent once its interpreter has
     started and its memory limit is set; the parent starts a render's wall
     clock only after it (``_start_worker``).
@@ -513,9 +517,17 @@ def _template_worker(connection: Any) -> None:
             except EOFError:
                 raise SystemExit(0) from None
             reply = _serve_request(source, payload, value_free)
+            # The request's CPU budget ends with its render: lift the soft
+            # limit back to the hard one before replying, so the budget a
+            # render left behind can never end the worker while it is idle or
+            # receiving the next request, which would be charged to that row.
+            _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
+            resource.setrlimit(resource.RLIMIT_CPU, (hard_limit, hard_limit))
             connection.send(reply)
             if reply[0] == "setup_failed":
                 raise SystemExit(1)
+            if reply[0] == "worker_spent":
+                raise SystemExit(0)
     except SystemExit:
         raise
     except BaseException:
@@ -539,6 +551,10 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     unpickling and restoring the context the parent packed, and building the
     template the parent already compiled. A failure there is ELSPETH's own
     (``setup_failed``, which the parent turns into a ``FrameworkBugError``).
+    A worker whose cumulative CPU leaves less than the render's budget under
+    a finite hard RLIMIT_CPU is spent, not failed: it replies
+    ``worker_spent`` without touching the request, and the parent sends the
+    request to a fresh worker.
 
     RENDER is the template meeting the row. A Tier-1 error there is ELSPETH's
     bug too: the template sees only plain row values (``TemplateRow``), never
@@ -550,10 +566,13 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     """
     try:
         # RLIMIT_CPU is cumulative over a process lifetime. Give each
-        # request two more CPU seconds, keeping the inherited hard bound.
+        # request two more CPU seconds, keeping the inherited hard bound; the
+        # worker lifts the soft limit back to that bound after the render.
         _, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
         usage = resource.getrusage(resource.RUSAGE_SELF)
         cpu_limit = math.ceil(usage.ru_utime + usage.ru_stime + 2)
+        if hard_limit != resource.RLIM_INFINITY and cpu_limit > hard_limit:
+            return "worker_spent", ""
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, hard_limit))
         context = pickle.loads(payload)
         if type(context) is not dict or any(type(key) is not str for key in context):
@@ -647,7 +666,9 @@ def _worker_death(process: Any, *, rendering: bool) -> Exception:
     the text names that status alone.
 
     - SIGXCPU while rendering is this row's template running out of its CPU
-      seconds (RLIMIT_CPU is set per request): a routed ``TemplateError``.
+      seconds: a routed ``TemplateError``. The soft RLIMIT_CPU is this
+      request's budget only from its SETUP until its reply; the worker lifts
+      it back to the hard limit before replying (``_template_worker``).
     - Any other signal, or SIGXCPU before a request was rendering, says
       nothing about the row (the kernel's OOM killer, an operator's kill, a
       crash): ``TemplateWorkerLostError``, which the run retries. A stop the
@@ -709,6 +730,21 @@ def _start_worker(index: int) -> tuple[Any, Any]:
     return process, parent
 
 
+def _exchange(entry: tuple[Any, Any], source: str, payload: bytes, value_free: bool) -> tuple[str, str]:
+    """Send one request to a running worker and read its reply."""
+    process, parent = entry
+    try:
+        parent.send((source, payload, value_free))
+        if not parent.poll(_WORKER_TIMEOUT_SECONDS):
+            raise TemplateError("Template exceeded the execution time limit")
+        status, value = parent.recv()
+    except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
+        # A worker that ended with the request still unread resets the
+        # socket instead of closing it; either way it is a death.
+        raise _worker_death(process, rendering=True) from exc
+    return status, value
+
+
 def _run_template_worker(source: str, payload: bytes, *, value_free: bool = False) -> str:
     if len(payload) > _MAX_CONTEXT_BYTES:
         raise TemplateError(f"Template context exceeds {_MAX_CONTEXT_BYTES} bytes")
@@ -719,17 +755,16 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         if entry is None or not entry[0].is_alive():
             _retire_worker(index)
             entry = _start_worker(index)
-        process, parent = entry
-        try:
-            parent.send((source, payload, value_free))
-            if not parent.poll(_WORKER_TIMEOUT_SECONDS):
-                raise TemplateError("Template exceeded the execution time limit")
-            status, value = parent.recv()
-            response_received = True
-        except (EOFError, BrokenPipeError, ConnectionResetError) as exc:
-            # A worker that ended with the request still unread resets the
-            # socket instead of closing it; either way it is a death.
-            raise _worker_death(process, rendering=True) from exc
+        status, value = _exchange(entry, source, payload, value_free)
+        if status == "worker_spent":
+            # The worker exits after this reply: its cumulative CPU leaves no
+            # room for a render's budget under the hard RLIMIT_CPU. That is its
+            # lifetime, not this row: a fresh worker starts from zero.
+            _retire_worker(index)
+            status, value = _exchange(_start_worker(index), source, payload, value_free)
+            if status == "worker_spent":
+                raise FrameworkBugError("The hard RLIMIT_CPU leaves a new template worker less than one render's CPU budget")
+        response_received = True
         if status == "setup_failed":
             # The worker exits after this reply; do not hand its slot on.
             _retire_worker(index)
@@ -942,7 +977,9 @@ def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxed
             return
     try:
         environment.filters["truncate"](environment, "", **literals)
-    except (AssertionError, TypeError) as exc:
+    except (AssertionError, TypeError, ArithmeticError) as exc:
+        # ArithmeticError: ``length + leeway`` with an int literal too large
+        # for a float overflows on every render.
         raise TemplateAssertionError(f"truncate() arguments can never be satisfied: {exc}", node.lineno) from exc
 
 

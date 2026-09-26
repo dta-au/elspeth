@@ -17,6 +17,10 @@ reply, and the parent maps it:
   the moment the worker's interpreter starts.
 - A worker's first message is ``ready``. Its start is not row time: the render
   wall clock starts after it, and a worker that never becomes ready aborts.
+- A request's CPU budget (the soft RLIMIT_CPU) lasts from its SETUP to its
+  reply. A reused worker with no room for another budget under a finite hard
+  limit replies ``worker_spent`` and exits; the parent renders the row on a
+  new worker.
 - All workers busy is backpressure: a render waits, it is never refused.
 
 No exception but ``SystemExit`` leaves the worker, so nothing it prints can
@@ -28,10 +32,12 @@ patch lives only in the child.
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import os
 import pickle
 import queue
+import resource
 import signal
 import subprocess
 import sys
@@ -227,6 +233,52 @@ def _worker_replying_a_non_string(connection: Any) -> None:
     connection.recv()
 
 
+def _spend_the_cpu_budget() -> None:
+    """A hard RLIMIT_CPU one second above what this process has used: no room for a render's two seconds."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    hard_limit = math.ceil(usage.ru_utime + usage.ru_stime) + 1
+    resource.setrlimit(resource.RLIMIT_CPU, (hard_limit, hard_limit))
+
+
+def _worker_whose_cpu_budget_is_spent(connection: Any) -> None:
+    """The real worker, started under a hard RLIMIT_CPU it has all but used up."""
+    _spend_the_cpu_budget()
+    templates._template_worker(connection)
+
+
+_SPENT_MARKER_ENV = "ELSPETH_TEST_SPENT_WORKER_MARKER"
+
+
+def _worker_spent_on_its_first_start(connection: Any) -> None:
+    """The first worker started is spent (it records its pid); every later one starts fresh."""
+    marker = Path(os.environ[_SPENT_MARKER_ENV])
+    if not marker.exists():
+        marker.write_text(str(os.getpid()))
+        _spend_the_cpu_budget()
+    templates._template_worker(connection)
+
+
+class _CpuLimitReportingConnection:
+    """The worker's pipe, adding to each reply whether the soft RLIMIT_CPU equals the hard one at the moment it is sent."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def recv(self) -> Any:
+        return self._connection.recv()
+
+    def send(self, message: tuple[str, str]) -> None:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_CPU)
+        self._connection.send(message if message[0] == "ready" else (*message, soft_limit == hard_limit))
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def _worker_reporting_its_cpu_limit(connection: Any) -> None:
+    templates._template_worker(_CpuLimitReportingConnection(connection))
+
+
 def _worker_with_a_foreign_undefined_contract(connection: Any) -> None:
     from jinja2 import TemplateRuntimeError
     from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -260,10 +312,65 @@ def test_a_setup_failure_in_the_worker_aborts_and_names_only_its_class(target: C
         assert templates._WORKERS == [None]
 
 
-def test_an_invalid_context_is_a_setup_failure_not_a_row_error() -> None:
+@pytest.mark.parametrize(
+    "context",
+    [pytest.param(["not", "a", "context"], id="not-a-dict"), pytest.param({1: "x"}, id="a-key-that-is-not-a-str")],
+)
+def test_an_invalid_context_is_a_setup_failure_not_a_row_error(context: object) -> None:
+    """The parent packs a dict of str keys; anything else is ELSPETH's own transport, never the row's."""
     with _raw_worker() as (_, parent):
-        status, value = _ask(parent, "{{ row }}", pickle.dumps(["not", "a", "context"], protocol=5), True)
+        status, value = _ask(parent, "{{ row }}", pickle.dumps(context, protocol=5), False)
     assert (status, value) == ("setup_failed", "FrameworkBugError")
+
+
+def test_a_template_the_worker_cannot_compile_is_a_setup_failure() -> None:
+    """The parent compiled this text already, so a compile failure in the worker is a divergence, never the row's."""
+    with _raw_worker() as (process, parent):
+        assert _ask(parent, "{% if row.q %}", _payload(row={"q": "x"}), False) == ("setup_failed", "TemplateSyntaxError")
+        process.join(60)
+    assert process.exitcode == 1
+
+
+def test_a_worker_whose_cpu_budget_is_spent_hands_the_request_back_and_exits() -> None:
+    """RLIMIT_CPU is cumulative and workers are reused: a finite hard limit is that worker's lifetime, not a setup failure."""
+    with _raw_worker(_worker_whose_cpu_budget_is_spent) as (process, parent):
+        assert _ask(parent, "{{ row.q }}", _payload(row={"q": "x"}), True) == ("worker_spent", "")
+        process.join(60)
+    assert process.exitcode == 0
+
+
+@pytest.mark.usefixtures("one_fresh_worker")
+def test_a_spent_worker_is_replaced_and_the_row_renders_on_a_fresh_one(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Before, the spent worker's ``setrlimit`` raised in SETUP and the run aborted as a FrameworkBugError."""
+    marker = tmp_path / "spent-worker.pid"
+    monkeypatch.setenv(_SPENT_MARKER_ENV, str(marker))
+    monkeypatch.setattr(templates, "_template_worker", _worker_spent_on_its_first_start)
+    assert SandboxedTemplate("{{ row.q }}").render(row={"q": "x"}) == "x"
+    entry = templates._WORKERS[0]
+    assert entry is not None
+    assert entry[0].pid != int(marker.read_text()), "the row rendered on a new worker"
+
+
+@pytest.mark.usefixtures("one_fresh_worker")
+def test_a_hard_cpu_limit_that_spends_even_a_new_worker_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(templates, "_template_worker", _worker_whose_cpu_budget_is_spent)
+    with pytest.raises(FrameworkBugError) as caught:
+        SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    assert str(caught.value) == "The hard RLIMIT_CPU leaves a new template worker less than one render's CPU budget"
+    assert templates._WORKERS == [None]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [pytest.param("{{ row.q }}", id="rendered"), pytest.param("{{ row.q | dictsort }}", id="routed"), pytest.param("{% if %}", id="setup")],
+)
+def test_a_request_s_cpu_budget_is_lifted_before_its_reply(source: str) -> None:
+    """The soft RLIMIT_CPU a render leaves behind must not end the worker while it idles or receives the next row."""
+    with _raw_worker(_worker_reporting_its_cpu_limit) as (_, parent):
+        parent.send((source, _payload(row={"q": "x"}), False))
+        assert parent.poll(60), "the worker sent nothing"
+        reply = parent.recv()
+    assert reply[-1] is True, reply
 
 
 # --- RENDER phase ------------------------------------------------------------
@@ -272,8 +379,12 @@ def test_an_invalid_context_is_a_setup_failure_not_a_row_error() -> None:
 def test_a_tier1_error_raised_while_rendering_aborts_with_its_class_only() -> None:
     with _raw_worker(_worker_whose_sandbox_raises_tier1) as (_, parent):
         assert _ask(parent, "{{ row.q }}", _payload(row={"q": "x"}), True) == ("render_tier1", "AuditIntegrityError")
-    with _serving(_worker_whose_sandbox_raises_tier1), pytest.raises(FrameworkBugError) as caught:
-        SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    with _serving(_worker_whose_sandbox_raises_tier1) as process:
+        with pytest.raises(FrameworkBugError) as caught:
+            SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+        # The worker that raised is retired, never handed to the next render.
+        assert templates._WORKERS == [None]
+        assert not process.is_alive()
     assert str(caught.value) == "Template rendering raised a Tier-1 error: AuditIntegrityError"
 
 
@@ -408,6 +519,53 @@ def test_a_worker_that_dies_before_reading_its_request_is_classified_as_a_death(
     """The unread request makes the parent's read fail as a reset, not EOF (S3 fix round 1, F3)."""
     with _serving(_worker_killed_before_reading), pytest.raises(TemplateWorkerLostError) as caught:
         SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+    _assert_lost_to(caught, int(signal.SIGKILL))
+
+
+class _AliveAfterDeath:
+    """A dead worker that still reads as alive: it died between the parent's liveness check and its send."""
+
+    def __init__(self, process: multiprocessing.process.BaseProcess) -> None:
+        self._process = process
+
+    def is_alive(self) -> bool:
+        return True
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._process.join(timeout)
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid
+
+    @property
+    def exitcode(self) -> int | None:
+        return self._process.exitcode
+
+
+def test_a_worker_that_died_before_the_request_was_sent_is_classified_as_a_death() -> None:
+    """The send fails with a broken pipe, not the read: still a death, classified by exit status."""
+    parent, child = _SPAWN.Pipe(duplex=True)
+    process = _SPAWN.Process(target=templates._template_worker, args=(child,), daemon=True)
+    process.start()
+    child.close()
+    _await_ready(parent)
+    process.kill()
+    process.join()
+    available: queue.SimpleQueue[int] = queue.SimpleQueue()
+    available.put(0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(templates, "_AVAILABLE_WORKERS", available)
+        patch.setattr(templates, "_WORKERS", [(_AliveAfterDeath(process), parent)])
+        try:
+            with pytest.raises(TemplateWorkerLostError) as caught:
+                SandboxedTemplate("{{ row.q }}").render(row={"q": "x"})
+            assert templates._WORKERS == [None]
+        finally:
+            templates._stop_template_workers()
     _assert_lost_to(caught, int(signal.SIGKILL))
 
 

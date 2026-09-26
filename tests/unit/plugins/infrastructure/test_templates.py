@@ -617,6 +617,18 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() arguments can never be satisfied: '>=' not supported between instances of 'str' and 'int'",
             id="truncate-length-str",
         ),
+        # ``length + leeway`` overflows when an int literal is too large for a
+        # float: an OverflowError on every render, not a construction crash.
+        pytest.param(
+            "{{ row.q | truncate(1" + "0" * 400 + ", leeway=0.5) }}",
+            "truncate() arguments can never be satisfied: int too large to convert to float",
+            id="truncate-overflowing-length",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(1e300, leeway=1" + "0" * 400 + ") }}",
+            "truncate() arguments can never be satisfied: int too large to convert to float",
+            id="truncate-overflowing-leeway",
+        ),
     ],
 )
 def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, message: str) -> None:
