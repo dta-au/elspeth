@@ -89,6 +89,9 @@ from tests.integration.plugins.transforms.test_template_worker_loss import (
 
 # The run's retry policy, parsed the way `elspeth run` / `elspeth join` parse it.
 # max_delay_seconds caps the jittered backoff, so the retried attempts stay fast.
+# max_attempts is NOT the RetrySettings default (3): a follower that ignored the
+# handed policy for a default one would spend a different number of attempts
+# (review-E1-follower-retry-r1 F1).
 _SETTINGS_YAML = """
 sources:
   stub:
@@ -109,7 +112,7 @@ sinks:
       schema:
         mode: observed
 retry:
-  max_attempts: 3
+  max_attempts: 4
   initial_delay_seconds: 0.01
   max_delay_seconds: 0.1
 """
@@ -628,10 +631,10 @@ def test_a_follower_that_spends_its_retries_routes_retry_exhausted(tmp_path: Pat
     """A4: every attempt fails; the row reaches on_error as retry_exhausted after max_attempts."""
     observed = _drain_once(tmp_path, (_TRANSIENT,), ProcessorMode.FOLLOWER)
 
-    assert observed.calls == 3
-    assert observed.node_states == [(0, "failed"), (1, "failed"), (2, "failed")]
+    assert observed.calls == 4
+    assert observed.node_states == [(0, "failed"), (1, "failed"), (2, "failed"), (3, "failed")]
     assert observed.transform_errors == [
-        {"reason": "retry_exhausted", "error": "scripted transient failure", "attempts": 3, "destination": "discard"}
+        {"reason": "retry_exhausted", "error": "scripted transient failure", "attempts": 4, "destination": "discard"}
     ]
     assert observed.outcomes == [("failure", "quarantined_at_source", True)]
     assert observed.work_items == [(TokenWorkStatus.FAILED.value, 1, None, None)]
