@@ -5907,7 +5907,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "SchedulerReadModel.count_failed_in_set",
         "<non-session-write-connection>",
         "write_connection",
-        "507106f1f32a3934",
+        "82c44894991625a6",
         1,
         None,
         line=124,

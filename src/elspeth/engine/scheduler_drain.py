@@ -552,13 +552,15 @@ class SchedulerDrainCoordinator:
                     #       (count_ready_in_set == 0) — a still-READY item is a
                     #       genuine stranded continuation and must raise; and
                     #   (2) NONE of the pending items are FAILED
-                    #       (count_failed_in_set == 0) — FAILED is the ONLY status
-                    #       absent from BOTH backstops (count_active_work AND
-                    #       complete_run's quiescence CAS cover READY/LEASED/BLOCKED/
-                    #       PENDING_SINK but NOT FAILED), so a self-FAILED stray would
-                    #       be silently lost; refusing on any FAILED pending row keeps
-                    #       it loud (this is the M1 residual fix, and it lands at N=1
-                    #       where the leader's OWN item is FAILED with no peer); and
+                    #       (count_failed_in_set == 0) — FAILED is absent from
+                    #       count_active_work and from complete_run's residual-work
+                    #       arm (READY/LEASED/BLOCKED/PENDING_SINK); complete_run's
+                    #       second arm refuses success only over a FAILED item whose
+                    #       token has NO outcome. Refusing on any FAILED pending row
+                    #       keeps every self-FAILED stray loud here, earlier and
+                    #       whatever its outcome (this is the M1 residual fix, and it
+                    #       lands at N=1 where the leader's OWN item is FAILED with no
+                    #       peer); and
                     #   (3) a peer is/was carrying work — has_peer_owned_work: some
                     #       OTHER lease_owner holds a LEASED or PENDING_SINK row on
                     #       this run.  PENDING_SINK is included because

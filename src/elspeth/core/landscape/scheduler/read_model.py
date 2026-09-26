@@ -106,13 +106,13 @@ class SchedulerReadModel:
         """Count how many of the given work item IDs are in FAILED status.
 
         Companion to :meth:`count_ready_in_set` for the ADR-030 M1 relinquish
-        discriminator. FAILED is the ONLY ``token_work_items`` status absent from
-        BOTH the run-level backstop (:meth:`count_active_work` →
-        ``has_unresolved_scheduler_work``) AND ``complete_run``'s quiescence CAS
-        (which both cover READY/LEASED/BLOCKED/PENDING_SINK). So a leader that
-        relinquished a self-FAILED pending continuation would lose it with no
-        backstop. The leader uses this verb to REFUSE to relinquish whenever ANY
-        pending row is FAILED — keeping a self-FAILED stray loud. Scoped to
+        discriminator. FAILED is absent from the run-level backstop
+        (:meth:`count_active_work` → ``has_unresolved_scheduler_work``) and from
+        ``complete_run``'s residual-work arm (both cover READY/LEASED/BLOCKED/
+        PENDING_SINK); ``complete_run``'s second arm refuses a success only over a
+        FAILED item whose token has no outcome. The leader uses this verb to
+        REFUSE to relinquish whenever ANY pending row is FAILED — keeping every
+        self-FAILED stray loud at the drain, whatever its outcome. Scoped to
         ``run_id`` like every sibling verb; chunked for
         ``SQLITE_MAX_VARIABLE_NUMBER``. An empty input returns 0.
         """
