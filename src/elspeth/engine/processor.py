@@ -1372,7 +1372,7 @@ class RowProcessor:
         result: TransformResult,
         *,
         record_violation: bool = True,
-    ) -> None:
+    ) -> frozenset[int]:
         """Batch-flush declaration dispatch before any terminal emissions.
 
         ADR-009 §Clause 2 — this closes the gap ADR-008 left open. The batch
@@ -1388,13 +1388,30 @@ class RowProcessor:
           heterogeneous batch is not a hazard — each pair is checked
           independently.
         - **TRANSFORM mode (N:M, batch-homogeneous).** Every output row is
-          checked against the intersection of all buffered tokens' effective
-          input fields (ADR-007 table line 53). This is the weakest shared
-          guarantee — a transform claiming ``passes_through_input=True`` must
-          preserve every field that every buffered input carried. Outputs are
-          not attributed to inputs in this mode, so a drop of a field only
-          some buffered inputs carried is not detected here (ADR-009
-          2026-09-26 note).
+          checked against the intersection of the effective input fields of
+          the buffered tokens that produced output (ADR-007 table line 53) —
+          a transform claiming ``passes_through_input=True`` must preserve
+          every field that every one of those inputs carried. Mixed-validity
+          batches may quarantine inputs; the pass-through contract applies to
+          emitted rows, and an input the plugin quarantined in-batch emits
+          nothing (routing records it FAILURE / QUARANTINED_AT_SOURCE and
+          expands the outputs from the non-quarantined tokens only), so it is
+          excluded from the intersection. Were it included, a quarantined
+          input lacking a field would drop that field from the intersection
+          and a plugin could strip it from every output although every
+          emitting input carried it. A non-empty emission with every input
+          quarantined contradicts the plugin's own quarantine record and
+          raises ``OrchestrationInvariantError``. A zero-row emission keeps
+          the intersection over every buffered token (``can_drop_rows``
+          governs it). Outputs are not attributed to inputs in this mode, so
+          a drop of a field only some emitting inputs carried is not detected
+          here (ADR-009 2026-09-26 note).
+
+        The quarantined set comes from ``validated_quarantined_indices`` —
+        the engine's validation of the plugin's
+        ``success_reason.metadata.quarantined_indices`` — computed ONCE here
+        and returned, so transform-mode routing (``_prepare_transform_route``)
+        consumes the same validated set instead of re-deriving it.
 
         A token's effective input fields come from
         ``derive_effective_input_fields``, the helper the single-token path
@@ -1408,8 +1425,15 @@ class RowProcessor:
         violate the "Every token reaches exactly one terminal state — no silent
         drops" invariant (docs/contracts/system-operations.md).
 
+        Returns:
+            The validated in-batch quarantined indices (empty when the plugin
+            quarantined nothing).
+
         Raises:
             FrameworkBugError: A buffered token has no input contract.
+            OrchestrationInvariantError: The quarantine metadata is malformed,
+                or a TRANSFORM-mode emission is non-empty while every
+                buffered input was quarantined.
             DeclarationContractViolation | PluginContractViolation:
                 Any batch-flush declaration contract fires.
                 ``_record_flush_violation`` writes per-token FAILED audit
@@ -1423,6 +1447,13 @@ class RowProcessor:
         else:
             emitted = []
         used_success_empty = result.rows is not None and len(result.rows) == 0
+        quarantined_indices = frozenset(
+            _validated_quarantined_indices(
+                result,
+                buffered_token_count=len(fctx.buffered_tokens),
+                aggregation_name=fctx.settings.name,
+            )
+        )
 
         identity_token = fctx.triggering_token or fctx.buffered_tokens[0]
         transform_node_id_str = str(fctx.node_id)
@@ -1506,13 +1537,22 @@ class RowProcessor:
                     # the OrchestrationInvariantError with its own message.
                     pass
             else:
-                # TRANSFORM mode: batch-homogeneous intersection (ADR-009 §Clause 2).
-                # Every emitted row must preserve the intersection of every
-                # buffered token's input contract — the weakest shared guarantee.
+                # TRANSFORM mode: batch-homogeneous intersection (ADR-009 §Clause 2)
+                # over the inputs that produced output — an input quarantined
+                # in-batch emits nothing and must not shrink the intersection.
                 # The batch-flush dispatcher surfaces the intersection via
                 # ``BatchFlushInputs.effective_input_fields`` (panel F1
                 # resolution: caller-computed; contracts don't re-derive).
-                input_fields = frozenset.intersection(*per_input_field_sets)
+                if emitted:
+                    emitting_field_sets = [fields for index, fields in enumerate(per_input_field_sets) if index not in quarantined_indices]
+                    if not emitting_field_sets:
+                        raise OrchestrationInvariantError(
+                            f"Aggregation {fctx.settings.name!r} emitted {len(emitted)} output row(s) "
+                            f"but all {len(fctx.buffered_tokens)} buffered token(s) were quarantined"
+                        )
+                    input_fields = frozenset.intersection(*emitting_field_sets)
+                else:
+                    input_fields = frozenset.intersection(*per_input_field_sets)
                 run_batch_flush_checks(
                     inputs=BatchFlushInputs(
                         plugin=fctx.transform,
@@ -1543,6 +1583,7 @@ class RowProcessor:
             if record_violation:
                 self._record_flush_violation(fctx, aggregate)
             raise
+        return quarantined_indices
 
     def _record_flush_violation(
         self,
@@ -1786,14 +1827,17 @@ class RowProcessor:
         self,
         fctx: _FlushContext,
         result: TransformResult,
+        *,
+        quarantined_indices: frozenset[int],
     ) -> _PreparedAggregationRoute:
-        """Validate every transform-route precondition without mutating state."""
-        quarantined_index_set = _validated_quarantined_indices(
-            result,
-            buffered_token_count=len(fctx.buffered_tokens),
-            aggregation_name=fctx.settings.name,
-        )
+        """Validate every transform-route precondition without mutating state.
 
+        ``quarantined_indices`` is the set ``_cross_check_flush_output``
+        validated and returned for this same flush result — the one
+        derivation both the cross-check and routing consume. That check has
+        already refused a non-empty emission with every input quarantined,
+        so a non-empty route always has a non-quarantined expansion parent.
+        """
         # Extract output rows
         if result.is_multi_row:
             if result.rows is None:
@@ -1809,7 +1853,7 @@ class RowProcessor:
                 )
             output_rows = (result.row,)
         if len(output_rows) == 0:
-            return _PreparedAggregationRoute(fctx, result, OutputMode.TRANSFORM, (), frozenset(quarantined_index_set), None)
+            return _PreparedAggregationRoute(fctx, result, OutputMode.TRANSFORM, (), quarantined_indices, None)
 
         # Enforce expected_output_count if configured
         if fctx.settings.expected_output_count is not None:
@@ -1821,12 +1865,7 @@ class RowProcessor:
                     f"This is a plugin contract violation."
                 )
 
-        non_quarantined_tokens = tuple(token for index, token in enumerate(fctx.buffered_tokens) if index not in quarantined_index_set)
-        if not non_quarantined_tokens:
-            raise OrchestrationInvariantError(
-                f"Aggregation {fctx.settings.name!r} emitted {len(output_rows)} output row(s) "
-                f"but all {len(fctx.buffered_tokens)} buffered token(s) were quarantined"
-            )
+        non_quarantined_tokens = tuple(token for index, token in enumerate(fctx.buffered_tokens) if index not in quarantined_indices)
         expand_parent_token = (
             fctx.expand_parent_token
             if any(token.token_id == fctx.expand_parent_token.token_id for token in non_quarantined_tokens)
@@ -1837,7 +1876,7 @@ class RowProcessor:
             result=result,
             output_mode=OutputMode.TRANSFORM,
             output_rows=tuple(output_rows),
-            quarantined_indices=frozenset(quarantined_index_set),
+            quarantined_indices=quarantined_indices,
             expansion_parent=expand_parent_token,
         )
 
@@ -1846,24 +1885,23 @@ class RowProcessor:
         fctx: _FlushContext,
         result: TransformResult,
         *,
-        prepared: _PreparedAggregationRoute | None = None,
+        prepared: _PreparedAggregationRoute,
     ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
         """Apply a fully validated transform-mode aggregation route."""
-        plan = prepared or self._prepare_transform_route(fctx, result)
-        if plan.context is not fctx or plan.result is not result:
+        if prepared.context is not fctx or prepared.result is not result:
             raise OrchestrationInvariantError("prepared transform route does not belong to the supplied flush result")
-        if plan.output_mode is not OutputMode.TRANSFORM:
+        if prepared.output_mode is not OutputMode.TRANSFORM:
             raise OrchestrationInvariantError("prepared transform route has the wrong aggregation output mode")
-        output_rows = plan.output_rows
-        quarantined_index_set = set(plan.quarantined_indices)
+        output_rows = prepared.output_rows
+        quarantined_index_set = set(prepared.quarantined_indices)
         if not output_rows:
             return self._route_empty_emission_results(fctx, quarantined_indices=frozenset(quarantined_index_set))
-        if plan.expansion_parent is None:  # pragma: no cover - guaranteed by preparation
+        if prepared.expansion_parent is None:  # pragma: no cover - guaranteed by preparation
             raise OrchestrationInvariantError("non-empty prepared transform route lacks an expansion parent")
 
         results: list[RowResult] = []
         child_items: list[WorkItem] = []
-        expand_parent_token = plan.expansion_parent
+        expand_parent_token = prepared.expansion_parent
         if fctx.buffered_tokens:
             output_contract = output_rows[0].contract
             parent_dispositions = aggregation_parent_dispositions(
@@ -2054,12 +2092,12 @@ class RowProcessor:
                 row_union_name=row_union_name,
             )
 
-        validated_context: list[_FlushContext] = []
+        validated_context: list[tuple[_FlushContext, frozenset[int]]] = []
 
         def validate_success(result: TransformResult, buffered_tokens: Sequence[TokenInfo], batch_id: str) -> None:
             fctx = build_flush_context(buffered_tokens, batch_id)
-            self._cross_check_flush_output(fctx, result)
-            validated_context.append(fctx)
+            quarantined_indices = self._cross_check_flush_output(fctx, result)
+            validated_context.append((fctx, quarantined_indices))
 
         result, buffered_tokens, batch_id = self._aggregation_executor.execute_flush(
             node_id=node_id,
@@ -2096,7 +2134,7 @@ class RowProcessor:
             )
             return self._dispose_failed_flush(disposition), []
 
-        fctx = validated_context[0]
+        fctx, quarantined_indices = validated_context[0]
 
         # Emit TransformCompleted telemetry for all buffered tokens
         for token in buffered_tokens:
@@ -2121,7 +2159,8 @@ class RowProcessor:
             )
             return flush_results, child_items
         if settings.output_mode == OutputMode.TRANSFORM:
-            flush_results, child_items = self._route_transform_results(fctx, result)
+            prepared = self._prepare_transform_route(fctx, result, quarantined_indices=quarantined_indices)
+            flush_results, child_items = self._route_transform_results(fctx, result, prepared=prepared)
             flush_results, _pending_sink_token_ids = self._complete_aggregation_flush(
                 node_id,
                 flush_results,
@@ -4531,9 +4570,12 @@ class RowProcessor:
         if stable_hash(output_data) != receipt.output_hash:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} payloads disagree with its output hash")
         fctx, recovered_result = self._build_committed_aggregation_output_context(receipt, blocked_items, rows)
-        self._cross_check_flush_output(fctx, recovered_result, record_violation=False)
+        # The recovered result carries the receipt's QUARANTINE members as its
+        # quarantined_indices, so the re-check applies the live rule: the
+        # TRANSFORM intersection excludes inputs quarantined in-batch.
+        quarantined_indices = self._cross_check_flush_output(fctx, recovered_result, record_violation=False)
         if receipt.output_mode == OutputMode.TRANSFORM.value:
-            return self._prepare_transform_route(fctx, recovered_result)
+            return self._prepare_transform_route(fctx, recovered_result, quarantined_indices=quarantined_indices)
         if receipt.output_mode != OutputMode.PASSTHROUGH.value:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown output mode")
         self._validate_passthrough_route(fctx, recovered_result)

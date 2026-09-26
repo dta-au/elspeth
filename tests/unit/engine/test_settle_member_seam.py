@@ -168,8 +168,9 @@ def aggregation_flush_processor():
         )
 
         def _flush():
+            prepared = processor._prepare_transform_route(fctx, flush_result, quarantined_indices=frozenset(quarantined_indices))
             with patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")):
-                return processor._route_transform_results(fctx, flush_result)
+                return processor._route_transform_results(fctx, flush_result, prepared=prepared)
 
         return processor, _flush
 

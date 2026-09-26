@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from elspeth.contracts import (
     Determinism,
@@ -928,6 +928,163 @@ class TestFlushOutputJournalDurability:
                 ).scalars()
             )
         assert sink_token_ids == tuple(sorted(input_token_ids))
+
+
+class _QuarantiningCopyBatchTransform(_SumBatchTransform):
+    """Pass-through TRANSFORM-mode batch: copies each row, quarantines rows with ``n == 0``.
+
+    ``drop_field`` makes it strip that field from every copy — a plugin bug the
+    flush cross-check must catch when every emitting input carried the field.
+    """
+
+    name = "quarantining_copy_batch"
+    determinism = Determinism.DETERMINISTIC
+    passes_through_input = True
+
+    def __init__(self, *, drop_field: str | None = None) -> None:
+        super().__init__()
+        self._drop_field = drop_field
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list):
+            self.batch_calls += 1
+            quarantined = [index for index, item in enumerate(row) if item.get("n") == 0]
+            contract = SchemaContract(
+                mode="OBSERVED",
+                fields=tuple(
+                    FieldContract(normalized_name=name, original_name=name, python_type=object, required=False, source="inferred")
+                    for name in ("id", "tag")
+                ),
+                locked=True,
+            )
+            copies = tuple(
+                PipelineRow({key: value for key, value in item.to_dict().items() if key != self._drop_field}, contract)
+                for index, item in enumerate(row)
+                if index not in quarantined
+            )
+            return TransformResult.success_multi(
+                copies,
+                success_reason={"action": "copy_batch", "metadata": {"quarantined_indices": quarantined}},
+            )
+        return TransformResult.success(row, success_reason={"action": "buffer"})
+
+
+@pytest.mark.timeout(120)
+class TestCommittedOutputResumeExcludesInBatchQuarantine:
+    """The resume re-check of a committed aggregation output applies the live rule.
+
+    ``_prepare_committed_aggregation_output`` rebuilds the result's
+    ``quarantined_indices`` from the receipt's QUARANTINE members and re-runs
+    ``_cross_check_flush_output``: the TRANSFORM intersection excludes inputs
+    quarantined in-batch, so a quarantined row lacking ``tag`` neither excuses a
+    receipt whose outputs dropped ``tag`` nor trips an honest one (ADR-009
+    2026-09-26 note).
+    """
+
+    def _crash_after_committed_output(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        transform: _QuarantiningCopyBatchTransform,
+        *,
+        bypass_live_check: bool,
+    ) -> tuple[LandscapeDB, CheckpointManager, Orchestrator, PipelineConfig, ExecutionGraph, CollectSink, Any, str]:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+        from elspeth.engine.processor import RowProcessor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        # Row 3 is quarantined in-batch (n == 0) and lacks 'tag'.
+        source = _LoadCountingSource([{"id": 1, "tag": "x"}, {"id": 2, "tag": "y"}, {"id": 3, "n": 0}], on_success="batch_in")
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+        )
+        real_execute_flush = AggregationExecutor.execute_flush
+        real_cross_check = RowProcessor._cross_check_flush_output
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before aggregation output routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        if bypass_live_check:
+            # Simulates a receipt the live check did not refuse — e.g. one
+            # committed by the pre-fix engine, whose all-token intersection
+            # ({id}) accepted the dropped 'tag'. The run crashes before routing,
+            # so the returned set is never consumed.
+            monkeypatch.setattr(RowProcessor, "_cross_check_flush_output", lambda self, fctx, result, **kwargs: frozenset())
+        with pytest.raises(RuntimeError, match="injected crash before aggregation output routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+        monkeypatch.setattr(RowProcessor, "_cross_check_flush_output", real_cross_check)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            member_actions = tuple(
+                conn.execute(
+                    select(aggregation_result_members_table.c.action).order_by(aggregation_result_members_table.c.ordinal)
+                ).scalars()
+            )
+        assert member_actions == ("consume_batch", "consume_batch", "quarantine")
+        return db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id
+
+    def test_honest_committed_output_with_a_quarantined_non_carrier_resumes(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        transform = _QuarantiningCopyBatchTransform()
+        db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id = self._crash_after_committed_output(
+            tmp_path, monkeypatch, transform, bypass_live_check=False
+        )
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        resumed = orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
+
+        assert resumed.status is RunStatus.COMPLETED_WITH_FAILURES
+        assert output_sink.results == [{"id": 1, "tag": "x"}, {"id": 2, "tag": "y"}]
+        assert transform.batch_calls == 1
+        with db.connection() as conn:
+            terminal_counts = dict(
+                conn.execute(
+                    select(token_outcomes_table.c.path, func.count())
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                    .group_by(token_outcomes_table.c.path)
+                ).all()
+            )
+            token_ids = set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id)).scalars())
+            terminal_token_ids = list(
+                conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).scalars()
+            )
+        assert terminal_counts == {"quarantined_at_source": 1, "batch_consumed": 2, "default_flow": 2}
+        assert sorted(terminal_token_ids) == sorted(token_ids), "every token reaches exactly one terminal outcome"
+
+    def test_committed_output_that_dropped_a_field_every_emitting_input_carried_is_refused_on_resume(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from elspeth.contracts.errors import PassThroughContractViolation
+
+        transform = _QuarantiningCopyBatchTransform(drop_field="tag")
+        db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id = self._crash_after_committed_output(
+            tmp_path, monkeypatch, transform, bypass_live_check=True
+        )
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
+
+        assert exc_info.value.divergence_set == frozenset({"tag"})
+        assert output_sink.results == []
+        assert transform.batch_calls == 1, "resume re-checks the committed output; it never replays the plugin"
 
 
 class _FailBatchTransform(BaseTransform):

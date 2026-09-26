@@ -17,6 +17,7 @@ from elspeth.contracts import TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation, derive_effective_input_fields
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
+    OrchestrationInvariantError,
     PassThroughContractViolation,
     UnexpectedEmptyEmissionViolation,
     ZeroEmissionSuccessContractViolation,
@@ -263,8 +264,9 @@ class TestOptionalFieldAbsentFromPayload:
     carry is not an input the transform can drop. A dropped field is still a
     violation, required or not, when every buffered row carried it (TRANSFORM
     mode) or when the paired row carried it (PASSTHROUGH mode). TRANSFORM mode
-    does not attribute outputs to inputs, so a field only some buffered rows
-    carried is outside the intersection it checks (ADR-009 2026-09-26 note).
+    does not attribute outputs to inputs, so a field only some emitting
+    buffered rows carried is outside the intersection it checks (ADR-009
+    2026-09-26 note).
     """
 
     def test_transform_mode_mixed_batch_without_optional_field_is_honest(self) -> None:
@@ -373,6 +375,71 @@ class TestOptionalFieldAbsentFromPayload:
         rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
         result = TransformResult.success_multi(rows, success_reason={"action": "copy-contract-fields"})
         processor._cross_check_flush_output(fctx, result)
+
+
+def _quarantine_reason(*indices: int) -> Any:
+    return {"action": "replicate", "metadata": {"quarantined_indices": list(indices)}}
+
+
+class TestTransformModeExcludesInBatchQuarantinedInputs:
+    """TRANSFORM mode intersects only over the inputs that produced output.
+
+    An input the plugin quarantined in-batch emits nothing and is recorded
+    FAILURE / QUARANTINED_AT_SOURCE; routing expands the outputs from the
+    non-quarantined tokens only. If its (smaller) field set entered the
+    intersection, a plugin could strip a field every emitting input carried
+    and pass (the quarantine-dilution shape, ADR-009 2026-09-26 note). The
+    quarantined set is the engine-validated one the cross-check returns and
+    routing consumes.
+    """
+
+    def _diluted_tokens(self) -> tuple[SchemaContract, list[TokenInfo]]:
+        contract = make_contract({"id": 1, "tag": "x", "n": 0})
+        return contract, [
+            _make_token("t0", {"id": 1, "tag": "x"}, contract),
+            _make_token("t1", {"id": 2, "tag": "y"}, contract),
+            _make_token("t2", {"id": 3, "n": 0}, contract),  # quarantined in-batch, lacks 'tag'
+        ]
+
+    def test_dropping_a_field_every_emitting_input_carried_fires_despite_a_quarantined_non_carrier(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(2))
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"tag"})
+
+    def test_honest_emission_with_a_quarantined_non_carrier_passes_and_returns_the_validated_set(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1, "tag": "x"}, contract), PipelineRow({"id": 2, "tag": "y"}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(2))
+        assert processor._cross_check_flush_output(fctx, result) == frozenset({2})
+
+    def test_non_empty_emission_with_every_input_quarantined_is_an_invariant_violation(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1, "tag": "x"}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(0, 1, 2))
+        with pytest.raises(OrchestrationInvariantError, match="all 3 buffered token"):
+            processor._cross_check_flush_output(fctx, result)
+
+    def test_zero_emission_with_every_input_quarantined_keeps_the_all_token_branch(self) -> None:
+        """The zero-emission branch is unchanged: can_drop_rows governs it, not the quarantine set."""
+        processor = _make_processor()
+        _contract, tokens = self._diluted_tokens()
+        fctx = _make_fctx(
+            transform=_make_flush_transform(can_drop_rows=True),
+            tokens=tokens,
+            output_mode=OutputMode.TRANSFORM,
+        )
+        result = TransformResult.success_empty(success_reason=_quarantine_reason(0, 1, 2))
+        assert processor._cross_check_flush_output(fctx, result) == frozenset({0, 1, 2})
 
 
 class TestEmptyEmissionGovernance:

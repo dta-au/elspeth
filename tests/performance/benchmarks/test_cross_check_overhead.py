@@ -38,7 +38,9 @@ from elspeth.contracts.declaration_contracts import (
     registered_declaration_contracts,
 )
 from elspeth.contracts.errors import PassThroughContractViolation
+from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.executors.declaration_dispatch import run_post_emission_checks
 from elspeth.engine.executors.pass_through import (
     PassThroughDeclarationContract,
@@ -163,10 +165,13 @@ def test_batch_flush_cross_check_within_budget(benchmark: pytest.FixtureRequest)
 
     Models the ADR-009 §Clause 2 batch-aware path: ``verify_pass_through`` is
     invoked once per emitted row with ``input_fields`` computed as the
-    intersection of every buffered token's ``derive_effective_input_fields``
-    (batch-homogeneous). The
-    benchmark includes the intersection computation plus the per-row
-    verification — the full flush-path cross-check cost for the operator.
+    intersection of ``derive_effective_input_fields`` over the buffered
+    tokens that produced output — the engine validates the plugin's
+    ``quarantined_indices`` with ``validated_quarantined_indices`` and drops
+    those inputs first (TRANSFORM mode, ADR-009 2026-09-26 note). The
+    benchmark includes the quarantine validation, the intersection
+    computation and the per-row verification — the full flush-path
+    cross-check cost for the operator.
 
     Budget rationale: single-token happy path ≤ 25 µs median; 64 rows ≈
     1600 µs upper bound with small intersection cost on top. Setting the
@@ -180,17 +185,24 @@ def test_batch_flush_cross_check_within_budget(benchmark: pytest.FixtureRequest)
     buffered_rows = [PipelineRow({f"field_{i}": f"v{i}" for i in range(200)}, input_contract) for _ in range(batch_size)]
     emitted_rows = [PipelineRow({f"field_{i}": f"v{i}" for i in range(200)}, output_contract) for _ in range(batch_size)]
     static_contract = frozenset(fc.normalized_name for fc in input_contract.fields)
+    # Every buffered input emits (none quarantined): the intersection then
+    # spans all 64 inputs, the costliest case for the filter below.
+    flush_result = TransformResult.success_multi(
+        emitted_rows,
+        success_reason={"action": "bench", "metadata": {"quarantined_indices": []}},
+    )
 
     def run_batch_cross_check() -> None:
-        # Batch-homogeneous input_fields — intersection across every
-        # buffered token's effective input fields. Measures the primitive cost; the live
-        # ``_cross_check_flush_output`` path additionally routes through
-        # ``run_runtime_checks`` and ``PassThroughDeclarationContract`` (ADR-010
-        # §Decision 3), which adds the dispatcher-overhead benchmark's
-        # measured overhead (~15 µs median) on top — well within the 1500 µs
-        # budget for a 64-row batch.
+        # Batch-homogeneous input_fields — intersection across the effective
+        # input fields of every buffered token that produced output. Measures
+        # the primitive cost; the live ``_cross_check_flush_output`` path
+        # additionally routes through ``run_runtime_checks`` and
+        # ``PassThroughDeclarationContract`` (ADR-010 §Decision 3), which adds
+        # the dispatcher-overhead benchmark's measured overhead (~15 µs
+        # median) on top — well within the 1500 µs budget for a 64-row batch.
+        quarantined = validated_quarantined_indices(flush_result, buffered_token_count=batch_size, aggregation_name="bench_batch")
         per_input_field_sets = [derive_effective_input_fields(row) for row in buffered_rows]
-        input_fields = frozenset.intersection(*per_input_field_sets)
+        input_fields = frozenset.intersection(*[fields for index, fields in enumerate(per_input_field_sets) if index not in quarantined])
         verify_pass_through(
             input_fields=input_fields,
             emitted_rows=emitted_rows,

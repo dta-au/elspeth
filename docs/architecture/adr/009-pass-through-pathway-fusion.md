@@ -34,17 +34,44 @@
 > `required: false`) counted that field as an input of the row that lacked
 > it. `batch_replicate` then aborted the run with a Tier-1
 > `PassThroughContractViolation` for a field it never received.
-> What the check still catches: a dropped field that EVERY buffered row
-> carried (TRANSFORM mode) or that the paired row carried (PASSTHROUGH mode)
-> raises, required or optional. What it does not catch: in TRANSFORM mode the
-> intersection cannot attribute an emitted row to the buffered row it came
-> from (§Alternatives #2 rejected per-row attribution), so a field that only
-> some buffered rows carry is outside the intersection, and a drop of it from
-> the rows that did carry it passes this site. Under the contract-only
-> derivation that shape raised only through the same path that aborted every
-> honest mixed batch. Read §Batch-mode semantics' "must preserve what every
-> input contributed" as "must preserve every field that every buffered input
-> carried".
+> What the check still catches: a dropped field that every emitting buffered
+> row carried (TRANSFORM mode) or that the paired row carried (PASSTHROUGH
+> mode) raises, required or optional.
+> In TRANSFORM mode the check is the intersection over the inputs that
+> produced output (inputs the plugin quarantined in-batch are excluded, since
+> they emit nothing and are recorded FAILURE); a field carried by only some of
+> those inputs is outside it, and a drop of it passes this site. Detecting that
+> needs output→input attribution, which §Alternatives #2 rejected. It affects
+> only fields no declaration names (source-inferred, `required: false`);
+> declared fields, optional ones included, are present on every row and stay
+> checked, and no guarantee propagated through `passes_through_input` covers a
+> gap field.
+> The exclusion is engine-side: the flush cross-check validates the plugin's
+> `quarantined_indices` once (`validated_quarantined_indices`) and routing
+> consumes the same set. Before it, a quarantined input lacking a field shrank
+> the intersection, so a plugin could strip that field from every output
+> although every emitting input carried it (measured with `batch_replicate`:
+> exit 1, `tag` gone from both outputs; now exit 4,
+> `PassThroughContractViolation`). A non-empty emission with every input
+> quarantined raises `OrchestrationInvariantError`; a zero-row emission keeps
+> the intersection over every buffered input (`can_drop_rows` governs it). The
+> resume re-check of a committed aggregation output applies the same rule.
+> A union-existence check (every field some input carried must appear on some
+> output) was prototyped and not adopted. Taken over every buffered input it
+> has a measured Tier-1 false positive: an honest `batch_replicate` run aborts
+> (exit 4) when a field's only carrier is quarantined in-batch. Excluding
+> quarantined inputs removes that case, but the check still misses partial
+> drops and adds an obligation nothing declares (every non-quarantined input
+> yields at least one output), which a legitimate N→fewer pass-through
+> transform would trip. For `batch_replicate`, preservation of a field only
+> some rows carry is pinned by exact-row tests
+> (`tests/integration/pipeline/test_pass_through_flush_optional_field.py`,
+> `test_mixed_batch_keeps_the_optional_copies_field_optional`), not by this
+> check or the Clause 4 harness, which drives single-row batches.
+> Under the contract-only derivation the partial-carrier shape raised only
+> through the same path that aborted every honest mixed batch. Read
+> §Batch-mode semantics' "must preserve what every input contributed" as
+> "must preserve every field that every emitting buffered input carried".
 
 ## Context
 

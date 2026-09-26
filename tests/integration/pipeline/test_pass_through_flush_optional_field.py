@@ -48,7 +48,7 @@ _WITH_FIRST = [{"id": 1, "n": 2}, {"id": 2}, {"id": 3, "n": 1}, {"id": 4}]
 _WITHOUT_FIRST = [{"id": 1}, {"id": 2, "n": 3}, {"id": 3}, {"id": 4, "n": 1}]
 
 
-def _settings_file(tmp_path: Path, *, source_schema: dict[str, Any] | None = None) -> Path:
+def _settings_file(tmp_path: Path, *, source_schema: dict[str, Any] | None = None, trigger_count: int = 2) -> Path:
     settings: dict[str, Any] = {
         "sources": {"src": _json_source(tmp_path / "in.jsonl", schema=source_schema)},
         "concurrency": {"max_workers": 1},
@@ -59,7 +59,7 @@ def _settings_file(tmp_path: Path, *, source_schema: dict[str, Any] | None = Non
                 "input": "rows",
                 "on_success": "out",
                 "on_error": "quarantine",
-                "trigger": {"count": 2},
+                "trigger": {"count": trigger_count},
                 "output_mode": "transform",
                 "options": {"schema": {"mode": "observed"}, "copies_field": "n", "default_copies": 1},
             }
@@ -115,14 +115,14 @@ def test_a_mixed_batch_replicates_every_row_with_default_copies_where_absent(tmp
     }
 
 
-def _drop_id_from_every_replica(monkeypatch: pytest.MonkeyPatch) -> None:
-    """batch_replicate loses ``id`` from each replica's payload — a field every buffered row carried."""
+def _drop_field_from_every_replica(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    """batch_replicate loses ``field`` from each replica's payload; its quarantine record is kept."""
 
     def process(self: BatchReplicate, rows: list[PipelineRow], ctx: Any) -> TransformResult:
         result = _REAL_REPLICATE_PROCESS(self, rows, ctx)
         if result.status != "success" or result.rows is None:
             return result
-        dropped = [PipelineRow({k: v for k, v in row.to_dict().items() if k != "id"}, row.contract) for row in result.rows]
+        dropped = [PipelineRow({k: v for k, v in row.to_dict().items() if k != field}, row.contract) for row in result.rows]
         return TransformResult.success_multi(dropped, success_reason=result.success_reason)
 
     monkeypatch.setattr(BatchReplicate, "process", process)
@@ -137,7 +137,7 @@ def test_dropping_a_carried_field_in_the_same_mixed_batch_still_aborts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_schema: dict[str, Any] | None
 ) -> None:
     """Control: the Tier-1 check still fires when the plugin drops a field every buffered row carried."""
-    _drop_id_from_every_replica(monkeypatch)
+    _drop_field_from_every_replica(monkeypatch, "id")
     _write_jsonl(tmp_path / "in.jsonl", _WITH_FIRST)
     settings = _settings_file(tmp_path, source_schema=source_schema)
     runner = CliRunner()
@@ -152,3 +152,71 @@ def test_dropping_a_carried_field_in_the_same_mixed_batch_still_aborts(
     contexts = _pass_through_violation_contexts(tmp_path)
     assert contexts, "the violation is recorded on the buffered tokens' node states"
     assert {tuple(context["divergence_set"]) for context in contexts} == {("id",)}
+
+
+# Quarantine dilution (ADR-009 2026-09-26 note). Row 3's copies count is 0, so
+# batch_replicate quarantines it in-batch (invalid_copies): it emits nothing and
+# is recorded FAILURE / QUARANTINED_AT_SOURCE. It also lacks ``tag``. The
+# TRANSFORM-mode intersection is taken over the inputs that produced output, so
+# row 3 cannot shrink it: ``tag`` stays checked because both emitting rows
+# carried it.
+_DILUTED = [{"id": 1, "tag": "x"}, {"id": 2, "tag": "y"}, {"id": 3, "n": 0}]
+_DILUTED_OUTCOMES = {"failure/quarantined_at_source": 1, "success/default_flow": 2, "transient/batch_consumed": 2}
+
+
+def _completed_outcomes(tmp_path: Path) -> dict[str, int]:
+    return dict(_query(tmp_path, "select outcome || '/' || path, count(*) from token_outcomes where completed = 1 group by 1"))
+
+
+def test_an_in_batch_quarantined_row_lacking_a_field_does_not_excuse_an_honest_batch(tmp_path: Path) -> None:
+    """Honest control: the emitting rows keep ``tag``; the quarantined row routes as recorded."""
+    _write_jsonl(tmp_path / "in.jsonl", _DILUTED)
+    result = _run(_settings_file(tmp_path, trigger_count=len(_DILUTED)))
+
+    assert result.exit_code == 1, result.output  # the routed in-batch quarantine, not an abort (_run refuses a traceback)
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "tag": "x", "copy_index": 0}, {"id": 2, "tag": "y", "copy_index": 0}]
+    assert _pass_through_violation_contexts(tmp_path) == []
+    assert _tokens_without_exactly_one_terminal(tmp_path) == 0
+    assert _completed_outcomes(tmp_path) == _DILUTED_OUTCOMES
+
+
+def test_dropping_a_field_every_emitting_row_carried_aborts_despite_a_quarantined_row_lacking_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quarantined non-carrier must not dilute the check: dropping ``tag`` is a Tier-1 violation."""
+    _drop_field_from_every_replica(monkeypatch, "tag")
+    _write_jsonl(tmp_path / "in.jsonl", _DILUTED)
+    settings = _settings_file(tmp_path, trigger_count=len(_DILUTED))
+    runner = CliRunner()
+    validated = runner.invoke(app, ["validate", "-s", str(settings)])
+    assert validated.exit_code == 0, validated.output
+
+    result = runner.invoke(app, ["run", "-s", str(settings), "--execute"])
+
+    assert result.exit_code == 4, result.output
+    assert "PassThroughContractViolation" in result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == []
+    contexts = _pass_through_violation_contexts(tmp_path)
+    assert contexts, "the violation is recorded on the buffered tokens' node states"
+    assert {tuple(context["divergence_set"]) for context in contexts} == {("tag",)}
+    assert _tokens_without_exactly_one_terminal(tmp_path) == 0
+
+
+def test_a_field_only_some_emitting_rows_carried_is_outside_the_transform_mode_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inherent limit ADR-009's 2026-09-26 note records, pinned so a change to it is visible.
+
+    Both rows emit; only row 1 carried ``tag``. Without output-to-input attribution
+    (rejected by ADR-009 §Alternatives #2) the intersection is ``{id}``, so a drop of
+    ``tag`` passes this site. batch_replicate's preservation of such a field is
+    pinned by the exact-row tests above and
+    ``test_mixed_batch_keeps_the_optional_copies_field_optional``, not by this check.
+    """
+    _drop_field_from_every_replica(monkeypatch, "tag")
+    _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "tag": "x"}, {"id": 2}])
+    result = _run(_settings_file(tmp_path))
+
+    assert result.exit_code == 0, result.output
+    assert _read_jsonl(tmp_path / "out.jsonl") == [{"id": 1, "copy_index": 0}, {"id": 2, "copy_index": 0}]
+    assert _pass_through_violation_contexts(tmp_path) == []

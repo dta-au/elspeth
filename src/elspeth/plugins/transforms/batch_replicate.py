@@ -131,7 +131,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3b2052704496be8f"
+    source_file_hash: str | None = "sha256:7eae6b13382ca8db"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -162,9 +162,7 @@ class BatchReplicate(BaseTransform):
     capability_tags: tuple[str, ...] = ("batch", "deaggregation", "row-expansion")
 
     # Every emitted row deep-copies its originating input before adding
-    # copy_index. Mixed-validity batches may quarantine inputs, but the
-    # pass-through contract applies to emitted rows and batch verification uses
-    # the fields shared by every buffered input (ADR-009 Clause 2).
+    # copy_index.
     passes_through_input = True
 
     # Sound because process() deep-copies each input row and only ADDS

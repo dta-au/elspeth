@@ -3253,7 +3253,9 @@ class TestAggregationFailureMatrix:
         )
         captured: dict[str, TokenInfo] = {}
 
-        bad_result = SimpleNamespace(status="success", is_multi_row=True, rows=None)
+        # success_reason: the flush cross-check validates quarantine metadata in
+        # both output modes before routing reaches the rows=None check.
+        bad_result = SimpleNamespace(status="success", is_multi_row=True, rows=None, success_reason=None)
 
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
@@ -3627,7 +3629,11 @@ class TestAggregationFailureMatrix:
         assert expand_token.call_args.kwargs["parent_token"] == valid_token
 
     def test_transform_mode_out_of_range_quarantined_index_fails_before_expansion(self) -> None:
-        """Malformed batch quarantine metadata must fail before child tokens are created."""
+        """Malformed batch quarantine metadata must fail before child tokens are created.
+
+        The flush cross-check is the one site that validates the metadata; routing
+        consumes the set it returns.
+        """
         _db, _factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         token = make_token_info(row_id="row-a", token_id="token-a", data={"value": 1})
         fctx = _FlushContext(
@@ -3660,7 +3666,7 @@ class TestAggregationFailureMatrix:
             patch.object(processor._token_manager, "expand_token") as expand_token,
             pytest.raises(OrchestrationInvariantError, match="quarantined_indices"),
         ):
-            processor._route_transform_results(fctx, flush_result)
+            processor._cross_check_flush_output(fctx, flush_result)
 
         expand_token.assert_not_called()
 
@@ -3862,7 +3868,11 @@ class TestTransformModeOutcomeOrdering:
             patch.object(processor, "_emit_token_completed"),
             pytest.raises(AuditIntegrityError, match="Failed to atomically record aggregation expansion") as exc_info,
         ):
-            processor._route_transform_results(fctx, flush_result)
+            processor._route_transform_results(
+                fctx,
+                flush_result,
+                prepared=processor._prepare_transform_route(fctx, flush_result, quarantined_indices=frozenset({1})),
+            )
 
         assert isinstance(exc_info.value.__cause__, LandscapeRecordError)
 

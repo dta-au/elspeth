@@ -847,6 +847,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # the executor unable to name the removal, so its source_file_hash moved
 # 7858d4b8d78e3a9e -> b39aa95f4046c12c (same tool); no manifest literal, resume
 # digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, S4 quarantine dilution): a PLUGIN
+# PROVENANCE rotation with no manifest pin. batch_replicate's stale comment on
+# how the batch pass-through check treats quarantined inputs moved into the
+# engine (RowProcessor._cross_check_flush_output), comment-only, so its
+# source_file_hash moved 3b2052704496be8f -> 7eae6b13382ca8db
+# (scripts/cicd/plugin_hash); no manifest literal, resume digest, registry
+# digest or oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

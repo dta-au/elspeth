@@ -256,11 +256,15 @@ drained and repair this release forward.
   received. The aggregation flush's pass-through check now takes each
   buffered row's input fields as the single-row check always has: the fields
   its contract declares and its payload carries. A transform that drops a
-  field still ends the run when every buffered row carried that field
-  (`output_mode: transform`) or when the paired row carried it
-  (`output_mode: passthrough`). In `transform` mode the check cannot tie an
-  output row to the row it came from, so dropping a field that only some
-  buffered rows carried is not detected there.
+  field still ends the run when every buffered row that produced output
+  carried that field (`output_mode: transform`) or when the paired row
+  carried it (`output_mode: passthrough`). A row the transform quarantines
+  inside the batch no longer weakens the `transform`-mode check: before, a
+  quarantined row lacking a field let the transform drop that field from
+  every output and the run finished. The same rule applies when a resumed run
+  re-checks a batch output committed before a crash. In `transform` mode the
+  check cannot tie an output row to the row it came from, so dropping a field
+  that only some of the emitting rows carried is not detected there.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
