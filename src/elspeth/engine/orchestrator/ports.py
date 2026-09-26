@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from elspeth.contracts import RowResult, TokenInfo
     from elspeth.contracts.barrier_scalars import BarrierScalars
     from elspeth.contracts.coordination import CoordinationToken
@@ -74,8 +76,9 @@ class RowProcessingPort(Protocol):
 class AggregationProcessorPort(Protocol):
     """Processor surface needed by aggregation timeout and EOF flushing."""
 
-    def process_token(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
+    def drain_released_continuations(self, continuations: Sequence[WorkItem], ctx: PluginContext) -> list[RowResult]:
+        """Advance every continuation of one out-of-claim flush in one drain."""
+        ...
 
     def check_aggregation_timeout(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError

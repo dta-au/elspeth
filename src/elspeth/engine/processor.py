@@ -5356,15 +5356,47 @@ class RowProcessor:
     def run_barrier_intake(self, ctx: PluginContext) -> list[RowResult]:
         """Public §E.2 intake entry for the orchestrator's EOF loop (§D step 3).
 
-        Runs one intake pass and drives any continuation items (merged
-        coalesce children, flush continuations) through the durable work
-        queue, returning every produced RowResult for the caller's outcome
-        accumulation.
+        Runs one intake pass and drives its continuation items (merged
+        coalesce children, flush continuations) through ONE durable drain
+        (:meth:`drain_released_continuations`), returning every produced
+        RowResult for the caller's outcome accumulation.
         """
         results, child_items = self._run_barrier_intake_pass(ctx)
-        for child_item in child_items:
-            results.extend(self._drain_work_queue(child_item, ctx))
+        results.extend(self.drain_released_continuations(child_items, ctx))
         return results
+
+    def drain_released_continuations(self, continuations: Sequence[WorkItem], ctx: PluginContext) -> list[RowResult]:
+        """Advance every continuation of one out-of-claim barrier release in ONE drain.
+
+        The single authority for the continuations of a release made outside a
+        claim: a timeout or end-of-source aggregation flush
+        (``orchestrator/aggregation.py``) and the orchestrator's end-of-input
+        intake (:meth:`run_barrier_intake`). The release already inserted every
+        continuation READY in its own ``complete_barrier`` transaction, so each
+        enqueue here only reconciles against that row and registers the live
+        item; nothing is claimed early. One claim loop then advances all of
+        them, exactly as the in-claim drain does for its intake children.
+
+        Driving each continuation through its own drain is wrong because a
+        drain claims every READY row of the run: the first continuation's drain
+        also advances its siblings, and the next per-item enqueue then replays
+        a work item that has already moved on (for example a sibling that
+        opened a scope and went terminal as its expand parent), which the
+        scheduler rightly refuses as an incompatible replay.
+
+        An empty release drains nothing: entering the claim loop with no
+        continuation would advance unrelated READY work under this call.
+        """
+        if not continuations:
+            return []
+        pending_items: dict[str, WorkItem] = {}
+        for continuation in continuations:
+            self._enqueue_scheduler_work_item(continuation, pending_items)
+        return self._drain_scheduler_claims(
+            ctx=ctx,
+            pending_items=pending_items,
+            recover_pending_sinks=False,
+        )
 
     def has_blocked_barrier_work(self) -> bool:
         """Whether any durable BLOCKED barrier holds remain (§D step-3 loop condition)."""

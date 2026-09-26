@@ -550,7 +550,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 2
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [downstream_result]
+        processor.drain_released_continuations.return_value = [downstream_result]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -564,8 +564,9 @@ class TestCheckAggregationTimeouts:
         )
 
         assert result.rows_succeeded == 1
-        processor.process_token.assert_called_once()
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
+        processor.drain_released_continuations.assert_called_once()
+        continuations = processor.drain_released_continuations.call_args.args[0]
+        assert [item.current_node_id for item in continuations] == [NodeID("continue-node")]
 
     def test_work_items_with_coalesce_node(self) -> None:
         """Work items can carry an explicit coalesce node continuation."""
@@ -584,7 +585,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = []
+        processor.drain_released_continuations.return_value = []
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -597,9 +598,8 @@ class TestCheckAggregationTimeouts:
             agg_transform_lookup=lookup,
         )
 
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
-        assert processor.process_token.call_args.kwargs["coalesce_node_id"] == NodeID("coalesce::merge")
-        assert processor.process_token.call_args.kwargs["coalesce_name"] == "merge"
+        # The flush's own continuation, with its coalesce cursor, reaches the one drain unchanged.
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [work_item]
 
     def test_downstream_routed_outcome(self) -> None:
         """ROUTED outcome from downstream is tracked."""
@@ -615,7 +615,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [routed]
+        processor.drain_released_continuations.return_value = [routed]
 
         pending: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {"output": [], "risk_sink": []}
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -648,7 +648,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [quarantined]
+        processor.drain_released_continuations.return_value = [quarantined]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -677,7 +677,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [coalesced]
+        processor.drain_released_continuations.return_value = [coalesced]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -707,7 +707,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [failed]
+        processor.drain_released_continuations.return_value = [failed]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -742,7 +742,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [completed]
+        processor.drain_released_continuations.return_value = [completed]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -776,7 +776,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = outcomes
+        processor.drain_released_continuations.return_value = outcomes
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -941,7 +941,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [downstream]
+        processor.drain_released_continuations.return_value = [downstream]
 
         pending = _make_pending()
 
@@ -953,6 +953,40 @@ class TestFlushRemainingAggregationBuffers:
         )
 
         assert result.rows_succeeded == 1
+
+    def test_every_continuation_of_one_flush_reaches_one_drain(self) -> None:
+        """A multi-row release hands ALL its continuations to one drain, never one drain per continuation.
+
+        A drain claims every READY row of the run, so a per-continuation drain
+        also advances the siblings and then replays their stale READY images.
+        """
+        first = _make_work_item(token=make_token_info(token_id="tok-1"), current_node_id=NodeID("continue-node"))
+        second = _make_work_item(token=make_token_info(token_id="tok-2"), current_node_id=NodeID("continue-node"))
+        downstream = [
+            _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=item.token, sink_name="output")
+            for item in (first, second)
+        ]
+
+        agg_transform = _make_batch_transform(node_id="agg-1")
+        config = _make_config(
+            transforms=[agg_transform, _TransformPlaceholder("continue-node")],
+            aggregation_settings={"agg-1": _make_agg_settings()},
+        )
+        processor = _make_processor()
+        processor.get_aggregation_buffer_count.return_value = 2
+        processor.handle_timeout_flush.return_value = ([], [first, second])
+        processor.drain_released_continuations.return_value = downstream
+
+        result = flush_remaining_aggregation_buffers(
+            config=config,
+            processor=processor,
+            ctx=_make_context(),
+            pending_tokens=_make_pending(),
+        )
+
+        processor.drain_released_continuations.assert_called_once()
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [first, second]
+        assert result.rows_succeeded == 2
 
     def test_downstream_routed_tokens_counted(self) -> None:
         """ROUTED downstream outcome is counted correctly."""
@@ -967,7 +1001,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [routed]
+        processor.drain_released_continuations.return_value = [routed]
 
         pending: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {"output": [], "risk": []}
 
@@ -995,7 +1029,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [coalesced]
+        processor.drain_released_continuations.return_value = [coalesced]
 
         pending = _make_pending()
 
@@ -1054,7 +1088,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [failed]
+        processor.drain_released_continuations.return_value = [failed]
 
         pending = _make_pending()
 
@@ -1086,7 +1120,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [completed]
+        processor.drain_released_continuations.return_value = [completed]
 
         pending = _make_pending()
 
@@ -1113,7 +1147,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [quarantined]
+        processor.drain_released_continuations.return_value = [quarantined]
 
         pending = _make_pending()
 
@@ -1143,7 +1177,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = outcomes
+        processor.drain_released_continuations.return_value = outcomes
 
         pending = _make_pending()
 
@@ -1174,7 +1208,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = []
+        processor.drain_released_continuations.return_value = []
 
         pending = _make_pending()
 
@@ -1185,8 +1219,8 @@ class TestFlushRemainingAggregationBuffers:
             pending_tokens=pending,
         )
 
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
-        assert processor.process_token.call_args.kwargs["coalesce_node_id"] == NodeID("coalesce::merge")
+        # The flush's own continuation, with its coalesce cursor, reaches the one drain unchanged.
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [work_item]
 
     def test_completed_result_branch_fallback_to_sink_name(self) -> None:
         """Completed result with branch not in pending routes to sink_name from result."""
