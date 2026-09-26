@@ -170,7 +170,7 @@ def _rag_query_template() -> Iterator[tuple[Mock, Callable[[], Any]]]:
         }
     )
     # on_start builds the provider and makes no network call (readiness is runtime_preflight's).
-    transform.on_start(make_context(run_id="run-1", node_id="rag-retrieval", landscape=Mock()))
+    transform.on_start(make_context(run_id="run-1", node_id="rag-retrieval"))
     row = PipelineRow({"question": "refunds?"}, SchemaContract(mode="OBSERVED", fields=()))
     ctx = make_context(run_id="run-1", state_id="state-1", token=make_token_info(token_id="token-1"))
     chunks = [RetrievalChunk(content="Section 1", score=0.9, source_id="doc1", metadata={})]
