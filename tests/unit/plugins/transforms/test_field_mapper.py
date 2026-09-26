@@ -1000,6 +1000,58 @@ class TestOutputSchemaConfig:
         assert declared.carried_output_fields() == frozenset({"Name"})
         assert undeclared.carried_output_fields() == frozenset({"Name"})
 
+    @pytest.mark.parametrize(
+        ("mapping", "shadowed"),
+        [
+            pytest.param({"Name": "ID"}, {"ID": "id"}, id="header-source-target-spells-a-kept-field"),
+            pytest.param({"Name": "Name"}, {}, id="identity-by-header-restores-the-header"),
+            pytest.param({"First Name": "FIRST_NAME"}, {}, id="target-respells-the-field-the-rename-removes"),
+            pytest.param({"Name": "given"}, {}, id="canonical-target"),
+        ],
+    )
+    def test_a_target_spelling_a_field_the_row_keeps_is_refused_before_the_write(
+        self, mapping: dict[str, str], shadowed: dict[str, str]
+    ) -> None:
+        """The field-name spelling rule where the executor abstains (an original-header source, 2026-09-25).
+
+        ``{Name: ID}`` over header ``ID`` wrote ``ID`` beside ``id``: a created
+        name shadowing a field the row keeps. The executor preflight cannot see
+        it (the removal is unnameable at construction), so ``process`` applies the
+        rule's predicate against the exact removal it is about to make. A target
+        that respells the field the rename removes is a restored header, not a
+        shadow.
+        """
+        from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
+        from elspeth.contracts.schema_contract import FieldContract
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"mapping": mapping, "schema": {"mode": "observed"}})
+        assert transform.forwards_input_fields is False
+        row = PipelineRow(
+            {"id": "1", "name": "Ann", "first_name": "A"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    FieldContract(normalized_name="id", original_name="ID", python_type=str, required=False, source="inferred"),
+                    FieldContract(normalized_name="name", original_name="Name", python_type=str, required=False, source="inferred"),
+                    FieldContract(
+                        normalized_name="first_name", original_name="First Name", python_type=str, required=False, source="inferred"
+                    ),
+                ),
+                locked=True,
+            ),
+        )
+
+        if shadowed:
+            with pytest.raises(HeaderSpelledDeclarationViolation) as excinfo:
+                transform.process(row, make_context())
+            reason = excinfo.value.to_transform_error_reason()
+            assert reason["reason"] == "target_is_header_spelling"
+            assert dict(zip(reason["fields"], reason["canonical_fields"], strict=True)) == shadowed
+            assert "Ann" not in str(excinfo.value)
+        else:
+            assert transform.process(row, make_context()).status == "success"
+
     def test_a_header_spelled_source_is_never_matched_to_its_normalized_declaration(self) -> None:
         """``{"First Name": "given"}`` abstains from reading ``first_name: str`` as the source's declaration (review-S1a-r2 F2).
 

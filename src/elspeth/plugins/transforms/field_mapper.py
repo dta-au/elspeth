@@ -18,7 +18,8 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
-from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.errors import HeaderSpelledDeclarationViolation, PluginContractViolation
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
@@ -313,7 +314,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7858d4b8d78e3a9e"
+    source_file_hash: str | None = "sha256:b39aa95f4046c12c"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -409,6 +410,14 @@ class FieldMapper(BaseTransform):
             if self.forwards_input_fields
             else frozenset()
         )
+
+        # Every mapping target is a created name (the field-name spelling rule,
+        # operator ruling 2026-09-25). Where this node forwards its input but
+        # the executor's preflight cannot name what it removes (an unresolved
+        # original-header source), ``process`` checks a target against the row
+        # it forwards; the candidates are fixed by config, so they are
+        # computed once.
+        self._target_spellings = DeclaredSpellings.of(reads=(), creates=cfg.mapping.values())
 
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,
@@ -733,6 +742,25 @@ class FieldMapper(BaseTransform):
                     f"{sorted(collisions)}. This is a pipeline configuration error — the transform's "
                     f"output fields collide with fields already present in the row."
                 )
+
+            # The spelling twin of the check above, for the same unnameable
+            # class: the executor preflight checks created names against what a
+            # node forwards only where ``removed_input_fields`` names it, and an
+            # original-header source abstains from that. So a target that is a
+            # header spelling of a field this row keeps (``{Name: ID}`` over
+            # header ``ID``: ``ID`` would land beside ``id``) is found here,
+            # against the exact removal ``process`` is about to make, before
+            # the payload is touched, with the rule's one predicate.
+            if not self.forwards_input_fields and self._target_spellings.creates:
+                removed = {
+                    source if source in row_data else row.contract.resolve_name(source)
+                    for source in self._mapping
+                    if "." not in source and source in row
+                }
+                forwarded = frozenset(row_data) - removed
+                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded)
+                if spellings:
+                    raise HeaderSpelledDeclarationViolation(component=f"Transform '{self.name}'", spellings=spellings)
 
         # Start with empty or copy depending on select_only
         if self._select_only:

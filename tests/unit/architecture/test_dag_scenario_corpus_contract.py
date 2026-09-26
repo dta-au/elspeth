@@ -841,6 +841,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # that declaration as a read), so its source_file_hash moved df53a6bf11f5e647
 # -> 7858d4b8d78e3a9e (same tool); no manifest literal, resume digest, registry
 # digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, field-name spelling rule, review): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper checks a rename
+# target against the row it forwards where an original-header source leaves
+# the executor unable to name the removal, so its source_file_hash moved
+# 7858d4b8d78e3a9e -> b39aa95f4046c12c (same tool); no manifest literal, resume
+# digest, registry digest or oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

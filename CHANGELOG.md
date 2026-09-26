@@ -144,7 +144,7 @@ drained and repair this release forward.
   under a declared schema), crashed with `Duplicate original_name` leaving the
   row with no outcome (a `value_transform` target `Name` over header `Name`),
   silently shadowed the field (target `Name` over header `NAME`, `field_mapper`
-  `{id: Name}`), or crashed a csv/json sink's write (a header-spelled custom
+  `{id: Name}` or `{Name: ID}`), or crashed a csv/json sink's write (a header-spelled custom
   `headers` key). A `required_input_fields` verdict for a header spelling of a
   guaranteed field now names the normalized spelling. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:

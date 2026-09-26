@@ -426,6 +426,19 @@ def test_a_field_mapper_rename_target_spelling_an_arriving_field_routes(tmp_path
     _assert_routed(tmp_path, result, reason=_CREATE, literal="Name", canonical="name")
 
 
+def test_a_header_source_rename_whose_target_spells_a_kept_field_routes(tmp_path: Path) -> None:
+    """``{Name: ID}`` over header ``ID,Name`` wrote ``ID`` beside ``id`` (exit 0).
+
+    The source is an original header, so the executor cannot name what the
+    rename removes and abstains; field_mapper checks the target against the
+    row it forwards, before the write.
+    """
+    mapper = _transform("field_mapper", {"mapping": {"Name": "ID"}, "schema": _OBSERVED})
+    result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[mapper]))
+
+    _assert_routed(tmp_path, result, reason=_CREATE, literal="ID", canonical="id")
+
+
 def test_a_rename_that_restores_the_header_is_not_a_shadow(tmp_path: Path) -> None:
     """``{name: Name}`` removes 'name' and writes 'Name': nothing arriving is shadowed."""
     mapper = _transform("field_mapper", {"mapping": {"name": "Name"}, "schema": _OBSERVED})
