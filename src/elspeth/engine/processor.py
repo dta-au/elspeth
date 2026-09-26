@@ -1391,7 +1391,10 @@ class RowProcessor:
           checked against the intersection of all buffered tokens' effective
           input fields (ADR-007 table line 53). This is the weakest shared
           guarantee — a transform claiming ``passes_through_input=True`` must
-          preserve what every input contributed.
+          preserve every field that every buffered input carried. Outputs are
+          not attributed to inputs in this mode, so a drop of a field only
+          some buffered inputs carried is not detected here (ADR-009
+          2026-09-26 note).
 
         A token's effective input fields come from
         ``derive_effective_input_fields``, the helper the single-token path

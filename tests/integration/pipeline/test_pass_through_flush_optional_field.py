@@ -15,7 +15,7 @@ the contract declares AND the payload carries (elspeth-5887fb7928 S4).
 
 Every case is a real ``elspeth run --execute`` (in-process CLI). The control
 cases prove the Tier-1 check still fires in the same mixed-batch shape when
-the plugin drops a field the rows actually carried.
+the plugin drops a field every buffered row carried.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _drop_id_from_every_replica(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_dropping_a_carried_field_in_the_same_mixed_batch_still_aborts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_schema: dict[str, Any] | None
 ) -> None:
-    """Control: the Tier-1 check still fires when the plugin drops a field the rows actually carried."""
+    """Control: the Tier-1 check still fires when the plugin drops a field every buffered row carried."""
     _drop_id_from_every_replica(monkeypatch)
     _write_jsonl(tmp_path / "in.jsonl", _WITH_FIRST)
     settings = _settings_file(tmp_path, source_schema=source_schema)

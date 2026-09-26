@@ -157,9 +157,10 @@ class PassThroughDeclarationContract(DeclarationContract):
     ) -> None:
         """Single-token path (TransformExecutor).
 
-        ``inputs.effective_input_fields`` is caller-derived from
-        ``input_row.contract.fields`` — contracts do NOT re-derive
-        (panel F1 resolution).
+        ``inputs.effective_input_fields`` is derived by the caller with
+        ``derive_effective_input_fields`` (the contract fields the input
+        row's payload carries) — contracts do NOT re-derive (panel F1
+        resolution).
         """
         transform_node_id = inputs.plugin.node_id
         if transform_node_id is None:

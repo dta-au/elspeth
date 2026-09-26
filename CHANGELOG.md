@@ -154,7 +154,11 @@ drained and repair this release forward.
   received. The aggregation flush's pass-through check now takes each
   buffered row's input fields as the single-row check always has: the fields
   its contract declares and its payload carries. A transform that drops a
-  field its rows did carry still ends the run.
+  field still ends the run when every buffered row carried that field
+  (`output_mode: transform`) or when the paired row carried it
+  (`output_mode: passthrough`). In `transform` mode the check cannot tie an
+  output row to the row it came from, so dropping a field that only some
+  buffered rows carried is not detected there.
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

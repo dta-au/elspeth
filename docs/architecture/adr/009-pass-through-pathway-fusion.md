@@ -33,13 +33,18 @@
 > batch mixing rows with and without an optional field (the source records it
 > `required: false`) counted that field as an input of the row that lacked
 > it. `batch_replicate` then aborted the run with a Tier-1
-> `PassThroughContractViolation` for a field it never received. A field a
-> row carries and the transform drops still raises.
-> The accepted trade-off (§Alternatives #2) now covers payload heterogeneity
-> as well as contract heterogeneity. In TRANSFORM mode, a field that only
-> some buffered rows carry is outside the intersection. A drop of it from the
-> rows that did carry it is therefore not caught at this site. PASSTHROUGH
-> mode still checks each pair.
+> `PassThroughContractViolation` for a field it never received.
+> What the check still catches: a dropped field that EVERY buffered row
+> carried (TRANSFORM mode) or that the paired row carried (PASSTHROUGH mode)
+> raises, required or optional. What it does not catch: in TRANSFORM mode the
+> intersection cannot attribute an emitted row to the buffered row it came
+> from (§Alternatives #2 rejected per-row attribution), so a field that only
+> some buffered rows carry is outside the intersection, and a drop of it from
+> the rows that did carry it passes this site. Under the contract-only
+> derivation that shape raised only through the same path that aborted every
+> honest mixed batch. Read §Batch-mode semantics' "must preserve what every
+> input contributed" as "must preserve every field that every buffered input
+> carried".
 
 ## Context
 
