@@ -329,10 +329,14 @@ payloads when checked before landing.
 - **Cost:** one extra `has_released_group_for_node` point lookup on the
   first late arrival against a key whose flavor is unknown in memory
   (restore-seeded or FIFO-evicted). Subsequent arrivals hit the cache.
-- **Not changed:** row_union's reasons and their readers; `CollectorOutcome`'s
+- **Not changed:** row_union's reasons and their readers. `CollectorOutcome`'s
   other failure reasons (`collector_missing_members`,
-  `collector_transform_error`), which are collector-plugin outcomes rather
-  than group-settlement dispositions and stay as plain strings.
+  `collector_transform_error`) are collector-plugin outcomes rather than
+  group-settlement dispositions, so this enum does not carry them. They have
+  their own closed vocabulary, `CollectorGroupFailureReason`, which
+  `collector_group_failures.failure_reason` stores under a CHECK (Landscape
+  epoch 45) and which each failed member's hold names together with its
+  `group_id`.
 
 ## Alternatives Considered
 

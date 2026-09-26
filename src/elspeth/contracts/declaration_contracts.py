@@ -213,8 +213,9 @@ class PreEmissionInputs:
     rather than to a downstream crash inside ``process()``.
 
     Panel F1 resolution (no ``override_input_fields`` sentinel): the caller
-    (``TransformExecutor``) derives ``effective_input_fields`` from
-    ``input_row.contract.fields`` once and passes it in. Contracts MUST use
+    (``TransformExecutor``) derives ``effective_input_fields`` once with
+    :func:`derive_effective_input_fields` (the fields the row's contract
+    declares AND its payload carries) and passes it in. Contracts MUST use
     ``effective_input_fields`` and MUST NOT derive it themselves — the
     caller-side derivation prevents the B-antipattern where each contract
     re-implements the derivation and they drift.

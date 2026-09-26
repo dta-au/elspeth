@@ -2457,7 +2457,12 @@ source calls, stores verification decisions, and assigns fenced occurrence
 indices to operations created under the run leader. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 Epoch 45 adds an immutable collector-group failure verdict per group so the
-run result can count structural failures independently of failed rows.
+run result can count structural failures independently of failed rows. The
+verdict's `failure_reason` is the closed `CollectorGroupFailureReason`
+vocabulary under a CHECK (`ck_collector_group_failures_failure_reason`), and
+each failed member's hold names its `group_id`. A Landscape store created by
+an earlier 0.8.1 pre-release build lacks that CHECK and is refused at startup
+even though it reports epoch 46; recreate it.
 Epoch 46 stores each valid source row's exact contract in `rows.source_contract_json`.
 Replay and verify use that row-level evidence when sparse sources add fields
 after the first row; older Landscape stores must be recreated.

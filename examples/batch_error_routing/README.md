@@ -67,12 +67,15 @@ and 3 were routed, which is all 12.
 
 `settings.yaml`:
 
+The totals are the batches A-001..A-003, A-004..A-006 and A-010..A-012, in
+that order:
+
 ```console
 $ cat examples/batch_error_routing/output/totals.csv
 batch_size,count,mean,sum
-3,3,148.33333333333334,445      # A-001..A-003
-3,3,155,465                     # A-004..A-006
-3,3,126.66666666666667,380      # A-010..A-012
+3,3,148.33333333333334,445
+3,3,155,465
+3,3,126.66666666666667,380
 
 $ cat examples/batch_error_routing/output/failed_batches.csv
 amount,order_id,region
@@ -88,15 +91,17 @@ there because their batch failed, and the audit trail says so.
 `settings_discard.yaml` writes the same three totals to `totals_discard.csv`
 and no failed-rows file.
 
-`settings_declared.yaml`:
+`settings_declared.yaml` sums in cents. Its totals are the batches
+A-001..A-003, A-004..A-006, A-007, A-009 and A-010, and finally A-011 and
+A-012, which are flushed at end of source:
 
 ```console
 $ cat examples/batch_error_routing/output/totals_declared.csv
 batch_size,count,mean,sum
-3,3,14833.333333333334,44500    # A-001..A-003, in cents
-3,3,15500,46500                 # A-004..A-006
-3,3,14166.666666666666,42500    # A-007, A-009, A-010
-2,2,8750,17500                  # A-011, A-012, flushed at end of source
+3,3,14833.333333333334,44500
+3,3,15500,46500
+3,3,14166.666666666666,42500
+2,2,8750,17500
 
 $ cat examples/batch_error_routing/output/failed_rows_declared.csv
 amount,order_id,region
@@ -298,11 +303,14 @@ WHERE t.run_id = (SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1)
   `settings_declared.yaml` eleven orders reach the aggregation and the last
   two are flushed at end of source.
 - A value of the wrong **type** always fails the batch. A missing amount
-  (`null`) or a non-finite float does not: `batch_stats` skips that row and
-  reports it on the total it writes (`skipped_missing`,
-  `skipped_missing_indices`, or the `skipped_non_finite` pair), unless no
+  (`null`) does not: `batch_stats` skips that row and reports it on the
+  total it writes (`skipped_missing`, `skipped_missing_indices`), unless no
   row in the batch has a usable amount, in which case the batch fails too,
-  since there is nothing to sum.
+  since there is nothing to sum. `batch_stats` treats a non-finite float the
+  same way (the `skipped_non_finite` pair), but none reaches it in this
+  example: the JSON source rejects `NaN` and `Infinity` when it parses the
+  line, and `on_validation_failure: discard` drops that order before the
+  aggregation.
 - Those `skipped_*` columns appear only on a total that skipped a row. The
   CSV sinks here fix their columns from the first row written, so such a
   total arriving after a clean one cannot be written: the sink records it as

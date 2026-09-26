@@ -4876,11 +4876,12 @@ class RowProcessor:
             barrier_key=str(node_id),
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=tuple(emissions),
-            # The later in-process continuation loop invokes process_token for
-            # these same WorkItems. Its idempotent enqueue reconciles against
+            # These same WorkItems are advanced after the commit: in a claim by
+            # the drain's intake enqueue, outside one by
+            # drain_released_continuations. Either enqueue reconciles against
             # the rows inserted here by deterministic work_item_id and strict
-            # field equality; a crash before that loop leaves durable READY
-            # work for resume instead of losing the continuation.
+            # field equality; a crash before that leaves durable READY work
+            # for resume instead of losing the continuation.
             emitted_ready=tuple(self._work_codec.ready_emission(item) for item in child_items),
             # §E.3 per-firing-group snapshot: this batch's adopted members.
             intake_snapshot_token_ids=frozenset(token.token_id for token in buffered_tokens),
