@@ -90,25 +90,20 @@ class QueryBuilder:
                 )
             )
 
-        if self._compiled_template is None and type(extracted) is not str:
-            return self._wrong_type(extracted)
-
         if self._compiled_template is not None:
             return self._build_template(extracted, row_data)
-        elif self._compiled_pattern is not None:
-            return self._build_regex(extracted)
-        else:
-            return self._build_field_only(extracted)
 
-    def _build_field_only(self, extracted: Any) -> QueryResult:
-        # build() routes observed wrong types before dispatch. Keep this guard
-        # for direct private calls so bytes cannot become a successful query:
-        # bytes.strip() and bool(b"x") both succeed, so a bytes value would
-        # otherwise PASS _validate_non_empty as QueryResult(query=b"...").
+        # The ONE type check for the modes that USE the value as the query.
         # Returned rather than raised: it is a fact about this row's data, like
-        # the missing and None cases in build(), so it takes the same exit.
+        # the missing and None cases above, so it takes the same exit. Field-only
+        # mode needs it because bytes.strip() and bool(b"x") both succeed, so a
+        # bytes value would otherwise become QueryResult(query=b"..."); regex
+        # mode needs it BEFORE the worker, so that any exception the worker
+        # raises is the worker's fault, never the row's.
         if type(extracted) is not str:
             return self._wrong_type(extracted)
+        if self._compiled_pattern is not None:
+            return self._build_regex(extracted)
         return self._validate_non_empty(extracted)
 
     def _wrong_type(self, extracted: Any) -> QueryResult:
@@ -151,16 +146,9 @@ class QueryBuilder:
             )
         return self._validate_non_empty(query)
 
-    def _build_regex(self, extracted: Any) -> QueryResult:
+    def _build_regex(self, extracted: str) -> QueryResult:
         assert self._compiled_pattern is not None  # guaranteed by build() guard
         assert self._regex_pool is not None  # created when pattern is compiled
-
-        # Checked BEFORE the worker (build() already routed a wrong type; this
-        # keeps the invariant local): re.Pattern.search() rejects a non-str
-        # with its own TypeError, and after this check any exception from the
-        # worker is the worker's fault, never the row's.
-        if type(extracted) is not str:
-            return self._wrong_type(extracted)
 
         future = self._regex_pool.submit(run_regex_worker, self._compiled_pattern, extracted)
         try:
