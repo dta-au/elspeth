@@ -431,17 +431,21 @@ a count that transiently matches a sibling branch's plugin set was never real.
 plugin class's `process` through the class's own code.
 For each class under `src/elspeth/plugins` whose `process` is defined in its
 own module (on the class or a same-module base), the gate starts at `process`
-and follows every reference to a method of the class or a same-module base
-(`self.`/`cls.`/`ClassName.`, called or passed as a callback) and to a
-module-level function of that module; a `raise TypeError` reached that way
-fails unless a `try` on the path catches it without re-raising. The reviewed
-expected set is empty.
+and follows every reference, called or passed as a callback, to a method of
+the class or a same-module base (`self.`/`cls.`/`ClassName.`, and `super().`
+into a same-module ancestor), to a method of another class in the same module
+(`_Checks.numeric`), to a module-level function of that module, and to every
+function a module-level dispatch-table literal holds. A `raise TypeError(...)`,
+or a `raise err` after `err = TypeError(...)` in the same function, reached that
+way fails unless a `try` on the path catches it without re-raising. The
+reviewed expected set is empty.
 
 **Does not see.** A class that inherits `process` from another module is never
 a root (6 of the 38 registered transforms: the Bedrock and Azure safety
 transforms, Azure AI Search and RAG retrieval). The gate does not follow a
-composed helper object (`self._builder.build(...)`) or anything imported from
-another module, and it does not see implicit raises. The RAG query builder's
+composed helper object (`self._builder.build(...)`), anything imported from
+another module, or dispatch through a class/instance-attribute table or
+`getattr`, and it does not see implicit raises. The RAG query builder's
 two `raise TypeError` sites (`transforms/rag/query.py`), which aborted runs
 until 11f5475d8 fixed them, were outside its reach at 74c0ce0db. Passing
 the gate does not prove a plugin cannot abort the run; the docstring lists

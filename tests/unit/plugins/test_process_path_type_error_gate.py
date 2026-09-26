@@ -22,13 +22,25 @@ What it flags
 For every class in every module under ``src/elspeth/plugins``, start at the
 class's ``process`` method (its own or one inherited from a base class defined
 in the same module) and follow every reference to another function in scope:
-``self.<m>`` / ``cls.<m>`` / ``<ThisClass>.<m>`` (methods of the class and its
-same-module bases, a subclass override winning) and bare names of module-level
-functions. A reference counts whether it is called or passed as a callback. A
-``raise TypeError`` reached this way is reported unless some ``try`` on the path
-(at the raise itself or at any reference that led to it) has a handler that
-catches ``TypeError``, ``Exception``, ``BaseException`` or everything, and that
-handler does not re-raise.
+
+* ``self.<m>`` / ``cls.<m>`` / ``<ThisClass>.<m>``: methods of the class and its
+  same-module bases, a subclass override winning;
+* ``super().<m>``: ``<m>`` on every same-module ancestor of the class whose
+  method makes the call (every one, not only the next in the MRO, so the walk
+  can only over-reach);
+* ``<OtherClass>.<m>``: a method of another class defined in the same module
+  (a static helper such as ``_Checks.numeric(v)``);
+* bare names of module-level functions;
+* the name of a module-level dispatch table (a dict, list, tuple or set
+  literal assigned at module level): every function or ``<Class>.<m>`` it holds.
+
+A reference counts whether it is called or passed as a callback. A
+``raise TypeError(...)``, or a ``raise err`` whose name the same function bound
+with ``err = TypeError(...)``, reached this way is reported unless some ``try``
+on the path (at the raise itself or at any reference that led to it) has a
+handler that catches ``TypeError``, ``Exception``, ``BaseException`` or
+everything, and that handler does not re-raise (``raise``, ``raise exc`` and
+``raise exc.with_traceback(...)`` of the bound name are re-raises).
 
 At base 74c0ce0db this flagged exactly the twelve original sites and nothing
 else. Scoped to ``TypeError`` deliberately: widening to ``ValueError``,
@@ -53,12 +65,17 @@ through the shapes the twelve original sites used. It is blind to:
   same module or another. This is the shape of the RAG query builder
   (``transforms/rag/query.py``), whose two ``raise TypeError`` sites aborted
   runs at 74c0ce0db and were fixed separately; the gate did not see them;
-* helper functions and classes imported from another module;
+* helper functions and classes imported from another module, and a
+  ``super()`` call that resolves to a base in another module;
+* dispatch that is not a module-level literal: a table held as a class or
+  instance attribute (``self._CHECKS[kind]``), built inside a function, or
+  filled at runtime, and name-based dispatch (``getattr(self, name)``);
 * implicit raises (``float(x)``, ``x < 1`` on a str, ``row[missing]``);
 * raises inside nested functions and lambdas (a new scope);
 * a ``TypeError`` subclass raised under its own name;
-* a ``TypeError`` bound to a name and raised later (``err = TypeError(...)``
-  then ``raise err``);
+* a ``TypeError`` built anywhere but a direct ``TypeError(...)`` call bound in
+  the raising function (``err = self._make_error()`` then ``raise err``, or a
+  name bound in another function);
 * a bare ``raise`` that re-raises a caught ``TypeError`` from inside a handler.
 
 The escape hatch
@@ -102,9 +119,10 @@ _NEW_SCOPE = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 REVIEWED_PROCESS_PATH_TYPE_ERRORS: tuple[str, ...] = ()
 
 # Anti-vacuity floor: how many plugin classes the scan roots at a process
-# method. Measured 2026-09-24 on the lane tree (36). A walk that silently
-# stopped seeing the plugin tree would report zero findings, which is exactly
-# what a clean tree reports.
+# method. Measured 2026-09-24 on the lane tree (36), and 36 again on
+# 2026-09-26. A walk that silently stopped seeing the plugin tree would report
+# zero findings, which is exactly what a clean tree reports;
+# test_a_scan_that_stopped_seeing_the_plugin_tree_fails_the_floor pins it.
 MIN_PROCESS_ROOTS = 36
 
 
@@ -125,6 +143,8 @@ class ProcessPathRaise:
 class _Function:
     qualname: str
     node: ast.FunctionDef | ast.AsyncFunctionDef
+    # The class whose body defines it; None for a module-level function.
+    owner: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +231,7 @@ def _class_methods(
             methods.update(_class_methods(module_classes[base.id], module_classes, seen | {cls.name}))
     for statement in cls.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            methods[statement.name] = _Function(f"{cls.name}.{statement.name}", statement)
+            methods[statement.name] = _Function(f"{cls.name}.{statement.name}", statement, cls.name)
     return methods
 
 
@@ -227,28 +247,122 @@ def _class_lineage(cls: ast.ClassDef, module_classes: Mapping[str, ast.ClassDef]
     return frozenset(names)
 
 
-def _references(
-    function: _Function,
-    module_functions: Mapping[str, _Function],
-    methods: Mapping[str, _Function],
-    receivers: frozenset[str],
-) -> Iterator[tuple[_Function, frozenset[str]]]:
-    """Every in-scope function ``function`` refers to (called or passed), with its guards."""
-    for node, guards in _walk_guarded(function.node, frozenset()):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in module_functions:
-            yield module_functions[node.id], guards
-        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in receivers and node.attr in methods:
-            yield methods[node.attr], guards
+@dataclass(frozen=True, slots=True)
+class _ModuleScope:
+    """What a reference inside one module can resolve to."""
+
+    functions: Mapping[str, _Function]
+    classes: Mapping[str, ast.ClassDef]
+    # Module-level containers (dispatch tables) naming in-scope functions: a
+    # reference to the table reaches every function it holds.
+    tables: Mapping[str, tuple[_Function, ...]]
 
 
-def scan_module(tree: ast.Module, relpath: str) -> ModuleScan:
-    """Every ``raise TypeError`` reachable, uncaught, from a class's ``process``."""
-    module_functions = {
+def _table_members(value: ast.expr, functions: Mapping[str, _Function], classes: Mapping[str, ast.ClassDef]) -> tuple[_Function, ...]:
+    """In-scope functions a module-level container literal holds (``{"int": _check_int}``, ``(_Checks.numeric,)``)."""
+    if not isinstance(value, (ast.Dict, ast.List, ast.Tuple, ast.Set)):
+        return ()
+    members: list[_Function] = []
+    for node in ast.walk(value):
+        if isinstance(node, ast.Name) and node.id in functions:
+            members.append(functions[node.id])
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in classes:
+            helper_methods = _class_methods(classes[node.value.id], classes)
+            if node.attr in helper_methods:
+                members.append(helper_methods[node.attr])
+    return tuple(members)
+
+
+def _module_scope(tree: ast.Module) -> _ModuleScope:
+    functions = {
         statement.name: _Function(statement.name, statement)
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    module_classes = {statement.name: statement for statement in tree.body if isinstance(statement, ast.ClassDef)}
+    classes = {statement.name: statement for statement in tree.body if isinstance(statement, ast.ClassDef)}
+    tables: dict[str, tuple[_Function, ...]] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+            target, value = statement.targets[0].id, statement.value
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
+            target, value = statement.target.id, statement.value
+        else:
+            continue
+        members = _table_members(value, functions, classes)
+        if members:
+            tables[target] = members
+    return _ModuleScope(functions, classes, tables)
+
+
+def _super_methods(owner: str | None, name: str, classes: Mapping[str, ast.ClassDef]) -> Iterator[_Function]:
+    """What ``super().<name>`` inside a method of ``owner`` can reach: ``name`` on any same-module ancestor.
+
+    Every ancestor defining it, not only the next one in the MRO: over-reaching
+    can only add a finding, never hide one.
+    """
+    if owner is None or owner not in classes:
+        return
+    for ancestor in sorted(_class_lineage(classes[owner], classes) - {owner}):
+        for statement in classes[ancestor].body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == name:
+                yield _Function(f"{ancestor}.{name}", statement, ancestor)
+
+
+def _is_super_call(node: ast.expr) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
+
+
+def _references(
+    function: _Function,
+    scope: _ModuleScope,
+    methods: Mapping[str, _Function],
+    receivers: frozenset[str],
+) -> Iterator[tuple[_Function, frozenset[str]]]:
+    """Every in-scope function ``function`` refers to (called or passed), with its guards.
+
+    ``self.``/``cls.``/``<ThisClass>.`` methods, ``super().`` methods of a
+    same-module ancestor, methods of another same-module class named directly
+    (``_Checks.numeric``), module-level functions, and every function a
+    module-level dispatch table holds.
+    """
+    for node, guards in _walk_guarded(function.node, frozenset()):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in scope.functions:
+                yield scope.functions[node.id], guards
+            for member in scope.tables.get(node.id, ()):
+                yield member, guards
+        elif isinstance(node, ast.Attribute):
+            if _is_super_call(node.value):
+                for inherited in _super_methods(function.owner, node.attr, scope.classes):
+                    yield inherited, guards
+            elif isinstance(node.value, ast.Name) and node.value.id in receivers:
+                if node.attr in methods:
+                    yield methods[node.attr], guards
+            elif isinstance(node.value, ast.Name) and node.value.id in scope.classes:
+                helper_methods = _class_methods(scope.classes[node.value.id], scope.classes)
+                if node.attr in helper_methods:
+                    yield helper_methods[node.attr], guards
+
+
+def _names_bound_to_a_type_error(function: _Function) -> frozenset[str]:
+    """Names this function's own scope binds to a new ``TypeError(...)`` (``err = TypeError(...)``)."""
+    bound: set[str] = set()
+    for node, _guards in _walk_guarded(function.node, frozenset()):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and _exception_name(node.value) == BANNED_EXCEPTION:
+            bound.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    return frozenset(bound)
+
+
+def _raises_a_type_error(exc: ast.expr, bound: frozenset[str]) -> bool:
+    if _exception_name(exc) == BANNED_EXCEPTION:
+        return True
+    return isinstance(exc, ast.Name) and exc.id in bound
+
+
+def scan_module(tree: ast.Module, relpath: str) -> ModuleScan:
+    """Every ``raise TypeError`` reachable, uncaught, from a class's ``process``."""
+    scope = _module_scope(tree)
+    module_classes = scope.classes
     found: set[ProcessPathRaise] = set()
     roots = 0
 
@@ -265,15 +379,16 @@ def scan_module(tree: ast.Module, relpath: str) -> ModuleScan:
             if (function.qualname, path_guards) in visited:
                 continue
             visited.add((function.qualname, path_guards))
+            bound = _names_bound_to_a_type_error(function)
             for node, guards in _walk_guarded(function.node, frozenset()):
                 if (
                     isinstance(node, ast.Raise)
                     and node.exc is not None
-                    and _exception_name(node.exc) == BANNED_EXCEPTION
+                    and _raises_a_type_error(node.exc, bound)
                     and not (guards | path_guards) & _ABSORBS_TYPE_ERROR
                 ):
                     found.add(ProcessPathRaise(relpath, function.qualname, node.lineno))
-            for callee, guards in _references(function, module_functions, methods, receivers):
+            for callee, guards in _references(function, scope, methods, receivers):
                 pending.append((callee, path_guards | guards))
 
     return ModuleScan(frozenset(found), roots)
@@ -309,14 +424,31 @@ def assert_matches_reviewed(found: Iterable[ProcessPathRaise], reviewed: Iterabl
     assert not stale, f"reviewed entries no longer match a site; remove them: {sorted(stale)}"
 
 
-def test_no_unreviewed_type_error_on_a_plugin_process_path() -> None:
-    found, roots = scan_tree(PLUGINS_ROOT)
-
+def assert_roots_floor(roots: int) -> None:
+    """The scan must have rooted at no fewer than ``MIN_PROCESS_ROOTS`` process methods."""
     assert roots >= MIN_PROCESS_ROOTS, (
         f"the scan rooted at only {roots} process methods under {PLUGINS_ROOT} "
         f"(floor {MIN_PROCESS_ROOTS}); it has stopped seeing the plugin tree, so its empty result proves nothing"
     )
+
+
+def test_no_unreviewed_type_error_on_a_plugin_process_path() -> None:
+    found, roots = scan_tree(PLUGINS_ROOT)
+
+    assert_roots_floor(roots)
     assert_matches_reviewed(found, REVIEWED_PROCESS_PATH_TYPE_ERRORS)
+
+
+def test_a_scan_that_stopped_seeing_the_plugin_tree_fails_the_floor(tmp_path: Path) -> None:
+    """A nonexistent or empty root scans as zero roots and zero findings: the floor, not the findings, catches it."""
+    found, roots = scan_tree(tmp_path / "no-plugins-here")
+
+    assert (found, roots) == ([], 0)
+    with pytest.raises(AssertionError, match="stopped seeing the plugin tree"):
+        assert_roots_floor(roots)
+    with pytest.raises(AssertionError, match="stopped seeing the plugin tree"):
+        assert_roots_floor(MIN_PROCESS_ROOTS - 1)
+    assert_roots_floor(MIN_PROCESS_ROOTS)
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +685,96 @@ class Search(_Base):
 """,
         {"Search._hook"},
     ),
+    # review-R8-propagation-gate-r2 F1: the shapes below escaped the analyzer.
+    "super_call_to_a_same_module_base_helper": (
+        """
+class _Base:
+    def _check(self, value):
+        if type(value) is not int:
+            raise TypeError("must be int")
+        return value
+
+class Stats(_Base):
+    def process(self, rows, ctx):
+        return [self._check(r["v"]) for r in rows]
+
+    def _check(self, value):
+        return super()._check(value)
+""",
+        {"_Base._check"},
+    ),
+    "super_call_through_an_empty_intermediate_base": (
+        """
+class _Mixin:
+    def _numeric(self, v):
+        if type(v) not in (int, float):
+            raise TypeError("must be numeric")
+        return v
+
+class _Base(_Mixin):
+    pass
+
+class Stats(_Base):
+    def process(self, row, ctx):
+        return super()._numeric(row["v"])
+""",
+        {"_Mixin._numeric"},
+    ),
+    "static_call_on_a_same_module_helper_class": (
+        """
+class _Checks:
+    @staticmethod
+    def numeric(value):
+        if type(value) not in (int, float):
+            raise TypeError("must be numeric")
+        return value
+
+class Stats:
+    def process(self, rows, ctx):
+        return [_Checks.numeric(r["v"]) for r in rows]
+""",
+        {"_Checks.numeric"},
+    ),
+    "module_function_via_a_dispatch_table": (
+        """
+def _check_int(v):
+    if type(v) is not int:
+        raise TypeError("must be int")
+
+_CHECKS = {"int": _check_int}
+
+class Stats:
+    def process(self, row, ctx):
+        return _CHECKS["int"](row["v"])
+""",
+        {"_check_int"},
+    ),
+    "helper_class_method_via_an_annotated_dispatch_table": (
+        """
+class _Checks:
+    @staticmethod
+    def label(v):
+        if type(v) is not str:
+            raise TypeError("must be str")
+
+_CHECKS: tuple = (_Checks.label,)
+
+class Stats:
+    def process(self, row, ctx):
+        return [check(row["v"]) for check in _CHECKS]
+""",
+        {"_Checks.label"},
+    ),
+    "type_error_bound_to_a_name_then_raised": (
+        """
+class Replicate:
+    def process(self, row, ctx):
+        if type(row["copies"]) is not int:
+            err = TypeError("must be int")
+            raise err
+""",
+        {"Replicate.process"},
+    ),
     "nested_class_is_rooted": (
         """
 class Outer:
@@ -651,6 +873,43 @@ class Mult:
 
     def _times(self, row):
         raise TypeError("x")
+""",
+    "other_exception_bound_to_a_name_then_raised": """
+class Replicate:
+    def process(self, row, ctx):
+        if row.contract.mode != "fixed":
+            err = ValueError("heterogeneous contract modes")
+            raise err
+""",
+    "dispatch_table_that_process_never_reads": """
+def _check_int(v):
+    raise TypeError("must be int")
+
+_CHECKS = {"int": _check_int}
+
+class Stats:
+    def process(self, row, ctx):
+        return row
+""",
+    "super_call_into_a_base_from_another_module": """
+from elspeth.plugins.infrastructure.base import BaseTransform
+
+class Stats(BaseTransform):
+    def process(self, row, ctx):
+        return super().process(row, ctx)
+""",
+    "helper_class_method_caught_at_the_call_site": """
+class _Checks:
+    @staticmethod
+    def numeric(value):
+        raise TypeError("must be numeric")
+
+class Stats:
+    def process(self, row, ctx):
+        try:
+            return _Checks.numeric(row["v"])
+        except TypeError:
+            return {"error": "invalid_input"}
 """,
     "overridden_base_helper_is_not_reached": """
 class _Base:
