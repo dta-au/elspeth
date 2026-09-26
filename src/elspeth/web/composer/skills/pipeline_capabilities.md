@@ -274,6 +274,35 @@ producer's routing field must exactly match the sink/connection name. Edge
 objects alone do not make a sink receive rows; route through every intervening
 cleanup node and then from the cleanup node to the sink.
 
+### Declared Types And Row Templates
+
+A type you declare is checked on every row and never converted to fit: a row
+whose value has another type goes to `on_error` (an `int` satisfies `float`;
+nothing else is widened). Declare the type the value actually has, and `any`
+for a created field whose type varies. A model node's structured output fields
+bind their row types — `integer` is `int`, `number` is `float`, `boolean` is
+`bool`, `string` and `enum` are `str` — so a node schema type on a field the
+model writes must be that type (validation refuses `int` over `number`), the
+`<response>_usage` field is `any`, and a downstream consumer of a `number`
+field declares `float`.
+
+A row template — an LLM prompt or query template, or a retrieval
+`query_template` — sees only the fields its node declares in
+`required_input_fields` (a retrieval template also sees its query field).
+Declare every field the template reads or tests. Reading or testing any other
+field fails every row, including `'x' in row`, a row carried through a `set`
+or loop variable, and a multi-query `row.source_row` column. `[]` shows the
+whole row but proves nothing to a field-scoped prompt-injection control, so
+declare the fields. `row` holds fields only: `row.to_dict()`, `row.contract`,
+`row.items()`, `row.keys()` and `row.values()` read fields of those names.
+Template literals must work as written: a `truncate` length is an integer
+literal, and no number literal may overflow a float.
+
+An expression whose value is stored in a row must not produce a set, which has
+no canonical order: build a list (`[a, b]`); a set used in place
+(`x in {...}`) is fine. A column a node declares as an input, such as a
+conversion's field, must be carried by every row that reaches the node.
+
 ### Utility Transforms
 
 Users often describe the effect, not the utility plugin. Plan utility transforms

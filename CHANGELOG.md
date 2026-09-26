@@ -155,8 +155,9 @@ drained and repair this release forward.
   `headers` key). A `required_input_fields` verdict for a header spelling of a
   guaranteed field now names the normalized spelling. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
-  Price}]` over header `Price` worked as a lookup and is now refused — write
-  `field: price`; and a conversion field is now a declared input, so one no
+  Price}]` over header `Price` worked as a lookup and now routes every row
+  with `declared_field_is_header_spelling` — write `field: price`; and a
+  conversion field is now a declared input, so one no
   row carries is refused at build against a `fixed` upstream and otherwise
   ends the run as a `DeclaredRequiredInputFieldsViolation` with the row's
   outcome recorded (it was routed `missing_field`), as `web_scrape`'s
@@ -504,6 +505,78 @@ drained and repair this release forward.
   every composer authority hash and the advisor fingerprint (session epoch 67).
   A planner `set_pipeline` whose row_union branch value is not a string now
   persists as an argument error instead of failing audit persistence.
+
+### Newly refused configurations
+
+Each configuration below ran on earlier 0.8.1 builds and is now refused, or
+now fails its rows. None has a compatibility path or a deprecation window:
+each ran only because nothing checked it. The bullets above give the full
+behaviour; this list is the inventory, with the old behaviour measured
+against the previous release branch.
+
+These ran and delivered rows before:
+
+- **A declaration spelled by a source header** (field-name spelling rule
+  above): `elspeth validate`, the build and the composer refuse it with
+  `field_name_header_spelling` where the upstream schema is declared. Behind
+  an observed source, a transform or aggregation routes every row with
+  `declared_field_is_header_spelling`, and a sink ends the run with
+  `HeaderSpelledDeclarationViolation` and every token's outcome recorded.
+  Before, the declaration was ignored (`value_transform` or sink `Name:
+  int?`, `batch_stats` `group_by: Name`) or matched by lookup (`type_coerce`
+  `field: Price`, `keyword_filter` `fields: [Count]`), and every row was
+  delivered. Declare the normalized name (`name`, `price`).
+- **A `type_coerce` conversion field that some rows lack** ends the run
+  with `DeclaredRequiredInputFieldsViolation` at the first such row behind
+  an observed source, and is refused at build behind a `fixed` one. Before,
+  those rows were routed `missing_field` and the rest converted.
+- **A template test or read of a field the node does not declare** (the
+  ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
+  or a `row.source_row` column read through a `set` alias fails each row
+  with `template_rendering_failed` ("Undeclared field"). So does `row.to_dict()` or `row.contract` under
+  `required_input_fields: []`: those names are now ordinary fields. In a RAG
+  `query_template`, a `row.<field>` read outside `required_input_fields`
+  and `query_field` is refused at configuration, as is `row.items()`,
+  `row.keys()` or `row.values()`. A `'x' in row` test there fails each row.
+  Before, all of these rendered, and the undeclared columns went to the LLM
+  or search provider. On the web, an LLM node with `required_input_fields:
+  []` or none is now `input_fields_unprovable` for a field-scoped prompt
+  shield.
+- **An LLM output type contradicted downstream** (the output-types bullet
+  above). A `schema.fields` type that the LLM's bound output type never
+  satisfies (`confidence: int` over `type: number`) is refused at
+  configuration. A downstream node that declares `int` for a `number` field
+  routes every row `contract_violation`. Before, both delivered while the
+  provider answered with integral numbers.
+- **A declared type on a created field that the value does not have**
+  (ADR-050 bullet above). A `json_explode` declaring `page: int` routes a
+  row whose element is a string; before, the string was delivered under an
+  `int` record.
+- **A `truncate` length literal that is not an integer** (`truncate(10.5)`,
+  also beside a row-derived argument; the template-literal bullet above) is
+  refused at configuration. Before, rows short enough not to be cut were
+  delivered and the rest failed.
+- **A stored expression that can produce a set.** A `value_transform`
+  operation or `reference_join` output whose expression can evaluate to a
+  set (`{ref['description'], ref['category']}`) is refused when the plugin is
+  built: a set has no canonical order. Before, `reference_join` delivered the
+  set as a list in hash-seed order, so identical input gave different output
+  values and hashes from one run to the next; `value_transform` ended the
+  run with a `TypeError`. Use a list. A set consumed in place (`x in {...}`,
+  `len({...})`) is unaffected.
+
+These already failed, or recorded a false type, and are now refused earlier
+or routed, with no loss:
+`output_mode: passthrough` with any shipped batch plugin (ended the run with
+the batch's rows left without an outcome); a template number literal that
+overflows to infinity; a `<response>_usage` schema type other than `any`;
+a header-spelled `value_transform` or `field_mapper` target and a
+header-spelled scan field over a non-string column (each crashed the run,
+recorded a false type, or failed every row). Also refused earlier: a dynamic
+RAG `row[...]` key (failed every row). A header-spelled `web_scrape`
+`url_field` or `blob_ref_field` now routes each row instead of ending the
+run. The composer now refuses an optional declared field whose upstream type
+the build already refused (`edge_field_type_incompatible`).
 
 ---
 
