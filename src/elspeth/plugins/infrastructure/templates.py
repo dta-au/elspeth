@@ -923,11 +923,21 @@ def _check_configuration_literals(ast: nodes.Template, environment: ImmutableSan
       defers the error to render. The same holds for a literal name given to
       ``map``, ``select``, ``reject``, ``selectattr`` and ``rejectattr``.
     - ``truncate`` arguments whose literal values break its preconditions
-      (``length >= len(end)``, ``leeway >= 0``). An argument computed from the
-      row is decided at render and routes.
+      (``length >= len(end)``, ``leeway >= 0``) or its slicing (a ``length``
+      that is not an integer). An argument computed from the row is decided
+      at render and routes.
+    - A number literal too large for a float (``1e400``). Python reads it as
+      infinity, which Jinja's code generator writes back as the bare name
+      ``inf``: in an expression (``truncate(1e400)``, ``x == 1e400``) every
+      render then fails with ``NameError``.
 
     The messages quote only template text.
     """
+    for constant in ast.find_all(nodes.Const):
+        if type(constant.value) is float and not math.isfinite(constant.value):
+            raise TemplateAssertionError(
+                "A number literal in this template is too large for a float (it overflows to infinity).", constant.lineno
+            )
     for test in ast.find_all(nodes.Test):
         if test.name not in environment.tests:
             raise TemplateAssertionError(f"No test named {test.name!r}.", test.lineno)
@@ -975,6 +985,11 @@ def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxed
             literals[name] = argument.value
         else:
             return
+    # The empty-string probe below returns before truncate slices, so a
+    # non-integer length (truncate(10.5)) would pass it and then fail every
+    # row long enough to be truncated ("slice indices must be integers").
+    if "length" in literals and type(literals["length"]) is not int:
+        raise TemplateAssertionError(f"truncate() length must be an integer literal, got {type(literals['length']).__name__}.", node.lineno)
     try:
         environment.filters["truncate"](environment, "", **literals)
     except (AssertionError, TypeError, ArithmeticError) as exc:

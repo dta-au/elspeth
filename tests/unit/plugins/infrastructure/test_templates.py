@@ -612,10 +612,17 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() arguments can never be satisfied: object of type 'NoneType' has no len()",
             id="truncate-end-none",
         ),
+        pytest.param("{{ row.q | truncate('abc') }}", "truncate() length must be an integer literal, got str.", id="truncate-length-str"),
+        # A float length passes truncate's assertions and the empty-string
+        # probe, then fails every row long enough to be sliced ("slice indices
+        # must be integers") — P4 review r1 F2.
         pytest.param(
-            "{{ row.q | truncate('abc') }}",
-            "truncate() arguments can never be satisfied: '>=' not supported between instances of 'str' and 'int'",
-            id="truncate-length-str",
+            "{{ row.q | truncate(10.5) }}", "truncate() length must be an integer literal, got float.", id="truncate-length-float"
+        ),
+        pytest.param(
+            "{{ row.q | truncate(length=10.0) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-keyword",
         ),
         # ``length + leeway`` overflows when an int literal is too large for a
         # float: an OverflowError on every render, not a construction crash.
@@ -624,10 +631,28 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() arguments can never be satisfied: int too large to convert to float",
             id="truncate-overflowing-length",
         ),
+        # A float literal too large for a float is infinity, which Jinja's code
+        # generator writes as the bare name ``inf``: every render in an
+        # expression raised NameError (P4 review r1 F2).
         pytest.param(
-            "{{ row.q | truncate(1e300, leeway=1" + "0" * 400 + ") }}",
-            "truncate() arguments can never be satisfied: int too large to convert to float",
-            id="truncate-overflowing-leeway",
+            "{{ row.q | truncate(1e400) }}",
+            "A number literal in this template is too large for a float (it overflows to infinity).",
+            id="truncate-infinite-length",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10, leeway=1e400) }}",
+            "A number literal in this template is too large for a float (it overflows to infinity).",
+            id="truncate-infinite-leeway",
+        ),
+        pytest.param(
+            "{% if row.n == -1e400 %}x{% endif %}",
+            "A number literal in this template is too large for a float (it overflows to infinity).",
+            id="infinite-literal-in-a-comparison",
+        ),
+        pytest.param(
+            "{{ 1e400 }}",
+            "A number literal in this template is too large for a float (it overflows to infinity).",
+            id="infinite-literal-printed",
         ),
     ],
 )
@@ -646,6 +671,8 @@ def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, mes
         pytest.param("{{ row.q | truncate(5, end=row.e) }}", id="truncate-end-from-the-row"),
         pytest.param("{{ row.q | truncate(3) }}", id="truncate-length-equal-to-end"),
         pytest.param("{{ row.q | truncate(10, leeway=0) }}", id="truncate-zero-leeway"),
+        pytest.param("{{ row.q | truncate(10, leeway=0.5) }}", id="truncate-float-leeway"),
+        pytest.param("{{ row.n * 1e300 }}", id="finite-float-literal"),
         pytest.param("{{ row.q | truncate(*row.args) }}", id="truncate-splat"),
         pytest.param("{{ row.q | truncate(1, False, '', 0, 9) }}", id="truncate-arity-left-to-render"),
         pytest.param("{{ row.l | map(attribute='a') | list }}", id="map-attribute"),

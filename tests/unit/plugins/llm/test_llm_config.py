@@ -2413,3 +2413,15 @@ class TestTemplateVariableBindings:
         }
         with pytest.raises(PluginConfigError, match="input_fields binds only"):
             LLMConfig.from_dict(bad, plugin_name="llm")
+
+
+def test_the_only_field_an_llm_transform_writes_as_any_is_the_usage_mapping() -> None:
+    """LLMConfig refuses every authored scalar over a written-``any`` field because that field is the usage mapping.
+
+    If another written field ever becomes ``any``, that refusal's reason (and
+    message) would be false for it: this pin makes the change re-decide it.
+    """
+    from elspeth.plugins.transforms.llm import _OUTPUT_FIELD_TYPE_TO_SCHEMA, _SUFFIX_SCHEMA_TYPES
+
+    assert {suffix for suffix, field_type in _SUFFIX_SCHEMA_TYPES.items() if field_type == "any"} == {"_usage"}
+    assert "any" not in _OUTPUT_FIELD_TYPE_TO_SCHEMA.values()

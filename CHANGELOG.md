@@ -223,6 +223,15 @@ drained and repair this release forward.
   plain dict, so `row.items()`, `row.keys()` and `row.values()` read fields
   of those names (they were dict methods), and `{{ row }}` no longer prints
   the row. No shipped example sets `query_template`.
+- **A template number literal that fails every row is refused when the
+  template is built.** `truncate` with a non-integer length (`truncate(10.5)`)
+  built and then failed every row long enough to be cut ("slice indices must
+  be integers"), and a literal too large for a float (`1e400`, which Python
+  reads as infinity) failed every render with `NameError` wherever it sat in
+  an expression (`truncate(1e400)`, `x == 1e400`). `elspeth validate` and the
+  composer now refuse both, as they already refused an unknown filter name or
+  an unsatisfiable `truncate` length. A length computed from the row is still
+  decided per row.
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics
@@ -248,7 +257,8 @@ drained and repair this release forward.
   writes as a type that value never has (`confidence: int` over `type:
   number`, or `llm_response: int`) is now refused at configuration by
   `elspeth validate` and the composer; before, it built and then failed
-  every row. A downstream node declaring `int` for a `number` field is not
+  every row. The same holds for any type but `any` on the `<response>_usage`
+  field, which carries the provider's token-usage mapping (or null). A downstream node declaring `int` for a `number` field is not
   caught at build and now routes every row, where a provider answering `7`
   used to deliver: declare it `float`.
 - **Collector group failures are counted where failures are reported.** A

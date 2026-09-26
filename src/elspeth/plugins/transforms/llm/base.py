@@ -542,8 +542,10 @@ class LLMConfig(TransformDataConfig):
         run time with a message blaming a schema bug, so it is refused here,
         as the LLM source refuses the same contradiction. The rule is the one
         declared-type rule (``declared_type_name_admits``): an ``int`` output
-        under a ``float`` declaration is admitted. ``any`` on either side
-        abstains.
+        under a ``float`` declaration is admitted. An authored ``any`` admits
+        everything. The one field written as ``any`` is ``<response>_usage``,
+        the provider's token-usage mapping (or null): no scalar declaration
+        admits a mapping, so anything but ``any`` over it is refused too.
         """
         authored = self.schema_config.fields if self.schema_config is not None else None
         if not authored:
@@ -558,11 +560,17 @@ class LLMConfig(TransformDataConfig):
                     f"{spec.name}_{self.response_field}", f"{spec.name}_", spec.output_fields or ()
                 )
             )
-        written_types = {definition.name: definition.field_type for definition in written if definition.field_type != "any"}
+        written_types = {definition.name: definition.field_type for definition in written}
         for field in authored:
             if field.name not in written_types or field.field_type == "any":
                 continue
             written_type = written_types[field.name]
+            if written_type == "any":
+                raise ValueError(
+                    f"LLM schema field {field.name!r} is declared {field.field_type!r}, but this transform writes it as the "
+                    f"provider's token-usage mapping (or null), which no {field.field_type!r} declaration admits; declare it "
+                    f"'any' or leave it out"
+                )
             if not declared_type_name_admits(field.field_type, written_type):
                 raise ValueError(
                     f"LLM schema field {field.name!r} is declared {field.field_type!r}, but this transform always writes it "

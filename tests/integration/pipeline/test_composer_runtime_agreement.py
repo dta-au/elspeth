@@ -7842,6 +7842,14 @@ class TestComposerRuntimeTemplateLiteralAgreement:
             "truncate() arguments can never be satisfied: int too large to convert to float",
             id="truncate-overflow",
         ),
+        pytest.param(
+            "{{ row.q | truncate(10.5) }}", "truncate() length must be an integer literal, got float.", id="truncate-float-length"
+        ),
+        pytest.param(
+            "{{ row.q | truncate(1e400) }}",
+            "A number literal in this template is too large for a float (it overflows to infinity).",
+            id="infinite-literal",
+        ),
         pytest.param("{% if row.q %}{{ row.q | no_such_filter }}{% endif %}", "No filter named 'no_such_filter'.", id="filter-in-if"),
         pytest.param("{% if row.q is no_such_test %}x{% endif %}", "No test named 'no_such_test'.", id="test-in-if"),
         pytest.param("{{ [row.q] | map('no_such_filter') | join }}", "No filter named 'no_such_filter'.", id="map-filter-name"),
@@ -8003,6 +8011,21 @@ class TestComposerRuntimeLlmAuthoredOutputTypeAgreement:
                 "'rate_confidence' is declared 'int', but this transform always writes it as 'float'",
                 id="multi-query",
             ),
+            # The usage field is written as 'any' because it is the provider's
+            # token-usage mapping (or null): a scalar declaration built and then
+            # failed every row as a "transform schema bug" (P4 review r1 F3).
+            pytest.param(
+                ["judged_usage: str"],
+                False,
+                "'judged_usage' is declared 'str', but this transform writes it as the provider's token-usage mapping (or null)",
+                id="scalar-over-usage",
+            ),
+            pytest.param(
+                ["rate_judged_usage: int"],
+                True,
+                "'rate_judged_usage' is declared 'int', but this transform writes it as the provider's token-usage mapping (or null)",
+                id="multi-query-scalar-over-usage",
+            ),
         ],
     )
     def test_both_refuse_a_declaration_the_written_type_never_satisfies(
@@ -8022,7 +8045,7 @@ class TestComposerRuntimeLlmAuthoredOutputTypeAgreement:
         [
             pytest.param(["score: float"], False, id="int-output-under-float"),
             pytest.param(["confidence: float", "score: int"], False, id="matching"),
-            pytest.param(["confidence: any", "judged_usage: any"], False, id="any-abstains"),
+            pytest.param(["confidence: any", "judged_usage: any"], False, id="authored-any-admits-everything"),
             pytest.param(["other: int"], False, id="a-field-the-transform-does-not-write"),
             pytest.param(["rate_confidence: float"], True, id="multi-query-matching"),
         ],
