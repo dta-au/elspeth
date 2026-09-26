@@ -934,13 +934,16 @@ close()
 
 - Each `process()` call: input_hash, output_hash, duration_ms, status
 - Errors: exception type, message, retryable flag
-- **TransformErrorEvent** for each `TransformResult.error()`:
+- A **`transform_errors` row** for each row failure routed through `on_error`
+  (one per buffered token when a batch fails):
   - `run_id`, `token_id`, `transform_id`
-  - `row` (input row data)
-  - `error_details` (from TransformResult.error())
-  - `destination` (sink name or "discard")
-  - `input_hash` (for traceability)
-  - `timestamp`
+  - `row_hash` and `row_data_json` (the input row)
+  - `error_details_json` (the reason from `TransformResult.error()`)
+  - `destination` (sink name or `"discard"`)
+  - `created_at`
+
+  The token's terminal outcome, with its `error_hash`, is recorded separately
+  in `token_outcomes`.
 
 ---
 
@@ -1687,7 +1690,7 @@ These operations are engine-level because:
 | Plugin Type | Config Field | Required? | On Missing Config + Error |
 |-------------|--------------|-----------|---------------------------|
 | **Source** | `on_validation_failure` | Yes | N/A (config validation fails) |
-| **Transform** | `on_error` | No | `ConfigurationError` - pipeline crashes |
+| **Transform** | `on_error` | Yes (transforms and aggregations) | N/A (settings validation fails) |
 | **Sink** | N/A | N/A | Sinks don't route errors |
 
 ---
