@@ -237,3 +237,39 @@ class TestSharedValidators:
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score"}))
 
         validate_batch_inputs(transform, [_row({"score": None})], node_kind=node_kind)
+
+    def test_a_field_required_by_its_original_header_is_present(self, node_kind: str) -> None:
+        """Presence resolves an ORIGINAL name exactly as ``row[field]`` does (review-R1 F1, mutant MA).
+
+        A batch plugin configured with the header spelling (``value_field:
+        "Amount USD"`` over a csv source normalizing it to ``amount_usd``) reads
+        ``row["Amount USD"]``, which resolves. Reading presence off the
+        normalized ``to_dict()`` keys instead would fail every such batch.
+        """
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+        row = PipelineRow(
+            {"amount_usd": 1.5},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    FieldContract(
+                        normalized_name="amount_usd", original_name="Amount USD", python_type=float, required=True, source="declared"
+                    ),
+                ),
+                locked=True,
+            ),
+        )
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Amount USD"}))
+
+        validate_batch_inputs(transform, [row], node_kind=node_kind)
+
+    def test_several_absent_fields_are_named_in_sorted_order(self, node_kind: str) -> None:
+        """The reason lists absent fields sorted, so its text (and error hash) never depends on set order (review-R1 F1, mutant MB)."""
+        required = frozenset({"variant", "score", "pair_id", "alpha", "zeta"})
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=required)
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind)
+
+        assert "required input field(s) ['alpha', 'pair_id', 'score', 'variant', 'zeta'] absent" in str(excinfo.value)

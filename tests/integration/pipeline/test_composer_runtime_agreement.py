@@ -7550,6 +7550,28 @@ class TestComposerRuntimeBatchPlacementAgreement:
         with pytest.raises(ValueError, match=r"Transform 'stats' uses transform 'batch_stats' which is batch-aware"):
             self._runtime_instantiate(state)
 
+    def test_both_accept_a_batch_plugin_that_declares_row_mode_as_row_transform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal is the CONJUNCTION ``is_batch_aware and not supports_row_mode_when_batch_aware`` on both sides.
+
+        No shipped batch plugin declares row mode, so the second conjunct was
+        equivalent on the live registry and a runtime check keyed on
+        ``is_batch_aware`` alone survived every test (review-R4 F2, mutant
+        MB). The declaration is flipped on the registered class itself, which
+        both the runtime loop and the composer's placement rule read.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
+        assert batch_stats_cls.is_batch_aware
+        monkeypatch.setattr(batch_stats_cls, "supports_row_mode_when_batch_aware", True)
+        state = self._state(tmp_path, self._batch_stats("transform"))
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        self._runtime_instantiate(state)
+
     def test_both_accept_batch_plugin_as_aggregation(self, tmp_path: Path) -> None:
         """Control: the same plugin and options under the aggregation kind."""
         state = self._state(tmp_path, self._batch_stats("aggregation", trigger={"count": 10}, output_mode="transform"))

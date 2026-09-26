@@ -436,6 +436,11 @@ class TestTheRestoreReaderProvesTheVerdictWhole:
                 id="flush-state-without-its-reason",
             ),
             pytest.param(
+                update(node_states_table).where(node_states_table.c.state_id == "state-1").values(status="completed"),
+                "lacks its FAILED flush node_state and reason",
+                id="flush-state-not-failed",
+            ),
+            pytest.param(
                 update(batch_members_table).where(batch_members_table.c.token_id == "tok-1").values(ordinal=5),
                 "has invalid batch membership",
                 id="membership-ordinal-gap",
