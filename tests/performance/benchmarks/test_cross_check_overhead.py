@@ -32,6 +32,7 @@ from elspeth.contracts.declaration_contracts import (
     _clear_registry_for_tests,
     _restore_registry_snapshot_for_tests,
     _snapshot_registry_for_tests,
+    derive_effective_input_fields,
     implements_dispatch_site,
     register_declaration_contract,
     registered_declaration_contracts,
@@ -162,7 +163,8 @@ def test_batch_flush_cross_check_within_budget(benchmark: pytest.FixtureRequest)
 
     Models the ADR-009 §Clause 2 batch-aware path: ``verify_pass_through`` is
     invoked once per emitted row with ``input_fields`` computed as the
-    intersection of all buffered input contracts (batch-homogeneous). The
+    intersection of every buffered token's ``derive_effective_input_fields``
+    (batch-homogeneous). The
     benchmark includes the intersection computation plus the per-row
     verification — the full flush-path cross-check cost for the operator.
 
@@ -181,13 +183,13 @@ def test_batch_flush_cross_check_within_budget(benchmark: pytest.FixtureRequest)
 
     def run_batch_cross_check() -> None:
         # Batch-homogeneous input_fields — intersection across every
-        # buffered input contract. Measures the primitive cost; the live
+        # buffered token's effective input fields. Measures the primitive cost; the live
         # ``_cross_check_flush_output`` path additionally routes through
         # ``run_runtime_checks`` and ``PassThroughDeclarationContract`` (ADR-010
         # §Decision 3), which adds the dispatcher-overhead benchmark's
         # measured overhead (~15 µs median) on top — well within the 1500 µs
         # budget for a 64-row batch.
-        per_input_field_sets = [frozenset(fc.normalized_name for fc in row.contract.fields) for row in buffered_rows]
+        per_input_field_sets = [derive_effective_input_fields(row) for row in buffered_rows]
         input_fields = frozenset.intersection(*per_input_field_sets)
         verify_pass_through(
             input_fields=input_fields,

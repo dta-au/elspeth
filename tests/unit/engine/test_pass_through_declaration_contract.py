@@ -362,7 +362,8 @@ def test_contract_claims_both_dispatch_sites() -> None:
 def test_batch_flush_check_raises_on_divergence() -> None:
     """The batch-flush site uses BatchFlushInputs; contract's logic parallels
     post_emission_check but reads ``effective_input_fields`` as the caller-
-    computed intersection of every buffered token's contract."""
+    computed intersection of every buffered token's effective input fields
+    (contract fields the payload carries)."""
     from elspeth.contracts.declaration_contracts import BatchFlushInputs, BatchFlushOutputs
 
     c = PassThroughDeclarationContract()

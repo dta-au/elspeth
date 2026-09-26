@@ -35,6 +35,11 @@
 > it. `batch_replicate` then aborted the run with a Tier-1
 > `PassThroughContractViolation` for a field it never received. A field a
 > row carries and the transform drops still raises.
+> The accepted trade-off (§Alternatives #2) now covers payload heterogeneity
+> as well as contract heterogeneity. In TRANSFORM mode, a field that only
+> some buffered rows carry is outside the intersection. A drop of it from the
+> rows that did carry it is therefore not caught at this site. PASSTHROUGH
+> mode still checks each pair.
 
 ## Context
 
