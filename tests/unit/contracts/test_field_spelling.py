@@ -77,36 +77,45 @@ class TestHeaderSpelledNames:
         )
 
 
+def _gate(
+    *,
+    reads: list[str],
+    creates: list[str],
+    present: set[str] | frozenset[str],
+    forwarded: set[str] | frozenset[str],
+    participated: bool,
+    closed: bool,
+) -> tuple[HeaderSpelling, ...]:
+    return header_spelled_declarations(
+        spellings=DeclaredSpellings.of(reads=reads, creates=creates),
+        present=present,
+        forwarded=forwarded,
+        participated=participated,
+        closed=closed,
+    )
+
+
 class TestBuildTimeGate:
     """``header_spelled_declarations`` is the one build-time verdict (DAG and composer)."""
 
     def test_an_abstaining_upstream_settles_nothing(self) -> None:
-        assert (
-            header_spelled_declarations(
-                reads=["Name"], creates=["Name"], present=frozenset(), forwarded=frozenset(), participated=False, closed=False
-            )
-            == ()
-        )
+        assert _gate(reads=["Name"], creates=["Name"], present=frozenset(), forwarded=frozenset(), participated=False, closed=False) == ()
 
     def test_a_read_needs_a_closed_upstream(self) -> None:
         # Absence of 'Name' is proven only by an upper bound on the arriving fields.
-        open_vote = header_spelled_declarations(
-            reads=["Name"], creates=[], present={"name"}, forwarded={"name"}, participated=True, closed=False
-        )
-        closed_vote = header_spelled_declarations(
-            reads=["Name"], creates=[], present={"name"}, forwarded={"name"}, participated=True, closed=True
-        )
+        open_vote = _gate(reads=["Name"], creates=[], present={"name"}, forwarded={"name"}, participated=True, closed=False)
+        closed_vote = _gate(reads=["Name"], creates=[], present={"name"}, forwarded={"name"}, participated=True, closed=True)
         assert open_vote == ()
         assert closed_vote == (HeaderSpelling(literal="Name", canonical="name", kind="read"),)
 
     def test_a_created_name_needs_only_participation(self) -> None:
-        assert header_spelled_declarations(
-            reads=[], creates=["Name"], present={"id", "name"}, forwarded={"id", "name"}, participated=True, closed=False
-        ) == (HeaderSpelling(literal="Name", canonical="name", kind="create"),)
+        assert _gate(reads=[], creates=["Name"], present={"id", "name"}, forwarded={"id", "name"}, participated=True, closed=False) == (
+            HeaderSpelling(literal="Name", canonical="name", kind="create"),
+        )
 
     def test_the_canonical_spelling_and_an_unrelated_created_name_pass(self) -> None:
         assert (
-            header_spelled_declarations(
+            _gate(
                 reads=["name"], creates=["Total", "name"], present={"id", "name"}, forwarded={"id", "name"}, participated=True, closed=True
             )
             == ()
@@ -122,10 +131,7 @@ def test_the_remedy_is_the_sources_sentence() -> None:
 def test_a_created_name_is_checked_against_what_the_node_forwards() -> None:
     # A rename that removes 'name' and writes 'Name' restores the header as the key:
     # nothing arriving is shadowed, so it is not refused.
-    assert (
-        header_spelled_declarations(reads=[], creates=["Name"], present={"id", "name"}, forwarded={"id"}, participated=True, closed=True)
-        == ()
-    )
+    assert _gate(reads=[], creates=["Name"], present={"id", "name"}, forwarded={"id"}, participated=True, closed=True) == ()
 
 
 class TestDeclaredSpellings:
@@ -153,6 +159,12 @@ class TestDeclaredSpellings:
         for spelling in spelled:
             assert header_spelling_canonical(spelling.literal, row_keys) == spelling.canonical
         assert header_spelling_canonical("Total", row_keys) is None
+
+    def test_only_a_node_without_candidates_is_empty(self) -> None:
+        # The build gate and the composer skip the upstream walk for an empty surface.
+        assert DeclaredSpellings.of(reads=["id", "name"], creates=["total"]).is_empty
+        assert not DeclaredSpellings.of(reads=["Name"], creates=[]).is_empty
+        assert not DeclaredSpellings.of(reads=[], creates=["Name"]).is_empty
 
     def test_a_created_name_is_checked_against_the_forwarded_keys_only(self) -> None:
         surface = DeclaredSpellings.of(reads=[], creates=["Name"])

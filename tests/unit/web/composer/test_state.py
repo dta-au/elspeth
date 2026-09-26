@@ -10150,6 +10150,22 @@ class TestCompositionStateQueueGuaranteePropagation:
         assert result.is_valid, [e.message for e in result.errors]
         assert self._queue_skip_warnings(result) == []
 
+    @pytest.mark.parametrize("required", [["name"], ["Name"]], ids=["canonical", "header_spelling_candidate"])
+    def test_an_abstaining_queue_is_reported_once_per_consumer(self, required: list[str]) -> None:
+        # The presence rule and the field-name spelling rule both walk the
+        # consumer's connection back through the queue. Each skipped check is
+        # one warning: the spelling pass must not repeat what the presence
+        # rule already reported, whether or not its declarations can be
+        # header spellings (measured: 2 identical warnings for both shapes
+        # before the spelling pass kept its walk's reports apart).
+        state = self._state(
+            sources={"orders": self._source(), "refunds": self._source()},
+            nodes=(self._queue(), self._consumer(required=required)),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert len(self._queue_skip_warnings(result)) == 1
+
     def test_queue_consumer_requiring_unguaranteed_field_is_rejected(self) -> None:
         # Red-parity direction: the engine rejects this at graph build
         # ("guarantees: (none - dynamic schema)" pre-fix / missing-field

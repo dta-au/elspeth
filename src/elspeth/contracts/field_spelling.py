@@ -177,8 +177,7 @@ def header_spelled_names(names: Iterable[str], present: Collection[str], *, kind
 
 def header_spelled_declarations(
     *,
-    reads: Iterable[str],
-    creates: Iterable[str],
+    spellings: DeclaredSpellings,
     present: Collection[str],
     forwarded: Collection[str],
     participated: bool,
@@ -188,10 +187,12 @@ def header_spelled_declarations(
 
     The single gate both the DAG validator and the Web Composer's Stage-1
     mirror call, so the two cannot disagree about when a build may refuse.
-    ``present`` is the upstream's guaranteed fields; ``forwarded`` is the part
-    of it the consumer carries onto its output (``present`` minus the fields the
-    consumer removes, empty when it forwards nothing), which is what a created
-    name can shadow.
+    ``spellings`` is the consumer's declarations reduced to the candidates the
+    predicate can ever flag (``DeclaredSpellings.of``); a caller whose
+    consumer has none need not resolve an upstream at all. ``present`` is the
+    upstream's guaranteed fields; ``forwarded`` is the part of it the consumer
+    carries onto its output (``present`` minus the fields the consumer removes,
+    empty when it forwards nothing), which is what a created name can shadow.
 
     A READ declaration (a field the node looks up on arriving rows) is refused
     only when the upstream vote is PARTICIPATING and CLOSED. The predicate's
@@ -209,13 +210,13 @@ def header_spelled_declarations(
     own — is a pipeline naming two fields by spellings of one name.
 
     Everything the build cannot settle is enforced per row by the runtime
-    residual, which applies ``header_spelling_canonical`` to the arriving row.
+    residual (``DeclaredSpellings.in_row``).
     """
     if not participated:
         return ()
     return _merge_spellings(
-        header_spelled_names(creates, forwarded, kind="create"),
-        header_spelled_names(reads, present, kind="read") if closed else (),
+        _spelled(spellings.creates, forwarded),
+        _spelled(spellings.reads, present) if closed else (),
     )
 
 
@@ -237,6 +238,11 @@ class DeclaredSpellings:
     def of(cls, *, reads: Iterable[str], creates: Iterable[str]) -> DeclaredSpellings:
         return cls(reads=_candidates(reads, kind="read"), creates=_candidates(creates, kind="create"))
 
+    @property
+    def is_empty(self) -> bool:
+        """True for the usual node: every declaration canonical, so no row and no upstream can flag one."""
+        return not self.reads and not self.creates
+
     def in_row(self, *, row_keys: Collection[str], forwarded_keys: Collection[str]) -> tuple[HeaderSpelling, ...]:
         """The run-time verdict for one arriving row — the residual the build could not settle.
 
@@ -245,7 +251,7 @@ class DeclaredSpellings:
         the part of the row the node carries onto its output (empty when it
         forwards nothing), which is what a created name can shadow.
         """
-        if not self.reads and not self.creates:
+        if self.is_empty:
             return ()
         return _merge_spellings(_spelled(self.creates, forwarded_keys), _spelled(self.reads, row_keys))
 

@@ -23,7 +23,12 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode
 from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.contracts.field_collision import can_overwrite_input_fields
-from elspeth.contracts.field_spelling import HEADER_SPELLING_RULE, describe_header_spellings, header_spelled_declarations
+from elspeth.contracts.field_spelling import (
+    HEADER_SPELLING_RULE,
+    DeclaredSpellings,
+    describe_header_spellings,
+    header_spelled_declarations,
+)
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
@@ -7167,16 +7172,14 @@ def _check_schema_contracts(
         component: str,
         consumer_id: str,
         consumer_label: str,
-        reads: frozenset[str],
-        creates: frozenset[str],
+        declared: DeclaredSpellings,
         removed: frozenset[str],
         producer: ProducerEntry,
     ) -> ValidationEntry | None:
         participates, vote_fields = _effective_producer_vote(producer)
         producer_schema = _known_producer_schema_config(producer)
         spellings = header_spelled_declarations(
-            reads=reads,
-            creates=creates,
+            spellings=declared,
             present=vote_fields,
             forwarded=vote_fields - removed,
             participated=participates,
@@ -7201,8 +7204,7 @@ def _check_schema_contracts(
         )
 
     class _SpellingSurfaces(NamedTuple):
-        reads: frozenset[str]
-        creates: frozenset[str]
+        declared: DeclaredSpellings
         removed: frozenset[str]
 
     def _probe_transform_spelling_surfaces(plugin: str, node: NodeSpec) -> _SpellingSurfaces | None:
@@ -7227,7 +7229,17 @@ def _check_schema_contracts(
             )
             else frozenset()
         )
-        return _SpellingSurfaces(transform.declared_read_fields, creates, transform.removed_input_fields)
+        return _SpellingSurfaces(
+            DeclaredSpellings.of(reads=transform.declared_read_fields, creates=creates),
+            transform.removed_input_fields,
+        )
+
+    # The producer walk reports the connections it cannot resolve ("Contract
+    # check skipped …"). The presence rules above already walked most of the
+    # same connections and reported them, so this pass collects its walk's
+    # reports apart and keeps only the ones no earlier rule made: one warning
+    # per skipped check, not one per rule that met it.
+    spelling_walk_warnings: list[ValidationEntry] = []
 
     for node in () if spelling_rule_abstains else nodes:
         if node.node_type != "transform" or node.plugin is None:
@@ -7235,17 +7247,18 @@ def _check_schema_contracts(
         if node.id in parse_failed_producers:
             continue
         surfaces = _probe_transform_spelling_surfaces(node.plugin, node)
-        if surfaces is None:
+        # A node whose declarations are all canonical has nothing any upstream
+        # could make a header spelling, so no producer is walked for it.
+        if surfaces is None or surfaces.declared.is_empty:
             continue
-        spelling_producer = _walk_to_real_producer(node.input, warnings=contract_warnings)
+        spelling_producer = _walk_to_real_producer(node.input, warnings=spelling_walk_warnings)
         if spelling_producer is None or spelling_producer.producer_id in parse_failed_producers:
             continue
         spelling_error = _header_spelling_error(
             component=f"node:{node.id}",
             consumer_id=node.id,
             consumer_label=f"Transform '{node.id}' ({node.plugin})",
-            reads=surfaces.reads,
-            creates=surfaces.creates,
+            declared=surfaces.declared,
             removed=surfaces.removed,
             producer=spelling_producer,
         )
@@ -7253,19 +7266,19 @@ def _check_schema_contracts(
             errors.append(spelling_error)
 
     for output in () if spelling_rule_abstains else outputs:
-        sink_reads = _sink_declarations(output).reads
-        if not sink_reads:
+        sink_declared = DeclaredSpellings.of(reads=_sink_declarations(output).reads, creates=())
+        if sink_declared.is_empty:
             continue
         sink_spelling_producers = resolver.sink_producers(output.name)
         if not sink_spelling_producers:
-            direct_producer = _walk_to_real_producer(output.name, warnings=contract_warnings)
+            direct_producer = _walk_to_real_producer(output.name, warnings=spelling_walk_warnings)
             sink_spelling_producers = () if direct_producer is None else (direct_producer,)
         seen_spelling_producers: set[str] = set()
         for sink_producer in sink_spelling_producers:
             real_producer = _walk_producer_entry_to_real_producer(
                 sink_producer,
                 connection_name=output.name,
-                warnings=contract_warnings,
+                warnings=spelling_walk_warnings,
             )
             if real_producer is None or real_producer.producer_id in seen_spelling_producers:
                 continue
@@ -7276,13 +7289,16 @@ def _check_schema_contracts(
                 component=f"output:{output.name}",
                 consumer_id=f"output:{output.name}",
                 consumer_label=f"Sink '{output.name}' ({output.plugin})",
-                reads=sink_reads,
-                creates=frozenset(),
+                declared=sink_declared,
                 removed=frozenset(),
                 producer=real_producer,
             )
             if spelling_error is not None:
                 errors.append(spelling_error)
+
+    for walk_warning in spelling_walk_warnings:
+        if walk_warning not in contract_warnings:
+            contract_warnings.append(walk_warning)
 
     # Eager schema-SYNTAX sweep (elspeth-33738eedb6). Every parser above is
     # LAZY: it resolves a declaration only when some contract comparison needs

@@ -19,6 +19,7 @@ from elspeth.contracts.enums import NodeType
 from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
+    DeclaredSpellings,
     describe_header_spellings,
     header_spelled_declarations,
     header_spelled_names,
@@ -1697,23 +1698,26 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
 
     for node_id, data in graph._graph.nodes(data=True):
         info = data["info"]
-        reads = info.declared_read_fields
-        creates = (
-            info.declared_created_fields
-            if can_overwrite_input_fields(
-                passes_through_input=info.passes_through_input,
-                forwards_input_fields=info.forwards_input_fields,
-            )
-            else frozenset()
+        declared = DeclaredSpellings.of(
+            reads=info.declared_read_fields,
+            creates=(
+                info.declared_created_fields
+                if can_overwrite_input_fields(
+                    passes_through_input=info.passes_through_input,
+                    forwards_input_fields=info.forwards_input_fields,
+                )
+                else frozenset()
+            ),
         )
-        if not reads and not creates:
+        # Every declaration canonical: no upstream can make one a header
+        # spelling, so no vote is walked.
+        if declared.is_empty:
             continue
 
         for predecessor_id in _live_predecessors(graph, node_id):
             vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
             spellings = header_spelled_declarations(
-                reads=reads,
-                creates=creates,
+                spellings=declared,
                 present=vote.fields,
                 forwarded=vote.fields - info.removed_input_fields,
                 participated=vote.participated,
