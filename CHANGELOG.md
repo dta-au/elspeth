@@ -178,7 +178,9 @@ drained and repair this release forward.
   constructed input model, which drops a declared field the transform itself
   creates, instead of the raw `schema:` block — so it no longer refuses a
   required `Name: str` under `{Name: Name}` or `{name: Name}` with "requires
-  fields: [Name]" while the runtime builds the pipeline.
+  fields: [Name]" while the runtime builds the pipeline. The same holds for a
+  batch aggregation declaring a field it writes (`batch_stats` with a required
+  `mean: float` behind a typed source).
   The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).
@@ -239,8 +241,14 @@ drained and repair this release forward.
   reads as infinity) failed every render with `NameError` wherever it sat in
   an expression (`truncate(1e400)`, `x == 1e400`). `elspeth validate` and the
   composer now refuse both, as they already refused an unknown filter name or
-  an unsatisfiable `truncate` length. A length computed from the row is still
-  decided per row.
+  an unsatisfiable `truncate` length. The non-integer length is refused
+  whatever the other arguments are (`truncate(10.5, end=row.e)`,
+  `truncate(10.5, leeway=row.n)` built and failed rows until now), and so are
+  a unary-plus literal (`truncate(+10.5)`; `truncate(+2)` is an unsatisfiable
+  length) and a bool length (`truncate(True)`, `truncate(False)`), as is a
+  bool `end`. A length computed from the row is still decided per row, and so
+  is a constant expression such as `truncate(10 / 2)`: templates are compiled
+  without constant folding, so validation does not evaluate arithmetic.
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics
