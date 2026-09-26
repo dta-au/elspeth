@@ -809,7 +809,14 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # resume digest, registry digest or oracle_freeze snapshot moved. The same
 # round then un-carried a declared header literal on such a mapping:
 # a45ae2bec03f6d88 -> df53a6bf11f5e647, likewise unpinned.
-EXPECTED_CASE_REGISTRY_SHA256 = "767f95459978d3ae4885e8681a405d84ad6acc88c58b694c7e894868a9a0af54"
+# Rotated 2026-09-26 (elspeth-5887fb7928, S6, review-R6 F1): a PLUGIN
+# PROVENANCE rotation. json_explode's process() comment was narrowed to the
+# module docstring's claim (a raised TypeError escapes; a raised
+# PluginContractViolation is converted), comment-only, so its source_file_hash
+# moved 67ab862fbd369a2b -> 26471026c209f7ef (the 1 manifest pin in
+# json-explode-parent-child; same tool). The production-path and oracle-freeze
+# files pass unchanged, so no resume digest and no oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "eda8062b9a7afb83c81dde54ba294fa85339f1b9eea28e35f69c8485b0002552"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -289,7 +289,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:67ab862fbd369a2b"
+    source_file_hash: str | None = "sha256:26471026c209f7ef"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -500,11 +500,11 @@ class JSONExplode(BaseTransform):
             # A wrong-typed value is a ROW-level failure, not a run-level one:
             # it is a fact about this row's data, identical in kind to the
             # empty-array rejection below, so it takes the same routable exit.
-            # Raising here instead would abort the whole run — ADR-008
-            # §"TIER_1 registration is load-bearing" (Correction 2026-08-21,
-            # elspeth-181db83da7): only a RETURNED error reaches the
-            # `result.status == "error"` branch that honours `on_error`; a
-            # raised exception escapes every catch site. Not coerced: a str or
+            # Raising a TypeError here instead would abort the whole run: it
+            # matches no conversion clause in the engine and escapes every
+            # catch site (ADR-008 Correction 2026-08-21, elspeth-181db83da7;
+            # see the module docstring). A raised PluginContractViolation, by
+            # contrast, is converted and routed. Not coerced: a str or
             # dict is not a list, and iterating one would fabricate rows
             # (one per character, or per key) that the operator never supplied.
             return TransformResult.error(
