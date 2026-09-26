@@ -205,9 +205,10 @@ drained and repair this release forward.
   reason `Undeclared field: the template reads 'x', a field this node does not
   declare in required_input_fields` (the field is named only when the template
   spells it). Behaviour changes: `'x' in row`, `row.get('x', default)` and
-  `row.x is defined` on an undeclared name fail the row instead of answering
-  `False` or the default (a declared field the row does not carry still
-  answers `False` / the default); `{% for k in row %}`, `row | length`,
+  `row.x is defined` on an undeclared name fail the row where configuration
+  does not refuse them first; before, they answered from the whole row, so
+  `'meta' in row` was `True` for a row carrying `meta` (a declared field the
+  row does not carry still answers `False` / the default); `{% for k in row %}`, `row | length`,
   `row | dictsort`, `row | items` and `dict(row)` see the declared fields, and
   configuration no longer refuses those whole-row forms with a declared list
   (the declared-but-unread check refuses only a prompt that never reads
