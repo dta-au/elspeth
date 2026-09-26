@@ -38,6 +38,9 @@ from typing import Any
 
 import pytest
 import yaml
+from sqlalchemy import Column, MetaData, Table, Text, create_engine
+
+from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
 
 SENTINEL = "SENTINEL_SPELLING_ROW_VALUE"
 _ID_NAME_CSV = f"ID,Name\n1,{SENTINEL}\n2,Bob\n"
@@ -214,6 +217,24 @@ def test_a_value_transform_schema_declaration_is_no_longer_inert(tmp_path: Path)
     _assert_routed(tmp_path, result, reason=_READ, literal="Name", canonical="name")
 
 
+def _provisioned_sqlite_target(path: Path) -> str:
+    """The database sink writes only to a table and effect ledger the operator provisioned."""
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    metadata = MetaData()
+    Table("t", metadata, Column("id", Text), Column("name", Text))
+    database_effect_ledger_table(metadata, "_elspeth_sink_effects")
+    metadata.create_all(engine)
+    engine.dispose()
+    return url
+
+
+# The runnable sinks' file suffixes; aws_s3, azure_blob, chroma_sink and
+# dataverse cannot run locally and are pinned by
+# tests/invariants/test_declared_field_spelling_surfaces.py.
+_SINK_SUFFIX = {"json": "jsonl", "csv": "csv", "text": "txt", "document": "docx"}
+
+
 @pytest.mark.parametrize(
     ("sink_plugin", "options"),
     [
@@ -221,6 +242,17 @@ def test_a_value_transform_schema_declaration_is_no_longer_inert(tmp_path: Path)
         pytest.param("csv", {"schema": {"mode": "flexible", "fields": ["Name: int?"]}}, id="csv-schema-field"),
         pytest.param("csv", {"schema": _OBSERVED, "headers": {"id": "Ident", "Name": "Full"}}, id="csv-custom-headers-key"),
         pytest.param("text", {"schema": _OBSERVED, "field": "Name"}, id="text-field-option"),
+        pytest.param("document", {"schema": _OBSERVED, "field": "Name"}, id="document-field-option"),
+        pytest.param(
+            "database",
+            {
+                "table": "t",
+                "if_exists": "append",
+                "effect_ledger": {"table": "_elspeth_sink_effects", "permissions": ["select", "insert"]},
+                "schema": {"mode": "flexible", "fields": ["Name: int?"]},
+            },
+            id="database-schema-field",
+        ),
     ],
 )
 def test_a_sink_declaration_by_header_ends_the_run_with_every_token_terminal(
@@ -233,7 +265,10 @@ def test_a_sink_declaration_by_header_ends_the_run_with_every_token_terminal(
     verdict and every token's terminal recorded.
     """
     options = dict(options)
-    options["path"] = str(tmp_path / f"out.{'jsonl' if sink_plugin == 'json' else sink_plugin}")
+    if sink_plugin == "database":
+        options["url"] = _provisioned_sqlite_target(tmp_path / "out.db")
+    else:
+        options["path"] = str(tmp_path / f"out.{_SINK_SUFFIX[sink_plugin]}")
     sink = {"plugin": sink_plugin, "on_write_failure": "discard", "options": options}
     result = _run(_settings(tmp_path, source=_csv_source(tmp_path), out_sink=sink))
 
