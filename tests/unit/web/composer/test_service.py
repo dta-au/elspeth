@@ -4192,6 +4192,78 @@ class TestComposeTimeout:
     """Tests for the server-side compose timeout (F1)."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error_class", "expected_failure_class"),
+        (("ServiceUnavailableError", "unavailable"), ("Timeout", "unavailable"), ("APIError", "malformed")),
+    )
+    async def test_end_advisor_classifies_real_sdk_failure_by_type(
+        self, monkeypatch: pytest.MonkeyPatch, error_class: str, expected_failure_class: str
+    ) -> None:
+        from litellm.exceptions import APIError, ServiceUnavailableError, Timeout
+
+        sdk_error = (
+            APIError(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
+            if error_class == "APIError"
+            else {"ServiceUnavailableError": ServiceUnavailableError, "Timeout": Timeout}[error_class](
+                message="provider secret", llm_provider="test", model="test/advisor"
+            )
+        )
+        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
+        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        physical_calls = 0
+
+        async def fail(*_args: object, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object) -> Any:
+            nonlocal physical_calls
+            physical_calls += 1
+            if on_provider_dispatch is not None:
+                on_provider_dispatch()
+            raise sdk_error
+
+        with patch.object(service, "_call_advisor_with_audit", side_effect=fail):
+            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+
+        assert physical_calls == 2
+        assert verdict.failure_class == expected_failure_class
+        assert verdict.findings_text == (
+            "advisor model was unavailable after retry" if expected_failure_class == "unavailable" else "advisor response was malformed"
+        )
+        assert "provider secret" not in repr(verdict)
+        assert checkpoint_persist.await_count == 1
+        assert checkpoint_persist.await_args.kwargs["record"].provider_attempts == 2
+
+    @pytest.mark.asyncio
+    async def test_end_advisor_first_party_same_named_failure_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
+        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        impostor_class = type("ServiceUnavailableError", (Exception,), {})
+        impostor = impostor_class("first-party defect")
+        with (
+            patch.object(service, "_call_advisor_with_audit", side_effect=impostor) as advisor,
+            pytest.raises(impostor_class) as raised,
+        ):
+            await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+
+        assert raised.value is impostor
+        assert advisor.await_count == 1
+        checkpoint_persist.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_end_advisor_generic_api_error_with_outage_name_remains_malformed(self) -> None:
+        """An SDK subclass name cannot override the generic APIError disposition."""
+        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        named_generic_api_error = type("ServiceUnavailableError", (LiteLLMAPIError,), {})
+        failure = named_generic_api_error(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
+
+        with patch.object(service, "_call_advisor_with_audit", side_effect=failure):
+            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+
+        assert verdict.failure_class == "malformed"
+        assert verdict.findings_text == "advisor response was malformed"
+        assert "provider secret" not in repr(verdict)
+
+    @pytest.mark.asyncio
     async def test_timeout_raises_convergence_error(self) -> None:
         """Exceeding composer_timeout_seconds raises ComposerConvergenceError
         with budget_exhausted='timeout'."""
@@ -5134,6 +5206,102 @@ class TestComposerAvailabilityAndBadRequest:
         assert result.message == "Recovered."
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_real_service_unavailable_is_eligible_for_bounded_retry(self) -> None:
+        from litellm.exceptions import ServiceUnavailableError
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = ServiceUnavailableError(message="private upstream response", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
+        with (
+            patch(
+                "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_llm_response(content="Recovered.")]
+            ) as mock_llm,
+            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
+
+        assert result.message == "Recovered."
+        assert mock_llm.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_real_bad_gateway_is_not_retried(self) -> None:
+        from litellm.exceptions import BadGatewayError
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = BadGatewayError(message="private upstream response", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failure) as mock_llm,
+            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(BadGatewayError),
+        ):
+            await service.compose("Hello", [], _empty_state(), session_id=session_id)
+
+        assert mock_llm.call_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_path", ("ordinary", "advisor", "text"))
+    async def test_real_sdk_timeout_has_timeout_terminal_audit(self, call_path: str, monkeypatch) -> None:
+        from litellm.exceptions import Timeout as LiteLLMTimeout
+
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        recorder = BufferingRecorder()
+        failure = LiteLLMTimeout(message="private timeout body", model="openrouter/openai/gpt-5.5", llm_provider="openrouter")
+
+        async def fail_completion(*args, **kwargs):
+            del args, kwargs
+            raise failure
+
+        if call_path == "ordinary":
+            monkeypatch.setattr(service, "_call_llm", fail_completion)
+            call = service._call_llm_with_audit([{"role": "user", "content": "Hello"}], [], timeout=5, recorder=recorder)
+        else:
+            monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", fail_completion)
+            if call_path == "advisor":
+                call = service._call_advisor_with_audit(
+                    {
+                        "trigger": "proactive_security_safety",
+                        "problem_summary": "Need guidance.",
+                        "recent_errors": [],
+                        "attempted_actions": [],
+                    },
+                    recorder=recorder,
+                )
+            else:
+                call = service._call_text_llm_with_audit([{"role": "user", "content": "Explain this run"}], timeout=5, recorder=recorder)
+
+        with pytest.raises(LiteLLMTimeout):
+            await call
+        assert len(recorder.llm_calls) == 1
+        audited = recorder.llm_calls[0]
+        assert audited.status is ComposerLLMCallStatus.TIMEOUT
+        assert audited.error_class == "Timeout"
+        assert audited.error_message == "Timeout"
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_timeout_uses_existing_compose_timeout_outcome(self) -> None:
+        from litellm.exceptions import Timeout as LiteLLMTimeout
+
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = LiteLLMTimeout(message="private timeout body", model="openrouter/openai/gpt-5.5", llm_provider="openrouter")
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failure) as mock_llm,
+            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(ComposerConvergenceError) as caught,
+        ):
+            await service.compose("Hello", [], _empty_state(), session_id=session_id)
+
+        assert caught.value.budget_exhausted == "timeout"
+        assert mock_llm.call_count == 1
+        mock_sleep.assert_not_awaited()
+        assert len(caught.value.llm_calls) == 1
+        assert caught.value.llm_calls[0].status is ComposerLLMCallStatus.TIMEOUT
 
     @pytest.mark.asyncio
     async def test_bad_request_llm_error_is_not_retried(self) -> None:

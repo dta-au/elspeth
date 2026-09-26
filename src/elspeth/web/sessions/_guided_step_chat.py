@@ -76,11 +76,13 @@ def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
         GuardrailRaisedException,
         ModifyResponseException,
     )
+    from openai import OpenAIError as OpenAIProviderError
 
     return (
         LiteLLMAPIError,
         LiteLLMAuthError,
         LiteLLMBadRequestError,
+        OpenAIProviderError,
         BudgetExceededError,
         BlockedPiiEntityError,
         GuardrailRaisedException,

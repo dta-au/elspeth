@@ -4875,6 +4875,11 @@ class SessionServiceProtocol(Protocol):
     async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
         """Checkpoint terminal provider audit and settle its ledger atomically."""
 
+    async def cancel_undispatched_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+    ) -> None:
+        """Close a proven undispatched COMPOSE intent under its original fence."""
+
     async def settle_provider_attempt(
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
     ) -> None:

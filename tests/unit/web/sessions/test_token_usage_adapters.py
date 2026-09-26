@@ -8,6 +8,7 @@ caller learns of it.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import time
 from datetime import UTC, datetime, timedelta
@@ -29,9 +30,10 @@ from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination import chargeable_admission_authority
 from elspeth.web.coordination import run_diagnostics_authority as diagnostics_module
 from elspeth.web.coordination.contracts import StartPermitState
-from elspeth.web.coordination.quota_authority import QuotaExceeded, TokenUsageEntry
+from elspeth.web.coordination.quota_authority import QuotaExceeded, TokenUsageEntry, TokenUsageSource
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
+from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
@@ -146,6 +148,181 @@ async def test_provider_checkpoint_settles_once_and_later_cohort_reuses_evidence
         assert conn.execute(select(quota_provider_attempts_table.c.settled_at)).scalar_one() is not None
     with pytest.raises(AuditIntegrityError, match="contradicts"):
         await harness.finish_provider_attempt(session_operation_context=context, call=dataclasses.replace(call, prompt_tokens=999))
+
+
+@pytest.mark.asyncio
+async def test_undispatched_cancellation_records_distinct_atomic_evidence_and_is_idempotent(harness, engine) -> None:
+    _session_id, context = _seed_compose_session(engine)
+    attempt = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    await harness.cancel_undispatched_provider_attempt(
+        session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+    )
+    await harness.cancel_undispatched_provider_attempt(
+        session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+    )
+    with engine.connect() as conn:
+        messages = conn.execute(select(chat_messages_table)).all()
+        ledger = conn.execute(select(token_usage_ledger_table)).all()
+        stored_attempt = conn.execute(select(quota_provider_attempts_table)).one()
+    assert len(messages) == len(ledger) == 1
+    assert messages[0].role == "audit"
+    assert messages[0].tool_calls is None
+    assert "provider_attempt.cancelled_before_dispatch" in messages[0].content
+    assert attempt.attempt_id in messages[0].content
+    assert context.fence.operation_id in messages[0].content
+    assert context.fence.lease_token not in messages[0].content
+    assert ledger[0].model == "test/model"
+    assert (ledger[0].prompt_tokens, ledger[0].completion_tokens, ledger[0].cached_prompt_tokens, ledger[0].reasoning_tokens) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert stored_attempt.settled_at is not None
+    assert stored_attempt.ledger_entry_id == ledger[0].entry_id
+    later = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    assert later.attempt_id != attempt.attempt_id
+
+
+@pytest.mark.asyncio
+async def test_undispatched_cancellation_rejects_changed_model_and_dispatched_settlement(harness, engine) -> None:
+    _session_id, context = _seed_compose_session(engine)
+    attempt = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    await harness.cancel_undispatched_provider_attempt(
+        session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+    )
+    with pytest.raises(AuditIntegrityError):
+        await harness.cancel_undispatched_provider_attempt(
+            session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="different/model"
+        )
+    with pytest.raises(AuditIntegrityError):
+        await harness.finish_provider_attempt(
+            session_operation_context=context,
+            call=dataclasses.replace(_call(prompt=0, completion=0), call_id=attempt.attempt_id),
+        )
+    with engine.connect() as conn:
+        assert len(conn.execute(select(chat_messages_table)).all()) == 1
+        assert len(conn.execute(select(token_usage_ledger_table)).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_title_cancellation_after_committed_admission_never_dispatches(
+    harness: DualFencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id, context = _seed_compose_session(engine)
+    admitted = asyncio.Event()
+    release_result = asyncio.Event()
+    begin = harness.begin_provider_attempt
+    sdk_entries = 0
+
+    async def _delayed_result(*, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None):
+        attempt = await begin(session_operation_context=session_operation_context, source=source, run_id=run_id)
+        admitted.set()
+        await release_result.wait()
+        return attempt
+
+    async def _provider(**_kwargs: object) -> object:
+        nonlocal sdk_entries
+        sdk_entries += 1
+        raise AssertionError("A cancelled admission must not dispatch the provider")
+
+    monkeypatch.setattr(harness, "begin_provider_attempt", _delayed_result)
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _provider)
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=harness,
+            session_id=UUID(session_id),
+            user_message="Build a CSV pipeline",
+            model="test/model",
+            temperature=None,
+            seed=None,
+            session_operation_context=context,
+        )
+    )
+    await asyncio.wait_for(admitted.wait(), timeout=5)
+    with engine.connect() as conn:
+        assert conn.execute(select(quota_provider_attempts_table.c.settled_at)).scalar_one() is None
+    task.cancel("cancelled after committed admission")
+    await asyncio.sleep(0)
+    release_result.set()
+    with pytest.raises(asyncio.CancelledError, match="cancelled after committed admission"):
+        await asyncio.wait_for(task, timeout=5)
+    with engine.connect() as conn:
+        events = conn.execute(select(chat_messages_table)).all()
+        ledger = conn.execute(select(token_usage_ledger_table)).all()
+        attempt = conn.execute(select(quota_provider_attempts_table)).one()
+    assert sdk_entries == 0
+    assert len(events) == len(ledger) == 1
+    assert events[0].tool_calls is None
+    assert "provider_attempt.cancelled_before_dispatch" in events[0].content
+    assert '"source":"auto_title"' in events[0].content
+    assert (ledger[0].prompt_tokens, ledger[0].completion_tokens) == (0, 0)
+    assert attempt.settled_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["operation_id", "operation_epoch", "lease_token", "identity_id"])
+async def test_undispatched_cancellation_rejects_changed_original_custody(harness, engine, changed: str) -> None:
+    _session_id, context = _seed_compose_session(engine)
+    attempt = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    replacement: str | int = "tampered-custody"
+    if changed == "operation_epoch":
+        replacement = context.fence.operation_epoch + 1
+    with engine.begin() as conn:
+        if changed == "identity_id":
+            ensure_test_identity(conn, identity_id="different-owner")
+            replacement = "different-owner"
+        conn.execute(
+            update(quota_provider_attempts_table)
+            .where(quota_provider_attempts_table.c.attempt_id == attempt.attempt_id)
+            .values({changed: replacement})
+        )
+    with pytest.raises(AuditIntegrityError):
+        await harness.cancel_undispatched_provider_attempt(
+            session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+        )
+    with engine.connect() as conn:
+        assert conn.execute(select(quota_provider_attempts_table.c.settled_at)).scalar_one() is None
+        assert conn.execute(select(chat_messages_table.c.id)).all() == []
+        assert conn.execute(select(token_usage_ledger_table.c.entry_id)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_undispatched_cancellation_rejects_prior_terminal_call(harness, engine) -> None:
+    _session_id, context = _seed_compose_session(engine)
+    attempt = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    await harness.finish_provider_attempt(
+        session_operation_context=context,
+        call=dataclasses.replace(_call(prompt=4, completion=2), call_id=attempt.attempt_id),
+    )
+    with pytest.raises(AuditIntegrityError):
+        await harness.cancel_undispatched_provider_attempt(
+            session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+        )
+    with engine.connect() as conn:
+        assert len(conn.execute(select(chat_messages_table)).all()) == 1
+        assert len(conn.execute(select(token_usage_ledger_table)).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_undispatched_cancellation_rolls_back_all_three_records_on_failure(harness, engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    _session_id, context = _seed_compose_session(engine)
+    attempt = await harness.begin_provider_attempt(session_operation_context=context, source="composer")
+    write = service_module.cancel_undispatched_provider_attempt_on_connection
+
+    def _write_then_fail(*args: object, **kwargs: object) -> None:
+        write(*args, **kwargs)
+        raise RuntimeError("forced transaction rollback")
+
+    monkeypatch.setattr(service_module, "cancel_undispatched_provider_attempt_on_connection", _write_then_fail)
+    with pytest.raises(RuntimeError, match="forced transaction rollback"):
+        await harness.cancel_undispatched_provider_attempt(
+            session_operation_context=context, attempt_id=attempt.attempt_id, requested_model="test/model"
+        )
+    with engine.connect() as conn:
+        assert conn.execute(select(quota_provider_attempts_table.c.settled_at)).scalar_one() is None
+        assert conn.execute(select(chat_messages_table.c.id)).all() == []
+        assert conn.execute(select(token_usage_ledger_table.c.entry_id)).all() == []
 
 
 @pytest.mark.asyncio

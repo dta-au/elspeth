@@ -7,14 +7,18 @@ from uuid import uuid4
 
 import pytest
 from litellm import ModelResponse
+from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
+    AdmissionRefusalReason,
     ChargeableAdmissionDecision,
     ChargeableAdmissionRefused,
     ChargeableOperation,
     QuotaDisposition,
 )
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.sessions import _auto_title
@@ -595,6 +599,284 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
     assert counter.calls == [(1, {"exception_class": "CancelledError"}, None)]
 
 
+@pytest.mark.asyncio
+async def test_auto_title_repeated_cancellation_finishes_settlement_and_preserves_original(monkeypatch) -> None:
+    original = asyncio.CancelledError("provider cancellation")
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def cancelled_provider(**_kwargs: object) -> object:
+        raise original
+
+    class _BlockingSettlementService(_TitleService):
+        async def settle_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+        ) -> None:
+            settlement_started.set()
+            await release_settlement.wait()
+            await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
+
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    service = _BlockingSettlementService()
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    )
+    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    task.cancel()
+    release_settlement.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(task, timeout=1)
+    assert caught.value is original
+    assert len(service.usage) == 1
+    assert service.usage[0][2][0].call_id == "title-attempt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement_failure", [RuntimeError("write failed"), AuditIntegrityError("audit write failed")])
+async def test_auto_title_provider_cancellation_preserves_failure_priority_during_settlement(
+    monkeypatch, settlement_failure: Exception
+) -> None:
+    original = asyncio.CancelledError("provider cancellation")
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def cancelled_provider(**_kwargs: object) -> object:
+        raise original
+
+    class _FailingSettlementService(_TitleService):
+        async def settle_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+        ) -> None:
+            settlement_started.set()
+            await release_settlement.wait()
+            raise settlement_failure
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    service = _FailingSettlementService()
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    )
+    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    task.cancel("second cancellation")
+    release_settlement.set()
+    expected_type = AuditIntegrityError if isinstance(settlement_failure, AuditIntegrityError) else asyncio.CancelledError
+    with pytest.raises(expected_type) as caught:
+        await asyncio.wait_for(task, timeout=1)
+    if isinstance(settlement_failure, AuditIntegrityError):
+        assert caught.value is settlement_failure
+        assert caught.value.__cause__ is original
+    else:
+        assert caught.value is original
+        assert caught.value.__cause__ is settlement_failure
+    assert service.usage == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cancelled", [False, True])
+async def test_auto_title_child_settlement_self_cancellation_fails_closed(monkeypatch, provider_cancelled: bool) -> None:
+    original = asyncio.CancelledError("provider cancellation")
+
+    async def provider(**_kwargs: object) -> object:
+        if provider_cancelled:
+            raise original
+        return _completion("Useful Pipeline")
+
+    class _SelfCancellingSettlementService(_TitleService):
+        async def settle_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+        ) -> None:
+            raise asyncio.CancelledError("settlement stopped itself")
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    service = _SelfCancellingSettlementService()
+    with pytest.raises(AuditIntegrityError, match="settlement was cancelled") as caught:
+        await _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    if provider_cancelled:
+        assert caught.value.__cause__ is original
+    assert service.usage == []
+
+
+@pytest.mark.asyncio
+async def test_auto_title_cancellation_during_success_settlement_finishes_accounting(monkeypatch) -> None:
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def successful_provider(**_kwargs: object) -> object:
+        return _completion("Useful Pipeline")
+
+    class _BlockingSettlementService(_TitleService):
+        async def settle_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+        ) -> None:
+            settlement_started.set()
+            await release_settlement.wait()
+            await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", successful_provider)
+    service = _BlockingSettlementService()
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    )
+    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    task.cancel()
+    release_settlement.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert len(service.usage) == 1
+    assert service.usage[0][2][0].call_id == "title-attempt"
+    assert service.updates == []
+
+
+@pytest.mark.asyncio
+async def test_auto_title_cancellation_during_admission_closes_undispatched_attempt(monkeypatch) -> None:
+    admission_started = asyncio.Event()
+    release_admission = asyncio.Event()
+    closure_started = asyncio.Event()
+    release_closure = asyncio.Event()
+    provider_calls = 0
+
+    async def provider(**_kwargs: object) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _completion("Useful Pipeline")
+
+    class _BlockingAdmissionService(_TitleService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancelled_attempts: list[str] = []
+
+        async def begin_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
+        ) -> ProviderAttempt:
+            attempt = await super().begin_provider_attempt(
+                session_operation_context=session_operation_context, source=source, run_id=run_id
+            )
+            admission_started.set()
+            await release_admission.wait()
+            return attempt
+
+        async def cancel_undispatched_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+        ) -> None:
+            assert session_operation_context == _TEST_CONTEXT
+            assert requested_model == "openai/test"
+            closure_started.set()
+            await release_closure.wait()
+            self.cancelled_attempts.append(attempt_id)
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    service = _BlockingAdmissionService()
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    )
+    await asyncio.wait_for(admission_started.wait(), timeout=1)
+    task.cancel("admission cancellation")
+    release_admission.set()
+    await asyncio.wait_for(closure_started.wait(), timeout=1)
+    task.cancel("second cancellation")
+    release_closure.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(task, timeout=1)
+    assert caught.value.args == ("admission cancellation",)
+    assert service.cancelled_attempts == ["title-attempt"]
+    assert provider_calls == 0
+    assert service.usage == []
+
+
+@pytest.mark.asyncio
+async def test_auto_title_cancellation_wins_over_concurrent_admission_refusal(monkeypatch) -> None:
+    admission_started = asyncio.Event()
+    release_admission = asyncio.Event()
+    provider_calls = 0
+
+    async def provider(**_kwargs: object) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _completion("Useful Pipeline")
+
+    class _BlockingRefusalService(_TitleService):
+        async def begin_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
+        ) -> ProviderAttempt:
+            assert session_operation_context == _TEST_CONTEXT
+            assert source == "auto_title"
+            assert run_id is None
+            admission_started.set()
+            await release_admission.wait()
+            raise ChargeableAdmissionRefused(
+                ChargeableAdmissionDecision(
+                    refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
+                    evidence=AdmissionPolicyEvidence(
+                        identity_policy_id="test-policy",
+                        quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE,
+                        secret_wiring_hash="a" * 64,
+                    ),
+                )
+            )
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    task = asyncio.create_task(
+        _auto_title.maybe_auto_title_session(
+            service=_BlockingRefusalService(),
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    )
+    await asyncio.wait_for(admission_started.wait(), timeout=1)
+    task.cancel("caller cancellation")
+    await asyncio.sleep(0)
+    release_admission.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(task, timeout=1)
+    assert caught.value.args == ("caller cancellation",)
+    assert provider_calls == 0
+
+
 # ── Task I1: the auto-title token-ledger adapter ──────────────────────────
 
 
@@ -684,6 +966,36 @@ async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) ->
             ),
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [BadGatewayError, ServiceUnavailableError, LiteLLMTimeout])
+async def test_auto_title_gateway_failure_settles_unknown_usage_without_title(monkeypatch, error_type) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def failing_provider(**_kwargs: object) -> object:
+        raise error
+
+    counter = _FakeCounter()
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    service = _TitleService()
+    await _auto_title.maybe_auto_title_session(
+        service=service,
+        session_id=_TEST_SESSION_ID,
+        user_message="Build a CSV pipeline",
+        model="openai/test",
+        temperature=None,
+        seed=None,
+        session_operation_context=_TEST_CONTEXT,
+    )
+    assert service.updates == []
+    assert counter.calls == [(1, {"exception_class": error_type.__name__}, None)]
+    assert len(service.usage) == 1
+    entry = service.usage[0][2][0]
+    assert entry.call_id == "title-attempt"
+    assert entry.prompt_tokens is None
+    assert entry.completion_tokens is None
 
 
 @pytest.mark.asyncio

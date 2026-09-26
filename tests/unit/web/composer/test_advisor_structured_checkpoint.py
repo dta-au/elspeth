@@ -356,8 +356,9 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(m
     admissions = 0
     physical_calls = 0
 
-    async def admission():
+    async def admission(*, model: str):
         nonlocal admissions
+        assert model == service._settings.composer_advisor_model
         admissions += 1
         if scenario == "admission-timeout-then-clean" and admissions == 1:
             raise TimeoutError("quota admission timed out before dispatch")

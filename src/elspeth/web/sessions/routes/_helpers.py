@@ -30,6 +30,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -122,6 +123,7 @@ from elspeth.web.composer.protocol import (
     ComposerService,
     ComposerServiceError,
 )
+from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_telemetry import (
     begin_composer_request_metrics,
     finish_composer_request_metrics,
@@ -805,6 +807,150 @@ def _litellm_error_detail(
     if raw_status_code is not None:
         detail["provider_status_code"] = raw_status_code
     return detail
+
+
+async def _handle_composer_provider_failure(
+    exc: Exception,
+    *,
+    route: Literal["messages", "recompose"],
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+    expose_provider_error: bool,
+) -> HTTPException:
+    """Publish one safe provider disposition for either Composer HTTP route."""
+    from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+
+    failure = classify_provider_failure(exc)
+    if failure is None:
+        raise TypeError("Composer provider failure requires a classified SDK exception")
+    slog.error(
+        "compose_llm_provider_error",
+        route=route,
+        session_id=str(session_id),
+        exc_class=type(exc).__name__,
+    )
+    if failure.kind == "auth":
+        headline = "The composer model is not available."
+        evidence = "The model provider rejected the composer request."
+        likely_next = "Check the composer provider configuration before retrying."
+        reason: ComposerProgressReason = "provider_auth_failed"
+        error_type = "llm_auth_error"
+    elif failure.kind == "bad_request":
+        headline = "The composer model rejected this request."
+        evidence = "The model provider rejected the composer request as invalid."
+        likely_next = "Check the composer provider configuration and request options before retrying."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    elif failure.kind == "timeout":
+        headline = "The composer model did not respond in time."
+        evidence = "The model call timed out."
+        likely_next = "Retry later; if this continues, ask an administrator to investigate the model gateway."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    else:
+        headline = "The composer model is temporarily unavailable."
+        evidence = "The model provider did not complete the request."
+        likely_next = (
+            "Retry later; if this continues, ask an administrator to investigate the model gateway."
+            if isinstance(exc, (BadGatewayError, ServiceUnavailableError))
+            else "Retry when the provider is available."
+        )
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline=headline,
+                evidence=(evidence,),
+                likely_next=likely_next,
+                reason=reason,
+            ),
+        )
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
+        )
+    # Gateway 502/503 text may contain an upstream response body. The staging
+    # debug option cannot make that material safe for a user-facing surface.
+    gateway_failure = isinstance(exc, (BadGatewayError, ServiceUnavailableError)) or failure.kind == "timeout"
+    detail = _litellm_error_detail(
+        error_type,
+        exc,
+        expose_provider_error=expose_provider_error and not gateway_failure,
+    )
+    if gateway_failure:
+        detail["guidance"] = likely_next
+    return HTTPException(status_code=504 if failure.kind == "timeout" else 502, detail=detail)
+
+
+async def _handle_composer_chargeable_refusal(
+    exc: ChargeableAdmissionRefused,
+    *,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+) -> HTTPException:
+    """Keep unknown token usage distinct from a failed provider dispatch."""
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
+        )
+    if exc.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE:
+        guidance = "Ask an administrator to reconcile token accounting before retrying."
+        if progress_sink is not None:
+            await _publish_progress(
+                progress_sink,
+                event=ComposerProgressEvent(
+                    phase="failed",
+                    headline="Token accounting is unavailable for this request.",
+                    evidence=("A new provider attempt could not be admitted.",),
+                    likely_next=guidance,
+                    reason="accounting_unavailable",
+                ),
+            )
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "composer_admission_refused",
+                "failure_code": "token_accounting_unavailable",
+                "detail": "Token accounting is unavailable, so a new model call cannot start. Ask an administrator to reconcile usage before retrying.",
+                "guidance": guidance,
+            },
+        )
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline="This request was refused by the admission policy.",
+                evidence=(str(exc),),
+                likely_next="Ask an administrator to review your access and quota configuration.",
+                reason="admission_refused",
+            ),
+        )
+    return HTTPException(
+        status_code=403,
+        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+    )
 
 
 def composition_validation_error_responses(
@@ -3912,6 +4058,8 @@ __all__ = [
     "_first_message_line",
     "_get_composer_progress_registry",
     "_get_session_compose_lock_registry",
+    "_handle_composer_chargeable_refusal",
+    "_handle_composer_provider_failure",
     "_handle_convergence_error",
     "_handle_planner_failure",
     "_handle_plugin_crash",

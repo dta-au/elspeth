@@ -28,9 +28,6 @@ from uuid import UUID
 
 import structlog
 from jsonschema import Draft202012Validator
-from litellm.exceptions import APIError as LiteLLMAPIError
-from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
@@ -127,6 +124,7 @@ from elspeth.web.composer.provider_discovery_response import (
     schema_projection_failure,
     surface_projection_failure,
 )
+from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
@@ -4146,39 +4144,22 @@ async def _plan_pipeline_inner(
                 _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
                 recorder.record_llm_call(timed_out_call)
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
-            except LiteLLMAuthError as exc:
+            except Exception as exc:
+                provider_failure = classify_provider_failure(exc)
                 record_provider_failure(
                     exc,
-                    ComposerLLMCallStatus.AUTH_ERROR,
+                    provider_failure.audit_status if provider_failure is not None else ComposerLLMCallStatus.API_ERROR,
                     started_at=started_at,
                     started_ns=started_ns,
                     ordinal=ordinal,
                 )
-                raise PipelinePlannerError(
-                    f"planner provider call failed ({type(exc).__name__})",
-                    code="PROVIDER_ERROR",
-                ) from None
-            except LiteLLMBadRequestError as exc:
-                record_provider_failure(
-                    exc,
-                    ComposerLLMCallStatus.BAD_REQUEST_ERROR,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    ordinal=ordinal,
-                )
-                raise PipelinePlannerError(
-                    f"planner provider call failed ({type(exc).__name__})",
-                    code="PROVIDER_ERROR",
-                ) from None
-            except LiteLLMAPIError as exc:
-                record_provider_failure(
-                    exc,
-                    ComposerLLMCallStatus.API_ERROR,
-                    started_at=started_at,
-                    started_ns=started_ns,
-                    ordinal=ordinal,
-                )
-                if attempt < model_config.max_api_attempts:
+                if provider_failure is None:
+                    # An admitted dispatch still needs terminal evidence, but
+                    # a first-party fault must retain its original type.
+                    raise
+                if provider_failure.kind == "timeout":
+                    raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
+                if provider_failure.retryable and attempt < model_config.max_api_attempts:
                     retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
                     if retry_delay > 0:
                         await asyncio.sleep(min(retry_delay, max(0.0, deadline - asyncio.get_running_loop().time())))

@@ -380,6 +380,7 @@ export type ComposerProgressReason =
   | "planner_repair_exhausted"
   | "service_setup_failed"
   | "admission_refused"
+  | "accounting_unavailable"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
   | "client_cancelled"
@@ -1180,6 +1181,8 @@ export interface ApiError {
    *  envelopes). "policy_blocked" is permanent by construction — retry
    *  affordances must not invite a retry for it. */
   failure_code?: string;
+  /** Static provider or accounting guidance supplied by the Composer route. */
+  guidance?: string;
   component_id?: string;
   plugin_id?: string;
   /**

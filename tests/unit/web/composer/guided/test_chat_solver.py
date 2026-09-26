@@ -23,6 +23,8 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCallStatus
 from elspeth.contracts.freeze import deep_thaw
@@ -408,6 +410,128 @@ async def test_management_auto_drop_uses_canonical_provider_api_error_classifica
     assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
     assert result.chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
     assert result.chat.error_class == "APIError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        (BadGatewayError, ComposerLLMCallStatus.API_ERROR),
+        (ServiceUnavailableError, ComposerLLMCallStatus.API_ERROR),
+        (LiteLLMTimeout, ComposerLLMCallStatus.TIMEOUT),
+    ],
+)
+async def test_management_auto_drop_handles_gateway_status_errors_with_terminal_audit(
+    monkeypatch: pytest.MonkeyPatch, error_type, expected_status: ComposerLLMCallStatus
+) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    result = await resolve_deferred_intent_management_chat_with_auto_drop(
+        site="test",
+        session_id="session",
+        user_id="user",
+        request=DeferredIntentManagementChatRequest(
+            model="test/model",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="cancel one saved instruction",
+            temperature=None,
+            seed=None,
+            timeout_seconds=5,
+            context_block="safe context",
+        ),
+        recorder=recorder,
+    )
+    assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
+    assert result.chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert result.chat.error_class == error_type.__name__
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is expected_status
+    assert recorder.llm_calls[0].error_class == error_type.__name__
+    assert "private upstream response" not in repr(result)
+    assert "private upstream response" not in repr(recorder.llm_calls[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("palette", ["source", "sink", "advisory"])
+@pytest.mark.parametrize("error_type", [BadGatewayError, ServiceUnavailableError])
+async def test_guided_palettes_absorb_gateway_status_errors(monkeypatch: pytest.MonkeyPatch, palette: str, error_type) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    shared = {
+        "site": "test",
+        "session_id": "session",
+        "user_id": "user",
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+    }
+    if palette == "source":
+        monkeypatch.setattr(guided_step_chat_module, "maybe_resolve_step_1_source_chat", provider_failure)
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            **shared, plugin_hint=None, current_source=None, available_source_plugins=()
+        )
+        chat = result.chat
+    elif palette == "sink":
+        monkeypatch.setattr(guided_step_chat_module, "maybe_resolve_step_2_sink_chat", provider_failure)
+        result = await resolve_step_2_sink_chat_with_auto_drop(**shared, current_sink=None)
+        chat = result.chat
+    else:
+        monkeypatch.setattr(guided_step_chat_module, "solve_step_chat", provider_failure)
+        chat = await guided_step_chat_module.solve_step_chat_with_auto_drop(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+    assert chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert chat.error_class == error_type.__name__
+    assert "private upstream response" not in repr(chat)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("solver", ["source", "sink", "advisory"])
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        (BadGatewayError, ComposerLLMCallStatus.API_ERROR),
+        (ServiceUnavailableError, ComposerLLMCallStatus.API_ERROR),
+        (LiteLLMTimeout, ComposerLLMCallStatus.TIMEOUT),
+    ],
+)
+async def test_guided_solver_provider_audit_uses_sdk_status_class(
+    monkeypatch: pytest.MonkeyPatch, solver: str, error_type, expected_status: ComposerLLMCallStatus
+) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    shared = {
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+        "recorder": recorder,
+    }
+    with pytest.raises(error_type):
+        if solver == "source":
+            await maybe_resolve_step_1_source_chat(**shared, plugin_hint=None, current_source=None, available_source_plugins=("csv",))
+        elif solver == "sink":
+            await maybe_resolve_step_2_sink_chat(**shared, current_sink=None)
+        else:
+            await solve_step_chat(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is expected_status
+    assert recorder.llm_calls[0].error_class == error_type.__name__
+    assert "private upstream response" not in repr(recorder.llm_calls[0])
 
 
 @pytest.mark.asyncio

@@ -281,7 +281,7 @@ export function MessageBubble({
                 deployment policy refused the pipeline (see the F13-D guided
                 precedent in sessionStore.ts) — so keep the failed text but
                 never render a retry invitation for it. */}
-            {message.local_failure_code !== "policy_blocked" && message.local_failure_code !== "admission_refused" && (
+            {message.local_failure_code !== "policy_blocked" && message.local_failure_code !== "admission_refused" && message.local_failure_code !== "token_accounting_unavailable" && (
               <Button
                 variant="bare"
                 onClick={() => onRetry(message.id)}
