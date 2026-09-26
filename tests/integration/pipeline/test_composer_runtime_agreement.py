@@ -7742,6 +7742,51 @@ class TestComposerRuntimeBatchPlacementAgreement:
         assert "downstream of the collector" in misplaced[0].message
         assert "downstream of the collector" in str(raised.value)
 
+    def _replicate(self, output_mode: str) -> NodeSpec:
+        node = self._node("copies", "aggregation", "batch_replicate", "rows", "main", trigger={"count": 3}, output_mode=output_mode)
+        return replace(node, options={"schema": {"mode": "observed"}, "copies_field": "n", "default_copies": 1})
+
+    def test_both_reject_batch_replicate_under_passthrough(self, tmp_path: Path) -> None:
+        """S4 review r2 F2: under passthrough a batch whose rows ask for 2 copies ended the run (exit 4).
+
+        ``elspeth validate`` admitted it while the composer refused it by the
+        plugin's NAME; both now read the class declaration
+        ``requires_transform_output_mode``.
+        """
+        state = self._state(tmp_path, self._replicate("passthrough"))
+
+        composer = state.validate()
+        assert not composer.is_valid
+        misplaced = [e for e in composer.errors if e.error_code == "batch_transform_misplaced"]
+        assert misplaced, composer.errors
+        assert "output_mode: transform" in misplaced[0].message
+        with pytest.raises(
+            ValueError, match=r"Aggregation 'copies' uses transform 'batch_replicate' with output_mode: passthrough"
+        ) as raised:
+            self._runtime_instantiate(state)
+        assert "Set output_mode: transform" in str(raised.value)
+
+    def test_both_accept_batch_replicate_under_transform(self, tmp_path: Path) -> None:
+        """Control: the same node under output_mode: transform."""
+        state = self._state(tmp_path, self._replicate("transform"))
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        self._runtime_instantiate(state)
+
+    def test_both_read_the_output_mode_declaration_not_the_plugin_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Flip the declaration on another batch plugin: both surfaces refuse it under passthrough."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
+        monkeypatch.setattr(batch_stats_cls, "requires_transform_output_mode", True)
+        state = self._state(tmp_path, self._batch_stats("aggregation", trigger={"count": 10}, output_mode="passthrough"))
+
+        composer = state.validate()
+        assert any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        with pytest.raises(ValueError, match=r"Aggregation 'stats' uses transform 'batch_stats' with output_mode: passthrough"):
+            self._runtime_instantiate(state)
+
     def test_both_accept_a_windowless_batch_plugin_as_collector(self, tmp_path: Path) -> None:
         """Control: the same collector topology closed by batch_stats, which reads no flush window."""
         state = self._explode_then(tmp_path, "batch_stats", {"schema": {"mode": "observed"}, "value_field": "v"})

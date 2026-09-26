@@ -1690,6 +1690,14 @@ def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[st
     return frozenset(cls.name for cls in transforms if cls.is_batch_aware and not cls.supports_row_mode_when_batch_aware)
 
 
+def _known_transform_plugins_requiring_transform_output_mode() -> frozenset[str]:
+    """Return transform names whose flush can emit another row count than it buffered (``output_mode: transform`` only)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.requires_transform_output_mode)
+
+
 def _known_transform_plugins_requiring_aggregation_batch_context() -> frozenset[str]:
     """Return transform names that read the aggregation flush window (``ctx.aggregation_batch``)."""
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -1742,8 +1750,10 @@ def _batch_aware_placement_error(
     """Reject a batch-aware transform from a node kind it cannot run in.
 
     Mirrors runtime_factory's placement refusals, from the same plugin class
-    declarations: a batch-only plugin as a row transform, and a plugin that
-    reads the aggregation flush window as a collector.
+    declarations: a batch-only plugin as a row transform, a plugin that reads
+    the aggregation flush window as a collector, and a plugin whose flush can
+    emit another row count than it buffered as an aggregation under any
+    output_mode but transform.
     """
     if plugin_name is None:
         return None
@@ -1765,14 +1775,18 @@ def _batch_aware_placement_error(
             "Batch-aware transforms require the aggregation/batch path unless the plugin explicitly supports row mode. "
             "Configure this node as node_type='aggregation' with an aggregation trigger, or use a row-level transform instead."
         )
-        if plugin_name == "batch_replicate":
-            message += " For batch_replicate, set output_mode: transform so replicated rows create new downstream tokens."
+        if plugin_name in _known_transform_plugins_requiring_transform_output_mode():
+            message += f" For {plugin_name}, set output_mode: transform so its rows create new downstream tokens."
         return message
 
-    if plugin_name == "batch_replicate" and node_type == "aggregation" and output_mode != "transform":
+    if (
+        node_type == "aggregation"
+        and output_mode != "transform"
+        and plugin_name in _known_transform_plugins_requiring_transform_output_mode()
+    ):
         return (
-            f"Node '{node_id}' uses batch_replicate, which deaggregates a batch into new rows. "
-            "Configure it as an aggregation with output_mode: transform so replicated rows create new downstream tokens."
+            f"Node '{node_id}' uses {plugin_name}, which can emit a different number of rows than it buffered. "
+            "Configure it as an aggregation with output_mode: transform so its rows create new downstream tokens."
         )
 
     return None

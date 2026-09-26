@@ -134,6 +134,7 @@ class _UncalledBatchTransform:
         self.is_batch_aware = True
         self.supports_row_mode_when_batch_aware = False
         self.requires_aggregation_batch_context = False
+        self.requires_transform_output_mode = False
         self.creates_tokens = False
         self.passes_through_input = False
         self.forwards_input_fields = False

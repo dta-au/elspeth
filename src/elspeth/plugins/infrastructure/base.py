@@ -459,6 +459,15 @@ class BaseTransform(ABC):
     # abort at run time.
     requires_aggregation_batch_context: bool = False
 
+    # True for a batch-aware plugin whose flush can emit a row count other
+    # than one per buffered row (batch_replicate's copies). Under
+    # output_mode: passthrough the engine requires exactly one output per
+    # input, so such a plugin would end the run on the first batch whose rows
+    # ask for another count. runtime_factory refuses it as an aggregation
+    # under any output_mode but transform, and the composer's placement rule
+    # reads the same declaration.
+    requires_transform_output_mode: bool = False
+
     # Token creation flag for deaggregation transforms
     # When True AND process() returns success_multi(), the processor creates
     # new token_ids for each output row with parent linkage to input token.
