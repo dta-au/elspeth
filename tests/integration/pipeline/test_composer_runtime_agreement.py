@@ -2097,6 +2097,50 @@ class TestComposerRuntimeAgreement:
         assert "value" in message
 
     @pytest.mark.parametrize(
+        ("sink_field", "admitted"),
+        [pytest.param("value: int?", False, id="optional-int-conflicts"), pytest.param("value: str?", True, id="optional-str-control")],
+    )
+    def test_both_type_check_an_optional_field_of_a_sink_that_requires_nothing(
+        self, tmp_path: Path, sink_field: str, admitted: bool
+    ) -> None:
+        """A flexible sink whose only field is optional still has that field's type checked on both surfaces (review-F1-final-minors-r1 F2).
+
+        Stage 1's output loop skipped a sink with no requirement and no locked
+        input, so ``csv(value: str) -> sink(flexible, value: int?)`` went
+        green while the DAG build refuses it: the runtime compares an
+        optional field's type as well. The ``str?`` row is the control.
+        """
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("value\nhello\n", encoding="utf-8")
+        output_path = tmp_path / "out.csv"
+        source_options = {"path": str(csv_path), "schema": {"mode": "fixed", "fields": ["value: str"]}}
+        sink_options = {"path": str(output_path), "schema": {"mode": "flexible", "fields": [sink_field]}}
+
+        state = self._empty_state()
+        state = state.with_source(SourceSpec(plugin="csv", on_success="main", options=source_options, on_validation_failure="discard"))
+        state = state.with_output(OutputSpec(name="main", plugin="csv", options=sink_options, on_write_failure="discard"))
+
+        composer_result = state.validate()
+        type_errors = [e for e in composer_result.errors if e.error_code == "edge_field_type_incompatible"]
+
+        def build_runtime_graph() -> None:
+            graph = self._build_runtime_graph(
+                source_plugin="csv", source_options=source_options, transform_plugin=None, sink_options=sink_options
+            )
+            graph.validate_edge_compatibility()
+
+        if admitted:
+            assert composer_result.is_valid, composer_result.errors
+            build_runtime_graph()
+            return
+        [type_error] = type_errors
+        assert type_error.component == "output:main"
+        assert "value (consumer expects int, producer emits str)" in type_error.message
+        with pytest.raises(GraphValidationError) as exc_info:
+            build_runtime_graph()
+        assert "value" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
         ("producer_type", "consumer_type", "admitted"),
         [
             pytest.param("int", "float", True, id="int-under-float"),
@@ -8390,6 +8434,54 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         assert entry.contract.missing_fields == ("other",)
         assert not runtime.is_valid
         assert any("other" in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize(
+        ("source_mode", "node_fields", "field"),
+        [
+            ("flexible", ["Name: str", "id: int?"], "id"),
+            ("fixed", ["Name: str", "id: int?"], "id"),
+            ("flexible", ["Name: str", "name: int?"], "name"),
+            ("flexible", ["id: int?"], "id"),
+        ],
+        ids=[
+            "created-required-beside-optional-flexible",
+            "created-required-beside-optional-fixed",
+            "optional-arriving-name",
+            "nothing-required",
+        ],
+    )
+    def test_both_type_check_an_optional_field_beside_a_demoted_requirement(
+        self, tmp_path: Path, source_mode: str, node_fields: list[str], field: str
+    ) -> None:
+        """An optional typed field is type-checked on both surfaces, whatever the node requires (review-F1-final-minors-r1 F2).
+
+        The runtime compares the type of every consumer field the producer
+        declares, optional ones included. Stage 1's consumer loop skipped a
+        node with nothing to demand — and once the created ``Name`` was
+        demoted, ``{Name: Name}`` with ``[Name: str, id: int?]`` had nothing
+        left, so Stage 1 went green on an edge the DAG build refuses. The
+        ``nothing-required`` row was skipped the same way before the demotion.
+        """
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": source_mode, "fields": ["id: str", "name: str"]},
+            node=self._field_mapper({"Name": "Name"}, schema={"mode": "flexible", "fields": node_fields}),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "edge_field_type_incompatible"]
+        assert f"{field} (consumer expects int, producer emits str)" in entry.message
+        assert not runtime.is_valid
+        assert any("Type mismatches" in e.message and f"'{field}'" in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize("node_fields", [["Name: str", "id: str?"], ["id: str?"]], ids=["created-required", "nothing-required"])
+    def test_both_accept_an_optional_field_whose_type_the_producer_satisfies(self, tmp_path: Path, node_fields: list[str]) -> None:
+        """Control: reaching the type check refuses only a real conflict — an optional ``id: str?`` behind ``id: str`` builds on both."""
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
+            node=self._field_mapper({"Name": "Name"}, schema={"mode": "flexible", "fields": node_fields}),
+        )
+        self._assert_both_accept(state, tmp_path)
 
     def test_both_reject_a_rename_target_spelling_a_field_the_node_keeps(self, tmp_path: Path) -> None:
         """Control for the removal leg: ``{id: Name}`` removes ``id``, keeps ``name``, and ``Name`` would land beside it."""

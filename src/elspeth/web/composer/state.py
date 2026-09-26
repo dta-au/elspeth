@@ -34,6 +34,7 @@ from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
+    FieldDefinition,
     SchemaConfig,
     get_aggregation_contract_options,
     get_raw_node_required_fields,
@@ -6473,6 +6474,37 @@ def _check_schema_contracts(
         )
         return upstream_type
 
+    def _consumer_typed_declarations(consumer: NodeSpec | OutputSpec, *, owner: str) -> tuple[FieldDefinition, ...]:
+        """Return the consumer's declared fields whose type an edge can conflict with.
+
+        The runtime Phase-2 check (``check_compatibility``) compares the type
+        of EVERY consumer model field the producer also declares, optional
+        ones included, so this is every field of an explicit (fixed or
+        flexible) ``schema:`` block except those typed ``any`` — a declared
+        abstention on both sides: the author has said the type is not pinned,
+        so no conflict is mechanically provable.
+
+        It is the one reading behind both ``_edge_field_type_conflict`` and
+        the consumer loops' "nothing to check" guards, so a guard cannot skip
+        a consumer the type check has fields for (review-F1-final-minors-r1
+        F2: a consumer whose only required field the transform creates, or
+        that requires nothing, still has its optional typed fields checked by
+        the runtime).
+        """
+        try:
+            consumer_options = consumer.options
+            consumer_owner = owner
+            if type(consumer) is NodeSpec and node_type_nests_contract_options(consumer.node_type):
+                consumer_options, consumer_owner = get_aggregation_contract_options(consumer.options, owner=consumer_owner)
+            consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
+        except ValueError:
+            # Malformed declarations own their rejection through the
+            # ``contract_config_invalid`` parsers; do not double-report.
+            return ()
+        if consumer_schema_config is None or consumer_schema_config.is_observed or consumer_schema_config.fields is None:
+            return ()
+        return tuple(field_def for field_def in consumer_schema_config.fields if field_def.field_type != "any")
+
     def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
 
@@ -6541,30 +6573,9 @@ def _check_schema_contracts(
             consumer_component = f"node:{consumer.id}"
         else:
             raise TypeError(f"edge consumer must be a NodeSpec or OutputSpec, got {type(consumer).__name__}")
-        try:
-            consumer_options = consumer.options
-            consumer_owner = consumer_component
-            if type(consumer) is NodeSpec and node_type_nests_contract_options(consumer.node_type):
-                consumer_options, consumer_owner = get_aggregation_contract_options(consumer.options, owner=consumer_owner)
-            consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
-        except ValueError:
-            # Malformed declarations own their rejection through the
-            # ``contract_config_invalid`` parsers; do not double-report.
-            return None
 
-        if consumer_schema_config is None:
-            return None
-        if consumer_schema_config.is_observed:
-            return None
-        if consumer_schema_config.fields is None:
-            return None
-
-        # ``any`` is a declared abstention on BOTH sides — the author has said
-        # the type is not pinned, so no conflict is mechanically provable.
         mismatches: list[tuple[str, str, str]] = []
-        for field_def in consumer_schema_config.fields:
-            if field_def.field_type == "any":
-                continue
+        for field_def in _consumer_typed_declarations(consumer, owner=consumer_component):
             producer_type = _resolved_producer_field_type(producer, field_def.name, source_map=source_map)
             if producer_type is not None and not declared_type_name_admits(field_def.field_type, producer_type):
                 mismatches.append((field_def.name, field_def.field_type, producer_type))
@@ -6627,13 +6638,17 @@ def _check_schema_contracts(
         # ``declared_input`` joins the same disjunction: a web_scrape with no
         # explicit contract and an unlocked input carries its requirement
         # ONLY there, and omitting it here would leave the rule permanently
-        # inert.
+        # inert. The consumer's typed declarations join it for the edge TYPE
+        # check: the runtime compares an optional field's type as well, so a
+        # consumer that requires nothing — or whose only required field the
+        # transform creates and the narrowing above dropped — still reaches it.
         if (
             not consumer_required
             and consumer_locked_input is None
             and not consumer_effective_required
             and not declared_input
             and not declared_string_input
+            and not _consumer_typed_declarations(node, owner=f"node:{node.id}")
         ):
             continue
 
@@ -6887,7 +6902,11 @@ def _check_schema_contracts(
             errors.append(sink_locked_error)
             continue
 
-        if not sink_required and sink_locked_input is None:
+        # A sink's typed declarations keep it in the loop for the edge TYPE
+        # check even when it requires nothing: the runtime compares an optional
+        # field's type as well (a flexible ``value: int?`` behind a ``value:
+        # str`` producer is an EdgeContractError at build).
+        if not sink_required and sink_locked_input is None and not _consumer_typed_declarations(output, owner=f"output:{output.name}"):
             continue
 
         sink_producers = resolver.sink_producers(output.name)
