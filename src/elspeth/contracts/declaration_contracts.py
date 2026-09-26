@@ -293,10 +293,20 @@ class BatchFlushInputs:
     the violation to the triggering token (or the first buffered token on
     timeout flushes — the caller computes this choice and passes it in).
 
-    ``effective_input_fields`` is the INTERSECTION across every buffered
-    token's ``derive_effective_input_fields`` (the fields its contract
-    declares AND its payload carries) — the weakest shared guarantee. Caller
-    computes this once; contracts use it directly.
+    ``effective_input_fields`` is the weakest shared guarantee over the
+    tokens' ``derive_effective_input_fields`` (the fields a contract declares
+    AND its payload carries). The caller computes it once and contracts use it
+    directly:
+
+    - TRANSFORM mode, non-empty emission: the INTERSECTION over the buffered
+      tokens NOT in the engine-validated in-batch quarantine set
+      (``validated_quarantined_indices``). A quarantined input emits nothing,
+      so its fields do not shrink the guarantee.
+    - TRANSFORM mode, zero emission: the INTERSECTION over every buffered
+      token.
+    - PASSTHROUGH mode: one dispatch per (input, output) pair, carrying that
+      one token's own fields (``buffered_tokens`` is that single token). A
+      zero emission falls back to the intersection over every buffered token.
     """
 
     plugin: Any

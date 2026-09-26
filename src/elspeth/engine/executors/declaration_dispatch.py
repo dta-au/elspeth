@@ -213,11 +213,14 @@ def run_batch_flush_checks(
 ) -> None:
     """Dispatch all applicable batch-flush contracts.
 
-    Called from ``RowProcessor._cross_check_flush_output`` for TRANSFORM
-    mode (ADR-009 §Clause 2 batch-homogeneous semantics). The caller
-    supplies ``effective_input_fields`` pre-computed as the intersection of
-    every buffered token's ``derive_effective_input_fields`` (contract fields
-    the payload carries).
+    Called from ``RowProcessor._cross_check_flush_output`` (ADR-009 §Clause 2).
+    The caller supplies ``effective_input_fields`` pre-computed from the
+    tokens' ``derive_effective_input_fields`` (contract fields the payload
+    carries). In TRANSFORM mode with a non-empty emission, that is the
+    intersection over the buffered tokens NOT in the engine-validated in-batch
+    quarantine set. With a zero emission, it is the intersection over every
+    buffered token. In PASSTHROUGH mode, each (input, output) pair is dispatched
+    separately with that input's own fields. See ``BatchFlushInputs``.
     """
     _dispatch(
         site=DispatchSite.BATCH_FLUSH,
