@@ -51,7 +51,7 @@ from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMCl
 from elspeth.plugins.infrastructure.pooling import PooledExecutor, RowContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow, declared_row_projection
 from elspeth.plugins.transforms.llm import (
     _OUTPUT_FIELD_TYPE_TO_SCHEMA,
     _SUFFIX_SCHEMA_TYPES,
@@ -262,6 +262,8 @@ class SingleQueryStrategy:
     """Direct template render → LLM call → raw content output."""
 
     template: PromptTemplate
+    # What the template's ``row`` holds: the node's declaration (ADR-051).
+    row_projection: RowProjection
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
@@ -298,7 +300,7 @@ class SingleQueryStrategy:
 
         # 1. Render template (THEIR DATA — wrap)
         try:
-            rendered = self.template.render_with_metadata(row, contract=row.contract)
+            rendered = self.template.render_with_metadata(TemplateRow.project(row, self.row_projection), contract=row.contract)
         except TemplateError as e:
             error_reason: TransformErrorReason = {
                 "reason": "template_rendering_failed",
@@ -508,6 +510,8 @@ class MultiQueryStrategy:
 
     query_specs: Sequence[QuerySpec]
     template: PromptTemplate
+    # What each query's ``row.source_row`` holds: the node's declaration (ADR-051).
+    row_projection: RowProjection
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
@@ -616,7 +620,7 @@ class MultiQueryStrategy:
 
         # Build template context from named input_fields
         try:
-            template_ctx = spec.build_template_context(row)
+            template_ctx = spec.build_template_context(row, self.row_projection)
         except KeyError as e:
             return TransformResult.error(
                 {
@@ -635,11 +639,9 @@ class MultiQueryStrategy:
         else:
             query_template = self.template
 
-        # Render template — use contract=None because template_ctx is a
-        # synthetic dict (keys are template variable names from input_fields,
-        # not source column names). Passing the source row's contract would
-        # wrap template_ctx in a PipelineRow that rejects these synthetic keys
-        # in FIXED schema mode.
+        # Render template — contract=None because template_ctx is a synthetic
+        # dict (keys are template variable names from input_fields, not source
+        # column names); its source_row is already the projected row.
         try:
             rendered = query_template.render_with_metadata(
                 template_ctx,
@@ -1222,7 +1224,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f2445ce8d382861d"
+    source_file_hash: str | None = "sha256:52e135b053c9d326"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1473,6 +1475,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # AzureOpenAIConfig._set_model_from_deployment ensures model is populated;
         # OpenRouterConfig requires model. So self._config.model is always non-empty.
         self._model = self._config.model
+        # What a template may see of each row: exactly the declared fields
+        # (the whole row under the ``[]`` opt-out; nothing when omitted). ADR-051.
+        self._row_projection: RowProjection = declared_row_projection(self._config.required_input_fields)
         self._template = PromptTemplate(
             self._config.effective_template(
                 resolve_queries(self._config.queries)[0].template
@@ -1547,6 +1552,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             self._strategy: SingleQueryStrategy | MultiQueryStrategy = MultiQueryStrategy(
                 query_specs=query_specs,
                 template=self._template,
+                row_projection=self._row_projection,
                 system_prompt=self._system_prompt,
                 system_prompt_source=self._system_prompt_source,
                 model=self._model,
@@ -1606,6 +1612,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             single_output_fields = tuple(self._config.output_fields or ())
             self._strategy = SingleQueryStrategy(
                 template=self._template,
+                row_projection=self._row_projection,
                 system_prompt=self._system_prompt,
                 system_prompt_source=self._system_prompt_source,
                 model=self._model,

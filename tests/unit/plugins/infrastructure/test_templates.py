@@ -14,10 +14,20 @@ from jinja2 import TemplateSyntaxError, nodes
 from elspeth.contracts.freeze import FrozenJsonArray
 from elspeth.plugins.infrastructure import templates as template_infrastructure
 from elspeth.plugins.infrastructure.templates import (
+    ALL_FIELDS,
     TemplateError,
+    TemplateRow,
     create_sandboxed_environment,
 )
 from elspeth.testing import make_pipeline_row
+
+
+def _whole(row: object) -> TemplateRow:
+    """The row as a node that opted out with ``required_input_fields: []`` sees it: every field (ADR-051)."""
+    from elspeth.contracts.schema_contract import PipelineRow
+
+    assert type(row) is PipelineRow
+    return TemplateRow.project(row, ALL_FIELDS)
 
 
 def test_create_sandboxed_environment_returns_immutable_sandbox():
@@ -30,7 +40,7 @@ def test_create_sandboxed_environment_returns_immutable_sandbox():
 def test_worker_preserves_nested_pipeline_rows_and_frozen_lookups():
     env = create_sandboxed_environment()
     template = env.from_string("{{ row.source_row.text }} {{ lookup.labels.primary }}")
-    row = {"source_row": make_pipeline_row({"text": "hello"})}
+    row = {"source_row": _whole(make_pipeline_row({"text": "hello"}))}
     lookup = MappingProxyType({"labels": MappingProxyType({"primary": "world"})})
 
     assert template.render(row=row, lookup=lookup) == "hello world"
@@ -124,13 +134,14 @@ def test_context_transport_rejects_large_row_before_deep_export(monkeypatch: pyt
         make_pipeline_row({"text": named_values(large_text)}),
     ]
 
-    def export_must_not_run() -> dict[str, object]:
+    def export_must_not_run(*_args: object) -> dict[str, object]:
         raise AssertionError("oversized row was deep-copied")
 
     monkeypatch.setattr(PipelineRow, "to_dict", export_must_not_run)
+    monkeypatch.setattr("elspeth.contracts.freeze.deep_thaw", export_must_not_run)
     for row in rows:
         with pytest.raises(TemplateError, match="parent packing limit"):
-            template_infrastructure._pack_context_value(row)
+            template_infrastructure._pack_context_value(_whole(row))
 
 
 def test_literal_template_skips_worker_but_expression_uses_it(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,7 +452,7 @@ def test_a_pipeline_row_lookup_is_rendered_value_free() -> None:
     """Production renders a PipelineRow as its TemplateRow projection, whose type repr is its qualified class name."""
     from elspeth.testing import make_pipeline_row
 
-    row = make_pipeline_row({"q": "x", "k": _SENTINEL})
+    row = _whole(make_pipeline_row({"q": "x", "k": _SENTINEL}))
     assert _render_error("{{ row[row.k] }}", row=row) == (
         f"Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute {_UNSPELLED}"
     )
@@ -709,12 +720,12 @@ def test_a_template_reaches_no_framework_api_on_the_row(source: str, expected: s
     The row is a real PipelineRow whose blob carries the sentinel as a key and a
     value; each render goes through the bounded worker.
     """
-    assert _render_error(source, row=_owned_api_row()) == expected
+    assert _render_error(source, row=_whole(_owned_api_row())) == expected
 
 
 def test_a_multi_query_source_row_reaches_no_framework_api() -> None:
-    """A PipelineRow nested in the context (multi-query ``row.source_row``) crosses as the same projection."""
-    context_row = {"text": "hello", "source_row": _owned_api_row()}
+    """A row nested in the context (multi-query ``row.source_row``) crosses as the same projection."""
+    context_row = {"text": "hello", "source_row": _whole(_owned_api_row())}
     assert _render_error("{{ row.source_row.contract.from_checkpoint(row.source_row.blob) }}", row=context_row) == (
         f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'"
     )
@@ -723,7 +734,7 @@ def test_a_multi_query_source_row_reaches_no_framework_api() -> None:
 
 def test_a_field_named_like_a_method_reads_the_field() -> None:
     """Dot, item and ``attr`` lookups resolve to fields: a column named ``keys`` is no longer shadowed by a method."""
-    row = make_pipeline_row({"keys": "K", "contract": "C", "items": "I", "to_dict": "D", "values": "V"})
+    row = _whole(make_pipeline_row({"keys": "K", "contract": "C", "items": "I", "to_dict": "D", "values": "V"}))
     template = create_sandboxed_environment().from_string(
         "{{ row.keys }}|{{ row.contract }}|{{ row['items'] }}|{{ row.to_dict }}|{{ row | attr('values') }}"
     )
@@ -738,21 +749,20 @@ def test_the_template_row_keeps_every_documented_row_form() -> None:
         "{{ row | list | join(',') }}|{{ row.blob.data == row['blob']['data'] }}|{{ row.q.upper() }}|"
         "{{ row | attr('q') }}"
     )
-    assert template.render(row=_owned_api_row()) == ("5|5|5|True|True|False|amount_usd,q,blob,|3|amount_usd,q,blob|True|HELLO|hello")
+    assert template.render(row=_whole(_owned_api_row())) == (
+        "5|5|5|True|True|False|amount_usd,q,blob,|3|amount_usd,q,blob|True|HELLO|hello"
+    )
 
 
 @pytest.mark.parametrize("source", ["{{ row | dictsort }}", "{{ row | items | list }}", "{{ dict(row) }}", "{{ '%(q)s' % row }}"])
-def test_a_whole_row_value_renders_every_field_so_configuration_treats_it_as_dynamic(source: str) -> None:
-    """The row is a Mapping of field values: whole-row forms read fields the template does not name.
+def test_an_opted_out_whole_row_value_renders_field_values_never_framework_objects(source: str) -> None:
+    """The row is a Mapping of field values: under the ``[]`` opt-out a whole-row form reads every field.
 
-    That is why configuration refuses them unless ``required_input_fields: []``
-    (``core.templates`` classifies each as ``whole-row``). A node that opts out
-    gets exactly the row's values, never framework objects.
+    A node that opts out gets exactly the row's values, never framework
+    objects. With a declared list the same forms see only the declared fields
+    (test_template_projection.py).
     """
-    from elspeth.core.templates import extract_jinja2_field_usage
-
-    assert "whole-row" in extract_jinja2_field_usage(source).dynamic_accesses
-    rendered = create_sandboxed_environment().from_string(source).render(row=_owned_api_row())
+    rendered = create_sandboxed_environment().from_string(source).render(row=_whole(_owned_api_row()))
     assert "hello" in rendered
     assert "Contract" not in rendered
 
@@ -767,12 +777,12 @@ def test_a_whole_row_value_renders_every_field_so_configuration_treats_it_as_dyn
 )
 def test_a_non_string_key_is_the_ordinary_undefined_field(source: str, expected: str) -> None:
     """Only a str names a field. Any other key is the value-free undefined error, never a TypeError from hashing it."""
-    assert _render_error(source, row=_owned_api_row()) == expected
+    assert _render_error(source, row=_whole(_owned_api_row())) == expected
 
 
 def test_row_values_render_exactly_as_the_frozen_pipeline_row_rendered_them() -> None:
     """The projection carries the PipelineRow's deep-frozen values, so nested containers print as before."""
-    row = make_pipeline_row({"meta": {"a": 1}, "tags": [1, 2]})
+    row = _whole(make_pipeline_row({"meta": {"a": 1}, "tags": [1, 2]}))
     template = create_sandboxed_environment().from_string("{{ row.meta }}|{{ row.tags }}|{{ row.meta.items() | list }}")
     assert template.render(row=row) == "{'a': 1}|(1, 2)|[('a', 1)]"
 
@@ -814,7 +824,7 @@ def test_the_projection_resolves_every_key_as_the_pipeline_row_does(row_index: i
     The projection is built by the real transport (pack in the parent, restore in the worker).
     """
     pipeline_row = _parity_rows()[row_index]
-    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(pipeline_row))
+    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(_whole(pipeline_row)))
     assert type(projected) is template_infrastructure.TemplateRow
 
     for key in ("amount_usd", "Amount USD", "note", "Note!", "extra", "absent"):
@@ -834,7 +844,7 @@ def test_the_projection_resolves_every_key_as_the_pipeline_row_does(row_index: i
 
 
 def test_the_template_row_is_immutable() -> None:
-    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(_owned_api_row()))
+    projected = template_infrastructure._restore_context_value(template_infrastructure._pack_context_value(_whole(_owned_api_row())))
     with pytest.raises(TypeError, match="immutable"):
         projected.q = "changed"
     with pytest.raises(TypeError, match="immutable"):

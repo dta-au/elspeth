@@ -169,9 +169,12 @@ class LLMConfig(TransformDataConfig):
 
     IMPORTANT: Template Field Requirements
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    If your template references row fields (e.g., {{ row.customer_id }}),
-    you SHOULD declare them in `required_input_fields`. This enables DAG
-    validation to catch missing fields at config time rather than runtime.
+    `required_input_fields` is what the template can see (ADR-051): at render
+    the template's `row` (a query's `row.source_row`) holds exactly the
+    declared fields, `[]` opts out to the whole row, and an omitted
+    declaration holds none. Declare every field the template reads
+    (e.g., {{ row.customer_id }}); DAG validation then also checks that the
+    upstream producer guarantees them.
 
     Use the helper utility to discover fields:
 
@@ -744,12 +747,11 @@ class LLMConfig(TransformDataConfig):
           CONTRACT check, not a proof of failure, and its wording must not
           borrow the multi-query branch's. A query renders a synthetic context,
           so an unbound name provably raises; single-prompt binds ``row`` to
-          the WHOLE row, so an undeclared reference raises only when that
-          column happens to be absent — which is exactly what the declaration
-          exists to rule out. ``required_input_fields`` is the audited set the
-          DAG checks against upstream guarantees and
-          ``verify_declared_required_fields`` re-checks per row, so a reference
-          outside it escapes both. Skipped when the declaration is ``None``
+          the declared fields only (ADR-051), so an undeclared reference fails
+          every row at render as an undeclared read. ``required_input_fields``
+          is the audited set the DAG checks against upstream guarantees and
+          ``verify_declared_required_fields`` re-checks per row; this limb is
+          the early, attributable form of that render failure. Skipped when the declaration is ``None``
           (the sibling validator above already rejects that with row
           references present) and when it is ``[]``, the documented opt-out.
           ``undeclared_row_fields`` owns the comparison; it drops undeclarable
@@ -810,10 +812,10 @@ class LLMConfig(TransformDataConfig):
                         f"options.required_input_fields does not declare — it declares {declared_names}. "
                         "required_input_fields IS this node's input contract: it is what the DAG checks "
                         "against the upstream producer's guarantees and what the engine verifies on every "
-                        "row. A reference outside it is required by nothing, so no producer is obliged to "
-                        "supply it, and a row that arrives without it fails the whole node at render with "
-                        "'Undefined variable' — an unattributed template error rather than a named contract "
-                        f"violation. {_UNDECLARED_ROW_FIELDS_REMEDY}"
+                        "row, and at render the template sees only the declared fields. A reference outside it "
+                        "is required by nothing, so no producer is obliged to supply it, and every row fails the "
+                        "whole node at render with 'Undeclared field'. "
+                        f"{_UNDECLARED_ROW_FIELDS_REMEDY}"
                     )
             return self
 
@@ -870,19 +872,27 @@ class LLMConfig(TransformDataConfig):
         # The binding checks above prove each query's template renders against
         # its synthetic context; this one proves the context itself can be BUILT
         # from a contracted row. ``build_template_context`` does
-        # ``row[row_column]`` for every input_fields value, and a template reads
-        # ``row.source_row.<column>`` directly, so with a non-empty declaration
-        # each such column must be covered by the node's declared input fields
-        # — otherwise edge validation checks only the declaration, validates
-        # green, and every row fails the query with template_context_failed
-        # (elspeth-a10d15055b). Skipped for None (the sibling validator above
-        # rejects that) and for [], the documented opt-out.
+        # ``row[row_column]`` for every input_fields value, so with a non-empty
+        # declaration each must be covered by the node's declared input fields
+        # (``image_inputs`` columns included: the value is read in the parent,
+        # from the full row) — otherwise edge validation checks only the
+        # declaration, validates green, and every row fails the query with
+        # template_context_failed (elspeth-a10d15055b). A template reading
+        # ``row.source_row.<column>`` sees only ``required_input_fields``
+        # (ADR-051), so those columns must be covered by it alone. Skipped for
+        # None (the sibling validator above rejects that) and for [], the
+        # documented opt-out.
         if self.required_input_fields:
-            covering = self.declared_input_fields
             for spec in resolve_queries(self.queries):
                 effective_template = self.effective_template(spec.template)
-                columns = {*spec.input_fields.values(), *multi_query_source_row_columns(effective_template)}
-                undeclared_columns = undeclared_row_fields(columns, covering)
+                undeclared_columns = tuple(
+                    sorted(
+                        {
+                            *undeclared_row_fields(spec.input_fields.values(), self.declared_input_fields),
+                            *undeclared_row_fields(multi_query_source_row_columns(effective_template), self.required_input_fields),
+                        }
+                    )
+                )
                 if undeclared_columns:
                     raise ValueError(multi_query_undeclared_columns_message(spec.name, undeclared_columns, self.required_input_fields))
         return self

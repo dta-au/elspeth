@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfig
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 
@@ -237,14 +237,18 @@ class QuerySpec:
         if self.output_fields is not None:
             object.__setattr__(self, "output_fields", tuple(self.output_fields))
 
-    def build_template_context(self, row: PipelineRow | dict[str, Any]) -> dict[str, Any]:
+    def build_template_context(self, row: PipelineRow, projection: RowProjection) -> dict[str, Any]:
         """Build template context mapping named variables to row values.
 
         Args:
-            row: Full row data (dict or PipelineRow)
+            row: The full row. Each ``input_fields`` value names a column the
+                query declares, read here in the parent process.
+            projection: The node's declaration (``declared_row_projection`` of
+                its ``required_input_fields``): ``source_row`` holds only those
+                fields (ADR-051).
 
         Returns:
-            Context dict with named variables and source_row reference
+            Context dict with named variables and the projected ``source_row``
 
         Raises:
             KeyError: If a required row column is missing
@@ -252,7 +256,7 @@ class QuerySpec:
         context: dict[str, Any] = {}
         for template_var, row_column in self.input_fields.items():
             context[template_var] = row[row_column]
-        context["source_row"] = row
+        context["source_row"] = TemplateRow.project(row, projection)
         return context
 
 

@@ -22,6 +22,7 @@ from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType, QuerySpec, ResponseFormat
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
@@ -138,6 +139,7 @@ def _make_single_strategy(
 ) -> SingleQueryStrategy:
     return SingleQueryStrategy(
         template=PromptTemplate(prompt_template),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",
@@ -163,6 +165,7 @@ def _make_multi_strategy(
     return MultiQueryStrategy(
         query_specs=query_specs,
         template=PromptTemplate(prompt_template),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",

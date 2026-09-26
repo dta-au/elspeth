@@ -21,6 +21,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
@@ -141,6 +142,7 @@ def _make_multi_query_strategy(*, executor: _PooledExecutorDouble | None = None)
     return MultiQueryStrategy(
         query_specs=specs,
         template=PromptTemplate("Analyze: {{ row.text }}"),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",
@@ -164,6 +166,7 @@ def single_query_result() -> TransformResult:
     """Execute SingleQueryStrategy with mocked provider, return the result."""
     strategy = SingleQueryStrategy(
         template=PromptTemplate("Classify: {{ row.text }}"),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",

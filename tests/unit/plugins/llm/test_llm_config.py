@@ -17,6 +17,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition
+from elspeth.testing import make_pipeline_row
 
 
 def _mapping_defs(defs: dict[str, dict[str, Any]]) -> dict[str, QueryDefinition]:
@@ -1646,12 +1647,16 @@ class TestQuerySpec:
             name="q1",
             input_fields=MappingProxyType({"text_content": "text", "category_name": "category"}),
         )
-        row = {"text": "hello world", "category": "science", "extra": "ignored"}
-        ctx = spec.build_template_context(row)
+        from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
+
+        row = make_pipeline_row({"text": "hello world", "category": "science", "extra": "ignored"})
+        ctx = spec.build_template_context(row, DeclaredFields(frozenset({"text", "category"})))
 
         assert ctx["text_content"] == "hello world"
         assert ctx["category_name"] == "science"
-        assert ctx["source_row"] is row
+        # source_row is the row projected to the node's declaration (ADR-051): 'extra' is not in it.
+        assert type(ctx["source_row"]) is TemplateRow
+        assert dict(ctx["source_row"]) == {"text": "hello world", "category": "science"}
 
     def test_build_template_context_missing_field_raises(self) -> None:
         from elspeth.plugins.transforms.llm.multi_query import QuerySpec
@@ -1660,8 +1665,10 @@ class TestQuerySpec:
             name="q1",
             input_fields=MappingProxyType({"text_content": "text"}),
         )
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS
+
         with pytest.raises(KeyError, match="text"):
-            spec.build_template_context({"other": "value"})
+            spec.build_template_context(make_pipeline_row({"other": "value"}), ALL_FIELDS)
 
     def test_input_fields_is_deeply_immutable(self) -> None:
         """input_fields dict must be truly immutable — shared across rows."""
@@ -2123,15 +2130,17 @@ class TestTemplateVariableBindings:
     def test_single_prompt_undeclared_reference_raises_at_render_today(self) -> None:
         """Pins the runtime consequence the rejection claims, so the message cannot drift.
 
-        Without this the message's "fails the whole node at render" is an
-        unverified assertion, and an ``| default()``-style change to the
-        sandbox would silently make it false.
+        Without this the message's "every row fails the whole node at render
+        with 'Undeclared field'" is an unverified assertion: the row a template
+        sees holds only the declared fields (ADR-051), so the undeclared read
+        fails even on a row that carries the column.
         """
-        from elspeth.plugins.infrastructure.templates import TemplateError
+        from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateError, TemplateRow
         from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
-        with pytest.raises(TemplateError, match="Undefined variable"):
-            PromptTemplate("Rate: {{ row.case_study }}").render({"case_study_1": "x"})
+        row = TemplateRow.project(make_pipeline_row({"case_study": "x", "case_study_1": "y"}), DeclaredFields(frozenset({"case_study_1"})))
+        with pytest.raises(TemplateError, match=r"^Undeclared field: the template reads 'case_study'"):
+            PromptTemplate("Rate: {{ row.case_study }}").render(row)
 
     def test_single_prompt_original_header_literal_accepted_against_normalized_declaration(self) -> None:
         """``row["Original Header"]`` resolves through ``SchemaContract.find_name``.

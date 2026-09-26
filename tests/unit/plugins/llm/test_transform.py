@@ -32,6 +32,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
     LLMAuditParent,
@@ -3070,6 +3071,7 @@ class TestParallelErrorReasonNotFabricated:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3154,6 +3156,7 @@ class TestParallelAuditMetadataThreadSafety:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3236,6 +3239,7 @@ class TestParallelAuditMetadataThreadSafety:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3324,6 +3328,7 @@ class TestMultiQueryFinishReasonAudit:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3371,6 +3376,7 @@ class TestMultiQueryFinishReasonAudit:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3423,6 +3429,7 @@ class TestSequentialErrorReasonNotFabricated:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -4205,3 +4212,61 @@ class TestStructuredOutputTypeBinding:
         assert result.row is not None
         assert type(result.row["confidence"]) is int
         verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+
+# ---------------------------------------------------------------------------
+# ADR-051: a template sees only its node's declared fields
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateSeesOnlyDeclaredFields:
+    """The LLM node projects every row to its ``required_input_fields`` before its templates render."""
+
+    _SENTINEL = "SENTINEL-P2-LLM-51c"
+
+    def _sent(self, config: dict[str, Any]) -> str:
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        result = transform._process_row(_make_row({"text": "hello", "secret": self._SENTINEL}), _make_ctx())
+        assert result.status == "success"
+        return " ".join(str(call) for call in mock_provider.execute_query.call_args_list)
+
+    def test_the_node_reads_its_declaration_as_the_projection(self) -> None:
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS, DeclaredFields
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        assert LLMTransform(_make_config())._strategy.row_projection == DeclaredFields(frozenset({"text"}))
+        assert LLMTransform(_make_config(required_input_fields=[]))._strategy.row_projection is ALL_FIELDS
+        assert LLMTransform(_make_multi_query_config())._strategy.row_projection == DeclaredFields(frozenset({"text"}))
+
+    def test_a_single_prompt_whole_row_form_sends_only_the_declared_fields(self) -> None:
+        # A form the static analysis cannot follow (review-S0-sandbox-r3): only the projection stops it.
+        sent = self._sent(
+            _make_config(prompt_template="{% for a, b in [(1, [row])] %}Classify: {{ row.text }} {{ b[0] | dictsort }}{% endfor %}")
+        )
+        assert "('text', 'hello')" in sent
+        assert self._SENTINEL not in sent
+
+    def test_a_multi_query_source_row_sends_only_the_declared_fields(self) -> None:
+        sent = self._sent(
+            _make_multi_query_config(
+                prompt_template="{% for a, b in [(1, [row.source_row])] %}Process {{ row.text_content }} {{ b[0] | dictsort }}{% endfor %}"
+            )
+        )
+        assert "('text', 'hello')" in sent
+        assert self._SENTINEL not in sent
+
+    def test_the_opt_out_sends_the_whole_row(self) -> None:
+        """Positive control: ``[]`` keeps the whole row, so the same template sends the undeclared column."""
+        sent = self._sent(
+            _make_config(
+                prompt_template="{% for a, b in [(1, [row])] %}Classify: {{ row.text }} {{ b[0] | dictsort }}{% endfor %}",
+                required_input_fields=[],
+            )
+        )
+        assert self._SENTINEL in sent

@@ -129,19 +129,33 @@ class TestDeclaredMultiQueryColumnsMustBeCovered:
             )
         assert "reads row column 'title'" in str(exc_info.value)
 
-    def test_image_input_columns_cover_query_reads(self) -> None:
-        """An image query reads its image and format columns; ``image_inputs`` already declares both."""
+    def test_image_input_columns_cover_query_input_fields(self) -> None:
+        """An ``input_fields`` value is read in the parent from the full row, so ``image_inputs`` columns cover it."""
         config = _multi(
             {
                 "describe": {
-                    "input_fields": {"text": "body", "picture": "photo"},
-                    "template": "{{ row.text }} {{ row.picture }} {{ row.source_row.photo_mime }}",
+                    "input_fields": {"text": "body", "picture": "photo", "mime": "photo_mime"},
+                    "template": "{{ row.text }} {{ row.picture }} {{ row.mime }}",
                 }
             },
             required=["body"],
             image_inputs=[{"field": "photo", "format_field": "photo_mime"}],
         )
         assert config.declared_input_fields == frozenset({"body", "photo", "photo_mime"})
+
+    def test_a_source_row_read_must_be_in_required_input_fields_itself(self) -> None:
+        """The template's ``row.source_row`` holds only ``required_input_fields`` (ADR-051): an image column is not in it.
+
+        Admitting it would validate green and fail every row at render with an
+        undeclared read, so configuration refuses it with the shared message.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            _multi(
+                {"describe": {"input_fields": {"text": "body"}, "template": "{{ row.text }} {{ row.source_row.photo_mime }}"}},
+                required=["body"],
+                image_inputs=[{"field": "photo", "format_field": "photo_mime"}],
+            )
+        assert "Query 'describe' reads row column 'photo_mime' through its input_fields values or 'row.source_row'" in str(exc_info.value)
 
 
 class TestSourceRowReadsWithoutAColumnName:

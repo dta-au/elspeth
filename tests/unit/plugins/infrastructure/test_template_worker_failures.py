@@ -296,12 +296,23 @@ def test_any_other_render_failure_is_the_rows_and_names_only_its_class(source: s
 
 
 def test_a_fixed_row_with_an_extra_key_fails_as_the_row_s_keyerror() -> None:
-    """S0 residual: TemplateRow iterates data keys but resolves through the name index."""
+    """S0 residual under the ``[]`` opt-out: the whole row iterates data keys but resolves through the name index."""
     from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+    from elspeth.plugins.infrastructure.templates import ALL_FIELDS, TemplateRow
 
     contract = SchemaContract(mode="FIXED", fields=(FieldContract("q", "q", str, True, "declared"),), locked=True)
     row = PipelineRow({"q": "x", _SENTINEL: 1}, contract)
-    assert _render_error("{{ row == row }}", row=row) == f"Template rendering failed: KeyError {_WITHHELD}"
+    assert _render_error("{{ row == row }}", row=TemplateRow.project(row, ALL_FIELDS)) == f"Template rendering failed: KeyError {_WITHHELD}"
+
+
+def test_a_declared_projection_of_a_fixed_row_with_an_extra_key_iterates_what_it_can_read() -> None:
+    """Built from the declared fields the row resolves, a projection's keys and lookups agree (r1 Finding B)."""
+    from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+    from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
+
+    contract = SchemaContract(mode="FIXED", fields=(FieldContract("q", "q", str, True, "declared"),), locked=True)
+    row = TemplateRow.project(PipelineRow({"q": "x", _SENTINEL: 1}, contract), DeclaredFields(frozenset({"q"})))
+    assert SandboxedTemplate("{{ row == row }}|{{ row | dictsort }}").render(row=row) == "True|[('q', 'x')]"
 
 
 @pytest.mark.parametrize(

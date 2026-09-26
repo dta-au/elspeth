@@ -1930,10 +1930,10 @@ _TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
     "A single-prompt llm node's prompt_template reads row fields its own options.required_input_fields does not "
     "declare. That declaration IS the node's input contract: it is what edge validation checks against the upstream "
-    "producer's guarantees and what the engine verifies on every row. A reference outside it is required by nothing, "
-    "so no producer is obliged to supply the field, and a row that arrives without it fails the whole node at render "
-    "with 'Undefined variable' — an unattributed template error rather than a named contract violation. The rejection "
-    "names the node, the fields read, and the fields declared."
+    "producer's guarantees and what the engine verifies on every row, and at render the template sees only the "
+    "declared fields. A reference outside it is required by nothing, so no producer is obliged to supply the field, "
+    "and every row fails the whole node at render with 'Undeclared field'. The rejection names the node, the fields "
+    "read, and the fields declared."
 )
 # The FIX text leads with rewrite-the-reference DELIBERATELY, and the ordering
 # is the finding, not a style choice. Declaring the read name is correct only
@@ -4019,8 +4019,8 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
                             f"options.required_input_fields does not declare — it declares {declared_display}. "
                             "required_input_fields is the node's input contract: it is what edge validation checks "
                             "against the upstream producer's guarantees and what the engine verifies on every row, "
-                            "so a reference outside it is required by nothing and a row arriving without the field "
-                            f"fails the whole node at render with 'Undefined variable'. "
+                            "and at render the template sees only the declared fields, so a reference outside it is "
+                            "required by nothing and every row fails the whole node at render with 'Undeclared field'. "
                             f"{_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX}"
                         ),
                         severity="high",
@@ -4275,9 +4275,12 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
     the context can be built from a contracted row — the ``input_fields``
     values need no template at all. The message is the plugin layer's
     (``multi_query_undeclared_columns_message``), so both surfaces read one
-    text. Coverage is ``undeclared_row_fields``'s exact comparison against the
-    declaration plus ``image_inputs`` columns, matching
-    ``LLMConfig.declared_input_fields``.
+    text. Coverage is ``undeclared_row_fields``'s exact comparison: an
+    ``input_fields`` value against the declaration plus ``image_inputs``
+    columns (``LLMConfig.declared_input_fields``: it is read in the parent,
+    from the full row), a ``row.source_row.<column>`` read against the
+    declaration alone (the template's ``source_row`` holds only the declared
+    fields, ADR-051).
     """
     queries = node.options.get("queries")
     if queries is None:
@@ -4289,6 +4292,7 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
     if not declared_names:
         return ()
 
+    declared_set = frozenset(declared_names)
     covering = set(declared_names)
     image_inputs = node.options.get("image_inputs")
     if isinstance(image_inputs, Sequence) and not isinstance(image_inputs, (str, bytes)):
@@ -4303,6 +4307,7 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
         if not isinstance(input_fields, Mapping):
             continue
         columns = {column for column in input_fields.values() if isinstance(column, str)}
+        source_row_columns: frozenset[str] = frozenset()
 
         override = entry.get("template")
         effective_template = override if isinstance(override, str) else (node_template if override is None else None)
@@ -4312,9 +4317,9 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
             # input_fields values are still checked without it.
             parsed, _syntax_error = _parse_template_names(effective_template)
             if parsed is not None:
-                columns.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", effective_template)))
+                source_row_columns = multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", effective_template))
 
-        undeclared = undeclared_row_fields(columns, covering)
+        undeclared = tuple(sorted({*undeclared_row_fields(columns, covering), *undeclared_row_fields(source_row_columns, declared_set)}))
         if undeclared:
             errors.append(
                 ValidationEntry(

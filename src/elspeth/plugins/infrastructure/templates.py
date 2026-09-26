@@ -3,9 +3,11 @@
 Provides a sandboxed Jinja2 environment factory and the TemplateError exception.
 Used by both LLM prompt templates and RAG query templates.
 
-The sandbox prevents unsafe access. A ``PipelineRow`` in a render context
-reaches the template as a ``TemplateRow``, its field values only, so no
-template can reach the row object, its schema contract or their methods.
+The sandbox prevents unsafe access. A row reaches a template only as a
+``TemplateRow``: the field values its node declares it reads, projected in
+this process before the context crosses to the render worker
+(``TemplateRow.project``; ADR-051). No template can reach the row object, its
+schema contract, their methods, or a field its node did not declare.
 Constant folding of authored expressions
 is disabled during bounded-size compilation; rendering runs in a child process
 with CPU, memory, input and output ceilings. When every worker is busy a render
@@ -24,12 +26,12 @@ import signal
 import sys
 import threading
 from atexit import register as register_exit
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from multiprocessing import resource_tracker
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from jinja2 import StrictUndefined, Template, TemplateSyntaxError, nodes
 from jinja2.compiler import CodeGenerator
@@ -44,6 +46,9 @@ from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.templates import validate_jinja_source
+
+if TYPE_CHECKING:
+    from elspeth.contracts.schema_contract import PipelineRow
 
 
 class TemplateError(Exception):
@@ -142,25 +147,122 @@ class _NoFoldTrackingCodeGenerator(_NoFoldCodeGenerator, TrackingCodeGenerator):
         self.optimizer = None
 
 
-class TemplateRow(Mapping[str, Any]):
-    """The ``row`` a template sees: the row's field values and nothing else.
+@dataclass(frozen=True, slots=True)
+class DeclaredFields:
+    """A template's row holds exactly these fields, named canonically (ADR-051).
 
-    A template renders operator-authored code against row data, so it gets a
-    plain projection of the ``PipelineRow``, never the row object itself:
-    ``row.contract``, ``row.to_dict()`` and the checkpoint API are owned
-    framework surface, and one of them (``from_checkpoint``) raises a Tier-1
-    error whose message quotes row keys. ``row.name``, ``row['name']`` and
-    ``row['Original Name']`` read a field by either spelling (the resolution
-    is ``PipelineRow.name_index``). The sandbox resolves every attribute and
-    item lookup on this type to a field; the one callable it admits is
-    ``row.get(name)``. Iteration, ``in`` and ``length`` see the field names.
+    Built from a node's ``required_input_fields`` by ``declared_row_projection``;
+    an empty set is a row with no fields.
     """
 
-    __slots__ = ("_names", "_values")
+    names: frozenset[str]
 
-    def __init__(self, values: Mapping[str, Any], names: Mapping[str, str]) -> None:
+
+@dataclass(frozen=True, slots=True)
+class AllFields:
+    """A template's row holds the whole row: the node opted out with ``required_input_fields: []``."""
+
+
+ALL_FIELDS = AllFields()
+
+# What a template's ``row`` may hold. Required wherever a PipelineRow becomes
+# a TemplateRow (``TemplateRow.project``): there is no default.
+RowProjection = DeclaredFields | AllFields
+
+
+def declared_row_projection(required_input_fields: Sequence[str] | None) -> RowProjection:
+    """The one reading of a template node's declaration as what its template may see (ADR-051).
+
+    - a list names exactly the fields the row holds;
+    - ``[]`` is the documented opt-out: the whole row;
+    - omitted (``None``) declares nothing, so the row holds nothing. It is
+      never the whole row: configuration admits ``None`` only when its static
+      analysis finds no row read, and that analysis is not a proof.
+    """
+    if required_input_fields is None:
+        return DeclaredFields(frozenset())
+    if len(required_input_fields) == 0:
+        return ALL_FIELDS
+    return DeclaredFields(frozenset(required_input_fields))
+
+
+class _UndeclaredFieldError(Exception):
+    """A template read a field its node does not declare (raised in the render worker only).
+
+    The key may be computed from row data (``row[row.k]``), so it is an
+    attribute, never the message: the worker turns it into value-free text
+    (``_undeclared_field_text``) before anything leaves the process.
+    """
+
+    def __init__(self, key: object) -> None:
+        super().__init__()
+        self.key = key
+
+
+class TemplateRow(Mapping[str, Any]):
+    """The ``row`` a template sees: the field values its node declares it reads, and nothing else.
+
+    A template renders operator-authored code against row data, so it never
+    gets the ``PipelineRow`` itself: ``row.contract``, ``row.to_dict()`` and
+    the checkpoint API are owned framework surface, and one of them
+    (``from_checkpoint``) raises a Tier-1 error whose message quotes row keys.
+    ``TemplateRow.project`` builds it in the parent process from the node's
+    declaration, before the context crosses to the render worker, so a field
+    the node did not declare never reaches the worker at all.
+
+    ``row.name``, ``row['name']`` and ``row['Original Name']`` read a declared
+    field by either spelling (the resolution is ``PipelineRow.name_index``
+    filtered to the declared fields). The sandbox resolves every attribute
+    and item lookup on this type to a field; the one callable it admits is
+    ``row.get(name)``. Iteration, ``in`` and ``length`` see the declared field
+    names the row carries.
+
+    A lookup, ``in`` test or ``get`` of a name the node does not declare
+    raises ``_UndeclaredFieldError``: a template can learn nothing about an
+    undeclared field, not even that it is absent. A declared field the row
+    does not carry is an ordinary missing key (``in`` is False, ``get``
+    returns its default). This is a deliberate deviation from the ``Mapping``
+    contract for ``__contains__`` and ``get`` (ADR-051); ``dict(row)``,
+    ``**row``, ``items`` and ``dictsort`` iterate the declared keys and work.
+    """
+
+    __slots__ = ("_declared", "_names", "_values")
+    _values: Mapping[str, Any]
+    _names: Mapping[str, str]
+    _declared: frozenset[str] | None
+
+    def __init__(self, values: Mapping[str, Any], names: Mapping[str, str], declared: frozenset[str] | None) -> None:
+        # ``declared`` is every spelling of every declared field; None means
+        # every name is declared (the ``[]`` opt-out, ``AllFields``).
         object.__setattr__(self, "_values", values)
         object.__setattr__(self, "_names", names)
+        object.__setattr__(self, "_declared", declared)
+
+    @classmethod
+    def project(cls, row: PipelineRow, projection: RowProjection) -> TemplateRow:
+        """Project ``row`` to what its node's template may see — the one place that happens.
+
+        ``AllFields`` keeps the whole row exactly as ``PipelineRow`` resolves
+        it. ``DeclaredFields`` keeps the declared fields the row carries,
+        readable by their canonical and original spellings, and remembers
+        every spelling of every declared field (from the contract, whether or
+        not the row carries it) so the worker can tell an absent declared
+        field from an undeclared one.
+        """
+        index = row.name_index()
+        match projection:
+            case AllFields():
+                return cls(row._data, MappingProxyType(index), None)
+            case DeclaredFields(names=declared):
+                pass
+        names = {key: target for key, target in index.items() if target in declared}
+        targets = frozenset(names.values())
+        values = MappingProxyType({key: value for key, value in row._data.items() if key in targets})
+        spellings = declared | frozenset(names) | {fc.original_name for fc in row.contract.fields if fc.normalized_name in declared}
+        return cls(values, MappingProxyType(names), spellings)
+
+    def _is_undeclared(self, key: object) -> bool:
+        return self._declared is not None and (type(key) is not str or key not in self._declared)
 
     def __setattr__(self, key: str, value: Any) -> None:
         raise TypeError("TemplateRow is immutable")
@@ -169,10 +271,18 @@ class TemplateRow(Mapping[str, Any]):
         raise TypeError("TemplateRow is immutable")
 
     def __getitem__(self, key: str) -> Any:
-        return self._values[self._names[key]]
+        if type(key) is str and key in self._names:
+            return self._values[self._names[key]]
+        if self._is_undeclared(key):
+            raise _UndeclaredFieldError(key)
+        raise KeyError(key)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._names
+        if type(key) is str and key in self._names:
+            return True
+        if self._is_undeclared(key):
+            raise _UndeclaredFieldError(key)
+        return False
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._values)
@@ -183,12 +293,18 @@ class TemplateRow(Mapping[str, Any]):
     def __getattr__(self, key: str) -> Any:
         # jinja2's ``attr`` filter asks ``hasattr`` before it defers to the
         # sandbox's getattr, so a field must answer here as ``row.name`` does.
+        # An undeclared name raises through ``hasattr`` on purpose.
         if key.startswith("_"):
             raise AttributeError(key)
         try:
             return self[key]
         except KeyError:
             raise AttributeError(key) from None
+
+
+def template_row_values(row: TemplateRow) -> Mapping[str, Any]:
+    """Exactly the field values ``row`` holds: what its template can see (``_variables_hash``, ADR-051)."""
+    return row._values
 
 
 class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
@@ -211,17 +327,20 @@ class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
         return super().getitem(obj, argument)
 
     def _row_field(self, row: TemplateRow, key: Any) -> Any:
-        if type(key) is str and key in row:
+        # ``in`` raises for a name the node does not declare; a declared field
+        # the row does not carry is the ordinary undefined.
+        if key in row:
             return row[key]
         return self.undefined(obj=row, name=key)
 
 
 @dataclass(frozen=True)
 class _RowTransport:
-    """A PipelineRow crossing to the render worker as plain data: values and the name index."""
+    """A projected row crossing to the render worker as plain data: its values, name index and declared spellings."""
 
     data: bytes
     names: bytes
+    declared: frozenset[str] | None
 
 
 def _pack_context_value(
@@ -234,11 +353,13 @@ def _pack_context_value(
 ) -> Any:
     """Detach frozen carriers with alias preservation and a parent work cap.
 
-    A ``PipelineRow`` crosses as plain data (its values and name index) and
-    arrives as a ``TemplateRow``: the contract never reaches the render worker.
-    A contract object anywhere in a template context is a caller bug.
+    A ``TemplateRow`` crosses as plain data (its projected values, name index
+    and declared spellings) and arrives as the same ``TemplateRow``: the
+    contract never reaches the render worker, and neither does a field the
+    projection left out. An unprojected ``PipelineRow`` or a contract object
+    anywhere in a template context is a caller bug.
     """
-    from elspeth.contracts.freeze import FrozenJsonArray
+    from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw
     from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 
     if depth > 64:
@@ -266,14 +387,16 @@ def _pack_context_value(
         raise TemplateError("Template context exceeds the parent packing limit")
     active.add(identity)
     try:
-        if type(value) is PipelineRow:
-            _charge_row_export(value._data, budget, depth=depth + 1)
-            data = pickle.dumps(value.to_dict(), protocol=5)
-            names = pickle.dumps(value.name_index(), protocol=5)
+        if type(value) is TemplateRow:
+            _charge_row_export(value._values, budget, depth=depth + 1)
+            data = pickle.dumps(deep_thaw(value._values), protocol=5)
+            names = pickle.dumps(dict(value._names), protocol=5)
             budget[1] += len(data) + len(names)
             if budget[1] > _MAX_PARENT_PACK_BYTES:
                 raise TemplateError("Template context exceeds the parent packing limit")
-            packed: Any = _RowTransport(data, names)
+            packed: Any = _RowTransport(data, names, value._declared)
+        elif type(value) is PipelineRow:
+            raise FrameworkBugError("A template context carries an unprojected PipelineRow: templates see a TemplateRow.project(...) only")
         elif type(value) in (SchemaContract, FieldContract):
             raise FrameworkBugError(f"A template context carries a {type(value).__name__}: templates see row values only")
         elif type(value) in (dict, MappingProxyType):
@@ -316,7 +439,11 @@ def _restore_context_value(value: Any, *, memo: dict[int, Any] | None = None) ->
         # The bytes come from _pack_context_value in the parent process over
         # this worker's own pipe, never from an external source. The values
         # are frozen exactly as PipelineRow froze them, so a value renders as before.
-        restored: Any = TemplateRow(deep_freeze(pickle.loads(value.data)), MappingProxyType(pickle.loads(value.names)))
+        restored: Any = TemplateRow(
+            deep_freeze(pickle.loads(value.data)),
+            MappingProxyType(pickle.loads(value.names)),
+            value.declared,
+        )
     elif type(value) is dict:
         restored = {key: _restore_context_value(item, memo=memo) for key, item in value.items()}
     elif type(value) is list:
@@ -407,8 +534,10 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     RENDER is the template meeting the row. A Tier-1 error there is ELSPETH's
     bug too: the template sees only plain row values (``TemplateRow``), never
     owned framework API, so it cannot come from row data (``render_tier1``).
-    Any other failure is this row's and is reported by its class alone,
-    whatever ``value_free`` says, because its message can quote row data.
+    A read of a field the node does not declare is reported with its own
+    value-free text (``undeclared_field``). Any other failure is this row's
+    and is reported by its class alone, whatever ``value_free`` says, because
+    its message can quote row data.
     """
     try:
         # RLIMIT_CPU is cumulative over a process lifetime. Give each
@@ -444,6 +573,8 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         return "safe_security", str(exc)[:1024]
     except _UndefinedContractError as exc:
         return "undefined_contract", str(exc)[:1024]
+    except _UndeclaredFieldError as exc:
+        return "undeclared_field", _undeclared_field_text(exc.key, source)
     except contract_errors.TIER_1_ERRORS as exc:
         return "render_tier1", type(exc).__name__
     except (
@@ -602,6 +733,9 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
                 # The worker only ever sends a joined string: the protocol is broken.
                 raise FrameworkBugError("Template worker returned a non-string result")
             return value
+        if status == "undeclared_field":
+            # The worker built this text from the template's own literals.
+            raise TemplateError(f"Undeclared field: {value}")
         if value_free:
             if status == "safe_undefined":
                 raise TemplateError(f"Undefined variable: {value}")
@@ -905,6 +1039,18 @@ def _template_literals(ast: nodes.Template) -> frozenset[str | int]:
     return frozenset(literals)
 
 
+def _undeclared_field_text(key: object, source: str) -> str:
+    """The value-free text of a read of an undeclared field: the key only when the template spells it out.
+
+    A computed key (``row[row.k]``) can be a row value, so it prints as
+    ``_UNSPELLED_KEY`` unless it equals one of the template's own literals.
+    """
+    parser = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
+    literals = _template_literals(parser.parse(source))
+    spelled = repr(key) if (type(key) is str or type(key) is int) and key in literals else _UNSPELLED_KEY
+    return f"the template reads {spelled}, a field this node does not declare in required_input_fields"
+
+
 def _value_free_undefined(literals: frozenset[str | int]) -> type[StrictUndefined]:
     """A StrictUndefined whose error message names only what the template spells out.
 
@@ -972,10 +1118,15 @@ class SandboxedTemplate:
     def render(self, **context: Any) -> str:
         """Render with ``context``: the ONE place a render failure becomes text.
 
-        Only two texts are ever emitted: a lookup failure raised by this
+        A row reaches ``context`` only as a ``TemplateRow`` (``TemplateRow.project``);
+        an unprojected ``PipelineRow`` is a ``FrameworkBugError``.
+
+        Three kinds of text are ever emitted: a lookup failure raised by this
         template's own undefined type, whose message names the owner's TYPE and
-        the key only when the operator's template spells that key out; and, for
-        anything else, the exception's class name (``withheld_error_detail``).
+        the key only when the operator's template spells that key out; a read
+        of a field the node does not declare (``Undeclared field: ...``), which
+        names the key under the same rule; and, for anything else, the
+        exception's class name (``withheld_error_detail``).
 
         Raises:
             TemplateError: A per-row operational failure, prefixed by its kind

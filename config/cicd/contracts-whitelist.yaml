@@ -446,7 +446,6 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.render_with_metadata:row"
 
   # LLM multi-query
-  - "src/elspeth/plugins/transforms/llm/multi_query.py:QuerySpec.build_template_context:row"
   - "src/elspeth/plugins/transforms/llm/multi_query.py:QuerySpec.build_template_context:return"
 
   # LLM provider protocol — response_format follows the OpenAI API spec

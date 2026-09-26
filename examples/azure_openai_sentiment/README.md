@@ -58,7 +58,7 @@ The output CSV will contain the original columns plus:
 - `sentiment_analysis` - The LLM's JSON response
 - `sentiment_analysis_usage` - Token usage metadata
 - `sentiment_analysis_template_hash` - Hash of the prompt template (for audit)
-- `sentiment_analysis_variables_hash` - Hash of the input variables (for audit)
+- `sentiment_analysis_variables_hash` - Hash of the fields the template could see: its `required_input_fields` (for audit)
 - `sentiment_analysis_model` - The deployment/model that responded
 
 ## Azure OpenAI Setup

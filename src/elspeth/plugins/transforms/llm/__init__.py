@@ -23,7 +23,7 @@ guaranteed_fields: Contract-stable fields downstream can depend on
 
 audit_fields: Provenance metadata for audit trail (may change between versions)
     - <response_field>_template_hash: SHA256 of prompt template
-    - <response_field>_variables_hash: SHA256 of rendered variables
+    - <response_field>_variables_hash: SHA256 of what the template could see (its declared fields, ADR-051)
     - <response_field>_template_source: Config file path
     - <response_field>_lookup_hash: SHA256 of lookup data
     - <response_field>_lookup_source: Config file path
@@ -85,7 +85,7 @@ MULTI_QUERY_GUARANTEED_SUFFIXES: tuple[str, ...] = (
 # Metadata field suffixes for audit-only fields (exist but may change between versions)
 LLM_AUDIT_SUFFIXES: tuple[str, ...] = (
     "_template_hash",  # SHA256 of prompt template
-    "_variables_hash",  # SHA256 of rendered template variables
+    "_variables_hash",  # SHA256 of what the template could see: its declared fields (ADR-051)
     "_template_source",  # File path of template (None if inline)
     "_lookup_hash",  # SHA256 of lookup data
     "_lookup_source",  # File path of lookup data (None if no lookup)
@@ -294,8 +294,9 @@ def build_llm_audit_metadata(
     Args:
         field_prefix: Response field name (e.g., "llm_response").
         template_hash: SHA-256 of prompt template.
-        variables_hash: SHA-256 of rendered template variables (None for batch-level
-            metadata where per-row hashes are recorded in the calls table).
+        variables_hash: SHA-256 of what the template could see, its declared fields
+            (ADR-051); None for batch-level metadata where per-row hashes are
+            recorded in the calls table.
         template_source: Config file path of template (None if inline).
         lookup_hash: SHA-256 of lookup data (None if no lookup).
         lookup_source: Config file path of lookup data (None if no lookup).

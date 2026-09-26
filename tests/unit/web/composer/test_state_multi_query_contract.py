@@ -119,14 +119,25 @@ def test_subscripted_source_row_column_outside_declaration_is_reported() -> None
     assert entry.message in _plugin_message(options)
 
 
-def test_image_input_columns_cover_query_reads() -> None:
-    """``image_inputs`` field and format_field are declared input columns, as ``LLMConfig.declared_input_fields`` counts them."""
+def test_a_source_row_read_of_an_image_column_is_refused_on_both_surfaces() -> None:
+    """``row.source_row`` holds only ``required_input_fields`` (ADR-051): an ``image_inputs`` column is not in it."""
+    options = _options(
+        ["body"], {"describe": {"input_fields": {"text": "body"}, "template": "{{ row.text }} {{ row.source_row.photo_mime }}"}}
+    )
+    options["image_inputs"] = [{"field": "photo", "format_field": "photo_mime"}]
+    (entry,) = _coded(_state(options))
+    assert "Query 'describe' reads row column 'photo_mime'" in entry.message
+    assert entry.message in _plugin_message(options)
+
+
+def test_image_input_columns_cover_query_input_fields() -> None:
+    """``image_inputs`` field and format_field cover ``input_fields`` values, as ``LLMConfig.declared_input_fields`` counts them."""
     options = _options(
         ["body"],
         {
             "describe": {
-                "input_fields": {"text": "body", "picture": "photo"},
-                "template": "{{ row.text }} {{ row.picture }} {{ row.source_row.photo_mime }}",
+                "input_fields": {"text": "body", "picture": "photo", "mime": "photo_mime"},
+                "template": "{{ row.text }} {{ row.picture }} {{ row.mime }}",
             }
         },
     )

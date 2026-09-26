@@ -96,7 +96,7 @@ The output includes:
 - `sentiment_analysis` - The LLM's JSON response
 - `sentiment_analysis_usage` - Token usage metadata
 - `sentiment_analysis_template_hash` - Hash of prompt template (for audit)
-- `sentiment_analysis_variables_hash` - Hash of input variables (for audit)
+- `sentiment_analysis_variables_hash` - Hash of the fields the template could see: its `required_input_fields` (for audit)
 - `sentiment_analysis_model` - The model that responded
 
 ### Viewing Results

@@ -1,4 +1,4 @@
-"""Only ``SandboxedTemplate`` renders a row (elspeth-5887fb7928 S3, W10).
+"""Only ``SandboxedTemplate`` renders a row, and only projected to its node's declaration (elspeth-5887fb7928 S3 W10, ADR-051).
 
 A row value in a template failure is withheld by exactly one renderer,
 ``SandboxedTemplate``, which renders in the bounded worker with the value-free
@@ -115,3 +115,81 @@ def test_a_message_quoting_environment_never_renders_a_row() -> None:
                 assert all(k.arg is not None for k in node.keywords), f"{name}:{node.lineno} renders with a ** context"
                 keywords = {k.arg for k in node.keywords if k.arg is not None}
                 assert keywords <= _RUN_LEVEL_RENDER_NAMES, f"{name}:{node.lineno} renders with {sorted(keywords)}"
+
+
+# ---------------------------------------------------------------------------
+# A row reaches a template only projected to its node's declaration (ADR-051)
+# ---------------------------------------------------------------------------
+
+# Where a PipelineRow becomes a TemplateRow, and where a node's declaration is
+# read as a projection. RAG's query_template joins both when it is projected
+# (the RAG-projection unit); its ``QueryBuilder.build(row.to_dict())`` then
+# leaves the tree.
+_EXPECTED_PROJECTION_SITES = Counter(
+    {
+        "plugins/transforms/llm/transform.py": 1,
+        "plugins/transforms/llm/multi_query.py": 1,
+    }
+)
+_EXPECTED_DECLARATION_READS = Counter({"plugins/transforms/llm/transform.py": 1})
+# The calls that hand a row to a template.
+_ROW_RENDER_CALLS = frozenset({"render", "render_with_metadata", "build_template_context"})
+
+
+def _passes_a_to_dict(call: ast.Call) -> bool:
+    """Whether any argument of ``call`` contains a ``<x>.to_dict()`` call: the whole row as a plain dict."""
+    arguments: list[ast.AST] = [*call.args, *(keyword.value for keyword in call.keywords)]
+    return any(
+        type(node) is ast.Call and type(node.func) is ast.Attribute and node.func.attr == "to_dict"
+        for argument in arguments
+        for node in ast.walk(argument)
+    )
+
+
+def _unprojected_render_sites(modules: dict[str, ast.Module]) -> list[str]:
+    return [
+        f"{name}:{node.lineno}"
+        for name, module in modules.items()
+        for node in ast.walk(module)
+        if type(node) is ast.Call and _called_name(node) in _ROW_RENDER_CALLS and _passes_a_to_dict(node)
+    ]
+
+
+def test_no_render_is_handed_a_whole_row_as_a_dict() -> None:
+    """``to_dict()`` into a render bypasses the projection: the packer refuses a PipelineRow, not a plain dict."""
+    assert _unprojected_render_sites(_modules()) == []
+
+
+def test_the_unprojected_render_scan_finds_a_to_dict_argument() -> None:
+    """Positive control for the scan above: each render call shape it must catch."""
+    probe = ast.parse(
+        "t.render(row=row.to_dict())\n"
+        "t.render_with_metadata(row.to_dict(), contract=c)\n"
+        "spec.build_template_context(dict(row.to_dict()), p)\n"
+        "t.render(row=TemplateRow.project(row, p))\n"
+    )
+    assert _unprojected_render_sites({"probe.py": probe}) == ["probe.py:1", "probe.py:2", "probe.py:3"]
+
+
+def test_rows_are_projected_only_where_a_node_declaration_is_read() -> None:
+    modules = _modules()
+    projections = Counter(
+        name
+        for name, module in modules.items()
+        if name != "plugins/infrastructure/templates.py"
+        for node in ast.walk(module)
+        if type(node) is ast.Call
+        and type(node.func) is ast.Attribute
+        and node.func.attr == "project"
+        and type(node.func.value) is ast.Name
+        and node.func.value.id == "TemplateRow"
+    )
+    declarations = Counter(
+        name
+        for name, module in modules.items()
+        if name != "plugins/infrastructure/templates.py"
+        for node in ast.walk(module)
+        if type(node) is ast.Call and _called_name(node) == "declared_row_projection"
+    )
+    assert projections == _EXPECTED_PROJECTION_SITES
+    assert declarations == _EXPECTED_DECLARATION_READS
