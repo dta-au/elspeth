@@ -171,7 +171,10 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # ExecutionRepository.complete_collector_failure opens the ONE
 # fenced_leader_transaction that fails the flush state and every member hold.
 # Re-derived by RUNNING the gate on the changed tree.
-_CLOCK_BOUNDARY_DIGEST = "66e5132fe9261d24d289426ba25a644fd32810253f12a3ed51697bb842613293"
+# E3 (lane ruling 2026-09-26, option A2): 66e5132f… → the value below, +1 identity:
+# SchedulerLeaseRepository.requeue_undecided_failed_work, resume's leader verb that
+# returns an outcomeless FAILED item to READY. Re-derived from the live inventory.
+_CLOCK_BOUNDARY_DIGEST = "62e34418a6e81e085fa796a49abaa21444516d4537723a8fae10c7b2f9c1afc7"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -355,6 +358,10 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.peer_active_leases"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.recover_expired_leases"),
+        # Resume's leader verb returning a FAILED item whose token has no
+        # outcome to READY (lane ruling 2026-09-26, option A2): it clears the
+        # lease columns under the epoch fence and stamps Landscape decision time.
+        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.requeue_undecided_failed_work"),
         ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_row_with_initial_claim"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_ready"),

@@ -37,6 +37,9 @@ class SchedulerEventType(StrEnum):
     MARK_PENDING_SINK = "mark_pending_sink"
     MARK_PENDING_SINK_TERMINAL = "mark_pending_sink_terminal"
     MARK_BLOCKED_BARRIER_TERMINAL = "mark_blocked_barrier_terminal"
+    # Resume returns a FAILED item whose token has no completed outcome (a claim
+    # that died on an exception mid-row) to READY for re-drive.
+    RESUME_REQUEUE_FAILED = "resume_requeue_failed"
 
 
 @dataclass(frozen=True, slots=True)

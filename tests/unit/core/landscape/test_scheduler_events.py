@@ -831,8 +831,15 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
         assert work_item["barrier_key"] is None
         assert work_item["barrier_blocked_at"] == work_item["updated_at"]
         assert work_item["lease_owner"] is None
-    elif expected_status in (TokenWorkStatus.TERMINAL, TokenWorkStatus.FAILED):
+    elif expected_status is TokenWorkStatus.TERMINAL:
         assert work_item["row_payload_json"] == scrubbed_row_payload_json(item.work_item_id)
+        assert work_item["lease_owner"] is None
+        assert work_item["pending_sink_name"] is None
+    elif expected_status is TokenWorkStatus.FAILED:
+        # No outcome is recorded for this token, so the row is undecided: the
+        # FAILED image keeps the claim-start payload resume re-drives from.
+        # A decided token's FAILED item is purged (test_resume_requeue_failed_work).
+        assert work_item["row_payload_json"] == payload
         assert work_item["lease_owner"] is None
         assert work_item["pending_sink_name"] is None
     else:

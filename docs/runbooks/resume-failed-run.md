@@ -166,6 +166,35 @@ The checkpoint was corrupted or source data changed. Options:
 2. Preserve the failed run's audit database and checkpoint files if they are
    needed for incident evidence.
 
+### A row raised an unexpected error
+
+The run stopped with a traceback from a transform (a plugin bug or an ELSPETH
+failure, on the leader or on an `elspeth join` follower), not with a routed
+row error. The row's work item is left `failed` with no outcome, and the run
+cannot be recorded as completed while it is: a finalization over it is
+refused with `FAILED scheduler work whose token has no terminal outcome`.
+
+1. Fix the cause.
+2. Run `elspeth resume <RUN_ID> --execute`. Resume returns each such row to
+   the queue, records a `resume_requeue_failed` scheduler event for it, and
+   processes it again from the node where its work started, under a new
+   attempt number. A row that already has an outcome, including one routed to
+   `on_error`, is not processed again.
+
+Notes:
+
+- The row is processed at least once more: an external call the failed
+  attempt made before it raised may be made again, as when a crashed worker's
+  row is taken over.
+- If the cause is not fixed, resume fails the same way, the run stays
+  `failed` and nothing is recorded as completed. Resume again after the fix.
+  If that failed resume had already taken a row waiting for its sink, the row
+  is held until its item lease (300 seconds) lapses; a resume before then
+  processes the requeued row but stops with `residual scheduler work`, and a
+  later resume finishes the run.
+- `elspeth abandon` refuses a `failed` run as resumable. To give up on the
+  run instead, start a fresh one.
+
 ### "source lifecycle is incomplete" on a run that is still `running`
 
 The run's leader died (crash, SIGKILL, evicted replica) before its source was

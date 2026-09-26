@@ -1014,6 +1014,24 @@ class TestStaleTokenFenceRefusals:
         assert row["lease_owner"] == "peer-worker"
         assert len(_fence_refusals(db, "recover_expired_leases")) == 1
 
+    def test_requeue_undecided_failed_work_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        repo = TokenSchedulerRepository(db.engine)
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
+        # A claim that died mid-row: FAILED and no outcome, so without the fence
+        # this item WOULD be requeued — the refusal is the fence, not a missed match.
+        repo.mark_failed(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
+            work_item_id=work_item_id,
+            expected_lease_owner=WORKER,
+        )
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError):
+            repo.leases.requeue_undecided_failed_work(coordination_token=token)
+        row = _work_item_row(db, token_id)
+        assert row["status"] == TokenWorkStatus.FAILED.value, "a deposed leader cannot requeue work under the new one"
+        assert row["work_item_id"] == work_item_id
+        assert len(_fence_refusals(db, "requeue_undecided_failed_work")) == 1
+
     def test_terminalize_pending_sinks_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)

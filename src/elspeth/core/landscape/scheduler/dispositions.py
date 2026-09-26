@@ -35,6 +35,7 @@ from elspeth.core.landscape.schema import (
     pending_sink_bundle_clause,
     token_outcomes_table,
     token_work_items_table,
+    work_item_token_decided_clause,
 )
 
 
@@ -63,9 +64,25 @@ class BlockedImage:
 
 @dataclass(frozen=True, slots=True)
 class TerminalImage:
-    """Column image of a TERMINAL or FAILED disposition: the scrubbed payload; the lease is cleared."""
+    """Column image of a TERMINAL disposition: the scrubbed payload; the lease is cleared."""
 
     row_payload_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class FailedImage:
+    """Column image of a FAILED disposition; the lease is cleared.
+
+    The row payload is purged to ``purged_row_payload_json`` only when the
+    token already carries a completed outcome (a routed failure records it
+    before ``mark_failed``). A token with none is undecided: the claim died on
+    an exception mid-row, and resume re-drives the item from this payload
+    (``requeue_undecided_failed_work``), exactly as a hard-killed LEASED item
+    keeps its payload for lease recovery. The choice is made in the UPDATE
+    itself, from the Tier-1 record, not by the caller.
+    """
+
+    purged_row_payload_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +98,7 @@ class PendingSinkImage:
     lease_owner: str
 
 
-DispositionImage = BlockedImage | TerminalImage | PendingSinkImage
+DispositionImage = BlockedImage | TerminalImage | FailedImage | PendingSinkImage
 
 
 class SchedulerDispositionRepository:
@@ -209,7 +226,7 @@ class SchedulerDispositionRepository:
             expected_lease_owner=expected_lease_owner,
             member_token=member_token,
             group_losses=group_losses,
-            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
+            image=FailedImage(purged_row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_failed_with_ready_children(
@@ -229,7 +246,7 @@ class SchedulerDispositionRepository:
             expected_lease_owner=expected_lease_owner,
             group_losses=group_losses,
             member_token=member_token,
-            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
+            image=FailedImage(purged_row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_pending_sink(
@@ -897,6 +914,22 @@ class SchedulerDispositionRepository:
                 )
             )
             next_lease_owner = None
+        elif isinstance(image, FailedImage):
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(and_(*predicates))
+                .values(
+                    status=status.value,
+                    updated_at=database_now,
+                    row_payload_json=case(
+                        (work_item_token_decided_clause(), image.purged_row_payload_json),
+                        else_=token_work_items_table.c.row_payload_json,
+                    ),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            )
+            next_lease_owner = None
         elif isinstance(image, PendingSinkImage):
             result = conn.execute(
                 update(token_work_items_table)
@@ -916,7 +949,9 @@ class SchedulerDispositionRepository:
             )
             next_lease_owner = image.lease_owner
         else:
-            raise TypeError(f"disposition image must be BlockedImage, TerminalImage or PendingSinkImage, got {type(image).__name__}")
+            raise TypeError(
+                f"disposition image must be BlockedImage, TerminalImage, FailedImage or PendingSinkImage, got {type(image).__name__}"
+            )
         if result.rowcount != 1:
             actual = (
                 conn.execute(

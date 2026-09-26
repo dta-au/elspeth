@@ -66,7 +66,10 @@ CHECK, and each failed member's hold names its group. A Landscape store created
 from an earlier 0.8.1 pre-release build at epoch 46 lacks that CHECK and is
 refused at startup; recreate it.
 Epoch 46 records each valid source row's exact contract for replay and verify
-of sparse source streams.
+of sparse source streams. Its scheduler event vocabulary also includes
+`resume_requeue_failed`; a Landscape store created from an earlier 0.8.1
+pre-release build at epoch 46 has the narrower `event_type` CHECK and is
+refused at startup; recreate it.
 These changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
 
@@ -276,6 +279,20 @@ drained and repair this release forward.
   resume of a leader that died mid-retry). A run can no longer be finalised
   successful while a row whose claim died mid-row has no outcome: it now ends
   `FAILED` instead of `COMPLETED`.
+- **`elspeth resume` finishes a row whose work died on an unexpected error.**
+  When a transform raises something that is neither a row error nor
+  retryable (a plugin bug or an ELSPETH failure), the row's work item is left
+  `failed` with no outcome and the run stops. Resume now returns each such
+  item to the queue, recorded as a `resume_requeue_failed` scheduler event,
+  and processes the row again from the node where its work started under a
+  new attempt number, so once the cause is fixed the run completes with every
+  row decided. Before, the row was never processed again, and resume stamped
+  the run `COMPLETED` with the row missing. A row that already has an outcome is
+  not processed again, and a failed item whose row has no outcome now keeps
+  its row data until it is decided. If the cause is not fixed, resume fails
+  the same way and the run stays `FAILED`. The re-run is at-least-once, as a
+  lease takeover already is: an external call the failed attempt made may be
+  made again.
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:
   `settings.yaml` routes all three rows, with their original values, to the

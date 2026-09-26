@@ -460,7 +460,12 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        validation refuses it). Populated epoch-44 stores require
 #        delete/recreate.
 #  46 → Valid source rows retain their exact source contract for sparse-stream
-#        replay and verify. Populated epoch-45 stores require delete/recreate.
+#        replay and verify. The scheduler_events event_type CHECK admits
+#        ``resume_requeue_failed``: resume returns a FAILED item whose token
+#        has no completed outcome to READY (folded into 46 by lane ruling
+#        2026-09-26, no bump; a store created before the fold carries the
+#        narrower CHECK and startup shape validation refuses it). Populated
+#        epoch-45 stores require delete/recreate.
 SQLITE_SCHEMA_EPOCH = 46
 
 schema_identity_table = create_schema_identity_table(metadata)
@@ -1050,6 +1055,37 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
                 no_error_evidence,
             ),
         ),
+    )
+
+
+def work_item_token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the work item's token carries a completed terminal outcome in its run.
+
+    Correlated to ``token_work_items`` (a SELECT over it or an UPDATE of it).
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == token_work_items_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == token_work_items_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
+def undecided_failed_work_clause() -> ColumnElement[bool]:
+    """Predicate selecting FAILED work items whose token has no completed outcome.
+
+    FAILED is a disposition, not a fate. A routed failure records the token's
+    outcome before ``mark_failed``; a FAILED item whose token has none is a
+    claim that died on an exception mid-row (the drain's exception arm marks
+    it FAILED and the worker exits), so the row is undecided. One predicate
+    for the two readers that must agree: ``complete_run`` refuses a success
+    stamp while such an item exists, and resume returns exactly these items
+    to READY for re-drive (``requeue_undecided_failed_work``).
+    """
+    return and_(
+        token_work_items_table.c.status == TokenWorkStatus.FAILED.value,
+        ~work_item_token_decided_clause(),
     )
 
 

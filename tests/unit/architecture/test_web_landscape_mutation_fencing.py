@@ -625,7 +625,13 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # into transform_errors (one row per member of a FAILED aggregation batch), inside its
 # own fenced_leader_transaction. Write set UNCHANGED (transform_errors/insert already
 # existed via record_transform_error). Measured by scripts/fencing_inventory.py.
-_EXPECTED_DML_COUNT = 161
+# E3 (lane ruling 2026-09-26, option A2): 161 -> 163, +2 identities, write set
+# UNCHANGED (token_work_items/update already existed):
+# SchedulerLeaseRepository.requeue_undecided_failed_work's rotating UPDATE (resume
+# returns an outcomeless FAILED item to READY), and SchedulerDispositionRepository.
+# _transition_on's FailedImage UPDATE (a FAILED item purges its row payload only when
+# its token is decided). Measured by scripts/fencing_inventory.py --baseline HEAD.
+_EXPECTED_DML_COUNT = 163
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -734,7 +740,8 @@ _EXPECTED_DML_COUNT = 161
 # K063 run accounting adds one collector_group_failures INSERT to the fenced
 # ExecutionRepository.complete_collector_failure verdict. The site records a
 # failed group even when no members arrived; all prior identities remain.
-_EXPECTED_DML_INVENTORY_SHA256 = "b3c42f082c209835c4756d0cf2fa333cf7a533259da3c5b9dec7165558068755"
+# E3: b3c42f08… -> the value below, the two arrivals named at _EXPECTED_DML_COUNT.
+_EXPECTED_DML_INVENTORY_SHA256 = "802297e658b9189952fbabb63b5be4e34a28e46f16879f862d509054fe0604f8"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -880,8 +887,12 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "7683d3e0cfefa635a465005c75805f5aa666f027bc
 # Replay source-contract retention leaves the 146 edges intact. Three call
 # fingerprints change as source_contract_json is forwarded from the scheduler
 # through DataFlowRepository and RowTokenRepository.
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 146
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "af506ca081699fb18d407b758118fc082d44bfc01dffd8d9093ec4fc5eb9ac45"
+# E3 (lane ruling 2026-09-26, option A2): 146 -> 147, af506ca0… -> the value below.
+# Arrived: SchedulerLeaseRepository.requeue_undecided_failed_work ->
+# SchedulerEventStore.record_many (the resume_requeue_failed events, on the verb's
+# one fenced connection). Measured by scripts/fencing_inventory.py --baseline HEAD.
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 147
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "1e0222f86a8f12d5a1de8ae10eaaf1b8b49589b97bd4e166abe8b453880e5f0f"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -10740,7 +10751,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.core.landscape.scheduler.group_losses', names=[alias(name='record_group_losses')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.payload_codec', names=[alias(name='scrubbed_row_payload_json')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_items_idempotent'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='pending_sink_bundle_clause'), alias(name='token_outcomes_table'), alias(name='token_work_items_table')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='pending_sink_bundle_clause'), alias(name='token_outcomes_table'), alias(name='token_work_items_table'), alias(name='work_item_token_decided_clause')], level=0)",
     ),
     "src/elspeth/core/landscape/scheduler/barrier.py": (
         "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",

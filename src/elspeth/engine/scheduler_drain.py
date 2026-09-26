@@ -931,7 +931,9 @@ class SchedulerDrainCoordinator:
         attempt 0 among them) are at other steps.
 
         Reclaim provenance needs no resume checkpoint: the rotation is
-        already recorded by the ``recover_expired_lease`` scheduler event.
+        already recorded by the ``recover_expired_lease`` scheduler event, or
+        by ``resume_requeue_failed`` when resume returns a FAILED item whose
+        token has no outcome (a claim that died on an exception) to READY.
         """
         rotation_offset = max(claimed.attempt - 1, 0)
         if claimed.attempt <= 1:

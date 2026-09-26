@@ -87,6 +87,7 @@ from elspeth.core.landscape.schema import (
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
+    undecided_failed_work_clause,
 )
 
 if TYPE_CHECKING:
@@ -902,23 +903,12 @@ class RunLifecycleRepository:
             .scalars()
             .all()
         )
-        # FAILED is a disposition, not a fate: every FAILED item's token must
-        # already carry its completed terminal outcome (a routed failure
-        # records it before mark_failed). A FAILED item whose token has none
-        # is a claim that died mid-row (the drain's exception arm marks it
-        # FAILED and the worker exits) — the row never reached an outcome, and
-        # FAILED is absent from the active-status arm.
+        # A FAILED item whose token has no completed outcome is a claim that
+        # died mid-row (see undecided_failed_work_clause): the row never
+        # reached an outcome, and FAILED is absent from the active-status arm.
+        # Resume returns such items to READY before it drains.
         outcomeless_failed_tokens = (
-            select(token_work_items_table.c.token_id)
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.status == TokenWorkStatus.FAILED.value)
-            .where(
-                ~select(token_outcomes_table.c.outcome_id)
-                .where(token_outcomes_table.c.run_id == run_id)
-                .where(token_outcomes_table.c.token_id == token_work_items_table.c.token_id)
-                .where(token_outcomes_table.c.completed == 1)
-                .exists()
-            )
+            select(token_work_items_table.c.token_id).where(token_work_items_table.c.run_id == run_id).where(undecided_failed_work_clause())
         )
         # The SUCCESS quiescence arms ride in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
@@ -962,7 +952,8 @@ class RunLifecycleRepository:
             raise OrchestrationInvariantError(
                 f"Cannot complete run {run_id} as {status.value!r}: FAILED scheduler work whose token has no "
                 f"terminal outcome exists (tokens {list(outcomeless_tokens)!r}, first 10). A claim died mid-row; "
-                "a run cannot be stamped successful while a row has not reached a recorded outcome."
+                "a run cannot be stamped successful while a row has not reached a recorded outcome. "
+                "`elspeth resume` returns such items to READY and re-drives them."
             )
 
         # ADR-038 fate decision: the terminal stamp above succeeded, so the

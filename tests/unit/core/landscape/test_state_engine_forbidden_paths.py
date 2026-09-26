@@ -783,6 +783,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_secret_resolutions",
         "record_source_field_resolution",
         "recover_expired_leases",
+        "requeue_undecided_failed_work",
         "register_candidate",
         "register_verified_candidate",
         "reserve",
@@ -1033,6 +1034,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "recover_expired_leases": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_recover_expired_leases_refused",
+        ),
+        "requeue_undecided_failed_work": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_requeue_undecided_failed_work_refused",
         ),
         # The audit-export registry CAS (ADR-048): its stale-token evidence
         # lives beside the export-bundle derivation machinery it needs to

@@ -5362,7 +5362,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "6d338cdb36214a65",
         1,
         None,
-        line=498,
+        line=499,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5373,7 +5373,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "35f1c0951a247db5",
         1,
         None,
-        line=621,
+        line=622,
         connection_escape=True,
     ),
     # ADR-047 fresh-time amendment: the PRAGMA verifier installs the reviewed
@@ -5584,7 +5584,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e6f248b018079f85",
         1,
         None,
-        line=969,
+        line=1093,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5817,7 +5817,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c585a80de69ed5e2",
         1,
         None,
-        line=869,
+        line=870,
     ),
     # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
     # hold ages; the read connection is handed to read_landscape_transaction_time.

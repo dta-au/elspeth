@@ -3117,10 +3117,10 @@ failure is retried the same way whichever process claimed the row, and each
 attempt is recorded as its own node state.
 
 **Retry time and the row's lease.** A row's attempts and backoff waits run
-inside one claim. The claim's lease (300 seconds) is refreshed after each
-attempt, at most once per heartbeat interval (60 seconds), so the longest
-stretch without a refresh is one attempt plus one backoff wait, or the
-heartbeat interval when that is longer. Another worker reclaims a live
+inside one claim. The claim's lease (300 seconds) is refreshed after an
+attempt only once a heartbeat interval (60 seconds) has passed since the last
+refresh, so a stretch without a refresh can reach almost the heartbeat
+interval plus one attempt plus one backoff wait. Another worker reclaims a live
 worker's row only when a stretch outlasts the lease plus the stall budget
 (300 + 600 seconds). The reclaimed row then runs again from its node under a
 new attempt number, and its external calls are made again, so keep
@@ -3128,6 +3128,16 @@ new attempt number, and its external calls are made again, so keep
 `max_delay_seconds` has no upper bound. A follower waiting out a backoff
 notices that its leader has gone or that the run has finished only when the
 wait ends, at most `max_delay_seconds` later.
+
+**An error that is neither retryable nor a row error.** When a transform
+raises something the row did not cause and no retry covers (a plugin bug or
+an ELSPETH failure), the run stops and that row is left without an outcome.
+The run is never recorded as completed over such a row. After fixing the
+cause, `elspeth resume` processes the row again from the node where its work
+started, under a new attempt number; a row that already has an outcome,
+including one routed to `on_error`, is not processed again. As with a
+reclaimed row, external calls the failed attempt made may be made again. See
+[Resume Failed Run](../runbooks/resume-failed-run.md#a-row-raised-an-unexpected-error).
 
 ---
 

@@ -34,13 +34,16 @@ from elspeth.core.landscape.scheduler.fencing import (
     fenced_write,
     require_coordination_token,
 )
+from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_json
 from elspeth.core.landscape.scheduler.work_items import item_from_mapping, work_item_id
 from elspeth.core.landscape.schema import (
     active_worker_fence_clause,
     claim_verb_fence_clause,
+    group_losses_table,
     pending_sink_bundle_clause,
     run_workers_table,
     token_work_items_table,
+    undecided_failed_work_clause,
 )
 
 
@@ -801,6 +804,127 @@ class SchedulerLeaseRepository:
             ],
         )
         return len(changed_ids)
+
+    def requeue_undecided_failed_work(self, *, coordination_token: CoordinationToken) -> int:
+        """Return every FAILED item whose token has no completed outcome to READY (resume only).
+
+        A claim that raises out of its traversal is marked FAILED by the
+        drain's exception arm and the worker exits; nothing decides the row.
+        The live drain keeps that disposition. Resume is the operator's "cause
+        fixed, continue" step, so it re-drives these rows exactly as it
+        re-drives a hard-killed worker's expired lease: crash timing must not
+        change a row's outcome. The re-drive is at-least-once, the takeover
+        contract ADR-030 already states: an external effect the crashed
+        attempt made may be replayed. A FAILED item whose token HAS a
+        completed outcome is decided and is never touched.
+
+        Each item rotates like a lease recovery: ``attempt + 1`` and a fresh
+        ``work_item_id``, so the re-claim takes the collision-free claim base
+        (``SchedulerDrainCoordinator.claim_attempt_offset``, gated on
+        ``attempt > 1``) and the crashed claim's node_states are never
+        re-inserted. Each rotation records a ``resume_requeue_failed`` event
+        naming the previous work item.
+
+        LEADER verb under the epoch fence. Refuses (Tier-1) an undecided item
+        whose row payload was purged or whose token a group-loss record
+        already names: either would re-drive a row the record says is gone.
+        """
+        require_coordination_token(coordination_token, verb="requeue_undecided_failed_work")
+        run_id = coordination_token.run_id
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="requeue_undecided_failed_work") as conn:
+            undecided = (
+                conn.execute(
+                    select(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(undecided_failed_work_clause())
+                    .order_by(
+                        token_work_items_table.c.ingest_sequence,
+                        token_work_items_table.c.step_index,
+                        token_work_items_table.c.work_item_id,
+                    )
+                    .with_for_update(of=token_work_items_table)
+                )
+                .mappings()
+                .all()
+            )
+            if not undecided:
+                return 0
+            purged = sorted(
+                row["token_id"] for row in undecided if row["row_payload_json"] == scrubbed_row_payload_json(row["work_item_id"])
+            )
+            if purged:
+                raise AuditIntegrityError(
+                    f"Resume cannot re-drive FAILED scheduler work for run {run_id!r}: token(s) {purged!r} have no "
+                    "completed outcome but their row payload was purged. A FAILED item keeps its payload until its "
+                    "token is decided."
+                )
+            token_ids = tuple(row["token_id"] for row in undecided)
+            lost = sorted(
+                conn.execute(
+                    select(group_losses_table.c.token_id)
+                    .where(group_losses_table.c.run_id == run_id)
+                    .where(group_losses_table.c.token_id.in_(token_ids))
+                    .distinct()
+                )
+                .scalars()
+                .all()
+            )
+            if lost:
+                raise AuditIntegrityError(
+                    f"Resume cannot re-drive FAILED scheduler work for run {run_id!r}: token(s) {lost!r} have no "
+                    "completed outcome but a group-loss record already names them."
+                )
+            database_now = read_landscape_decision_time(conn)
+            next_ids = {row["work_item_id"]: work_item_id(run_id, row["token_id"], row["node_id"], row["attempt"] + 1) for row in undecided}
+            changed_ids = frozenset(
+                conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.work_item_id.in_(tuple(next_ids)))
+                    .where(undecided_failed_work_clause())
+                    .values(
+                        work_item_id=case(next_ids, value=token_work_items_table.c.work_item_id),
+                        attempt=token_work_items_table.c.attempt + 1,
+                        status=TokenWorkStatus.READY.value,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        updated_at=database_now,
+                    )
+                    .returning(token_work_items_table.c.work_item_id)
+                )
+                .scalars()
+                .all()
+            )
+            if changed_ids != frozenset(next_ids.values()):
+                raise AuditIntegrityError(
+                    f"Resume re-drive of FAILED scheduler work for run {run_id!r} rotated {len(changed_ids)} of "
+                    f"{len(next_ids)} locked items; the leader-fenced transaction held every row it selected."
+                )
+            self._events.record_many(
+                conn,
+                records=[
+                    SchedulerEventRecord(
+                        event_type=SchedulerEventType.RESUME_REQUEUE_FAILED,
+                        run_id=run_id,
+                        token_id=row["token_id"],
+                        work_item_id=next_ids[row["work_item_id"]],
+                        node_id=row["node_id"],
+                        from_status=TokenWorkStatus.FAILED,
+                        to_status=TokenWorkStatus.READY,
+                        from_lease_owner=None,
+                        to_lease_owner=None,
+                        from_attempt=row["attempt"],
+                        to_attempt=row["attempt"] + 1,
+                        recorded_at=database_now,
+                        from_lease_expires_at=None,
+                        to_lease_expires_at=None,
+                        caller_owner=coordination_token.worker_id,
+                        context={"previous_work_item_id": row["work_item_id"]},
+                    )
+                    for row in undecided
+                ],
+            )
+        return len(undecided)
 
     def heartbeat_lease(
         self,

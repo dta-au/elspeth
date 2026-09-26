@@ -703,6 +703,11 @@ class ResumeCoordinator:
 
             # Stage 3 — only the seat winner may rewrite incomplete batches.
             batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot, coordination_token=coordination_token)
+            # Stage 3b — a claim that died on an exception mid-row left its item
+            # FAILED with no outcome. Return it to READY (a recorded
+            # resume_requeue_failed event) so the scheduler drain re-drives it
+            # at the collision-free claim base; decided FAILED items stay.
+            snapshot.factory.scheduler.leases.requeue_undecided_failed_work(coordination_token=coordination_token)
 
             return ResumeState(
                 factory=snapshot.factory,

@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Engine
-from sqlalchemy.schema import CreateIndex
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 import elspeth.core.landscape.database as database_module
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
@@ -354,6 +354,36 @@ class TestSchemaCompatibilityGuards:
         msg = str(exc_info.value)
         assert "Missing check constraints:" in msg
         assert "collector_group_failures.ck_collector_group_failures_failure_reason" in msg
+
+    def test_from_url_rejects_a_scheduler_events_table_made_before_the_requeue_event_fold(self, tmp_path: Path) -> None:
+        """A store created at epoch 46 before ``resume_requeue_failed`` joined the event_type CHECK is refused.
+
+        The fold carries no epoch bump (lane ruling 2026-09-26: fold into 46 only
+        if a pre-fold store is refused at open), so the epoch cannot tell such a
+        store apart; startup shape validation of the CHECK does. The pre-fold
+        table is today's DDL with exactly the new literal removed.
+        """
+        db_path = tmp_path / "pre_fold_scheduler_events.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        _stamp_current_landscape_identity(engine)
+        table = metadata.tables["scheduler_events"]
+        current_ddl = str(CreateTable(table).compile(dialect=engine.dialect))
+        pre_fold_ddl = current_ddl.replace(", 'resume_requeue_failed'", "")
+        assert pre_fold_ddl != current_ddl  # the mutation really removed the literal
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE scheduler_events")
+            conn.exec_driver_sql(pre_fold_ddl)
+            for index in table.indexes:
+                conn.exec_driver_sql(str(CreateIndex(index).compile(dialect=engine.dialect)))
+        engine.dispose()
+
+        with pytest.raises(SchemaCompatibilityError) as exc_info:
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+
+        msg = str(exc_info.value)
+        assert "scheduler_events.ck_scheduler_events_event_type CHECK constraint SQL mismatch" in msg
+        assert "Missing indexes" not in msg
 
     def test_checkpoint_sequence_uniqueness_is_required_schema_contract(self) -> None:
         """Per-run checkpoint ordering must be mechanically unique in fresh and stale DBs."""
