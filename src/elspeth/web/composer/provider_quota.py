@@ -178,6 +178,18 @@ async def admit_provider_attempt(*, model: str) -> None:
         raise cancellation
 
 
+def provider_attempt_needs_terminal_audit() -> bool:
+    """Whether a completion failure belongs to an admitted, unaudited attempt.
+
+    Retry admission first settles the preceding call. If that fails, the
+    span still holds its terminal evidence and must not be rebound to the
+    retry's exception. Unscoped callers retain their own audit lifecycle.
+    Check before building a call record, which binds it into the span.
+    """
+    span = _CONTEXTVAR_GET(_SPAN)
+    return span is None or (span.attempt is not None and span.call is None)
+
+
 def bind_provider_attempt(call: ComposerLLMCall) -> ComposerLLMCall:
     """Use the database-clock identity of the actual dispatched attempt."""
     span = _CONTEXTVAR_GET(_SPAN)
