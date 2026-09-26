@@ -7944,6 +7944,20 @@ class TestComposerRuntimeTemplateLiteralAgreement:
             id="truncate-float-length-beside-row-leeway",
         ),
         pytest.param("{{ row.q | truncate(True) }}", "truncate() length must be an integer literal, got bool.", id="truncate-bool-length"),
+        # Each precondition over only the arguments it reads (review-F1-final-minors-r1 F1).
+        pytest.param(
+            "{{ row.q | truncate(2, leeway=row.n) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+            id="truncate-short-length-beside-row-leeway",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(row.n, leeway=-1) }}",
+            "truncate() arguments can never be satisfied: expected leeway >= 0, got -1",
+            id="truncate-negative-leeway-beside-row-length",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10, foo=1) }}", "truncate() got an unexpected keyword argument 'foo'.", id="truncate-unknown-keyword"
+        ),
         pytest.param(
             "{{ row.q | truncate(1e400) }}",
             "A number literal in this template is too large for a float (it overflows to infinity).",
@@ -8022,6 +8036,8 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         [
             pytest.param("{{ row.q | truncate(row.n) }}", id="truncate-length-from-the-row"),
             pytest.param("{% if row.q %}{{ row.q | truncate(3) }}{% endif %}", id="valid-literal-inside-if"),
+            pytest.param("{{ row.q | truncate(3, leeway=row.n) }}", id="satisfied-length-beside-row-leeway"),
+            pytest.param("{{ row.q | truncate(0, end=row.q) }}", id="zero-length-beside-row-end"),
         ],
     )
     def test_both_admit_a_template_whose_failure_depends_on_the_row(self, tmp_path: Path, plugin: str, template: str) -> None:

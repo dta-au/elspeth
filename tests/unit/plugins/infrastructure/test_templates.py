@@ -661,6 +661,64 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() arguments can never be satisfied: object of type 'bool' has no len()",
             id="truncate-end-bool",
         ),
+        # Each precondition is decided over only the arguments it reads, so a
+        # row-derived argument it does not read does not defer it
+        # (review-F1-final-minors-r1 F1): ``length >= len(end)`` reads length
+        # and end, ``leeway >= 0`` reads leeway.
+        pytest.param(
+            "{{ row.q | truncate(2, leeway=row.n) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+            id="truncate-short-length-beside-row-leeway",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(+2, leeway=row.n) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+            id="truncate-unary-plus-short-beside-row-leeway",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(-5, end=row.e) }}",
+            "truncate() arguments can never be satisfied: expected length >= 0, got -5",
+            id="truncate-negative-length-beside-row-end",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(20, end=True, leeway=row.n) }}",
+            "truncate() arguments can never be satisfied: object of type 'bool' has no len()",
+            id="truncate-end-bool-beside-row-leeway",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(row.n, end=5) }}",
+            "truncate() arguments can never be satisfied: object of type 'int' has no len()",
+            id="truncate-end-int-beside-row-length",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(row.n, leeway=-1) }}",
+            "truncate() arguments can never be satisfied: expected leeway >= 0, got -1",
+            id="truncate-negative-leeway-beside-row-length",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10.5, *row.args) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-beside-a-spread",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10.5, **row.kwargs) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-beside-a-keyword-spread",
+        ),
+        # A call that cannot bind is a TypeError on every render.
+        pytest.param(
+            "{{ row.q | truncate(1, False, '', 0, 9) }}",
+            "truncate() takes at most 4 arguments after the filtered value, got 5.",
+            id="truncate-too-many-arguments",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10.5, foo=1) }}", "truncate() got an unexpected keyword argument 'foo'.", id="truncate-unknown-keyword"
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10, length=5) }}",
+            "truncate() got multiple values for argument 'length'.",
+            id="truncate-argument-given-twice",
+        ),
         # ``length + leeway`` overflows when an int literal is too large for a
         # float: an OverflowError on every render, not a construction crash.
         pytest.param(
@@ -712,7 +770,14 @@ def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, mes
         pytest.param("{{ row.q | truncate(+10, end=row.e) }}", id="truncate-unary-plus-int-beside-row-end"),
         pytest.param("{{ row.n * 1e300 }}", id="finite-float-literal"),
         pytest.param("{{ row.q | truncate(*row.args) }}", id="truncate-splat"),
-        pytest.param("{{ row.q | truncate(1, False, '', 0, 9) }}", id="truncate-arity-left-to-render"),
+        # A row-derived argument a precondition reads stands in as the value
+        # that satisfies it, so each of these can render (an ``end`` of ''
+        # admits any length >= 0; a spread may supply ``end``).
+        pytest.param("{{ row.q | truncate(0, end=row.e) }}", id="truncate-zero-length-beside-row-end"),
+        pytest.param("{{ row.q | truncate(3, leeway=row.n) }}", id="truncate-length-equal-to-end-beside-row-leeway"),
+        pytest.param("{{ row.q | truncate(2, **row.kwargs) }}", id="truncate-short-length-beside-a-keyword-spread"),
+        pytest.param("{{ row.q | truncate(1, *row.args) }}", id="truncate-short-length-beside-a-spread"),
+        pytest.param("{{ row.q | truncate(row.n, end='abc') }}", id="truncate-row-length-beside-literal-end"),
         pytest.param("{{ row.l | map(attribute='a') | list }}", id="map-attribute"),
         pytest.param("{{ row.l | map('upper') | list }}", id="map-known-filter"),
         pytest.param("{{ row.l | map(row.f) | list }}", id="map-filter-from-the-row"),

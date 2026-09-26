@@ -922,10 +922,12 @@ def _check_configuration_literals(ast: nodes.Template, environment: ImmutableSan
       only outside ``{% if %}`` and inline ``if`` expressions; inside them it
       defers the error to render. The same holds for a literal name given to
       ``map``, ``select``, ``reject``, ``selectattr`` and ``rejectattr``.
-    - ``truncate`` arguments whose literal values break its preconditions
+    - ``truncate`` arguments that cannot bind (too many, an unknown keyword,
+      one given twice), or whose literal values break its preconditions
       (``length >= len(end)``, ``leeway >= 0``) or its slicing (a ``length``
-      that is not an integer). An argument computed from the row is decided
-      at render and routes.
+      that is not an integer). Each precondition is decided over only the
+      arguments it reads, so a row-derived argument it does not read does
+      not defer it; one it does read is decided at render and routes.
     - A number literal too large for a float (``1e400``). Python reads it as
       infinity, which Jinja's code generator writes back as the bare name
       ``inf``: in an expression (``truncate(1e400)``, ``x == 1e400``) every
@@ -955,42 +957,85 @@ def _check_configuration_literals(ast: nodes.Template, environment: ImmutableSan
             _check_truncate_literals(node, environment)
 
 
-def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxedEnvironment) -> None:
-    """Evaluate ``truncate``'s preconditions when every argument they read is a literal.
+# truncate(s, length=255, killwords=False, end='...', leeway=None): the
+# arguments after the filtered value, in order, and the defaults Jinja uses
+# for the three its preconditions read.
+_TRUNCATE_PARAMETERS = ("length", "killwords", "end", "leeway")
+_TRUNCATE_DEFAULTS: Mapping[str, int | str | None] = MappingProxyType({"length": 255, "end": "...", "leeway": None})
+# Stand-ins for an argument the row supplies: each satisfies every
+# precondition it takes part in, so the probe below fails only on what the
+# literals alone decide. ``end=""`` asks the least of ``length >= len(end)``;
+# ``leeway=0`` passes ``leeway >= 0`` and adds nothing to ``length + leeway``.
+# A row-supplied ``length`` stands in as ``len(end)``, the least that holds.
+_TRUNCATE_ROW_END = ""
+_TRUNCATE_ROW_LEEWAY = 0
 
-    Runs Jinja's own filter on an empty string: its assertions run before it
-    reads the string, and an empty string then returns unchanged, so this
-    evaluates exactly those preconditions on the operator's literals.
+
+def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxedEnvironment) -> None:
+    """Refuse ``truncate`` arguments that fail on every row, deciding each precondition over only the arguments it reads.
+
+    Jinja's ``do_truncate`` fails a render, whatever the row, when:
+
+    - the call cannot bind: more than four arguments after the filtered
+      value, a keyword it does not take, or one argument given twice;
+    - ``length`` is not an integer (it slices with it; read alone);
+    - ``length >= len(end)`` fails (reads length and end — a literal ``end``
+      that is not a string fails ``len()`` whatever ``length`` is, and a
+      negative literal ``length`` fails it whatever ``end`` is);
+    - ``leeway >= 0`` fails (reads leeway alone);
+    - ``length + leeway`` overflows (reads both).
+
+    An argument computed from the row — or one a ``*args``/``**kwargs``
+    spread may supply — is replaced by the stand-in that satisfies every
+    precondition it takes part in, and Jinja's own filter then runs on an
+    empty string: its assertions run before it reads the string, and an
+    empty string returns unchanged. So a refusal names a failure the
+    operator's literals decide on their own, and an argument the row decides
+    is left to render, where it routes.
     """
-    if node.dyn_args is not None or node.dyn_kwargs is not None or len(node.args) > 4:
-        return
-    # truncate(s, length=255, killwords=False, end='...', leeway=None)
-    arguments: dict[str, nodes.Expr] = dict(zip(("length", "killwords", "end", "leeway"), node.args, strict=False))
+    if len(node.args) > len(_TRUNCATE_PARAMETERS):
+        raise TemplateAssertionError(
+            f"truncate() takes at most {len(_TRUNCATE_PARAMETERS)} arguments after the filtered value, got {len(node.args)}.",
+            node.lineno,
+        )
+    arguments: dict[str, nodes.Expr] = dict(zip(_TRUNCATE_PARAMETERS, node.args, strict=False))
     for keyword in node.kwargs:
         # Jinja's parser builds a call's keyword arguments as Keyword nodes
         # with a str key (its annotations say Pair); anything else is left to render.
         key: object = keyword.key
-        if type(key) is not str or key in arguments or key not in ("length", "killwords", "end", "leeway"):
+        if type(key) is not str:
             return
+        if key not in _TRUNCATE_PARAMETERS:
+            raise TemplateAssertionError(f"truncate() got an unexpected keyword argument {key!r}.", node.lineno)
+        if key in arguments:
+            raise TemplateAssertionError(f"truncate() got multiple values for argument {key!r}.", node.lineno)
         arguments[key] = keyword.value
+    spread = node.dyn_args is not None or node.dyn_kwargs is not None
     literals: dict[str, int | float | str | None] = {}
-    for name in ("length", "end", "leeway"):
+    for name, default in _TRUNCATE_DEFAULTS.items():
         if name in arguments:
             is_literal, value = _literal_argument(arguments[name])
             if is_literal:
                 literals[name] = value
-    # The empty-string probe below returns before truncate slices, so a
-    # non-integer length (truncate(10.5), truncate(True)) would pass it and
-    # then fail every row long enough to be truncated ("slice indices must be
-    # integers") or every row outright. This precondition reads length alone,
-    # so it holds whatever the other arguments are (truncate(10.5, end=row.e)).
+        elif not spread:
+            # Absent and nothing can supply it: Jinja's default.
+            literals[name] = default
+    # The empty-string probe returns before truncate slices, so a non-integer
+    # length (truncate(10.5), truncate(True)) would pass it and then fail every
+    # row long enough to be truncated ("slice indices must be integers") or
+    # every row outright.
     if "length" in literals and type(literals["length"]) is not int:
         raise TemplateAssertionError(f"truncate() length must be an integer literal, got {type(literals['length']).__name__}.", node.lineno)
-    if any(name in arguments and name not in literals for name in ("length", "end", "leeway")):
-        # A row-derived argument: the joint preconditions are decided at render.
-        return
+    # The literals override the stand-ins; every other argument the probe
+    # reads is the row's, so it takes the stand-in.
+    probe: dict[str, int | float | str | None] = {"end": _TRUNCATE_ROW_END, "leeway": _TRUNCATE_ROW_LEEWAY, **literals}
+    if "length" not in probe:
+        row_end = probe["end"]
+        # A literal end that is not a string fails len() whatever the length;
+        # any stand-in length lets the probe report that.
+        probe["length"] = len(row_end) if type(row_end) is str else 0
     try:
-        environment.filters["truncate"](environment, "", **literals)
+        environment.filters["truncate"](environment, "", **probe)
     except (AssertionError, TypeError, ArithmeticError) as exc:
         # ArithmeticError: ``length + leeway`` with an int literal too large
         # for a float overflows on every render.
