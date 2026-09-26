@@ -89,8 +89,11 @@ drained and repair this release forward.
   with a value-free reason that records whether the transform computed or
   carried it, and a created field that bypassed the declaration ends the run.
   Row-to-row type variance at a transform output no longer aborts a run, a
-  declared `page: int` can no longer deliver a str, a `value_transform` typing
-  a carried field no longer trips ADR-014 on a valid row, and two observed
+  declared `page: int` can no longer deliver a str, an operator typing a
+  field the transform carries (`value_transform`, `field_mapper`,
+  `passthrough`, `truncate`, `keyword_filter`, `type_coerce` and the AWS
+  Bedrock guardrails, after an observed or a typed source) no longer ends the
+  run with a Tier-1 `SchemaConfigModeViolation` on a valid row, and two observed
   sources disagreeing on a column now share a sink. Whether a declaration
   is enforced no longer depends on spelling: a `field_mapper` target spelled
   like a source's CSV header (`{"name": "Name"}`) is checked like any other
