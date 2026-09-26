@@ -73,7 +73,7 @@ pytestmark = pytest.mark.composer_llm_eval
 
 SOURCE_REPORT = "docs/composer/evidence/composer-llm-eval-2026-04-28.md"
 EVAL_MODEL = "openrouter/openai/gpt-5.5"
-EVAL_USER_ID = "dta_user"
+EVAL_USER_ID = "eval-user"
 
 ISSUE_CHARACTERIZATION = "elspeth-a5481032bd"
 ISSUE_BLOB_PATH = "elspeth-411435710b"

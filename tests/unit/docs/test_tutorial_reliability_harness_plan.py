@@ -39,3 +39,27 @@ def test_runnable_staging_examples_do_not_embed_concrete_credentials() -> None:
             offenders.append(relative_path.as_posix())
 
     assert offenders == []
+
+
+def test_test_tree_does_not_embed_retired_staging_credentials() -> None:
+    """No test file or fixture carries a retired staging credential as a literal.
+
+    A test id is copied into fixtures, logs and reports; the retired staging
+    account name once lived on as a test user id. Every text file under
+    ``tests/`` is scanned (binary fixtures and bytecode caches cannot hold a
+    typed literal), and only the offending path is reported, never the token.
+    """
+    offenders: list[str] = []
+    tests_root = REPO_ROOT / "tests"
+
+    for path in sorted(tests_root.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if _contains_retired_staging_credential(text):
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+
+    assert offenders == []

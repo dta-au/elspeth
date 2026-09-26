@@ -57,7 +57,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 
 EVAL_MODEL = "openrouter/openai/gpt-5.5"
-EVAL_USER_ID = "dta_user"
+EVAL_USER_ID = "eval-user"
 
 
 @dataclass(frozen=True, slots=True)
