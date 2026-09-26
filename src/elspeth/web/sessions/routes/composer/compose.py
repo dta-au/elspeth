@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import replace as _replace_dataclass
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
@@ -45,6 +46,8 @@ from .._helpers import (
     _ComposerRequestTerminalStatus,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _handle_composer_chargeable_refusal,
+    _handle_composer_provider_failure,
     _handle_convergence_error,
     _handle_planner_failure,
     _handle_plugin_crash,
@@ -70,7 +73,6 @@ from .._helpers import (
     asyncio,
     client_cancelled_progress_event,
     composer_turn_end_assistant_row,
-    contextlib,
     convergence_progress_event,
     get_current_user,
     get_rate_limiter,
@@ -78,6 +80,7 @@ from .._helpers import (
     slog,
     validation_errors_for_composer_surface,
 )
+from ..guided_operations import _join_shielded_task_after_cancellation
 from .pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
 
 router = APIRouter()
@@ -191,8 +194,7 @@ async def recompose(
 
             # Run the LLM composition loop
             composer: ComposerService = request.app.state.composer_service
-            from litellm.exceptions import APIError as LiteLLMAPIError
-            from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+            from openai import OpenAIError
 
             try:
                 # Same disconnect watcher as send_message: cancel the
@@ -239,79 +241,16 @@ async def recompose(
                     chat_ingress_inputs=chat_ingress_inputs,
                 )
                 raise HTTPException(status_code=422, detail=response_body) from exc
-            except LiteLLMAuthError as exc:
-                # Recompose mirror of the redaction contract in send_message
-                # (see block comment there for full rationale).  The two
-                # paths MUST carry byte-identical response shapes and
-                # redaction granularity — any future divergence becomes a
-                # selective leak surface (attacker picks whichever endpoint
-                # still echoes str(exc)).
-                slog.error(
-                    "recompose_llm_auth_error",
-                    session_id=str(session_id),
-                    exc_class=type(exc).__name__,
-                )
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="failed",
-                        headline="The composer model is not available.",
-                        evidence=("The model provider rejected the composer request.",),
-                        likely_next="Check the composer provider configuration before retrying.",
-                        reason="provider_auth_failed",
-                    ),
-                )
-                llm_calls = _llm_calls_from_exception(exc)
-                if llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        llm_calls,
-                        pre_send_state_id,
-                        plugin_crash_pending=True,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                raise HTTPException(
-                    status_code=502,
-                    detail=_litellm_error_detail(
-                        "llm_auth_error",
-                        exc,
-                        expose_provider_error=settings.composer_expose_provider_errors,
-                    ),
-                ) from exc
-            except LiteLLMAPIError as exc:
-                slog.error(
-                    "recompose_llm_unavailable",
-                    session_id=str(session_id),
-                    exc_class=type(exc).__name__,
-                )
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="failed",
-                        headline="The composer model is temporarily unavailable.",
-                        evidence=("The model provider did not complete the request.",),
-                        likely_next="Retry when the provider is available.",
-                        reason="provider_unavailable",
-                    ),
-                )
-                llm_calls = _llm_calls_from_exception(exc)
-                if llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        llm_calls,
-                        pre_send_state_id,
-                        plugin_crash_pending=True,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                raise HTTPException(
-                    status_code=502,
-                    detail=_litellm_error_detail(
-                        "llm_unavailable",
-                        exc,
-                        expose_provider_error=settings.composer_expose_provider_errors,
-                    ),
+            except OpenAIError as exc:
+                raise await _handle_composer_provider_failure(
+                    exc,
+                    route="recompose",
+                    service=service,
+                    session_id=session.id,
+                    composition_state_id=pre_send_state_id,
+                    progress_sink=progress_sink,
+                    session_operation_context=compose_operation_lease.context,
+                    expose_provider_error=settings.composer_expose_provider_errors,
                 ) from exc
             except _BadRequestLLMError as exc:
                 slog.error(
@@ -445,6 +384,15 @@ async def recompose(
                     session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+            except ChargeableAdmissionRefused as exc:
+                raise await _handle_composer_chargeable_refusal(
+                    exc,
+                    service=service,
+                    session_id=session.id,
+                    composition_state_id=pre_send_state_id,
+                    progress_sink=progress_sink,
+                    session_operation_context=compose_operation_lease.context,
+                ) from exc
             except ComposerAdmissionRefused as exc:
                 # Mirror of the send_message arm (messages.py). The refusal is
                 # a committed admission decision (identity disabled, quota), so
@@ -789,8 +737,8 @@ async def recompose(
             # comment there for the shielded-publish rationale.
             llm_calls = _llm_calls_from_exception(exc)
             if llm_calls:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(
+                await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
                         _persist_llm_calls(
                             service,
                             session.id,
@@ -798,23 +746,29 @@ async def recompose(
                             pre_send_state_id,
                             plugin_crash_pending=True,
                             session_operation_context=compose_operation_lease.context,
-                        )
-                    )
+                        ),
+                        name="recompose-cancelled-llm-call-persist",
+                    ),
+                    primary_cancellation=exc,
+                )
             # A cancel delivered by the compose heartbeat after it lost the
             # request's lease is a server fault, not a user Stop (finding
             # #28): publish ``failed`` and record ``failed``. The bare
             # ``raise`` below hands it to ``_track_compose_inflight``, which
             # uncancels the task and answers with the structured 503.
             heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(
+            await _join_shielded_task_after_cancellation(
+                asyncio.create_task(
                     _publish_progress(
                         progress_sink,
                         event=(
                             client_cancelled_progress_event() if heartbeat_cancel is None else _composer_heartbeat_failed_progress_event()
                         ),
-                    )
-                )
+                    ),
+                    name="recompose-cancelled-progress-publish",
+                ),
+                primary_cancellation=exc,
+            )
             terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
             if _is_client_disconnect_cancel(exc):
                 # Disconnect-initiated cancel — see the send_message

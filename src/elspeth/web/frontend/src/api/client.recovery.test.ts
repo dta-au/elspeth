@@ -34,6 +34,26 @@ describe("api/client recovery contracts", () => {
     fetchSpy.mockRestore();
   });
 
+  it("preserves static Composer retry guidance from a nested provider error", async () => {
+    const response = {
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: async () => ({
+        detail: {
+          error_type: "llm_unavailable",
+          detail: "BadGatewayError",
+          guidance: "Retry later; ask an administrator to investigate if this continues.",
+        },
+      }),
+    } as Response;
+    await expect(parseResponse(response)).rejects.toMatchObject({
+      error_type: "llm_unavailable",
+      detail: "BadGatewayError",
+      guidance: "Retry later; ask an administrator to investigate if this continues.",
+    });
+  });
+
   it.each([
     ["absent", undefined],
     ["nonconforming", {}],

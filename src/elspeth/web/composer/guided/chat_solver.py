@@ -85,6 +85,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
+from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
@@ -2866,7 +2867,8 @@ async def maybe_manage_deferred_intent_chat(
         error_message = "malformed_response"
         raise
     except Exception as exc:
-        status = ComposerLLMCallStatus.API_ERROR
+        failure = classify_provider_failure(exc)
+        status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
         error_class = type(exc).__name__
         error_message = type(exc).__name__
         raise
@@ -3789,7 +3791,8 @@ async def maybe_resolve_step_1_source_chat(
                 return repair_outcome
             raise
         except Exception as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
@@ -4808,7 +4811,8 @@ async def maybe_resolve_step_2_sink_chat(
                 return repair_outcome
             raise
         except Exception as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
@@ -4995,7 +4999,8 @@ async def solve_step_chat(
         error_message = "malformed_response"
         raise
     except Exception as exc:
-        status = ComposerLLMCallStatus.API_ERROR
+        failure = classify_provider_failure(exc)
+        status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
         error_class = type(exc).__name__
         error_message = type(exc).__name__
         raise

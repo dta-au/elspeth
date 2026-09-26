@@ -119,6 +119,7 @@ from elspeth.web.coordination.quota_authority import (
     TokenUsageEntry,
     TokenUsageSource,
     begin_provider_attempt_on_connection,
+    cancel_undispatched_provider_attempt_on_connection,
     llm_call_usage_entries,
     record_token_usage_on_connection,
     settle_provider_attempt_on_connection,
@@ -10683,6 +10684,59 @@ class SessionServiceImpl:
             writer_principal="compose_loop",
             session_operation_context=session_operation_context,
         )
+
+    async def cancel_undispatched_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+    ) -> None:
+        """Close a COMPOSE intent only when its owner proved SDK entry never occurred.
+
+        A distinct audit message, zero-use ledger entry, and settlement commit
+        together under the original live fence. This cannot reconcile a past
+        pending attempt or a provider call whose outcome is unknown.
+        """
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("Undispatched cancellation requires COMPOSE authority")
+        sid = session_operation_context.fence.session_id
+
+        def _sync() -> None:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._require_session_operation_context_on_connection(
+                    conn, session_operation_context, session_id=sid, expected_kind=SessionOperationKind.COMPOSE, now=database_now(conn)
+                )
+
+                def _append_audit_event(event_id: str, content: str, created_at: datetime) -> None:
+                    self._assert_session_write_lock_held(conn, sid, caller="cancel_undispatched_provider_attempt")
+                    sequence_no = self._reserve_sequence_range(conn, sid, count=1)
+                    self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="audit",
+                        content=content,
+                        raw_content=None,
+                        tool_calls=None,
+                        sequence_no=sequence_no,
+                        writer_principal="compose_loop",
+                        composition_state_id=None,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=created_at,
+                        session_operation_context=session_operation_context,
+                        message_id=event_id,
+                    )
+                    with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as mutations:
+                        mutations.mark_session_updated(updated_at=created_at)
+
+                cancel_undispatched_provider_attempt_on_connection(
+                    conn,
+                    session_operation_context=session_operation_context,
+                    attempt_id=attempt_id,
+                    requested_model=requested_model,
+                    append_audit_event=_append_audit_event,
+                )
+
+        await self._run_sync(_sync)
 
     async def settle_provider_attempt(
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry

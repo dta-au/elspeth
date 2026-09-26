@@ -44,13 +44,14 @@ if TYPE_CHECKING:
 
 import structlog
 from jinja2 import TemplateSyntaxError
+from openai import OpenAIError
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence, BlobNotFoundError, BlobRecord, BlobServiceProtocol
-from elspeth.contracts.chargeable_admission import ChargeableOperation
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused, ChargeableOperation
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
 from elspeth.contracts.composer_llm_audit import (
@@ -207,6 +208,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
+from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
 from elspeth.web.composer.redaction import redact_tool_call_arguments
@@ -939,7 +941,7 @@ async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | Non
 
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
-    await admit_provider_attempt()
+    await admit_provider_attempt(model=kwargs["model"])
     if on_provider_dispatch is not None:
         on_provider_dispatch()
     return await litellm.acompletion(**kwargs)
@@ -4216,8 +4218,6 @@ class ComposerServiceImpl:
         await self._require_chargeable_admission(session_operation_context)
         with composer_quota_scope(self._require_sessions_service(), session_operation_context):
             deadline = asyncio.get_event_loop().time() + self._timeout_seconds
-            from litellm.exceptions import APIError as LiteLLMAPIError
-
             # One recorder spans planning or the ordinary loop so every provider
             # and discovery audit for this request is accounted for.
             recorder = BufferingRecorder()
@@ -4375,7 +4375,7 @@ class ComposerServiceImpl:
                     ),
                 )
                 raise
-            except (ComposerServiceError, LiteLLMAPIError):
+            except ComposerServiceError:
                 # Generic service-level failure (prompt prep, availability check,
                 # or a LiteLLMAPIError surfacing through the inner loop). The
                 # route handlers further narrow provider failures; here the
@@ -8515,10 +8515,6 @@ class ComposerServiceImpl:
         required, add it with focused usage-accounting tests rather than
         inheriting the primary-composer marker placement by accident.
         """
-        from litellm.exceptions import APIError as LiteLLMAPIError
-        from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-        from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
-
         advisor_model = self._settings.composer_advisor_model
         configured_timeout = self._settings.composer_advisor_timeout_seconds
         effective_timeout = configured_timeout if timeout is None else min(configured_timeout, timeout)
@@ -8632,18 +8628,9 @@ class ComposerServiceImpl:
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             raise
-        except LiteLLMAuthError as exc:
-            status = ComposerLLMCallStatus.AUTH_ERROR
-            error_class = type(exc).__name__
-            error_message = type(exc).__name__
-            raise
-        except LiteLLMBadRequestError as exc:
-            status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
-            error_class = type(exc).__name__
-            error_message = type(exc).__name__
-            raise
-        except LiteLLMAPIError as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+        except OpenAIError as exc:
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             raise
@@ -9313,27 +9300,23 @@ class ComposerServiceImpl:
         # gate folds findings_text into a ValidationError and the assistant
         # message).
         #
-        # Allowlist is name/type-based and TIGHT. Builtin TimeoutError /
-        # ConnectionError cover the asyncio.wait_for deadline and stdlib transport
-        # errors. The name-set covers LiteLLM's typed transport classes by
-        # ``type(exc).__name__`` (verified against the installed litellm: the
-        # provider-deadline class is ``Timeout`` (subclasses APITimeoutError, but
-        # its own __name__ is "Timeout" and it is NOT a builtin TimeoutError), and
-        # ``ServiceUnavailableError`` is a 503 outage). ``BadRequestError`` /
-        # generic ``APIError`` / ``InternalServerError`` are deliberately ABSENT —
-        # they are ambiguous (could be a malformed/4xx request) and fall through to
-        # the fail-closed MALFORMED default.
-        _unavailable_types = (TimeoutError, ConnectionError)
-        _unavailable_names = {
-            "APITimeoutError",
-            "APIConnectionError",
-            "AuthenticationError",
-            "RateLimitError",
-            "Timeout",
-            "ServiceUnavailableError",
-        }
+        # Keep the END gate's narrower wording policy while using the shared
+        # SDK classifier as its provenance check. Generic APIError and bad
+        # requests remain MALFORMED here, even when their status is 503; they
+        # do not establish which side produced an invalid exchange. Concrete
+        # transport, timeout, auth, rate-limit and service-unavailable types
+        # establish an unavailable advisor. Builtin deadline and connection
+        # failures retain their existing unavailable wording.
+        from litellm.exceptions import ServiceUnavailableError as LiteLLMServiceUnavailableError
+        from openai import APIConnectionError, APITimeoutError, AuthenticationError, RateLimitError
+
         failure_class: Literal["none", "unavailable", "malformed"]
-        if last_exc is not None and (isinstance(last_exc, _unavailable_types) or type(last_exc).__name__ in _unavailable_names):
+        sdk_failure = classify_provider_failure(last_exc) if last_exc is not None else None
+        sdk_unavailable = sdk_failure is not None and isinstance(
+            last_exc,
+            (APITimeoutError, APIConnectionError, AuthenticationError, RateLimitError, LiteLLMServiceUnavailableError),
+        )
+        if last_exc is not None and (isinstance(last_exc, (TimeoutError, ConnectionError)) or sdk_unavailable):
             failure_class = "unavailable"
         else:
             # Malformed responses and other admitted provider exception classes
@@ -9424,9 +9407,6 @@ class ComposerServiceImpl:
         the bytes actually sent, so the audit row is truthful about the
         wire payload (elspeth-4e79436719).
         """
-        from litellm.exceptions import APIError as LiteLLMAPIError
-        from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-
         if supports_anthropic_prompt_cache_markers(self._model):
             messages, tools_or_none = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
             tools = tools_or_none if tools_or_none is not None else tools
@@ -9477,14 +9457,9 @@ class ComposerServiceImpl:
             error_message = type(exc).__name__
             attach_llm_calls(exc, recorder)
             raise
-        except LiteLLMAuthError as exc:
-            status = ComposerLLMCallStatus.AUTH_ERROR
-            error_class = type(exc).__name__
-            error_message = type(exc).__name__
-            attach_llm_calls(exc, recorder)
-            raise
-        except LiteLLMAPIError as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+        except OpenAIError as exc:
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             attach_llm_calls(exc, recorder)
@@ -9553,9 +9528,6 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder | None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
-        from litellm.exceptions import APIError as LiteLLMAPIError
-        from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -9598,14 +9570,9 @@ class ComposerServiceImpl:
             error_message = type(exc).__name__
             attach_llm_calls(exc, recorder)
             raise
-        except LiteLLMAuthError as exc:
-            status = ComposerLLMCallStatus.AUTH_ERROR
-            error_class = type(exc).__name__
-            error_message = type(exc).__name__
-            attach_llm_calls(exc, recorder)
-            raise
-        except LiteLLMAPIError as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+        except OpenAIError as exc:
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             attach_llm_calls(exc, recorder)
@@ -9696,8 +9663,6 @@ class ComposerServiceImpl:
         wall-clock timeout does not trip (and so does not charge) either
         turn budget.
         """
-        from litellm.exceptions import APIError as LiteLLMAPIError
-        from litellm.exceptions import AuthenticationError as LiteLLMAuthError
 
         def _captured_invocations() -> tuple[ComposerToolInvocation, ...]:
             return recorder.invocations if recorder is not None else ()
@@ -9735,8 +9700,6 @@ class ComposerServiceImpl:
                     llm_calls=_captured_llm_calls(),
                     failed_turn=failed_turn,
                 ) from None
-            except LiteLLMAuthError:
-                raise
             except _BadRequestLLMError:
                 # Bad-request from provider: never retry. 400s are not transient,
                 # and the carrier holds the provider's status code + detail on
@@ -9755,7 +9718,26 @@ class ComposerServiceImpl:
                 # useful — otherwise the route falls back to the redacted
                 # class-name wrap and operators lose triage data.
                 raise
-            except LiteLLMAPIError:
+            except ChargeableAdmissionRefused as exc:
+                # A previous failed physical attempt has already been settled
+                # before the retry admission decision. Preserve its buffered
+                # audit sidecar without inventing a new call for the refusal.
+                attach_llm_calls(exc, recorder)
+                raise
+            except OpenAIError as exc:
+                failure = classify_provider_failure(exc)
+                if failure is not None and failure.kind == "timeout":
+                    raise ComposerConvergenceError.capture(
+                        max_turns=composition_turns_used + discovery_turns_used,
+                        budget_exhausted="timeout",
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=_captured_invocations(),
+                        llm_calls=_captured_llm_calls(),
+                        failed_turn=failed_turn,
+                    ) from None
+                if failure is None or not failure.retryable:
+                    raise
                 attempt += 1
                 if attempt >= _LLM_API_MAX_ATTEMPTS:
                     raise

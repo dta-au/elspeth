@@ -41,11 +41,19 @@ from elspeth.web.coordination.quota_authority import (
     TokenUsageEntry,
     admit_storage_bytes_on_connection,
     begin_provider_attempt_on_connection,
+    cancel_undispatched_provider_attempt_on_connection,
 )
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, quota_policies_table, sessions_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    quota_policies_table,
+    quota_provider_attempts_table,
+    sessions_table,
+    token_usage_ledger_table,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -135,6 +143,67 @@ def test_daily_total_widens_before_adding_token_columns(pg_fenced: FencedSession
         RepositoryQuotaAuthority.daily_token_total(pg_fenced.connection_token, identity_id=pg_fenced.identity_id, day_start_utc=DAY)
         == 4_000_000_000
     )
+
+
+def test_undispatched_cancellation_is_atomic_and_idempotent_on_postgres(pg_fenced: FencedSession) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    conn = _resolve_mutation_connection(pg_fenced.connection_token)
+    context = SessionOperationContext(
+        fence=SessionOperationFence(session_id=pg_fenced.session_id, operation_id="operation", lease_token="lease", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+    policy = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+    attempt = begin_provider_attempt_on_connection(conn, session_operation_context=context, source="composer", policy=policy)
+
+    def append_event(event_id: str, content: str, created_at: datetime) -> None:
+        conn.execute(
+            insert(chat_messages_table).values(
+                id=event_id,
+                session_id=pg_fenced.session_id,
+                role="audit",
+                content=content,
+                raw_content=None,
+                tool_calls=None,
+                sequence_no=1,
+                writer_principal="compose_loop",
+                composition_state_id=None,
+                tool_call_id=None,
+                parent_assistant_id=None,
+                created_at=created_at,
+            )
+        )
+
+    for _ in range(2):
+        cancel_undispatched_provider_attempt_on_connection(
+            conn,
+            session_operation_context=context,
+            attempt_id=attempt.attempt_id,
+            requested_model="test/model",
+            append_audit_event=append_event,
+        )
+    events = conn.execute(select(chat_messages_table)).all()
+    ledger = conn.execute(select(token_usage_ledger_table)).all()
+    stored_attempt = conn.execute(select(quota_provider_attempts_table)).one()
+    assert len(events) == len(ledger) == 1
+    assert events[0].tool_calls is None
+    assert (ledger[0].prompt_tokens, ledger[0].completion_tokens, ledger[0].cached_prompt_tokens, ledger[0].reasoning_tokens) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert events[0].created_at == ledger[0].recorded_at
+    assert stored_attempt.settled_at is not None
+    assert stored_attempt.ledger_entry_id == ledger[0].entry_id
+    with pytest.raises(AuditIntegrityError):
+        cancel_undispatched_provider_attempt_on_connection(
+            conn,
+            session_operation_context=context,
+            attempt_id=attempt.attempt_id,
+            requested_model="different/model",
+            append_audit_event=append_event,
+        )
 
 
 def test_pending_attempt_admission_serializes_on_identity_lock(pg_fenced: FencedSession) -> None:

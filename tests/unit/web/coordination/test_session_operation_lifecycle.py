@@ -169,7 +169,11 @@ class _FakeAuthority:
 
 
 async def _wait_for_thread_event(event: threading.Event) -> None:
-    assert await asyncio.wait_for(asyncio.to_thread(event.wait, 1), timeout=2)
+    async def wait() -> None:
+        while not event.is_set():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(wait(), timeout=2)
 
 
 def _lifecycle_traceback_local_text(error: BaseException) -> str:
@@ -540,11 +544,12 @@ async def test_adopt_invalid_timing_cancellation_joins_blocked_release_and_sanit
             lease_seconds=0,
         )
     )
-    release_started = await asyncio.wait_for(asyncio.to_thread(authority.release_called.wait, 1), timeout=2)
-    if not release_started:
+    try:
+        await _wait_for_thread_event(authority.release_called)
+    except TimeoutError:
         with pytest.raises(ValueError, match="lease_seconds"):
             await adopt_task
-    assert release_started
+        raise
 
     adopt_task.cancel("first-validation-cleanup-cancellation")
     await asyncio.sleep(0)
@@ -1261,6 +1266,62 @@ async def test_context_exit_preserves_body_and_integrity_cleanup_failures(body_f
             raise body_failure
     assert caught.value.exceptions == (body_failure, cleanup_error)
     assert authority.release_finished.is_set()
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_context_exit_repeated_cancellation_preserves_original_body_cancellation() -> None:
+    authority = _FakeAuthority()
+    authority.release_allowed.clear()
+    lease = await _acquire(authority, renew_interval_seconds=10)
+    body_cancellation = asyncio.CancelledError("body-cancellation")
+
+    async def run_body() -> None:
+        async with lease:
+            raise body_cancellation
+
+    body_task = asyncio.create_task(run_body())
+    await _wait_for_thread_event(authority.release_called)
+    body_task.cancel("close-cancellation")
+    authority.release_allowed.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await body_task
+
+    assert raised.value is body_cancellation
+    assert authority.release_finished.is_set()
+    assert authority.release_attempts == [lease.context]
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [OSError("release failed"), AuditIntegrityError("release integrity failed")],
+    ids=["ordinary", "integrity"],
+)
+async def test_context_exit_repeated_cancellation_preserves_cleanup_failure(cleanup_error: BaseException) -> None:
+    authority = _FakeAuthority()
+    authority.release_allowed.clear()
+    authority.release_error = cleanup_error
+    lease = await _acquire(authority, renew_interval_seconds=10)
+    body_cancellation = asyncio.CancelledError("body-cancellation")
+
+    async def run_body() -> None:
+        async with lease:
+            raise body_cancellation
+
+    body_task = asyncio.create_task(run_body())
+    await _wait_for_thread_event(authority.release_called)
+    body_task.cancel("close-cancellation")
+    authority.release_allowed.set()
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await body_task
+
+    assert raised.value.exceptions == (body_cancellation, cleanup_error)
+    assert authority.release_finished.is_set()
+    assert authority.release_attempts == [lease.context]
     assert lease.closed
 
 

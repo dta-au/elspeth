@@ -1835,6 +1835,20 @@ describe("sessionStore", () => {
       expect(state.messages[0].local_error).toBe(state.error);
     });
 
+    it("shows the gateway's safe retry guidance instead of generic immediate retry copy", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 502,
+        error_type: "llm_unavailable",
+        detail: "BadGatewayError",
+        guidance: "Retry later; if this continues, ask an administrator to investigate the model gateway.",
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().error).toContain("Retry later; if this continues");
+      expect(useSessionStore.getState().error).not.toContain("try again in a moment");
+    });
+
     it("opens recovery state for recovery-shaped compose failures", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       const recoveryError = makeRecoveryError();

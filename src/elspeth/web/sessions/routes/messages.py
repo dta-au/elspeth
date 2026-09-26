@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import replace as _replace_dataclass
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.compartments import compartment_ingress_record
@@ -57,6 +58,8 @@ from ._helpers import (
     _failed_turn_response_body,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _handle_composer_chargeable_refusal,
+    _handle_composer_provider_failure,
     _handle_convergence_error,
     _handle_planner_failure,
     _handle_plugin_crash,
@@ -342,8 +345,7 @@ def register_message_routes(router: APIRouter) -> None:
 
                 # 4. Run the LLM composition loop
                 composer: ComposerService = request.app.state.composer_service
-                from litellm.exceptions import APIError as LiteLLMAPIError
-                from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+                from openai import OpenAIError
 
                 try:
                     # The watcher cancels this task if the client
@@ -404,93 +406,16 @@ def register_message_routes(router: APIRouter) -> None:
                         chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=422, detail=response_body) from exc
-                except LiteLLMAuthError as exc:
-                    # ``str(exc)`` on LiteLLM exceptions can embed the provider
-                    # name, model ID, request payload fragments, and — on
-                    # certain provider code paths — the upstream HTTP response
-                    # body, which has been observed to echo the Authorization
-                    # header.  Redact the HTTP ``detail`` field to the class
-                    # name only; route the full exception to structured
-                    # server-side logging via ``slog.error`` with session
-                    # correlation.  Mirrors the ``partial_state_save_error``
-                    # contract on the SQLAlchemy 422 path in
-                    # ``_handle_convergence_error`` above.
-                    # exc_info deliberately omitted for the same reason
-                    # SQLAlchemy ``exc_info`` is dropped in the canonical
-                    # narrow-catch sites: ``__cause__`` chains on these
-                    # exception classes can carry upstream provider detail
-                    # that must not be retained in structured logs either.
-                    slog.error(
-                        "compose_llm_auth_error",
-                        session_id=str(session_id),
-                        exc_class=type(exc).__name__,
-                    )
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="failed",
-                            headline="The composer model is not available.",
-                            evidence=("The model provider rejected the composer request.",),
-                            likely_next="Check the composer provider configuration before retrying.",
-                            reason="provider_auth_failed",
-                        ),
-                    )
-                    llm_calls = _llm_calls_from_exception(exc)
-                    if llm_calls:
-                        await _persist_llm_calls(
-                            service,
-                            session.id,
-                            llm_calls,
-                            compose_base_state_id,
-                            plugin_crash_pending=True,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    raise HTTPException(
-                        status_code=502,
-                        detail=_litellm_error_detail(
-                            "llm_auth_error",
-                            exc,
-                            expose_provider_error=settings.composer_expose_provider_errors,
-                        ),
-                    ) from exc
-                except LiteLLMAPIError as exc:
-                    # Same redaction rationale as the auth-error block above.
-                    # ``LiteLLMAPIError`` message shape varies by provider (OpenAI,
-                    # Azure OpenAI, Anthropic, Bedrock) and can include
-                    # rate-limit window details, account/tenant identifiers,
-                    # and upstream request IDs that are operator-only material.
-                    slog.error(
-                        "compose_llm_unavailable",
-                        session_id=str(session_id),
-                        exc_class=type(exc).__name__,
-                    )
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="failed",
-                            headline="The composer model is temporarily unavailable.",
-                            evidence=("The model provider did not complete the request.",),
-                            likely_next="Retry when the provider is available.",
-                            reason="provider_unavailable",
-                        ),
-                    )
-                    llm_calls = _llm_calls_from_exception(exc)
-                    if llm_calls:
-                        await _persist_llm_calls(
-                            service,
-                            session.id,
-                            llm_calls,
-                            compose_base_state_id,
-                            plugin_crash_pending=True,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    raise HTTPException(
-                        status_code=502,
-                        detail=_litellm_error_detail(
-                            "llm_unavailable",
-                            exc,
-                            expose_provider_error=settings.composer_expose_provider_errors,
-                        ),
+                except OpenAIError as exc:
+                    raise await _handle_composer_provider_failure(
+                        exc,
+                        route="messages",
+                        service=service,
+                        session_id=session.id,
+                        composition_state_id=compose_base_state_id,
+                        progress_sink=progress_sink,
+                        session_operation_context=compose_operation_lease.context,
+                        expose_provider_error=settings.composer_expose_provider_errors,
                     ) from exc
                 except _BadRequestLLMError as exc:
                     slog.error(
@@ -680,6 +605,15 @@ def register_message_routes(router: APIRouter) -> None:
                         session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+                except ChargeableAdmissionRefused as exc:
+                    raise await _handle_composer_chargeable_refusal(
+                        exc,
+                        service=service,
+                        session_id=session.id,
+                        composition_state_id=compose_base_state_id,
+                        progress_sink=progress_sink,
+                        session_operation_context=compose_operation_lease.context,
+                    ) from exc
                 except ComposerAdmissionRefused as exc:
                     await _publish_progress(
                         progress_sink,
@@ -1112,7 +1046,8 @@ def register_message_routes(router: APIRouter) -> None:
                                 session_operation_context=compose_operation_lease.context,
                             ),
                             name="send-message-cancelled-llm-call-persist",
-                        )
+                        ),
+                        primary_cancellation=exc,
                     )
                 # A cancel delivered by the compose heartbeat after it lost
                 # the request's lease is a server fault, not a user Stop
@@ -1132,7 +1067,8 @@ def register_message_routes(router: APIRouter) -> None:
                             ),
                         ),
                         name="send-message-cancelled-progress-publish",
-                    )
+                    ),
+                    primary_cancellation=exc,
                 )
                 terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
                 if _is_client_disconnect_cancel(exc):

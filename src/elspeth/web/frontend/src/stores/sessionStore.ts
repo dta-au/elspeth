@@ -692,7 +692,7 @@ function formatProviderDiagnostic(apiErr: ApiError): string {
 }
 
 function formatLlmUnavailableError(apiErr: ApiError): string {
-  return `${LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
+  return `${apiErr.guidance ?? LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
 }
 
 function formatLlmAuthError(apiErr: ApiError): string {

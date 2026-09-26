@@ -266,6 +266,7 @@ export async function parseResponse<T>(
     let sources: string[] | undefined;
     let requestId: string | undefined;
     let failureCode: string | undefined;
+    let guidance: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
@@ -312,6 +313,7 @@ export async function parseResponse<T>(
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+      guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
       // Convergence discriminator + its recovery copy. Kept off `detail` so
       // the SPA branches on the taxonomy rather than parsing prose.
@@ -463,6 +465,7 @@ export async function parseResponse<T>(
       sources,
       request_id: requestId,
       failure_code: failureCode,
+      guidance,
       component_id: componentId,
       plugin_id: pluginId,
       reason,

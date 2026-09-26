@@ -25,6 +25,8 @@ import pytest
 import structlog
 from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
@@ -1840,11 +1842,12 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
 
 
 @pytest.mark.asyncio
-async def test_unexpected_completion_exception_propagates_without_provider_audit(
+async def test_unexpected_completion_exception_preserves_identity_and_terminal_audit(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    failure = RuntimeError("local completion adapter defect")
+    secret = "LOCAL-COMPLETION-ADAPTER-DEFECT-SECRET"  # secret-scan: allow-this-line
+    failure = RuntimeError(secret)
     recorder = BufferingRecorder()
 
     with pytest.raises(RuntimeError) as caught:
@@ -1856,7 +1859,11 @@ async def test_unexpected_completion_exception_propagates_without_provider_audit
         )
 
     assert caught.value is failure
-    assert recorder.llm_calls == ()
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.API_ERROR
+    assert call.error_class == "RuntimeError"
+    assert call.error_message == "RuntimeError"
+    assert secret not in canonical_json([call.to_dict()])
 
 
 @pytest.mark.asyncio
@@ -6089,6 +6096,110 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
     assert raw_canary not in canonical_json([call.to_dict() for call in recorder.llm_calls])
     assert [attempt.ordinal for attempt in recorder.planner_attempts] == [1]
     assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", [PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL, PlannerSurface.TUTORIAL_PROFILE])
+async def test_service_unavailable_on_second_planning_call_audits_each_retry(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+) -> None:
+    secret = "UPSTREAM-RESPONSE-BODY-SECRET"
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"max_api_attempts": 2},
+            surface=surface,
+        )
+
+    assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == 3
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2, 3]
+    assert [call.status for call in recorder.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.API_ERROR,
+        ComposerLLMCallStatus.API_ERROR,
+    ]
+    assert [call.error_class for call in recorder.llm_calls] == [None, "ServiceUnavailableError", "ServiceUnavailableError"]
+    # This unit path has no quota authority, so physical ordinals rather than
+    # database attempt IDs distinguish the three dispatched calls.
+    assert secret not in str(caught.value)
+    assert secret not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+
+
+@pytest.mark.asyncio
+async def test_bad_gateway_is_not_retried_and_is_audited(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        BadGatewayError(message="UPSTREAM-RESPONSE-BODY-SECRET", llm_provider="test-provider", model="test/planner")
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"max_api_attempts": 3},
+        )
+
+    assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR]
+    assert recorder.llm_calls[0].error_class == "BadGatewayError"
+
+
+@pytest.mark.asyncio
+async def test_sdk_timeout_records_timeout_instead_of_provider_outage(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        LiteLLMTimeout(message="UPSTREAM-RESPONSE-BODY-SECRET", llm_provider="test-provider", model="test/planner")
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert caught.value.code == "TIMEOUT"
+    assert len(completion.requests) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.TIMEOUT]
+    assert recorder.llm_calls[0].error_class == "Timeout"
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_failure_does_not_invent_provider_call(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_request_construction(**_kwargs: Any) -> Any:
+        raise ValueError("pre-dispatch")
+
+    monkeypatch.setattr("elspeth.web.composer.pipeline_planner.build_planner_request_kwargs", fail_request_construction)
+    completion = _ScriptedCompletion()
+    recorder = BufferingRecorder()
+
+    with pytest.raises(ValueError, match="pre-dispatch"):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert completion.requests == []
+    assert recorder.llm_calls == ()
 
 
 @pytest.mark.asyncio

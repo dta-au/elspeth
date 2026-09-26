@@ -202,14 +202,52 @@ async def _replay_completed[ResponseT: BaseModel](
     return response
 
 
-async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
-    """Join owned cleanup despite repeated cancellation of the caller."""
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T: ...
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError) -> T | None: ...
+
+
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError | None = None
+) -> T | None:
+    """Join owned cleanup despite repeated caller cancellation.
+
+    A route already unwinding its original cancellation can keep an ordinary
+    child failure secondary while continuing later cleanup. A registered
+    integrity failure stays primary. A child that cancels itself has not
+    proved its cleanup complete and therefore fails closed.
+    """
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             continue
-    return task.result()
+        except BaseException:
+            # A failed child is raised by ``shield`` as soon as it finishes;
+            # consume that result below using the same priority rule as a
+            # child that finished before this join began.
+            if not task.done():
+                raise
+    try:
+        return task.result()
+    except BaseException as child_error:
+        if primary_cancellation is None:
+            raise
+        if _is_guided_integrity_failure(child_error):
+            raise child_error from primary_cancellation
+        if isinstance(child_error, asyncio.CancelledError):
+            raise AuditIntegrityError("Shielded cleanup task was cancelled before completion") from primary_cancellation
+        if not isinstance(child_error, Exception):
+            raise
+        primary_cancellation.add_note(f"Shielded cleanup also failed with {type(child_error).__name__}.")
+        previous_cause = primary_cancellation.__cause__
+        primary_cancellation.__cause__ = (
+            child_error if previous_cause is None else BaseExceptionGroup("Shielded cleanup failures", [previous_cause, child_error])
+        )
+        return None
 
 
 def _record_guided_cleanup_failure(error: BaseException, *, site: str, session_lease: SessionOperationLease) -> None:

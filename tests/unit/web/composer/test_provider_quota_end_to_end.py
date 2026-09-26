@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import structlog
+from litellm.exceptions import ServiceUnavailableError
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
@@ -19,7 +20,8 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.provider_quota import composer_quota_scope, quota_provider_calls
+from elspeth.web.composer.pipeline_proposal import PlannerSurface
+from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
 from elspeth.web.composer.service import _litellm_acompletion
 from elspeth.web.coordination import chargeable_admission_authority, quota_authority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -33,6 +35,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.fenced_session import IDENTITY_TOKENS_PER_DAY, seed_token_policies
+from tests.unit.web.composer.test_pipeline_planner import _custody, _origin, _plan, _response, _ScriptedCompletion
 
 
 @pytest.fixture
@@ -152,6 +155,82 @@ async def test_timeout_with_unknown_usage_blocks_next_physical_call(quota_servic
     assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
     assert dispatches == ["sent"]
     assert refusals == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", [PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL, PlannerSurface.TUTORIAL_PROFILE])
+async def test_second_planning_call_503_settles_before_quota_refuses_retry(
+    quota_service,
+    tmp_path: Path,
+    tool_context,
+    surface: PlannerSurface,
+) -> None:
+    engine, service, _ = quota_service
+    session = await service.create_session(user_id="alice", title="Planner quota", auth_provider_type="local")
+    secret = "UPSTREAM-RESPONSE-BODY-SECRET"
+
+    class AdmittedCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> Any:
+            await admit_provider_attempt(model=kwargs["model"])
+            return await super().__call__(**kwargs)
+
+    script = AdmittedCompletion(
+        _response(("list_sources", {})),
+        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+    )
+
+    recorder = BufferingRecorder()
+    origin = dataclasses.replace(_origin(), session_id=str(session.id), user_id="alice")
+
+    async with await _lease(service, session.id) as lease:
+        custody = dataclasses.replace(
+            _custody(tmp_path),
+            session_engine=engine,
+            session_operation_context=lease.context,
+            session_operation_authority=service.session_operation_authority,
+        )
+        with composer_quota_scope(service, lease.context), pytest.raises(ChargeableAdmissionRefused) as caught:
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=script,
+                recorder=recorder,
+                model_overrides={"max_api_attempts": 2},
+                originating_message=origin,
+                custody_config=custody,
+                surface=surface,
+            )
+
+    assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+    assert len(script.requests) == 2
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.API_ERROR]
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+    assert recorder.llm_calls[1].error_class == "ServiceUnavailableError"
+    assert secret not in repr(recorder.llm_calls)
+    with engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table).order_by(quota_provider_attempts_table.c.started_at)).all()
+        usage = connection.execute(select(token_usage_ledger_table).order_by(token_usage_ledger_table.c.recorded_at)).all()
+    assert len(attempts) == len(usage) == 2
+    assert all(attempt.settled_at is not None for attempt in attempts)
+    assert [call.call_id for call in recorder.llm_calls] == [attempt.attempt_id for attempt in attempts]
+    assert usage[1].prompt_tokens is None and usage[1].completion_tokens is None
+
+    # The settled unknown usage remains authoritative for a fresh operation.
+    async with await _lease(service, session.id) as fresh:
+        fresh_custody = dataclasses.replace(custody, session_operation_context=fresh.context)
+        with composer_quota_scope(service, fresh.context), pytest.raises(ChargeableAdmissionRefused) as fresh_caught:
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=script,
+                recorder=BufferingRecorder(),
+                model_overrides={"max_api_attempts": 2},
+                originating_message=origin,
+                custody_config=fresh_custody,
+                surface=surface,
+            )
+    assert fresh_caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+    assert len(script.requests) == 2
 
 
 @pytest.mark.asyncio

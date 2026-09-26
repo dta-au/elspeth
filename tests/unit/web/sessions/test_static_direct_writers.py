@@ -2085,6 +2085,16 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
     ReviewedWriter(
+        path="tests/testcontainer/web/test_quota_authority_postgres.py",
+        enclosing_symbol="test_undispatched_cancellation_is_atomic_and_idempotent_on_postgres.append_event",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "PostgreSQL quota authority fixture inserts the exact cancellation audit event requested by the "
+            "low-level callback so the transaction, timestamp, replay, and conflict checks run on the production dialect."
+        ),
+    ),
+    ReviewedWriter(
         path="tests/integration/web/composer/guided/test_respond.py",
         enclosing_symbol="TestStep2IntraStep.test_component_back_edit_rejects_proposal_base_bound_to_older_head_atomically",
         table="composition_states",

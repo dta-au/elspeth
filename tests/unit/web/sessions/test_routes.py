@@ -854,6 +854,8 @@ def _make_app(
     tmp_path: Path,
     user_id: str = "alice",
     max_upload_bytes: int = 10 * 1024 * 1024,
+    *,
+    quota_enabled: bool = False,
 ) -> tuple[FastAPI, SessionServiceImpl]:
     """Create a test app with session routes and a mock auth user."""
     engine = create_session_engine(
@@ -864,11 +866,25 @@ def _make_app(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=user_id)
+        if quota_enabled:
+            from tests.helpers.fenced_session import seed_token_policies
+
+            seed_token_policies(conn, identity_id=user_id)
     telemetry = build_sessions_telemetry()
+    chargeable_admission_policy = None
+    if quota_enabled:
+        from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
+        from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
+
+        chargeable_admission_policy = ChargeableAdmissionPolicy(
+            identity_token_quota_configured=True,
+            secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash,
+        )
     service = DualFencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
+        chargeable_admission_policy=chargeable_admission_policy,
     )
 
     app = FastAPI()
@@ -6354,6 +6370,179 @@ class TestLiteLLMErrorRedaction:
         )
         exc.__cause__ = RuntimeError(f"upstream: {self._CANARY_CAUSE}")
         return exc
+
+    @pytest.mark.parametrize("route", ("messages", "recompose"))
+    @pytest.mark.parametrize("error_class", ("BadGatewayError", "ServiceUnavailableError", "Timeout"))
+    @pytest.mark.parametrize("expose_provider_errors", (False, True))
+    def test_gateway_error_has_safe_failed_progress_and_one_audit(
+        self, tmp_path, caplog, route: str, error_class: str, expose_provider_errors: bool
+    ) -> None:
+        from litellm.exceptions import BadGatewayError, ServiceUnavailableError, Timeout
+
+        classes = {"BadGatewayError": BadGatewayError, "ServiceUnavailableError": ServiceUnavailableError, "Timeout": Timeout}
+        exc = classes[error_class](message=self._canary_message(), llm_provider=self._CANARY_PROVIDER, model=self._CANARY_MODEL)
+        exc.__cause__ = RuntimeError(f"upstream: {self._CANARY_CAUSE}")
+        cast(Any, exc).llm_calls = (
+            _llm_call(
+                status=ComposerLLMCallStatus.TIMEOUT if error_class == "Timeout" else ComposerLLMCallStatus.API_ERROR,
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+                provider_request_id=None,
+                error_class=error_class,
+                error_message=error_class,
+            ),
+        )
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=exc)
+        app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(update={"composer_expose_provider_errors": expose_provider_errors})
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(created.json()["id"])
+        if route == "recompose":
+            asyncio.run(service.add_message(session_id, "user", "Hello", writer_principal="route_user_message"))
+            response = client.post(f"/api/sessions/{session_id}/recompose")
+        else:
+            response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+
+        assert response.status_code == (504 if error_class == "Timeout" else 502)
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "llm_unavailable"
+        assert detail["detail"] == error_class
+        assert "retry" in detail["guidance"].lower()
+        assert "provider_detail" not in detail
+        progress = asyncio.run(app.state.composer_progress_registry.get_latest(str(session_id)))
+        assert progress.phase == "failed"
+        assert progress.reason == "provider_unavailable"
+        records = asyncio.run(service.get_messages(session_id, limit=None))
+        llm_rows = _llm_call_audit_rows(records)
+        assert len(llm_rows) == 1
+        assert llm_rows[0][1]["call"]["error_class"] == error_class
+        assert not any(record.role == "assistant" for record in records)
+        for _, canary in self._all_canaries():
+            assert canary not in response.text
+            assert canary not in str(progress)
+            assert canary not in str(llm_rows)
+            assert canary not in caplog.text
+
+    @pytest.mark.parametrize("route", ("messages", "recompose"))
+    def test_accounting_refusal_after_failed_attempt_is_not_reported_as_provider_failure(self, tmp_path, route: str) -> None:
+        from elspeth.contracts.chargeable_admission import (
+            AdmissionPolicyEvidence,
+            AdmissionRefusalReason,
+            ChargeableAdmissionDecision,
+            ChargeableAdmissionRefused,
+            QuotaDisposition,
+        )
+
+        decision = ChargeableAdmissionDecision(
+            evidence=AdmissionPolicyEvidence(
+                identity_policy_id="test-token-policy",
+                quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE,
+                secret_wiring_hash="0" * 64,
+            ),
+            refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
+        )
+        exc = ChargeableAdmissionRefused(decision)
+        cast(Any, exc).llm_calls = (
+            _llm_call(
+                status=ComposerLLMCallStatus.API_ERROR,
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+                provider_request_id=None,
+                error_class="ServiceUnavailableError",
+                error_message="ServiceUnavailableError",
+            ),
+        )
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=exc)
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(created.json()["id"])
+        if route == "recompose":
+            asyncio.run(service.add_message(session_id, "user", "Hello", writer_principal="route_user_message"))
+            response = client.post(f"/api/sessions/{session_id}/recompose")
+        else:
+            response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["failure_code"] == "token_accounting_unavailable"
+        assert "administrator" in detail["guidance"]
+        assert "provider failed" not in detail["detail"].lower()
+        progress = asyncio.run(app.state.composer_progress_registry.get_latest(str(session_id)))
+        assert progress.phase == "failed"
+        assert progress.reason == "accounting_unavailable"
+        assert "accounting" in progress.headline.lower()
+        records = asyncio.run(service.get_messages(session_id, limit=None))
+        assert len(_llm_call_audit_rows(records)) == 1
+        assert not any(record.role == "assistant" for record in records)
+
+    def test_ordinary_retry_respects_real_quota_after_503(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A settled unknown-use call blocks a physical retry at the public route."""
+        from litellm.exceptions import ServiceUnavailableError
+        from sqlalchemy import select
+
+        from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
+
+        secret = "UPSTREAM-RESPONSE-BODY-SECRET"
+        physical_calls = 0
+
+        async def unavailable_provider(**_kwargs: Any) -> None:
+            nonlocal physical_calls
+            physical_calls += 1
+            raise ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner")
+
+        monkeypatch.setattr("litellm.acompletion", unavailable_provider)
+        monkeypatch.setattr("elspeth.web.composer.service._LLM_API_RETRY_BASE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        )
+        app, service = _make_app(tmp_path, quota_enabled=True)
+        app.state.settings = app.state.settings.model_copy(update={"composer_model": "test/planner", "composer_boot_probe_enabled": False})
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings,
+            sessions_service=service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=app.state.plugin_snapshot_factory,
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Ordinary retry quota"})
+        assert created.status_code == 201
+        session_id = uuid.UUID(created.json()["id"])
+
+        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["failure_code"] == "token_accounting_unavailable"
+        assert secret not in response.text
+        assert physical_calls == 1
+        progress = asyncio.run(app.state.composer_progress_registry.get_latest(str(session_id)))
+        assert progress.phase == "failed"
+        assert progress.reason == "accounting_unavailable"
+        assert secret not in str(progress)
+        records = asyncio.run(service.get_messages(session_id, limit=None))
+        audit_rows = _llm_call_audit_rows(records)
+        assert len(audit_rows) == 1
+        assert audit_rows[0][1]["call"]["error_class"] == "ServiceUnavailableError"
+        assert secret not in str(audit_rows)
+        assert not any(record.role == "assistant" for record in records)
+        with service._engine.connect() as connection:
+            attempts = connection.execute(select(quota_provider_attempts_table)).all()
+            usage = connection.execute(select(token_usage_ledger_table)).all()
+        assert len(attempts) == len(usage) == 1
+        assert attempts[0].settled_at is not None
+        assert usage[0].prompt_tokens is None and usage[0].completion_tokens is None
 
     def _make_bad_request_error(self) -> Exception:
         from elspeth.web.composer.service import _BadRequestLLMError
@@ -16290,3 +16479,140 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
     snapshot = await app.state.composer_progress_registry.get_latest(str(service.session.id))
     assert snapshot.phase == "cancelled"
     assert snapshot.reason == "client_cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_write", ("audit", "progress"))
+async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_path, monkeypatch, blocked_write: str) -> None:
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.models import session_operation_fences_table
+    from elspeth.web.sessions.routes.composer import compose as compose_module
+
+    app, service = _make_progress_route_app(tmp_path)
+    await service.add_message(service.session.id, "user", "Retry", writer_principal="route_user_message")
+    llm_call = _llm_call(
+        status=ComposerLLMCallStatus.CANCELLED,
+        model_returned=None,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        provider_request_id=None,
+        error_class="CancelledError",
+        error_message="CancelledError",
+    )
+    cancelled = _cancelled_error_with_llm_call(llm_call)
+    cancelled.args = ("original composer cancellation",)
+
+    class _CancellingComposer:
+        async def compose(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise cancelled
+
+    app.state.composer_service = _CancellingComposer()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    if blocked_write == "audit":
+        real_write = compose_module._persist_llm_calls
+
+        async def paused_write(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            result = await real_write(*args, **kwargs)
+            completed.set()
+            return result
+
+        monkeypatch.setattr(compose_module, "_persist_llm_calls", paused_write)
+    else:
+        real_publish = compose_module._publish_progress
+
+        async def paused_publish(*args, **kwargs):
+            event = kwargs["event"]
+            if event.phase == "cancelled":
+                entered.set()
+                await release.wait()
+            result = await real_publish(*args, **kwargs)
+            if event.phase == "cancelled":
+                completed.set()
+            return result
+
+        monkeypatch.setattr(compose_module, "_publish_progress", paused_publish)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request_task = asyncio.create_task(client.post(f"/api/sessions/{service.session.id}/recompose"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            request_task.cancel("repeated shutdown cancellation")
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(request_task), timeout=0.05)
+            assert not request_task.done()
+            with service._engine.connect() as connection:
+                fence = connection.execute(
+                    select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(service.session.id))
+                ).one()
+            assert fence.released_at is None
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError, match="original composer cancellation"):
+            await request_task
+
+    assert completed.is_set()
+    assert len(_llm_call_audit_rows(service.messages)) == 1
+    snapshot = await app.state.composer_progress_registry.get_latest(str(service.session.id))
+    assert snapshot.phase == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("messages", "recompose"))
+@pytest.mark.parametrize("secondary", ("runtime_error", "self_cancel"))
+async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_path, monkeypatch, route: str, secondary: str) -> None:
+    from elspeth.web.sessions.routes import messages as messages_module
+    from elspeth.web.sessions.routes.composer import compose as compose_module
+
+    app, service = _make_progress_route_app(tmp_path)
+    if route == "recompose":
+        await service.add_message(service.session.id, "user", "Retry", writer_principal="route_user_message")
+    original = _cancelled_error_with_llm_call(
+        _llm_call(
+            status=ComposerLLMCallStatus.CANCELLED,
+            model_returned=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            provider_request_id=None,
+            error_class="CancelledError",
+            error_message="CancelledError",
+        )
+    )
+    original.args = ("original composer cancellation",)
+
+    class _CancellingComposer:
+        async def compose(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise original
+
+    async def failing_persist(*args, **kwargs) -> None:
+        del args, kwargs
+        if secondary == "self_cancel":
+            raise asyncio.CancelledError("cleanup self-cancelled")
+        raise RuntimeError("cleanup failed")
+
+    app.state.composer_service = _CancellingComposer()
+    monkeypatch.setattr(messages_module if route == "messages" else compose_module, "_persist_llm_calls", failing_persist)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request = (
+            client.post(f"/api/sessions/{service.session.id}/messages", json={"content": "Hello"})
+            if route == "messages"
+            else client.post(f"/api/sessions/{service.session.id}/recompose")
+        )
+        if secondary == "self_cancel":
+            with pytest.raises(AuditIntegrityError) as caught_integrity:
+                await request
+            assert caught_integrity.value.__cause__ is original
+        else:
+            with pytest.raises(asyncio.CancelledError, match="original composer cancellation") as caught:
+                await request
+            assert caught.value is original
+            assert isinstance(original.__cause__, RuntimeError)
