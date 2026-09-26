@@ -24,6 +24,18 @@
 > Track 2 work is delivered by ADR-012's `CanDropRowsContract`; zero-emission
 > governance is owned there, not by the carve-out recorded below.
 
+> **Implementation note (2026-09-26, elspeth-5887fb7928 S4).** §Batch-mode
+> semantics below says "buffered input contracts" and "input token's contract
+> fields". Both batch modes now derive each buffered token's input fields with
+> `derive_effective_input_fields`, the helper the single-token path has used
+> since `08b6d4e27`: the fields the token's contract declares AND its payload
+> carries. Before this note the flush site read the contract alone, so a
+> batch mixing rows with and without an optional field (the source records it
+> `required: false`) counted that field as an input of the row that lacked
+> it. `batch_replicate` then aborted the run with a Tier-1
+> `PassThroughContractViolation` for a field it never received. A field a
+> row carries and the transform drops still raises.
+
 ## Context
 
 ADR-007 (pass-through contract propagation) and ADR-008 (runtime contract cross-check) shipped as a partial landing. Two limitations were documented at landing time and are now closed:

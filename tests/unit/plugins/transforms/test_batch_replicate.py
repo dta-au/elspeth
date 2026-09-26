@@ -766,3 +766,41 @@ class TestBatchReplicateContractPreservation:
         copy_idx_field = result.rows[0].contract.get_field("copy_index")
         assert copy_idx_field is not None
         assert copy_idx_field.python_type is int
+
+    def test_mixed_batch_keeps_the_optional_copies_field_optional(self, ctx: PluginContext) -> None:
+        """A row without copies_field shares the source's contract, where copies is optional.
+
+        An observed source records every field ``required=False`` and hands
+        that one contract to every row, whether or not the row carries the
+        field. The replica of a row without ``copies`` carries no ``copies``,
+        and the emitted contract says so truthfully: the field stays optional.
+        The pass-through cross-check therefore has nothing to object to
+        (elspeth-5887fb7928 S4; the engine half is in
+        ``tests/unit/engine/test_cross_check_flush_output.py``).
+        """
+        from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        transform = BatchReplicate({"schema": DYNAMIC_SCHEMA, "copies_field": "copies", "default_copies": 1})
+        source_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+                FieldContract(normalized_name="copies", original_name="copies", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        rows = [PipelineRow({"id": 1, "copies": 2}, source_contract), PipelineRow({"id": 2}, source_contract)]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert [row.to_dict() for row in result.rows] == [
+            {"id": 1, "copies": 2, "copy_index": 0},
+            {"id": 1, "copies": 2, "copy_index": 1},
+            {"id": 2, "copy_index": 0},
+        ]
+        copies_field = result.rows[0].contract.get_field("copies")
+        assert copies_field is not None
+        assert copies_field.required is False

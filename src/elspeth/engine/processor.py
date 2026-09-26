@@ -117,6 +117,7 @@ from elspeth.contracts.declaration_contracts import (
     BoundaryInputs,
     BoundaryOutputs,
     DeclarationContractViolation,
+    derive_effective_input_fields,
 )
 from elspeth.contracts.enums import (
     FrameKind,
@@ -1383,13 +1384,20 @@ class RowProcessor:
 
         - **PASSTHROUGH mode (1:1).** Each output token pairs with exactly one
           input token. The cross-check walks pairs and uses that specific
-          input token's contract fields as ``input_fields``. A heterogeneous
-          batch is not a hazard — each pair is checked independently.
+          input token's effective input fields as ``input_fields``. A
+          heterogeneous batch is not a hazard — each pair is checked
+          independently.
         - **TRANSFORM mode (N:M, batch-homogeneous).** Every output row is
-          checked against the intersection of all buffered input contracts
-          (ADR-007 table line 53). This is the weakest shared guarantee — a
-          transform claiming ``passes_through_input=True`` must preserve what
-          every input contributed.
+          checked against the intersection of all buffered tokens' effective
+          input fields (ADR-007 table line 53). This is the weakest shared
+          guarantee — a transform claiming ``passes_through_input=True`` must
+          preserve what every input contributed.
+
+        A token's effective input fields come from
+        ``derive_effective_input_fields``, the helper the single-token path
+        uses: the fields its contract declares AND its payload carries. An
+        optional field a row does not carry is not an input the transform could
+        have dropped, so a batch mixing rows with and without it is honest.
 
         Called BEFORE ``_emit_transform_completed`` and the routing methods
         (§2.5): a failed cross-check must not follow a COMPLETED or
@@ -1429,9 +1437,11 @@ class RowProcessor:
                         "Framework invariant violated."
                     )
 
-            per_input_field_sets = [
-                frozenset(fc.normalized_name for fc in token.row_data.contract.fields) for token in fctx.buffered_tokens
-            ]
+            # A buffered token's input fields are the ones its contract declares
+            # AND its payload carries — the single-token path's derivation, not
+            # the contract alone. An optional field the row does not carry is
+            # not an input the transform can drop (elspeth-5887fb7928 S4).
+            per_input_field_sets = [derive_effective_input_fields(token.row_data) for token in fctx.buffered_tokens]
 
             static_contract = fctx.transform.effective_static_contract()
 

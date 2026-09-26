@@ -26,6 +26,13 @@
 > Tukey upper fence (`q3 + 3×IQR`) ≤ 50 µs. This note reports current
 > enforcement without rewriting the criterion accepted in this ADR.
 
+> **Current implementation note (2026-09-26).** §Decision step 1's
+> `input_fields = frozenset(input_row.contract.fields)` has not been the
+> derivation since `08b6d4e27`. `derive_effective_input_fields` takes the
+> contract fields the input row's payload carries, so an optional field the
+> row lacks is not an input. The batch-flush site uses the same helper (see
+> ADR-009's 2026-09-26 note).
+
 ## Context
 
 ADR-007 establishes opt-in propagation declared via `BaseTransform.passes_through_input`. Static DAG analysis now trusts that declaration — the validator walks through annotated transforms and propagates predecessor guarantees downstream, mirroring runtime behaviour.

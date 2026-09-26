@@ -293,8 +293,9 @@ class BatchFlushInputs:
     timeout flushes — the caller computes this choice and passes it in).
 
     ``effective_input_fields`` is the INTERSECTION across every buffered
-    token's contract — the weakest shared guarantee. Caller computes this
-    once; contracts use it directly.
+    token's ``derive_effective_input_fields`` (the fields its contract
+    declares AND its payload carries) — the weakest shared guarantee. Caller
+    computes this once; contracts use it directly.
     """
 
     plugin: Any

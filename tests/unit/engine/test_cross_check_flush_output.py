@@ -253,6 +253,103 @@ class TestTransformModeIntersection:
         assert "x" in exc_info.value.divergence_set
 
 
+class TestOptionalFieldAbsentFromPayload:
+    """A buffered token's input fields are the contract fields its payload carries.
+
+    An observed source records every field ``required: false``, and a row that
+    lacks one still carries the source's contract. The flush cross-check must
+    derive input fields as the single-token path does
+    (``derive_effective_input_fields``): an optional field the row does not
+    carry is not an input the transform can drop. A field the row DOES carry
+    and the transform drops is still a violation, required or not.
+    """
+
+    def test_transform_mode_mixed_batch_without_optional_field_is_honest(self) -> None:
+        processor = _make_processor()
+        # The source's contract: both fields optional (``required=False``).
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2}, contract),
+        ]
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # Each emitted row is a copy of its own input: t1's copy has no 'n'.
+        rows = [
+            PipelineRow({"id": 1, "n": 2}, contract),
+            PipelineRow({"id": 1, "n": 2}, contract),
+            PipelineRow({"id": 2}, contract),
+        ]
+        result = TransformResult.success_multi(rows, success_reason={"action": "replicate"})
+        processor._cross_check_flush_output(fctx, result)
+
+    def test_transform_mode_dropping_a_carried_optional_field_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # Every input carried 'n'; the output drops it from payload and contract.
+        reduced = make_contract({"id": 1})
+        rows = [PipelineRow({"id": 1}, reduced), PipelineRow({"id": 2}, reduced)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-carried-optional"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+
+    def test_transform_mode_dropping_a_required_field_from_the_payload_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = _make_contract({"id": int, "n": int})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # The payload-side vector: the contract still names 'n', the payload lost it.
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-required-payload"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+
+    def test_passthrough_mode_row_without_optional_field_is_honest(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2}, contract),
+        ]
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.PASSTHROUGH)
+        rows = [PipelineRow({"id": 1, "n": 2}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "annotate"})
+        processor._cross_check_flush_output(fctx, result)
+
+    def test_passthrough_mode_dropping_a_carried_optional_field_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.PASSTHROUGH)
+        # t1 carried 'n'; its paired output lost it.
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-paired-optional"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+        assert exc_info.value.token_id == "t1"
+
+
 class TestEmptyEmissionGovernance:
     @pytest.mark.parametrize(
         ("output_mode", "can_drop_rows"),

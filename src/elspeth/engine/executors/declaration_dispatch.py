@@ -216,7 +216,8 @@ def run_batch_flush_checks(
     Called from ``RowProcessor._cross_check_flush_output`` for TRANSFORM
     mode (ADR-009 §Clause 2 batch-homogeneous semantics). The caller
     supplies ``effective_input_fields`` pre-computed as the intersection of
-    every buffered token's contract fields.
+    every buffered token's ``derive_effective_input_fields`` (contract fields
+    the payload carries).
     """
     _dispatch(
         site=DispatchSite.BATCH_FLUSH,

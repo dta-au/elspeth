@@ -147,6 +147,14 @@ drained and repair this release forward.
   disagrees with its group's verdict is refused as audit corruption. A
   collector plugin's returned error is now scrubbed and stored structurally
   on the flush state, as the aggregation seam already did.
+- **A batch mixing rows with and without an optional field no longer ends
+  the run.** A `batch_replicate` batch where some rows carry `copies_field`
+  and others do not (each of those uses `default_copies`) used to end the run
+  with a `PassThroughContractViolation` for a field the plugin never
+  received. The aggregation flush's pass-through check now takes each
+  buffered row's input fields as the single-row check always has: the fields
+  its contract declares and its payload carries. A transform that drops a
+  field its rows did carry still ends the run.
 - **VANguard identity residual.** Configured administrator seeding is consumed
   permanently, authentication audit reuses an application-owned engine, and
   authority withdrawal revokes awaiting approvals and refuses new execution.

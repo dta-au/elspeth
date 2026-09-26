@@ -189,8 +189,9 @@ class PassThroughDeclarationContract(DeclarationContract):
         """Batch-flush TRANSFORM mode (ADR-009 §Clause 2).
 
         ``inputs.effective_input_fields`` is the caller-computed INTERSECTION
-        of every buffered token's contract — the weakest shared guarantee
-        every emitted row must preserve.
+        of every buffered token's effective input fields (contract fields the
+        payload carries) — the weakest shared guarantee every emitted row
+        must preserve.
         """
         transform_node_id = inputs.plugin.node_id
         if transform_node_id is None:
