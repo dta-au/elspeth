@@ -32,6 +32,16 @@ from elspeth.core.dag.wiring import WiredTransform
 class MockTransformWithSchemaConfig:
     """Mock transform with computed _output_schema_config attribute."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     name = "mock_transform_with_schema"
     input_schema = None
     output_schema = None
@@ -59,6 +69,16 @@ class MockTransformWithSchemaConfig:
 
 class MockTransformWithoutSchemaConfig:
     """Mock transform without _output_schema_config attribute."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     name = "mock_transform_no_schema"
     input_schema = None
@@ -105,6 +125,11 @@ class MockFixedSource(MockSource):
 class MockSink:
     """Mock sink plugin."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     name = "mock_sink"
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
@@ -117,6 +142,11 @@ class MockSink:
 
 class MockSinkWithSchema:
     """Mock sink plugin with schema config."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
 
     name = "mock_sink_schema"
     input_schema = None
@@ -451,6 +481,16 @@ class TestGuaranteedFieldsWithSchemaConfig:
 
 class MockAggregationTransform:
     """Mock transform for aggregation with _output_schema_config."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     name = "mock_agg_transform"
     input_schema = None
@@ -1020,6 +1060,16 @@ class TestPassThroughNodesUseTypedSchema:
 
 class _ConfigurableTransform:
     """Mock transform with per-instance guaranteed_fields for schema tests."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None

@@ -832,6 +832,40 @@ schema:
 
 The DAG validates at construction time that upstream `guaranteed_fields` satisfy downstream `required_fields`. For explicit schemas (`mode: fixed` or `flexible`), declared fields are implicitly guaranteed.
 
+### Field names in declarations
+
+Every source normalizes its external headers to lowercase identifiers: spaces
+and punctuation become `_`, a leading digit gains a `_` prefix and a Python
+keyword a `_` suffix (`Name` → `name`, `First Name` → `first_name`, `class` →
+`class_`). Rows are keyed by that normalized name; a source `field_mapping`
+value is used as written.
+
+A row LOOKUP resolves either spelling: an expression or template reading
+`row['First Name']`, and a `field_mapper` mapping source, find `first_name`.
+A DECLARATION does not. A name a node commits to before any row exists — a
+transform, aggregation or sink `schema` field, `required_fields`,
+`required_input_fields`, a column option such as `url_field`, `query_field`,
+`blob_ref_field`, `value_field` or `group_by`, a `type_coerce` conversion's
+`field`, a sink's custom `headers` key or dataverse `field_mapping` key, and a
+created name such as a `value_transform` target or a `field_mapper` rename
+target — must use the name rows carry. A declaration spelled by the header of
+a field the row carries is refused with the source's remedy (`headers are
+normalized to lowercase identifiers ('Name' -> 'name'). Declare 'name'`):
+
+- at `elspeth validate` / build time wherever the upstream's declared schema
+  proves it (a read needs a `fixed` upstream; a created name any upstream that
+  declares its fields);
+- otherwise per row: a transform or aggregation routes every such row to
+  `on_error` with the reason `declared_field_is_header_spelling` (a read) or
+  `target_is_header_spelling` (a created name), naming only the configured
+  spelling and its normalized form; a sink, whose seam routes no contract
+  violation, ends the run with every token's outcome recorded.
+
+A created name that is not a spelling of an arriving field (`Total`, or
+`sci__rag_context` from an upstream `rag_retrieval`) is unaffected, and so is
+a rename that removes the field it respells (`field_mapper` `{name: Name}`
+restores the header as the key).
+
 ---
 
 ## Queue Settings

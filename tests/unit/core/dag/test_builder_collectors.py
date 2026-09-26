@@ -27,6 +27,12 @@ class _Source:
 
 class _Sink:
     name = "out"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -38,6 +44,16 @@ class _Sink:
 
 class _MultiRowTransform:
     """Stub multi-row transform (creates_tokens=True) — a scope opener."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None
@@ -65,6 +81,16 @@ class _MultiRowTransform:
 class _BatchTransform:
     """Stub batch-aware transform — the collector plugin."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     input_schema = None
     output_schema = None
     creates_tokens = False
@@ -87,6 +113,16 @@ class _BatchTransform:
 
 class _PlainTransform:
     """Stub plain transform for per-branch fork chains (not a scope opener/closer)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None

@@ -35,7 +35,7 @@ _ROUTE_LINE = re.compile(r"^ {2}(\d+)\. ", re.MULTILINE)
 
 
 def _verdict() -> str:
-    return _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}))
+    return _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}), frozenset())
 
 
 def _dataclass_field_names(cls: type) -> frozenset[str]:
@@ -118,7 +118,7 @@ class TestTheVerdictStillStatesTheContractAndTheSymptom:
         key on "does not guarantee them" and on the sink/upstream naming, so a
         rewrite that improved only the tail would break them from a distance.
         """
-        verdict = _sink_required_violation_message("json", "coalesce_merge_b_99", frozenset({"id", "value"}))
+        verdict = _sink_required_violation_message("json", "coalesce_merge_b_99", frozenset({"id", "value"}), frozenset())
 
         assert re.search(
             r"Sink 'json' requires fields \['id', 'value'\].*upstream 'coalesce_merge_b_99' does not guarantee them",
@@ -132,4 +132,4 @@ class TestTheVerdictStillStatesTheContractAndTheSymptom:
         identically, so a graph tripping BOTH rules reads the same as one
         tripping only this rule.
         """
-        assert _verdict() == _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}))
+        assert _verdict() == _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}), frozenset())

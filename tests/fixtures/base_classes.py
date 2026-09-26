@@ -180,6 +180,11 @@ class _TestSinkBase(SinkEffectContract):
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
     effect_mode_remediation: str | None = None
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """SinkProtocol's field-name spelling surface, modelled as BaseSink computes it."""
+        return frozenset(self.input_schema.model_fields) | self.declared_required_fields
+
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}
         self._diversion_log: list[Any] = []

@@ -444,9 +444,16 @@ class TestTypeCoerceBehavior:
         assert result.success_reason is not None
         assert "quantity" in result.success_reason["metadata"]["fields_unchanged"]
 
-    def test_missing_field_errors(self, ctx: "PluginContext") -> None:
+    def test_a_conversion_field_is_a_declared_input(self) -> None:
+        """Presence is the engine's contract, not process()'s (field-name spelling rule, 2026-09-25).
+
+        The conversion field is projected onto ``declared_input_fields``, so a
+        row without it is refused by ADR-013's pre-emission check (and at build
+        against a closed upstream) before ``process()`` runs; the in-plugin
+        ``missing_field`` branch that used to answer it is gone. The CLI proof
+        is ``tests/integration/pipeline/test_field_name_spelling_rule.py``.
+        """
         from elspeth.plugins.transforms.type_coerce import TypeCoerce
-        from elspeth.testing import make_pipeline_row
 
         transform = TypeCoerce(
             {
@@ -454,12 +461,7 @@ class TestTypeCoerceBehavior:
                 "conversions": [{"field": "missing", "to": "int"}],
             }
         )
-        row = make_pipeline_row({"other": 42})
-        result = transform.process(row, ctx)
-        assert result.status == "error"
-        assert result.reason is not None
-        assert result.reason["reason"] == "missing_field"
-        assert result.reason["field"] == "missing"
+        assert transform.declared_input_fields == frozenset({"missing"})
 
     def test_conversion_failure_errors(self, ctx: "PluginContext") -> None:
         from elspeth.plugins.transforms.type_coerce import TypeCoerce

@@ -50,6 +50,14 @@ fault and Tier 1, and ADR-013 scopes it to single-row transforms.
 The message names the row index, field and error type, never the row VALUE
 (``contracts.safe_validation_errors``): it becomes the routed reason. An absent
 field is named from the transform's CONFIG, never from the row's own keys.
+
+Before presence, the input check applies the field-name spelling rule's runtime
+residual (operator ruling 2026-09-25): a declared read spelled by the header of
+a field the buffered row carries fails the batch with
+``HeaderSpelledDeclarationViolation`` (a ``PluginContractViolation``, routed the
+same way), naming only the config literal and its canonical form. The build
+refuses the same declaration wherever a participating, closed upstream proves
+it; this settles an abstaining or open one.
 """
 
 from __future__ import annotations
@@ -59,7 +67,8 @@ from collections.abc import Sequence
 from pydantic import ValidationError
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
-from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.errors import HeaderSpelledDeclarationViolation, PluginContractViolation
+from elspeth.contracts.field_spelling import header_spelled_row_declarations
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.engine.executors.declared_output_types import verify_created_output_types
 
@@ -87,7 +96,26 @@ def validate_batch_inputs(
             declares required, or fails the declared input schema.
     """
     required = transform.schema_required_input_fields()
+    declared_reads = transform.declared_read_fields
     for idx, row in enumerate(rows):
+        # The field-name spelling rule's runtime residual, checked before the
+        # presence check below: ``in`` on a PipelineRow resolves a header
+        # spelling to the field it names, so a header-spelled ``group_by`` or
+        # ``value_field`` passes presence while the plugin keys its output by
+        # the literal. Created names are not checked at a batch seam: its
+        # output does not carry the buffered rows forward (the build's
+        # TRANSFORM-only scope, elspeth-cfcd333f83).
+        spellings = header_spelled_row_declarations(
+            reads=declared_reads,
+            creates=(),
+            row_keys=frozenset(row.to_dict()),
+            forwarded_keys=(),
+        )
+        if spellings:
+            raise HeaderSpelledDeclarationViolation(
+                component=f"{node_kind} transform '{transform.name}' (buffered row {idx})",
+                spellings=spellings,
+            )
         # ``in`` on a PipelineRow resolves original and normalized names exactly
         # as ``row[field]`` does, so a field reported present here cannot raise
         # KeyError inside the plugin.

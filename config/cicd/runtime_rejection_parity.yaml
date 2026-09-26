@@ -3272,6 +3272,16 @@ sites:
     constructed, and composer names are capped at 38 by core/config.py:75 _MAX_NODE_NAME_LENGTH. Probed
     a 60-char node id: Stage 1 red (node_id_invalid, state.py:5142), Stage 2 red at ElspethSettings, no
     GraphValidationError at all.'
+- key: 9393bc1b6aca40c5
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_created_fields is only meaningful for TRANSFORM nodes; node {} has type {}
+    with declared_created_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_created_fields is written only on the builder's transform path (builder.py, from TransformProtocol.declared_created_fields);
+    add_node defaults it to frozenset(). elspeth-5887fb7928 field-name spelling rule.
 - key: 93e547da47bf8cce
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3293,6 +3303,17 @@ sites:
   disposition: structural
   note: declared_output_fields is written only at builder.py:403 (transform path) and defaults to frozenset()
     in add_node (graph.py:138); the node type is fixed by the same builder branch.
+- key: 6370619955bb948f
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_read_fields is only meaningful for TRANSFORM, AGGREGATION, COLLECTOR or SINK
+    nodes; node {} has type {} with declared_read_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_read_fields is written only on the builder's transform, aggregation, collector and sink
+    paths (builder.py, from the plugin's declared_read_fields); add_node defaults it to frozenset(). elspeth-5887fb7928
+    field-name spelling rule.
 - key: 0c238cf34e2c8f4e
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3533,6 +3554,27 @@ sites:
     Two reachability attempts on the residue failed: fixed-mode disjoint branches trip the branch-chain
     edge check first, flexible-mode disjoint branches are green at both stages. Same shadow basis as the
     mixed-mode sibling at schema_validation.py:900.'
+- key: c05f5995a52215ae
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_declared_field_spellings
+  exception: GraphValidationError
+  message: 'Field name header spelling: {} ''{}'' (node ''{}'') declares field names its upstream ''{}''
+    carries under their canonical spelling: {}. {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - field_name_header_spelling
+  note: 'elspeth-5887fb7928 field-name spelling rule (operator ruling 2026-09-25, 2026-09-26 Q4 amendment).
+    Stage 1 Rule S (_check_schema_contracts) makes the SAME call as this validator, contracts.field_spelling.header_spelled_declarations,
+    on the same plugin-declared surfaces (declared_read_fields / declared_created_fields read off the
+    constructed instance), so the predicate and its participation/closedness gates cannot drift. Pinned
+    end to end by TestComposerRuntimeFieldNameSpellingAgreement (tests/integration/pipeline/test_composer_runtime_agreement.py):
+    transform created name, transform read and sink read rejected by both with the predicate text asserted;
+    controls (new capitalised name, canonical overwrite, observed upstream, open upstream) accepted by
+    both. Two Stage-1 abstentions, Stage 2 (this validator) authoritative there: an AGGREGATION or COLLECTOR
+    consumer (its batch plugin is not probed by Rule S; an aggregation with required_input_fields does
+    not construct and owns its own rejection), and a composition with a node cycle (already pipeline_cycle;
+    the producer vote recurses through pass-through transforms).'
 - key: 31d79a84fe7082c9
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_forgiven_field_ancestor_types
@@ -3588,24 +3630,27 @@ sites:
     controls green. Stage 1 ABSTAINS on fork-branch producers, emitting a warning instead (_walk_producer_entry_to_real_producer,
     state.py ~2703-2793) — probed: a fixed-schema transform on a fork branch is Stage-1 is_valid=True
     and Stage-2 red at schema_validation.py:282.'
-- key: 909faa5921a845ea
+- key: b67957d77d4ffd58
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_single_edge
   exception: EdgeContractError
   message: 'Schema contract violation: edge ''{}'' → ''{}'' Consumer ({}) requires fields: {} Producer
-    ({}) guarantees: {} Missing fields: {} Fix: Either: 1. Add missing fields'
+    ({}) guarantees: {} Missing fields: {} {} Fix: Either: 1. Add missing fie'
   ordinal: 0
   disposition: abstains
   counterpart:
   - schema_contract_violation
-  note: 'Mirrored on the ordinary path and ABSTAINING on fork branches — probed BOTH with controls. Direct:
+  note: 'Re-keyed, not newly introduced: same raise site as 909faa5921a845ea, whose message template gained
+    the field-name spelling rule''s header_spelling_hint line (elspeth-5887fb7928; the line is empty unless
+    a missing name is a header spelling of a guaranteed one). Disposition and evidence carried over unchanged:
+    Mirrored on the ordinary path and ABSTAINING on fork branches — probed BOTH with controls. Direct:
     a consumer declaring required_input_fields [''absent_col''] on a csv source is Stage-1 red (schema_contract_violation,
-    emitted by the contract loop in CompositionState.validate, state.py ~4281) with Stage-2 raise-site
-    schema_validation.py:199. Move that same consumer onto a fork branch and Stage 1 goes is_valid=True
-    with only a WARNING ("Contract check skipped because fork gate ''g'' produces connection ''x''", _walk_producer_entry_to_real_producer,
-    state.py ~2703-2793) while Stage 2 still raises at schema_validation.py:199; both controls green.
-    Probed separately from its Phase-2 sibling because the two Stage-1 mirrors have different gates —
-    only the type mirror is gated on _producer_is_typed_source. elspeth-2ed41f0a4a census 2026-08-17'
+    emitted by the contract loop in CompositionState.validate) with Stage-2 raise-site validate_single_edge.
+    Move that same consumer onto a fork branch and Stage 1 goes is_valid=True with only a WARNING ("Contract
+    check skipped because fork gate ''g'' produces connection ''x''", _walk_producer_entry_to_real_producer)
+    while Stage 2 still raises; both controls green. Probed separately from its Phase-2 sibling because
+    the two Stage-1 mirrors have different gates — only the type mirror is gated on _producer_is_typed_source.
+    elspeth-2ed41f0a4a census 2026-08-17'
 - key: 2cc6ea6e441c400b
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_single_edge

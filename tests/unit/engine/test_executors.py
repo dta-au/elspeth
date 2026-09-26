@@ -375,6 +375,9 @@ def _make_transform(
             "is_batch_aware",
             "_output_schema_config",
             "effective_static_contract",
+            "declared_read_fields",
+            "declared_created_fields",
+            "removed_input_fields",
         ]
     )
     t.name = name
@@ -391,6 +394,12 @@ def _make_transform(
     t.is_batch_aware = is_batch_aware
     t._output_schema_config = None
     t.effective_static_contract.return_value = frozenset()
+    # The field-name spelling surfaces (TransformProtocol): a mock declares its
+    # required inputs as reads and its output fields as created names, as
+    # BaseTransform does, and removes nothing it forwards.
+    t.declared_read_fields = t.declared_input_fields
+    t.declared_created_fields = t.declared_output_fields
+    t.removed_input_fields = frozenset()
     return t
 
 
@@ -433,6 +442,11 @@ class _AggregationTransformDouble:
         # value check reads it. None declares no output contract to enforce.
         self._output_schema_config: SchemaConfig | None = None
         self.process = _CallRecorder()
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol spelling surface: this fake declares its required input columns only.
+        return self.schema_required_input_fields()
 
     def schema_required_input_fields(self) -> frozenset[str]:
         # Declares no required column, so the flush preflight's presence check passes every row.
@@ -4170,6 +4184,11 @@ class TestAggregationExecutor:
         class _CapturingBatchTransform:
             """Tiny batch-aware transform that snapshots ctx.aggregation_batch."""
 
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # BatchTransformProtocol spelling surface: this fake declares its required input columns only.
+                return self.schema_required_input_fields()
+
             name = "capturing_agg"
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
@@ -4318,6 +4337,12 @@ class TestAggregationExecutor:
 
         class _CapturingBatchTransform:
             name = "capturing_agg"
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # BatchTransformProtocol spelling surface: this fake declares its required input columns only.
+                return self.schema_required_input_fields()
+
             input_schema = _PermissiveSchema
             output_schema = _PermissiveSchema
             _output_schema_config: SchemaConfig | None = None
@@ -6499,6 +6524,17 @@ class TestTransformExecutorBatchPath:
 
         class _FakeBatchTransform(BatchTransformMixin):
             is_batch_aware = False
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+                return frozenset(self.declared_input_fields)
+
+            @property
+            def declared_created_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+                return frozenset(self.declared_output_fields)
+
             output_schema = _PermissiveSchema
 
             def __init__(self) -> None:
@@ -6514,6 +6550,8 @@ class TestTransformExecutorBatchPath:
                 self._pool_size = pool_size
                 self._batch_wait_timeout = batch_wait_timeout
                 self.passes_through_input = False
+                self.forwards_input_fields = False
+                self.removed_input_fields = frozenset()
                 self.can_drop_rows = False
                 self._output_schema_config = None
                 self.accept = _CallRecorder()

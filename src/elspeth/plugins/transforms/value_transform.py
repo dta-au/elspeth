@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.field_spelling import header_spelling_canonical
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -132,6 +133,32 @@ class ValueTransformConfig(TransformDataConfig):
     def _validate_operations_not_empty(self) -> ValueTransformConfig:
         if not self.operations:
             raise ValueError("operations must contain at least one operation")
+        return self
+
+    @model_validator(mode="after")
+    def _reject_targets_spelling_one_another(self) -> ValueTransformConfig:
+        """Refuse a target that is a header spelling of another target (field-name spelling rule).
+
+        Operations run in order on one working row, so ``target: name`` then
+        ``target: Name`` writes two keys that name one field — the created-name
+        shadow the rule refuses (operator ruling 2026-09-25, 2026-09-26 Q4
+        amendment (c)). A target against the ARRIVING row is settled by the
+        build and the executor preflight, which see upstream; a target against
+        its own node's other targets is decidable from this config alone, so it
+        is refused here, with the same predicate.
+        """
+        targets = frozenset(op.target for op in self.operations)
+        spellings = sorted(
+            (target, canonical) for target in targets if (canonical := header_spelling_canonical(target, targets - {target})) is not None
+        )
+        if spellings:
+            raise ValueError(
+                "; ".join(
+                    f"target '{target}' is a header spelling of target '{canonical}': both would be written as separate "
+                    f"fields of one row. Name both '{canonical}'"
+                    for target, canonical in spellings
+                )
+            )
         return self
 
     def created_before_read_targets(self) -> frozenset[str]:
@@ -335,7 +362,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:89bb2afff7b49a6b"
+    source_file_hash: str | None = "sha256:f645e8e83a012f3f"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (

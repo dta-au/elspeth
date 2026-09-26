@@ -346,6 +346,7 @@ def build_execution_graph(
             input_schema=sink.input_schema,  # SinkProtocol requires this
             output_schema_config=sink_schema_config,
             declared_required_fields=sink.declared_required_fields,
+            declared_read_fields=sink.declared_read_fields,
         )
 
     graph.set_sink_id_map(sink_ids)
@@ -420,6 +421,8 @@ def build_execution_graph(
             declared_output_fields=transform.declared_output_fields,
             declared_input_fields=transform.declared_input_fields,
             declared_string_input_fields=transform.declared_string_input_fields,
+            declared_read_fields=transform.declared_read_fields,
+            declared_created_fields=transform.declared_created_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
@@ -473,6 +476,7 @@ def build_execution_graph(
             input_schema=transform.input_schema,
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
+            declared_read_fields=transform.declared_read_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
@@ -762,6 +766,7 @@ def build_execution_graph(
                 input_schema=transform.input_schema,
                 output_schema=transform.output_schema,
                 output_schema_config=collector_output_schema_config,
+                declared_read_fields=transform.declared_read_fields,
                 passes_through_input=transform.passes_through_input,
                 forwards_input_fields=transform.forwards_input_fields,
                 removed_input_fields=transform.removed_input_fields,

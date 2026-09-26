@@ -94,11 +94,14 @@ rows meet.**
    fields fails; the exemption is never read from the plugin's own output
    config, so a carrying transform cannot drop the operator's declaration
    and exempt itself (S7 fix round 2). A type_coerce conversion field spelled
-   by a source's original header (`Price` for the header of `price`) under a
-   declared schema still ends the run: that is a different root (the plugin
-   keys the conversion's output declaration by the config spelling, while
-   the row resolves it to the normalized name), open pending a ruling on
-   header spellings at runtime. The stamp types only what is emitted: a
+   by a source's original header (`Price` for the header of `price`) used to
+   end the run under a declared schema: the plugin keys the conversion's
+   output declaration by the config spelling while the row resolves it to
+   the normalized name. The field-name spelling rule (operator ruling
+   2026-09-25, `contracts.field_spelling`) closes that root: the conversion
+   field is a declared input, a header spelling of it is refused at build
+   where the upstream proves it and routed per row otherwise, so no
+   header-spelled declaration reaches the stamp. The stamp types only what is emitted: a
    plugin that drops a field its declaration guarantees still ends the run
    (the gate's own control). Every registered transform keeps an `_output_schema_config`,
    and the gate fails one that does not: without it the DAG builder still

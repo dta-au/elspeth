@@ -706,6 +706,12 @@ def _make_mock_transform(
     transform.output_schema = _PermissiveSchema
     transform._output_schema_config = None
     transform.effective_static_contract.return_value = frozenset()
+    # The field-name spelling surfaces (Transform/BatchTransformProtocol): this
+    # mock declares no field names, forwards nothing it removes.
+    transform.declared_read_fields = frozenset()
+    transform.declared_created_fields = frozenset()
+    transform.forwards_input_fields = False
+    transform.removed_input_fields = frozenset()
     if is_batch_aware:
         # No declared required column: the flush preflight's presence check passes every row.
         transform.schema_required_input_fields.return_value = frozenset()

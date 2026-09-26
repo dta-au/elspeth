@@ -597,6 +597,20 @@ where the architectural fix landed:
   row decides (``truncate(row.n)``) still builds and routes per row. Pinned
   by ``TestComposerRuntimeTemplateLiteralAgreement``.
 
+* Shape 31 — a declaration spelled by the source HEADER of a field the rows
+  carry (elspeth-5887fb7928, operator ruling 2026-09-25 "field-name spelling
+  rule"; CLI shapes in the lane's systems-spelling-sweep.md and the Q4
+  specialist probes A-F). A value_transform target ``Name`` over a flexible
+  source guaranteeing ``name`` crashed ``Duplicate original_name`` (header
+  ``Name``) or silently shadowed the field (header ``NAME``); a schema field
+  ``Name: int?`` at a transform or sink was silently inert. The runtime build
+  now refuses every case a participating upstream proves
+  (``validate_declared_field_spellings``) and the composer's Rule S makes the
+  SAME call (``header_spelled_declarations``), so both refuse together and
+  both admit the controls (a new capitalised name, a canonical overwrite, an
+  observed upstream the build cannot see — routed per row at run time).
+  Pinned by ``TestComposerRuntimeFieldNameSpellingAgreement``.
+
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
@@ -7757,3 +7771,151 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         composer_options, runtime_options = self._options(plugin, template)
         assert _prevalidate_transform(plugin, composer_options) is None
         self._runtime(tmp_path, plugin, runtime_options)
+
+
+class TestComposerRuntimeFieldNameSpellingAgreement:
+    """Shape 31 — a header-spelled declaration: both surfaces refuse it together, and admit the controls.
+
+    Bug verification protocol: deleting the Rule S block in
+    ``_check_schema_contracts`` fails every ``test_both_reject_*`` on the
+    composer side (validate GREEN, runtime RED — the soundness violation
+    ADR-040 §2 forbids); making ``header_spelling_canonical`` return None fails
+    them on both sides.
+    """
+
+    @staticmethod
+    def _csv_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "spelling.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ID,Name\n1,Ann\n", encoding="utf-8")
+        return path
+
+    def _source(self, tmp_path: Path, schema: dict[str, Any]) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success="t_in",
+            options={"path": str(self._csv_input(tmp_path)), "schema": schema},
+            on_validation_failure="discard",
+        )
+
+    @staticmethod
+    def _output(tmp_path: Path, schema: dict[str, Any] | None = None) -> OutputSpec:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return OutputSpec(
+            name="main",
+            plugin="json",
+            options={"path": str(out_dir / "out.jsonl"), "format": "jsonl", "schema": schema or {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    @staticmethod
+    def _value_transform(*, target: str, schema: dict[str, Any] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="t",
+            node_type="transform",
+            plugin="value_transform",
+            input="t_in",
+            on_success="main",
+            on_error="discard",
+            options={"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": "row['name']"}]},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _state(
+        self, tmp_path: Path, *, source_schema: dict[str, Any], node: NodeSpec | None, output_schema: dict[str, Any] | None = None
+    ) -> CompositionState:
+        source = self._source(tmp_path, source_schema)
+        if node is None:
+            source = SourceSpec(
+                plugin=source.plugin, on_success="main", options=source.options, on_validation_failure=source.on_validation_failure
+            )
+        return CompositionState(
+            source=source,
+            nodes=() if node is None else (node,),
+            edges=(),
+            outputs=(self._output(tmp_path, output_schema),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    @staticmethod
+    def _both(state: CompositionState, tmp_path: Path) -> tuple[Any, Any]:
+        composer = state.validate()
+        runtime = validate_pipeline_for_trained_operator(
+            state,
+            SimpleNamespace(data_dir=tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+        return composer, runtime
+
+    def _assert_both_reject(self, state: CompositionState, tmp_path: Path, spelling: str) -> None:
+        composer, runtime = self._both(state, tmp_path)
+        assert not composer.is_valid
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert spelling in entry.message
+        assert entry.contract is not None
+        assert "Name" in entry.contract.missing_fields
+        assert not runtime.is_valid
+        assert any("Field name header spelling" in e.message and spelling in e.message for e in runtime.errors), runtime.errors
+
+    def _assert_both_accept(self, state: CompositionState, tmp_path: Path) -> None:
+        composer, runtime = self._both(state, tmp_path)
+        assert not [e for e in composer.errors if e.error_code == "field_name_header_spelling"], composer.errors
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    def test_both_reject_a_target_spelling_an_arriving_field(self, tmp_path: Path) -> None:
+        """Probe A: flexible source guaranteeing 'name', value_transform target 'Name'."""
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "flexible", "fields": ["id: str", "name: str"]},
+            node=self._value_transform(target="Name"),
+        )
+        self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of the arriving field 'name'")
+
+    def test_both_reject_a_header_spelled_read_behind_a_closed_upstream(self, tmp_path: Path) -> None:
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
+            node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}),
+        )
+        self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
+
+    def test_both_reject_a_header_spelled_sink_declaration_behind_a_closed_upstream(self, tmp_path: Path) -> None:
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
+            node=None,
+            output_schema={"mode": "flexible", "fields": ["Name: str?"]},
+        )
+        self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
+
+    @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
+    def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "flexible", "fields": ["id: str", "name: str"]},
+            node=self._value_transform(target=target),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_accept_what_an_observed_upstream_cannot_prove(self, tmp_path: Path) -> None:
+        """Probe D: the build cannot see 'name'; the executor preflight routes the row at run time."""
+        state = self._state(tmp_path, source_schema={"mode": "observed"}, node=self._value_transform(target="Name"))
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_accept_a_read_an_open_upstream_may_carry_as_written(self, tmp_path: Path) -> None:
+        """A flexible upstream may carry 'Name' as a field of its own: absence is not proven, so neither refuses."""
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "flexible", "fields": ["id: str", "name: str"]},
+            node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}),
+        )
+        self._assert_both_accept(state, tmp_path)

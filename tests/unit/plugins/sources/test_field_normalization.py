@@ -62,9 +62,7 @@ class TestNormalizeFieldName:
 
     def test_algorithm_version_available(self) -> None:
         """Algorithm version is accessible for audit trail."""
-        from elspeth.plugins.sources.field_normalization import (
-            NORMALIZATION_ALGORITHM_VERSION,
-        )
+        from elspeth.contracts.field_spelling import NORMALIZATION_ALGORITHM_VERSION
 
         assert NORMALIZATION_ALGORITHM_VERSION == "1.0.1"
 

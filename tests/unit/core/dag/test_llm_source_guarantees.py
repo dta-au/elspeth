@@ -39,6 +39,16 @@ def _llm_source_options(**overrides: Any) -> dict[str, Any]:
 class _UsageConsumerTransform:
     """Stub consumer requiring one of the LLM source's guaranteed metadata fields."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     name = "usage_consumer"
     input_schema = None
     output_schema = None
@@ -61,6 +71,12 @@ class _UsageConsumerTransform:
 
 class _CollectorSink:
     name = "collector"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_write_failure = "discard"

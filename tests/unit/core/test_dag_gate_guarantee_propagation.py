@@ -60,6 +60,16 @@ class _PassThroughTransform:
     names ONLY the added field.
     """
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -86,6 +96,16 @@ class _PassThroughTransform:
 class _RequiringTransform:
     """Mock transform with explicit required_input_fields in its config."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -110,6 +130,12 @@ class _RequiringTransform:
 
 class _BuilderMockSink:
     name = "mock_sink"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure: str = "discard"

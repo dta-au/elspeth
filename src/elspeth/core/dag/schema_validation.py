@@ -17,6 +17,12 @@ from elspeth.contracts import PluginSchema, RoutingMode, check_compatibility
 from elspeth.contracts.data import CompatibilityResult, resolved_guarantee_type_mismatch
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.field_collision import can_overwrite_input_fields
+from elspeth.contracts.field_spelling import (
+    HEADER_SPELLING_RULE,
+    describe_header_spellings,
+    header_spelled_declarations,
+    header_spelled_names,
+)
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
@@ -57,6 +63,12 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # O(N^2) → O(N) reason — the locked-consumer extras check re-walks
     # ancestry on every edge otherwise.
     definite_emits_caches = DefiniteEmitsCaches()
+
+    # A header-spelled declaration speaks first: it is the root cause of the
+    # missing/extra-field verdict any check below would report about the same
+    # name, and only this check names the remedy (operator ruling 2026-09-25,
+    # field-name spelling rule).
+    validate_declared_field_spellings(graph)
 
     # Validate each edge (skip divert edges — quarantine/error data doesn't
     # conform to producer schemas because it failed validation or errored)
@@ -209,6 +221,7 @@ def validate_single_edge(
                 f"  Producer ({from_info.plugin_name}) guarantees: "
                 f"{sorted(producer_guaranteed) if producer_guaranteed else '(none - dynamic schema)'}\n"
                 f"  Missing fields: {sorted(missing)}\n"
+                f"{header_spelling_hint(missing, producer_guaranteed)}"
                 f"\n"
                 f"Fix: Either:\n"
                 f"  1. Add missing fields to producer's schema or guaranteed_fields, or\n"
@@ -697,7 +710,7 @@ def _validate_locked_consumer_guaranteed_extras(
 
     if sink_missing:
         message = (
-            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing)}\n"
+            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing, walk_effective_guarantee_vote(graph, from_node_id, {}).fields)}\n"
             f"\n"
             f"The same edge ALSO violates the consumer's locked input contract. "
             f"BOTH must be repaired — dropping the extras alone leaves the sink "
@@ -1189,7 +1202,28 @@ def _sink_required_missing_fields(
     return sink_required - vote.fields
 
 
-def _sink_required_violation_message(sink_plugin_name: str, predecessor_id: str, missing: frozenset[str]) -> str:
+def header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str]) -> str:
+    """One line naming each missing field that is a header spelling of a guaranteed one, or "".
+
+    A required name is checked against a producer's guarantees fail-closed by
+    set difference (Phase 1, the sink required-field rule), so a header
+    spelling of a guaranteed field reads as simply "missing". When the
+    predicate of the field-name spelling rule (operator ruling 2026-09-25)
+    explains the miss, the verdict says so and names the remedy — the same
+    sentence the source and ``validate_declared_field_spellings`` use.
+    """
+    spellings = header_spelled_names(missing, guaranteed, kind="read")
+    if not spellings:
+        return ""
+    return f"  Header spellings: {describe_header_spellings(spellings)}.\n"
+
+
+def _sink_required_violation_message(
+    sink_plugin_name: str,
+    predecessor_id: str,
+    missing: frozenset[str],
+    guaranteed: frozenset[str],
+) -> str:
     """The one wording of the sink required-fields verdict.
 
     Shared by the dedicated sweep and the per-edge combined report so a graph
@@ -1232,7 +1266,14 @@ def _sink_required_violation_message(sink_plugin_name: str, predecessor_id: str,
         f"that declares nothing ABSTAINS, and the sink's requirement is enforced "
         f"per row at runtime instead of at build time.\n"
         f"  3. Remove {sorted(missing)} from the sink's declared_required_fields."
+        f"{_indented_header_spelling_hint(missing, guaranteed)}"
     )
+
+
+def _indented_header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str]) -> str:
+    """``header_spelling_hint`` as a trailing paragraph for a multi-line verdict, or ""."""
+    hint = header_spelling_hint(missing, guaranteed)
+    return f"\n\n{hint.strip()}" if hint else ""
 
 
 def validate_sink_required_fields(graph: ExecutionGraph) -> None:
@@ -1289,7 +1330,12 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
                 continue
 
             raise GraphValidationError(
-                _sink_required_violation_message(info.plugin_name, predecessor_id, missing),
+                _sink_required_violation_message(
+                    info.plugin_name,
+                    predecessor_id,
+                    missing,
+                    walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache).fields,
+                ),
                 component_id=str(node_id),
                 component_type="sink",
             )
@@ -1591,6 +1637,98 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
                 f"upstream's schema or guaranteed_fields.",
                 component_id=str(node_id),
                 component_type="transform",
+            )
+
+
+_SPELLING_COMPONENT_TYPE: dict[NodeType, str] = {
+    NodeType.TRANSFORM: "transform",
+    NodeType.AGGREGATION: "aggregation",
+    NodeType.COLLECTOR: "collector",
+    NodeType.SINK: "sink",
+}
+
+
+def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
+    """Refuse a declaration spelled by the header of a field its upstream carries.
+
+    The field-name spelling rule (operator ruling 2026-09-25): a DECLARATION
+    names the field as rows carry it, and an original-header spelling is
+    refused with the source's own remedy. Row lookups keep resolving either
+    spelling; only names a node commits to before any row exists are checked —
+    ``NodeInfo.declared_read_fields`` (schema fields, required fields and every
+    option projected onto ``declared_input_fields``, at transforms,
+    aggregations, collectors and sinks) and ``NodeInfo.declared_created_fields``
+    (the names a transform writes).
+
+    The predicate is ``contracts.field_spelling``'s, and the gating is its
+    ``header_spelled_declarations`` — the same call the Web Composer's Stage-1
+    mirror makes, so the two surfaces cannot disagree about when a build may
+    refuse. Soundness, per predecessor vote:
+
+    - a READ is refused only against a PARTICIPATING and CLOSED vote. Absence of
+      the header literal needs an upper bound on the arriving fields; an open
+      upstream may carry it as a field of its own (elspeth-9c5ff8fa7d).
+    - a CREATED name is refused against a participating vote, checked against
+      the fields the transform carries FORWARD (the vote minus its
+      ``removed_input_fields``) and only where its write path preserves the
+      input row (``can_overwrite_input_fields``, the collision validator's
+      capability key): a transform that builds a fresh row, or removes the
+      field it renames, shadows nothing.
+
+    An abstaining or open upstream is enforced per row by the runtime residual
+    (``TransformExecutor`` preflight, the batch flush preflight, the sink's
+    pre-write validation), which applies the same predicate to the arriving
+    row.
+
+    Runs FIRST in ``validate_edge_compatibility``, unlike the checks that run
+    last to keep an older error stable: a header-spelled declaration is the
+    root cause of the missing- or extra-field verdict those checks would
+    otherwise report about the same name, and only this one names the remedy.
+
+    ``_live_predecessors`` skips DIVERT edges, whose payload is an error
+    envelope rather than the producer's row — the never-reject-a-runnable-
+    pipeline direction.
+
+    Raises:
+        GraphValidationError: if a node declares a header spelling of a field a
+            participating predecessor carries.
+    """
+    effective_fields_cache: dict[str, EffectiveGuaranteeVote] = {}
+
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        reads = info.declared_read_fields
+        creates = (
+            info.declared_created_fields
+            if can_overwrite_input_fields(
+                passes_through_input=info.passes_through_input,
+                forwards_input_fields=info.forwards_input_fields,
+            )
+            else frozenset()
+        )
+        if not reads and not creates:
+            continue
+
+        for predecessor_id in _live_predecessors(graph, node_id):
+            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
+            spellings = header_spelled_declarations(
+                reads=reads,
+                creates=creates,
+                present=vote.fields,
+                forwarded=vote.fields - info.removed_input_fields,
+                participated=vote.participated,
+                closed=vote.closed,
+            )
+            if not spellings:
+                continue
+
+            component_type = _SPELLING_COMPONENT_TYPE[info.node_type]
+            raise GraphValidationError(
+                f"Field name header spelling: {component_type} '{info.plugin_name}' (node '{node_id}') "
+                f"declares field names its upstream '{predecessor_id}' carries under their canonical "
+                f"spelling: {describe_header_spellings(spellings)}. {HEADER_SPELLING_RULE}",
+                component_id=str(node_id),
+                component_type=component_type,
             )
 
 

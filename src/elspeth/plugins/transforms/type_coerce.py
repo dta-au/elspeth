@@ -241,6 +241,25 @@ class TypeCoerceConfig(TransformDataConfig):
         description="List of field type conversions to apply",
     )
 
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Every conversion's ``field`` is an input this transform requires.
+
+        A conversion names an existing field it reads and retypes, and the
+        output config keys that field's declaration by the same name
+        (``_build_type_coerce_output_schema_config``), so the name is a
+        declaration, not a mere lookup. Projecting it here puts it on the one
+        surface every declared-input authority reads: the build's
+        ``validate_transform_declared_input_fields`` and the Web Composer's
+        mirror (a conversion naming a column a participating, closed upstream
+        does not carry is refused before the run), the executor's pre-emission
+        check, and the field-name spelling rule (operator ruling 2026-09-25,
+        2026-09-26 Q4 amendment), which refuses a header spelling (``Price``
+        for the header of ``price``) at build where the upstream proves it and
+        routes the row otherwise.
+        """
+        return super().declared_input_fields | frozenset(spec.field for spec in self.conversions)
+
     @model_validator(mode="after")
     def _validate_conversions_not_empty(self) -> TypeCoerceConfig:
         if not self.conversions:
@@ -281,7 +300,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b83875b8e25d513d"
+    source_file_hash: str | None = "sha256:d6cb511830dd8923"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -359,26 +378,14 @@ class TypeCoerce(BaseTransform):
         conversion_targets: dict[str, Literal["int", "float", "bool", "str"]] = {}
 
         for spec in self._conversions:
-            config_field = spec.field  # Field name from config (may be original header)
+            # The row carries ``field`` under exactly this name: it is a
+            # declared input (``TypeCoerceConfig.declared_input_fields``), so the
+            # engine refused a row without it before process() (ADR-013), and
+            # the field-name spelling rule refused a header spelling of it (the
+            # build, or the executor preflight, operator ruling 2026-09-25).
+            config_field = spec.field
             target_type_name = spec.to
-
-            # Check field exists (PipelineRow resolves both original and normalized names)
-            if config_field not in row:
-                return TransformResult.error(
-                    {
-                        "reason": "missing_field",
-                        "field": config_field,
-                        "message": f"Field '{config_field}' not found in row",
-                    }
-                )
-
-            # Resolve to normalized key for output dict (handles original header names)
-            normalized_key = row.contract.find_name(config_field)
-            if normalized_key is None:
-                # Field exists in row but not in contract — use config name as-is
-                # (shouldn't happen for valid rows, but defensive for edge cases)
-                normalized_key = config_field
-            conversion_targets[normalized_key] = target_type_name
+            conversion_targets[config_field] = target_type_name
 
             value = row[config_field]
 
@@ -398,7 +405,7 @@ class TypeCoerce(BaseTransform):
             target_type = _TARGET_TYPES[target_type_name]
             # Use type() not isinstance() to avoid bool matching int
             if type(value) is target_type:
-                fields_unchanged.append(normalized_key)
+                fields_unchanged.append(config_field)
                 continue
 
             # Apply conversion
@@ -416,8 +423,8 @@ class TypeCoerce(BaseTransform):
                     }
                 )
 
-            output[normalized_key] = converted
-            fields_coerced.append(normalized_key)
+            output[config_field] = converted
+            fields_coerced.append(config_field)
 
         output_contract = self._build_output_contract(row.contract, conversion_targets)
         return TransformResult.success(
@@ -450,9 +457,10 @@ class TypeCoerce(BaseTransform):
         its operation targets (as ``any``, since expression result types are
         uninferable); a conversion target's type is exactly ``spec.to``, so the
         declaration here is concrete. ``required=True, nullable=False`` is
-        truthful for the success stream: a missing or ``None`` conversion field
-        errors the row onto the divert path, so every emitted row carries a
-        non-None converted value. Observed-mode configs (``fields is None``)
+        truthful for the success stream: a conversion field is a declared input
+        the engine requires before ``process()``, and a ``None`` one errors the
+        row onto the divert path, so every emitted row carries a non-None
+        converted value. Observed-mode configs (``fields is None``)
         stay observed — declaring into them would flip downstream edges off the
         observed bypass path; the walk abstains at undeclared pass-throughs
         instead.

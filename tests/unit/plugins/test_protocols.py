@@ -166,6 +166,17 @@ class TestTransformProtocol:
 
         class DoubleTransform:
             name = "double"
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+                return frozenset(self.declared_input_fields)
+
+            @property
+            def declared_created_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+                return frozenset(self.declared_output_fields)
+
             input_schema = InputSchema
             output_schema = OutputSchema
             routes: ClassVar[dict[str, str]] = {}

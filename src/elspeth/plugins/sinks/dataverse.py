@@ -283,7 +283,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2b76d08ac316a480"
+    source_file_hash: str | None = "sha256:aade9b9e9425a491"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -412,6 +412,10 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             limiter=limiter,
             additional_domains=self._additional_domains,
         )
+
+    def config_named_input_columns(self) -> frozenset[str]:
+        """``field_mapping`` keys are the pipeline fields each row is read by (``_map_row``), as written."""
+        return super().config_named_input_columns() | frozenset(self._field_mapping)
 
     def _build_upsert_url(self, key_value: str) -> str:
         """Build PATCH URL for upsert with alternate key.

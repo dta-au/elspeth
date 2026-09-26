@@ -456,6 +456,23 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # dispatch, the plugins enforce the contract in their own process paths.
     declared_string_input_fields: frozenset[str]
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this transform declares it reads from an arriving row (field-name spelling rule).
+
+        See ``BaseTransform.declared_read_fields``; ``contracts.field_spelling``
+        is the rule.
+        """
+        ...
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        """Names this transform declares it writes as fields of its own (field-name spelling rule).
+
+        See ``BaseTransform.declared_created_fields``.
+        """
+        ...
+
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
     # instead of probing for optional methods, preserving a closed lifecycle
     # surface.
@@ -693,6 +710,16 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
         """
         ...
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this batch transform declares it reads from every buffered row (field-name spelling rule).
+
+        See ``BaseTransform.declared_read_fields``. The flush preflight
+        (``engine.executors.batch_contract_validation``) checks every buffered
+        row against it.
+        """
+        ...
+
     def schema_required_input_fields(self) -> frozenset[str]:
         """Return the fields every buffered row must carry before ``process`` runs.
 
@@ -832,6 +859,15 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # Sinks that declare required fields have them checked BEFORE write().
     # Empty frozenset = no required-field check = all fields optional.
     declared_required_fields: frozenset[str]
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this sink declares it reads from an arriving row (field-name spelling rule).
+
+        See ``BaseSink.declared_read_fields``; checked by the build and by
+        ``SinkExecutor`` before the write.
+        """
+        ...
 
     # Write failure routing — injected by runtime_factory from SinkSettings.
     # "discard" = drop failed rows with audit record, else = failsink name.

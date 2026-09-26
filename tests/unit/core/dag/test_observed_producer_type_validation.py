@@ -498,6 +498,12 @@ class _ThreadingFakeSource:
 
 class _ThreadingFakeSink:
     name = "mock_sink"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -509,6 +515,16 @@ class _ThreadingFakeSink:
 
 class _ThreadingFakeBatchTransform:
     """Batch-aware pass-through fake declaring the value-preservation promise."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None
@@ -532,6 +548,16 @@ class _ThreadingFakeBatchTransform:
 
 class _ThreadingFakeOpenerTransform:
     """Multi-row opener fake for the collector build (scope opener)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None

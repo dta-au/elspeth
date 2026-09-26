@@ -119,6 +119,43 @@ drained and repair this release forward.
   type it recorded; a node whose types match continues and its record's
   `source` becomes `declared`. There is no compatibility shim (epoch 45 is
   undeployed).
+- **A declaration names a field as rows carry it (field-name spelling rule).**
+  Sources key every row by the normalized form of each header (`Name` →
+  `name`). A row lookup still resolves either spelling (`row['Name']` in an
+  expression or template, a `field_mapper` mapping source), but a declaration —
+  a transform, aggregation or sink `schema` field, `required_fields`,
+  `required_input_fields`, a column option such as `url_field`, `query_field`,
+  `blob_ref_field`, `value_field` or `group_by`, a `type_coerce` conversion's
+  `field`, a sink's custom `headers` key or dataverse `field_mapping` key, a
+  `value_transform` target or a `field_mapper` rename target — spelled by the
+  header of a field the row carries is now refused with the source's remedy
+  ("headers are normalized to lowercase identifiers ('Name' -> 'name').
+  Declare 'name'"). `elspeth validate`, the build and the Composer (new error
+  code `field_name_header_spelling`) refuse it wherever the upstream's
+  declared schema proves it; otherwise a transform or aggregation routes each
+  row to `on_error` with `declared_field_is_header_spelling` or
+  `target_is_header_spelling`, naming only the configured spelling and its
+  normalized form, and a sink ends the run with every token's outcome
+  recorded. Before this, such a declaration was silently inert (a
+  `value_transform` or any sink `Name: int?`), recorded a false Tier-1 claim
+  (`field_mapper` `{Name: given}` with `Name: int?` recorded `given: int,
+  declared` over a delivered str), ended the run with a Tier-1 violation
+  (`web_scrape` `url_field: Url`, a header-spelled `type_coerce` conversion
+  under a declared schema), crashed with `Duplicate original_name` leaving the
+  row with no outcome (a `value_transform` target `Name` over header `Name`),
+  silently shadowed the field (target `Name` over header `NAME`, `field_mapper`
+  `{id: Name}`), or crashed a csv/json sink's write (a header-spelled custom
+  `headers` key). A `required_input_fields` verdict for a header spelling of a
+  guaranteed field now names the normalized spelling. Behaviour changes: a
+  `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
+  Price}]` over header `Price` worked as a lookup and is now refused — write
+  `field: price`; and a conversion field is now a declared input, so one no
+  row carries is refused at build against a `fixed` upstream and otherwise
+  ends the run as a `DeclaredRequiredInputFieldsViolation` with the row's
+  outcome recorded (it was routed `missing_field`), as `web_scrape`'s
+  `url_field` always has. The normalization algorithm moved to
+  `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
+  is still `1.0.1`).
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics

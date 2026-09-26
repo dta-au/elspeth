@@ -1481,6 +1481,59 @@ class BaseTransform(ABC):
             return frozenset()
         return frozenset(schema_config.required_fields or ())
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Every name this transform DECLARES it reads from an arriving row.
+
+        The read half of the declaration surface the field-name spelling rule
+        governs (operator ruling 2026-09-25, ``contracts.field_spelling``): a
+        name the node commits to before any row exists and that the engine
+        compares to row keys as written, so a header spelling of it never meets
+        the field it means. Three surfaces:
+
+        - ``schema.fields`` names this transform does not create — a created
+          field's declaration types an output (``declared_created_fields``);
+        - ``schema.required_fields``, where every batch transform folds its
+          configured input columns (``value_field``, ``group_by`` ...);
+        - ``declared_input_fields``: ``required_input_fields`` plus every option
+          a plugin projects onto it (``url_field``, ``query_field``,
+          ``blob_ref_field``, ``key_field``, type_coerce's
+          ``conversions[].field`` ...).
+
+        Deliberately NOT the column-option limb of ``consumed_input_fields``:
+        an option that stays off those surfaces is a row LOOKUP, resolved
+        through ``PipelineRow`` under either spelling (truncate's ``fields``,
+        field_mapper's mapping sources, json_explode's ``array_field``), and
+        the ruling keeps lookups spelling-free.
+
+        The build (``validate_declared_field_spellings``), the Web Composer's
+        Stage-1 mirror and the transform and batch preflights all read this one
+        property, so the surfaces they check cannot drift apart.
+        """
+        schema_config = self._schema_config
+        authored: frozenset[str] = frozenset()
+        if schema_config is not None and schema_config.fields is not None:
+            authored = frozenset(field.name for field in schema_config.fields) - self.self_created_input_fields
+        return authored | self.schema_required_input_fields() | self.declared_input_fields
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        """Every name this transform declares it WRITES as a field of its own.
+
+        The create half of the spelling rule's declaration surface: the
+        ADR-011 guarantee surface (``declared_output_fields``), the ADR-050
+        created declarations (``created_output_fields()``) and the demotion set
+        (``self_created_input_fields``, where value_transform keeps its
+        targets). A created name that is a header spelling of a field the row
+        carries forward lands beside that field under a second key: a silent
+        shadow, or ``Duplicate original_name`` when the literal is that field's
+        own header. A name may be both read and created (a target that reads
+        its own field); the create rule is the stronger one at build time.
+        """
+        return (
+            self.declared_output_fields | frozenset(field.name for field in self.created_output_fields()) | self.self_created_input_fields
+        )
+
     def _config_named_input_columns(self) -> frozenset[str]:
         """Column names this transform's own config options point at for READING.
 
@@ -2071,6 +2124,38 @@ class BaseSink(ABC, SinkEffectContract):
     # Empty frozenset = no required-field check.
     declared_required_fields: frozenset[str] = frozenset()
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Every name this sink DECLARES it reads from an arriving row.
+
+        The sink half of the declaration surface the field-name spelling rule
+        governs (operator ruling 2026-09-25, ``contracts.field_spelling``): the
+        ``schema.fields`` names (the declared input model's fields, keyed as
+        written), ``declared_required_fields`` (which folds in the options a
+        sink writes FROM: text/document ``field``, chroma ``id_field`` and
+        ``document_field``), and every other option naming a row column
+        (``config_named_input_columns``). Each is compared to row keys as
+        written, so a header spelling of it never meets the field it means.
+
+        The build (``validate_declared_field_spellings``), the Web Composer's
+        Stage-1 mirror and the sink's pre-write validation all read this one
+        property.
+        """
+        return frozenset(self.input_schema.model_fields) | self.declared_required_fields | self.config_named_input_columns()
+
+    def config_named_input_columns(self) -> frozenset[str]:
+        """Row columns this sink's own options name, beyond its schema and required fields.
+
+        The default is the keys of a custom ``headers`` mapping (csv, json,
+        aws_s3, azure_blob): ``apply_display_headers`` matches them to row keys
+        as written, and a row field no key matches is a write-time error. A
+        sink whose other options key output by row field names (dataverse
+        ``field_mapping``) extends this. Chroma's ``metadata_fields`` need no
+        entry: its config requires each to be a declared schema field.
+        """
+        mapping = self._headers_custom_mapping
+        return frozenset() if mapping is None else frozenset(mapping)
+
     # Failsink infrastructure — set by orchestrator from SinkSettings.on_write_failure.
     # None until injected at pipeline startup; "discard" or sink name at runtime.
     _on_write_failure: str | None
@@ -2142,8 +2227,11 @@ class BaseSink(ABC, SinkEffectContract):
 
     # Display header state — set by init_display_headers() in subclass __init__.
     # Declared here for mypy structural typing against DisplayHeaderHost protocol.
+    # The custom mapping alone carries a class default: None is the truthful
+    # value for a sink that never initialises display headers, and
+    # config_named_input_columns reads it on every sink.
     _headers_mode: HeaderMode
-    _headers_custom_mapping: dict[str, str] | None
+    _headers_custom_mapping: dict[str, str] | None = None
     _resolved_display_headers: dict[str, str] | None
     _display_headers_resolved: bool
     _needs_resume_field_resolution: bool

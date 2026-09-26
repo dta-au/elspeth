@@ -51,6 +51,11 @@ class _BoundRegionMockSource:
 class _BoundRegionMockSink:
     """A mock sink with a caller-chosen name, for graphs needing >1 sink."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -65,6 +70,17 @@ class _BoundRegionMockSink:
 
 class _BoundRegionTransform:
     input_schema = None
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
@@ -85,6 +101,16 @@ class _BoundRegionTransform:
 
 class _BoundRegionMultiRowTransform:
     """A creates_tokens=True stub — a scope opener candidate (spec §7 rule 5)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None
@@ -109,6 +135,16 @@ class _BoundRegionMultiRowTransform:
 class _BoundRegionCollectorPlugin:
     """A batch-aware stub — the collector plugin closing a declared scope."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -131,6 +167,16 @@ class _BoundRegionCollectorPlugin:
 
 class _BoundRegionAggregationTransform:
     """A stub aggregation-node plugin (spec §7 rule 6, ruling 25)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None

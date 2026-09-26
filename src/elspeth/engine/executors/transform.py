@@ -378,6 +378,41 @@ class TransformExecutor:
                 f"before any process() invocation."
             )
 
+        # --- FIELD-NAME SPELLING (pre-execution) ---
+        # The runtime residual of the field-name spelling rule (operator ruling
+        # 2026-09-25): a name this transform DECLARES — a read (schema field,
+        # required or column option) or a created target — that is the header
+        # spelling of a field the arriving row carries. The build refused every
+        # case a participating upstream proves (validate_declared_field_spellings);
+        # an abstaining or open upstream is settled here, on the row, with the
+        # same predicate. It runs BEFORE the pre-emission dispatch on purpose:
+        # a header-spelled declared input would otherwise reach
+        # DeclaredRequiredFieldsContract as a MISSING field — a Tier-1 abort for
+        # what is an operator configuration error — and a header-spelled target
+        # would reach process() and write a second key beside the field it
+        # names. Raised as a Tier-2 PluginContractViolation, so it routes via
+        # on_error with one stable, value-free reason.
+        from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+        from elspeth.contracts.field_spelling import header_spelled_row_declarations
+
+        row_keys = frozenset(input_dict)
+        spellings = header_spelled_row_declarations(
+            reads=transform.declared_read_fields,
+            creates=transform.declared_created_fields,
+            row_keys=row_keys,
+            forwarded_keys=(
+                row_keys - transform.removed_input_fields
+                if can_overwrite_input_fields(
+                    passes_through_input=transform.passes_through_input,
+                    forwards_input_fields=transform.forwards_input_fields,
+                )
+                else frozenset()
+            ),
+        )
+        if spellings:
+            raise HeaderSpelledDeclarationViolation(component=f"Transform '{transform.name}'", spellings=spellings)
+
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
         # Centralized check: if this transform declares output fields AND its
         # write path preserves the input row, verify none collide with input
@@ -388,8 +423,6 @@ class TransformExecutor:
         # dict (select_only field_mapper) consumes-and-replaces rather than
         # overwrites — arming on the declaration alone was a 100% row-loss
         # false positive (elspeth-6ea3619737). See can_overwrite_input_fields.
-        from elspeth.contracts.field_collision import can_overwrite_input_fields
-
         if transform.declared_output_fields and can_overwrite_input_fields(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,

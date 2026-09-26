@@ -262,6 +262,24 @@ class NodeInfo:
     # exclusion and batch-aware family members (the Azure pair) declare too.
     declared_string_input_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # The field-name spelling rule's declaration surface (operator ruling
+    # 2026-09-25, contracts.field_spelling). declared_read_fields: every name the
+    # node DECLARES it reads from an arriving row — populated for the
+    # plugin-bearing consumers TRANSFORM, AGGREGATION, COLLECTOR (from
+    # TransformProtocol.declared_read_fields) and SINK (from
+    # SinkProtocol.declared_read_fields). declared_created_fields: every name a
+    # TRANSFORM declares it writes as a field of its own. Their one consumer is
+    # validate_declared_field_spellings, which refuses a header spelling of a
+    # field a participating upstream carries. Declaration only.
+    #
+    # NOT derivable from the fields above: reads fold the schema's declared
+    # names together with declared_input_fields and schema.required_fields, and
+    # creates fold three plugin declarations (declared_output_fields,
+    # created_output_fields(), self_created_input_fields), because value_transform
+    # keeps declared_output_fields empty while creating every target.
+    declared_read_fields: frozenset[str] = field(default_factory=frozenset)
+    declared_created_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
     # by the builder from TransformProtocol.passes_through_input. When True,
     # the validator walk propagates predecessor guarantees through this node
@@ -393,6 +411,33 @@ class NodeInfo:
                 f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_string_input_fields={sorted(self.declared_string_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the spelling rule's surfaces sit only on the node
+        # kinds whose plugin declares them, so a builder bug that projects one
+        # anywhere else surfaces here rather than as data no validator reads.
+        # Created names are TRANSFORM-only for the reason declared_output_fields
+        # is: an aggregation or collector is reductive, so what arrives at it
+        # does not describe what leaves it (elspeth-cfcd333f83).
+        if self.declared_read_fields and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+            NodeType.SINK,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.declared_read_fields is only meaningful for TRANSFORM, AGGREGATION, "
+                f"COLLECTOR or SINK nodes; node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_read_fields={sorted(self.declared_read_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        if self.declared_created_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_created_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_created_fields={sorted(self.declared_created_fields)!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

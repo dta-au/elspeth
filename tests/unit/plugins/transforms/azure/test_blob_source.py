@@ -8,10 +8,10 @@ import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
 from elspeth.contracts import SourceRow
+from elspeth.contracts.field_spelling import NORMALIZATION_ALGORITHM_VERSION
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.sources.azure_blob_source import AzureBlobSource
-from elspeth.plugins.sources.field_normalization import NORMALIZATION_ALGORITHM_VERSION
 from tests.fixtures.factories import make_operation_context
 
 # Dynamic schema config for tests - DataPluginConfig requires schema

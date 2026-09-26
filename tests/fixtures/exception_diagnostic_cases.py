@@ -18,6 +18,7 @@ from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import RegisteredWorker
 from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.field_spelling import HeaderSpelling
 from elspeth.core.checkpoint import recovery
 from tests.fixtures.abandon_refusal_diagnostics import assert_abandon_refusal_cause_reaches_cli
 from tests.fixtures.exception_diagnostic_consumers import (
@@ -450,6 +451,27 @@ DIAGNOSTIC_CASES = (
         "control",
         "The actual runtime-preflight classifier consumes wrapper retryability.",
         _exercise_preflight_retryable,
+    ),
+    # The field-name spelling rule's runtime residual (elspeth-5887fb7928): the
+    # routed reason is its message plus the literal/canonical pairs, so both
+    # observations must survive the renderer.
+    _message_case(
+        errors.HeaderSpelledDeclarationViolation,
+        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        "component",
+        (("Transform 'alpha_component'", "Transform 'alpha_component'"), ("Sink 'omega_component'", "Sink 'omega_component'")),
+    ),
+    _message_case(
+        errors.HeaderSpelledDeclarationViolation,
+        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        "spellings",
+        (
+            ((HeaderSpelling(literal="Alpha", canonical="alpha", kind="read"),), "'Alpha' is a header spelling of 'alpha'"),
+            (
+                (HeaderSpelling(literal="Omega", canonical="omega", kind="create"),),
+                "'Omega' is a header spelling of the arriving field 'omega'",
+            ),
+        ),
     ),
     *_structured_cases(
         errors.ZeroEmissionSuccessContractViolation,

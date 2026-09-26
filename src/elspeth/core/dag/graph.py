@@ -160,6 +160,8 @@ class ExecutionGraph:
         declared_output_fields: frozenset[str] = frozenset(),
         declared_input_fields: frozenset[str] = frozenset(),
         declared_string_input_fields: frozenset[str] = frozenset(),
+        declared_read_fields: frozenset[str] = frozenset(),
+        declared_created_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
         forwards_input_fields: bool = False,
         removed_input_fields: frozenset[str] = frozenset(),
@@ -208,6 +210,15 @@ class ExecutionGraph:
                 TransformProtocol.declared_string_input_fields; no derivation
                 from schema config for the same reason as its siblings
                 (elspeth-b19dfe41fb). Empty frozenset otherwise.
+            declared_read_fields: For TRANSFORM, AGGREGATION, COLLECTOR and
+                SINK nodes — every name the node's plugin declares it reads
+                from an arriving row (TransformProtocol/SinkProtocol
+                .declared_read_fields). No derivation when omitted: the plugin
+                folds option-projected names in that no config surface carries.
+            declared_created_fields: For TRANSFORM nodes only — every name the
+                transform declares it writes as a field of its own
+                (TransformProtocol.declared_created_fields). Both feed the
+                field-name spelling rule (validate_declared_field_spellings).
             passes_through_input: For TRANSFORM nodes only — True iff the transform
                 unconditionally emits rows containing every input field
                 (ADR-007). Validator walk propagates predecessor guarantees
@@ -275,6 +286,8 @@ class ExecutionGraph:
             declared_output_fields=declared_output_fields,
             declared_input_fields=declared_input_fields,
             declared_string_input_fields=declared_string_input_fields,
+            declared_read_fields=declared_read_fields,
+            declared_created_fields=declared_created_fields,
             preserves_input_values=preserves_input_values,
             observed_value_type=observed_value_type,
             passes_through_input=passes_through_input,

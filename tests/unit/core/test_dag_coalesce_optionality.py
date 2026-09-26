@@ -1020,6 +1020,11 @@ class _BuilderMockSource:
 class _BuilderMockSink:
     """Mock sink plugin with no declared required fields."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     name = "mock_sink"
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
@@ -1032,6 +1037,16 @@ class _BuilderMockSink:
 
 class _TransformWithTypedSchema:
     """Mock transform that exposes a typed _output_schema_config with fields."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None
@@ -1388,6 +1403,12 @@ class TestBuilderBranchExclusiveFieldDowngrade:
 
         class _SinkRequiringExclusive:
             name = "strict_sink"
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+                return frozenset(self.declared_required_fields)
+
             input_schema = None
             config: ClassVar[dict[str, Any]] = {}
             _on_write_failure: str = "discard"
@@ -2550,6 +2571,16 @@ class _PassThroughBranchTransform:
     color_name/hex carried through llm_variant_a/b.
     """
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -2661,6 +2692,12 @@ class TestBuilderCoalescePassThroughGuaranteePropagation:
 
         class _SinkRequiringAllFour:
             name = "strict_sink"
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+                return frozenset(self.declared_required_fields)
+
             input_schema = None
             config: ClassVar[dict[str, Any]] = {}
             _on_write_failure: str = "discard"

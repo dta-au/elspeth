@@ -530,6 +530,22 @@ like `approval_status`. If the source is bound, inspect the source and use the
 literal observed header such as `approved`; if no source facts are available,
 ask a narrow column-identification question instead of fabricating a field.
 
+Declarations name a field as rows carry it. Every source normalizes its
+headers to lowercase identifiers (spaces and punctuation become `_`, a leading
+digit gains a `_` prefix, a Python keyword gains a `_` suffix), and
+`inspect_source`'s `observed_headers` are the RAW headers: header `Approved`
+is declared `approved`, `First Name` is `first_name`, `Price USD` is
+`price_usd`. This holds for every declaration on a transform, aggregation or
+output: schema `fields`, `required_input_fields`, any option that names an
+input column (including a conversion's field), a custom output-header key,
+and a name the node creates. A header spelling there is refused: at
+validation with `field_name_header_spelling` where the upstream's declared
+schema proves it, otherwise at run time, where every row routes to
+`on_error` (reason `declared_field_is_header_spelling` or
+`target_is_header_spelling`), observed schemas included. Row LOOKUPS keep
+either spelling: an expression or template reading `row['Price USD']`, and an
+option that only locates a field to read or rename, resolve the header too.
+
 For routing or splitting requests, choose output plugins and formats from the
 user's requested result and each policy-visible sink's live contract. Do not
 infer sink behavior from the source plugin's name or from static format lore.
@@ -1217,6 +1233,7 @@ These are common one-shot mappings:
 | `gate_expression_preview_memory_exhaustion` | Preview ran out of memory evaluating the gate against sampled rows — a resource failure, not a typing mismatch. Simplify the gate condition so it does not build large intermediate values, then re-run `preview_pipeline`. |
 | `aggregation_numeric_value_field_type_mismatch_against_source_schema` | A batch node's numeric `value_field` flows unchanged from an observed CSV source, so it arrives as `str` and the batch is rejected at runtime. Fires for the plugin wherever it is hosted — an `aggregation` OR a `collector` (the code name is historical; the diagnostic message names the actual node kind). Declare the field with a numeric type in the SOURCE schema (the source coerces at ingestion), or insert a `type_coerce` upstream of the batch node with a `conversions` entry targeting the numeric type. For a **collector**, that `type_coerce` may sit either inside the EXPAND scope (between the scope opener and the collector) or upstream of the scope opener — both are valid. If the field is categorical, use `batch_top_k` instead of a numeric batch plugin. |
 | `declared_input_type_mismatch_against_source_schema` | A transform or output declares an input field with a concrete non-str type (e.g. `id: int`) while the field flows unchanged from an observed CSV source — it arrives as `str` and every row fails that consumer's input validation. Inspection's `inferred_types` are LEXICAL observations; they do not change what arrives. Declare the field's type in the SOURCE schema (e.g. `schema.mode='flexible'` with `schema.fields` including `id: int` — the source coerces at ingestion), or insert a `type_coerce` upstream converting the field, or declare the field as `str` on the consumer if string values are acceptable. Never declare the intended post-conversion type on the consuming node's own `schema:` block — it declares what ARRIVES. |
+| `field_name_header_spelling` | A declaration on the named consumer spells a field by its source HEADER (`Name`) instead of the normalized name rows carry (`name`). Rewrite each name in `missing_fields` to its normalized form on that consumer (`patch_node_options` / `patch_output_options`) — schema fields, `required_input_fields`, column-naming options, custom output-header keys. For a created name the normalized form overwrites the arriving field; for a new field pick a name no arriving field normalizes to. Do not insert a renaming node to restore the header spelling. |
 | Joined or enriched field disagrees with a consumer's required type | Consult the producer's `get_plugin_schema` and `get_plugin_assistance` to establish actual output types. Preserve supplied reference data. Keep the consumer's contract aligned with those types when that meets the request; otherwise discover and configure an explicit conversion before the consumer. A type declaration alone is not proof of conversion. Any format change must be permitted by the user's data requirements. |
 | Producer guarantees are empty and producer is source | Patch source schema using inspected fields. |
 | Consumer requires a generated or inspected source field but source guarantees are empty | Declare that known field through the selected source's schema-defined contract mechanism, then retry; do not ask the user to confirm a field you authored or inspected. |

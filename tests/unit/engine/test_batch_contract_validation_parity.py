@@ -64,6 +64,11 @@ class _ObservedSchema(PluginSchema):
 class _FakeBatchTransform:
     """Minimal `BatchTransformProtocol` surface the validators actually read."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol spelling surface: this fake declares its required input columns only.
+        return self.schema_required_input_fields()
+
     def __init__(self, *, input_schema: type[PluginSchema] = _StrictItemSchema, required: frozenset[str] = frozenset()) -> None:
         self.name = "fake_batch"
         self.input_schema: type[PluginSchema] = input_schema
@@ -238,14 +243,16 @@ class TestSharedValidators:
 
         validate_batch_inputs(transform, [_row({"score": None})], node_kind=node_kind)
 
-    def test_a_field_required_by_its_original_header_is_present(self, node_kind: str) -> None:
-        """Presence resolves an ORIGINAL name exactly as ``row[field]`` does (review-R1 F1, mutant MA).
+    def test_a_field_required_by_its_header_spelling_is_refused_by_the_spelling_rule(self, node_kind: str) -> None:
+        """A header-spelled declaration fails the batch, routed, naming only config literals (ruling 2026-09-25).
 
-        A batch plugin configured with the header spelling (``value_field:
-        "Amount USD"`` over a csv source normalizing it to ``amount_usd``) reads
-        ``row["Amount USD"]``, which resolves. Reading presence off the
-        normalized ``to_dict()`` keys instead would fail every such batch.
+        ``value_field: "Amount USD"`` over a csv source normalizing it to
+        ``amount_usd`` is a DECLARATION (the batch transform folds it into
+        ``schema.required_fields``), and the field-name spelling rule refuses
+        a header spelling of a field the row carries. Before the rule, presence
+        resolved it and the plugin keyed its output by the literal.
         """
+        from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
         from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 
         row = PipelineRow(
@@ -261,6 +268,41 @@ class TestSharedValidators:
             ),
         )
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Amount USD"}))
+
+        with pytest.raises(HeaderSpelledDeclarationViolation) as excinfo:
+            validate_batch_inputs(transform, [row], node_kind=node_kind)
+        # Routed like every flush preflight violation (a PluginContractViolation),
+        # with a stable reason carrying the literal and its canonical name only.
+        assert isinstance(excinfo.value, PluginContractViolation)
+        reason = excinfo.value.to_transform_error_reason()
+        assert reason["reason"] == "declared_field_is_header_spelling"
+        assert reason["fields"] == ["Amount USD"]
+        assert reason["canonical_fields"] == ["amount_usd"]
+        assert "1.5" not in str(excinfo.value)
+
+    def test_a_required_original_header_the_source_mapped_away_resolves_through_the_contract(self, node_kind: str) -> None:
+        """Presence resolves an ORIGINAL name exactly as ``row[field]`` does (review-R1 F1, mutant MA).
+
+        A header a source ``field_mapping`` renamed to an unrelated key
+        (``Weird Header`` -> ``b``) is not a header spelling by the rule's
+        predicate — ``normalize("Weird Header")`` is ``weird_header``, which the
+        row does not carry — so it reaches the presence check, which resolves it
+        through the contract. Reading presence off the normalized ``to_dict()``
+        keys instead would fail every such batch.
+        """
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+        row = PipelineRow(
+            {"b": 1.5},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    FieldContract(normalized_name="b", original_name="Weird Header", python_type=float, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Weird Header"}))
 
         validate_batch_inputs(transform, [row], node_kind=node_kind)
 

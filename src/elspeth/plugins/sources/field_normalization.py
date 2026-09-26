@@ -10,25 +10,23 @@ Per ELSPETH's Three-Tier Trust Model, this is Tier 3 (external data) handling:
 Algorithm Stability:
     The normalization algorithm is versioned and frozen per major version.
     NORMALIZATION_ALGORITHM_VERSION is stored in the audit trail to enable
-    debugging cross-run field name drift when algorithm evolves.
+    debugging cross-run field name drift when algorithm evolves. The algorithm
+    and its version live in ``elspeth.contracts.field_spelling``, beside the
+    field-name spelling rule that every downstream declaration surface applies
+    with it; this module is the source boundary's Tier-3 use of it.
 """
 
 from __future__ import annotations
 
-import keyword
-import re
-import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
-# Algorithm version for audit trail - frozen per major version.
-# Increment when algorithm changes affect output.
-NORMALIZATION_ALGORITHM_VERSION = "1.0.1"
-
-
-# Pre-compiled regex patterns (module level for efficiency)
-_CONSECUTIVE_UNDERSCORES = re.compile(r"_+")
+from elspeth.contracts.field_spelling import (
+    NORMALIZATION_ALGORITHM_VERSION,
+    header_normalization_remedy,
+    normalized_field_name_or_empty,
+)
 
 
 class ExternalHeaderError(ValueError):
@@ -57,60 +55,6 @@ class FieldMappingCollisionError(ValueError):
     """
 
 
-def _is_identifier_continue(char: str) -> bool:
-    """Return whether char can appear after a valid Python identifier start."""
-    return f"_{char}".isidentifier()
-
-
-def _replace_non_identifier_chars(value: str) -> str:
-    """Replace characters outside Python's identifier alphabet with underscores."""
-    return "".join(char if _is_identifier_continue(char) else "_" for char in value)
-
-
-def _normalize_field_name_or_empty(raw: str) -> str:
-    """Steps 1-8 of :func:`normalize_field_name`; empty means no header produces a name.
-
-    Callers that need "does anything normalize to this?" as data — the
-    declared-field reachability check and the declarable-form lookup — read
-    the empty result here instead of catching the ``ExternalHeaderError`` the
-    public entry point raises for it.
-    """
-    # Step 1: Unicode NFC normalization
-    normalized = unicodedata.normalize("NFC", raw)
-
-    # Step 2: Strip whitespace
-    normalized = normalized.strip()
-
-    # Step 3: Lowercase
-    normalized = normalized.lower()
-
-    # Step 4: Replace non-identifier chars with underscore. Python's \w includes
-    # Unicode number symbols like superscript two that are not legal identifiers.
-    normalized = _replace_non_identifier_chars(normalized)
-
-    # Step 5: Collapse consecutive underscores
-    normalized = _CONSECUTIVE_UNDERSCORES.sub("_", normalized)
-
-    # Step 6: Strip leading/trailing underscores
-    normalized = normalized.strip("_")
-
-    # Step 7: Prefix if the first remaining char cannot start an identifier.
-    if normalized and not normalized.isidentifier() and f"_{normalized}".isidentifier():
-        normalized = f"_{normalized}"
-
-    # Step 8: Handle Python keywords
-    if keyword.iskeyword(normalized):
-        normalized = f"{normalized}_"
-
-    # Defense-in-depth: verify a non-empty result is a valid identifier
-    if normalized and not normalized.isidentifier():
-        raise ValueError(
-            f"Header '{raw}' normalized to '{normalized}' which is not a valid identifier. This is a bug in the normalization algorithm."
-        )
-
-    return normalized
-
-
 def normalize_field_name(raw: str) -> str:
     """Normalize messy header to valid Python identifier.
 
@@ -135,7 +79,7 @@ def normalize_field_name(raw: str) -> str:
         ExternalHeaderError: If header normalizes to empty string.
         ValueError: If the normalization algorithm produces an invalid identifier.
     """
-    normalized = _normalize_field_name_or_empty(raw)
+    normalized = normalized_field_name_or_empty(raw)
 
     # Step 9: Validate non-empty result
     # Tier 3: an external header that normalizes away to nothing is bad source data.
@@ -516,7 +460,7 @@ def check_declared_fields_reachable(
                     f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
                 )
                 continue
-            normalized = _normalize_field_name_or_empty(name)
+            normalized = normalized_field_name_or_empty(name)
             if not normalized:
                 # e.g. '_' — normalization strips it to nothing, so no external
                 # header can produce it and it is not a mapping value.
@@ -529,8 +473,8 @@ def check_declared_fields_reachable(
             if normalized != name:
                 problems.append(
                     f"declared field '{name}' can never appear on a row from this source: "
-                    f"{header_kind} are normalized to lowercase identifiers ('{name}' -> '{normalized}'). "
-                    f"Declare '{normalized}', or add field_mapping: {{{normalized}: {name}}} to preserve the original name."
+                    f"{header_normalization_remedy(name, normalized, header_kind=header_kind)}, "
+                    f"or add field_mapping: {{{normalized}: {name}}} to preserve the original name."
                 )
 
     if problems:
@@ -556,7 +500,7 @@ def declarable_field_name(name: str) -> str | None:
 
     if is_valid_field_name(name.strip()):
         return name.strip()
-    canonical = _normalize_field_name_or_empty(name)
+    canonical = normalized_field_name_or_empty(name)
     if not canonical or not is_valid_field_name(canonical):
         return None
     return canonical

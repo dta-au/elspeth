@@ -580,6 +580,9 @@ class _MapperShape:
     recorded: dict[str, tuple[str, str]] = dataclasses.field(default_factory=dict)
 
 
+_HEADER_SPELLED: frozenset[tuple[str | None, ...]] = frozenset({("declared_field_is_header_spelling", None, None, None, None, None)})
+
+
 def _routed(name: str) -> frozenset[tuple[str | None, ...]]:
     """The one value-free reason a str under an operator's ``int`` routes with."""
     return frozenset({("contract_violation", name, "int", "str", "operator", "computed")})
@@ -594,17 +597,20 @@ _MAPPER_SHAPES: dict[str, _MapperShape] = {
     # input field ``name`` through its original_name and read as unchanged.
     "r3_norm_to_hdr_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int",), reasons=_routed("Name")),
     "r3_norm_to_hdr_intq": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
-    "hdr_name_intq": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int?",), reasons=_routed("Name")),
+    # Field-name spelling rule (operator ruling 2026-09-25): the schema field
+    # ``Name`` is a READ declaration, the header spelling of the arriving
+    # ``name``. Behind this observed source the build cannot see it, so the
+    # executor preflight routes every row with the rule's one stable reason,
+    # optional or required alike (before the rule: the value check here, the
+    # input check for the required form below).
+    "hdr_name_intq": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int?",), reasons=_HEADER_SPELLED),
     # Same root cause: this created field was recorded ``authorship: carried``.
     "r3_id_to_hdr_int": _MapperShape(
         "in.csv", _ID_NAME_SENTINEL_CSV, {"id": "Name"}, ("Name: int",), select_only=True, reasons=_routed("Name")
     ),
     # The spelling control: the same rename to a target that is no header.
     "r3_norm_to_other_int": _MapperShape("in.csv", _ID_NAME_SENTINEL_CSV, {"name": "given"}, ("given: int",), reasons=_routed("given")),
-    # A REQUIRED header literal is missing from the normalized input row: the input check routes it.
-    "hdr_name_int": _MapperShape(
-        "in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int",), reasons=frozenset({("contract_violation", None, None, None, None, None)})
-    ),
+    "hdr_name_int": _MapperShape("in.csv", _ID_NAME_CSV, {"Name": "Name"}, ("Name: int",), reasons=_HEADER_SPELLED),
     # An undeclared identity by header is carried under the source's contract (review-S1a-r2 F1).
     "hdr_caseid_select": _MapperShape(
         "in.csv",

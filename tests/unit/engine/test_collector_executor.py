@@ -107,6 +107,11 @@ class _SpanFactorySentinel:
 class _FakeCollectorTransform:
     """A duck-typed BatchTransformProtocol stand-in with test-controllable behaviour."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol spelling surface: this fake declares its required input columns only.
+        return self.schema_required_input_fields()
+
     # `BatchTransformProtocol` REQUIRES these two (plugin_protocols.py:600-601).
     # The fake omitted them for as long as the collector never read them, which
     # is the same blind spot as the defect: nothing on this path validated, so

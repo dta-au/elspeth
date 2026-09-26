@@ -213,6 +213,12 @@ def test_edge_validation_timing_from_plugin_instances() -> None:
 
     class MockSink:
         name: ClassVar[str] = "test_sink"
+
+        @property
+        def declared_read_fields(self) -> frozenset[str]:
+            # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+            return frozenset(self.declared_required_fields)
+
         config: ClassVar[dict[str, Any]] = {}
         input_schema: ClassVar[type[PluginSchema]] = ConsumerSchema  # Needs: id, name, email
         _on_write_failure: str = "discard"

@@ -42,6 +42,12 @@ class _BuilderValidationSourceImpostor:
 
 class _BuilderValidationMockSink:
     name = "mock_sink"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -53,6 +59,17 @@ class _BuilderValidationMockSink:
 
 class _BuilderValidationTransform:
     input_schema = None
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"

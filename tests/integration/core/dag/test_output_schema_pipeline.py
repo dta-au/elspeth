@@ -42,6 +42,11 @@ class MockSource:
 class MockSink:
     """Minimal sink implementing enough of SinkProtocol for the builder."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     name = "mock_sink"
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
@@ -57,6 +62,16 @@ _SENTINEL = object()
 
 class MockFieldAddingTransform:
     """Mock transform with configurable output fields and required inputs."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
 
     input_schema = None
     output_schema = None

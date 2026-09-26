@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NotRequired, Required,
 
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.declaration_contracts import DeclarationContractViolation
+from elspeth.contracts.field_spelling import HEADER_SPELLING_RULE, HeaderSpelling, describe_header_spellings
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 
@@ -594,6 +595,12 @@ TransformErrorCategory = Literal[
     "field_type_mismatch",
     # Field collision (output would overwrite input fields)
     "field_collision",
+    # Field-name spelling rule (operator ruling 2026-09-25): a declaration names
+    # a field by the header spelling of one the arriving row carries. Stable,
+    # value-free codes: the reason carries config literals and their canonical
+    # names only.
+    "declared_field_is_header_spelling",  # a declared READ (schema field, required or column option)
+    "target_is_header_spelling",  # a CREATED name (value_transform target, rename target, output field)
     # Contract violations (schema validation)
     "contract_violation",
     "multiple_contract_violations",
@@ -754,6 +761,7 @@ class TransformErrorReason(TypedDict):
     # Field collision context
     collisions: NotRequired[list[str]]  # Field names that would be overwritten
     fields: NotRequired[list[str]]
+    canonical_fields: NotRequired[list[str]]  # Canonical names of header-spelled declarations, aligned with `fields`
 
     # Multi-query/template context
     query: NotRequired[str]
@@ -1755,6 +1763,50 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
         schema checks render ``contracts.safe_validation_errors``).
         """
         return {"reason": "contract_violation", "error": scrub_text_for_audit(str(self))}
+
+
+# TIER-2: Pipeline configuration fault seen on the arriving row — a declaration spelled by the header of a field the row carries; routed via on_error like the field-collision preflight, never audit corruption.
+class HeaderSpelledDeclarationViolation(PluginContractViolation):
+    """A node declares a field by the header spelling of one the arriving row carries.
+
+    The runtime residual of the field-name spelling rule (operator ruling
+    2026-09-25; ``contracts.field_spelling``). The build refuses the same
+    declaration wherever a participating upstream proves it
+    (``validate_declared_field_spellings``); an abstaining or open upstream is
+    settled here, on the first row whose keys show it. It is the operator's
+    configuration, not our code and not the row's data, so it is Tier 2 and
+    ROUTED at the transform and batch seams (like the collision preflight's
+    "pipeline configuration error"), never a Tier-1 abort; the sink seam, which
+    routes no contract violation, still ends the run with every token's
+    terminal recorded.
+
+    Value-free by construction: the message and reason carry only config
+    literals and their normalized forms, never a row value and never the
+    header the row actually carried (``FieldContract.original_name``, which is
+    row-derived). A stable ``reason`` gives every row one ``error_hash``, so the
+    failure reads as one configuration category, not N row faults.
+    """
+
+    def __init__(self, *, component: str, spellings: tuple[HeaderSpelling, ...]) -> None:
+        if not spellings:
+            raise ValueError("HeaderSpelledDeclarationViolation requires at least one spelling")
+        self.component = component
+        self.spellings = spellings
+        super().__init__(
+            f"{component} declares field names the arriving row carries under their canonical spelling: "
+            f"{describe_header_spellings(spellings)}. {HEADER_SPELLING_RULE} This is a pipeline configuration error."
+        )
+
+    def to_transform_error_reason(self) -> TransformErrorReason:
+        """The routed reason: a stable code, the config literals and their canonical names only."""
+        return {
+            "reason": "target_is_header_spelling"
+            if any(spelling.kind == "create" for spelling in self.spellings)
+            else "declared_field_is_header_spelling",
+            "error": scrub_text_for_audit(str(self)),
+            "fields": [spelling.literal for spelling in self.spellings],
+            "canonical_fields": [spelling.canonical for spelling in self.spellings],
+        }
 
 
 # TIER-2: Plugin success-empty misuse — row-level contract bug remains fully auditable and does not imply Tier-1 framework or audit-record corruption.

@@ -22,6 +22,8 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode
 from elspeth.contracts.enums import NodeType as RuntimeNodeType
+from elspeth.contracts.field_collision import can_overwrite_input_fields
+from elspeth.contracts.field_spelling import HEADER_SPELLING_RULE, describe_header_spellings, header_spelled_declarations
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
@@ -2242,6 +2244,35 @@ def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]
     # Abstain rather than invent: the raw-config union at the call site keeps
     # whatever the schema block declared.
     return declared if declared is not None else frozenset()
+
+
+def _probe_sink_declared_read_fields(output: OutputSpec) -> frozenset[str]:
+    """Read ``plugin``'s ``declared_read_fields`` off a constructed sink (field-name spelling rule).
+
+    Rule S's sink-side input, read from the same property ``core/dag/builder.py``
+    feeds to ``NodeInfo`` for ``validate_declared_field_spellings`` and
+    ``SinkExecutor`` checks per row: the schema's declared names, the declared
+    required fields and the column options a sink names (a custom ``headers``
+    key, dataverse ``field_mapping``). Constructed and abstaining exactly as
+    ``_probe_sink_declared_required_fields`` does, for the same reasons.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+    try:
+        with plugin_preflight_mode(True):
+            sink = get_shared_plugin_manager().create_sink(
+                output.plugin,
+                prepare_validation_probe_options(output.options, plugin=output.plugin),
+            )
+    except Exception as exc:
+        if not _is_sink_config_probe_exception(exc):
+            raise
+        return frozenset()
+    try:
+        return sink.declared_read_fields
+    finally:
+        sink.close()
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -4849,8 +4880,6 @@ def _check_schema_contracts(
         whose options do not yet build is owned by the existing config-validation
         paths, and Rule D must not turn an incomplete draft into a hard error.
         """
-        from elspeth.contracts.field_collision import can_overwrite_input_fields
-
         try:
             transform = probe_cache.transform(plugin, node)
         except Exception as exc:
@@ -7107,6 +7136,150 @@ def _check_schema_contracts(
                 ),
             )
         )
+
+    # Rule S: the field-name spelling rule (operator ruling 2026-09-25). Stage-1
+    # mirror of ``validate_declared_field_spellings`` (core/dag/schema_validation.py),
+    # making the SAME call — ``header_spelled_declarations`` — on the same
+    # plugin-declared surfaces (``declared_read_fields`` / ``declared_created_fields``
+    # read off the constructed instance), so the two cannot disagree about when a
+    # build refuses. ``closed`` is read the way the declared-input block above
+    # reads it: from the producer's own computed schema config's extras firewall;
+    # an unknown producer (draft config, failed probe) reads as open. A consumer
+    # whose producer the walk cannot resolve abstains, and so does a construction
+    # failure — both are owned by other rules, and the runtime residual enforces
+    # the rule per row whatever Stage 1 abstained on.
+    #
+    # Two further abstentions, both recorded in the runtime_rejection_parity
+    # entry for validate_declared_field_spellings. Aggregation and collector
+    # consumers: their batch plugin is not probed here (an aggregation whose
+    # options carry required_input_fields does not construct, and that shape is
+    # refused by its own rule), so Stage 2's real build refuses them. And a
+    # composition with a node cycle, already refused as ``pipeline_cycle``: the
+    # producer vote recurses through pass-through transforms, which a cycle
+    # makes unbounded.
+    spelling_rule_abstains = _node_topology_cycle(nodes) is not None
+
+    def _header_spelling_error(
+        *,
+        component: str,
+        consumer_id: str,
+        consumer_label: str,
+        reads: frozenset[str],
+        creates: frozenset[str],
+        removed: frozenset[str],
+        producer: ProducerEntry,
+    ) -> ValidationEntry | None:
+        participates, vote_fields = _effective_producer_vote(producer)
+        producer_schema = _known_producer_schema_config(producer)
+        spellings = header_spelled_declarations(
+            reads=reads,
+            creates=creates,
+            present=vote_fields,
+            forwarded=vote_fields - removed,
+            participated=participates,
+            closed=producer_schema is not None and not producer_schema.allows_extra_fields,
+        )
+        if not spellings:
+            return None
+        return _err(
+            component,
+            f"Field name header spelling: '{producer.producer_id}' -> '{consumer_id}'. {consumer_label} declares field "
+            f"names its producer carries under their canonical spelling: {describe_header_spellings(spellings)}. "
+            f"{HEADER_SPELLING_RULE}",
+            "high",
+            "field_name_header_spelling",
+            # Config literals only (field names the author wrote), never the
+            # header a row carried: see SchemaContractDetail.
+            contract=SchemaContractDetail(
+                producer=producer.producer_id,
+                consumer=consumer_id,
+                missing_fields=tuple(spelling.literal for spelling in spellings),
+            ),
+        )
+
+    class _SpellingSurfaces(NamedTuple):
+        reads: frozenset[str]
+        creates: frozenset[str]
+        removed: frozenset[str]
+
+    def _probe_transform_spelling_surfaces(plugin: str, node: NodeSpec) -> _SpellingSurfaces | None:
+        """Read the spelling rule's surfaces off the node's shared probe instance, or None.
+
+        Created names only where the write path keeps the input row, in
+        lockstep with the build rule and the executor preflight. A construction
+        failure abstains (None), as the sibling probes do: a draft node whose
+        options do not yet build is owned by the config-validation paths.
+        """
+        try:
+            transform = probe_cache.transform(plugin, node)
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return None
+        creates = (
+            transform.declared_created_fields
+            if can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            )
+            else frozenset()
+        )
+        return _SpellingSurfaces(transform.declared_read_fields, creates, transform.removed_input_fields)
+
+    for node in () if spelling_rule_abstains else nodes:
+        if node.node_type != "transform" or node.plugin is None:
+            continue
+        if node.id in parse_failed_producers:
+            continue
+        surfaces = _probe_transform_spelling_surfaces(node.plugin, node)
+        if surfaces is None:
+            continue
+        spelling_producer = _walk_to_real_producer(node.input, warnings=contract_warnings)
+        if spelling_producer is None or spelling_producer.producer_id in parse_failed_producers:
+            continue
+        spelling_error = _header_spelling_error(
+            component=f"node:{node.id}",
+            consumer_id=node.id,
+            consumer_label=f"Transform '{node.id}' ({node.plugin})",
+            reads=surfaces.reads,
+            creates=surfaces.creates,
+            removed=surfaces.removed,
+            producer=spelling_producer,
+        )
+        if spelling_error is not None:
+            errors.append(spelling_error)
+
+    for output in () if spelling_rule_abstains else outputs:
+        sink_reads = _probe_sink_declared_read_fields(output)
+        if not sink_reads:
+            continue
+        sink_spelling_producers = resolver.sink_producers(output.name)
+        if not sink_spelling_producers:
+            direct_producer = _walk_to_real_producer(output.name, warnings=contract_warnings)
+            sink_spelling_producers = () if direct_producer is None else (direct_producer,)
+        seen_spelling_producers: set[str] = set()
+        for sink_producer in sink_spelling_producers:
+            real_producer = _walk_producer_entry_to_real_producer(
+                sink_producer,
+                connection_name=output.name,
+                warnings=contract_warnings,
+            )
+            if real_producer is None or real_producer.producer_id in seen_spelling_producers:
+                continue
+            seen_spelling_producers.add(real_producer.producer_id)
+            if real_producer.producer_id in parse_failed_producers:
+                continue
+            spelling_error = _header_spelling_error(
+                component=f"output:{output.name}",
+                consumer_id=f"output:{output.name}",
+                consumer_label=f"Sink '{output.name}' ({output.plugin})",
+                reads=sink_reads,
+                creates=frozenset(),
+                removed=frozenset(),
+                producer=real_producer,
+            )
+            if spelling_error is not None:
+                errors.append(spelling_error)
 
     # Eager schema-SYNTAX sweep (elspeth-33738eedb6). Every parser above is
     # LAZY: it resolves a declaration only when some contract comparison needs

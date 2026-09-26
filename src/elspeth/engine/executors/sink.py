@@ -35,6 +35,7 @@ from elspeth.contracts.enums import NodeStateStatus, RoutingMode, RunMode, Termi
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     FrameworkBugError,
+    HeaderSpelledDeclarationViolation,
     OrchestrationInvariantError,
     PluginContractViolation,
     RunLeadershipLostError,
@@ -42,6 +43,7 @@ from elspeth.contracts.errors import (
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
+from elspeth.contracts.field_spelling import header_spelled_row_declarations
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
@@ -510,7 +512,32 @@ class SinkExecutor:
         node_id: str,
         row_contracts: Sequence[SchemaContract | None] | None,
     ) -> None:
-        """Run Layer 1 boundary contracts once per row before sink validation."""
+        """Run Layer 1 boundary contracts once per row before sink validation.
+
+        The field-name spelling rule's runtime residual runs first (operator
+        ruling 2026-09-25): a name this sink declares — schema field, required
+        field, or a column option such as a custom ``headers`` key — that is the
+        header spelling of a field the row carries would never meet it:
+        silently inert when optional, a Tier-1 "missing required field" when
+        required, a crash at write for a custom header key. It is the root cause
+        of what the contracts below would report about the same name, so it
+        speaks first. The build refused every case a participating, closed
+        upstream proves; this settles the rest on the row. It also covers
+        failsink rows: the diversion enrichment adds ``__diversion_*`` keys, which
+        no declaration spells. The sink seam routes no contract violation, so
+        both callers end the run with every token's terminal recorded.
+        """
+        declared_reads = sink.declared_read_fields
+        if declared_reads:
+            for row in rows:
+                spellings = header_spelled_row_declarations(
+                    reads=declared_reads,
+                    creates=(),
+                    row_keys=frozenset(row),
+                    forwarded_keys=(),
+                )
+                if spellings:
+                    raise HeaderSpelledDeclarationViolation(component=f"Sink '{sink.name}'", spellings=spellings)
         for row_index, (token, row) in enumerate(zip(tokens, rows, strict=True)):
             row_contract = None if row_contracts is None else row_contracts[row_index]
             run_boundary_checks(

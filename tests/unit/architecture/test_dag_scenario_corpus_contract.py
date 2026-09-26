@@ -825,7 +825,18 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # stamp, so no count, terminal, projection, resume digest or oracle_freeze
 # snapshot moved. truncate, keyword_filter and type_coerce moved too but no
 # corpus case uses them.
-EXPECTED_CASE_REGISTRY_SHA256 = "f6420d198cbba1913b07e769b63ae5184432cf65b6022a9f5ed6ffebeb6eeced"
+# Rotated 2026-09-26 (elspeth-5887fb7928, field-name spelling rule): a PLUGIN
+# PROVENANCE rotation. value_transform refuses a target that is a header
+# spelling of another of its targets at config, so its source_file_hash moved
+# 89bb2afff7b49a6b -> f645e8e83a012f3f (the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail;
+# scripts/cicd/plugin_hash). type_coerce b83875b8e25d513d -> d6cb511830dd8923
+# (conversion fields are declared inputs) and dataverse 2b76d08ac316a480 ->
+# aade9b9e9425a491 (field_mapping keys are read declarations) have no manifest
+# pin. The production-path and
+# oracle-freeze files pass unchanged, so no resume digest and no oracle_freeze
+# snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
