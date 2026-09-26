@@ -271,9 +271,8 @@ drained and repair this release forward.
   transform whose quarantine record contradicts itself still ends the run
   with `BatchQuarantineContradictionError` (a Tier-1 invariant error). This
   covers malformed `quarantined_indices`, or rows emitted while every input
-  is claimed quarantined. Every buffered row is now recorded `failed` before
-  the run ends; before, a batch that also broke a declaration contract left
-  every row without an outcome.
+  is claimed quarantined. Every buffered row is recorded `failed` before the
+  run ends.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

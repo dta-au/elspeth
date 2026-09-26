@@ -543,7 +543,8 @@ class TestQuarantineContradictionRecordsEveryToken:
         with pytest.raises(BatchQuarantineContradictionError, match="expected int"):
             processor._cross_check_flush_output(fctx, result)
 
-        self._assert_every_token_failed(processor, tokens, failure_kind="quarantine_metadata_invalid")
+        contexts = self._assert_every_token_failed(processor, tokens, failure_kind="quarantine_metadata_invalid")
+        assert {ctx["emitted_row_count"] for ctx in contexts} == {len(rows)}
         assert all(sentinel not in row.context_json for row in _completed_outcomes(processor))
 
     @pytest.mark.parametrize(
