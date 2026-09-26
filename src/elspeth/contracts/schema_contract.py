@@ -34,8 +34,12 @@ def declared_type_admits(declared: type, actual: type) -> bool:
     """Whether a value classified as ``actual`` satisfies a field declared ``declared``.
 
     The ONE rule for checking a value against a declared contract type
-    (``SchemaContract.validate`` is its only caller; every per-row check of a
-    declared type goes through ``validate``). Exact type, with one widening:
+    (every per-row check of a declared type goes through
+    ``SchemaContract.validate``), and the rule the build applies to
+    declarations before any row exists: the DAG edge check
+    (``contracts.data._types_compatible``) and the composer's edge mirror
+    (``declared_type_name_admits``) call it, so what the build admits and what
+    a row passes cannot disagree. Exact type, with one widening:
     an ``int`` satisfies a ``float`` declaration — the numeric tower, and JSON
     has a single number type — which is also what pydantic's strict mode
     admits at every input and output schema check. The value is never
@@ -45,6 +49,17 @@ def declared_type_admits(declared: type, actual: type) -> bool:
     satisfy ``int``.
     """
     return actual is declared or (declared is float and actual is int)
+
+
+def declared_type_name_admits(declared: str, actual: str) -> bool:
+    """``declared_type_admits`` for two contract type NAMES (``"int"``, ``"float"``, ...).
+
+    For a build-time check that compares declarations as written (the
+    composer's field-type strings) rather than annotations or values. A name
+    outside ``CONTRACT_TYPE_MAP`` is a caller bug (a schema DSL ``any`` must be
+    abstained on before asking), so it raises ``KeyError``.
+    """
+    return declared_type_admits(CONTRACT_TYPE_MAP[declared], CONTRACT_TYPE_MAP[actual])
 
 
 @dataclass(frozen=True, slots=True)

@@ -469,19 +469,13 @@ def validate_forgiven_field_ancestor_types(graph: ExecutionGraph) -> None:
         if not forgiven_candidates:
             continue
         producer_guaranteed = walk_effective_guaranteed_fields(graph, from_id, guarantee_cache)
-        # NOTE: consumer strictness read directly for the same Tier-1 reason.
-        consumer_strict = consumer_schema.model_config["strict"]
         for field_name, consumer_field in forgiven_candidates:
             if field_name not in producer_guaranteed:
                 continue
             resolved = resolve_guaranteed_field_type(graph, from_id, field_name, cache=type_cache)
             if resolved is None:
                 continue  # unknowable: the per-row preflight keeps the verdict
-            mismatch = resolved_guarantee_type_mismatch(
-                resolved.field_type,
-                consumer_field.annotation,
-                consumer_strict=consumer_strict,
-            )
+            mismatch = resolved_guarantee_type_mismatch(resolved.field_type, consumer_field.annotation)
             if mismatch is None:
                 continue
             expected_name, actual_name = mismatch
@@ -565,20 +559,13 @@ def validate_observed_producer_declared_types(graph: ExecutionGraph) -> None:
         producer_schema = get_effective_producer_schema(graph, from_id, _cache=schema_cache)
         if producer_schema is not None and producer_schema.model_fields:
             continue  # typed producer: check_compatibility + the forgiven pass own this edge
-        # NOTE: consumer strictness read directly per the Tier-1 trust model —
-        # PluginSchema owns model_config; a missing key would be our bug.
-        consumer_strict = consumer_schema.model_config["strict"]
         for field_name, consumer_field in consumer_schema.model_fields.items():
             if not consumer_field.is_required():
                 continue
             resolved = resolve_guaranteed_field_type(graph, from_id, field_name, cache=type_cache)
             if resolved is None:
                 continue  # unknowable: the per-row preflight keeps the verdict
-            mismatch = resolved_guarantee_type_mismatch(
-                resolved.field_type,
-                consumer_field.annotation,
-                consumer_strict=consumer_strict,
-            )
+            mismatch = resolved_guarantee_type_mismatch(resolved.field_type, consumer_field.annotation)
             if mismatch is None:
                 continue
             expected_name, actual_name = mismatch

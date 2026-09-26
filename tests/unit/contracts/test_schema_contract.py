@@ -558,6 +558,32 @@ class TestSchemaContractValidation:
         assert declared_type_admits(float, int) is True
         assert declared_type_admits(int, float) is False
 
+    @pytest.mark.parametrize(
+        ("declared", "actual", "admitted"),
+        [
+            pytest.param("float", "int", True, id="int-under-float"),
+            pytest.param("float", "float", True, id="exact"),
+            pytest.param("float", "bool", False, id="bool-under-float"),
+            pytest.param("int", "bool", False, id="bool-under-int"),
+            pytest.param("int", "float", False, id="float-under-int"),
+            pytest.param("str", "int", False, id="int-under-str"),
+        ],
+    )
+    def test_the_type_name_twin_is_the_same_rule(self, declared: str, actual: str, admitted: bool) -> None:
+        """``declared_type_name_admits`` answers the composer's type-NAME question with the value rule itself."""
+        from elspeth.contracts.schema_contract import declared_type_admits, declared_type_name_admits
+        from elspeth.contracts.type_normalization import CONTRACT_TYPE_MAP
+
+        assert declared_type_name_admits(declared, actual) is admitted
+        assert declared_type_admits(CONTRACT_TYPE_MAP[declared], CONTRACT_TYPE_MAP[actual]) is admitted
+
+    def test_the_type_name_twin_refuses_a_name_the_caller_should_have_abstained_on(self) -> None:
+        """A schema DSL ``any`` is an abstention the caller makes before asking; asking anyway is a bug."""
+        from elspeth.contracts.schema_contract import declared_type_name_admits
+
+        with pytest.raises(KeyError):
+            declared_type_name_admits("float", "any")
+
     def test_validate_none_matches_nonetype(self) -> None:
         """None value matches type(None) contract."""
         contract = SchemaContract(

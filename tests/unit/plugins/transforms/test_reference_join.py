@@ -816,7 +816,7 @@ class TestJoinedOutputFieldTypes:
         )
         field = _declared_output_field(transform, "response_sla_hours")
         assert field.field_type == "str"
-        assert resolved_guarantee_type_mismatch(field.field_type, str, consumer_strict=True) is None
+        assert resolved_guarantee_type_mismatch(field.field_type, str) is None
 
 
 class TestAuthorDeclarationsOnJoinedFields:

@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic.fields import FieldInfo
 
 from elspeth.contracts.schema import FIELD_TYPE_MAP
+from elspeth.contracts.schema_contract import declared_type_admits
 
 T = TypeVar("T", bound="PluginSchema")
 
@@ -207,10 +208,10 @@ def check_compatibility(
     Compatibility means:
     - All REQUIRED fields in consumer are provided by producer
     - Fields with defaults in consumer are optional
-    - Field types are compatible (exact match or coercible when consumer allows)
+    - Field types are compatible (``_types_compatible``: exact match, or an int
+      producer for a float consumer, the one widening the runtime admits)
     - Consumer constraints are satisfied by producer (e.g., allow_inf_nan=False)
     - If consumer has extra="forbid", producer must not have extra fields
-    - If consumer has strict=True, no type coercion is allowed (int->float rejected)
 
     ``producer_guaranteed`` carries the OTHER knowledge channel: fields the
     graph proves present on every row even though the producer never typed
@@ -255,11 +256,6 @@ def check_compatibility(
     producer_fields = producer_schema.model_fields
     consumer_fields = consumer_schema.model_fields
 
-    # Check if consumer schema is strict (no type coercion allowed)
-    # NOTE: We control all schemas via PluginSchema base class which sets model_config["strict"].
-    # Direct access is correct per Tier 1 trust model - missing key would be our bug.
-    consumer_strict = consumer_schema.model_config["strict"]
-
     # The extras firewall, missing-arm direction: only a producer that admits
     # undeclared fields can deliver a guaranteed-but-undeclared one.
     # NOTE: We control all schemas via PluginSchema base class which sets model_config["extra"].
@@ -280,11 +276,7 @@ def check_compatibility(
                 missing.append(field_name)
         else:
             producer_field = producer_fields[field_name]
-            if not _types_compatible(
-                producer_field.annotation,
-                consumer_field.annotation,
-                consumer_strict=consumer_strict,
-            ):
+            if not _types_compatible(producer_field.annotation, consumer_field.annotation):
                 mismatches.append(
                     (
                         field_name,
@@ -380,29 +372,26 @@ def _unwrap_annotated(annotation: Any) -> Any:
     return current
 
 
-def _types_compatible(
-    actual: Any,
-    expected: Any,
-    *,
-    consumer_strict: bool = False,
-) -> bool:
+def _types_compatible(actual: Any, expected: Any) -> bool:
     """Check if actual type is compatible with expected type.
 
     Handles:
     - Exact matches
     - Any type (accepts everything)
-    - Numeric compatibility (int -> float) - ONLY when consumer_strict=False
+    - The declared-type rule ``declared_type_admits``: an ``int`` producer
+      satisfies a ``float`` consumer, strict or not (ruling C3). It is the one
+      rule the runtime applies to a VALUE (``SchemaContract.validate``, and
+      pydantic strict at every input and output schema check), so the build
+      never refuses what every row would pass. It is not coercion: no value is
+      converted. ``bool`` does not satisfy ``int`` or ``float``, and nothing
+      else widens (a ``float`` does not satisfy ``int``).
     - Optional[X] on consumer side (producer can send X or X | None)
-    - Union types with coercion (int compatible with float | None when not strict)
+    - Union types, member by member under the same rule
     - Annotated[T, ...] unwrapping (metadata stripped before comparison)
 
     Args:
         actual: The producer's output type annotation
         expected: The consumer's input type annotation
-        consumer_strict: If True, no type coercion allowed (int->float rejected).
-                        Respects docs/guides/data-trust-and-error-handling.md
-                        §Coercion Rules by Plugin Type: transforms/sinks must
-                        NOT coerce.
     """
     # Unwrap Annotated metadata before any comparisons.
     # Config-generated schemas may wrap types (e.g., FiniteFloat -> Annotated[float, ...]).
@@ -410,7 +399,7 @@ def _types_compatible(
     actual = _unwrap_annotated(actual)
     expected = _unwrap_annotated(expected)
 
-    # Exact match
+    # Exact match (``==``, not ``is``: parameterized generics compare by value)
     if actual == expected:
         return True
 
@@ -418,22 +407,19 @@ def _types_compatible(
     if expected is Any:
         return True
 
-    # Numeric compatibility (int -> float is OK) - but ONLY when consumer allows coercion
-    # Per docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin
-    # Type, transforms/sinks with strict=True must NOT coerce
-    if expected is float and actual is int:
-        return not consumer_strict
+    if declared_type_admits(expected, actual):
+        return True
 
     # Handle Optional/Union types (both typing.Union and types.UnionType)
     if _is_union_type(expected):
         expected_args = get_args(expected)
-        # Check if actual type matches any of the union members (with coercion rules)
-        if any(_types_compatible(actual, expected_member, consumer_strict=consumer_strict) for expected_member in expected_args):
+        # Check if actual type matches any of the union members
+        if any(_types_compatible(actual, expected_member) for expected_member in expected_args):
             return True
         # Check if actual is a Union where all members are compatible
         if _is_union_type(actual):
             actual_args = get_args(actual)
-            return all(any(_types_compatible(a, e, consumer_strict=consumer_strict) for e in expected_args) for a in actual_args)
+            return all(any(_types_compatible(a, e) for e in expected_args) for a in actual_args)
 
     return False
 
@@ -441,8 +427,6 @@ def _types_compatible(
 def resolved_guarantee_type_mismatch(
     field_type: str,
     consumer_annotation: Any,
-    *,
-    consumer_strict: bool,
 ) -> tuple[str, str] | None:
     """Compare a guarantee-channel ancestor declaration against a consumer field.
 
@@ -450,7 +434,7 @@ def resolved_guarantee_type_mismatch(
     nearest ancestor declaration IS knowable (``ResolvedGuaranteeType``,
     ``core.dag.guarantees``), this applies the declared type-mismatch arm's
     compatibility policy — same ``FIELD_TYPE_MAP`` materialization, same
-    ``_types_compatible`` coercion rules, same ``_type_name`` spelling — on
+    ``_types_compatible`` rule, same ``_type_name`` spelling — on
     the BASE type alone. Nullability is deliberately excluded: the two
     declared-arm materializations disagree about it (the coalesce factory
     folds ``nullable``/optional into ``| None``, the plugin factory reads
@@ -468,6 +452,6 @@ def resolved_guarantee_type_mismatch(
     if field_type == "any":
         return None
     actual = FIELD_TYPE_MAP[field_type]
-    if _types_compatible(actual, consumer_annotation, consumer_strict=consumer_strict):
+    if _types_compatible(actual, consumer_annotation):
         return None
     return (_type_name(consumer_annotation), _type_name(actual))

@@ -98,7 +98,10 @@ drained and repair this release forward.
   a declared or locked type is checked (a `bool` never does, and no value is
   converted): an observed source that locked a field `float` admits a later
   `int` instead of quarantining the row, and a transform output declared
-  `float` that holds an `int` is delivered instead of routed. The meaning of
+  `float` that holds an `int` is delivered instead of routed. The build-time
+  edge check and the Composer's edge mirror apply the same rule, so a producer
+  declaring `x: int` into a consumer declaring `x: float` now builds instead of
+  being refused as a type mismatch. The meaning of
   `nodes.output_contract_json` changes for transform nodes to "the declared
   output contract, field set evolving", so contract `version_hash`es and the
   LLM prompt `contract_hash` differ from earlier runs. Aggregation and

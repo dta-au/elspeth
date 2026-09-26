@@ -36,6 +36,7 @@ from elspeth.contracts.schema import (
     node_type_nests_contract_options,
     raw_options_have_schema,
 )
+from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.contracts.sink import (
     FAILSINK_ELIGIBLE_PLUGIN_TEXT,
     FAILSINK_ELIGIBLE_SINK_PLUGINS,
@@ -6418,7 +6419,10 @@ def _check_schema_contracts(
         Comparing declared type strings cannot drift that way because it
         reconstructs nothing. It is deliberately the weaker check: it abstains
         wherever either side declares ``any``, and it does not model coercion.
-        Under-rejecting is the correct direction here — the runtime remains
+        The two names are compared by ``declared_type_name_admits``, the
+        runtime's one declared-type rule (an ``int`` producer satisfies a
+        ``float`` consumer; ``bool`` satisfies neither), so this mirror and the
+        DAG edge check admit exactly the same pairs. Under-rejecting is the correct direction here — the runtime remains
         authoritative, and a false red misdirects the authoring loop while a
         missed one is caught downstream.
 
@@ -6470,7 +6474,7 @@ def _check_schema_contracts(
             if field_def.field_type == "any":
                 continue
             producer_type = _resolved_producer_field_type(producer, field_def.name, source_map=source_map)
-            if producer_type is not None and producer_type != field_def.field_type:
+            if producer_type is not None and not declared_type_name_admits(field_def.field_type, producer_type):
                 mismatches.append((field_def.name, field_def.field_type, producer_type))
         if not mismatches:
             return None
