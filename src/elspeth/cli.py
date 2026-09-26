@@ -4489,6 +4489,7 @@ def join(
         active_db = follower_db if follower_db is not None else db
 
         # Build and run the follower processor.
+        from elspeth.contracts.config import RuntimeRetryConfig
         from elspeth.contracts.plugin_context import PluginContext
         from elspeth.core.config import AggregationSettings as _AggregationSettings
         from elspeth.core.landscape.factory import RecorderFactory
@@ -4532,6 +4533,7 @@ def join(
             payload_store=payload_store,
             concurrency_config=follower_concurrency_config,
             telemetry=follower_telemetry_manager,
+            retry_config=RuntimeRetryConfig.from_settings(settings_config.retry),
         )
 
         ctx = PluginContext(

@@ -7519,7 +7519,12 @@ class TestExecuteTransformNoRetry:
         assert routing_reason_payload["error"] == "<redacted-secret>"
 
         # Settle the direct executor's claim before taking an immutable export.
-        factory.scheduler.mark_failed(
+        # The row was routed to its error sink, which this harness never
+        # runs; settle the claim TERMINAL as that sink write would (the
+        # sibling scheduler test does the same). A FAILED item is a claim
+        # that died mid-row, and complete_run refuses a success over one
+        # whose token has no outcome.
+        factory.scheduler.mark_terminal(
             member_token=ctx.require_member_token(),
             work_item_id=ctx.require_work_item().work_item_id,
             expected_lease_owner=ctx.require_member_token().worker_id,
@@ -7755,7 +7760,12 @@ class TestExecuteTransformNoRetry:
         assert routing_reason_payload == result.reason
 
         # Settle the direct executor's claim before taking an immutable export.
-        factory.scheduler.mark_failed(
+        # The row was routed to its error sink, which this harness never
+        # runs; settle the claim TERMINAL as that sink write would (the
+        # sibling scheduler test does the same). A FAILED item is a claim
+        # that died mid-row, and complete_run refuses a success over one
+        # whose token has no outcome.
+        factory.scheduler.mark_terminal(
             member_token=ctx.require_member_token(),
             work_item_id=ctx.require_work_item().work_item_id,
             expected_lease_owner=ctx.require_member_token().worker_id,

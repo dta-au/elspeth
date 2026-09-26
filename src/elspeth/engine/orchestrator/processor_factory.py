@@ -162,6 +162,7 @@ def build_row_processor(
     barrier_restore: BarrierJournalRestoreContext | None = None,
     coordination_token: CoordinationToken | None = None,
     member_token: WorkerMembershipToken | None = None,
+    follower_retry_config: RuntimeRetryConfig | None = None,
 ) -> tuple[RowProcessor, dict[CoalesceName, NodeID], CoalesceExecutor | None]:
     """Build a RowProcessor with all supporting infrastructure.
 
@@ -175,8 +176,10 @@ def build_row_processor(
     Mode gates (LEADER behavior is unchanged; FOLLOWER matches the old
     follower.py hand assembly kwarg-for-kwarg):
 
-    - retry_manager: FOLLOWER never constructs one (follower passes
-      ``settings=None`` anyway; the explicit gate documents the intent).
+    - retry_manager: FOLLOWER builds it from ``follower_retry_config`` — the
+      run's ``settings.retry``, which admission's config_hash check makes equal
+      to the leader's — and refuses to build without it; any other mode builds
+      it from ``settings.retry`` and refuses a ``follower_retry_config``.
     - coalesce executor: FOLLOWER gets ``coalesce_executor=None`` even on a
       coalesce graph, WITHOUT the settings.coalesce raise — the barrier/
       coalesce plane is leader-only (ADR-030 §B.2).
@@ -203,9 +206,25 @@ def build_row_processor(
     from elspeth.engine.coalesce_executor import CoalesceExecutor
     from elspeth.engine.tokens import TokenManager
 
+    # One retry authority: the run's settings.retry. A follower has no
+    # ElspethSettings here (settings=None keeps the leader-only coalesce and
+    # barrier planes off), so it is handed the same RuntimeRetryConfig its
+    # admitted config_hash guarantees equals the leader's. The authority is
+    # enforced both ways: a follower without it, or a leader/resume processor
+    # handed a second one beside its settings, is a wiring bug.
     retry_manager: RetryManager | None = None
-    if settings is not None and mode is not ProcessorMode.FOLLOWER:
-        retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry))
+    if mode is ProcessorMode.FOLLOWER:
+        if follower_retry_config is None:
+            raise OrchestrationInvariantError("A follower row processor requires the run's retry config")
+        retry_manager = RetryManager(follower_retry_config)
+    else:
+        if follower_retry_config is not None:
+            raise OrchestrationInvariantError(
+                f"follower_retry_config was passed to a {mode.value!r}-mode row processor; only a follower takes it "
+                "(the leader and resume paths read the run's settings.retry)"
+            )
+        if settings is not None:
+            retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry))
 
     # Derive coalesce routing from graph topology unconditionally.
     # If the graph has coalesce nodes, the processor needs branch_to_coalesce

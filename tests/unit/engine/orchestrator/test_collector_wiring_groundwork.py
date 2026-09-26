@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from elspeth.config_loading import load_settings_from_yaml_string
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -238,6 +239,11 @@ def _build_processor(graph: ExecutionGraph, config: PipelineConfig, settings: El
         coordination_token=leader if mode is ProcessorMode.LEADER else None,
         scheduler_lease_owner="follower-1" if mode is ProcessorMode.FOLLOWER else None,
         member_token=member if mode is ProcessorMode.FOLLOWER else None,
+        follower_retry_config=(
+            RuntimeRetryConfig(max_attempts=3, base_delay=0.01, max_delay=0.1, jitter=0.0, exponential_base=2.0)
+            if mode is ProcessorMode.FOLLOWER
+            else None
+        ),
     )
     return processor
 

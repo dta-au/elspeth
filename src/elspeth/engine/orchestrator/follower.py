@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from elspeth.contracts import RowResult
-    from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
+    from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig, RuntimeRetryConfig
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape.factory import RecorderFactory
@@ -498,6 +498,7 @@ def build_follower_processor(
     telemetry: TelemetryManagerProtocol | None = None,
     scheduler_lease_seconds: int = 300,
     scheduler_heartbeat_seconds: int = 60,
+    retry_config: RuntimeRetryConfig,
 ) -> FollowerProcessor:
     """Assemble a follower-mode :class:`FollowerProcessor`.
 
@@ -511,6 +512,8 @@ def build_follower_processor(
     - ``barrier_restore=None`` — no barrier memory
     - ``coalesce_executor=None`` — no coalesce executor (leader-only plane;
       no settings.coalesce required even on a coalesce graph)
+    - ``follower_retry_config=retry_config`` — the run's retry policy (one
+      retry authority; the follower has no ``ElspethSettings`` here)
     - ``aggregation_settings={}`` — no trigger evaluation (barrier counting is
       leader-only per §B.2); ``follower_barrier_node_ids`` carries the
       aggregation node ID set so the processor intercepts batch-aware transforms
@@ -544,6 +547,11 @@ def build_follower_processor(
         telemetry: Runtime telemetry manager shared with executor traversal.
         scheduler_lease_seconds: Item lease TTL (default 300 s).
         scheduler_heartbeat_seconds: Item heartbeat cadence (default 60 s).
+        retry_config: The run's retry policy, built from the admitted
+            settings' ``retry`` block (``RuntimeRetryConfig.from_settings``).
+            Admission requires the follower's config_hash to equal the run's,
+            so this is the leader's own policy: a transient failure is retried
+            the same way whichever process claimed the row.
 
     Returns:
         A :class:`FollowerProcessor` ready to drive via :meth:`FollowerProcessor.run`.
@@ -610,7 +618,8 @@ def build_follower_processor(
     processor, _coalesce_node_map, _coalesce_executor = build_row_processor(
         graph=graph,
         config=config,
-        settings=None,  # follower: no retry policy, no coalesce registration
+        settings=None,  # follower: no coalesce registration
+        follower_retry_config=retry_config,  # the run's settings.retry (config_hash-equal to the leader's)
         factory=factory,
         run_id=run_id,
         source_id=source_id,

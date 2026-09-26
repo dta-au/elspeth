@@ -52,6 +52,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunMembershipLostError
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
@@ -1211,6 +1212,7 @@ def _run_real_follower(
         clock=clock,
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
+        retry_config=RuntimeRetryConfig.from_settings(settings.retry),
     )
     ctx = PluginContext(
         run_id=run_id,

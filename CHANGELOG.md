@@ -261,6 +261,17 @@ drained and repair this release forward.
   (`output_mode: passthrough`). In `transform` mode the check cannot tie an
   output row to the row it came from, so dropping a field that only some
   buffered rows carried is not detected there.
+- **A follower started with `elspeth join` retries transient failures.** It
+  applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
+  network error or a lost template render worker is retried there instead of
+  sending the row to `on_error` after one attempt (`transient_error_no_retry`).
+  A row re-claimed after its lease was reaped now starts above every attempt
+  the lost claim recorded; before, a re-claim after an in-claim retry
+  re-inserted a recorded attempt, the reclaiming process stopped with a Tier-1
+  `LandscapeRecordError` and the row was left with no outcome (reachable in a
+  resume of a leader that died mid-retry). A run can no longer be finalised
+  successful while a row whose claim died mid-row has no outcome: it now ends
+  `FAILED` instead of `COMPLETED`.
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:
   `settings.yaml` routes all three rows, with their original values, to the

@@ -27,6 +27,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import Determinism, PipelineRow
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.config import QueueSettings, SourceSettings, TransformSettings
@@ -225,6 +226,7 @@ def _run_follower_attempt(
             clock=clock,
             scheduler_lease_seconds=_LEASE_SECONDS,
             scheduler_heartbeat_seconds=_HEARTBEAT_SECONDS,
+            retry_config=RuntimeRetryConfig(max_attempts=3, base_delay=0.01, max_delay=0.1, jitter=0.0, exponential_base=2.0),
         )
         ctx = PluginContext(
             run_id=run_id,

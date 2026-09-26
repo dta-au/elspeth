@@ -641,7 +641,7 @@ class SchedulerDrainCoordinator:
                                 coalesce_node_id=item.coalesce_node_id,
                                 coalesce_name=item.coalesce_name,
                                 on_success_sink=item.on_success_sink,
-                                attempt_offset=max(claimed.attempt - 1, 0),
+                                attempt_offset=self.claim_attempt_offset(claimed, item.token),
                                 row_union_node_id=item.row_union_node_id,
                                 row_union_name=item.row_union_name,
                                 collector_name=item.collector_name,
@@ -895,6 +895,50 @@ class SchedulerDrainCoordinator:
                 return
             results.append(self.row_result_from_pending_sink(pending_sink))
 
+    def claim_attempt_offset(self, claimed: TokenWorkItem, token: TokenInfo) -> int:
+        """The node_state attempt base for a READY claim, derived from the Tier-1 record.
+
+        The executors write ``token.resume_attempt_offset + offset + i``, where
+        ``i`` is the RetryManager's index inside this ONE claim. The two attempt
+        axes move independently: a retry adds node_states without touching the
+        scheduler attempt, and a lease rotation adds exactly one to the
+        scheduler attempt however many node_states the lost claim wrote. So the
+        scheduler attempt is only a lower bound. A re-claim (``claimed.attempt >
+        1``) whose lost claim retried must start above what that claim
+        recorded, or it re-inserts an attempt already on
+        ``UNIQUE(token_id, step_index, attempt)``, raises Tier-1 and strands the
+        token with no outcome.
+
+        **Token scope, not step scope.** One claim runs the token through
+        every node up to its next hand-off, and the lost claim may have written
+        at several of them. A single base for the whole re-drive is collision
+        free only if it is above the token's maximum over ALL steps; a base read
+        at one node collides at another (retries at N, lease lost at M). The
+        price is attempt-number fidelity: the attempt can jump past numbers at
+        nodes the lost claim never reached. Uniqueness wins that trade here.
+        The pending-sink re-drive (:meth:`row_result_from_pending_sink`) makes
+        the opposite choice because it writes at ONE step, the sink, where a
+        step-scoped maximum is already collision free.
+
+        **One total base.** A restored token already carries
+        ``resume_attempt_offset = recorded max + 1``, so the recorded maximum
+        is compared against the TOTAL base and only the shortfall is added
+        here; a token restored with nothing written since keeps the plain
+        rotation offset. A first claim (``claimed.attempt == 1``) has nothing to
+        rise above: the token's attempts at earlier nodes (the source's
+        attempt 0 among them) are at other steps.
+
+        Reclaim provenance needs no resume checkpoint: the rotation is
+        already recorded by the ``recover_expired_lease`` scheduler event.
+        """
+        rotation_offset = max(claimed.attempt - 1, 0)
+        if claimed.attempt <= 1:
+            return rotation_offset
+        recorded = self._barrier_restore_reads.get_max_node_state_attempts(self._run_id, [claimed.token_id])
+        if claimed.token_id not in recorded:
+            return rotation_offset
+        return max(rotation_offset, recorded[claimed.token_id] + 1 - token.resume_attempt_offset)
+
     def row_result_from_pending_sink(self, scheduled: TokenWorkItem) -> RowResult:
         """Rebuild a sink-bound row result without re-running its producer node."""
         if scheduled.pending_sink_name is None or scheduled.pending_outcome is None or scheduled.pending_path is None:
@@ -904,7 +948,8 @@ class SchedulerDrainCoordinator:
         # opening attempt 0), the re-driven sink write must run at the bumped
         # attempt or its node_state insert collides with audited history.
         # Scoped to the sink step — the only step a pending-sink re-drive
-        # writes; producer-node attempts must not inflate the offset.
+        # writes; producer-node attempts must not inflate the offset. (A READY
+        # re-claim is token-scoped instead; claim_attempt_offset states why.)
         max_attempts = self._barrier_restore_reads.get_max_node_state_attempts(
             self._run_id,
             [scheduled.token_id],
@@ -918,6 +963,9 @@ class SchedulerDrainCoordinator:
             # normal first-attempt case, not corruption. The provenance guard
             # below still rejects offset > 0 without a resume checkpoint.
             attempt_offset = 0
+        # This provenance guard covers the pending-sink re-drive only. A READY
+        # re-claim after a lease rotation legitimately starts above attempt 0
+        # with no checkpoint: its provenance is the recover_expired_lease event.
         if attempt_offset > 0 and self._resume_checkpoint_id is None:
             raise AuditIntegrityError(
                 f"Scheduler pending sink token {scheduled.token_id!r} (run {self._run_id!r}) already has "

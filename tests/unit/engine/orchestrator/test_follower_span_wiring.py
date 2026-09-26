@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import LeaderInfo, WorkerMembershipToken
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.plugin_context import PluginContext
@@ -161,6 +162,7 @@ def test_builder_emits_follower_row_as_root_in_durable_run_trace() -> None:
             config=config,  # type: ignore[arg-type]
             payload_store=object(),  # type: ignore[arg-type]
             telemetry=telemetry,  # type: ignore[arg-type]
+            retry_config=RuntimeRetryConfig(max_attempts=3, base_delay=0.01, max_delay=0.1, jitter=0.0, exponential_base=2.0),
         )
         follower.run(PluginContext(run_id=_RUN_ID, config={}, landscape=None))
 

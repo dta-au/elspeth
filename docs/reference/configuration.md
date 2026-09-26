@@ -1187,14 +1187,13 @@ render only, never to waiting for or starting a worker:
   get less, the run stops as an ELSPETH failure.
 - **Worker lost.** A worker ended by a signal the row did not cause (the
   kernel's out-of-memory killer, an operator's `kill`, a crash) raises a
-  retryable error, `Template worker was stopped by signal N`. In `elspeth run`
-  the run's [retry settings](#retry-settings) retry the row on a new worker,
-  and the row goes to `on_error` only when the retries are used up. A follower
-  started with `elspeth join` applies no retry settings, so a row it processes
-  goes to `on_error` after the first lost worker, as it does for any other
-  retryable error there. A multi-query LLM node with a `pool_size` above 1
-  retries the one query itself within `max_capacity_retry_seconds`. A worker
-  that exits with no signal and no reply stops the run as an ELSPETH failure.
+  retryable error, `Template worker was stopped by signal N`. The run's
+  [retry settings](#retry-settings) retry the row on a new worker, in
+  `elspeth run` and on a follower started with `elspeth join` alike, and the
+  row goes to `on_error` only when the retries are used up. A multi-query LLM
+  node with a `pool_size` above 1 retries the one query itself within
+  `max_capacity_retry_seconds`. A worker that exits with no signal and no
+  reply stops the run as an ELSPETH failure.
 
 Stopping a run with Ctrl-C (SIGINT) or SIGTERM lets a template render already
 in progress finish. systemd's default stop sends SIGTERM to every process in
@@ -3111,6 +3110,24 @@ retry:
 | `exponential_base` | float | `2.0` | Exponential backoff base |
 
 Delay calculation: `min(initial_delay * base^attempt, max_delay)`
+
+A follower started with `elspeth join` applies these settings too. Admission
+requires the follower's settings to hash equal to the run's, so a transient
+failure is retried the same way whichever process claimed the row, and each
+attempt is recorded as its own node state.
+
+**Retry time and the row's lease.** A row's attempts and backoff waits run
+inside one claim. The claim's lease (300 seconds) is refreshed after each
+attempt, at most once per heartbeat interval (60 seconds), so the longest
+stretch without a refresh is one attempt plus one backoff wait, or the
+heartbeat interval when that is longer. Another worker reclaims a live
+worker's row only when a stretch outlasts the lease plus the stall budget
+(300 + 600 seconds). The reclaimed row then runs again from its node under a
+new attempt number, and its external calls are made again, so keep
+`max_delay_seconds` plus your slowest attempt well under 15 minutes.
+`max_delay_seconds` has no upper bound. A follower waiting out a backoff
+notices that its leader has gone or that the run has finished only when the
+wait ends, at most `max_delay_seconds` later.
 
 ---
 

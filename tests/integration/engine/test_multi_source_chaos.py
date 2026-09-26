@@ -55,6 +55,7 @@ from sqlalchemy import and_, select, update
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
@@ -704,7 +705,13 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
         run_id=run.run_id, worker_id="worker:chaos-follower", config_hash=stable_hash({}), window_seconds=80
     )
     follower = build_follower_processor(
-        factory=factory, member_token=member, graph=graph, config=config, payload_store=payload_store, clock=clock
+        factory=factory,
+        member_token=member,
+        graph=graph,
+        config=config,
+        payload_store=payload_store,
+        clock=clock,
+        retry_config=RuntimeRetryConfig(max_attempts=3, base_delay=0.01, max_delay=0.1, jitter=0.0, exponential_base=2.0),
     )
     ctx = PluginContext(
         run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), payload_store=payload_store, member_token=member

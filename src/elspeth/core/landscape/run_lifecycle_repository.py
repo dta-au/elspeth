@@ -756,8 +756,11 @@ class RunLifecycleRepository:
            (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY) it carries the
            in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
            PENDING_SINK token_work_items)`` so a run can never be stamped
-           successful over residual scheduler work; FAILED/INTERRUPTED check
-           only fence + immutability (the journal is left intact for resume);
+           successful over residual scheduler work, and a second arm
+           ``NOT EXISTS (FAILED token_work_items whose token has no completed
+           token_outcomes row)`` so it is never stamped successful over a row
+           whose claim died mid-row; FAILED/INTERRUPTED check only fence +
+           immutability (the journal is left intact for resume);
         4. ADR-038 abandonment of undecided tokens when the run is
            non-resumable, plus fail-open of effect-linked operations;
         5. follower departure hygiene (no-op at N=1) + ``worker_depart``
@@ -780,7 +783,8 @@ class RunLifecycleRepository:
             AuditIntegrityError: If status is not a terminal run status
             AuditIntegrityError: If the run is not found or already terminal
             OrchestrationInvariantError: If a SUCCESS finalize found residual
-                scheduler work (quiescence violation)
+                scheduler work, or a FAILED work item whose token has no
+                terminal outcome (quiescence violation)
             RunLeadershipLostError: If ``coordination_token`` is stale
         """
         if status not in _TERMINAL_RUN_STATUSES:
@@ -898,9 +902,27 @@ class RunLifecycleRepository:
             .scalars()
             .all()
         )
-        # The SUCCESS quiescence arm rides in the SAME statement as the stamp;
+        # FAILED is a disposition, not a fate: every FAILED item's token must
+        # already carry its completed terminal outcome (a routed failure
+        # records it before mark_failed). A FAILED item whose token has none
+        # is a claim that died mid-row (the drain's exception arm marks it
+        # FAILED and the worker exits) — the row never reached an outcome, and
+        # FAILED is absent from the active-status arm.
+        outcomeless_failed_tokens = (
+            select(token_work_items_table.c.token_id)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.FAILED.value)
+            .where(
+                ~select(token_outcomes_table.c.outcome_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.token_id == token_work_items_table.c.token_id)
+                .where(token_outcomes_table.c.completed == 1)
+                .exists()
+            )
+        )
+        # The SUCCESS quiescence arms ride in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
-        quiescence_clauses = [~residual_work_exists] if is_success_status else []
+        quiescence_clauses = [~residual_work_exists, ~outcomeless_failed_tokens.exists()] if is_success_status else []
         state_llm_calls = (
             select(func.count())
             .select_from(calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id))
@@ -926,12 +948,21 @@ class RunLifecycleRepository:
                 raise _already_terminal_error(run_id, str(existing.status))
             if existing is None:
                 raise AuditIntegrityError(f"Cannot complete run {run_id}: run not found")
-            # Run exists, not terminal ⇒ the quiescence arm refused
+            # Run exists, not terminal ⇒ a quiescence arm refused
             # (only reachable for SUCCESS statuses).
+            if conn.execute(select(residual_work_exists)).scalar_one():
+                raise OrchestrationInvariantError(
+                    f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
+                    "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
+                    "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+                )
+            outcomeless_tokens = (
+                conn.execute(outcomeless_failed_tokens.order_by(token_work_items_table.c.token_id).limit(10)).scalars().all()
+            )
             raise OrchestrationInvariantError(
-                f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
-                "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
-                "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+                f"Cannot complete run {run_id} as {status.value!r}: FAILED scheduler work whose token has no "
+                f"terminal outcome exists (tokens {list(outcomeless_tokens)!r}, first 10). A claim died mid-row; "
+                "a run cannot be stamped successful while a row has not reached a recorded outcome."
             )
 
         # ADR-038 fate decision: the terminal stamp above succeeded, so the
