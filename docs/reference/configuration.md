@@ -1257,6 +1257,22 @@ The `<response_field>_variables_hash` an LLM node records is the SHA-256 of
 what its template could see: the declared field values (for a query, its
 variables and its `row.source_row`).
 
+**RAG query templates.** A `query_template` on `rag_retrieval` or
+`azure_ai_search` sees `query` (the `query_field` value) and `row`, and the
+rules above apply with one difference: `query_field` is always declared,
+because the node reads it by its own option.
+
+| `required_input_fields` | the query template's `row` holds |
+|---|---|
+| a list, e.g. `[topic]` | those fields and `query_field` |
+| `[]` (the opt-out) | every field of the row |
+| omitted | `query_field` only |
+
+Configuration refuses a literal read outside that set, a computed key, a name
+other than `query` or `row`, and fields declared beyond `query_field` when
+the template never reads `row`. Declare only the fields the query uses: the
+query field needs no declaration.
+
 `provider: azure` adds:
 
 | Option | Type | Required | Default | Description |

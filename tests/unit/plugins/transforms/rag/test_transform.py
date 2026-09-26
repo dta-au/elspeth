@@ -460,6 +460,49 @@ def _setup_transform_with_mock_provider(chunks=None, **config_overrides):
     return transform, mock_provider
 
 
+class TestQueryTemplateSeesOnlyDeclaredFields:
+    """What a real ``process`` sends the search provider holds only the declared fields (ADR-051 (f)).
+
+    The template is one configuration admits under a declaration (the r3
+    tuple-unpack escape, invisible to the static analysis); ``[]`` is the
+    positive control that the provider fake would see an undeclared value.
+    """
+
+    _SENTINEL = "SENTINEL-P3-transform-9b2"
+    _ESCAPE = "{{ query }} {% for a, b in [(1, [row])] %}{{ b[0] | dictsort }}{% endfor %}"
+
+    def _query_sent(self, **config: Any) -> str:
+        transform, provider = _setup_transform_with_mock_provider(
+            [RetrievalChunk(content="c", score=0.9, source_id="d", metadata={})], query_template=self._ESCAPE, **config
+        )
+        result = transform.process(_make_row({"question": "q?", "topic": "t", "secret": self._SENTINEL}), _mock_ctx())
+        assert result.status == "success"
+        [call] = provider.search_calls
+        return str(call["query"])
+
+    def test_a_declared_list_sends_only_the_declared_fields_and_the_query_field(self) -> None:
+        assert self._query_sent(required_input_fields=["topic"]) == "q? [('question', 'q?'), ('topic', 't')]"
+
+    def test_an_omitted_declaration_sends_only_the_query_field(self) -> None:
+        assert self._query_sent() == "q? [('question', 'q?')]"
+
+    def test_the_opt_out_sends_the_whole_row(self) -> None:
+        assert self._SENTINEL in self._query_sent(required_input_fields=[])
+
+    def test_an_undeclared_read_the_analysis_cannot_see_routes_value_free(self) -> None:
+        transform, provider = _setup_transform_with_mock_provider(
+            query_template="{{ query }} {% for v in [[row]] %}{{ v[0].secret }}{% endfor %}", required_input_fields=["question"]
+        )
+        result = transform.process(_make_row({"question": "q?", "secret": self._SENTINEL}), _mock_ctx())
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "template_rendering_failed",
+            "error": "Undeclared field: the template reads 'secret', a field this node does not declare in required_input_fields",
+            "field": "question",
+        }
+        assert provider.search_calls == []
+
+
 class TestProcessFlow:
     def test_successful_retrieval(self):
         chunks = [

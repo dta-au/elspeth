@@ -345,6 +345,8 @@ def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp
             "output_prefix": "kb",
             "query_field": "question",
             "query_template": "{{ query }} {{ row[row.k] }}",
+            # A computed key is admitted only under the opt-out, the whole row (ADR-051).
+            "required_input_fields": [],
             "provider": "chroma",
             "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
             "schema_config": {"mode": "observed"},
@@ -378,7 +380,10 @@ def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp
     )
     assert json.loads(transform_error.error_details_json) == {
         "reason": "template_rendering_failed",
-        "error": "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>",
+        "error": (
+            "Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute "
+            "<a key the template does not spell out>"
+        ),
         "field": "question",
     }
     assert _audit_cells_containing(db, _TEMPLATE_KEY_SENTINEL) == [("transform_errors", "row_data_json")]

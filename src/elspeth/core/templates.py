@@ -70,10 +70,12 @@ if TYPE_CHECKING:
 __all__ = [
     "DYNAMIC_ROW_FIELD",
     "Jinja2FieldExtraction",
+    "describe_dynamic_row_access",
     "extract_jinja2_field_usage",
     "extract_jinja2_fields",
     "extract_jinja2_fields_with_details",
     "extract_jinja2_fields_with_names",
+    "template_loads_name",
 ]
 
 DYNAMIC_ROW_FIELD = "<dynamic-row-field>"
@@ -90,6 +92,38 @@ CARRIER_LIMIT_DYNAMIC_ACCESS = "carrier-limit"
 # no alias records more than this many paths, and a template whose analysis
 # reaches the cap reports CARRIER_LIMIT_DYNAMIC_ACCESS instead of being trusted.
 _MAX_CARRIER_PATHS_PER_ALIAS = 256
+
+# How a configuration refusal names each dynamic-access kind to the author.
+# One table for every template surface that refuses dynamic row access (the
+# LLM prompt and the RAG query template), so a kind added to the analysis
+# cannot be described on one surface and a KeyError on the other.
+_DYNAMIC_ACCESS_EXAMPLES: dict[str, str] = {
+    ATTR_FILTER_DYNAMIC_ACCESS: "row|attr(expr)",
+    CARRIER_LIMIT_DYNAMIC_ACCESS: "a variable or macro argument that holds itself, too deep to follow",
+    "get": "row.get(expr)",
+    "item": "row[expr]",
+    MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS: "map(attribute=expr)",
+    ROW_API_DYNAMIC_ACCESS: "row API",
+}
+
+
+def describe_dynamic_row_access(dynamic_accesses: Iterable[str]) -> str:
+    """``"<kinds> via <examples>"`` for a template's dynamic row accesses, sorted and deduplicated."""
+    kinds = sorted(set(dynamic_accesses))
+    return f"{', '.join(kinds)} via {', '.join(_DYNAMIC_ACCESS_EXAMPLES[kind] for kind in kinds)}"
+
+
+def template_loads_name(template_string: str, name: str) -> bool:
+    """Whether the template reads the variable ``name`` anywhere, in any form.
+
+    ``row.x``, ``row | dictsort``, ``[row]`` and ``m(row)`` all load ``row``;
+    a template that never loads it cannot see a single row field, whatever its
+    node declares. Raises ``TemplateSyntaxError`` for text that does not parse.
+    """
+    validate_jinja_source(template_string)
+    ast = _create_field_extraction_environment().parse(template_string)
+    return any(node.name == name and node.ctx == "load" for node in ast.find_all(Name))
+
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})

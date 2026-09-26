@@ -41,6 +41,8 @@ _EXPECTED_MESSAGE_QUOTING_ENVIRONMENTS = Counter(
     {
         "plugins/sinks/azure_blob_sink.py": 2,
         "plugins/transforms/llm/base.py": 3,
+        # RetrievalOutputConfig parses the query template for its unbound names: config text only.
+        "plugins/transforms/rag/core.py": 1,
         "plugins/sources/llm/config.py": 2,
         "web/composer/state.py": 2,
     }
@@ -122,16 +124,22 @@ def test_a_message_quoting_environment_never_renders_a_row() -> None:
 # ---------------------------------------------------------------------------
 
 # Where a PipelineRow becomes a TemplateRow, and where a node's declaration is
-# read as a projection. RAG's query_template joins both when it is projected
-# (the RAG-projection unit); its ``QueryBuilder.build(row.to_dict())`` then
-# leaves the tree.
+# read as a projection: the LLM prompt (single and multi-query) and the RAG
+# query template, whose ``RetrievalOutputConfig.query_template_row_projection``
+# is read by both its configuration checks and ``QueryBuilder``.
 _EXPECTED_PROJECTION_SITES = Counter(
     {
         "plugins/transforms/llm/transform.py": 1,
         "plugins/transforms/llm/multi_query.py": 1,
+        "plugins/transforms/rag/query.py": 1,
     }
 )
-_EXPECTED_DECLARATION_READS = Counter({"plugins/transforms/llm/transform.py": 1})
+_EXPECTED_DECLARATION_READS = Counter(
+    {
+        "plugins/transforms/llm/transform.py": 1,
+        "plugins/transforms/rag/core.py": 1,
+    }
+)
 # The calls that hand a row to a template.
 _ROW_RENDER_CALLS = frozenset({"render", "render_with_metadata", "build_template_context"})
 

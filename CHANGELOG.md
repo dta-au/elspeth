@@ -183,6 +183,26 @@ drained and repair this release forward.
   values; an LLM node with `required_input_fields: []` or none is now
   `input_fields_unprovable` for a field-scoped prompt shield — only
   `fields: all` covers it. Shipped examples render byte-identical prompts.
+- **A RAG `query_template` sees only its node's declared fields (ADR-051).**
+  `rag_retrieval` and `azure_ai_search` rendered the query template against
+  the whole row, and configuration checked none of its reads, so
+  `{{ row.secret }}` or `{{ row | dictsort }}` sent undeclared columns to the
+  search provider with exit 0. The template's `row` is now the row narrowed
+  to `required_input_fields` plus `query_field`: a list holds those fields,
+  an omitted declaration holds `query_field` alone, and `[]` keeps the whole
+  row. Configuration now refuses, in `elspeth validate`, the composer and at
+  run start, the reads it can prove fail or go unused, as it does for an LLM
+  prompt: a literal `row.<field>` read outside the declaration (with the
+  declaration omitted, any field but `query_field`); a computed key
+  (`row[k]`, `row.get(k)`, `row | attr(k)`) or a retired row-API name unless
+  `required_input_fields: []`; a top-level name other than `query` or `row`;
+  and fields declared beyond `query_field` for a template that never reads
+  `row`. A read configuration cannot see fails the row with
+  `template_rendering_failed` and the `Undeclared field` reason. Behaviour
+  changes: under every declaration `row` is the template row rather than a
+  plain dict, so `row.items()`, `row.keys()` and `row.values()` read fields
+  of those names (they were dict methods), and `{{ row }}` no longer prints
+  the row. No shipped example sets `query_template`.
 - **Plugin-computed output fields have concrete types; LLM structured output
   types are bound (ADR-050 Decision 12).** Every shipped transform declares
   the type its own code fixes for each field it computes — batch statistics

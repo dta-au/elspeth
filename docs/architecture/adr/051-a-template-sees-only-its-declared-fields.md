@@ -101,12 +101,32 @@ which fields each rendered prompt could draw on. A non-canonical value (NaN,
 Infinity) in an undeclared column no longer fails the row, and under `[]` the
 hash is unchanged.
 
-(f) **RAG `query_template` is in scope, as the next unit (RAG-projection).**
-It renders `row.to_dict()` today and has no declared read set, so it gets the
-LLM-shaped validators first (template row reads ⊆ `required_input_fields` ∪
-`{query_field}`; omitted plus row reads refused; the declared-but-unreferenced
-dual) with composer agreement, then this same projection. It is not an
-exception to this decision.
+(f) **A RAG `query_template` is held to the same rule.** `rag_retrieval` and
+`azure_ai_search` share `RetrievalOutputConfig`. Its declared read set is
+`required_input_fields` plus `query_field`, the field the node reads by its
+own option. `declared_row_projection(required_input_fields,
+always_declared={query_field})` reads it: a list holds those fields plus
+`query_field`, omitted holds `query_field` alone, and `[]` stays the whole row
+(`always_declared` never turns the opt-out into a list).
+`RetrievalOutputConfig.query_template_row_projection()` is the one value both
+the configuration checks and `QueryBuilder` read. `QueryBuilder.build` takes
+the `PipelineRow` and renders `row=TemplateRow.project(row, projection)`; it
+no longer receives `row.to_dict()`. Configuration refuses what it can prove,
+with the LLM prompt's rules:
+
+- a literal row read outside the declared read set (omitted plus a read of
+  any field but `query_field`);
+- a computed key, a reserved row-API name or `carrier-limit` under a
+  declaration, as in (c);
+- a top-level name other than `query`, `row` or a sandbox global.
+
+The dual refuses fields declared beyond `query_field` when the template never
+loads `row` at all. It does not count literal `row.<field>` reads: a whole
+row used as a value interpolates the declared fields under this decision. It
+never suggests `[]`, because the query field reaches the template as
+`{{ query }}` without a declaration. The composer runs the same model on its
+mutation gate and at Stage 2. Required-control coverage (d) applies only to
+LLM-capability nodes, so a retrieval node has no coverage surface to change.
 
 (g) **Reversibility: moderate.** Widening the view back is a one-line change in
 `declared_row_projection`, but the documented template semantics, the meaning
@@ -145,6 +165,8 @@ carries and work as a `Mapping`.
   r1–r3 red-team rounds and the fix rounds) is a runtime test with zero
   sentinel hits (`tests/unit/plugins/infrastructure/test_template_projection.py`),
   independent of the static analysis. The transport bytes are tested too.
+  The same corpus rendered as a RAG query template shows no sentinel either
+  (`tests/unit/plugins/transforms/rag/test_query_template_projection.py`).
 - A template form the analysis cannot see and that reads an undeclared field
   now fails every row at render (routed, value-free) instead of leaking. That
   is the "configuration green, rows fail" shape the tree already accepts for
@@ -167,4 +189,6 @@ carries and work as a `Mapping`.
 - `src/elspeth/plugins/infrastructure/templates.py` (`TemplateRow.project`,
   `declared_row_projection`), `src/elspeth/plugins/transforms/llm/templates.py`
   (`_variables_hash`), `src/elspeth/web/plugin_policy/coverage.py`
-  (`_llm_input_fields`).
+  (`_llm_input_fields`), `src/elspeth/plugins/transforms/rag/core.py`
+  (`RetrievalOutputConfig.query_template_row_projection` and its checks) and
+  `src/elspeth/plugins/transforms/rag/query.py` (`QueryBuilder`).

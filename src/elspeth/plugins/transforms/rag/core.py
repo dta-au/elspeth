@@ -40,7 +40,16 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
-from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError
+from elspeth.plugins.infrastructure.templates import (
+    AllFields,
+    DeclaredFields,
+    RowProjection,
+    SandboxedTemplate,
+    TemplateError,
+    create_sandboxed_environment,
+    declared_row_projection,
+    find_runtime_unbound_variables,
+)
 from elspeth.plugins.transforms.rag.formatter import format_context
 from elspeth.plugins.transforms.rag.query import QueryBuilder
 
@@ -52,6 +61,10 @@ logger = structlog.get_logger(__name__)
 
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
+
+# The two names QueryBuilder renders a query template with: the query_field
+# value and the projected row (rag/query.py).
+_QUERY_CONTEXT_NAMES: frozenset[str] = frozenset({"query", "row"})
 
 
 class RetrievalOutputConfig(TransformDataConfig):
@@ -152,6 +165,102 @@ class RetrievalOutputConfig(TransformDataConfig):
             raise ValueError(f"Invalid query template: {exc}") from exc
         return v
 
+    def query_template_row_projection(self) -> RowProjection:
+        """What the query template's ``row`` holds (ADR-051): the node's declaration.
+
+        ``required_input_fields`` read as every template node reads it, with
+        ``query_field`` always declared (the node reads it by its own option):
+        a list holds those fields plus ``query_field``, omitted holds
+        ``query_field`` alone, and ``[]`` is the opt-out, the whole row. The
+        configuration checks below and the render read this one value.
+        """
+        return declared_row_projection(self.required_input_fields, always_declared=frozenset({self.query_field}))
+
+    @model_validator(mode="after")
+    def _validate_query_template_row_reads(self) -> Self:
+        """Refuse a query template whose reads configuration can prove fail or go unused.
+
+        The query renders with ``query`` (the ``query_field`` value) and
+        ``row``, projected to ``query_template_row_projection()``. Each refusal
+        is a template that would otherwise fail every row at render, or a
+        declaration the template cannot use; the LLM prompt template carries
+        the same checks (``LLMConfig``), and the composer's mutation gate runs
+        this model, so ``elspeth validate``, the composer and the run agree.
+
+        - a top-level name other than ``query``, ``row`` or a sandbox global
+          is undefined on every row;
+        - under a declaration (a list, or omitted), a computed row key
+          (``row[k]``, ``row.get(k)``, ``row|attr(k)``), a reserved row-API
+          name or ``carrier-limit`` names no field the declaration could
+          cover; ``[]`` opts out of these checks;
+        - a literal ``row.<field>`` read outside the declaration fails every
+          row as an undeclared read; omitted, only ``query_field`` is declared;
+        - the dual: fields declared beyond ``query_field`` while the template
+          never reads ``row`` at all can never reach the query.
+        """
+        if self.query_template is None:
+            return self
+        from elspeth.core.templates import describe_dynamic_row_access, extract_jinja2_field_usage, template_loads_name
+        from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
+
+        template = self.query_template
+        env = create_sandboxed_environment()
+        # The field validator compiled the template, so it parses here.
+        unbound = sorted(find_runtime_unbound_variables(env.parse(template)) - _QUERY_CONTEXT_NAMES - frozenset(env.globals))
+        if unbound:
+            names = ", ".join(f"'{name}'" for name in unbound)
+            raise ValueError(
+                f"query_template references {names}, which the query render context does not define: a query "
+                "template sees 'query' (the query_field value) and 'row', so rendering fails with 'Undefined "
+                "variable' on every row. Rewrite each name as '{{ query }}' or '{{ row.<field> }}', or remove it."
+            )
+
+        match self.query_template_row_projection():
+            case AllFields():
+                return self
+            case DeclaredFields(names=declared):
+                pass
+
+        usage = extract_jinja2_field_usage(template)
+        if usage.dynamic_accesses:
+            raise ValueError(
+                f"query_template uses dynamic row field access ({describe_dynamic_row_access(usage.dynamic_accesses)}). "
+                "The template's row holds only the fields this node declares (options.required_input_fields and "
+                "query_field), and a computed key names no field a declaration could cover. Use static row.field or "
+                "row['field'] references, or set options.required_input_fields: [] to opt out: the template then "
+                "sees the whole row."
+            )
+
+        undeclared = undeclared_row_fields(usage.fields, declared)
+        if undeclared:
+            fields = describe_undeclared_row_fields(undeclared)
+            if self.required_input_fields is None:
+                raise ValueError(
+                    f"query_template reads {fields} under 'row', but options.required_input_fields is not declared, "
+                    f"so the template's row holds only the query field '{self.query_field}' and every row fails "
+                    "at render with 'Undeclared field'. Declare the fields the query reads in "
+                    "options.required_input_fields (the upstream producer must guarantee them), or set "
+                    "options.required_input_fields: [] to opt out: the template then sees the whole row."
+                )
+            declared_names = ", ".join(f"'{name}'" for name in sorted(declared))
+            raise ValueError(
+                f"query_template reads {fields} under 'row', which this node does not declare: its template sees "
+                f"{declared_names} (options.required_input_fields and query_field), so every row fails at render "
+                "with 'Undeclared field'. Add each field to options.required_input_fields only if the upstream "
+                "producer guarantees it, or rewrite the reference to a declared field."
+            )
+
+        beyond_query = sorted(set(self.required_input_fields or ()) - {self.query_field})
+        if beyond_query and not template_loads_name(template, "row"):
+            listed = ", ".join(f"'{name}'" for name in beyond_query)
+            raise ValueError(
+                f"options.required_input_fields declares {listed}, but query_template never reads 'row', so no "
+                "declared field can reach the query. Reference them in the template (e.g. "
+                f"'{{{{ row.{beyond_query[0]} }}}}'), or drop them from options.required_input_fields: the query "
+                f"field '{self.query_field}' reaches the template as '{{{{ query }}}}' without a declaration."
+            )
+        return self
+
     @field_validator("query_pattern")
     @classmethod
     def validate_regex(cls, v: str | None) -> str | None:
@@ -234,6 +343,7 @@ class RetrievalTransformBase(BaseTransform):
         # Query builder
         self._query_builder = QueryBuilder(
             self._retrieval_config.query_field,
+            row_projection=self._retrieval_config.query_template_row_projection(),
             query_template=self._retrieval_config.query_template,
             query_pattern=self._retrieval_config.query_pattern,
         )
@@ -358,7 +468,7 @@ class RetrievalTransformBase(BaseTransform):
         token_id = ctx.token.token_id
 
         # 1. Build query from row data
-        query_result = self._query_builder.build(row.to_dict())
+        query_result = self._query_builder.build(row)
         if query_result.error is not None:
             self._quarantine_count += 1
             return TransformResult.error(

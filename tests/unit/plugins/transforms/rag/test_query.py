@@ -7,9 +7,23 @@ from typing import Any
 
 import pytest
 
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS, TemplateError
 from elspeth.plugins.transforms.rag import query as rag_query
 from elspeth.plugins.transforms.rag.query import QueryBuilder
+
+
+def _row(data: dict[str, Any]) -> PipelineRow:
+    """A real PipelineRow, as ``RetrievalTransformBase.process`` hands ``build``."""
+    return PipelineRow(data, SchemaContract(mode="OBSERVED", fields=()))
+
+
+def _builder(query_field: str, **kwargs: Any) -> QueryBuilder:
+    """A QueryBuilder whose template, if any, sees the whole row (``[]``).
+
+    What a declared template sees is pinned in ``TestTemplateRowProjection``.
+    """
+    return QueryBuilder(query_field, row_projection=ALL_FIELDS, **kwargs)
 
 
 class _RegexPoolFake:
@@ -60,8 +74,8 @@ def regex_semantics_pool(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestFieldOnlyMode:
     def test_extracts_value_verbatim(self):
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"question": "What is RAG?"})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"question": "What is RAG?"}))
         assert result.query == "What is RAG?"
 
     def test_missing_field_returns_error(self):
@@ -75,29 +89,29 @@ class TestFieldOnlyMode:
         Mirrors the null_value guard below and the azure/base.py missing_field
         pattern (base.py lines ~304-307).
         """
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"other_field": "value"})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"other_field": "value"}))
         assert result.error is not None
         assert result.error["reason"] == "missing_field"
         assert result.error["field"] == "question"
 
     def test_none_value_returns_error(self):
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"question": None})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"question": None}))
         assert result.error is not None
         assert result.error["reason"] == "invalid_input"
         assert result.error["cause"] == "null_value"
 
     def test_empty_string_returns_error(self):
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"question": ""})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"question": ""}))
         assert result.error is not None
         assert result.error["reason"] == "invalid_input"
         assert result.error["cause"] == "empty_query"
 
     def test_whitespace_only_returns_error(self):
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"question": "   \t\n  "})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"question": "   \t\n  "}))
         assert result.error is not None
         assert result.error["reason"] == "invalid_input"
         assert result.error["cause"] == "empty_query"
@@ -120,8 +134,8 @@ class TestFieldOnlyMode:
         and None cases) so the engine routes the row; a raise here aborted the
         run. The reason names the field and the type, never the value.
         """
-        builder = QueryBuilder(query_field="question")
-        result = builder.build({"question": bad_value})
+        builder = _builder(query_field="question")
+        result = builder.build(_row({"question": bad_value}))
 
         assert result.query is None
         assert result.error == {
@@ -142,32 +156,32 @@ class TestFieldOnlyMode:
 
 class TestTemplateMode:
     def test_renders_with_query_and_row(self):
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="topic",
             query_template="Find documents about {{ query }} for {{ row.category }}",
         )
-        result = builder.build({"topic": "compliance", "category": "finance"})
+        result = builder.build(_row({"topic": "compliance", "category": "finance"}))
         assert result.query == "Find documents about compliance for finance"
 
     def test_structural_error_at_compile_time(self):
         with pytest.raises(TemplateError):
-            QueryBuilder(
+            _builder(
                 query_field="topic",
                 query_template="{% if unclosed",
             )
 
     def test_render_error_returns_error(self):
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="topic",
             query_template="{{ query }} for {{ row.missing_field }}",
         )
-        result = builder.build({"topic": "test"})
+        result = builder.build(_row({"topic": "test"}))
         assert result.error is not None
         assert result.error["reason"] == "template_rendering_failed"
 
     def test_resource_bounded_render_returns_row_error(self):
-        builder = QueryBuilder(query_field="topic", query_template="{{ query * 300000000 }}")
-        result = builder.build({"topic": "x"})
+        builder = _builder(query_field="topic", query_template="{{ query * 300000000 }}")
+        result = builder.build(_row({"topic": "x"}))
         assert result.error is not None
         assert result.error["reason"] == "template_rendering_failed"
 
@@ -175,13 +189,17 @@ class TestTemplateMode:
         """A lookup key computed from the row never reaches the reason (RAG-F1).
 
         Before the shared renderer the reason was Jinja's text:
-        ``'dict object' has no attribute 'SENTINEL-rag-4e1f'``.
+        ``'dict object' has no attribute 'SENTINEL-rag-4e1f'``. Configuration
+        admits a computed key only under the ``[]`` opt-out, the whole row.
         """
-        builder = QueryBuilder(query_field="topic", query_template="{{ query }} {{ row[row.k] }}")
-        result = builder.build({"topic": "t", "k": "SENTINEL-rag-4e1f"})
+        builder = _builder(query_field="topic", query_template="{{ query }} {{ row[row.k] }}")
+        result = builder.build(_row({"topic": "t", "k": "SENTINEL-rag-4e1f"}))
         assert result.error == {
             "reason": "template_rendering_failed",
-            "error": "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>",
+            "error": (
+                "Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute "
+                "<a key the template does not spell out>"
+            ),
             "field": "topic",
         }
 
@@ -192,8 +210,8 @@ class TestTemplateMode:
         Jinja's message quotes that name (the row's value), so only the class
         is kept. RAG's own catch list used to omit the class, so the run aborted.
         """
-        builder = QueryBuilder(query_field="topic", query_template="{{ [query] | map(query) | list }}")
-        result = builder.build({"topic": "SENTINEL-rag-map"})
+        builder = _builder(query_field="topic", query_template="{{ [query] | map(query) | list }}")
+        result = builder.build(_row({"topic": "SENTINEL-rag-map"}))
         assert result.error == {
             "reason": "template_rendering_failed",
             "error": "Template rendering failed: TemplateRuntimeError (message withheld: it can quote row data)",
@@ -218,7 +236,7 @@ class TestTemplateMode:
     def test_a_template_that_fails_every_row_is_refused_when_built(self, template: str, message: str) -> None:
         """A configuration error is refused at construction, never routed once per row."""
         with pytest.raises(TemplateError) as excinfo:
-            QueryBuilder(query_field="topic", query_template=template)
+            _builder(query_field="topic", query_template=template)
         assert str(excinfo.value) == f"Invalid query template syntax: {message}"
 
 
@@ -229,37 +247,37 @@ class TestTemplateMode:
 
 class TestRegexMode:
     def test_captures_first_group(self, regex_semantics_pool):
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+?)(?:\n|$)",
         )
-        result = builder.build({"text": "issue: payment failed\nother stuff"})
+        result = builder.build(_row({"text": "issue: payment failed\nother stuff"}))
         assert result.query == "payment failed"
 
     def test_full_match_when_no_groups(self, regex_semantics_pool):
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"\w+@\w+\.\w+",
         )
-        result = builder.build({"text": "contact user@example.com for help"})
+        result = builder.build(_row({"text": "contact user@example.com for help"}))
         assert result.query == "user@example.com"
 
     def test_no_match_returns_error(self, regex_semantics_pool):
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
-        result = builder.build({"text": "no issue here"})
+        result = builder.build(_row({"text": "no issue here"}))
         assert result.error is not None
         assert result.error["reason"] == "no_regex_match"
 
     def test_non_participating_group_returns_error(self, regex_semantics_pool):
         """Optional capture group that didn't participate."""
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"(?:issue|problem)(?::\s*(.+?))?$",
         )
-        result = builder.build({"text": "issue"})
+        result = builder.build(_row({"text": "issue"}))
         assert result.error is not None
         assert result.error["reason"] == "no_regex_match"
         assert result.error["cause"] == "capture_group_empty"
@@ -267,12 +285,12 @@ class TestRegexMode:
     def test_timeout_on_catastrophic_backtracking(self):
         """ReDoS protection: pathological pattern with adversarial input."""
         pattern = "".join(("(", "a+", ")", "+", "b"))
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=pattern,
             regex_timeout=0.1,  # Short timeout for test
         )
-        result = builder.build({"text": "a" * 30})
+        result = builder.build(_row({"text": "a" * 30}))
         assert result.error is not None
         assert result.error["reason"] == "regex_timeout"
         assert result.error["reason"] != "no_regex_match"
@@ -296,7 +314,7 @@ class TestWorkerFailureDetection:
 
     def test_worker_exception_raises_runtime_error(self):
         """When the pool future raises, build() must raise RuntimeError."""
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
@@ -306,7 +324,7 @@ class TestWorkerFailureDetection:
         _replace_regex_pool(builder, failed_future)
 
         with pytest.raises(RuntimeError, match="Regex worker failed"):
-            builder.build({"text": "issue: payment failed"})
+            builder.build(_row({"text": "issue: payment failed"}))
 
     def test_worker_type_error_on_a_str_is_a_worker_bug(self):
         """A TypeError from the worker is not a row fault once the value is a str.
@@ -315,7 +333,7 @@ class TestWorkerFailureDetection:
         a TypeError it raises is reported like any other worker failure, never
         relabelled as a wrong-typed row.
         """
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
@@ -325,11 +343,11 @@ class TestWorkerFailureDetection:
         _replace_regex_pool(builder, failed_future)
 
         with pytest.raises(RuntimeError, match="Regex worker failed"):
-            builder.build({"text": "issue: payment failed"})
+            builder.build(_row({"text": "issue: payment failed"}))
 
     def test_worker_error_includes_pattern_and_cause(self):
         """RuntimeError from worker failure includes the pattern for diagnostics."""
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
@@ -339,7 +357,7 @@ class TestWorkerFailureDetection:
         _replace_regex_pool(builder, failed_future)
 
         with pytest.raises(RuntimeError, match="issue:") as exc_info:
-            builder.build({"text": "issue: payment failed"})
+            builder.build(_row({"text": "issue: payment failed"}))
         assert "kaboom" in str(exc_info.value)
 
     def test_non_str_value_is_rejected_before_the_regex_worker(self):
@@ -352,7 +370,7 @@ class TestWorkerFailureDetection:
         pattern would match the digits if the int were stringified, so a
         coercing implementation fails here too.
         """
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"(\d+)",
         )
@@ -371,7 +389,7 @@ class TestWorkerFailureDetection:
         builder._regex_pool.shutdown(wait=False)
         builder._regex_pool = _RecordingPool(worker_answer)
         try:
-            result = builder.build({"text": 12345})
+            result = builder.build(_row({"text": 12345}))
         finally:
             builder.close()
 
@@ -397,18 +415,18 @@ class TestPoolLifecycle:
     """ProcessPoolExecutor is created for regex mode and shut down on close()."""
 
     def test_pool_created_only_for_regex_mode(self):
-        builder_field = QueryBuilder(query_field="text")
+        builder_field = _builder(query_field="text")
         assert builder_field._regex_pool is None
 
-        builder_template = QueryBuilder(query_field="text", query_template="{{ query }}")
+        builder_template = _builder(query_field="text", query_template="{{ query }}")
         assert builder_template._regex_pool is None
 
-        builder_regex = QueryBuilder(query_field="text", query_pattern=r"\w+")
+        builder_regex = _builder(query_field="text", query_pattern=r"\w+")
         assert builder_regex._regex_pool is not None
         builder_regex.close()
 
     def test_close_shuts_down_pool(self):
-        builder = QueryBuilder(query_field="text", query_pattern=r"\w+")
+        builder = _builder(query_field="text", query_pattern=r"\w+")
         assert builder._regex_pool is not None
         builder.close()
         assert builder._regex_pool is None
@@ -416,7 +434,7 @@ class TestPoolLifecycle:
     @pytest.mark.skipif(not os.path.exists("/proc"), reason="Linux /proc required")
     def test_no_fd_leak_after_repeated_evaluations(self):
         """FDs don't accumulate over many calls with pool reuse."""
-        builder = QueryBuilder(
+        builder = _builder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
         )
@@ -424,7 +442,7 @@ class TestPoolLifecycle:
         fd_count_before = len(os.listdir(f"/proc/{pid}/fd"))
 
         for _ in range(20):
-            result = builder.build({"text": "issue: payment failed"})
+            result = builder.build(_row({"text": "issue: payment failed"}))
             assert result.query is not None
 
         fd_count_after = len(os.listdir(f"/proc/{pid}/fd"))

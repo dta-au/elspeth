@@ -610,6 +610,22 @@ where the architectural fix landed:
   both admit the controls (a new capitalised name, a canonical overwrite, an
   observed upstream the build cannot see — routed per row at run time).
   Pinned by ``TestComposerRuntimeFieldNameSpellingAgreement``.
+* Shape 32 — a RAG ``query_template`` reading outside its node's declaration
+  (elspeth-5887fb7928 P3, ADR-051 (f); CLI repros in the lane's
+  ``impl-P3-RAG-projection.md``). The template rendered ``row.to_dict()``, so
+  ``{{ row.secret }}`` or ``{{ row | dictsort }}`` sent undeclared columns to
+  the search provider with exit 0. ``RetrievalOutputConfig`` now refuses the
+  reads configuration can prove fail or go unused (undeclared literal read,
+  omitted declaration with row reads, computed key, fields declared for a
+  template that never reads ``row``, an undefined top-level name), and the
+  render projects the row to the same declaration. Closed on the composer's
+  mutation gate (``_prevalidate_transform``: upsert_node / set_pipeline /
+  patch_node_options) and on Stage 2, which both run the plugin's own config
+  model. ``CompositionState.validate()`` abstains on these refusals exactly
+  as it does on every other RAG option refusal (probe tolerance,
+  ``_is_config_probe_exception``; measured for ``query_template`` +
+  ``query_pattern`` too), so no new gap class. Pinned by
+  ``TestComposerRuntimeRagQueryTemplateAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -7712,6 +7728,8 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         rag = {
             "query_field": "q",
             "query_template": template,
+            # The template reads row.n: declared, as the llm arm does (Shape 32).
+            "required_input_fields": ["q", "n"],
             "output_prefix": "sci",
             "provider": "chroma",
             "provider_config": {"collection": "agreement", "mode": "ephemeral"},
@@ -7919,3 +7937,83 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}),
         )
         self._assert_both_accept(state, tmp_path)
+
+
+class TestComposerRuntimeRagQueryTemplateAgreement:
+    """Shape 32 — a RAG query template reads only what its node declares (elspeth-5887fb7928 P3, ADR-051 (f)).
+
+    The composer side is its mutation gate (``_prevalidate_transform``); the
+    runtime side is plugin instantiation from settings, as ``elspeth
+    validate`` does. Both run ``RetrievalOutputConfig``, so both refuse the
+    same template with the same text, and admit the same controls.
+
+    Bug verification protocol: deleting the
+    ``RetrievalOutputConfig._validate_query_template_row_reads`` validator
+    makes every refusal case fail on both sides (the composer returns None,
+    the runtime DID NOT RAISE); the controls stay green.
+    """
+
+    _REFUSED = (
+        pytest.param(
+            "{{ query }} {{ row.secret }}",
+            ["q"],
+            "query_template reads 'secret' under 'row', which this node does not declare",
+            id="undeclared",
+        ),
+        pytest.param(
+            "{{ query }} {{ row.secret }}",
+            None,
+            "query_template reads 'secret' under 'row', but options.required_input_fields is not declared",
+            id="omitted-with-row-reads",
+        ),
+        pytest.param(
+            "{{ query }} {{ row[query] }}", ["q"], "query_template uses dynamic row field access (item via row[expr])", id="computed-key"
+        ),
+        pytest.param(
+            "{{ query }} words", ["q", "n"], "options.required_input_fields declares 'n', but query_template never reads 'row'", id="dual"
+        ),
+        pytest.param("{{ qurey }}", [], "query_template references 'qurey', which the query render context does not define", id="unbound"),
+    )
+
+    @staticmethod
+    def _options(template: str, required_input_fields: list[str] | None) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "query_field": "q",
+            "query_template": template,
+            "output_prefix": "sci",
+            "provider": "chroma",
+            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
+            "schema": {"mode": "observed"},
+        }
+        if required_input_fields is not None:
+            options["required_input_fields"] = required_input_fields
+        return options
+
+    @pytest.mark.parametrize(("template", "required_input_fields", "message"), _REFUSED)
+    def test_both_refuse_a_read_outside_the_declaration(
+        self, tmp_path: Path, template: str, required_input_fields: list[str] | None, message: str
+    ) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        options = self._options(template, required_input_fields)
+        composer = _prevalidate_transform("rag_retrieval", options)
+        assert composer is not None
+        assert message in composer, composer
+        with pytest.raises(PluginConfigError, match=re.escape(message)):
+            TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)
+
+    @pytest.mark.parametrize(
+        ("template", "required_input_fields"),
+        [
+            pytest.param("{{ query }} {{ row.n }}", ["n"], id="declared-read"),
+            pytest.param("{{ row.q }}", None, id="the-query-field-needs-no-declaration"),
+            pytest.param("{{ query }} {{ row | dictsort }}", ["q", "n"], id="whole-row-use-holds-the-declaration"),
+            pytest.param("{{ query }} {{ row[query] }}", [], id="the-opt-out"),
+        ],
+    )
+    def test_both_admit_a_read_the_declaration_covers(self, tmp_path: Path, template: str, required_input_fields: list[str] | None) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        options = self._options(template, required_input_fields)
+        assert _prevalidate_transform("rag_retrieval", options) is None
+        TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)

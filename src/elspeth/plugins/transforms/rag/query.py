@@ -2,7 +2,8 @@
 
 Three modes, all anchored on query_field:
 1. Field only: use field value verbatim
-2. Field + template: render Jinja2 template with {{ query }} and {{ row }}
+2. Field + template: render Jinja2 template with {{ query }} and {{ row }},
+   the row projected to the node's declaration (ADR-051)
 3. Field + regex: extract search text via capture group
 """
 
@@ -18,8 +19,10 @@ from typing import Any
 from jinja2 import TemplateSyntaxError
 
 from elspeth.contracts.errors import TransformErrorReason
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.regex_worker import run_regex_worker
-from elspeth.plugins.infrastructure.templates import SandboxedTemplate, TemplateError
+from elspeth.plugins.infrastructure.templates import RowProjection, SandboxedTemplate, TemplateError, TemplateRow
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,9 @@ class QueryBuilder:
 
     Supports three modes:
     - Field only: query_field set, no template or pattern
-    - Template: query_field + query_template (Jinja2)
+    - Template: query_field + query_template (Jinja2); the template's ``row``
+      is ``TemplateRow.project(row, row_projection)``, so a field the node
+      does not declare never reaches the render worker (ADR-051)
     - Regex: query_field + query_pattern (re capture group)
 
     Regex mode uses a ProcessPoolExecutor (max 1 worker) for timeout enforcement.
@@ -48,11 +53,13 @@ class QueryBuilder:
         self,
         query_field: str,
         *,
+        row_projection: RowProjection,
         query_template: str | None = None,
         query_pattern: str | None = None,
         regex_timeout: float = 5.0,
     ) -> None:
         self._query_field = query_field
+        self._row_projection = row_projection
         self._regex_timeout = regex_timeout
         self._compiled_template: SandboxedTemplate | None = None
         self._compiled_pattern: re.Pattern[str] | None = None
@@ -70,16 +77,18 @@ class QueryBuilder:
             # bounds concurrent process count while amortizing spawn cost.
             self._regex_pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
 
-    def build(self, row_data: dict[str, Any]) -> QueryResult:
-        """Construct a search query from row data."""
-        if self._query_field not in row_data:
+    def build(self, row: PipelineRow) -> QueryResult:
+        """Construct a search query from a row."""
+        if self._query_field not in row:
             return QueryResult(
                 error=TransformErrorReason(
                     reason="missing_field",
                     field=self._query_field,
                 )
             )
-        extracted = row_data[self._query_field]
+        # The plain value, as the row carries it in its data (PipelineRow
+        # holds a frozen copy); the value is never converted.
+        extracted = deep_thaw(row[self._query_field])
 
         if extracted is None:
             return QueryResult(
@@ -91,7 +100,7 @@ class QueryBuilder:
             )
 
         if self._compiled_template is not None:
-            return self._build_template(extracted, row_data)
+            return self._build_template(extracted, row)
 
         # The ONE type check for the modes that USE the value as the query.
         # Returned rather than raised: it is a fact about this row's data, like
@@ -125,14 +134,14 @@ class QueryBuilder:
             )
         )
 
-    def _build_template(self, extracted: Any, row_data: dict[str, Any]) -> QueryResult:
+    def _build_template(self, extracted: Any, row: PipelineRow) -> QueryResult:
         assert self._compiled_template is not None  # guaranteed by build() guard
         # No str check here, deliberately: `{{ query }}` is a template binding
         # like `{{ row.x }}`, and every ELSPETH template surface (LLM prompts
         # included) interpolates a row value of any type. Field-only and regex
         # modes USE the value as the query, so they require a str.
         try:
-            query = self._compiled_template.render(query=extracted, row=row_data)
+            query = self._compiled_template.render(query=extracted, row=TemplateRow.project(row, self._row_projection))
         except TemplateError as e:
             # SandboxedTemplate's message is value-free by construction: a
             # template may compute a lookup key from the row, and Jinja's own

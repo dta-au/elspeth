@@ -436,10 +436,6 @@ allowed_dict_patterns:
   # LLM transforms handle dynamic row data and external API responses
   # ═══════════════════════════════════════════════════════════════════════════
 
-  # RAG query construction — row_data is Tier 2 pipeline data (user-defined schema)
-  - "src/elspeth/plugins/transforms/rag/query.py:QueryBuilder.build:row_data"
-  - "src/elspeth/plugins/transforms/rag/query.py:QueryBuilder._build_template:row_data"
-
   # LLM templates
   - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.__init__:lookup_data"
   - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.render:row"

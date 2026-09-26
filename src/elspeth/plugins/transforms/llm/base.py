@@ -558,7 +558,7 @@ class LLMConfig(TransformDataConfig):
         if self.required_input_fields == []:
             return self
 
-        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.core.templates import describe_dynamic_row_access, extract_jinja2_field_usage
 
         dynamic_accesses: list[str] = []
         for label, template in self._field_extraction_templates():
@@ -578,19 +578,9 @@ class LLMConfig(TransformDataConfig):
         if not dynamic_accesses:
             return self
 
-        access_kinds = sorted(set(dynamic_accesses))
-        access_examples_by_kind = {
-            "attr": "row|attr(expr)",
-            "carrier-limit": "a variable or macro argument that holds itself, too deep to follow",
-            "get": "row.get(expr)",
-            "item": "row[expr]",
-            "map(attribute)": "map(attribute=expr)",
-            "row-api": "row API",
-        }
-        access_examples = ", ".join(access_examples_by_kind[kind] for kind in access_kinds)
         raise ValueError(
             "LLM prompt_template uses dynamic row field access "
-            f"({', '.join(access_kinds)} via {access_examples}). "
+            f"({describe_dynamic_row_access(dynamic_accesses)}). "
             "Dynamic row keys cannot be audited against options.required_input_fields. "
             "Use static row.field or row['field'] references, or set "
             "options.required_input_fields: [] to explicitly opt out and accept runtime risk."

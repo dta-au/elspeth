@@ -170,7 +170,11 @@ ALL_FIELDS = AllFields()
 RowProjection = DeclaredFields | AllFields
 
 
-def declared_row_projection(required_input_fields: Sequence[str] | None) -> RowProjection:
+def declared_row_projection(
+    required_input_fields: Sequence[str] | None,
+    *,
+    always_declared: frozenset[str] = frozenset(),
+) -> RowProjection:
     """The one reading of a template node's declaration as what its template may see (ADR-051).
 
     - a list names exactly the fields the row holds;
@@ -178,12 +182,17 @@ def declared_row_projection(required_input_fields: Sequence[str] | None) -> RowP
     - omitted (``None``) declares nothing, so the row holds nothing. It is
       never the whole row: configuration admits ``None`` only when its static
       analysis finds no row read, and that analysis is not a proof.
+
+    ``always_declared`` names fields a node reads by its own option whatever
+    ``required_input_fields`` says (a retrieval node's ``query_field``). They
+    join a list and the omitted case, and never turn ``[]`` into a list: the
+    opt-out stays the whole row.
     """
     if required_input_fields is None:
-        return DeclaredFields(frozenset())
+        return DeclaredFields(always_declared)
     if len(required_input_fields) == 0:
         return ALL_FIELDS
-    return DeclaredFields(frozenset(required_input_fields))
+    return DeclaredFields(frozenset(required_input_fields) | always_declared)
 
 
 class _UndeclaredFieldError(Exception):
