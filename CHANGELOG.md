@@ -91,9 +91,10 @@ drained and repair this release forward.
   Row-to-row type variance at a transform output no longer aborts a run, a
   declared `page: int` can no longer deliver a str, an operator typing a
   field the transform carries (`value_transform`, `field_mapper`,
-  `passthrough`, `truncate`, `keyword_filter`, `type_coerce` and the AWS
-  Bedrock guardrails, after an observed or a typed source) no longer ends the
-  run with a Tier-1 `SchemaConfigModeViolation` on a valid row, and two observed
+  `passthrough`, `truncate`, `keyword_filter`, `type_coerce` when its
+  conversion fields use the normalized names, and the AWS Bedrock guardrails,
+  after an observed or a typed source) no longer ends the run with a Tier-1
+  `SchemaConfigModeViolation` on a valid row, and two observed
   sources disagreeing on a column now share a sink. The Azure content-safety
   and prompt-shield guardrails record the operator's type for a field they
   pass through, as the AWS guardrails do, instead of the upstream inference
