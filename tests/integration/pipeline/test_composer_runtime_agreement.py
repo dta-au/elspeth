@@ -7761,6 +7761,53 @@ class TestComposerRuntimeBatchPlacementAgreement:
     def _aggregation(self, plugin: str, output_mode: str | None) -> NodeSpec:
         return self._node("agg", "aggregation", plugin, "rows", "main", trigger={"count": 3}, output_mode=output_mode)
 
+    @pytest.mark.parametrize(
+        ("fields", "composer_missing"),
+        [(["mean: float"], None), (["mean: float", "other: str"], ("other",))],
+        ids=["created", "created-and-not-created"],
+    )
+    def test_both_demote_a_required_declaration_of_a_field_the_aggregation_creates(
+        self, tmp_path: Path, fields: list[str], composer_missing: tuple[str, ...] | None
+    ) -> None:
+        """batch_stats declaring a required ``mean: float`` behind a typed source (elspeth-d6eeb3a71d, F1).
+
+        ``mean`` is written by the aggregation, so the runtime input model
+        demotes it; the composer reads that same constructed model. Before, the
+        composer refused ``requires fields: [mean]`` while the runtime built the
+        pipeline. A required field the aggregation does not create is still
+        demanded by both.
+        """
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "values.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"id": 1, "v": 2.5}\n', encoding="utf-8")
+        aggregation = self._node("agg", "aggregation", "batch_stats", "rows", "main", trigger={"count": 1}, output_mode="transform")
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="json",
+                on_success="rows",
+                options={"path": str(path), "format": "jsonl", "schema": {"mode": "fixed", "fields": ["id: int", "v: float"]}},
+                on_validation_failure="discard",
+            ),
+            nodes=(replace(aggregation, options={"schema": {"mode": "flexible", "fields": fields}, "value_field": "v"}),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="aggregation-demotion"),
+            version=1,
+        )
+
+        composer = state.validate()
+        runtime = validate_pipeline_for_trained_operator(
+            state, SimpleNamespace(data_dir=tmp_path), composer_yaml_generator, session_id=_AGREEMENT_SESSION_ID
+        )
+        if composer_missing is None:
+            assert composer.is_valid, composer.errors
+            assert runtime.is_valid, runtime.errors
+        else:
+            [entry] = [e for e in composer.errors if e.error_code == "schema_contract_violation"]
+            assert entry.contract is not None
+            assert entry.contract.missing_fields == composer_missing
+            assert not runtime.is_valid
+
     def test_both_reject_every_registered_batch_plugin_under_passthrough(self, tmp_path: Path) -> None:
         """No shipped batch plugin emits one row per buffered row, so passthrough admits none of them.
 
