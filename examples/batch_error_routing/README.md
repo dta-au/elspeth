@@ -297,9 +297,18 @@ WHERE t.run_id = (SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1)
   so no batch waits for the end-of-source flush in `settings.yaml`. In
   `settings_declared.yaml` eleven orders reach the aggregation and the last
   two are flushed at end of source.
-- `batch_stats` treats a missing amount (`null`) and a non-finite float
-  differently: it skips that row and reports it in `skipped_missing` or
-  `skipped_non_finite`. Only a value of the wrong **type** fails the batch.
+- A value of the wrong **type** always fails the batch. A missing amount
+  (`null`) or a non-finite float does not: `batch_stats` skips that row and
+  reports it on the total it writes (`skipped_missing`,
+  `skipped_missing_indices`, or the `skipped_non_finite` pair), unless no
+  row in the batch has a usable amount, in which case the batch fails too,
+  since there is nothing to sum.
+- Those `skipped_*` columns appear only on a total that skipped a row. The
+  CSV sinks here fix their columns from the first row written, so such a
+  total arriving after a clean one cannot be written: the sink records it as
+  a failure (`sink_discarded`, "fields outside the established columns")
+  under its `on_write_failure: discard`. If your data can carry missing
+  amounts, write the totals to a JSON sink instead.
 
 ## See Also
 
