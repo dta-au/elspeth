@@ -973,19 +973,33 @@ class TestOutputSchemaConfig:
 
         assert transform.carried_output_fields() == carried
 
-    def test_an_identity_mapping_whose_header_literal_is_declared_is_not_carried(self) -> None:
-        """``{"Name": "Name"}`` with ``Name: int?`` is the operator's declaration of the emitted key (ADR-050 Decision 5).
+    def test_a_declared_header_literal_is_a_read_declaration_the_spelling_rule_governs(self) -> None:
+        """``{"Name": "Name"}`` with ``Name: int?`` declares ``Name`` as a READ (field-name spelling rule, 2026-09-25).
 
-        The input row is keyed ``name``, so no input check held the value to
-        the ``Name`` declaration: like a rename declared by its target name
-        alone, it is not carried. An undeclared literal stays carried.
+        The mapping SOURCE ``Name`` is a lookup and resolves either spelling;
+        the schema field ``Name`` is a declaration. Behind a normalizing
+        source it is the header spelling of ``name``, so the build refuses it
+        where the upstream proves it and the executor preflight routes the row
+        otherwise — the declaration never reaches the emitted contract. The
+        carried set no longer special-cases a declared header literal (the
+        limb that did is gone): an identity mapping by a header is carried
+        whatever the schema declares.
         """
+        from elspeth.contracts.field_spelling import header_spelled_row_declarations
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         declared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["Name: int?"]}})
         undeclared = FieldMapper({"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["id: int"]}})
 
-        assert declared.carried_output_fields() == frozenset()
+        assert "Name" in declared.declared_read_fields
+        [spelling] = header_spelled_row_declarations(
+            reads=declared.declared_read_fields,
+            creates=declared.declared_created_fields,
+            row_keys=frozenset({"id", "name"}),
+            forwarded_keys=frozenset(),
+        )
+        assert (spelling.literal, spelling.canonical, spelling.kind) == ("Name", "name", "read")
+        assert declared.carried_output_fields() == frozenset({"Name"})
         assert undeclared.carried_output_fields() == frozenset({"Name"})
 
     def test_a_header_spelled_source_is_never_matched_to_its_normalized_declaration(self) -> None:

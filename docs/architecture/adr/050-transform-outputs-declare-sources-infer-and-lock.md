@@ -121,10 +121,12 @@ rows meet.**
    header (`{"Name": "Name"}`) is carried too: it writes the literal header
    key, absent from the normalized input row, under the source field's
    contract, so it is not a created field even though, as an identity, it is
-   not a `declared_output_fields` name. When the operator declares that
-   header literal itself (`Name: int?`), the declaration is the target's, as
-   for any rename declared by its target name alone, so it is not carried and
-   Decision 5 checks its value. A plugin whose created NAMES are data (blob_csv_expand's CSV
+   not a `declared_output_fields` name. A schema field spelled by that header
+   literal (`Name: int?`) is not an output declaration of the target: it is a
+   READ declaration of the header spelling of `name`, which the field-name
+   spelling rule refuses (at build where a participating, closed upstream
+   proves it, per row otherwise), so the carried set no longer depends on it.
+   A plugin whose created NAMES are data (blob_csv_expand's CSV
    headers) passes them to the stamp per emission with the type its code
    fixes (`str`); the field set may grow row to row, the types cannot.
 4. **Completeness, Tier 1.** `OutputDeclarationCompletenessContract`
