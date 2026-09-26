@@ -975,27 +975,47 @@ def _check_truncate_literals(node: nodes.Filter, environment: ImmutableSandboxed
         arguments[key] = keyword.value
     literals: dict[str, int | float | str | None] = {}
     for name in ("length", "end", "leeway"):
-        if name not in arguments:
-            continue
-        argument = arguments[name]
-        # Jinja parses ``-1`` as Neg(Const(1)).
-        if type(argument) is nodes.Neg and type(argument.node) is nodes.Const and type(argument.node.value) in (int, float):
-            literals[name] = -argument.node.value
-        elif type(argument) is nodes.Const and (type(argument.value) in (int, float, str) or argument.value is None):
-            literals[name] = argument.value
-        else:
-            return
+        if name in arguments:
+            is_literal, value = _literal_argument(arguments[name])
+            if is_literal:
+                literals[name] = value
     # The empty-string probe below returns before truncate slices, so a
-    # non-integer length (truncate(10.5)) would pass it and then fail every
-    # row long enough to be truncated ("slice indices must be integers").
+    # non-integer length (truncate(10.5), truncate(True)) would pass it and
+    # then fail every row long enough to be truncated ("slice indices must be
+    # integers") or every row outright. This precondition reads length alone,
+    # so it holds whatever the other arguments are (truncate(10.5, end=row.e)).
     if "length" in literals and type(literals["length"]) is not int:
         raise TemplateAssertionError(f"truncate() length must be an integer literal, got {type(literals['length']).__name__}.", node.lineno)
+    if any(name in arguments and name not in literals for name in ("length", "end", "leeway")):
+        # A row-derived argument: the joint preconditions are decided at render.
+        return
     try:
         environment.filters["truncate"](environment, "", **literals)
     except (AssertionError, TypeError, ArithmeticError) as exc:
         # ArithmeticError: ``length + leeway`` with an int literal too large
         # for a float overflows on every render.
         raise TemplateAssertionError(f"truncate() arguments can never be satisfied: {exc}", node.lineno) from exc
+
+
+def _literal_argument(argument: nodes.Expr) -> tuple[bool, int | float | str | None]:
+    """Return ``(True, value)`` for an argument written as a literal, else ``(False, None)``.
+
+    A literal is a ``Const`` (the parser builds one only for a number, bool,
+    string or ``none``; a bool is an int here) or a unary minus
+    or plus over a number or bool ``Const``: Jinja parses ``-1`` as
+    ``Neg(Const(1))`` and ``+10.5`` as ``Pos(Const(10.5))``, and evaluates
+    both without the row. Constant EXPRESSIONS (``10 / 2``) are deliberately
+    not folded: the environment disables Jinja's constant folding
+    (``optimized=False``), so configuration validation never evaluates
+    operator arithmetic either.
+    """
+    if type(argument) is nodes.Const:
+        return True, argument.value
+    if (type(argument) is nodes.Neg or type(argument) is nodes.Pos) and type(argument.node) is nodes.Const:
+        operand = argument.node.value
+        if type(operand) in (int, float, bool):
+            return True, (-operand if type(argument) is nodes.Neg else +operand)
+    return False, None
 
 
 def create_sandboxed_environment(*, value_free: bool = False) -> ImmutableSandboxedEnvironment:

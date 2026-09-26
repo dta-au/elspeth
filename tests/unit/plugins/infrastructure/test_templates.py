@@ -624,6 +624,43 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
             "truncate() length must be an integer literal, got float.",
             id="truncate-length-float-keyword",
         ),
+        # The integer precondition reads length alone, so a row-derived sibling
+        # argument does not excuse it; unary plus and bool literals are literals
+        # too (P5 review r1 F1).
+        pytest.param(
+            "{{ row.q | truncate(10.5, end=row.e) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-beside-row-end",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(length=10.5, end=row.e) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-keyword-beside-row-end",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10.5, leeway=row.n) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-float-beside-row-leeway",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(+10.5) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-length-unary-plus-float",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(+2) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 2",
+            id="truncate-length-unary-plus-short",
+        ),
+        pytest.param("{{ row.q | truncate(True) }}", "truncate() length must be an integer literal, got bool.", id="truncate-length-true"),
+        pytest.param(
+            "{{ row.q | truncate(False) }}", "truncate() length must be an integer literal, got bool.", id="truncate-length-false"
+        ),
+        pytest.param(
+            "{{ row.q | truncate(10, end=True) }}",
+            "truncate() arguments can never be satisfied: object of type 'bool' has no len()",
+            id="truncate-end-bool",
+        ),
         # ``length + leeway`` overflows when an int literal is too large for a
         # float: an OverflowError on every render, not a construction crash.
         pytest.param(
@@ -672,6 +709,7 @@ def test_a_template_its_own_literals_fail_is_refused_when_built(source: str, mes
         pytest.param("{{ row.q | truncate(3) }}", id="truncate-length-equal-to-end"),
         pytest.param("{{ row.q | truncate(10, leeway=0) }}", id="truncate-zero-leeway"),
         pytest.param("{{ row.q | truncate(10, leeway=0.5) }}", id="truncate-float-leeway"),
+        pytest.param("{{ row.q | truncate(+10, end=row.e) }}", id="truncate-unary-plus-int-beside-row-end"),
         pytest.param("{{ row.n * 1e300 }}", id="finite-float-literal"),
         pytest.param("{{ row.q | truncate(*row.args) }}", id="truncate-splat"),
         pytest.param("{{ row.q | truncate(1, False, '', 0, 9) }}", id="truncate-arity-left-to-render"),

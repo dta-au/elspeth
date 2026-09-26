@@ -7846,6 +7846,12 @@ class TestComposerRuntimeTemplateLiteralAgreement:
             "{{ row.q | truncate(10.5) }}", "truncate() length must be an integer literal, got float.", id="truncate-float-length"
         ),
         pytest.param(
+            "{{ row.q | truncate(10.5, leeway=row.n) }}",
+            "truncate() length must be an integer literal, got float.",
+            id="truncate-float-length-beside-row-leeway",
+        ),
+        pytest.param("{{ row.q | truncate(True) }}", "truncate() length must be an integer literal, got bool.", id="truncate-bool-length"),
+        pytest.param(
             "{{ row.q | truncate(1e400) }}",
             "A number literal in this template is too large for a float (it overflows to infinity).",
             id="infinite-literal",
