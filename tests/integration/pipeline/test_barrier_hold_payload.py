@@ -42,6 +42,7 @@ from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import node_states_table, runs_table, token_outcomes_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.engine.clock import Clock
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.preflight import (
     assemble_and_validate_pipeline_config,
@@ -164,13 +165,16 @@ class _TransientFlushFault(RuntimeError):
     """An ordinary plugin exception: not Tier-1, not a contract violation, so the flush aborts the run."""
 
 
-def build_pipeline(tmp_path: Path, body_yaml: str, docs: list[dict[str, Any]], *, db: LandscapeDB | None = None) -> dict[str, Any]:
+def build_pipeline(
+    tmp_path: Path, body_yaml: str, docs: list[dict[str, Any]], *, db: LandscapeDB | None = None, clock: Clock | None = None
+) -> dict[str, Any]:
     """Build a checkpointed json-source/json-sink pipeline through the production build path.
 
     ``body_yaml`` is the processing section (a format string over nothing but
     literal braces). The audit database is SQLite under ``tmp_path`` unless
-    ``db`` (a PostgreSQL proof) is given. Shared with
-    ``test_collector_failure_verdict.py`` and its PostgreSQL twin.
+    ``db`` (a PostgreSQL proof) is given. ``clock`` drives the orchestrator's
+    timeouts (a ``MockClock`` makes a timeout trigger deterministic). Shared
+    with ``test_collector_failure_verdict.py`` and its PostgreSQL twin.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     input_path = tmp_path / "docs.jsonl"
@@ -225,6 +229,7 @@ def build_pipeline(tmp_path: Path, body_yaml: str, docs: list[dict[str, Any]], *
             db,
             checkpoint_manager=checkpoints,
             checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+            clock=clock,
         ),
         "payload_store": FilesystemPayloadStore(tmp_path / "payloads"),
         "catalog": (catalog_sha256, catalog_source),

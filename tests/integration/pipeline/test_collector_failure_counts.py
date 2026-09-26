@@ -423,6 +423,12 @@ def _readers(db: LandscapeDB, run_id: str) -> list[Any]:
         ("group_reason", "whose verdict records 'collector_missing_members'"),
         ("hold_group", "which has no collector_group_failures row"),
         ("hold_without_group", "does not carry the verdict's failure_reason, group_id"),
+        # Every verdict row gone while the holds remain: the reader must still
+        # walk the holds (it short-cuts only when the run has no collector
+        # node), or this corruption would read as zero groups and zero members.
+        ("every_group_row_deleted", "which has no collector_group_failures row"),
+        # One member holding two verdicts is two terminal decisions for one token.
+        ("duplicate_hold", "holds more than one collector group-failure verdict"),
     ],
 )
 def test_a_hold_that_disagrees_with_its_group_verdict_is_refused_by_every_reader(
@@ -435,16 +441,25 @@ def test_a_hold_that_disagrees_with_its_group_verdict_is_refused_by_every_reader
     db = env["db"]
     assert _surfaces(db, result.run_id).errors["collector_group"] == 3, "control: the untampered run counts"
     with db.connection() as conn:
-        hold_id, error_json = conn.execute(
-            select(node_states_table.c.state_id, node_states_table.c.error_json)
-            .where(node_states_table.c.error_json.like('%"CollectorGroupFailure"%'))
-            .order_by(node_states_table.c.state_id)
-            .limit(1)
-        ).one()
-    error = json.loads(error_json)
+        hold = (
+            conn.execute(
+                select(node_states_table)
+                .where(node_states_table.c.error_json.like('%"CollectorGroupFailure"%'))
+                .order_by(node_states_table.c.state_id)
+                .limit(1)
+            )
+            .mappings()
+            .one()
+        )
+    hold_id = hold["state_id"]
+    error = json.loads(hold["error_json"])
     with db.engine.begin() as conn:
         if tamper == "group_reason":
             conn.execute(update(collector_group_failures_table).values(failure_reason="collector_missing_members"))
+        elif tamper == "every_group_row_deleted":
+            conn.execute(collector_group_failures_table.delete().where(collector_group_failures_table.c.run_id == result.run_id))
+        elif tamper == "duplicate_hold":
+            conn.execute(insert(node_states_table).values({**hold, "state_id": f"{hold_id}-copy", "attempt": hold["attempt"] + 1}))
         else:
             if tamper == "hold_reason":
                 error["context"]["failure_reason"] = "collector_missing_members"

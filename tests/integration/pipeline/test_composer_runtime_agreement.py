@@ -2142,6 +2142,73 @@ class TestComposerRuntimeAgreement:
             with pytest.raises(GraphValidationError, match=rf"x \(expected {consumer_type}, got {producer_type}\)"):
                 runtime_build()
 
+    @pytest.mark.parametrize(
+        ("producer_type", "consumer_type", "admitted"),
+        [
+            pytest.param("int", "float", True, id="int-under-float"),
+            pytest.param("bool", "float", False, id="bool-under-float"),
+            pytest.param("float", "int", False, id="float-under-int"),
+        ],
+    )
+    def test_both_apply_the_one_declared_type_rule_through_an_observed_forwarder(
+        self, tmp_path: Path, producer_type: str, consumer_type: str, admitted: bool
+    ) -> None:
+        """Ruling C3 on the guarantee channel: a typed source, an observed passthrough, a typed sink.
+
+        The sink's upstream is an observed transform, so the direct-edge type
+        check abstains and the build reaches the source's declared type through
+        the forwarded guarantee (``resolved_guarantee_type_mismatch``). That
+        pass must apply the same one rule as the direct edge, on both surfaces.
+        """
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("x\n1\n", encoding="utf-8")
+        output_path = tmp_path / "out.csv"
+        source_options = {"path": str(csv_path), "schema": {"mode": "fixed", "fields": [f"x: {producer_type}"]}}
+        transform_options = {"schema": {"mode": "observed"}}
+        sink_options = {"path": str(output_path), "schema": {"mode": "fixed", "fields": [f"x: {consumer_type}"]}}
+
+        state = self._empty_state()
+        state = state.with_source(SourceSpec(plugin="csv", on_success="t1", options=source_options, on_validation_failure="discard"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="passthrough",
+                input="t1",
+                on_success="main",
+                on_error="discard",
+                options=transform_options,
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(OutputSpec(name="main", plugin="csv", options=sink_options, on_write_failure="discard"))
+        composer_type_errors = [e for e in state.validate().errors if e.error_code == "edge_field_type_incompatible"]
+
+        def runtime_build() -> None:
+            graph = self._build_runtime_graph(
+                source_plugin="csv",
+                source_options=source_options,
+                transform_plugin="passthrough",
+                transform_options=transform_options,
+                sink_options=sink_options,
+            )
+            graph.validate()
+            graph.validate_edge_compatibility()
+
+        if admitted:
+            assert composer_type_errors == []
+            runtime_build()
+        else:
+            [type_error] = composer_type_errors
+            assert f"x (consumer expects {consumer_type}, producer emits {producer_type})" in type_error.message
+            with pytest.raises(GraphValidationError, match=r"Observed-schema type violation"):
+                runtime_build()
+
     def test_both_accept_aggregation_with_input_fields_and_required_fields(
         self,
         tmp_path: Path,

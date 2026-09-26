@@ -163,6 +163,19 @@ class TestTemplateMode:
         result = builder.build(_row({"topic": "compliance", "category": "finance"}))
         assert result.query == "Find documents about compliance for finance"
 
+    @pytest.mark.parametrize(("value", "rendered"), [(42, "42"), (1.5, "1.5"), (True, "True")], ids=["int", "float", "bool"])
+    def test_a_non_str_value_is_interpolated_not_refused(self, value, rendered):
+        """Template mode binds the value like any row value; only the modes that USE it as the query require a str.
+
+        The one type check in ``build`` runs after the template dispatch, so its
+        order is the behaviour: hoisting it above the dispatch would refuse this
+        row as ``wrong_type``.
+        """
+        builder = _builder(query_field="topic", query_template="Find documents about {{ query }}")
+        result = builder.build(_row({"topic": value}))
+        assert result.error is None
+        assert result.query == f"Find documents about {rendered}"
+
     def test_structural_error_at_compile_time(self):
         with pytest.raises(TemplateError):
             _builder(

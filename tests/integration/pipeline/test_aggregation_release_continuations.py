@@ -26,6 +26,7 @@ process death after the release committed, and between the continuations, is
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,9 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import token_outcomes_table, token_work_items_table, tokens_table
+from elspeth.engine.clock import MockClock
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.json_source import JSONSource
 from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 from elspeth.plugins.transforms.batch_stats import BatchStats
 from tests.integration.pipeline.test_barrier_hold_payload import build_pipeline, resume_pipeline, run_pipeline, terminal_counts
@@ -134,6 +137,7 @@ _GROUP_OUTPUT = {
 # Captured once, so a patch wraps the real plugin, not an earlier wrapper.
 _REAL_BATCH_STATS_PROCESS = BatchStats.process
 _REAL_BATCH_REPLICATE_PROCESS = BatchReplicate.process
+_REAL_JSONL_LOAD = JSONSource._load_jsonl
 
 
 class _FlushFault(RuntimeError):
@@ -199,6 +203,49 @@ def test_a_release_into_a_scope_opener_completes_every_document(
     # The opener's discard of an unparseable document leaves its work item FAILED, as it does without the release.
     assert journal.pop(TokenWorkStatus.FAILED.value, 0) == unparseable
     assert set(journal) == {TokenWorkStatus.TERMINAL.value}
+
+
+@pytest.mark.parametrize("output_mode", ["passthrough", "transform"])
+def test_a_timeout_release_mid_source_into_a_scope_opener_completes_every_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_mode: str
+) -> None:
+    """The TIMEOUT arm: two buffered documents are released while the source still has rows.
+
+    The injected clock passes ``timeout_seconds`` just before the source yields
+    its third document, so the pre-row timeout check releases the first two
+    mid-source (an out-of-claim release) into the opener. The drain it runs
+    leaves pending-sink rows to the run's own sink write: recovering them there
+    re-drives rows whose node states are already recorded, which collides on
+    ``node_states``' (token, step, attempt) key and aborts the run.
+    """
+    clock = MockClock(start=0.0)
+    batch_sizes: list[int] = []
+
+    def replicate(self: BatchReplicate, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
+        batch_sizes.append(len(rows))
+        return _REAL_BATCH_REPLICATE_PROCESS(self, rows, ctx)
+
+    def load_jsonl(self: JSONSource, ctx: Any) -> Iterator[Any]:
+        for index, row in enumerate(_REAL_JSONL_LOAD(self, ctx)):
+            if index == 2:
+                clock.advance(10.0)
+            yield row
+
+    monkeypatch.setattr(BatchReplicate, "process", replicate)
+    monkeypatch.setattr(JSONSource, "_load_jsonl", load_jsonl)
+    body = _scope_pipeline(output_mode).replace("trigger: {{count: 100}}", "trigger: {{timeout_seconds: 5}}")
+    docs = [{"id": 1, "items": [3, 1, 2]}, {"id": 2, "items": [5, 7]}, {"id": 3, "items": [5, 7]}]
+    env = build_pipeline(tmp_path, body, docs, clock=clock)
+    flushes = _count_collector_flushes(monkeypatch)
+
+    result = run_pipeline(env)
+
+    assert result.status is RunStatus.COMPLETED
+    assert batch_sizes == [2, 1], "the timeout released the first two documents mid-source, end of source the third"
+    assert _output_rows(env) == sorted((_GROUP_OUTPUT[doc_id] for doc_id in (1, 2, 3)), key=json.dumps)
+    assert len(flushes) == 3, "each document's group is flushed exactly once"
+    assert _tokens_without_a_terminal_outcome(env["db"]) == 0
+    assert set(_journal_statuses(env["db"])) == {TokenWorkStatus.TERMINAL.value}
 
 
 def test_a_release_into_a_transform_then_a_second_barrier_completes(tmp_path: Path) -> None:
