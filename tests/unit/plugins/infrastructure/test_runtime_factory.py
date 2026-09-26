@@ -175,7 +175,5 @@ def test_only_report_assemble_declares_the_aggregation_window_requirement():
 
     transforms = get_shared_plugin_manager().get_transforms()
     assert {cls.name for cls in transforms if cls.requires_aggregation_batch_context} == {"report_assemble"}
-    # Likewise opt-in: only batch_replicate's flush emits another row count than it buffered.
-    assert {cls.name for cls in transforms if cls.requires_transform_output_mode} == {"batch_replicate"}
     # Positive control: the registry is populated and batch plugins are in it.
     assert len({cls.name for cls in transforms if cls.is_batch_aware}) >= 13

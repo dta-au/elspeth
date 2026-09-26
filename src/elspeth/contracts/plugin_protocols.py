@@ -397,11 +397,6 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
 
-    # True when a flush can emit a row count other than one per buffered row,
-    # so the plugin runs only as an aggregation with output_mode: transform;
-    # runtime_factory refuses any other output_mode.
-    requires_transform_output_mode: bool
-
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
     # and new tokens will be created for each output row.
@@ -654,11 +649,6 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # True when the plugin reads ``ctx.aggregation_batch``, which only an
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
-
-    # True when a flush can emit a row count other than one per buffered row,
-    # so the plugin runs only as an aggregation with output_mode: transform;
-    # runtime_factory refuses any other output_mode.
-    requires_transform_output_mode: bool
 
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
