@@ -224,7 +224,13 @@ drained and repair this release forward.
   observed-mode LLM source recorded `score: float` for an `integer` field.
   JSON and CSV sink bytes are unchanged (both write an integral float as an
   integer); the LLM node's recorded contract and every `contract_hash` over
-  it move.
+  it move. An LLM transform whose own `schema.fields` types a field it
+  writes as a type that value never has (`confidence: int` over `type:
+  number`, or `llm_response: int`) is now refused at configuration by
+  `elspeth validate` and the composer; before, it built and then failed
+  every row. A downstream node declaring `int` for a `number` field is not
+  caught at build and now routes every row, where a provider answering `7`
+  used to deliver: declare it `float`.
 - **Collector group failures are counted where failures are reported.** A
   collector group that fails as a whole now shows in the web run's failure
   categories and in MCP error analysis, one entry per failed member token

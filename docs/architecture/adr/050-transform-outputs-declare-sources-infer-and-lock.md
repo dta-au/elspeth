@@ -382,6 +382,15 @@ rows meet.**
   and after); what changes is the type a downstream node receives and the
   node records, and with it the LLM node's recorded contract and every
   `contract_hash` computed over it.
+- A declaration the bound type never satisfies can no longer deliver. On the
+  LLM node itself it is refused at configuration: `LLMConfig` refuses an
+  authored `schema.fields` type that does not admit the type the transform
+  writes (`confidence: int` over `type: number`), as the LLM source already
+  did. A DOWNSTREAM node declaring `int` for an LLM `number` field is not
+  refused at build: the LLM's created-field types live in the runtime stamp,
+  not in the output schema the build compares (the promotion is the ruled
+  follow-up), so that consumer routes every row at its input check, where
+  before the binding a provider answering `7` delivered it.
 - A pre-change run at the same Landscape epoch that is resumed after the
   change is neither refused up front nor uniformly aborted. The node writer
   (`merge_for_node_evolution`) raises on a TYPE difference only, so it

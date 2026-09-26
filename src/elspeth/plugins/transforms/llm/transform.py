@@ -54,12 +54,11 @@ from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_
 from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow, declared_row_projection
 from elspeth.plugins.transforms.llm import (
     _OUTPUT_FIELD_TYPE_TO_SCHEMA,
-    _SUFFIX_SCHEMA_TYPES,
-    LLM_GUARANTEED_SUFFIXES,
     _build_augmented_output_schema,
     _build_llm_output_schema_config,
     _build_multi_query_output_schema,
     _FieldType,
+    _llm_created_output_fields,
     build_llm_audit_metadata,
     get_llm_guaranteed_fields,
     populate_llm_operational_fields,
@@ -1187,18 +1186,6 @@ class MultiQueryStrategy:
 # ---------------------------------------------------------------------------
 
 
-def _llm_created_output_fields(
-    response_field: str,
-    prefix: str,
-    output_fields: tuple[OutputFieldConfig, ...],
-) -> tuple[FieldDefinition, ...]:
-    """The typed created fields of one query: its operational fields plus its structured fields under ``prefix``."""
-    return (
-        *(FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES),
-        *(FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in output_fields),
-    )
-
-
 class LLMTransform(BaseTransform, BatchTransformMixin):
     """Unified LLM transform with provider dispatch and strategy selection.
 
@@ -1224,7 +1211,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:52e135b053c9d326"
+    source_file_hash: str | None = "sha256:a6ff8d1e5faa13bf"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

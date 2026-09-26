@@ -93,6 +93,23 @@ LLM_AUDIT_SUFFIXES: tuple[str, ...] = (
 )
 
 
+def _llm_created_output_fields(
+    response_field: str,
+    prefix: str,
+    output_fields: Iterable[OutputFieldConfig],
+) -> tuple[FieldDefinition, ...]:
+    """The typed created fields of one query: its operational fields plus its structured fields under ``prefix``.
+
+    The one table of what an LLM transform writes and as which type: the
+    transform stamps it (``LLMTransform.created_output_fields``) and
+    ``LLMConfig`` checks the operator's authored types against it.
+    """
+    return (
+        *(FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES),
+        *(FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in output_fields),
+    )
+
+
 def _validate_response_field(response_field: str) -> None:
     if not response_field or not response_field.strip():
         raise ValueError("response_field cannot be empty or whitespace-only")
@@ -482,6 +499,7 @@ __all__ = [
     "_SUFFIX_SCHEMA_TYPES",
     "_build_augmented_output_schema",
     "_build_multi_query_output_schema",
+    "_llm_created_output_fields",
     "build_llm_audit_metadata",
     "get_llm_audit_fields",
     "get_llm_guaranteed_fields",

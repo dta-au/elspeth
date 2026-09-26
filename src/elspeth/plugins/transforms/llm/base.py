@@ -15,12 +15,13 @@ from jinja2 import TemplateSyntaxError
 from jinja2 import nodes as jinja_nodes
 from pydantic import Field, ValidationError, field_validator, model_validator
 
+from elspeth.contracts.schema_contract import declared_type_name_admits
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
-from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, _llm_created_output_fields
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QueryDefinition, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
@@ -525,6 +526,48 @@ class LLMConfig(TransformDataConfig):
                         f"response/operational fields {sorted(reserved)}; choose another suffix "
                         "or rename response_field"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_authored_types_admit_the_written_types(self) -> LLMConfig:
+        """An authored ``schema.fields`` type on a field this transform writes must admit the type it writes.
+
+        The operator's type is the field's recorded declaration (ADR-050:
+        operator > plugin), and every value the transform writes is checked
+        against it. The transform writes each such field as one fixed type:
+        the response and model as ``str``, and each ``output_fields`` entry as
+        the type its ``type`` binds at parse (``number`` is always a ``float``,
+        ``integer`` an ``int``). A declaration that type can never satisfy
+        (``confidence: int`` over ``type: number``) would fail every row at
+        run time with a message blaming a schema bug, so it is refused here,
+        as the LLM source refuses the same contradiction. The rule is the one
+        declared-type rule (``declared_type_name_admits``): an ``int`` output
+        under a ``float`` declaration is admitted. ``any`` on either side
+        abstains.
+        """
+        authored = self.schema_config.fields if self.schema_config is not None else None
+        if not authored:
+            return self
+        if self.queries is None:
+            written = _llm_created_output_fields(self.response_field, "", self.output_fields or ())
+        else:
+            written = tuple(
+                definition
+                for spec in resolve_queries(self.queries)
+                for definition in _llm_created_output_fields(
+                    f"{spec.name}_{self.response_field}", f"{spec.name}_", spec.output_fields or ()
+                )
+            )
+        written_types = {definition.name: definition.field_type for definition in written if definition.field_type != "any"}
+        for field in authored:
+            if field.name not in written_types or field.field_type == "any":
+                continue
+            written_type = written_types[field.name]
+            if not declared_type_name_admits(field.field_type, written_type):
+                raise ValueError(
+                    f"LLM schema field {field.name!r} is declared {field.field_type!r}, but this transform always writes it "
+                    f"as {written_type!r}, which that declaration never admits; declare it {written_type!r} or leave it out"
+                )
         return self
 
     @model_validator(mode="after")

@@ -7863,6 +7863,115 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         self._runtime(tmp_path, plugin, runtime_options)
 
 
+class TestComposerRuntimeLlmAuthoredOutputTypeAgreement:
+    """An authored type on a field the LLM transform writes must admit the type it writes (S1b review F1).
+
+    The transform binds each ``output_fields`` type to one row type at parse
+    (``number`` is always a float), so ``confidence: int`` over ``type:
+    number`` used to build and then fail every row at run time as a "schema
+    bug". Both surfaces now refuse it from the config model; an ``int``
+    output under a ``float`` declaration stays admitted (ruling C3).
+    """
+
+    @staticmethod
+    def _options(authored: list[str], *, queries: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+        """(composer options, runtime options)."""
+        output_fields = [{"suffix": "score", "type": "integer"}, {"suffix": "confidence", "type": "number"}]
+        common: dict[str, Any] = {
+            "provider": "openrouter",
+            "model": "openai/gpt-4.1-nano",
+            "required_input_fields": ["q"],
+            "response_field": "judged",
+            "schema": {"mode": "flexible", "fields": authored},
+        }
+        if queries:
+            common["queries"] = {"rate": {"input_fields": {"text": "q"}, "template": "Rate {{ row.text }}", "output_fields": output_fields}}
+        else:
+            common["prompt_template"] = "Rate {{ row.q }}"
+            common["output_fields"] = output_fields
+        return {**common, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**common, "api_key": "sk-test-key"}
+
+    @staticmethod
+    def _runtime(tmp_path: Path, options: dict[str, Any]) -> None:
+        csv_path = tmp_path / "in.csv"
+        csv_path.write_text("q\nhello\n", encoding="utf-8")
+        config = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="t1",
+                    options={
+                        "path": str(csv_path),
+                        "schema": {"mode": "observed", "guaranteed_fields": ["q"]},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[TransformSettings(name="t1", plugin="llm", input="t1", on_success="main", on_error="discard", options=options)],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv", on_write_failure="discard", options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}}
+                )
+            },
+        )
+        instantiate_plugins_from_config(config)
+
+    @pytest.mark.parametrize(
+        ("authored", "queries", "message"),
+        [
+            pytest.param(
+                ["confidence: int"],
+                False,
+                "'confidence' is declared 'int', but this transform always writes it as 'float'",
+                id="int-over-number",
+            ),
+            pytest.param(
+                ["score: str"], False, "'score' is declared 'str', but this transform always writes it as 'int'", id="str-over-integer"
+            ),
+            pytest.param(
+                ["score: bool"], False, "'score' is declared 'bool', but this transform always writes it as 'int'", id="bool-over-integer"
+            ),
+            pytest.param(
+                ["judged: int"], False, "'judged' is declared 'int', but this transform always writes it as 'str'", id="response-field"
+            ),
+            pytest.param(
+                ["rate_confidence: int"],
+                True,
+                "'rate_confidence' is declared 'int', but this transform always writes it as 'float'",
+                id="multi-query",
+            ),
+        ],
+    )
+    def test_both_refuse_a_declaration_the_written_type_never_satisfies(
+        self, tmp_path: Path, authored: list[str], queries: bool, message: str
+    ) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(authored, queries=queries)
+        composer = _prevalidate_transform("llm", composer_options)
+        assert composer is not None
+        assert message in composer, composer
+        with pytest.raises(PluginConfigError, match=re.escape(message)):
+            self._runtime(tmp_path, runtime_options)
+
+    @pytest.mark.parametrize(
+        ("authored", "queries"),
+        [
+            pytest.param(["score: float"], False, id="int-output-under-float"),
+            pytest.param(["confidence: float", "score: int"], False, id="matching"),
+            pytest.param(["confidence: any", "judged_usage: any"], False, id="any-abstains"),
+            pytest.param(["other: int"], False, id="a-field-the-transform-does-not-write"),
+            pytest.param(["rate_confidence: float"], True, id="multi-query-matching"),
+        ],
+    )
+    def test_both_admit_a_declaration_the_written_type_satisfies(self, tmp_path: Path, authored: list[str], queries: bool) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(authored, queries=queries)
+        assert _prevalidate_transform("llm", composer_options) is None
+        self._runtime(tmp_path, runtime_options)
+
+
 class TestComposerRuntimeFieldNameSpellingAgreement:
     """Shape 31 — a header-spelled declaration: both surfaces refuse it together, and admit the controls.
 
