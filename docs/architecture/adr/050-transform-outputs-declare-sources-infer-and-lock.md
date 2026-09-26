@@ -121,7 +121,7 @@ rows meet.**
    header (`{"Name": "Name"}`) is carried too: its source is a row lookup, so
    it is the rename `name` -> `Name`, writing the literal header key, absent
    from the normalized input row, under the source field's contract; it is not
-   a created field even though, as an identity, it is not a
+   a `created_output_fields()` declaration even though, as an identity, it is not a
    `declared_output_fields` name. When the operator declares that header
    literal itself (`Name: str?`), the declaration is the target's, as for any
    rename declared by its target name alone, so it is not carried and
