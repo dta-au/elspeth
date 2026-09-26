@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol, TransformResult
-from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation
+from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation, derive_effective_input_fields
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     PassThroughContractViolation,
@@ -260,8 +260,11 @@ class TestOptionalFieldAbsentFromPayload:
     lacks one still carries the source's contract. The flush cross-check must
     derive input fields as the single-token path does
     (``derive_effective_input_fields``): an optional field the row does not
-    carry is not an input the transform can drop. A field the row DOES carry
-    and the transform drops is still a violation, required or not.
+    carry is not an input the transform can drop. A dropped field is still a
+    violation, required or not, when every buffered row carried it (TRANSFORM
+    mode) or when the paired row carried it (PASSTHROUGH mode). TRANSFORM mode
+    does not attribute outputs to inputs, so a field only some buffered rows
+    carried is outside the intersection it checks (ADR-009 2026-09-26 note).
     """
 
     def test_transform_mode_mixed_batch_without_optional_field_is_honest(self) -> None:
@@ -348,6 +351,28 @@ class TestOptionalFieldAbsentFromPayload:
             processor._cross_check_flush_output(fctx, result)
         assert exc_info.value.divergence_set == frozenset({"n"})
         assert exc_info.value.token_id == "t1"
+
+    def test_transform_mode_payload_key_outside_the_contract_is_not_an_input(self) -> None:
+        """The flush site uses the shared helper, not the payload's keys (panel F1).
+
+        ``derive_effective_input_fields`` counts only the contract fields the
+        payload carries, so a payload key the contract does not name is not an
+        input on the single-token path. The flush site must agree. A
+        ``PipelineRow`` with such a key constructs; whether a live pipeline
+        delivers one to an aggregation has not been shown.
+        """
+        processor = _make_processor()
+        contract = make_contract({"id": 1})
+        tokens = [
+            _make_token("t0", {"id": 1, "extra": 2}, contract),
+            _make_token("t1", {"id": 2, "extra": 3}, contract),
+        ]
+        assert all(derive_effective_input_fields(token.row_data) == frozenset({"id"}) for token in tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "copy-contract-fields"})
+        processor._cross_check_flush_output(fctx, result)
 
 
 class TestEmptyEmissionGovernance:
