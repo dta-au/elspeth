@@ -1431,8 +1431,16 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"batch_transform_misplaced",
-        "A batch-aware plugin is configured as a row-level transform; batch plugins only run as aggregations.",
-        "Re-emit the node with node_type='aggregation' and a trigger (e.g. trigger={'count': N}), or pick a row-level transform plugin.",
+        "A batch-aware plugin sits in a node kind it cannot run in. Three placements carry this code: a batch-only "
+        "plugin as node_type='transform' (it processes a whole batch, never one row); a plugin that reads the "
+        "aggregation flush window (report_assemble) as a collector, whose end-of-group flush has no window; and "
+        "batch_replicate as an aggregation without output_mode: transform.",
+        "Read the message to see which placement was refused. A transform: re-emit the node with "
+        "node_type='aggregation' and a trigger (e.g. trigger={'count': N}), or pick a row-level transform plugin. "
+        "A collector: keep the collector, close the scope with a batch-aware plugin that reads no flush window "
+        "(list_transforms, then get_plugin_schema), and if the refused plugin is still wanted, run it as an aggregation "
+        "downstream of the collector. Turning the collector itself into an aggregation leaves the scope without a "
+        "closer. batch_replicate: set output_mode: 'transform'.",
     ),
     (
         r"batch_required_fields_invalid",

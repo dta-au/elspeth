@@ -7591,8 +7591,13 @@ class TestComposerRuntimeBatchPlacementAgreement:
         assert "aggregation flush window" in misplaced[0].message
         with pytest.raises(
             ValueError, match=r"Collector 'stitch' uses transform 'report_assemble' which requires an aggregation flush window"
-        ):
+        ) as raised:
             self._runtime_instantiate(state)
+        # Both sides give the same remedy: keep the collector as the closer, move the plugin downstream.
+        assert "Close the scope with a batch-aware plugin that reads no flush window" in misplaced[0].message
+        assert "Close the scope with a batch-aware plugin that reads no flush window" in str(raised.value)
+        assert "downstream of the collector" in misplaced[0].message
+        assert "downstream of the collector" in str(raised.value)
 
     def test_both_accept_a_windowless_batch_plugin_as_collector(self, tmp_path: Path) -> None:
         """Control: the same collector topology closed by batch_stats, which reads no flush window."""

@@ -269,3 +269,32 @@ def test_direct_exact_lookup_precedes_any_legacy_prose_pattern(monkeypatch: pyte
     result = execute_tool("explain_validation_error", {"error_text": record.code}, _empty_state(), _mock_catalog())
     assert result.data["explanation"] == record.explanation
     assert result.data["suggested_fix"] == record.suggested_fix
+
+
+def test_the_shared_batch_placement_code_teaches_every_arm_that_emits_it() -> None:
+    """``batch_transform_misplaced`` has three emitting arms; its guidance must fit each (review-R4 F1).
+
+    The code was reused for report_assemble-as-collector so that no wire code
+    moved; the guidance still taught only the row-transform arm, and its fix
+    (convert to an aggregation, or pick a row-level plugin) is wrong for a
+    collector: a row plugin cannot close a scope, and converting the closer
+    leaves the scope without one.
+    """
+    from elspeth.web.composer.state import _batch_aware_placement_error
+
+    arms = {
+        "transform": _batch_aware_placement_error("n", "transform", "batch_stats", None),
+        "collector": _batch_aware_placement_error("n", "collector", "report_assemble", None),
+        "replicate": _batch_aware_placement_error("n", "aggregation", "batch_replicate", "passthrough"),
+    }
+    assert all(message is not None for message in arms.values()), arms
+    explanation, fix = generation.explain_validation_code("batch_transform_misplaced") or ("", "")
+
+    assert "node_type='transform'" in explanation
+    assert "report_assemble" in explanation and "collector" in explanation
+    assert "batch_replicate" in explanation and "output_mode: transform" in explanation
+    assert "leaves the scope without a closer" in fix
+    assert "downstream of the collector" in fix
+    # The collector arm's own message gives the same remedy, never "make the collector an aggregation".
+    assert "downstream of the collector" in (arms["collector"] or "")
+    assert "Configure this node as node_type='aggregation'" not in (arms["collector"] or "")

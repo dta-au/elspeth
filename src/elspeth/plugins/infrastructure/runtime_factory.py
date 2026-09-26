@@ -178,7 +178,9 @@ def instantiate_plugins_from_config(
                 raise ValueError(
                     f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' which "
                     f"requires an aggregation flush window (its trigger and row positions); a collector's "
-                    f"end_of_group flush does not have one. Declare it under aggregations: with a trigger."
+                    f"end_of_group flush does not have one. Close the scope with a batch-aware plugin that reads "
+                    f"no flush window; to keep this plugin, declare it under aggregations: (with a trigger) "
+                    f"downstream of the collector."
                 )
             transform = transform_cls(dict(collector_config.options))
             transform.on_success = collector_config.on_success

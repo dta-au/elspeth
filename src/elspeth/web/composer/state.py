@@ -1749,7 +1749,8 @@ def _batch_aware_placement_error(
         return (
             f"Node '{node_id}' uses '{plugin_name}' as a collector, but the plugin requires an aggregation "
             "flush window (its trigger and row positions), which a collector's end_of_group flush does not have. "
-            "Configure this node as node_type='aggregation' with an aggregation trigger instead."
+            "Close the scope with a batch-aware plugin that reads no flush window; to keep this plugin, run it as an "
+            "aggregation (with a trigger) downstream of the collector."
         )
 
     if plugin_name not in _known_batch_aware_transform_plugins_requiring_aggregation():
