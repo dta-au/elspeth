@@ -520,6 +520,27 @@ def test_a_rename_that_restores_the_header_is_not_a_shadow(tmp_path: Path) -> No
     assert [sorted(json.loads(line)) for line in (tmp_path / "out.jsonl").read_text().splitlines()] == [["Name", "id"], ["Name", "id"]]
 
 
+def test_a_required_created_name_the_source_cannot_supply_builds_and_routes_each_row(tmp_path: Path) -> None:
+    """``{Name: Name}`` + required ``Name: str`` over a source with no ``name`` (P1 review r3 F1).
+
+    ``Name`` is the name the node creates, so neither the runtime nor the
+    composer demands it of the input row; the pipeline builds, and each row
+    whose lookup finds nothing routes ``missing_field`` — every token terminal,
+    no traceback. The Stage-1 half is pinned in the composer/runtime agreement
+    file (Shape 31).
+    """
+    mapper = _transform("field_mapper", {"mapping": {"Name": "Name"}, "schema": {"mode": "flexible", "fields": ["Name: str"]}})
+    source = _csv_source(tmp_path, f"ID,Other\n1,{SENTINEL}\n2,Bob\n", schema={"mode": "fixed", "fields": ["id: str", "other: str"]})
+    result = _run(_settings(tmp_path, source=source, transforms=[mapper]))
+
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
+    reasons = _reasons(tmp_path)
+    assert [r["reason"] for r in reasons] == ["missing_field", "missing_field"]
+    assert all(SENTINEL not in json.dumps(r) for r in reasons)
+
+
 # ---------------------------------------------------------------------------
 # Batch transforms (sweep §2.8)
 # ---------------------------------------------------------------------------

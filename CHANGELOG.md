@@ -125,7 +125,11 @@ drained and repair this release forward.
 - **A declaration names a field as rows carry it (field-name spelling rule).**
   Sources key every row by the normalized form of each header (`Name` →
   `name`). A row lookup still resolves either spelling (`row['Name']` in an
-  expression or template, a `field_mapper` mapping source), but a declaration —
+  expression, a `field_mapper` mapping source). A template reference is not a
+  free lookup: it must name a field its node declares in
+  `required_input_fields`, so `{{ row.Name }}` is refused whether the node
+  declares `name` or `Name`, and a header-spelled reference is accepted only
+  under `required_input_fields: []` (the whole-row opt-out). A declaration —
   a transform, aggregation or sink `schema` field, `required_fields`,
   `required_input_fields`, a column option such as `url_field`, `query_field`,
   `blob_ref_field`, `value_field` or `group_by`, a `type_coerce` conversion's
@@ -169,7 +173,12 @@ drained and repair this release forward.
   emitted field's declaration exactly as under `{name: Name}`: it is accepted,
   the emitted value is checked against it, and a required `Name: str` is no
   longer demanded on the input row (it was refused at build as a missing
-  field, or routed `contract_violation`, while `{name: Name}` ran).
+  field, or routed `contract_violation`, while `{name: Name}` ran). The web
+  composer now agrees: its required-field check reads the transform's
+  constructed input model, which drops a declared field the transform itself
+  creates, instead of the raw `schema:` block — so it no longer refuses a
+  required `Name: str` under `{Name: Name}` or `{name: Name}` with "requires
+  fields: [Name]" while the runtime builds the pipeline.
   The normalization algorithm moved to
   `elspeth.contracts.field_spelling` unchanged (`NORMALIZATION_ALGORITHM_VERSION`
   is still `1.0.1`).

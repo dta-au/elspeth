@@ -8291,6 +8291,51 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
         self._assert_both_accept(state, tmp_path)
 
+    @pytest.mark.parametrize(
+        ("source_schema", "mapping"),
+        [
+            ({"mode": "fixed", "fields": ["id: str", "name: str"]}, {"Name": "Name"}),
+            ({"mode": "flexible", "fields": ["id: str", "name: str"]}, {"Name": "Name"}),
+            ({"mode": "fixed", "fields": ["id: str", "name: str"]}, {"name": "Name"}),
+            ({"mode": "fixed", "fields": ["id: str", "other: str"]}, {"Name": "Name"}),
+        ],
+        ids=["identity-by-header-fixed", "identity-by-header-flexible", "canonical-rename-fixed", "identity-by-header-source-lacks-name"],
+    )
+    def test_both_accept_a_required_declaration_of_the_name_the_node_creates(
+        self, tmp_path: Path, source_schema: dict[str, Any], mapping: dict[str, str]
+    ) -> None:
+        """A REQUIRED ``Name: str`` the field_mapper writes is not demanded of the input row on either surface (P1 review r3 F1).
+
+        The runtime's input model demotes a field the transform creates and
+        does not read (``demoted_input_fields``, elspeth-d6eeb3a71d); the
+        composer reads the same constructed model rather than the raw
+        ``schema:`` block. Before, Stage 1 refused all four shapes with
+        ``schema_contract_violation`` ('requires fields: [Name]') while the
+        runtime built them — the canonical-rename row since before the
+        spelling rule. Where the source cannot supply ``name`` at all, both
+        build and each row routes ``missing_field`` at the lookup.
+        """
+        state = self._state(
+            tmp_path,
+            source_schema=source_schema,
+            node=self._field_mapper(mapping, schema={"mode": "flexible", "fields": ["Name: str"]}),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_still_demand_a_required_declaration_the_node_does_not_create(self, tmp_path: Path) -> None:
+        """Control: the demotion covers only created names — a required ``other: str`` the source lacks is refused by both."""
+        state = self._state(
+            tmp_path,
+            source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]},
+            node=self._field_mapper({"name": "Name"}, schema={"mode": "flexible", "fields": ["Name: str", "other: str"]}),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "schema_contract_violation"]
+        assert entry.contract is not None
+        assert entry.contract.missing_fields == ("other",)
+        assert not runtime.is_valid
+        assert any("other" in e.message for e in runtime.errors), runtime.errors
+
     def test_both_reject_a_rename_target_spelling_a_field_the_node_keeps(self, tmp_path: Path) -> None:
         """Control for the removal leg: ``{id: Name}`` removes ``id``, keeps ``name``, and ``Name`` would land beside it."""
         state = self._state(

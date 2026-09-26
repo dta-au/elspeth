@@ -4947,6 +4947,39 @@ def _check_schema_contracts(
             return _DeclaredInputs(frozenset(), frozenset())
         return _DeclaredInputs(transform.declared_input_fields, transform.declared_string_input_fields)
 
+    def _probe_consumer_model_required(node: NodeSpec, declared_required: frozenset[str]) -> frozenset[str]:
+        """Narrow ``declared_required`` to what the node's constructed input model requires.
+
+        The runtime Phase-2 check (``check_compatibility``) reads the
+        consumer's constructed ``input_schema`` and demands only the fields
+        that model marks required. For a transform, aggregation or collector
+        that model is ``BaseTransform.input_schema``, which demotes to optional
+        every declared field the transform CREATES and does not read
+        (``demoted_input_fields``, elspeth-d6eeb3a71d): field_mapper's
+        ``{Name: Name}`` or ``{name: Name}`` with a required ``Name: str``
+        writes ``Name``, so no input row is asked for it. Reading the same
+        model keeps the composer on that one authority instead of the raw
+        ``schema:`` block, which cannot see the demotion (P1 review r3 F1).
+        Only a field the model carries AND marks optional is dropped — a
+        plugin whose input model is not built from the node's ``schema:``
+        block keeps the raw declaration, as before.
+
+        A construction failure abstains to the raw declaration (the node's
+        config-validation paths own a draft that does not build), which keeps
+        the composer's pre-existing refusal rather than inventing an
+        acceptance.
+        """
+        if not declared_required or node.plugin is None or node.node_type not in {"transform", "aggregation", "collector"}:
+            return declared_required
+        try:
+            transform = probe_cache.transform(node.plugin, node)
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return declared_required
+        model_fields = transform.input_schema.model_fields
+        return frozenset(name for name in declared_required if name not in model_fields or model_fields[name].is_required())
+
     def _string_input_field_type_conflict(
         producer: ProducerEntry,
         node: NodeSpec,
@@ -6264,7 +6297,9 @@ def _check_schema_contracts(
         model, so Phase-2 type validation rejects a typed producer that does
         not guarantee one. This helper mirrors that, honouring the nested
         contract-options alias the rest of the contract pipeline uses for the
-        kinds in ``NESTED_CONTRACT_OPTIONS_NODE_TYPES``.
+        kinds in ``NESTED_CONTRACT_OPTIONS_NODE_TYPES``. It reads config only;
+        the caller narrows it by the constructed input model's demotion
+        (``_probe_consumer_model_required``).
         """
         contract_options = node.options
         contract_owner = f"node:{node.id}"
@@ -6559,6 +6594,9 @@ def _check_schema_contracts(
             errors.append(consumer_effective_error)
             continue
         assert consumer_effective_required is not None  # No error => resolved.
+        # The runtime demands what the constructed input model requires, after
+        # the transform's self-created-field demotion — not the raw declaration.
+        consumer_effective_required = _probe_consumer_model_required(node, consumer_effective_required)
 
         # Projected input declarations (elspeth-ada5a60249). Read off the
         # constructed plugin because neither surface above carries them: the
