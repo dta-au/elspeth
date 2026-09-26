@@ -280,7 +280,9 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
                     retryable=False,
                 )
 
+        # Pass through unchanged, under the node's declared contract: the ONE
+        # stamp writes the operator's declared fields onto it (ADR-050 Decision 2).
         return TransformResult.success(
-            self._align_output_row_contract(row),
+            PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
             success_reason={"action": "validated", "metadata": {"fields_checked": len(self._fields)}},
         )

@@ -281,7 +281,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9c6541f5f66f1bcb"
+    source_file_hash: str | None = "sha256:b83875b8e25d513d"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -492,17 +492,19 @@ class TypeCoerce(BaseTransform):
         contract: SchemaContract,
         conversion_targets: dict[str, Literal["int", "float", "bool", "str"]],
     ) -> SchemaContract:
-        """Apply output declarations without losing observed types or header aliases.
+        """The emitted contract: each converted field retyped, then the node's declarations stamped.
 
-        Observed sources infer optional fields. This transform's explicit
-        input schema validates its declared fields before processing, and its
-        output schema declares their post-conversion presence/nullability.
-        Those declarations belong to this output even when the upstream
-        contract carried weaker metadata.
+        A converted field carries the type this transform wrote (never
+        ``None``: a ``None`` or unconvertible value errors the row). That is
+        the whole contract of an observed-mode node, whose output config
+        deliberately declares nothing (see
+        ``_build_type_coerce_output_schema_config``). When the operator's
+        schema declares fields, the output config holds the declaration of
+        every declared field and every conversion target, and the ONE stamp
+        (``_apply_declared_output_field_contracts``, ADR-050 Decision 2)
+        writes it onto the emitted contract; the strict input check admitted
+        every value it did not convert.
         """
-        output_schema_config = self._output_schema_config
-        assert output_schema_config is not None, "TypeCoerce initializes its output schema before processing"
-        declared_fields = {field.name: field for field in output_schema_config.fields or ()}
         changed = False
         output_fields: list[FieldContract] = []
         for field in contract.fields:
@@ -510,22 +512,19 @@ class TypeCoerce(BaseTransform):
             new_field = field
             if target_type_name is not None:
                 new_field = replace(field, python_type=_TARGET_TYPES[target_type_name], nullable=False)
-            if field.normalized_name in declared_fields:
-                declaration = declared_fields[field.normalized_name]
-                new_field = replace(new_field, required=declaration.required, nullable=declaration.nullable, source="declared")
             output_fields.append(new_field)
             if new_field != field:
                 changed = True
 
-        evolved_contract = contract
+        converted_contract = contract
         if changed:
-            evolved_contract = SchemaContract(
+            converted_contract = SchemaContract(
                 mode=contract.mode,
                 fields=tuple(output_fields),
                 locked=contract.locked,
             )
 
-        return self._align_output_contract(evolved_contract)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(converted_contract))
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

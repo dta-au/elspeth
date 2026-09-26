@@ -816,7 +816,16 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # moved 67ab862fbd369a2b -> 26471026c209f7ef (the 1 manifest pin in
 # json-explode-parent-child; same tool). The production-path and oracle-freeze
 # files pass unchanged, so no resume digest and no oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "eda8062b9a7afb83c81dde54ba294fa85339f1b9eea28e35f69c8485b0002552"
+# Rotated 2026-09-26 (elspeth-5887fb7928, S7, review-S1a-r4 F2): a PLUGIN
+# PROVENANCE rotation. passthrough now routes its emitted contract through the
+# one declaration stamp (ADR-050 Decision 2), so its source_file_hash moved
+# 4465297d3b60b81e -> f8c2fe03ad0bdf86 (the 2 manifest pins, plain and
+# JSON-escaped, of its observed-mode node record; scripts/cicd/plugin_hash).
+# Every corpus passthrough is observed-mode, where the stamp has nothing to
+# stamp, so no count, terminal, projection, resume digest or oracle_freeze
+# snapshot moved. truncate, keyword_filter and type_coerce moved too but no
+# corpus case uses them.
+EXPECTED_CASE_REGISTRY_SHA256 = "f6420d198cbba1913b07e769b63ae5184432cf65b6022a9f5ed6ffebeb6eeced"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

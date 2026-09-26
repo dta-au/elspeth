@@ -93,7 +93,7 @@ class Truncate(BaseTransform):
     name = "truncate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2896ce58bf9810c4"
+    source_file_hash: str | None = "sha256:59df23578303bf55"
     config_model = TruncateConfig
     usage_when_to_use: str = (
         "Use for a deterministic character-length cap on selected text fields, optionally reserving "
@@ -257,7 +257,9 @@ class Truncate(BaseTransform):
                     output[normalized_field_name] = value[:max_len]
                 fields_modified.append(normalized_field_name)
 
-        output_contract = self._align_output_contract(row.contract)
+        # The ONE stamp writes the operator's declared fields onto the emitted
+        # contract (ADR-050 Decision 2); a truncated value is still a str.
+        output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={

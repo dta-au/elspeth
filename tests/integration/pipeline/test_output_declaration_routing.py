@@ -1025,3 +1025,111 @@ def test_two_observed_sources_disagreeing_on_a_column_share_one_csv_sink(tmp_pat
     lines = (tmp_path / "out.csv").read_text().splitlines()
     assert lines[0] == "id,v"
     assert sorted(lines[1:]) == ["1,a", "2,b", "K-1,c", "K-2,d"]
+
+
+def _plugin(plugin: str, options: dict[str, Any]) -> dict[str, Any]:
+    return {"name": "declare", "plugin": plugin, "input": "rows", "on_success": "out", "on_error": "quarantine", "options": options}
+
+
+# ADR-050 Decision 2 at every shipped transform that forwards the input row
+# under its own output declaration. Each option set leaves ``a`` and ``s``
+# untouched (``s`` is truncated only past 11 characters, the filter pattern
+# never matches, the coercion is of ``id``), so the operator's declarations of
+# those two fields are declarations of CARRIED fields.
+_CARRYING_TRANSFORMS: dict[str, tuple[str, dict[str, Any]]] = {
+    "passthrough": ("passthrough", {}),
+    "truncate": ("truncate", {"fields": {"s": 11}}),
+    "keyword_filter": ("keyword_filter", {"fields": ["s"], "blocked_patterns": ["zzz"]}),
+    "type_coerce": ("type_coerce", {"conversions": [{"field": "id", "to": "str"}]}),
+}
+
+
+class TestAnOperatorDeclarationOfACarriedFieldIsStamped:
+    """S7 (review-S1a-r4 F2): the operator's declaration of a field the transform carries reaches the emitted contract.
+
+    Before, passthrough, truncate, keyword_filter and type_coerce emitted their
+    input row's contract unstamped, so an operator who typed a carried field
+    after an observed source (``required=False``, the inferred type) ended the
+    run with a Tier-1 ``SchemaConfigModeViolation`` on a VALID row (exit 4).
+    Each now routes its emitted contract through the one stamp; the value the
+    strict input check admitted is delivered unchanged, and the recorded
+    declaration is true of it. The registry-wide form of this proof is
+    ``tests/invariants/test_operator_declared_carried_fields.py``.
+    """
+
+    @pytest.mark.parametrize("shape", sorted(_CARRYING_TRANSFORMS))
+    def test_a_valid_row_is_delivered_under_the_operators_declaration(self, shape: str, tmp_path: Path) -> None:
+        plugin, options = _CARRYING_TRANSFORMS[shape]
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 5, "s": "hello"}, {"id": 2, "a": 7, "s": "bye"}])
+        transform = _plugin(plugin, {**options, "schema": {"mode": "flexible", "fields": ["a: float", "s: str"]}})
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 0, result.output
+        delivered = _read_jsonl(tmp_path / "out.jsonl")
+        assert [(row["a"], row["s"]) for row in delivered] == [(5, "hello"), (7, "bye")]
+        assert [outcome for (outcome, _path), n in _outcomes(tmp_path).items() for _ in range(n)] == ["success", "success"]
+        [recorded] = _transform_node_contracts(tmp_path).values()
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        contract = SchemaContract.from_checkpoint(json.loads(recorded))
+        for name, declared in (("a", float), ("s", str)):
+            field = contract.get_field(name)
+            assert (field.python_type, field.required, field.source) == (declared, True, "declared")
+        assert all(contract.validate(row) == [] for row in delivered)
+
+    @pytest.mark.parametrize("shape", sorted(_CARRYING_TRANSFORMS))
+    def test_a_row_breaking_the_declaration_is_routed_not_aborted(self, shape: str, tmp_path: Path) -> None:
+        """The declaration is still enforced at the input check: a float ``a`` under ``a: int`` and a row without ``a`` route, value-free.
+
+        The observed source locks ``a: float`` on row 1 and admits row 2's
+        ``int`` (ruling C3), so both reach the transform; only the int is
+        delivered.
+        """
+        plugin, options = _CARRYING_TRANSFORMS[shape]
+        _write_jsonl(
+            tmp_path / "in.jsonl",
+            [{"id": 1, "a": 5.5, "s": SENTINEL}, {"id": 2, "a": 5, "s": "hello"}, {"id": 3, "s": "no a"}],
+        )
+        transform = _plugin(plugin, {**options, "schema": {"mode": "flexible", "fields": ["a: int", "s: str"]}})
+        result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 1, result.output
+        assert [row["id"] for row in _read_jsonl(tmp_path / "out.jsonl")] in ([2], ["2"])
+        assert sorted(row["id"] for row in _read_jsonl(tmp_path / "q.jsonl")) == [1, 3]
+        reasons = _transform_error_reasons(tmp_path)
+        assert [reason["reason"] for reason in reasons] == ["contract_violation", "contract_violation"]
+        assert SENTINEL not in json.dumps(reasons)
+
+    def test_a_csv_header_field_declared_by_its_normalized_name(self, tmp_path: Path) -> None:
+        """review-S1a-r4 ``s_csv_passthrough_str``: an observed CSV source, ``name: str`` declared on a passthrough."""
+        (tmp_path / "in.csv").write_text("id,Name\n1,Ann\n2,Bob\n")
+        source = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": str(tmp_path / "in.csv"), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+        }
+        transform = _plugin("passthrough", {"schema": {"mode": "flexible", "fields": ["name: str"]}})
+        result = _run(_settings(tmp_path, sources={"src": source}, transforms=[transform]))
+        assert result.exit_code == 0, result.output
+        assert [row["name"] for row in _read_jsonl(tmp_path / "out.jsonl")] == ["Ann", "Bob"]
+        [recorded] = _transform_node_contracts(tmp_path).values()
+        [name] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "name"]
+        assert (name["original_name"], name["python_type"], name["required"], name["source"]) == ("Name", "str", True, "declared")
+
+    def test_a_typed_source_int_forwarded_under_an_operator_float(self, tmp_path: Path) -> None:
+        """S6 S7a-TYPED-SOURCE: a fixed ``x: int`` source, ``x: float`` on a passthrough (ruling C3), exit 0."""
+        (tmp_path / "in.csv").write_text("id,x\n1,5\n2,7\n")
+        source = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "path": str(tmp_path / "in.csv"),
+                "on_validation_failure": "discard",
+                "schema": {"mode": "fixed", "fields": ["id: int", "x: int"]},
+            },
+        }
+        transform = _plugin("passthrough", {"schema": {"mode": "flexible", "fields": ["x: float"]}})
+        result = _run(_settings(tmp_path, sources={"src": source}, transforms=[transform]))
+        assert result.exit_code == 0, result.output
+        assert [row["x"] for row in _read_jsonl(tmp_path / "out.jsonl")] == [5, 7]
+        [recorded] = _transform_node_contracts(tmp_path).values()
+        [x] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "x"]
+        assert (x["python_type"], x["source"]) == ("float", "declared")

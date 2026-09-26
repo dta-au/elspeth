@@ -75,7 +75,25 @@ rows meet.**
    nullable). It runs in every schema mode, keeps the emitted field's
    `original_name` (a declaration types a field, it does not rename it), and
    never reads the row's value. The plugin-side pin value_transform keeps
-   reads the same table, so the pin and the stamp cannot disagree.
+   reads the same table, so the pin and the stamp cannot disagree. Every
+   transform with an `_output_schema_config` routes every emitted contract
+   through it, including a transform that forwards its input row unchanged:
+   the operator's declaration of a CARRIED field is an output declaration
+   too, and the ADR-014 metadata check compares the emitted contract to it
+   by exact type, `required` and `nullable`. A forwarded input contract that
+   skipped the stamp keeps the upstream inference (an observed source's
+   `required=False`, its inferred type) and ended the run with a Tier-1
+   `SchemaConfigModeViolation` on a valid row; passthrough, truncate,
+   keyword_filter, type_coerce and the two AWS Bedrock guardrails did, until
+   S7 (review-S1a-r4 F2). The registry gate
+   `tests/invariants/test_operator_declared_carried_fields.py` builds every
+   registered transform with an operator schema typing two carried fields
+   and requires every emission to pass the ADR-014 check and carry both
+   declarations. The stamp types only what is emitted: a plugin that drops a
+   field its declaration guarantees still ends the run (the gate's own
+   control). A transform with no output declaration (the two Azure
+   guardrails) makes no claim about a carried field, so the operator's
+   declaration there is an input check only.
 3. **Two plugin hooks, both owned types:** `created_output_fields() ->
    tuple[FieldDefinition, ...]` (created fields with the type the plugin's
    code fixes, or `any`) and `carried_output_fields() -> frozenset[str]`
@@ -384,7 +402,11 @@ rows meet.**
   stamped `float, declared` and its row contract's own `validate()` is
   empty, so the recorded declaration is true of the value (before this ADR
   the same row ended the run with a Tier-1 `SchemaConfigModeViolation`).
-  Pinned by `tests/unit/plugins/transforms/test_value_transform_contract_metadata.py::test_forwarded_float_declaration_is_stamped_and_never_aborts`.
+  Pinned by `tests/unit/plugins/transforms/test_value_transform_contract_metadata.py::test_forwarded_float_declaration_is_stamped_and_never_aborts`
+  for value_transform, and for every declaring transform by
+  `tests/invariants/test_operator_declared_carried_fields.py` and
+  `tests/integration/pipeline/test_output_declaration_routing.py::TestAnOperatorDeclarationOfACarriedFieldIsStamped`
+  (Decision 2).
   The one rule moves three observable outcomes, all measured end to end:
   a value_transform target the operator typed `float` that computes an
   `int`, and a json_explode `page: float` over `int` elements, are
@@ -521,7 +543,9 @@ operator's declaration, which is the row's data.
   (precedence, nullable, lineage, carried, dynamic, plugin hooks),
   `tests/invariants/test_output_declaration_completeness.py` (the roster
   gate with controls, batch-aware transforms and their conditional keys
-  included), `tests/integration/pipeline/test_output_declaration_batch_seams.py`
+  included), `tests/invariants/test_operator_declared_carried_fields.py`
+  (the roster gate for an operator's declaration of a carried field, with
+  an unstamped and a field-dropping control), `tests/integration/pipeline/test_output_declaration_batch_seams.py`
   (the value check at the aggregation flush, the collector flush and a
   passthrough batch), `tests/property/contracts/test_schema_contract_properties.py::TestJ1LatticeLaws`,
   `tests/unit/core/landscape/test_graph_recording.py` (the node writer
