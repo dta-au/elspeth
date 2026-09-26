@@ -83,7 +83,10 @@ confidentiality control.** It stays a hard refusal: an undeclared literal read
 `carrier-limit` still fail at `elspeth validate`, in the composer and at run
 start, because each would otherwise fail every row. The "whole-row" kind is
 retired: a whole row used as a value holds only the declared fields, which is
-exactly what the node declared. Relaxing the remaining dynamic-key refusal is
+exactly what the node declared. The LLM prompt's declared-but-unread dual
+counts the same way: it refuses a declared list only when the template never
+reads the context `row`, so `{{ row | dictsort }}` with `[note]` builds, and
+its remedy never suggests `[]`. Relaxing the remaining dynamic-key refusal is
 a later UX decision, not part of this one. A multi-query `row.source_row.<col>`
 read must be covered by `required_input_fields` itself (not by `image_inputs`
 columns), on both the plugin and the composer surface, because that is what
@@ -121,7 +124,9 @@ with the LLM prompt's rules:
 - a top-level name other than `query`, `row` or a sandbox global.
 
 The dual refuses fields declared beyond `query_field` when the template never
-loads `row` at all. It does not count literal `row.<field>` reads: a whole
+reads the context `row` at all; a `row` the template binds itself (a `set` or
+loop variable, a macro parameter) is not the context row, which Jinja's own
+scope analysis decides. It does not count literal `row.<field>` reads: a whole
 row used as a value interpolates the declared fields under this decision. It
 never suggests `[]`, because the query field reaches the template as
 `{{ query }}` without a declaration. The composer runs the same model on its

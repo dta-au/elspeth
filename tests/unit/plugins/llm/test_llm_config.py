@@ -1281,10 +1281,53 @@ class TestRequiredInputFieldsAppearInTemplate:
             )
 
         message = str(exc_info.value)
-        assert "does not interpolate any row.* fields" in message
+        assert "prompt_template never reads 'row', so no declared field reaches the prompt" in message
         assert "['content', 'url']" in message
         assert "{{ row.url }}" in message
         assert "{{ row.content }}" in message
+        # The remedy never points at the whole-row opt-out: under ADR-051 ``[]``
+        # is the one setting that shows the template every column.
+        assert "[]" not in message
+        assert "remove options.required_input_fields" in message
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{% for row in [1] %}{% endfor %}Rate this.", id="loop-variable"),
+            pytest.param("{% set row = 'x' %}{{ row }}", id="set-variable"),
+            pytest.param("{% macro m(row) %}{{ row }}{% endmacro %}{{ m('x') }}", id="macro-parameter"),
+        ],
+    )
+    def test_a_row_the_template_binds_itself_is_not_a_read_of_the_row(self, template: str) -> None:
+        """A local ``row`` never carries a declared field, so the declaration still goes unused."""
+        with pytest.raises(ValidationError, match="prompt_template never reads 'row'"):
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{{ row | dictsort }}", id="dictsort"),
+            pytest.param("{{ row | tojson }}", id="tojson"),
+            pytest.param("{% for k, v in row | items %}{{ k }}={{ v }} {% endfor %}", id="items"),
+            pytest.param("{% macro m() %}{{ row.note }}{% endmacro %}{{ m() }}", id="macro-body"),
+        ],
+    )
+    def test_a_whole_row_form_with_a_declared_list_is_admitted(self, template: str) -> None:
+        """ADR-051: the template's row holds exactly the declared fields, so a whole-row form interpolates them."""
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["note"],
+        )
+        assert config.required_input_fields == ["note"]
 
     def test_declared_fields_with_matching_row_interpolation_accepted(self) -> None:
         """Canonical case: every declared field appears as a row.* reference."""

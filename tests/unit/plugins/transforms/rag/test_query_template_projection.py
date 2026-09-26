@@ -197,6 +197,27 @@ def test_the_query_template_projection_is_the_declaration(required_input_fields:
             "field can reach the query.",
             id="dual-declared-but-row-never-read",
         ),
+        # A ``row`` the template binds itself is a local variable, never the
+        # context row: none of these can let a declared field reach the query
+        # (P3 review, finding 1).
+        pytest.param(
+            "{% for row in [1] %}{% endfor %}{{ query }}",
+            ["question", "topic"],
+            "options.required_input_fields declares 'topic', but query_template never reads 'row'",
+            id="dual-a-loop-variable-named-row",
+        ),
+        pytest.param(
+            "{% set row = query %}{{ row }}",
+            ["question", "topic"],
+            "options.required_input_fields declares 'topic', but query_template never reads 'row'",
+            id="dual-a-set-variable-named-row",
+        ),
+        pytest.param(
+            "{% macro m(row) %}{{ row }}{% endmacro %}{{ m(query) }}",
+            ["question", "topic"],
+            "options.required_input_fields declares 'topic', but query_template never reads 'row'",
+            id="dual-a-macro-parameter-named-row",
+        ),
     ],
 )
 def test_configuration_refuses_a_read_it_can_prove_fails_or_goes_unused(template: str, required_input_fields: Any, expected: str) -> None:
@@ -224,6 +245,10 @@ def test_the_dual_remedy_never_points_at_the_whole_row_opt_out() -> None:
         pytest.param("{{ query }} {{ row | dictsort }}", ["question", "topic"], id="dual-counts-a-whole-row-use"),
         pytest.param("{% for a, b in [(1, [row])] %}{{ b[0] | dictsort }}{% endfor %}", ["topic"], id="r3-escape-form"),
         pytest.param("{{ query }} {{ row.secret }} {{ row[query] }}", [], id="the-opt-out-skips-the-row-checks"),
+        # A macro body's read of ``row`` is a read of the context row.
+        pytest.param(
+            "{% macro m() %}{{ row.topic }}{% endmacro %}{{ query }} {{ m() }}", ["topic"], id="a-macro-body-reads-the-context-row"
+        ),
     ],
 )
 def test_configuration_admits_what_the_declaration_covers(template: str, required_input_fields: Any) -> None:

@@ -174,7 +174,9 @@ drained and repair this release forward.
   `False` or the default (a declared field the row does not carry still
   answers `False` / the default); `{% for k in row %}`, `row | length`,
   `row | dictsort`, `row | items` and `dict(row)` see the declared fields, and
-  configuration no longer refuses those whole-row forms with a declared list;
+  configuration no longer refuses those whole-row forms with a declared list
+  (the declared-but-unread check refuses only a prompt that never reads
+  `row`, and its remedy no longer suggests `[]`);
   a multi-query `row.source_row.<column>` read must be listed in
   `required_input_fields` itself (an `image_inputs` column is refused there);
   `<response_field>_variables_hash` is the hash of the declared field values
@@ -197,7 +199,8 @@ drained and repair this release forward.
   (`row[k]`, `row.get(k)`, `row | attr(k)`) or a retired row-API name unless
   `required_input_fields: []`; a top-level name other than `query` or `row`;
   and fields declared beyond `query_field` for a template that never reads
-  `row`. A read configuration cannot see fails the row with
+  the context `row` (a `row` it binds itself, as a `set` or loop variable or
+  a macro parameter, does not count). A read configuration cannot see fails the row with
   `template_rendering_failed` and the `Undeclared field` reason. Behaviour
   changes: under every declaration `row` is the template row rather than a
   plain dict, so `row.items()`, `row.keys()` and `row.values()` read fields

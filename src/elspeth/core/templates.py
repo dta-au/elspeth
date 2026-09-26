@@ -37,7 +37,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from jinja2 import Environment
+from jinja2 import Environment, meta
 from jinja2.compiler import find_undeclared
 from jinja2.nodes import (
     Assign,
@@ -114,15 +114,21 @@ def describe_dynamic_row_access(dynamic_accesses: Iterable[str]) -> str:
 
 
 def template_loads_name(template_string: str, name: str) -> bool:
-    """Whether the template reads the variable ``name`` anywhere, in any form.
+    """Whether the template reads the context variable ``name`` anywhere, in any form.
 
-    ``row.x``, ``row | dictsort``, ``[row]`` and ``m(row)`` all load ``row``;
-    a template that never loads it cannot see a single row field, whatever its
-    node declares. Raises ``TemplateSyntaxError`` for text that does not parse.
+    ``row.x``, ``row | dictsort``, ``[row]``, ``m(row)`` and a macro body's
+    ``row.a`` all read the context's ``row``; a template that never does
+    cannot see a single row field, whatever its node declares. A ``row`` the
+    template binds itself (``{% set row = ... %}``, ``{% for row in ... %}``,
+    a macro parameter, ``{% with row = ... %}``) is a local variable, so a
+    read of it is not a read of the context; Jinja's own scope analysis
+    (``meta.find_undeclared_variables``) says which reads resolve from the
+    context. Raises ``TemplateSyntaxError`` for text that does not parse or
+    compile.
     """
     validate_jinja_source(template_string)
     ast = _create_field_extraction_environment().parse(template_string)
-    return any(node.name == name and node.ctx == "load" for node in ast.find_all(Name))
+    return name in meta.find_undeclared_variables(ast)
 
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})

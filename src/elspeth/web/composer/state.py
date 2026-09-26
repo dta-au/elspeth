@@ -3950,9 +3950,10 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
       ``_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX``, which
       ``tools/generation.py`` imports rather than copies.
 
-    This is a contract check, not a proof of failure: ``row`` is bound to the
-    whole row, so an undeclared reference raises only when that column is in
-    fact absent — which is precisely what the declaration exists to rule out.
+    A reference this rule reports fails every row, not only a row missing
+    that column: the template's ``row`` holds only the declared fields
+    (ADR-051), so an undeclared read fails the render with ``Undeclared
+    field`` whatever the row carries.
     ``undeclared_row_fields`` owns the comparison, matching a declaration
     under either the literal or the canonical row key and dropping bracket
     literals no declaration could express.

@@ -706,19 +706,27 @@ class LLMConfig(TransformDataConfig):
 
     @model_validator(mode="after")
     def _validate_required_input_fields_appear_in_template(self) -> LLMConfig:
-        """Reject single-query configs that declare row-field requirements the template never uses.
+        """Reject single-query configs that declare row fields the template never reads.
 
         Dual of `_validate_required_input_fields_declared`. That check catches the
         "template uses row.X but contract is undeclared" footgun. This check catches
-        the inverse "contract declares X but template never references row.X" footgun
-        — a prompt body that does not interpolate any row data, so every row receives
-        the same static prompt and the model has no per-row context to reason about.
+        the inverse: fields declared for a template that never reads ``row`` at
+        all, so no declared field can reach the prompt and every row receives the
+        same static prompt.
+
+        A template reads ``row`` when any read of it resolves from the context
+        (``template_loads_name``): a named field (``row.x``) or the row as a whole
+        (``row | dictsort``, ``{% for k, v in row | items %}``). Under ADR-051 the
+        whole row a template sees is exactly the declared fields, so a whole-row
+        form with a declared list interpolates those fields and passes. A ``row``
+        the template binds itself (``{% set row = ... %}``, a loop variable, a
+        macro parameter) is not the context row.
 
         Scope:
         - Single-query mode only (``queries is None``). Multi-query mode flows row
-          data via per-query ``input_fields`` mappings, so an empty ``row.*`` set in
-          the top-level template is not by itself diagnostic.
-        - Empty ``required_input_fields: []`` is the explicit opt-out and passes.
+          data via per-query ``input_fields`` mappings, so the top-level template
+          not reading ``row`` is not by itself diagnostic.
+        - Empty ``required_input_fields: []`` (the whole-row opt-out) passes.
         - ``required_input_fields is None`` is handled by the sibling validator;
           this check only fires when fields are declared.
         """
@@ -727,10 +735,9 @@ class LLMConfig(TransformDataConfig):
         if self.required_input_fields is None or len(self.required_input_fields) == 0:
             return self
 
-        from elspeth.core.templates import extract_jinja2_fields
+        from elspeth.core.templates import template_loads_name
 
-        template_fields = extract_jinja2_fields(self.effective_template())
-        if template_fields:
+        if template_loads_name(self.effective_template(), "row"):
             return self
 
         declared = sorted(self.required_input_fields)
@@ -738,20 +745,19 @@ class LLMConfig(TransformDataConfig):
         example_interpolations = " ".join(f"{{{{ row.{f} }}}}" for f in declared)
         raise ValueError(
             f"LLM options.required_input_fields declares {declared} but the "
-            "prompt_template does not interpolate any row.* fields. "
+            "prompt_template never reads 'row', so no declared field reaches the prompt. "
             "Every row would receive the same static prompt and the model would "
             "have no row-specific context to reason about.\n\n"
             "Fix one of the following:\n"
             f"  (a) Reference the declared fields inside prompt_template using "
             f"Jinja2 row-namespace syntax, e.g. {example_interpolations}\n"
-            "  (b) If the fields are required for runtime presence but intentionally "
-            "not interpolated into the prompt, set\n"
-            "      options.required_input_fields: []   # explicit opt-out\n"
-            "      and document the presence assertion elsewhere.\n\n"
+            "  (b) If every row is meant to receive the same prompt, remove "
+            "options.required_input_fields: a template that reads no row field "
+            "needs no declaration.\n\n"
             "Composer repair example:\n"
             f'  patch_node_options({{"node_id": "<node_id>", "patch": '
             f'{{"prompt_template": "<...includes {example_interpolations}...>"}}}})\n\n'
-            f"Declared fields: {declared_json}. Template row.* references: []."
+            f"Declared fields: {declared_json}."
         )
 
     @model_validator(mode="after")
