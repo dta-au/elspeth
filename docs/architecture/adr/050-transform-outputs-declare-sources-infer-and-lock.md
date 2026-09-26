@@ -91,9 +91,14 @@ rows meet.**
    and requires every emission to pass the ADR-014 check and carry both
    declarations. The stamp types only what is emitted: a plugin that drops a
    field its declaration guarantees still ends the run (the gate's own
-   control). A transform with no output declaration (the two Azure
-   guardrails) makes no claim about a carried field, so the operator's
-   declaration there is an input check only.
+   control). Every registered transform keeps an `_output_schema_config`,
+   and the gate fails one that does not: without it the DAG builder still
+   projects the operator's schema onto the node's outgoing edge, so the
+   build would check consumers against the operator's type while the
+   emitted contract kept the upstream inference. The two Azure guardrails
+   were in that state (a declared `float` recorded as the inferred `int`)
+   until S7 fix round 1 gave them the output declaration and the stamp the
+   AWS guardrails have.
 3. **Two plugin hooks, both owned types:** `created_output_fields() ->
    tuple[FieldDefinition, ...]` (created fields with the type the plugin's
    code fixes, or `any`) and `carried_output_fields() -> frozenset[str]`

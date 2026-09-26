@@ -610,7 +610,7 @@ class BaseTransform(ABC):
     # DAG contract for output field validation (centralized in DAG builder).
     # Transforms that add fields must set this via _build_output_schema_config()
     # so the DAG builder can validate downstream required_input_fields.
-    # None = no output contract provided (acceptable for shape-preserving transforms).
+    # None = no output contract; every registered transform sets one (ADR-050 D2 gate).
     _output_schema_config: SchemaConfig | None
 
     # The transform's INPUT schema config. Captured centrally by

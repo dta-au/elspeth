@@ -393,8 +393,8 @@ def build_execution_graph(
         _validate_output_schema_contract(transform)
         output_schema_config = transform._output_schema_config
 
-        # Shape-preserving transforms don't compute _output_schema_config.
-        # Parse the raw schema config so every node has a typed schema.
+        # A transform without _output_schema_config (none is registered; test
+        # doubles are): parse the raw schema config so every node is typed.
         if output_schema_config is None:
             output_schema_config = _parse_contract_schema_config(
                 transform_config,

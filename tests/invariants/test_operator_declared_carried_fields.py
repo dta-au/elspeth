@@ -19,10 +19,14 @@ an observed optional ``str`` and a ``float`` over an ``int`` (ruling C3: an
 ``int`` satisfies a ``float`` declaration) — runs the ADR-009 probe, and
 requires every emission to (1) pass the ADR-014 check, (2) carry each
 declared field as ``source="declared"`` with the declared type and
-requiredness, and (3) pass the engine's value check. A transform with no
-output declaration (``_output_schema_config is None``) or whose output config
-does not carry the operator's fields (a reductive batch output) makes no
-claim about them and is outside the sweep; each is named by the test id.
+requiredness, and (3) pass the engine's value check. Every registered
+transform keeps an output declaration: one with ``_output_schema_config is
+None`` fails the sweep, because the DAG builder then projects the operator's
+schema onto its outgoing edge anyway, so a typed edge would sit over an
+emitted contract that is still the input's inference (the two Azure
+guardrails, until S7 fix round 1). A transform whose output config does not
+carry the operator's fields (a reductive batch output) makes no claim about
+them and is outside the sweep; each is named by the test id.
 
 Control: ``test_an_unstamped_pass_through_ends_the_run`` keeps the failure
 the sweep exists to catch — an in-file transform that emits its input
@@ -108,8 +112,10 @@ def test_an_operator_declared_carried_field_is_stamped_on_emission(_transform_cl
         pytest.skip(f"{_transform_cls.__name__}: {exc.reason}")
     transform = _transform_cls(config)
     output_schema_config = transform._output_schema_config
-    if output_schema_config is None:
-        pytest.skip(f"{_transform_cls.__name__} declares no output contract, so it makes no claim about carried fields")
+    assert output_schema_config is not None, (
+        f"{_transform_cls.__name__} keeps no output declaration, so the operator's schema types its edge at build "
+        "time while its emitted contract stays the input's inference; set _output_schema_config and stamp every emission"
+    )
     declared_names = {definition.name for definition in output_schema_config.fields or ()}
     if not {name for name, _declared, _value in _CARRIED} <= declared_names:
         pytest.skip(f"{_transform_cls.__name__}'s output declaration does not carry the operator's fields (a reductive output)")

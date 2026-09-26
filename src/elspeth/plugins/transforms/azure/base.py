@@ -170,6 +170,11 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         schema = create_schema_from_config(cfg.schema_config, schema_name, allow_coercion=False)
         self.input_schema = schema
         self.output_schema = schema
+        # The operator's schema is this node's output declaration too: a
+        # guardrail passes the row through unchanged, so every field the
+        # operator types is a carried field whose declaration the ONE stamp
+        # writes onto the emitted contract (ADR-050 Decision 2).
+        self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
@@ -392,8 +397,9 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             if violation is not None:
                 return violation
 
+        # Pass through unchanged, under the node's declared contract.
         return TransformResult.success(
-            self._align_output_row_contract(row),
+            PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
             success_reason={"action": "validated"},
         )
 
