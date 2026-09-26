@@ -132,6 +132,8 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchPassthroughShapeError,
+    BatchPassthroughShapeKind,
     BatchQuarantineContradictionError,
     BatchQuarantineContradictionKind,
     CapacityError,
@@ -1440,6 +1442,13 @@ class RowProcessor:
                 declaration dispatch, because the TRANSFORM intersection needs
                 the validated set. ``_record_flush_violation`` writes
                 per-token FAILED audit entries before re-raising.
+            BatchPassthroughShapeError: A PASSTHROUGH flush is not a
+                ``success_multi`` of one row per buffered row (or of none), or
+                it quarantines an input (a Tier-1
+                ``OrchestrationInvariantError``: build admits only a plugin
+                declaring ``flush_emits_one_row_per_buffered_row``). Detected
+                before the declaration dispatch; ``_record_flush_violation``
+                writes per-token FAILED audit entries before re-raising.
             DeclarationContractViolation | PluginContractViolation:
                 Any batch-flush declaration contract fires.
                 ``_record_flush_violation`` writes per-token FAILED audit
@@ -1500,12 +1509,19 @@ class RowProcessor:
             static_contract = fctx.transform.effective_static_contract()
 
             if fctx.settings.output_mode == OutputMode.PASSTHROUGH:
-                # 1:1 pairing — routing enforces len(emitted) == len(buffered).
-                # Dispatch each pair through the audit-complete batch-flush
-                # dispatcher (ADR-010 §Semantics amendment 2026-04-20). Each
-                # pair's effective_input_fields is derived per-token — the
-                # PASSTHROUGH carve-out preserves per-token identity.
-                if len(emitted) == len(fctx.buffered_tokens):
+                # Passthrough carries only a success_multi of exactly one row per
+                # buffered row (or none) with nothing quarantined; build admits
+                # only a plugin declaring flush_emits_one_row_per_buffered_row.
+                # Any other shape is that plugin breaking its declaration,
+                # recorded on every buffered token before the Tier-1 abort.
+                shape_violation = self._passthrough_shape_violation(fctx, result, emitted=emitted, quarantined_indices=quarantined_indices)
+                if shape_violation is not None:
+                    raise shape_violation
+                # 1:1 pairing. Dispatch each pair through the audit-complete
+                # batch-flush dispatcher (ADR-010 §Semantics amendment
+                # 2026-04-20). Each pair's effective_input_fields is derived
+                # per-token — the PASSTHROUGH carve-out preserves per-token identity.
+                if emitted:
                     for token, emitted_row, token_fields in zip(
                         fctx.buffered_tokens,
                         emitted,
@@ -1528,7 +1544,7 @@ class RowProcessor:
                                 used_success_empty=used_success_empty,
                             ),
                         )
-                elif len(emitted) == 0:
+                else:
                     # Zero-emission success has no 1:1 pairing witness, but the
                     # dispatcher still must evaluate governance contracts and the
                     # pass-through empty-emission path. The honest batch-level
@@ -1551,11 +1567,6 @@ class RowProcessor:
                             used_success_empty=used_success_empty,
                         ),
                     )
-                else:
-                    # Count mismatch is ``_route_passthrough_results``'s
-                    # concern; pass through unchecked so routing can surface
-                    # the OrchestrationInvariantError with its own message.
-                    pass
             else:
                 # TRANSFORM mode: batch-homogeneous intersection (ADR-009 §Clause 2)
                 # over the inputs that produced output — an input quarantined
@@ -1600,6 +1611,10 @@ class RowProcessor:
             if record_violation:
                 self._record_flush_violation(fctx, contradiction)
             raise
+        except BatchPassthroughShapeError as shape_violation:
+            if record_violation:
+                self._record_flush_violation(fctx, shape_violation)
+            raise
         except DeclarationContractViolation as violation:
             if record_violation:
                 self._record_flush_violation(fctx, violation)
@@ -1611,6 +1626,45 @@ class RowProcessor:
                 self._record_flush_violation(fctx, aggregate)
             raise
         return quarantined_indices
+
+    def _passthrough_shape_violation(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+        *,
+        emitted: Sequence[PipelineRow],
+        quarantined_indices: frozenset[int],
+    ) -> BatchPassthroughShapeError | None:
+        """Return the passthrough flush's shape violation, or None when it is one row per buffered row."""
+        buffered_token_count = len(fctx.buffered_tokens)
+        failure_kind: BatchPassthroughShapeKind
+        if quarantined_indices:
+            failure_kind = "quarantined_indices_declared"
+            message = f"passthrough aggregation {fctx.settings.name!r} cannot declare quarantined_indices"
+        elif not result.is_multi_row:
+            failure_kind = "single_row_result"
+            message = (
+                f"Passthrough mode requires multi-row result, but transform {fctx.transform.name!r} returned single row. "
+                "Use TransformResult.success_multi() for passthrough."
+            )
+        elif len(emitted) not in {0, buffered_token_count}:
+            failure_kind = "row_count_mismatch"
+            message = (
+                f"Passthrough mode requires same number of output rows as input rows. Transform {fctx.transform.name!r} "
+                f"returned {len(emitted)} rows but received {buffered_token_count} input rows."
+            )
+        else:
+            return None
+        return BatchPassthroughShapeError(
+            f"{message} Passthrough admits only a plugin that declares flush_emits_one_row_per_buffered_row, "
+            "so this flush breaks the plugin's own declaration.",
+            failure_kind=failure_kind,
+            plugin=fctx.transform.name,
+            node_id=str(fctx.node_id),
+            run_id=self._run_id,
+            buffered_token_count=buffered_token_count,
+            emitted_row_count=len(emitted),
+        )
 
     def _quarantine_contradiction(
         self,
@@ -1637,7 +1691,8 @@ class RowProcessor:
         violation: DeclarationContractViolation
         | PluginContractViolation
         | AggregateDeclarationContractViolation
-        | BatchQuarantineContradictionError,
+        | BatchQuarantineContradictionError
+        | BatchPassthroughShapeError,
     ) -> None:
         """Record FAILED audit entries for every buffered token on flush failure.
 
@@ -1791,28 +1846,6 @@ class RowProcessor:
             )
         return tuple(results), child_items
 
-    @staticmethod
-    def _validate_passthrough_route(
-        fctx: _FlushContext,
-        result: TransformResult,
-    ) -> tuple[PipelineRow, ...]:
-        """Purely validate and return a passthrough aggregation output."""
-        if not result.is_multi_row:
-            raise OrchestrationInvariantError(
-                f"Passthrough mode requires multi-row result, "
-                f"but transform '{fctx.transform.name}' returned single row. "
-                f"Use TransformResult.success_multi() for passthrough."
-            )
-        if result.rows is None:  # pragma: no cover - guaranteed by is_multi_row
-            raise RuntimeError("Multi-row result has rows=None")
-        if len(result.rows) not in {0, len(fctx.buffered_tokens)}:
-            raise OrchestrationInvariantError(
-                f"Passthrough mode requires same number of output rows "
-                f"as input rows. Transform '{fctx.transform.name}' returned "
-                f"{len(result.rows)} rows but received {len(fctx.buffered_tokens)} input rows."
-            )
-        return tuple(result.rows)
-
     def _route_passthrough_results(
         self,
         fctx: _FlushContext,
@@ -1821,10 +1854,18 @@ class RowProcessor:
         """Route passthrough aggregation results after successful flush.
 
         Passthrough mode: original tokens continue with enriched data.
-        Validates 1:1 row count, updates token data, and routes to
-        downstream processing or COMPLETED outcome.
+        Updates token data (the 1:1 shape was checked by the flush
+        cross-check) and routes to downstream processing or COMPLETED outcome.
         """
-        pipeline_rows = self._validate_passthrough_route(fctx, result)
+        # _cross_check_flush_output ran first and refused every other shape
+        # (BatchPassthroughShapeError), so this is a success_multi of one row
+        # per buffered token, or of none.
+        if result.rows is None:
+            raise FrameworkBugError(
+                f"Passthrough aggregation {fctx.settings.name!r} reached routing with result.rows None; "
+                "the flush cross-check admits only a success_multi row list."
+            )
+        pipeline_rows = result.rows
         if not pipeline_rows:
             return self._route_empty_emission_results(fctx)
         has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
@@ -4627,7 +4668,6 @@ class RowProcessor:
             return self._prepare_transform_route(fctx, recovered_result, quarantined_indices=quarantined_indices)
         if receipt.output_mode != OutputMode.PASSTHROUGH.value:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown output mode")
-        self._validate_passthrough_route(fctx, recovered_result)
         return _PreparedAggregationRoute(
             context=fctx,
             result=recovered_result,

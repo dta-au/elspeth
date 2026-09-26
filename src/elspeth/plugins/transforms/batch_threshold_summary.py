@@ -109,9 +109,11 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6fb59bd45cd921a2"
+    source_file_hash: str | None = "sha256:9e8f259440811ec9"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use to emit named threshold summary rows containing finite-value match counts and rates for each flushed window."
     )

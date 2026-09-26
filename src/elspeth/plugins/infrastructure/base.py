@@ -459,6 +459,19 @@ class BaseTransform(ABC):
     # abort at run time.
     requires_aggregation_batch_context: bool = False
 
+    # True only for a batch-aware plugin whose every successful flush emits
+    # exactly one row per buffered row, in buffered order, as
+    # TransformResult.success_multi (also for a one-row batch) and with no
+    # quarantined_indices. That is what output_mode: passthrough carries: each
+    # buffered token continues with its own row. runtime_factory refuses a
+    # plugin that does not declare it as a passthrough aggregation, and the
+    # composer's placement rule reads the same declaration. A plugin that
+    # declares it and then emits another shape is a plugin bug: the flush
+    # records every buffered token FAILED and the run aborts. False by default
+    # (a reducer, a replicator, a plugin that skips rows); every batch-aware
+    # plugin states it explicitly.
+    flush_emits_one_row_per_buffered_row: bool = False
+
     # Token creation flag for deaggregation transforms
     # When True AND process() returns success_multi(), the processor creates
     # new token_ids for each output row with parent linkage to input token.

@@ -1421,6 +1421,72 @@ class BatchQuarantineContradictionError(AuditEvidenceBase, OrchestrationInvarian
         }
 
 
+BatchPassthroughShapeKind = Literal["single_row_result", "row_count_mismatch", "quarantined_indices_declared"]
+
+
+class BatchPassthroughShapeAudit(TypedDict):
+    """Value-free audit payload of ``BatchPassthroughShapeError``."""
+
+    exception_type: str
+    failure_kind: BatchPassthroughShapeKind
+    plugin: str
+    node_id: str
+    run_id: str
+    buffered_token_count: int
+    emitted_row_count: int
+
+
+@tier_1_error(
+    reason="ADR-009: a passthrough aggregation's flush is not one row per buffered row — plugin bug at the flush cross-check",
+    caller_module=__name__,
+)
+class BatchPassthroughShapeError(AuditEvidenceBase, OrchestrationInvariantError):
+    """A passthrough aggregation's successful flush is not one row per buffered row.
+
+    ``output_mode: passthrough`` continues each buffered token with its own
+    output row, so the flush must be ``success_multi`` with exactly one row per
+    buffered row (or none) and must not quarantine an input. Only a plugin that
+    declares ``flush_emits_one_row_per_buffered_row`` is admitted to that mode
+    at build, so reaching this is that plugin breaking its own declaration.
+
+    Raised by the aggregation flush cross-check before the declaration
+    dispatch. It is audit evidence: the processor records every buffered token
+    FAILURE / UNROUTED with ``to_audit_dict`` and then raises it, so no token
+    of the batch is left without a terminal outcome. ``to_audit_dict`` carries
+    the kind, the identities and the counts, never the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: BatchPassthroughShapeKind,
+        plugin: str,
+        node_id: str,
+        run_id: str,
+        buffered_token_count: int,
+        emitted_row_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind: BatchPassthroughShapeKind = failure_kind
+        self.plugin = plugin
+        self.node_id = node_id
+        self.run_id = run_id
+        self.buffered_token_count = buffered_token_count
+        self.emitted_row_count = emitted_row_count
+
+    def to_audit_dict(self) -> BatchPassthroughShapeAudit:
+        return {
+            "exception_type": type(self).__name__,
+            "failure_kind": self.failure_kind,
+            "plugin": self.plugin,
+            "node_id": self.node_id,
+            "run_id": self.run_id,
+            "buffered_token_count": self.buffered_token_count,
+            "emitted_row_count": self.emitted_row_count,
+        }
+
+
 # TIER-2: Operator-interpretable refuse signal — audit DB is intact and truthful (records that no rows were committed); not a corruption or framework bug. Inherits OrchestrationInvariantError so the broad catch still matches, but the semantic tier is Tier-2 (clean refuse with run_id), not Tier-1 (invariant violation).
 class EmptyResumeStateError(OrchestrationInvariantError):
     """Raised when resume is attempted for a run with no recorded work.

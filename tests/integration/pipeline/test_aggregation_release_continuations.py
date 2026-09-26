@@ -42,21 +42,20 @@ from elspeth.core.landscape.schema import token_outcomes_table, token_work_items
 from elspeth.engine.clock import MockClock
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.sources.json_source import JSONSource
-from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 from elspeth.plugins.transforms.batch_stats import BatchStats
+from tests.fixtures.passthrough_batch_plugins import PassthroughIdentityBatch
 from tests.integration.pipeline.test_barrier_hold_payload import build_pipeline, resume_pipeline, run_pipeline, terminal_counts
 
 _RELEASE_INTO_SCOPE = """
 aggregations:
   - name: eof_buffer
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: buffered
     on_success: rows
     on_error: discard
     trigger: {{count: 100}}
     output_mode: OUTPUT_MODE
     options:
-      include_copy_index: false
       schema: {{mode: observed}}
 transforms:
   - name: explode
@@ -86,24 +85,22 @@ scopes:
 _RELEASE_INTO_SECOND_BARRIER = """
 aggregations:
   - name: eof_buffer
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: buffered
     on_success: rows
     on_error: discard
     trigger: {{count: 100}}
     output_mode: passthrough
     options:
-      include_copy_index: false
       schema: {{mode: observed}}
   - name: second_buffer
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: tagged
     on_success: out
     on_error: discard
     trigger: {{count: 100}}
     output_mode: passthrough
     options:
-      include_copy_index: false
       schema: {{mode: observed}}
 transforms:
   - name: tag
@@ -136,7 +133,7 @@ _GROUP_OUTPUT = {
 
 # Captured once, so a patch wraps the real plugin, not an earlier wrapper.
 _REAL_BATCH_STATS_PROCESS = BatchStats.process
-_REAL_BATCH_REPLICATE_PROCESS = BatchReplicate.process
+_REAL_IDENTITY_BATCH_PROCESS = PassthroughIdentityBatch.process
 _REAL_JSONL_LOAD = JSONSource._load_jsonl
 
 
@@ -221,9 +218,9 @@ def test_a_timeout_release_mid_source_into_a_scope_opener_completes_every_docume
     clock = MockClock(start=0.0)
     batch_sizes: list[int] = []
 
-    def replicate(self: BatchReplicate, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
+    def identity(self: PassthroughIdentityBatch, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
         batch_sizes.append(len(rows))
-        return _REAL_BATCH_REPLICATE_PROCESS(self, rows, ctx)
+        return _REAL_IDENTITY_BATCH_PROCESS(self, rows, ctx)
 
     def load_jsonl(self: JSONSource, ctx: Any) -> Iterator[Any]:
         for index, row in enumerate(_REAL_JSONL_LOAD(self, ctx)):
@@ -231,7 +228,7 @@ def test_a_timeout_release_mid_source_into_a_scope_opener_completes_every_docume
                 clock.advance(10.0)
             yield row
 
-    monkeypatch.setattr(BatchReplicate, "process", replicate)
+    monkeypatch.setattr(PassthroughIdentityBatch, "process", identity)
     monkeypatch.setattr(JSONSource, "_load_jsonl", load_jsonl)
     body = _scope_pipeline(output_mode).replace("trigger: {{count: 100}}", "trigger: {{timeout_seconds: 5}}")
     docs = [{"id": 1, "items": [3, 1, 2]}, {"id": 2, "items": [5, 7]}, {"id": 3, "items": [5, 7]}]
@@ -265,16 +262,16 @@ def _fault_the_first_flush(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """The aggregation's first flush raises; later flushes work. Returns a record that the fault fired."""
     # The fault makes the plugin's behaviour call-dependent, so it is declared so:
     # resume re-invokes it by design rather than by accident.
-    monkeypatch.setattr(BatchReplicate, "determinism", Determinism.NON_DETERMINISTIC)
+    monkeypatch.setattr(PassthroughIdentityBatch, "determinism", Determinism.NON_DETERMINISTIC)
     fired: list[str] = []
 
-    def replicate(self: BatchReplicate, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
+    def identity(self: PassthroughIdentityBatch, rows: list[PipelineRow], ctx: PluginContext) -> TransformResult:
         if not fired:
             fired.append("flush")
             raise _FlushFault("in the aggregation flush, before the release")
-        return _REAL_BATCH_REPLICATE_PROCESS(self, rows, ctx)
+        return _REAL_IDENTITY_BATCH_PROCESS(self, rows, ctx)
 
-    monkeypatch.setattr(BatchReplicate, "process", replicate)
+    monkeypatch.setattr(PassthroughIdentityBatch, "process", identity)
     return fired
 
 

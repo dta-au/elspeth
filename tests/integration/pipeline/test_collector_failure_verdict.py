@@ -21,7 +21,8 @@ leaves no verdict, and the group is re-flushed, exactly as an aggregation
 flush with no recorded verdict is.
 
 Shape (Codex's reduced one-group probe): one source row, then an EOF
-batch_replicate passthrough buffer so the scope's flush runs after the
+passthrough identity buffer (the test-only ``test_passthrough_identity_batch``)
+so the scope's flush runs after the
 source is exhausted (resume refuses an incomplete source), then json_explode
 (three members), then a batch_stats collector (require_all), then a sink.
 """
@@ -54,14 +55,13 @@ from tests.integration.pipeline.test_barrier_hold_payload import build_pipeline,
 _COLLECTOR_PIPELINE = """
 aggregations:
   - name: eof_buffer
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: buffered
     on_success: rows
     on_error: discard
     trigger: {{count: 100}}
     output_mode: passthrough
     options:
-      include_copy_index: false
       schema: {{mode: observed}}
 transforms:
   - name: explode

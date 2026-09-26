@@ -177,9 +177,11 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:504ed89733ba1d10"
+    source_file_hash: str | None = "sha256:21a4b6ceef9ea575"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
+    # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
+    flush_emits_one_row_per_buffered_row = False
     preserves_input_values = True
     usage_when_to_use: str = (
         "Use for window-local z-score and robust-z annotations on finite numeric rows, preserving each valid "

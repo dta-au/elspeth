@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import (
@@ -151,6 +152,18 @@ def instantiate_plugins_from_config(
                     f"transforms that can process multiple rows at once. "
                     f"Use a batch-aware transform like 'batch_stats' or 'batch_replicate', "
                     f"or set is_batch_aware=True on your custom transform."
+                )
+            # output_mode: passthrough continues each buffered token with its
+            # own output row, so it carries only a plugin whose flush emits
+            # exactly one row per buffered row. Any other plugin would end the
+            # run on its first flush. Decided on the class declaration, before
+            # construction; the composer's placement rule reads the same one.
+            if agg_config.output_mode is OutputMode.PASSTHROUGH and not transform_cls.flush_emits_one_row_per_buffered_row:
+                raise ValueError(
+                    f"Aggregation '{agg_config.name}' uses transform '{agg_config.plugin}' with output_mode: "
+                    f"passthrough, but '{agg_config.plugin}' does not emit exactly one row per buffered row, "
+                    f"which is what passthrough carries. Use output_mode: transform, so the rows its flush emits "
+                    f"become new downstream tokens."
                 )
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success

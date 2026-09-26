@@ -2157,7 +2157,18 @@ trigger:
 | Mode | Behavior |
 |------|----------|
 | `transform` | Batch applies transform function to produce results (default) |
-| `passthrough` | Batch releases all accepted rows unchanged |
+| `passthrough` | Each buffered row continues as its own token, carrying the row the plugin returned for it |
+
+`passthrough` carries only a plugin whose flush emits exactly one row per
+buffered row, in order (the plugin class declares
+`flush_emits_one_row_per_buffered_row`). No shipped batch plugin does: each
+one reduces the batch (`batch_stats`, `report_assemble`, …), replicates rows
+(`batch_replicate`) or skips rows (`batch_outlier_annotator` skips a null or
+non-finite value). `elspeth validate` and the composer therefore refuse every
+shipped batch plugin under `passthrough`, with "Use output_mode: transform".
+A plugin that declares the capability and then returns another shape is a
+plugin bug: every row of the batch is recorded failed and the run aborts
+(exit 4).
 
 For N→1 aggregation (e.g., computing statistics), use `transform` mode with `expected_output_count: 1` to validate cardinality.
 

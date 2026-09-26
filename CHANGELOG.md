@@ -287,6 +287,23 @@ drained and repair this release forward.
   covers malformed `quarantined_indices`, or rows emitted while every input
   is claimed quarantined. Every buffered row is recorded `failed` before the
   run ends.
+- **`output_mode: passthrough` admits only a batch plugin that emits one row
+  per buffered row; no shipped plugin does.** Every batch plugin now declares
+  whether its flush emits exactly one row per buffered row
+  (`flush_emits_one_row_per_buffered_row`), and `elspeth validate`, `elspeth
+  run` and the composer read that one declaration. None of the 13 shipped
+  batch plugins does: they reduce the batch, replicate rows (`batch_replicate`)
+  or skip rows (`batch_outlier_annotator` skips a null or non-finite value).
+  So an aggregation of any of them under `output_mode: passthrough` is now
+  refused at config with "Use output_mode: transform". Before, `batch_stats`,
+  `batch_outlier_annotator` or `batch_replicate` under `passthrough` passed
+  `elspeth validate` and ended the run (exit 4) on the first flush that was
+  not one row per buffered row, and the rows of that batch were left without
+  an outcome. The composer refused only `batch_replicate`, by name, and also
+  refused it when `output_mode` was left to its default, `transform`. A
+  plugin that declares the capability and then returns another shape still
+  ends the run with `BatchPassthroughShapeError` (a Tier-1 invariant error),
+  but every buffered row is recorded `failed` first.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

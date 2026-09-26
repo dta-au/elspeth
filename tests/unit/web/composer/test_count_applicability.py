@@ -123,8 +123,17 @@ async def test_audited_dispatch_distinguishes_structural_and_semantic_count_fail
             await audited_dispatch()
     else:
         outcome = await audited_dispatch()
-        assert outcome.result.success is (count is None)
-        if count is not None:
+        assert outcome.result.success is False
+        if count is None:
+            # No count failure: the only refusal is that batch_stats cannot run
+            # under output_mode: passthrough (its flush is not one row per
+            # buffered row), which the count rule neither causes nor hides.
+            errors = outcome.result.validation.errors
+            assert CODE not in [error.error_code for error in errors]
+            rejected = [error for error in errors if error.component == "rejected_mutation"]
+            assert len(rejected) == 1, errors
+            assert "'batch_stats' does not emit exactly one row per buffered row" in rejected[0].message
+        else:
             assert outcome.result.updated_state is state
             assert [error.error_code for error in outcome.result.validation.errors] == [CODE]
     assert len(recorder.invocations) == 1

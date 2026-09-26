@@ -56,6 +56,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchPassthroughShapeError,
     CapacityError,
     ExecutionError,
     FrameworkBugError,
@@ -3269,7 +3270,7 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
             patch.object(processor._data_flow, "record_token_outcome"),
             patch.object(processor, "_emit_transform_completed"),
-            pytest.raises(RuntimeError, match="rows=None"),
+            pytest.raises(FrameworkBugError, match=r"result\.rows None"),
         ):
             processor.process_row(
                 row_index=0,
@@ -3281,7 +3282,12 @@ class TestAggregationFailureMatrix:
             )
 
     def test_passthrough_success_with_output_count_mismatch_raises(self) -> None:
-        """Passthrough flush must return one output row per buffered input token."""
+        """Passthrough flush must return one output row per buffered input token.
+
+        The mismatch is the plugin breaking its flush_emits_one_row_per_buffered_row
+        declaration: every buffered token is recorded FAILURE / UNROUTED with the
+        value-free shape evidence before the Tier-1 abort.
+        """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="passthrough")
         source_row = _make_source_row({"value": 10})
         ctx = make_context(
@@ -3298,8 +3304,11 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
+        other_token_ids: list[str] = []
+
         def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             other_token = make_token_info(data={"value": 20})
+            other_token_ids.append(other_token.token_id)
             return mismatch_result, [captured["token"], other_token], "batch-1"
 
         with (
@@ -3307,8 +3316,9 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
             patch.object(processor._data_flow, "record_token_outcome"),
+            patch.object(processor._data_flow, "record_token_outcome_leader") as record_leader,
             patch.object(processor, "_emit_transform_completed"),
-            pytest.raises(OrchestrationInvariantError, match="same number of output rows"),
+            pytest.raises(BatchPassthroughShapeError, match="same number of output rows") as raised,
         ):
             processor.process_row(
                 row_index=0,
@@ -3318,6 +3328,16 @@ class TestAggregationFailureMatrix:
                 source_row_index=0,
                 ingest_sequence=0,
             )
+
+        assert isinstance(raised.value, OrchestrationInvariantError)
+        assert raised.value.failure_kind == "row_count_mismatch"
+        recorded = [call.kwargs for call in record_leader.call_args_list]
+        assert [kwargs["ref"].token_id for kwargs in recorded] == [captured["token"].token_id, other_token_ids[0]]
+        for kwargs in recorded:
+            assert (kwargs["outcome"], kwargs["path"]) == (TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
+            assert kwargs["context"]["failure_kind"] == "row_count_mismatch"
+            assert (kwargs["context"]["buffered_token_count"], kwargs["context"]["emitted_row_count"]) == (2, 1)
+            assert "value" not in kwargs["context"]
 
     def test_timeout_flush_passthrough_with_downstream_returns_continuation_work(self) -> None:
         """Timeout flush atomically journals downstream continuation work."""

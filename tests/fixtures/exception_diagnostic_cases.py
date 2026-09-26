@@ -518,6 +518,26 @@ DIAGNOSTIC_CASES = (
         },
     ),
     *_structured_cases(
+        errors.BatchPassthroughShapeError,
+        {
+            "message": "fixed-message",
+            "failure_kind": "row_count_mismatch",
+            "plugin": "fixed-plugin",
+            "node_id": "fixed-node",
+            "run_id": "fixed-run",
+            "buffered_token_count": 3,
+            "emitted_row_count": 1,
+        },
+        {
+            "failure_kind": ("single_row_result", "quarantined_indices_declared"),
+            "plugin": ("plugin-alpha", "plugin-omega"),
+            "node_id": ("node-alpha", "node-omega"),
+            "run_id": ("run-alpha", "run-omega"),
+            "buffered_token_count": (1, 5),
+            "emitted_row_count": (0, 2),
+        },
+    ),
+    *_structured_cases(
         errors.DeclaredOutputTypeViolation,
         {
             "transform": "fixed-transform",

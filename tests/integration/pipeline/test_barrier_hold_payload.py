@@ -55,6 +55,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.plugins.transforms.batch_stats import BatchStats
 from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
+from tests.fixtures.passthrough_batch_plugins import passthrough_batch_plugins
 
 _SOURCE_AND_SINK = """
 sources:
@@ -83,14 +84,13 @@ sinks:
 _COLLECTOR_ARM = """
 aggregations:
   - name: eof_buffer
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: buffered
     on_success: rows
     on_error: discard
     trigger: {{count: 100}}
     output_mode: passthrough
     options:
-      include_copy_index: false
       schema: {{mode: observed}}
 transforms:
   - name: explode
@@ -181,7 +181,10 @@ def build_pipeline(
     input_path.write_text("\n".join(json.dumps(doc) for doc in docs) + "\n")
     output_path = tmp_path / "out.jsonl"
     settings = load_settings_from_yaml_string((_SOURCE_AND_SINK + body_yaml).format(input_path=input_path, output_path=output_path))
-    bundle = instantiate_plugins_from_config(settings, preflight_mode=True, sink_effect_purpose=SinkEffectExecutionPurpose.FRESH)
+    # A processing section may name the test-only passthrough-capable batch
+    # plugin: output_mode: passthrough admits no shipped plugin.
+    with passthrough_batch_plugins():
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True, sink_effect_purpose=SinkEffectExecutionPurpose.FRESH)
     sinks = execution_sinks_for_runtime(settings, bundle.sinks)
     modes = sink_effect_modes_from_runtime_bindings(
         sinks,

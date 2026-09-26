@@ -132,9 +132,11 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:70f0b1567a78cf77"
+    source_file_hash: str | None = "sha256:59702cfd8e9c57c7"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use when a pair ID identifies matched baseline and candidate rows in the same flushed window and you "
         "need win, loss, tie, and score-delta summaries."

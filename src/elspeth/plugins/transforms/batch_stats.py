@@ -127,9 +127,11 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5c0fc24a3edacee1"
+    source_file_hash: str | None = "sha256:22cdfd69d10e19f5"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use to replace a window of rows with count, sum, and optional mean statistics over one numeric field. "
         "Omit trigger or use trigger: {} for one bounded whole-source end-of-source aggregate; a count, timeout, "

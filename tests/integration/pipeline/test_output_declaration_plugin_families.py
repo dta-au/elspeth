@@ -10,8 +10,9 @@ value. ``test_output_declaration_batch_seams.py`` covers the reductive
 aggregation, the collector and batch_replicate; this file covers the other
 families:
 
-- passthrough batch annotation (``batch_outlier_annotator`` under
-  ``aggregations:``): the whole batch follows ``on_error``;
+- batch annotation (``batch_outlier_annotator`` under ``aggregations:``,
+  ``output_mode: transform`` — it is not passthrough-capable, since it skips
+  rows whose value is null or non-finite): the whole batch follows ``on_error``;
 - per-row retrieval (``rag_retrieval``, whose core ``azure_ai_search`` shares):
   the row follows the transform's ``on_error``;
 - per-row LLM structured output (``llm``): the declaration of each
@@ -140,7 +141,7 @@ def _outlier_aggregation() -> dict[str, Any]:
                 "on_success": "out",
                 "on_error": "quarantine",
                 "trigger": {"count": 3},
-                "output_mode": "passthrough",
+                "output_mode": "transform",
                 "options": {"schema": {"mode": "observed"}, "value_field": "amount"},
             }
         ]
@@ -150,9 +151,7 @@ def _outlier_aggregation() -> dict[str, Any]:
 _OUTLIER_ROWS = [{"id": 1, "amount": 2}, {"id": 2, "amount": 3}, {"id": 3, "amount": 50}]
 
 
-def test_a_passthrough_annotator_computing_the_wrong_type_fails_the_batch_value_free(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_batch_annotator_computing_the_wrong_type_fails_the_batch_value_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _fault_outlier_mean(monkeypatch)
     _write_jsonl(tmp_path / "in.jsonl", _OUTLIER_ROWS)
 

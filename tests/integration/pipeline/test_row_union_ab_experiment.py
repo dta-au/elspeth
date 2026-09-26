@@ -24,6 +24,7 @@ from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+from tests.fixtures.passthrough_batch_plugins import passthrough_batch_plugins
 
 
 def _run_pipeline(tmp_path: Path, aggregation_yaml: str) -> tuple[object, Path]:
@@ -251,7 +252,7 @@ transforms:
         mode: observed
 aggregations:
   - name: control_batch
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: control_branch
     on_success: control_ready
     on_error: discard
@@ -260,9 +261,6 @@ aggregations:
     options:
       schema:
         mode: observed
-      copies_field: copies
-      default_copies: 1
-      include_copy_index: false
 row_unions:
   - name: variant_union
     branches:
@@ -280,7 +278,9 @@ sinks:
         mode: observed
 """
     )
-    bundle = instantiate_plugins_from_config(settings)
+    # output_mode: passthrough admits no shipped batch plugin: the test-only identity plugin stands in.
+    with passthrough_batch_plugins():
+        bundle = instantiate_plugins_from_config(settings)
     with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region") as exc_info:
         ExecutionGraph.from_plugin_instances(
             sources=bundle.sources,

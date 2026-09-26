@@ -133,6 +133,10 @@ component; `row_union` requires an explicit `on_success` connection.
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered
   aggregation/transform sequence such as aggregation followed by replication.
+  Give an aggregation `output_mode: transform` (the default): `passthrough`
+  carries only a plugin whose flush emits exactly one row per buffered row,
+  and no discovered batch plugin does (each reduces, replicates or skips rows),
+  so every one is refused under `passthrough`.
 - [capability-node:queue] A `queue` is the explicit fan-in point for multiple
   producers entering shared processing. Multiple named sources retain their
   independent schemas and identities.

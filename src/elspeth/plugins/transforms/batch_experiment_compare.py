@@ -138,9 +138,11 @@ class BatchExperimentCompare(BaseTransform):
     name = "batch_experiment_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:939b7578166ed712"
+    source_file_hash: str | None = "sha256:626294f25b250e5d"
     config_model = BatchExperimentCompareConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for an unpaired mean, lift, z-score, and normal-bound comparison of numeric experiment variants within one flushed batch."
     )

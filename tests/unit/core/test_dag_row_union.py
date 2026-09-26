@@ -27,11 +27,13 @@ from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.graph import GraphValidationError
+from tests.fixtures.passthrough_batch_plugins import passthrough_batch_plugins
 
 
 def _build_graph(yaml_text: str) -> ExecutionGraph:
     settings = load_settings_from_yaml_string(yaml_text)
-    bundle = instantiate_plugins_from_config(settings)
+    with passthrough_batch_plugins():
+        bundle = instantiate_plugins_from_config(settings)
     return ExecutionGraph.from_plugin_instances(
         sources=bundle.sources,
         source_settings_map=bundle.source_settings_map,
@@ -1237,6 +1239,9 @@ coalesce:
 
 
 def _branch_agg_yaml(tmp_path: Path, *, output_mode: str) -> str:
+    # The aggregation is the test-only identity batch plugin: output_mode:
+    # passthrough admits no shipped batch plugin (none emits exactly one row
+    # per buffered row), and the placement rule under test ignores the plugin.
     input_path = tmp_path / "branch_agg_input.jsonl"
     if not input_path.exists():
         input_path.write_text('{"id": 1, "copies": 1}\n')
@@ -1286,7 +1291,7 @@ transforms:
         mode: observed
 aggregations:
   - name: control_batch
-    plugin: batch_replicate
+    plugin: test_passthrough_identity_batch
     input: control_branch
     on_success: control_ready
     on_error: discard
@@ -1295,9 +1300,6 @@ aggregations:
     options:
       schema:
         mode: observed
-      copies_field: copies
-      default_copies: 1
-      include_copy_index: false
 {barrier_block}sinks:
   output:
     plugin: json

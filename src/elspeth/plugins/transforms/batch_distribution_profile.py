@@ -124,9 +124,11 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:798dbb2c0e48740f"
+    source_file_hash: str | None = "sha256:b73a41fbd8f60e86"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for numeric descriptive statistics and optional group profiles within each window. When configured, "
         "group_by partitions one flushed batch and never accumulates a group across windows."

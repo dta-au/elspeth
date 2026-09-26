@@ -1820,9 +1820,9 @@ def build_execution_graph(
         # barrier binding.
         #
         # output_mode: passthrough is NOT rejected by THIS check — it targets
-        # only the transform-mode identity-collision hazard
-        # (_route_passthrough_results validates 1:1 and updates the ORIGINAL
-        # tokens, so every buffered row_id keeps its own arrival for THAT
+        # only the transform-mode identity-collision hazard (the flush
+        # cross-check enforces 1:1 and _route_passthrough_results updates the
+        # ORIGINAL tokens, so every buffered row_id keeps its own arrival for THAT
         # hazard specifically). Rule 6 (validate_no_aggregations_in_regions,
         # called later in this function) independently bans ANY aggregation
         # inside a bound region regardless of output_mode (spec §7 rule 6,

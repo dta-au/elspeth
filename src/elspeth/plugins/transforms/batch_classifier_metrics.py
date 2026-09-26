@@ -175,9 +175,11 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b17e579df62a1874"
+    source_file_hash: str | None = "sha256:d12cb55d7ed4c5c6"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use when rows carry actual and predicted scalar labels and each flushed window should emit confusion, "
         "accuracy, precision/recall, and F1 metrics; None pairs are excluded."

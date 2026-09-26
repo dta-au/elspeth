@@ -66,6 +66,13 @@
 > recorded FAILURE / UNROUTED with its value-free `to_audit_dict` (kind,
 > identities and counts, never the metadata). The resume re-check records
 > nothing.
+> 2026-09-27: the PASSTHROUGH shape is checked at the same site, before the
+> per-pair dispatch: a `success_multi` of exactly one row per buffered token
+> (or of none) and no `quarantined_indices`. Build admits a PASSTHROUGH
+> aggregation only for a plugin declaring
+> `flush_emits_one_row_per_buffered_row`, so any other shape is that plugin
+> breaking its declaration. It raises `BatchPassthroughShapeError`, recorded
+> on every buffered token the same way; routing no longer re-checks the count.
 > A union-existence check (every field some input carried must appear on some
 > output) was prototyped and not adopted. Taken over every buffered input it
 > has a measured Tier-1 false positive: an honest `batch_replicate` run aborts
@@ -125,7 +132,7 @@ Invoked from two sites:
 **Batch-mode semantics.** Two output modes require distinct handling:
 
 - **`OutputMode.TRANSFORM` (batch-homogeneous intersection).** `input_fields` is the intersection of all buffered input contracts (ADR-007 table line 53). Every emitted row must preserve the intersection — the weakest shared guarantee across the batch. A transform claiming `passes_through_input=True` must preserve what every input contributed.
-- **`OutputMode.PASSTHROUGH` (1:1 pairing).** Tokens are 1:1 with outputs (routing enforces the count match). Each `(input_token, output_row)` pair is checked independently using that specific input token's contract fields. Using the batch intersection for passthrough would create a correctness hole on heterogeneous batches — a field present on only one input token could be silently dropped on its corresponding output token.
+- **`OutputMode.PASSTHROUGH` (1:1 pairing).** Tokens are 1:1 with outputs (the cross-check enforces the shape first; see the 2026-09-27 note). Each `(input_token, output_row)` pair is checked independently using that specific input token's contract fields. Using the batch intersection for passthrough would create a correctness hole on heterogeneous batches — a field present on only one input token could be silently dropped on its corresponding output token.
 
 **Call-site placement (critical).** `_cross_check_flush_output` MUST run BEFORE `_emit_transform_completed` and the `_route_*` methods. A failed cross-check must not follow a COMPLETED (telemetry) or CONSUMED_IN_BATCH (Landscape) terminal-state emission on any token, or the audit trail would contain both terminal states for the same token — violating the "every row reaches exactly one terminal state" invariant (stated over tokens at docs/contracts/system-operations.md §Complete Token State Diagram: "Every token reaches exactly one terminal state — no silent drops.").
 

@@ -86,9 +86,11 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bde9f69e39c2f250"
+    source_file_hash: str | None = "sha256:7ab92d9020563f77"
     config_model = BatchTopKConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for type-aware scalar frequencies and top-k counts within each window. When configured, group_by "
         "partitions one flushed batch and never accumulates a group across windows."

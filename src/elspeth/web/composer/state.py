@@ -1695,6 +1695,14 @@ def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[st
     return frozenset(cls.name for cls in transforms if cls.is_batch_aware and not cls.supports_row_mode_when_batch_aware)
 
 
+def _known_transform_plugins_emitting_one_row_per_buffered_row() -> frozenset[str]:
+    """Return batch-aware transform names that ``output_mode: passthrough`` can carry (one output row per buffered row)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.is_batch_aware and cls.flush_emits_one_row_per_buffered_row)
+
+
 def _known_transform_plugins_requiring_aggregation_batch_context() -> frozenset[str]:
     """Return transform names that read the aggregation flush window (``ctx.aggregation_batch``)."""
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -1747,8 +1755,11 @@ def _batch_aware_placement_error(
     """Reject a batch-aware transform from a node kind it cannot run in.
 
     Mirrors runtime_factory's placement refusals, from the same plugin class
-    declarations: a batch-only plugin as a row transform, and a plugin that
-    reads the aggregation flush window as a collector.
+    declarations: a batch-only plugin as a row transform, a plugin that reads
+    the aggregation flush window as a collector, and a plugin whose flush does
+    not emit exactly one row per buffered row as an aggregation under
+    ``output_mode: passthrough``. An absent ``output_mode`` is the runtime
+    default, ``transform``.
     """
     if plugin_name is None:
         return None
@@ -1770,14 +1781,22 @@ def _batch_aware_placement_error(
             "Batch-aware transforms require the aggregation/batch path unless the plugin explicitly supports row mode. "
             "Configure this node as node_type='aggregation' with an aggregation trigger, or use a row-level transform instead."
         )
-        if plugin_name == "batch_replicate":
-            message += " For batch_replicate, set output_mode: transform so replicated rows create new downstream tokens."
+        if plugin_name not in _known_transform_plugins_emitting_one_row_per_buffered_row():
+            message += (
+                f" '{plugin_name}' does not emit exactly one row per buffered row, so give the aggregation "
+                "output_mode: transform (the default)."
+            )
         return message
 
-    if plugin_name == "batch_replicate" and node_type == "aggregation" and output_mode != "transform":
+    if (
+        node_type == "aggregation"
+        and output_mode == "passthrough"
+        and plugin_name not in _known_transform_plugins_emitting_one_row_per_buffered_row()
+    ):
         return (
-            f"Node '{node_id}' uses batch_replicate, which deaggregates a batch into new rows. "
-            "Configure it as an aggregation with output_mode: transform so replicated rows create new downstream tokens."
+            f"Node '{node_id}' uses '{plugin_name}' as an aggregation with output_mode: passthrough, but "
+            f"'{plugin_name}' does not emit exactly one row per buffered row, which is what passthrough carries. "
+            "Use output_mode: transform, so the rows its flush emits become new downstream tokens."
         )
 
     return None

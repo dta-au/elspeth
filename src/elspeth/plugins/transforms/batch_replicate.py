@@ -131,9 +131,11 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7eae6b13382ca8db"
+    source_file_hash: str | None = "sha256:27a09dd97ca24961"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    # Not passthrough-capable: each row asks for its own number of copies.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for bounded per-row copy expansion. A missing copies_field uses default_copies, while a valid integer "
         "count controls the emitted copies and optional copy indexes."

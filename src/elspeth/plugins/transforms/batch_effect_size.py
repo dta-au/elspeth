@@ -133,9 +133,11 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f1d2b1c59463f7fe"
+    source_file_hash: str | None = "sha256:550b947ad68a1580"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
     usage_when_not_to_use: str = (
         "Not for hypothesis testing or matched observations: it does not establish statistical significance and is not a paired analysis."

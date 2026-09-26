@@ -7751,6 +7751,69 @@ class TestComposerRuntimeBatchPlacementAgreement:
         assert composer.is_valid, composer.errors
         self._runtime_instantiate(state)
 
+    # output_mode: passthrough continues each buffered token with its own row,
+    # so it carries only a plugin declaring flush_emits_one_row_per_buffered_row
+    # (S4 review r2 F2; lane-owner decision 2026-09-27, option A). Under it a
+    # replicator, a reducer or a row-skipping annotator ended the run on its
+    # first flush (exit 4, tokens without an outcome) after `elspeth validate`
+    # had admitted it; the composer refused only batch_replicate, by NAME.
+
+    def _aggregation(self, plugin: str, output_mode: str | None) -> NodeSpec:
+        return self._node("agg", "aggregation", plugin, "rows", "main", trigger={"count": 3}, output_mode=output_mode)
+
+    def test_both_reject_every_registered_batch_plugin_under_passthrough(self, tmp_path: Path) -> None:
+        """No shipped batch plugin emits one row per buffered row, so passthrough admits none of them.
+
+        Both refusals are decided on the class before any plugin option is
+        read, so the node carries only a schema.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        names = sorted(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware)
+        assert len(names) >= 13, names  # positive control: the registry is populated
+        for name in names:
+            state = self._state(tmp_path, self._aggregation(name, "passthrough"))
+
+            composer = state.validate()
+            misplaced = [e for e in composer.errors if e.error_code == "batch_transform_misplaced"]
+            assert len(misplaced) == 1, (name, composer.errors)
+            assert f"'{name}' does not emit exactly one row per buffered row" in misplaced[0].message
+            assert "Use output_mode: transform" in misplaced[0].message
+            with pytest.raises(ValueError, match=rf"Aggregation 'agg' uses transform '{name}' with output_mode: passthrough") as raised:
+                self._runtime_instantiate(state)
+            assert "Use output_mode: transform" in str(raised.value)
+
+    @pytest.mark.parametrize("output_mode", ["transform", None], ids=["explicit-transform", "absent-is-the-runtime-default"])
+    def test_both_accept_batch_replicate_outside_passthrough(self, tmp_path: Path, output_mode: str | None) -> None:
+        """Control: transform mode, written or left to the runtime default (the old by-name rule refused an absent mode)."""
+        node = replace(self._aggregation("batch_replicate", output_mode), options={"schema": {"mode": "observed"}, "copies_field": "n"})
+        state = self._state(tmp_path, node)
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        self._runtime_instantiate(state)
+
+    def test_both_read_the_passthrough_declaration_not_the_plugin_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Flip the declaration on batch_stats: both surfaces then admit it under passthrough."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
+        monkeypatch.setattr(batch_stats_cls, "flush_emits_one_row_per_buffered_row", True)
+        node = replace(self._aggregation("batch_stats", "passthrough"), options={"schema": {"mode": "observed"}, "value_field": "v"})
+        state = self._state(tmp_path, node)
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        self._runtime_instantiate(state)
+
+    def test_the_row_transform_refusal_names_the_output_mode_a_batch_plugin_needs(self, tmp_path: Path) -> None:
+        """A batch plugin placed as a row transform is told which output_mode its aggregation needs."""
+        state = self._state(tmp_path, self._batch_stats("transform"))
+
+        misplaced = [e for e in state.validate().errors if e.error_code == "batch_transform_misplaced"]
+        assert len(misplaced) == 1
+        assert "give the aggregation output_mode: transform (the default)" in misplaced[0].message
+
 
 class TestComposerRuntimeTemplateLiteralAgreement:
     """Shape 30 — a template whose own literals fail on every row (elspeth-5887fb7928 S3).

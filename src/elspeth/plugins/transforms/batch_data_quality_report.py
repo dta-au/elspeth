@@ -117,9 +117,11 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:824cc55edc791aa8"
+    source_file_hash: str | None = "sha256:1a103c222ef37a45"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use to emit one quality row per configured existing field in a flushed batch; a present None is missing, "
         "while absent columns are errors rather than missing observations."

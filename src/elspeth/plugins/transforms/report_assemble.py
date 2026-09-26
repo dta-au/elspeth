@@ -102,7 +102,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:05824728790cda1b"
+    source_file_hash: str | None = "sha256:a36acc831f84db24"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -131,6 +131,8 @@ class ReportAssemble(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("report", "aggregation", "batch", "pagination")
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to one assembled report row.
+    flush_emits_one_row_per_buffered_row = False
     # Pagination reads the flush window (flush_index, row_start/row_end,
     # trigger), which a collector's end_of_group flush does not have.
     requires_aggregation_batch_context = True
