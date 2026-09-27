@@ -13,12 +13,9 @@ from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, Char
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.advisor_policy import ADVISOR_UNAVAILABLE_USER_DETAIL
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import (
-    _ADVISOR_UNAVAILABLE_USER_DETAIL,
-    AdvisorCheckpointVerdict,
-    ComposerServiceImpl,
-)
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -152,7 +149,7 @@ async def test_run_signoff_progress_defaults_none() -> None:
         return_value=AdvisorCheckpointVerdict(
             ok=False,
             blocking=False,
-            findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL,
+            findings_text=ADVISOR_UNAVAILABLE_USER_DETAIL,
         )
     )
     service._run_advisor_checkpoint = checkpoint

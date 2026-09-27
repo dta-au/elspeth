@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from elspeth.web.composer.service import _ADVISOR_MALFORMED_USER_DETAIL, _parse_advisor_checkpoint_guidance
+from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL
+from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
 
 
 @pytest.mark.parametrize("findings", ["", "Intent satisfied, contracts consistent.", "The CLEAN token is ordinary text here."])
@@ -28,4 +29,4 @@ def test_prose_verdict_cannot_clear_or_block_as_an_accepted_response(guidance: s
     assert verdict.ok is False
     assert verdict.blocking is False
     assert verdict.failure_class == "malformed"
-    assert verdict.findings_text == _ADVISOR_MALFORMED_USER_DETAIL
+    assert verdict.findings_text == ADVISOR_MALFORMED_USER_DETAIL

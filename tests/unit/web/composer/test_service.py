@@ -2035,13 +2035,15 @@ class TestComposerMultiTurnToolCalls:
         still land, but no human/transcript field may retain model-authored
         prose produced from the advisor repair context.
         """
-        from elspeth.web.composer.service import (
-            _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
-            _ADVISOR_FINDINGS_UNTRUSTED_END,
+        from elspeth.web.composer.advisor_context import (
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
             _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
             _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
             _ADVISOR_UNTRUSTED_SUMMARY_END,
+        )
+        from elspeth.web.composer.advisor_policy import (
+            _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+            _ADVISOR_FINDINGS_UNTRUSTED_END,
         )
 
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
