@@ -10,6 +10,7 @@ signatures.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import combinations
 from typing import TYPE_CHECKING
 
@@ -1506,6 +1507,108 @@ def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class DeclaredInputDisposition:
+    """What the build settles about one node's declared input fields.
+
+    Both halves come from ONE walk of the predecessors' presence votes
+    (``EffectiveGuaranteeVote``), so they cannot drift apart:
+
+    - ``certain_missing`` — the REFUSAL: per live predecessor whose vote
+      PARTICIPATED and is CLOSED, the declared fields it provably omits
+      (``participated ∧ closed ∧ f ∉ vote.fields``; set difference proves
+      absence, which needs the upper bound). In predecessor order, empty when
+      nothing is certain.
+    - ``proven`` — the PROOF: the declared fields every arriving row provably
+      carries, ``declared ∩ ⋂_{p ∈ live preds} (vote(p).fields if
+      vote(p).participated else ∅)``. ``fields`` is a LOWER bound, so presence
+      needs no closedness term (an ``observed`` source naming
+      ``guaranteed_fields`` proves them although it is open). Backed at run
+      time by the upstream vals that stand behind each listed field (ADR-016
+      source guarantees, ADR-011 declared outputs, ADR-008/009 pass-through).
+
+    The two are disjoint by construction: a refused field is outside that
+    predecessor's ``fields``, so it is outside the intersection.
+
+    Two edges of the intersection are stated rather than left to set algebra,
+    because each errs toward PROVING, the direction that turns a routed row
+    fact into a run abort: a node with NO live predecessor proves nothing (the
+    empty intersection is the universe, not ∅), and a node with ANY DIVERT
+    in-edge proves nothing (a row can arrive through error handling carrying
+    an error envelope, not the producer's declared row; since spec §7 rule 9 a
+    DIVERT edge can land on a coalesce, row_union or collector). The refusal
+    keeps ignoring DIVERT predecessors (``_live_predecessors``): it must never
+    reject a runnable pipeline, while the proof must never over-claim.
+    """
+
+    certain_missing: tuple[tuple[str, tuple[str, ...]], ...]
+    proven: frozenset[str]
+
+
+def declared_input_disposition(
+    graph: ExecutionGraph,
+    node_id: str,
+    declared: frozenset[str],
+    cache: dict[str, EffectiveGuaranteeVote],
+) -> DeclaredInputDisposition:
+    """Settle ``declared`` against every predecessor of ``node_id`` in one vote walk.
+
+    The single authority for both the build refusal
+    (``validate_transform_declared_input_fields``) and the published proof
+    (``compute_declared_input_proof``); see ``DeclaredInputDisposition``.
+    """
+    live_predecessors = _live_predecessors(graph, node_id)
+    has_divert_in_edge = any(
+        edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True)
+    )
+    certain_missing: list[tuple[str, tuple[str, ...]]] = []
+    presence: list[frozenset[str]] = []
+    for predecessor_id in live_predecessors:
+        vote = walk_effective_guarantee_vote(graph, predecessor_id, cache)
+        if vote.participated and vote.closed:
+            missing = tuple(sorted(declared - vote.fields))
+            if missing:
+                certain_missing.append((predecessor_id, missing))
+        presence.append(vote.fields if vote.participated else frozenset())
+    if not live_predecessors or has_divert_in_edge:
+        proven: frozenset[str] = frozenset()
+    else:
+        proven = declared.intersection(*presence)
+    return DeclaredInputDisposition(certain_missing=tuple(certain_missing), proven=proven)
+
+
+_DECLARED_INPUT_PROOF_NODE_TYPES = frozenset({NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR})
+
+
+def compute_declared_input_proof(graph: ExecutionGraph) -> dict[NodeID, frozenset[str]]:
+    """The build's declared-input PROOF for every node that enforces an input declaration.
+
+    One entry per TRANSFORM (its ``declared_input_fields``, enforced by the
+    executor preflight) and per AGGREGATION/COLLECTOR (its
+    ``batch_required_input_fields``, enforced by ``validate_batch_inputs``) —
+    including nodes that declare nothing, whose entry is the empty set, so a
+    node missing from the map is a wiring defect the runtime refuses rather
+    than a node that proves nothing.
+
+    The runtime classifies a declared-input miss by this map (ADR-013
+    Amendment 2026-09-27): a miss of a PROVEN field is our bug (Tier 1); a
+    miss of fields the build never proved, absent from the row, is a fact
+    about that row and routes. The builder calls this on the FINAL graph —
+    after the rule-9 DIVERT-into-closer edges, which change what a closer's
+    vote and its successors' proofs may claim — and publishes the result as
+    frozen build metadata beside the node step map.
+    """
+    cache: dict[str, EffectiveGuaranteeVote] = {}
+    proof: dict[NodeID, frozenset[str]] = {}
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        if info.node_type not in _DECLARED_INPUT_PROOF_NODE_TYPES:
+            continue
+        declared = info.declared_input_fields if info.node_type == NodeType.TRANSFORM else info.batch_required_input_fields
+        proof[NodeID(str(node_id))] = declared_input_disposition(graph, str(node_id), declared, cache).proven if declared else frozenset()
+    return proof
+
+
 def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
     """Reject transforms whose declared input fields no upstream guarantees.
 
@@ -1616,15 +1719,10 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
         if not declared_input:
             continue
 
-        for predecessor_id in _live_predecessors(graph, node_id):
-            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
-            if not vote.participated or not vote.closed:
-                continue
-
-            missing = sorted(declared_input - vote.fields)
-            if not missing:
-                continue
-
+        disposition = declared_input_disposition(graph, str(node_id), declared_input, effective_fields_cache)
+        if disposition.certain_missing:
+            predecessor_id, certain = disposition.certain_missing[0]
+            missing = list(certain)
             raise GraphValidationError(
                 f"Transform '{info.plugin_name}' (node '{node_id}') requires input "
                 f"fields {missing} that its upstream '{predecessor_id}' does not "

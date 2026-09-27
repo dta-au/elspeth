@@ -1,8 +1,9 @@
 """TransformExecutor - wraps transform.process() with audit recording."""
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    DeclaredInputFieldAbsentViolation,
     HeaderSpelledDeclarationViolation,
     OrchestrationInvariantError,
     PassThroughContractViolation,
@@ -56,6 +58,7 @@ from elspeth.engine.executors.declaration_dispatch import (
     run_post_emission_checks,
     run_pre_emission_checks,
 )
+from elspeth.engine.executors.declared_input_miss import classify_declared_input_miss, declared_input_proof_entry
 from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
@@ -196,6 +199,7 @@ class TransformExecutor:
         max_workers: int | None = None,
         error_edge_ids: dict[NodeID, str] | None = None,
         before_terminal_audit: Callable[[], None] | None = None,
+        declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({}),
     ) -> None:
         """Initialize executor.
 
@@ -208,6 +212,14 @@ class TransformExecutor:
             error_edge_ids: Map of transform node_id -> DIVERT edge_id for error routing.
                            Built by the processor from the edge_map using error_edge_label().
                            Only populated for transforms with on_error pointing to a real sink.
+            declared_input_proof: The build's declared-input proof
+                (``ExecutionGraph.get_declared_input_proof``, carried on the
+                processor's ``DAGTraversalContext``): node_id -> the declared
+                input fields every arriving row provably carries. The preflight
+                classifies a declared-input miss by it. The empty default serves
+                executors built for transforms that declare no input; a
+                transform that declares one and has no entry is refused on its
+                first row (``OrchestrationInvariantError``).
         """
         self._execution = execution
         self._data_flow = data_flow
@@ -225,6 +237,10 @@ class TransformExecutor:
         # of the transform's config, fixed once construction finishes, so the
         # preflight pays only the predicate's membership legs per row.
         self._spelling_surfaces: dict[str, _NodeSpellingSurface] = {}
+        # The build's declared-input proof, and each node's verified entry,
+        # resolved on the node's first row (a pure function of the build).
+        self._declared_input_proof = declared_input_proof
+        self._declared_input_proven: dict[str, frozenset[str]] = {}
         # OpenTelemetry counter for pass-through cross-check violations now lives
         # at module scope in engine.executors.pass_through (ADR-009 §Clause 2).
         # Both this executor and the processor's batch-flush cross-check share
@@ -474,6 +490,43 @@ class TransformExecutor:
         # It also runs BEFORE transform.process() so a missing-field crash in
         # the plugin body cannot steal attribution from the declaration surface.
         effective_input_fields = derive_effective_input_fields(token.row_data)
+
+        # --- DECLARED-INPUT MISS ROUTER (pre-execution; ADR-013 Amendment 2026-09-27) ---
+        # A declared input field the row does not carry, where the build never
+        # proved it present (an observed or open upstream) and the payload does
+        # not carry it either, is a fact about this row: refused here, before
+        # process(), and routed via on_error with a value-free, row-invariant
+        # reason. A miss that touches a PROVEN field, or a field the payload
+        # carries while the contract lost it, is our bug: it falls through to
+        # the UNCHANGED DeclaredRequiredFieldsContract below, which aborts on
+        # the full missing set. This is engine row validation, not an ADR-010
+        # adopter — the dispatcher routes nothing, and the contract keeps its
+        # one Tier-1 violation class.
+        declared_input = transform.declared_input_fields
+        if declared_input:
+            # Resolved on the node's first row, miss or not: a node the proof
+            # does not cover is a wiring defect of every run, not only of the
+            # runs whose data happens to be sparse.
+            if node_id not in self._declared_input_proven:
+                self._declared_input_proven[node_id] = declared_input_proof_entry(
+                    self._declared_input_proof,
+                    node_id=NodeID(node_id),
+                    declared=declared_input,
+                    component=f"Transform '{transform.name}'",
+                )
+            missing_input = declared_input - effective_input_fields
+            if missing_input:
+                miss_kind = classify_declared_input_miss(
+                    missing=missing_input,
+                    proven=self._declared_input_proven[node_id],
+                    payload_keys=frozenset(token.row_data.keys()),
+                )
+                if miss_kind == "absent":
+                    raise DeclaredInputFieldAbsentViolation(
+                        component=f"Transform '{transform.name}'",
+                        fields=tuple(sorted(missing_input)),
+                    )
+
         static_contract = transform.effective_static_contract()
         try:
             run_pre_emission_checks(

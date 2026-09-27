@@ -88,6 +88,7 @@ from elspeth.contracts.errors import (
     TIER_1_ERRORS,
     AuditIntegrityError,
     DeclarationContractViolation,
+    DeclaredInputFieldAbsentViolation,
     DeclaredRequiredInputFieldsViolation,
     FrameworkBugError,
     OrchestrationInvariantError,
@@ -825,9 +826,20 @@ class TestTransformExecutor:
         factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_declared_input_fields_violation_precedes_generic_input_validation(self) -> None:
-        """Missing declared fields surface as ADR-013 violations before schema validation."""
+        """A PROVEN declared field's miss surfaces as the Tier-1 ADR-013 violation before schema validation.
+
+        The build proved ``customer_id`` present on every arriving row, so a
+        row without it is our bug (ADR-013 Amendment 2026-09-27): the router
+        falls through and the unchanged contract aborts.
+        """
         factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"node_1": frozenset({"customer_id"})},
+        )
         transform = _make_transform(declared_input_fields=frozenset({"customer_id"}))
 
         from elspeth.contracts import PluginSchema
@@ -854,12 +866,59 @@ class TestTransformExecutor:
         assert kwargs["path"] == TerminalPath.UNROUTED
         assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
 
+    def test_a_declaring_transform_without_a_proof_entry_is_refused_on_its_first_row(self) -> None:
+        """A node the build's proof does not cover is a wiring defect, even on a row that misses nothing (architect T7).
+
+        Read as "proves nothing" it would silently route every miss — including
+        the proven ones that expose engine defects.
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform(declared_input_fields=frozenset({"customer_id"}))
+        token = TokenInfo(row_id="row_proofless", token_id="tok_proofless", row_data=make_row({"customer_id": "c-1"}))
+
+        with pytest.raises(OrchestrationInvariantError, match="proof has no entry"):
+            executor.execute_transform(transform, token, make_context(), attempt=0)
+
+        transform.process.assert_not_called()
+
+    def test_an_unproven_absent_declared_field_is_routed_before_process(self) -> None:
+        """The routed half: an empty proof entry and a row without the field (ADR-013 Amendment 2026-09-27)."""
+        factory = _make_factory()
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"node_1": frozenset()},
+        )
+        transform = _make_transform(declared_input_fields=frozenset({"customer_id"}))
+        token = TokenInfo(row_id="row_unproven", token_id="tok_unproven", row_data=make_row({"account_id": "acc-1"}))
+
+        with pytest.raises(DeclaredInputFieldAbsentViolation, match=r"\['customer_id'\]") as excinfo:
+            executor.execute_transform(transform, token, make_context(), attempt=0)
+
+        transform.process.assert_not_called()
+        assert "acc-1" not in str(excinfo.value) and "account_id" not in str(excinfo.value)
+        factory.data_flow.record_token_outcome.assert_not_called()
+
     def test_field_mapper_missing_mapping_source_never_reaches_non_strict_process(self) -> None:
-        """A derived mapping-source requirement closes the original silent-skip seam."""
+        """A derived mapping-source requirement closes the original silent-skip seam.
+
+        The build did not prove the source (the proof entry is empty), so the
+        miss is a fact about the row: refused before process() and left to the
+        router (ADR-013 Amendment 2026-09-27), never a silent skip.
+        """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"tidy_output": frozenset()},
+        )
         transform = FieldMapper(
             {
                 "schema": {"mode": "observed"},
@@ -894,23 +953,28 @@ class TestTransformExecutor:
 
         with (
             patch.object(FieldMapper, "process", autospec=True) as process,
-            pytest.raises(DeclaredRequiredInputFieldsViolation, match=r"missing \['complementary_colour'\]"),
+            pytest.raises(DeclaredInputFieldAbsentViolation, match=r"\['complementary_colour'\]") as excinfo,
         ):
             executor.execute_transform(transform, token, ctx, attempt=0)
 
         process.assert_not_called()
-        factory.data_flow.record_token_outcome.assert_called_once()
-        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        assert kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert kwargs["path"] == TerminalPath.UNROUTED
-        assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
+        assert excinfo.value.to_transform_error_reason()["reason"] == "missing_field"
+        assert excinfo.value.to_transform_error_reason()["fields"] == ["complementary_colour"]
+        # Routed, so the router — not the executor — writes the token's one terminal outcome.
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_type_coerce_fixed_schema_accepts_pre_coercion_input_and_succeeds(self) -> None:
         """TypeCoerce must validate input before coercion and output after coercion."""
         from elspeth.plugins.transforms.type_coerce import TypeCoerce
 
         factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"type_coerce_1": frozenset({"quantity"})},
+        )
         transform = TypeCoerce(
             {
                 "schema": {"mode": "fixed", "fields": ["quantity: str"]},
@@ -1597,7 +1661,13 @@ class TestTransformExecutor:
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"fm_select_only": frozenset({"a"})},
+        )
         transform = FieldMapper(
             {
                 "mapping": {"a": "tgt"},
@@ -1778,11 +1848,17 @@ class TestTransformExecutor:
             executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_field_mapper_mapping_source_is_dispatched_as_a_required_input(self) -> None:
-        """The executor enforces d4's derived source before non-strict process()."""
+        """The executor enforces d4's derived source before non-strict process(); an unproven miss routes."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         factory = _make_factory()
-        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            declared_input_proof={"fm_required_source": frozenset()},
+        )
         transform = FieldMapper(
             {
                 "mapping": {"maybe_field": "output"},
@@ -1815,7 +1891,7 @@ class TestTransformExecutor:
             locked=True,
         )
 
-        with pytest.raises(DeclaredRequiredInputFieldsViolation, match="maybe_field"):
+        with pytest.raises(DeclaredInputFieldAbsentViolation, match="maybe_field"):
             executor.execute_transform(
                 transform,
                 _make_token(

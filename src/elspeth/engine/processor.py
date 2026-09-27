@@ -223,6 +223,14 @@ class DAGTraversalContext:
     # closed at resolution instead of being skipped. Barrier nodes are
     # structural by definition and always unioned in.
     structural_node_ids: frozenset[NodeID] = frozenset()
+    # The build's declared-input proof (ExecutionGraph.get_declared_input_proof):
+    # node_id -> the declared input fields every arriving row provably carries.
+    # The transform preflight and the batch seams classify a declared-input
+    # miss by it (ADR-013 Amendment 2026-09-27). The empty default serves the
+    # hand-built contexts of tests whose nodes declare no input; a node that
+    # does declare one and has no entry is refused on its first row
+    # (OrchestrationInvariantError), never read as "proves nothing".
+    declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "node_step_map", deep_freeze(self.node_step_map))
@@ -232,6 +240,7 @@ class DAGTraversalContext:
         object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
         object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
         object.__setattr__(self, "collector_node_map", deep_freeze(self.collector_node_map))
+        object.__setattr__(self, "declared_input_proof", deep_freeze(self.declared_input_proof))
         object.__setattr__(
             self,
             "structural_node_ids",
@@ -712,6 +721,7 @@ class RowProcessor:
             error_edge_ids=error_edge_ids,
             data_flow=data_flow,
             before_terminal_audit=self._heartbeat_active_claim,
+            declared_input_proof=traversal.declared_input_proof,
         )
         self._gate_executor = GateExecutor(
             execution,

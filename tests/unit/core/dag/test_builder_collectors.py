@@ -106,6 +106,10 @@ class _BatchTransform:
     def carried_output_sources(self) -> dict[str, str]:
         return {}
 
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
+
     input_schema = None
     output_schema = None
     creates_tokens = False

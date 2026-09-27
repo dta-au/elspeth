@@ -227,4 +227,5 @@ def build_dag_traversal_context(
         row_union_node_map=graph.get_row_union_id_map(),
         collector_node_map=graph.get_collector_id_map(),
         structural_node_ids=structural_node_ids,
+        declared_input_proof=graph.get_declared_input_proof(),
     )

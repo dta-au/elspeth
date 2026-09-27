@@ -244,6 +244,19 @@ class NodeInfo:
     # that invariant at graph construction.
     declared_input_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Populated only for AGGREGATION and COLLECTOR nodes by the builder from
+    # BatchTransformProtocol.schema_required_input_fields() — the fields every
+    # BUFFERED row must carry, which validate_batch_inputs enforces before a
+    # batch plugin runs. The batch seam's counterpart of declared_input_fields
+    # above, kept separate because a batch plugin never declares
+    # declared_input_fields (_initialize_declared_input_fields refuses it) and
+    # the transform-only build REFUSAL does not apply to it. Its only consumer
+    # is the declared-input PROOF (schema_validation.compute_declared_input_proof):
+    # the build publishes which of these fields every arriving row provably
+    # carries, so a runtime miss can be classified the same way at both seams
+    # (ADR-013 Amendment 2026-09-27). Empty frozenset for every other node.
+    batch_required_input_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Populated only for TRANSFORM nodes by the builder from
     # TransformProtocol.declared_string_input_fields — the fields the transform
     # requires to be PRESENT and STRING-VALUED on every arriving row, failing
@@ -422,6 +435,16 @@ class NodeInfo:
                 f"NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_input_fields={sorted(self.declared_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the batch seam's presence requirement sits only
+        # on the two node kinds that run a batch plugin (NESTED_CONTRACT_OPTIONS_NODE_TYPES).
+        if self.batch_required_input_fields and self.node_type not in (NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.batch_required_input_fields is only meaningful for AGGREGATION and COLLECTOR nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with batch_required_input_fields={sorted(self.batch_required_input_fields)!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

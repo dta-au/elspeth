@@ -13,7 +13,7 @@ import hashlib
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
 from elspeth.contracts.enums import NodeType, OutputMode
@@ -54,9 +54,10 @@ from elspeth.core.dag.models import (
     _GateEntry,
     _suggest_similar,
 )
+from elspeth.core.dag.schema_validation import compute_declared_input_proof
 
 if TYPE_CHECKING:
-    from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts import BatchTransformProtocol, SinkProtocol, SourceProtocol, TransformProtocol
     from elspeth.contracts.schema_contract import OutputFieldDeclaration
     from elspeth.core.config import (
         AggregationSettings,
@@ -615,6 +616,8 @@ def build_execution_graph(
             input_schema=transform.input_schema,
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
+            # The runtime factory admits only batch-aware plugins as aggregations.
+            batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
             declared_read_fields=transform.declared_read_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
@@ -908,6 +911,8 @@ def build_execution_graph(
                 input_schema=transform.input_schema,
                 output_schema=transform.output_schema,
                 output_schema_config=collector_output_schema_config,
+                # The runtime factory admits only batch-aware plugins as collectors.
+                batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
                 declared_read_fields=transform.declared_read_fields,
                 passes_through_input=transform.passes_through_input,
                 forwards_input_fields=transform.forwards_input_fields,
@@ -2210,6 +2215,12 @@ def build_execution_graph(
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
+
+    # The declared-input proof reads the FINAL topology: the rule-9 DIVERT
+    # edges above change what a closer's vote (and so its successors' proofs)
+    # may claim, and the runtime classifies a declared-input miss by exactly
+    # this map (ADR-013 Amendment 2026-09-27).
+    graph.set_declared_input_proof(compute_declared_input_proof(graph))
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)
