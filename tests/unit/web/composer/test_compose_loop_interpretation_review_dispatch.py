@@ -54,16 +54,16 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
-from elspeth.web.composer.service import (
-    AdvisorCheckpointVerdict,
-    ComposerAvailability,
-    ComposerServiceImpl,
-    _pending_interpretation_review_repair_message,
-)
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM
 from elspeth.web.composer.state import (
     CompositionState,
@@ -221,8 +221,8 @@ class _ScriptedLLM:
         self.messages.append(_messages)
         self.tools.append(_tools)
         if not self._responses:
-            return _fake_text_response("Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_text_response("Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 @dataclass(frozen=True)
@@ -641,10 +641,10 @@ def _force_composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep tests independent of local API keys — same pattern as the wider
     composer test suite (conftest.py ``_composer_available_for_phase3``)."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="anthropic")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="anthropic")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _build_composer(
@@ -775,8 +775,8 @@ def test_composer_runtime_preflight_uses_backend_readiness_contract(
     state = _state_with_llm_node()
     expected = ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
 
-    with patch("elspeth.web.composer.service.validate_pipeline", return_value=expected) as validate:
-        result = composer._runtime_preflight(state, user_id="alice", session_id=None)
+    with patch("elspeth.web.composer.composer_preflight.validate_pipeline", return_value=expected) as validate:
+        result = composer._preflight.runtime_preflight(state, user_id="alice", session_id=None)
 
     assert result is expected
     validate.assert_called_once()
@@ -1032,7 +1032,7 @@ async def test_request_interpretation_review_result_uses_profile_aware_validatio
     )
 
     with patch(
-        "elspeth.web.composer.service.normalize_tool_result_validation",
+        "elspeth.web.composer.session_tool.normalize_tool_result_validation",
         wraps=normalize_tool_result_validation,
     ) as normalize:
         result = await composer._run_one_turn_for_test(
@@ -1404,13 +1404,13 @@ async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_tur
     repair gate as the no-tool completion claim: masked failures spend the
     shared repair budget BEFORE the handoff may complete.
     """
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
 
     composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
     session_id = await _seed_bare_session(sessions_service, "Staged review spends a repair turn")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_valid()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
 
     sink_dir = tmp_path / "outputs" / str(session_id)
     llm = _ScriptedLLM(
@@ -1484,13 +1484,13 @@ async def test_staged_review_over_unwired_draft_adds_only_reply_turn(
     elspeth-e6ff1b8c13 fixed. Wiredness (sources AND outputs) is the
     applicability axis, the same one the cross-turn arm uses.
     """
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
 
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Unwired draft keeps the handoff")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
 
     llm = _ScriptedLLM(
         [
@@ -1539,14 +1539,15 @@ async def test_staged_review_with_spent_budget_withholds_cards_for_invalid_graph
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A spent repair budget cannot turn a broken graph into review cards."""
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
+    from elspeth.web.composer import composition_completion as completion_module
 
     composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
     session_id = await _seed_bare_session(sessions_service, "Spent budget completes qualified")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_structural_failure()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
-    monkeypatch.setattr(service_module, "_MAX_REPAIR_TURNS", 0)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
+    monkeypatch.setattr(completion_module, "_MAX_REPAIR_TURNS", 0)
 
     llm = _ScriptedLLM(_staged_review_script_prefix(sink_path=str(tmp_path / "outputs" / str(session_id) / "output.csv")))
 
@@ -1872,7 +1873,7 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     and ``affected_nodes`` must exclude source sites (mirroring the runtime
     preflight's ``InterpretationReviewPending`` handling).
     """
-    from elspeth.web.composer.service import _orphaned_interpretation_review_validation
+    from elspeth.web.composer.composition_completion import _orphaned_interpretation_review_validation
 
     result = _orphaned_interpretation_review_validation(
         (
@@ -1924,7 +1925,7 @@ async def test_prompt_template_review_event_does_not_trigger_vague_term_repair(
         composer_skill_hash="a" * 64,
     )
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -1955,7 +1956,7 @@ async def test_missing_prompt_template_review_event_reported_by_orphan_gate(
     state = _state_with_prompt_template_review_node()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -1981,7 +1982,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -1998,7 +1999,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
 
     # Idempotent: a second call must not create a duplicate.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -2032,7 +2033,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -2042,7 +2043,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -2373,7 +2374,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     session_id, state_id_a = await _seed_session_and_state(sessions_service, state=state_a)
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_id_a),
@@ -2438,7 +2439,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     )
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(record_b.id),
@@ -2510,7 +2511,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
     state_a = _state_with_parts([{"kind": "text", "text": prompt}])
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_a_id),
@@ -2537,7 +2538,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
         provenance="tool_call",
     )
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(state_b_record.id),
@@ -2613,7 +2614,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
     state_a = _state("original reason")
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_a_id),
@@ -2634,7 +2635,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
         provenance="tool_call",
     )
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(state_b_record.id),
@@ -2679,7 +2680,7 @@ def test_has_pending_prompt_template_requirement_false_on_duplicate() -> None:
     }
 
     assert (
-        ComposerServiceImpl._has_pending_prompt_template_requirement(
+        _has_pending_prompt_template_requirement(
             options,
             user_term="llm_prompt_template:rate_node",
         )
@@ -2696,7 +2697,7 @@ def test_has_pending_prompt_template_requirement_rejects_malformed_present_requi
     }
 
     with pytest.raises(InvariantError, match="user_term"):
-        ComposerServiceImpl._has_pending_prompt_template_requirement(
+        _has_pending_prompt_template_requirement(
             options,
             user_term="llm_prompt_template:rate_node",
         )
@@ -2713,7 +2714,7 @@ async def test_missing_invented_source_review_event_forces_review_tool_retry(
     state = _state_with_source_review()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -2732,7 +2733,7 @@ async def test_missing_pipeline_decision_review_event_forces_review_tool_retry(
     state = _state_with_pipeline_decision_review()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -2767,7 +2768,7 @@ async def test_unreviewed_raw_html_cleanup_forces_pipeline_decision_staging_retr
     state = _state_with_unreviewed_raw_html_cleanup()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -3261,10 +3262,10 @@ async def test_f6_rate_cap_branch_emits_telemetry_and_writes_audit_row(
        template).
     """
     composer = _build_composer(tmp_path, sessions_service)
-    # Swap in a fresh telemetry container so we can inspect the
-    # interpretation_rate_cap_exceeded_total counter cleanly.
+    # Replace the counter on the actual session-tool owner. The composition
+    # root supplies an OTel counter, which observed_value cannot inspect.
     telemetry = build_sessions_telemetry()
-    composer._telemetry = telemetry  # type: ignore[attr-defined]
+    composer._session_tools._telemetry = telemetry
 
     # Multi-node state — the rate cap is keyed on ``user_term``, NOT
     # ``affected_node_id``. Three distinct sites all reference the same
@@ -3556,20 +3557,20 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
     # Half (1) — the masking site is REAL for this state (and is PT-kind).
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert any(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
     # Per-instance assertable advisor stub (instance attr wins over the autouse
     # class-level CLEAN stub) so we can assert it was awaited.
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3579,7 +3580,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3616,18 +3617,18 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
 
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     class _AssistantMessage:
         content = "Done — the pipeline is ready for review."
 
     llm_messages: list[dict[str, Any]] = []
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="Select the colour column.",
             llm_messages=llm_messages,
@@ -3637,7 +3638,7 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3672,7 +3673,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the source contract")
     )
 
@@ -3680,7 +3681,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
         content = "Done — the pipeline is ready for review."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="Select the colour column.",
             llm_messages=[],
@@ -3690,7 +3691,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3742,12 +3743,12 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
 
     # Half (1) — the masking site is REAL for this state (and is PT-kind), with
     # no genuine non-PT orphan to legitimately suppress the advisor.
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     llm = _ScriptedLLM(
         [
@@ -3824,7 +3825,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
     # Force the blocked-return branch (ok=False == unavailable). Instance attr
     # wins over the autouse class-level CLEAN stub.
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
@@ -3832,7 +3833,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3842,7 +3843,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3870,7 +3871,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
     # The PT site is now resolvable (a pending event matches it), so the orphan
     # gate sees no orphan for it.
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -3909,7 +3910,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the prompt")
     )
 
@@ -3917,7 +3918,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3927,7 +3928,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3975,12 +3976,12 @@ async def test_p5_budget_exhaustion_advisor_blocked_return_surfaces_prompt_templ
     # orphan that would legitimately suppress the END advisor), so genuine_orphans
     # is empty and the P5 END gate fires (see the CLEAN counterpart
     # test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion).
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites and all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
     # Force the P5 blocked-return branch (ok=False == unavailable -> fail closed).
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     # set_metadata (not set_pipeline) so the model-less PT node is not
     # re-canonicalized; the single mutation exhausts max_composition_turns=1 ->
@@ -4038,7 +4039,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
     state = _state_with_llm_node()  # bare {{interpretation:cool}}, no PT requirement, no event
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
@@ -4046,7 +4047,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -4056,7 +4057,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -4103,7 +4104,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
     assert await sessions_service.list_interpretation_events(session_id, status="all") == []
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4115,7 +4116,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
 
     # Idempotent while the card is live: a second validate adds nothing.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4134,7 +4135,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
 
     # Repair mode honours evidence in ANY status: no resurrection after resolve.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4179,7 +4180,7 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
     async with acquire_compose_context(sessions_service, session_id) as compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4196,7 +4197,7 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
         log=structlog.get_logger("test.sessions.reading"),
         session_operation_authority=authority,
     )
-    await _build_composer(tmp_path, reading_service).surface_pending_interpretation_reviews(
+    await _build_composer(tmp_path, reading_service)._interpretation_surfacing.surface_pending_interpretation_reviews(
         state,
         session_id=str(session_id),
         current_state_id=str(state_id),
@@ -4456,7 +4457,7 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
             return await original_classify(**kwargs)
 
         monkeypatch.setattr(composer, "_classify_and_budget_turn", classify_with_prior)
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the interpretation before completion")
     )
     session_id = uuid4()
@@ -4551,6 +4552,9 @@ async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_f
             persisted_assistant_matches_current_dispatch=False,
             unwind_audit_failed=False,
             failed_turn=None,
+            redacted_assistant_tool_calls=(),
+            redacted_tool_rows=(),
+            audit_outcome=None,
         )
 
     composer._persist_turn_audit = _drop_second_persist  # type: ignore[method-assign]
@@ -4603,13 +4607,13 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Bounded review reply")
     recorded: list[BufferingRecorder] = []
-    original_audited_call = composer._call_llm_with_audit
+    original_audited_call = composer._provider_gateway._call_llm_with_audit
 
     async def capture_audit(*args: Any, **kwargs: Any) -> Any:
         recorded.append(kwargs["recorder"])
         return await original_audited_call(*args, **kwargs)
 
-    monkeypatch.setattr(composer, "_call_llm_with_audit", capture_audit)
+    monkeypatch.setattr(composer._provider_gateway, "_call_llm_with_audit", capture_audit)
     if mode == "expired":
         original_classify = composer._classify_and_budget_turn
 
@@ -4653,8 +4657,10 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
         if mode == "cancel":
             raise asyncio.CancelledError
         if mode == "tools":
-            return _fake_response_with_tool_call(tool_call_id="forbidden", tool_name="set_pipeline", arguments={})
-        return _fake_text_response("A fork preserves both answers." if mode == "text" else "  ")
+            return _admit_composer_llm_completion(
+                _fake_response_with_tool_call(tool_call_id="forbidden", tool_name="set_pipeline", arguments={})
+            )
+        return _admit_composer_llm_completion(_fake_text_response("A fork preserves both answers." if mode == "text" else "  "))
 
     if mode == "cancel":
         with pytest.raises(asyncio.CancelledError):
@@ -4694,8 +4700,6 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
 
     import litellm
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
-
-    from elspeth.web.composer import service as service_module
 
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Portable reply history")
@@ -4738,7 +4742,7 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
 
     async def installed_adapter_completion(**kwargs: Any) -> Any:
         if "tools" in kwargs:
-            return await scripted(kwargs["messages"], kwargs["tools"])
+            return scripted._responses.pop(0)
         reply_wire.extend(deepcopy(kwargs["messages"]))
         wire = adapter.transform_request(
             model=model,
@@ -4755,7 +4759,7 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
                 assert "toolResult" not in block
         return _fake_text_response("A fork keeps both persona answers.")
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", installed_adapter_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", installed_adapter_completion)
     result = await composer._run_one_turn_for_test(session_id=str(session_id), message="Should we use a fork?")
     assert result.raw_assistant_content == "A fork keeps both persona answers."
     assert len(histories) == 2

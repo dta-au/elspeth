@@ -33,8 +33,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import advisor_audit, no_tool_policy
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_audit import ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND, AdvisorTerminalPublication
+from elspeth.web.composer.composition_completion import _replace_advisor_repair_public_result
 from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.service import _replace_advisor_repair_public_result
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -73,6 +73,8 @@ def _fenced_session(service: Any) -> tuple[str, SessionOperationContext]:
         service._sessions_service = MagicMock(
             spec=SessionServiceProtocol, add_message=AsyncMock(spec=SessionServiceProtocol.add_message, return_value=None)
         )
+        service._advisor_checkpoint._sessions_service = service._sessions_service
+        service._completion._sessions_service = service._sessions_service
     session_id = str(uuid.uuid4())
     context = SessionOperationContext(
         fence=SessionOperationFence(
@@ -226,12 +228,12 @@ class TestQualifiedReplacerPersistsThePublication:
         mirrored: list[dict[str, Any]] = []
         monkeypatch.setattr(advisor_audit, "record_advisor_terminal_publication", lambda **kw: mirrored.append(kw))
 
-        published = await service._qualified_advisor_repair_public_result(
+        published = await service._completion._qualified_advisor_repair_public_result(
             ComposerResult(message="prose", state=_empty_state(), runtime_preflight=_valid_result()),
             user_id="alice",
             session_id=session_id,
             session_operation_context=context,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=0,
             session_scope="s1",
         )
@@ -249,12 +251,12 @@ class TestQualifiedReplacerPersistsThePublication:
         monkeypatch.setattr(advisor_audit, "record_advisor_terminal_publication", lambda **kw: mirrored.append(kw))
         blocked = _blocked_terminal(service, runtime_preflight=None)
 
-        published = await service._qualified_advisor_repair_public_result(
+        published = await service._completion._qualified_advisor_repair_public_result(
             blocked,
             user_id="alice",
             session_id=session_id,
             session_operation_context=context,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=0,
             session_scope="s1",
         )
@@ -268,12 +270,12 @@ class TestQualifiedReplacerPersistsThePublication:
         service = _service()
         session_id, _context = _fenced_session(service)
         with pytest.raises(TypeError, match="requires the turn's session_operation_context"):
-            await service._qualified_advisor_repair_public_result(
+            await service._completion._qualified_advisor_repair_public_result(
                 ComposerResult(message="prose", state=_empty_state(), runtime_preflight=_valid_result()),
                 user_id="alice",
                 session_id=session_id,
                 session_operation_context=None,
-                cache=service._new_runtime_preflight_cache(),
+                cache=service._preflight.new_cache(),
                 initial_version=0,
                 session_scope="s1",
             )
@@ -287,7 +289,7 @@ def _blocked_terminal(
     findings_backend_authored: bool = False,
     reason: str = "flagged_final_pass",
 ) -> Any:
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
     from elspeth.web.composer.tool_batch import BufferingRecorder
 
     # The verdict shape must match the reason the way the gate produces it:
@@ -308,7 +310,7 @@ def _blocked_terminal(
             findings_text="FLAGGED: still wrong",
             findings_backend_authored=findings_backend_authored,
         )
-    return service._advisor_blocked_result(
+    return service._advisor_checkpoint._advisor_blocked_result(
         reason=reason,
         verdict=verdict,
         state=_empty_state(),

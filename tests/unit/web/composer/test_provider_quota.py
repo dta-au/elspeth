@@ -22,8 +22,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import composer_quota_scope, quota_provider_calls
-from elspeth.web.composer.service import _litellm_acompletion
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageSource
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service

@@ -49,8 +49,8 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
-from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -3086,7 +3086,6 @@ async def post_guided_respond(
     _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
 
     service: SessionServiceProtocol = request.app.state.session_service
-    composer = request.app.state.composer_service
     payload_store = request.app.state.payload_store
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     rate_limiter = await get_rate_limiter(request)
@@ -3180,7 +3179,7 @@ async def post_guided_respond(
         ):
             raise AuditIntegrityError("Guided RESPOND replay result proposal has incomplete composer provenance")
         record = await service.get_state_in_session(result.state_id, session_id)
-        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
         from elspeth.web.coordination.contracts import SessionOperationKind
         from elspeth.web.coordination.lifecycle import SessionOperationLease
 
@@ -4340,7 +4339,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=planner_current_state,
                                 guided=planning_guided,
@@ -4836,7 +4835,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=body.correction_feedback,
                                 current_state=predecessor_candidate,
                                 guided=planning_guided,
@@ -5279,7 +5278,7 @@ async def post_guided_respond(
                         # deferred cancellation: the settlement is durable, and
                         # skipping here would orphan the session in exactly the
                         # failure this pass exists to prevent.
-                        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+                        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
                         planner_row = authority.row
                         if (
@@ -5517,7 +5516,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=state,
                                 guided=resulting_guided,

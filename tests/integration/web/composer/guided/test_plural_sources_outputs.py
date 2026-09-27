@@ -588,7 +588,7 @@ def test_invalid_component_action_is_atomic_before_provider(
     async def forbidden_provider(**_kwargs: object) -> object:
         raise AssertionError("invalid component action reached planner provider")
 
-    monkeypatch.setattr(client.app.state.composer_service, "plan_guided_pipeline", forbidden_provider)
+    monkeypatch.setattr(client.app.state.planning_application, "plan_guided_pipeline", forbidden_provider)
     response = client.post(
         f"/api/sessions/{session_id}/guided/respond",
         json={

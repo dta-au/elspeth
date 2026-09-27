@@ -35,6 +35,7 @@ import rfc8785
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -42,7 +43,8 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ToolArgumentError,
 )
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -150,7 +152,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[_FakeToolCall] | None = None
     if tool_calls:
         fake_tool_calls = [
@@ -163,17 +165,19 @@ def _make_llm_response(
             )
             for tc in tool_calls
         ]
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    )
 
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Skip the boot-time API key check — these tests target compose behavior."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +267,7 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     recorder = BufferingRecorder()
     with (
         patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[
@@ -412,7 +416,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
             captured_recorder["instance"] = self
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=AssertionError("Tier-1 invariant breach"),
@@ -509,8 +513,8 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             return_value=bad_result,
@@ -567,14 +571,14 @@ async def test_timeout_after_successful_tool_carries_audit_invocations() -> None
 
     calls = {"count": 0}
 
-    async def first_tool_then_timeout_llm(*_args: Any, **_kwargs: Any) -> _FakeLLMResponse:
+    async def first_tool_then_timeout_llm(*_args: Any, **_kwargs: Any) -> _AdmittedLLMCompletion:
         calls["count"] += 1
         if calls["count"] == 1:
             return turn
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=first_tool_then_timeout_llm),
+        patch.object(service._provider_gateway, "_call_llm", new=first_tool_then_timeout_llm),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             return_value=success_result,
@@ -619,8 +623,8 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", side_effect=RuntimeError("synthetic runtime preflight bug")),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", side_effect=RuntimeError("synthetic runtime preflight bug")),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
@@ -693,8 +697,8 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_tolerant_crash),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", side_effect=strict_handoff_tolerant_crash),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
@@ -777,8 +781,8 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=tool_turn_then_timeout),
-        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_or_tolerant),
+        patch.object(service._provider_gateway, "_call_llm", new=tool_turn_then_timeout),
+        patch.object(service._preflight, "runtime_preflight", side_effect=strict_handoff_or_tolerant),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             wraps=_strict_execute_tool,
@@ -858,7 +862,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
             captured_recorder["instance"] = self
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=asyncio.CancelledError("raw cancellation detail must not persist"),
@@ -912,8 +916,8 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
@@ -956,8 +960,8 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
@@ -1093,8 +1097,8 @@ class TestComposerDiscoveryAuditPreservesResult:
         passing_preflight = _passing_preflight()
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_strict_execute_tool,
@@ -1164,8 +1168,8 @@ class TestComposerDiscoveryAuditPreservesResult:
         passing_preflight = _passing_preflight()
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_strict_execute_tool,

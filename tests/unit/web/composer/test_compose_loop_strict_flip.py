@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
 from elspeth.web.composer.guided.protocol import GuidedStep
@@ -63,15 +64,15 @@ _NONE = ToolContractDialect.NONE
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """The END advisor gate is not under test; make it a CLEAN no-op."""
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture(autouse=True)
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _settings(**overrides: Any) -> WebSettings:
@@ -223,7 +224,7 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
     for label, strict_setting in (("strict", "preferred"), ("off", "off")):
         settings = base_settings.model_copy(update={"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": strict_setting})
         service = ComposerServiceImpl.for_trained_operator(
-            composer_service_with_real_sessions._catalog, settings, sessions_service=sessions, session_engine=sessions._engine
+            _mock_catalog(), settings, sessions_service=sessions, session_engine=sessions._engine
         )
         requests: list[dict[str, Any]] = []
 
@@ -238,7 +239,7 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
 
         monkeypatch.setattr("litellm.acompletion", completion)
         with pytest.raises(PipelinePlannerError):
-            await service.plan_guided_pipeline(
+            await service._planning_application.plan_guided_pipeline(
                 session_operation_context=operation_context,
                 intent="Build the reviewed pipeline.",
                 current_state=_empty_state(),
@@ -272,7 +273,7 @@ def test_openai_strict_set_pipeline_keeps_the_envelope_and_an_explicit_strict_fa
 
     Control: stamp every tool ``strict: true`` in ``wire_tool_definitions`` and this goes red.
     """
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     none_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_NONE)}
     strict_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_STRICT)}
@@ -288,7 +289,7 @@ def test_openai_strict_list_keeps_registry_order_and_cache_marker_placement() ->
     D8 means no production route carries both; this pins the function only.
     """
     from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
     from elspeth.web.composer.tools import get_tool_definitions
 
     tools = composer_loop_tool_definitions(_STRICT)

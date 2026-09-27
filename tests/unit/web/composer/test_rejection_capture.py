@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy import text
 
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
@@ -75,11 +76,15 @@ def _mutation_response(call_id: str) -> Any:
             arguments=json.dumps({"patch": {"name": "Rated leads"}}),
         ),
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    )
 
 
 def _text_response(content: str) -> Any:
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    )
 
 
 async def _run_one_turn(service: ComposerServiceImpl, *, llm: Any, session_id: str) -> Any:

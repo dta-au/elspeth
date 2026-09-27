@@ -6,8 +6,8 @@ import json
 
 import pytest
 
+from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
 from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL
-from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
 
 
 @pytest.mark.parametrize("findings", ["", "Intent satisfied, contracts consistent.", "The CLEAN token is ordinary text here."])

@@ -408,8 +408,8 @@ def test_restore_of_empty_projected_coalesce_map_is_an_empty_map() -> None:
 
 
 def test_runtime_preflight_key_differs_for_coalesce_reorder(fake_composer_service: ComposerServiceImpl) -> None:
-    abc = fake_composer_service._runtime_preflight_key(_state(("a", "b", "c")), session_scope="s", plugin_snapshot=None)
-    acb = fake_composer_service._runtime_preflight_key(_state(("a", "c", "b")), session_scope="s", plugin_snapshot=None)
+    abc = fake_composer_service._preflight.key(_state(("a", "b", "c")), session_scope="s", plugin_snapshot=None)
+    acb = fake_composer_service._preflight.key(_state(("a", "c", "b")), session_scope="s", plugin_snapshot=None)
     assert abc.state_version == acb.state_version
     assert abc.state_content_hash != acb.state_content_hash
     assert abc != acb

@@ -18,7 +18,7 @@ async def run(output: Path, model: str) -> dict[str, Any]:
     import litellm
 
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
     from elspeth.web.composer.tools._dispatch import get_tool_definitions
     from elspeth.web.composer.tools.wire_projection import (
         decode_wire_arguments,

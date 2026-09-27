@@ -21,6 +21,7 @@ from elspeth.contracts.chargeable_admission import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer import provider_gateway
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.telemetry import _FakeCounter
@@ -146,7 +147,7 @@ async def _run_auto_title(monkeypatch, response: object) -> tuple[_TitleService,
     async def _canned(**_kwargs: object) -> object:
         return response
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _canned)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _canned)
     service = _TitleService()
     session_id = uuid4()
     await _auto_title.maybe_auto_title_session(
@@ -350,7 +351,7 @@ async def test_auto_title_outbound_call_redacts_fences_and_truncates(monkeypatch
         captured.update(kwargs)
         return _completion("Useful Pipeline")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _capture)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _capture)
     service = _TitleService()
     secret = "AKIA" + "A" * 16
     session_id = uuid4()
@@ -401,7 +402,7 @@ async def test_auto_title_threads_exact_compose_context_to_title_write(monkeypat
     async def _successful_completion(**_kwargs: object) -> object:
         return _completion("Fenced title")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _successful_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _successful_completion)
 
     await _auto_title.maybe_auto_title_session(
         service=_FencedTitleService(),  # type: ignore[arg-type]
@@ -424,7 +425,7 @@ async def test_auto_title_timeout_records_telemetry_and_returns(monkeypatch) -> 
     async def _raise_timeout(**_kwargs: object) -> object:
         raise TimeoutError("title generation timed out")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _raise_timeout)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_timeout)
     service = _TitleService()
 
     await _auto_title.maybe_auto_title_session(
@@ -449,7 +450,7 @@ async def test_auto_title_malformed_provider_response_records_telemetry_and_retu
     async def _malformed_response(**_kwargs: object) -> object:
         return ModelResponse(choices=[])
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _malformed_response)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _malformed_response)
     service = _TitleService()
 
     await _auto_title.maybe_auto_title_session(
@@ -474,7 +475,7 @@ async def test_auto_title_null_provider_content_is_an_explicit_no_title(monkeypa
     async def _null_content(**_kwargs: object) -> object:
         return _completion(None)
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _null_content)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _null_content)
     service = _TitleService()
 
     await _auto_title.maybe_auto_title_session(
@@ -499,7 +500,7 @@ async def test_auto_title_rejects_non_string_provider_content(monkeypatch) -> No
     async def _wrong_content_type(**_kwargs: object) -> object:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=7))])
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _wrong_content_type)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _wrong_content_type)
     service = _TitleService()
 
     await _auto_title.maybe_auto_title_session(
@@ -524,7 +525,7 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
     async def _raise_programmer_error(**_kwargs: object) -> object:
         raise TypeError("signature drift")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _raise_programmer_error)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_programmer_error)
 
     service = _TitleService()
     with pytest.raises(TypeError, match="signature drift"):
@@ -555,7 +556,7 @@ async def test_auto_title_raw_transport_failure_settles_without_replacing_defaul
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
     service = _TitleService()
     await _auto_title.maybe_auto_title_session(
         service=service,
@@ -588,7 +589,7 @@ async def test_auto_title_first_party_http_error_after_response_is_not_provider_
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", response_from_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", response_from_provider)
     service = _TitleService()
     with pytest.raises(httpx.ConnectError, match="local adapter bug"):
         await _auto_title.maybe_auto_title_session(
@@ -615,7 +616,7 @@ async def test_auto_title_provider_failure_does_not_hide_failed_terminal_settlem
         ) -> None:
             raise RuntimeError("ledger unavailable")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
     service = _FailingSettlementService()
     with pytest.raises(AuditIntegrityError, match="could not be settled"):
         await _auto_title.maybe_auto_title_session(
@@ -650,7 +651,7 @@ async def test_auto_title_title_write_failure_propagates(monkeypatch, error_type
             del session_id, title, session_operation_context
             raise error_type("database unavailable")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _completion_response)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _completion_response)
 
     with pytest.raises(error_type, match="database unavailable"):
         await _auto_title.maybe_auto_title_session(
@@ -675,7 +676,7 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
     async def cancelled_provider(**kwargs: object) -> object:
         raise cancellation
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
     with pytest.raises(asyncio.CancelledError) as caught:
         await _auto_title.maybe_auto_title_session(
             service=_TitleService(),
@@ -708,7 +709,7 @@ async def test_auto_title_repeated_cancellation_finishes_settlement_and_preserve
             await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
 
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
     service = _BlockingSettlementService()
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
@@ -751,7 +752,7 @@ async def test_auto_title_provider_cancellation_preserves_failure_priority_durin
             await release_settlement.wait()
             raise settlement_failure
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
     service = _FailingSettlementService()
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
@@ -793,7 +794,7 @@ async def test_auto_title_child_settlement_self_cancellation_fails_closed(monkey
         ) -> None:
             raise asyncio.CancelledError("settlement stopped itself")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
     service = _SelfCancellingSettlementService()
     with pytest.raises(AuditIntegrityError, match="settlement was cancelled") as caught:
         await _auto_title.maybe_auto_title_session(
@@ -826,7 +827,7 @@ async def test_auto_title_cancellation_during_success_settlement_finishes_accoun
             await release_settlement.wait()
             await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", successful_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", successful_provider)
     service = _BlockingSettlementService()
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
@@ -886,7 +887,7 @@ async def test_auto_title_cancellation_during_admission_closes_undispatched_atte
             await release_closure.wait()
             self.cancelled_attempts.append(attempt_id)
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
     service = _BlockingAdmissionService()
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
@@ -944,7 +945,7 @@ async def test_auto_title_cancellation_wins_over_concurrent_admission_refusal(mo
                 )
             )
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
             service=_BlockingRefusalService(),
@@ -1027,7 +1028,7 @@ async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) ->
         raise TimeoutError("title generation timed out")
 
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _raise_timeout)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_timeout)
     service = _TitleService()
     await _auto_title.maybe_auto_title_session(
         service=service,
@@ -1067,7 +1068,7 @@ async def test_auto_title_gateway_failure_settles_unknown_usage_without_title(mo
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
     service = _TitleService()
     await _auto_title.maybe_auto_title_session(
         service=service,

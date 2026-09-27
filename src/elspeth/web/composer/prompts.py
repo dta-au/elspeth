@@ -110,7 +110,7 @@ def build_system_prompt(data_dir: str | None = None) -> str:
 #
 # ``build_context_string`` / ``build_messages`` advertise a
 # ``schemas_loaded`` kwarg whose production source is
-# ``ComposerServiceImpl._schemas_loaded_for_session`` — the per-session
+# ``SchemaDisclosureTracker.schemas_loaded_for_session`` — the per-session
 # tracker of which ``get_plugin_schema`` calls have already succeeded. If
 # the service ever stops threading that tracker (refactor regression,
 # missed call site, accidental removal of the kwarg), the prompt would
@@ -373,7 +373,7 @@ def build_context_string(
         schemas_loaded: Per-session set of ``(kind, plugin_name)`` pairs
             for which ``get_plugin_schema`` has returned successfully in
             this session. Sourced from
-            ``ComposerServiceImpl._schemas_loaded_for_session``. Surfaces
+            ``SchemaDisclosureTracker.schemas_loaded_for_session``. Surfaces
             in ``composer_progress`` as
             ``schemas_loaded_this_session`` (sorted list of
             ``"<kind>/<plugin>"``). These are historical identities, not
@@ -552,7 +552,7 @@ def build_messages(
         schemas_loaded: Forwarded verbatim to ``build_context_string``.
             Defaults to the ``_SCHEMAS_LOADED_UNSET`` sentinel; the
             production caller (``ComposerServiceImpl._build_messages``)
-            always threads ``_schemas_loaded_for_session(session_id)``
+            always threads ``schemas_loaded_for_session(session_id)``
             (a real frozenset, possibly empty). Non-service callers
             wanting the "tracked, empty" reading must pass
             ``frozenset()`` explicitly.

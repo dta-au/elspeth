@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.web.composer.service import _backend_surface_args_for_site
+from elspeth.web.composer.interpretation_surfacing import _backend_surface_args_for_site
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,

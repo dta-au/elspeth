@@ -23,7 +23,8 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError
-from elspeth.web.composer.service import ComposerServiceImpl, _admit_composer_llm_completion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.dependencies import create_catalog_service
@@ -32,7 +33,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
 
 from .conftest import _fake_llm_response
-from .test_preview_policy_snapshot import _service
+from .test_preview_policy_snapshot import _registry, _service
 
 
 @pytest.mark.anyio
@@ -48,8 +49,14 @@ async def test_applied_mutation_is_audited_before_preflight(
 ) -> None:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    service = _service(tmp_path, snapshot)
-    service._sessions_service = composer_service_with_real_sessions._sessions_service
+    registry = _registry(tmp_path)
+    service = _service(
+        tmp_path,
+        snapshot,
+        catalog,
+        registry=registry,
+        sessions_service=composer_service_with_real_sessions._sessions_service,
+    )
     state = complaint_triage_state(pending=True)
     classifier = state.nodes[0]
     state = replace(
@@ -124,7 +131,7 @@ async def test_applied_mutation_is_audited_before_preflight(
             )
         return findings
 
-    monkeypatch.setattr(service, "_cached_runtime_preflight", preflight)
+    monkeypatch.setattr(service._preflight, "cached_runtime_preflight", preflight)
     completion = _admit_composer_llm_completion(
         _fake_llm_response(tool_calls=({"id": "mutation", "name": "set_metadata", "arguments": {"patch": {"name": "Complaint triage"}}},))
     )
@@ -158,7 +165,7 @@ async def test_applied_mutation_is_audited_before_preflight(
             failed_turn=failed_turn,
             cancellation_requested=asyncio.Event(),
             plugin_snapshot=snapshot,
-            policy_catalog=PolicyCatalogView(catalog, snapshot, service._operator_profile_registry),
+            policy_catalog=PolicyCatalogView(catalog, snapshot, registry),
             session_operation_context=SessionOperationContext(
                 SessionOperationFence(result_session_id, str(uuid4()), str(uuid4()), 1), SessionOperationKind.COMPOSE
             ),

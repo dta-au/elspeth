@@ -5,8 +5,7 @@ from fastapi import HTTPException
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-from elspeth.web.composer.protocol import ComposerServiceError
-from elspeth.web.composer.service import ComposerAdmissionRefused
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerServiceError
 from elspeth.web.sessions.protocol import GuidedOperationFailed, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.routes._helpers import (
     _FREEFORM_PLANNER_FAILURE_HTTP,

@@ -170,9 +170,6 @@ def test_lazy_freeform_composition_does_not_pass_a_guided_checkpoint(tmp_path, e
     session = client.post("/api/sessions", json={"title": "Freeform request"}).json()
     session_id = uuid.UUID(session["id"])
     composer = MagicMock(spec=ComposerService)
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
-    )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
         return_value=ComposerResult(

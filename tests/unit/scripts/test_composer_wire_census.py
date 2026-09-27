@@ -122,6 +122,33 @@ def test_live_catalog_includes_zero_knob_tools_and_absence() -> None:
     assert rows["validate_secret_ref"].model_class is not None
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "ctx.service._validate_advisor_arguments(arguments)",
+        "ctx.advisor_checkpoint._validate_advisor_arguments({'trigger': arguments['trigger']})",
+    ],
+)
+def test_advisor_interception_requires_owned_receiver_and_complete_arguments(monkeypatch: pytest.MonkeyPatch, replacement: str) -> None:
+    from scripts.cicd import composer_wire_census as census
+
+    from elspeth.web.composer.tool_batch import run_tool_batch
+
+    getsource = census.inspect.getsource
+    source = getsource(run_tool_batch)
+    original_call = "ctx.advisor_checkpoint._validate_advisor_arguments(arguments)"
+    assert source.count(original_call) == 1
+
+    def mutated_source(function: object) -> str:
+        if function is run_tool_batch:
+            return source.replace(original_call, replacement)
+        return getsource(function)
+
+    monkeypatch.setattr(census.inspect, "getsource", mutated_source)
+    with pytest.raises(CensusError, match="advisor interception does not forward the complete decoded arguments"):
+        census._advisor_admission_handler()
+
+
 def test_module_qualified_model_receiver(module_factory: Callable[[str, str], ModuleType]) -> None:
     models = module_factory("census_models", "class Model(BaseModel):\n    wire: str\n")
     module = module_factory(

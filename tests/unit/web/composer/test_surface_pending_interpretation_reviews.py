@@ -25,7 +25,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord, InterpretationResolveError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -54,10 +54,10 @@ def sessions_service(engine) -> SessionServiceImpl:
 
 @pytest.fixture(autouse=True)
 def _force_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="anthropic")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="anthropic")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _composer(tmp_path, sessions_service) -> ComposerServiceImpl:
@@ -148,7 +148,7 @@ async def _surface(
         )
     )
     try:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -611,6 +611,47 @@ async def test_surfacer_surfaces_pipeline_decision(tmp_path, sessions_service) -
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.PIPELINE_DECISION in kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("writer_error_type", "propagates"),
+    [(InterpretationResolveError, False), (ValueError, True)],
+)
+async def test_pipeline_decision_surfacer_only_skips_expected_writer_refusal(
+    tmp_path,
+    sessions_service,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_error_type: type[ValueError],
+    propagates: bool,
+) -> None:
+    composer = _composer(tmp_path, sessions_service)
+    state = CompositionState(
+        source=None,
+        nodes=(_field_mapper_pipeline_decision_node(),),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    session_id, state_id = await _persist(sessions_service, state)
+    writer_error = writer_error_type("writer refusal")
+    calls = 0
+
+    async def fail_writer(**_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise writer_error
+
+    monkeypatch.setattr(sessions_service, "create_pending_interpretation_event", fail_writer)
+    if propagates:
+        with pytest.raises(ValueError) as raised:
+            await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
+        assert raised.value is writer_error
+    else:
+        await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
+    assert calls == 1
+    assert await sessions_service.list_interpretation_events(session_id, status="pending") == []
 
 
 @pytest.mark.asyncio

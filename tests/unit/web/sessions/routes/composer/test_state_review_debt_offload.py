@@ -35,7 +35,7 @@ from tests.unit.web.sessions.test_e2e_state_seed_route import _make_app, _ready_
 
 from elspeth.web.execution.schemas import ValidationResult
 
-_CHECK_TARGET = "elspeth.web.composer.service.unsurfaceable_pending_interpretation_review_sites"
+_CHECK_TARGET = "elspeth.web.composer.interpretation_surfacing.unsurfaceable_pending_interpretation_review_sites"
 _PREFLIGHT_TARGET = "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state"
 
 

@@ -44,7 +44,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import SessionOperationContext
@@ -337,7 +337,7 @@ def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
 def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
     batch_source = textwrap.dedent(inspect.getsource(tool_batch.run_tool_batch))
     assert "session_operation_context=ctx.session_operation_context" in batch_source
-    dispatch_source = textwrap.dedent(inspect.getsource(ComposerServiceImpl._dispatch_session_aware_tool))
+    dispatch_source = textwrap.dedent(inspect.getsource(SessionToolOwner._dispatch_session_aware_tool))
     assert "session_operation_context=session_operation_context" in dispatch_source
 
 

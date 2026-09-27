@@ -15,7 +15,7 @@ from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_planner
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import planning_application as planning_module
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.capability_skill import build_planner_capability_manifest
@@ -32,8 +32,8 @@ from elspeth.web.composer.pipeline_proposal import (
     PresentBase,
     composition_content_hash,
 )
+from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.composer.prompts import build_system_prompt
-from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
@@ -53,8 +53,8 @@ def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
     return manager
 
 
-def test_guided_full_is_an_explicit_composer_service_surface() -> None:
-    assert "plan_guided_full_pipeline" in ComposerService.__dict__
+def test_guided_full_is_an_explicit_planning_application_surface() -> None:
+    assert "plan_guided_full_pipeline" in PlanningApplication.__dict__
 
 
 def test_guided_full_controller_owns_no_topology_constructor() -> None:
@@ -69,16 +69,15 @@ async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert service_module.plan_pipeline is pipeline_planner.plan_pipeline
-    assert ComposerServiceImpl.plan_guided_full_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
-    assert ComposerServiceImpl.plan_guided_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
-    assert ComposerServiceImpl._plan_and_stage_empty_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
+    assert planning_module.plan_pipeline is pipeline_planner.plan_pipeline
+    assert PlanningApplication.plan_guided_full_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
+    assert PlanningApplication.plan_guided_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
+    assert PlanningApplication._plan_and_stage_empty_pipeline.__globals__["plan_pipeline"] is pipeline_planner.plan_pipeline
 
     app = composer_test_client.app
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(
             available=True,
             model="test/shared-planner",
             provider="test",
@@ -143,7 +142,7 @@ async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
             provider="test",
         )
 
-    monkeypatch.setattr(service_module, "plan_pipeline", fake_plan_pipeline)
+    monkeypatch.setattr(planning_module, "plan_pipeline", fake_plan_pipeline)
     operation_lease = await SessionOperationLease.acquire(
         app.state.session_service.session_operation_authority,
         session_id=session_id,
@@ -151,7 +150,7 @@ async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
         owner_instance_id=app.state.session_service.session_operation_owner_instance_id,
         lease_seconds=app.state.session_service.session_operation_lease_seconds,
     )
-    result, catalog_ids = await service.plan_guided_full_pipeline(
+    result, catalog_ids = await service._planning_application.plan_guided_full_pipeline(
         intent="Build a complete pipeline.",
         current_state=state,
         originating_message=PlannerOriginatingMessage(
@@ -190,7 +189,7 @@ async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     # elspeth-1e3ad83d89: guided-full MUST defer inline-custody finalization
     # into the atomic staging settlement — its originating chat message only
     # exists there, and finalizing mid-plan violates the blob lineage FK.
-    # This pins the real call site (service.py defer_finalize=True), which the
+    # This pins the real call site (planning_application.py defer_finalize=True), which the
     # custody integration tests cannot see because they fake the service.
     assert call["custody_config"].defer_finalize is True
 
@@ -236,7 +235,7 @@ def test_shared_candidate_finalizer_wires_named_llm_source_and_is_idempotent(
     llm_source_policy_manager: PluginManager,
 ) -> None:
     view, snapshot = _guardrail_profile_view(tmp_path)
-    finalize = service_module._required_controls_candidate_finalizer(
+    finalize = planning_module._required_controls_candidate_finalizer(
         policy_catalog=view,
         plugin_snapshot=snapshot,
     )

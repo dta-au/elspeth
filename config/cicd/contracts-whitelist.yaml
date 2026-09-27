@@ -833,7 +833,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tool_batch.py:run_tool_batch:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:tools (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._try_terminate_no_tools:llm_messages (list)"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._try_terminate_no_tools:llm_messages (list)"
   - "src/elspeth/web/composer/guided/chat_solver.py:_bounded_acompletion:kwargs"
 
   # Shared pipeline planner provider/tool wire shapes. These are ephemeral
@@ -960,8 +960,8 @@ allowed_dict_patterns:
   # _attempt_proof_repair appends a synthesised user-role message to the
   # OpenAI-format chat completion list. Each entry is the documented chat
   # message shape ({role, content, ...}) which is inherently dynamic.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_proof_repair:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_empty_state_uploaded_blob_repair:llm_messages (list)"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_proof_repair:llm_messages (list)"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_empty_state_uploaded_blob_repair:llm_messages (list)"
   # Deterministic advisor checkpoints (elspeth-dac6602a2b): the early/preflight
   # advisory passes append their guidance to the SAME OpenAI chat-completion
   # ``llm_messages`` list ({role, content, ...}) shared across the compose loop,
@@ -969,9 +969,9 @@ allowed_dict_patterns:
   # ``_build_checkpoint_arguments`` returns the checkpoint tool-call argument dict
   # (heterogeneous {phase, state-derived scalars}), not reducible to a TypedDict —
   # same rationale as ``_build_session_aware_kwargs:return`` below.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_preflight_repair:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._maybe_run_early_checkpoint:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_checkpoint_arguments:return"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_preflight_repair:llm_messages (list)"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._maybe_run_early_checkpoint:llm_messages (list)"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._build_checkpoint_arguments:return"
   # R2-F14 (elspeth-5403f346c0): the format-retry helper returns a COPY of that
   # same checkpoint-argument dict with the verdict-format re-prompt appended to
   # ``problem_summary``. Identical shape, identical rationale — it cannot be a
@@ -991,28 +991,28 @@ allowed_dict_patterns:
   # each handler in ``_SESSION_AWARE_TOOL_HANDLERS`` accepts a
   # heterogeneous kwarg set (state, service-method references, snapshot
   # scalars) that cannot be reduced to a single TypedDict.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._dispatch_session_aware_tool:arguments"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._dispatch_session_aware_tool:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_session_aware_kwargs:arguments"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_session_aware_kwargs:return"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._dispatch_session_aware_tool:arguments"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._dispatch_session_aware_tool:llm_messages (list)"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._build_session_aware_kwargs:arguments"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._build_session_aware_kwargs:return"
   # ``_apply_openrouter_app_identity`` mutates the LiteLLM ``acompletion``
   # kwargs in place to brand OpenRouter-routed composer calls as ELSPETH. The
   # kwargs are LiteLLM's open-ended completion surface (``acompletion(**kwargs:
   # Any)``) — the same untyped external-library boundary as the entries above —
   # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
-  - "src/elspeth/web/composer/service.py:_apply_openrouter_app_identity:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_app_identity:kwargs"
   # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
   # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
   # kwargs dict as the entry above, for the same reason: it is LiteLLM's
   # untyped external-library completion surface, not a contract this
   # codebase owns the shape of.
-  - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_endpoint_kwargs:kwargs"
   # ``_apply_openrouter_usage_accounting`` pins OpenRouter's usage-accounting
   # opt-in (elspeth-190a5c4668) on the same open-ended LiteLLM ``acompletion``
   # kwargs dict as the two entries above, for the same reason: it is LiteLLM's
   # untyped external-library completion surface, not a contract this codebase
   # owns the shape of.
-  - "src/elspeth/web/composer/service.py:_apply_openrouter_usage_accounting:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_usage_accounting:kwargs"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
@@ -1102,22 +1102,22 @@ allowed_dict_patterns:
   # LiteLLM message shape; persisted history remains nominally typed.
   - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
-  - "src/elspeth/web/composer/service.py:composer_loop_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.
   # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
-  - "src/elspeth/web/composer/service.py:build_composer_loop_request_kwargs:return"
+  - "src/elspeth/web/composer/provider_gateway.py:build_composer_loop_request_kwargs:return"
   - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
   - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:tools (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:tools (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:tools (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:tools (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:tools (list)"
   # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
   # payload; returns the admitted model or an owned AdvisorArgumentRejection.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._validate_advisor_arguments:arguments"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._validate_advisor_arguments:arguments"
   # elspeth-4e79436719 §Phase 3: Anthropic cache_control marker transform
   # operates on the same provider-call payload shape as the call sites above.
   # The `tools` parameter is typed `list | None`, so the contracts check
@@ -1141,7 +1141,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/audit.py:_public_llm_call_audit_payload:return"
   - "src/elspeth/web/composer/yaml_generator.py:_has_blob_binding:options"
   - "src/elspeth/web/composer/yaml_generator.py:_has_bind_source_mode:options"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._evaluate_terminal_no_tool_advisor_gate:llm_messages (list)"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._evaluate_terminal_no_tool_advisor_gate:llm_messages (list)"
   - "src/elspeth/web/composer/discovery_cache.py:make_cache_key:arguments"
   - "src/elspeth/web/sessions/fork_custody.py:_strip_guided_profile_in_meta:return"
   - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._secret_requirements:schema"

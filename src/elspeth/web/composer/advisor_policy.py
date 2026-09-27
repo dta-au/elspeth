@@ -1,15 +1,15 @@
 """Advisor verdict presentation and completion-readiness policy.
 
 This module builds closed, user-safe validation outcomes from admitted advisor
-decisions. Provider dispatch and durable checkpoint publication remain owned by
-the Composer service.
+decisions. Provider dispatch and durable checkpoint publication belong to the
+advisor checkpoint owner.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
@@ -28,6 +28,25 @@ _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_
 _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER = _no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
 _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE
 _advisor_signoff_pending_handoff_wording = _no_tool_policy.advisor_signoff_pending_handoff_wording
+
+
+def outstanding_findings_detail(outstanding_findings: ValidationResult | None) -> str | None:
+    """Leading objection from a red masked validation, or None for a pure handoff."""
+    if outstanding_findings is None:
+        return None
+    objection = _no_tool_policy.first_validation_objection(outstanding_findings)
+    return objection if objection else "run validation for details."
+
+
+def advisor_preflight_shape(runtime_result: ValidationResult | None) -> Literal["absent", "green", "pending_handoff", "red"]:
+    """Closed preflight-shape vocabulary for terminal-publication telemetry."""
+    if runtime_result is None:
+        return "absent"
+    if runtime_result.is_valid:
+        return "green"
+    if _no_tool_policy.is_pending_interpretation_handoff(runtime_result):
+        return "pending_handoff"
+    return "red"
 
 
 # END authoritative advisor gate. The synthetic ValidationResult builder is
@@ -105,7 +124,7 @@ def advisor_signoff_blocked_validation(
     """Build the fully-red shape for a RED runtime preflight.
 
     Returned (not raised) by the END authoritative advisor gate
-    (:meth:`ComposerServiceImpl._advisor_blocked_result`) when the advisor
+    (:meth:`AdvisorCheckpointOwner._advisor_blocked_result`) when the advisor
     A green build always takes :func:`advisor_signoff_pending_validation`,
     regardless of advisor reason: a FLAG is not evidence execution is unsafe.
     An ABSENT preflight takes :func:`advisor_signoff_unverified_validation`

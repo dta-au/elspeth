@@ -1564,12 +1564,12 @@ async def post_guided_chat_schema8(
                     # consumes it. Step 2's discovery loop is the sole
                     # consumer (run_guided_chat_provider_attempt passes it
                     # to resolve_step_2_sink_chat_with_auto_drop and
-                    # nowhere else), so binding the service attribute
+                    # nowhere else), so binding the tracker operation
                     # eagerly on every turn coupled steps 1/3/4 to a
                     # collaborator they never use.
                     mark_schema_loaded = (
                         functools.partial(
-                            request.app.state.composer_service._mark_plugin_schema_loaded,
+                            request.app.state.schema_disclosure.mark_plugin_schema_loaded,
                             str(session_id),
                         )
                         if frozen.guided.step is GuidedStep.STEP_2_SINK

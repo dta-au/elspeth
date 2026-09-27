@@ -17,8 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-from elspeth.web.composer.protocol import ComposerService
-from elspeth.web.composer.service import ComposerAdmissionRefused, ComposerServiceError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
 from tests.unit.web.sessions.test_routes import TestClient, _make_app
 
 _REFUSAL_TEXT = "Composer admission refused: identity_disabled."

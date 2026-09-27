@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.state import CompositionState
@@ -29,13 +30,13 @@ def service(tmp_path):
 
 async def _attempt(service, state: CompositionState, *, user_id="user-1", session_scope="session:one", snapshot=None):
     messages = []
-    fired = await service._attempt_preflight_repair(
+    fired = await service._completion._attempt_preflight_repair(
         state=state,
         llm_messages=messages,
         user_id=user_id,
         session_id=None,
         last_runtime_preflight=None,
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=state.version,
         session_scope=session_scope,
         recorder=SimpleNamespace(llm_calls=()),
@@ -49,7 +50,7 @@ async def _attempt(service, state: CompositionState, *, user_id="user-1", sessio
 @pytest.mark.anyio
 async def test_bookkeeping_checkpoint_does_not_replenish_repair_campaign(service, monkeypatch):
     fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
     state = _nonempty_state(version=1)
     saved = replace(state, version=2)
     assert composition_content_hash(saved) == composition_content_hash(state)
@@ -57,7 +58,7 @@ async def test_bookkeeping_checkpoint_does_not_replenish_repair_campaign(service
     assert not await _attempt(service, state)
     assert not await _attempt(service, saved)
     assert len(fake.calls) == 3  # The current verdict is still recomputed every turn.
-    assert service._runtime_preflight_key(state, session_scope="session:one", plugin_snapshot=None) != service._runtime_preflight_key(
+    assert service._preflight.key(state, session_scope="session:one", plugin_snapshot=None) != service._preflight.key(
         saved, session_scope="session:one", plugin_snapshot=None
     )
 
@@ -66,7 +67,7 @@ async def test_bookkeeping_checkpoint_does_not_replenish_repair_campaign(service
 @pytest.mark.parametrize("change", ["source", "output", "user", "session", "settings", "plugins"])
 async def test_changed_repair_authority_gets_an_independent_campaign(service, monkeypatch, change):
     monkeypatch.setattr(
-        service_module, "validate_pipeline", _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        preflight_module, "validate_pipeline", _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
     )
     state = _nonempty_state(version=1)
     assert await _attempt(service, state)
@@ -83,7 +84,7 @@ async def test_changed_repair_authority_gets_an_independent_campaign(service, mo
     elif change == "session":
         kwargs["session_scope"] = "session:two"
     elif change == "settings":
-        monkeypatch.setattr(service_module, "runtime_preflight_settings_hash", lambda _settings: "changed-settings")
+        monkeypatch.setattr(preflight_module, "runtime_preflight_settings_hash", lambda _settings: "changed-settings")
     else:
         snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
         snapshot.snapshot_hash = "changed-plugins"
@@ -96,7 +97,7 @@ async def test_changed_repair_authority_gets_an_independent_campaign(service, mo
 @pytest.mark.parametrize("change", ["prompt_template", "review_draft", "secret_ref"])
 async def test_node_and_review_control_changes_replenish_campaign(service, monkeypatch, change):
     monkeypatch.setattr(
-        service_module, "validate_pipeline", _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        preflight_module, "validate_pipeline", _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
     )
     node = _state_with_llm(_pending_options()).nodes[0]
     state = replace(_nonempty_state(version=1), nodes=(node,))

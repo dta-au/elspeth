@@ -21,21 +21,10 @@ if TYPE_CHECKING:
     from pydantic import SecretStr
 
     from elspeth.contracts.session_operation import SessionOperationContext
-    from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
-    from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
-    from elspeth.web.composer.pipeline_planner import (
-        GuidedPlannerDecline,
-        PipelinePlanResult,
-        PlannerOriginatingMessage,
-    )
-    from elspeth.web.composer.pipeline_proposal import PresentBase
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.sessions.protocol import GuidedOperationFence
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -464,6 +453,10 @@ class ComposerResult:
 
 class ComposerServiceError(Exception):
     """Base exception for composer service errors."""
+
+
+class ComposerAdmissionRefused(ComposerServiceError):
+    """A committed admission decision refused this provider operation."""
 
 
 def _convergence_reason_for_budget(
@@ -1680,110 +1673,6 @@ class ComposerService(Protocol):
         Raises:
             ComposerConvergenceError: If the loop exceeds max_turns.
         """
-
-    async def plan_guided_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        guided: GuidedSession,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        user_id: str | None,
-        supersedes_draft_hash: str | None,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-        correction_target: GuidedCorrectionTarget | None = None,
-        revision_authority: GuidedRevisionAuthority | None = None,
-        root_goal: str | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run the shared planner once with split private/provider-safe facts.
-
-        ``root_goal`` is the outcome the author stated when the session
-        started, carried as a NAMED reviewed fact on a correction or revision
-        only — never folded into ``intent``, which always means "the request
-        being made now". A revision that narrows or withdraws part of the goal
-        would otherwise argue against the goal inside the one field the
-        planner (and the deterministic request guards that parse it) read as
-        the current request.
-        """
-        ...
-
-    async def plan_guided_full_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        policy_catalog: PolicyCatalogView,
-        plugin_snapshot: PluginAvailabilitySnapshot,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Plan one ordinary guided-full proposal through the shared planner."""
-        ...
-
-    async def surface_pending_interpretation_reviews(
-        self,
-        state: CompositionState,
-        *,
-        session_id: str | None,
-        current_state_id: str | None,
-        only_missing_evidence: bool = False,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        """Kind-general backend surfacer for the GUIDED commit path (B1).
-
-        Surfaces a resolvable pending interpretation EVENT for every
-        interpretation site on ``state`` whose writer-boundary precondition
-        holds (every ``InterpretationKind`` member). Called by the guided
-        route persistence seam (``post_guided_respond``) after every committed
-        source or transform commit, because the guided dispatch path
-        never reaches the freeform fail-closed orphan gate, and by the
-        /validate backstop (elspeth-03f5728c33) with
-        ``only_missing_evidence=True`` to repair states stranded by a compose
-        that died after persisting its mutating turn — repair mode leaves every
-        site already carrying evidence in any resolution status alone.
-        Advisory polarity: the run-time
-        ``UnresolvedInterpretationPlaceholderError`` gate stays the hard
-        backstop. Idempotent; a no-op when there is no session/persisted
-        state. See P3.1 for the concrete implementation.
-        """
-        ...
-
-    async def run_signoff_checkpoint(
-        self,
-        *,
-        state: CompositionState,
-        session_id: str | None,
-        recorder: BufferingRecorder | None,
-        progress: ComposerProgressSink | None = None,
-        user_message: str | None = None,
-    ) -> AdvisorCheckpointVerdict:
-        """Run the deterministic END evidence-scoped completion advisory checkpoint.
-
-        Public façade over the private ``_run_advisor_checkpoint(phase='end')``
-        so the guided STEP_4_WIRE dispatcher — which holds a ``ComposerService``
-        handle but not the impl's private methods — can request an
-        evidence-scoped completion advisory verdict. Non-raising: a sustained
-        provider failure yields ``ok=False`` (unavailable); a FLAGGED review yields
-        ``blocking=True``; CLEAN yields ``ok=True, blocking=False``. The caller
-        (the wire branch) maps the verdict to terminal/redirect per D13.
-
-        ``recorder`` threads the advisor call's audit sidecar; ``progress``
-        (when set) receives a ``calling_model`` event before the call.
-        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
-        chat turn, forwarded so the advisor can compare the supplied pipeline
-        evidence with explicit constraints visible in the bounded excerpt
-        (schema mode, field names/types, named plugins/values); optional and
-        rendered inside the existing untrusted fence.
-        """
-        ...
 
     async def explain_run_diagnostics(
         self,

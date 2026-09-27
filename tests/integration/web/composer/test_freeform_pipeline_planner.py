@@ -237,9 +237,8 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -337,9 +336,8 @@ async def test_planner_llm_call_audit_persists_the_served_endpoint(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -428,9 +426,8 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -577,9 +574,8 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -813,9 +809,8 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -873,9 +868,8 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -947,9 +941,8 @@ async def _recipe_composer_context(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -1170,13 +1163,13 @@ async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effe
         monkeypatch,
         message=message,
     )
-    from elspeth.web.composer import service as composer_service
+    from elspeth.web.composer import planning_application
 
     fallback = AsyncMock(
-        spec=composer_service.plan_pipeline,
+        spec=planning_application.plan_pipeline,
         side_effect=PipelinePlannerError("fallback stopped", code="TEST_STOP"),
     )
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", fallback)
+    monkeypatch.setattr(planning_application, "plan_pipeline", fallback)
 
     with pytest.raises(PipelinePlannerError, match="fallback stopped"):
         await composer.compose(

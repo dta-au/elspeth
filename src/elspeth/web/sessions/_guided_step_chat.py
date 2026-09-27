@@ -787,7 +787,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     api_key: str | None = None,
     reasoning_effort: str | None = None,
     # F2 marking hook, threaded verbatim to the solver's discovery loop —
-    # binds ComposerServiceImpl._mark_plugin_schema_loaded at the route.
+    # binds the shared schema disclosure tracker at the route.
     mark_schema_loaded: Callable[[str, str], None] | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.

@@ -44,7 +44,6 @@ def test_tool_batch_owns_discovery_cache_helpers() -> None:
             "_CachedDiscoveryPayload",
             "_RuntimePreflightCache",
             "_MAX_PENDING_PROPOSALS_PER_TURN",
-            "_arg_error_payload",
             "_cached_discovery_payload",
             "_make_cache_key",
             "_result_from_cached_discovery_payload",
@@ -53,6 +52,18 @@ def test_tool_batch_owns_discovery_cache_helpers() -> None:
         }
         & service_imports
     )
+
+
+def test_tool_batch_imports_arg_error_payload_from_its_owner() -> None:
+    path = _ROOT / "src/elspeth/web/composer/tool_batch.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "elspeth.web.composer.tool_error_payloads"
+        and any(alias.name == "arg_error_payload" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    assert "_arg_error_payload" not in _imports_from_service("src/elspeth/web/composer/tool_batch.py")
 
 
 def test_turn_audit_uses_tool_error_payload_owner() -> None:

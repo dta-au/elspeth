@@ -124,13 +124,13 @@ from elspeth.web.composer.protocol import (
     ComposerServiceError,
 )
 from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_telemetry import (
     begin_composer_request_metrics,
     finish_composer_request_metrics,
     mark_composer_request_terminal,
 )
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
-from elspeth.web.composer.service import _BadRequestLLMError
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
 from elspeth.web.composer.telemetry_phase8 import (
@@ -4096,7 +4096,6 @@ __all__ = [
     "ValidationResult",
     "ValidationSummary",
     "WebRateLimiter",
-    "_BadRequestLLMError",
     "_ComposerPreflightTelemetryResult",
     "_ComposerPreflightTelemetrySource",
     "_ComposerRequestEndpoint",

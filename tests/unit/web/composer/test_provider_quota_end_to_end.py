@@ -23,8 +23,8 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.pipeline_proposal import PlannerSurface
+from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
-from elspeth.web.composer.service import _litellm_acompletion
 from elspeth.web.coordination import chargeable_admission_authority, quota_authority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import QuotaExceeded

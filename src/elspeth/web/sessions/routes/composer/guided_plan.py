@@ -25,10 +25,9 @@ from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, Pipeline
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.progress import ComposerRequestLease, client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
-from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
@@ -517,7 +516,7 @@ async def post_guided_plan(
         )
 
         async with _cancel_on_client_disconnect(request):
-            outcome = await request.app.state.composer_service.plan_guided_full_pipeline(
+            outcome = await request.app.state.planning_application.plan_guided_full_pipeline(
                 intent=body.intent,
                 current_state=observed_state,
                 originating_message=PlannerOriginatingMessage(
