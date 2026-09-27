@@ -286,3 +286,32 @@ def test_row_union_group_lost_before_any_arrival_is_counted_at_its_first_straggl
 
     _assert_counted_once_per_token(run, exit_code=1, rows_failed=2, coalesce_failed=1)
     assert _failure_reasons_at_barrier(run.db_path) == {"row_union_branch_lost"}
+
+
+def test_row_union_group_lost_after_two_arrivals_counts_every_held_member(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row_union LIVE loss arm with two held members: path_a and path_b
+    arrive and are held, then path_c is lost on row 2 (price 20 -> division by
+    zero -> discard). The loss notification fails the group and must surface
+    one result per held member — surfacing only the first leaves the live
+    rows_failed one below the audit derive and ends the run exit 4."""
+    body = {
+        "gates": [_fork_gate(["path_a", "path_b", "path_c"])],
+        "transforms": [
+            _value_transform("vt_a", "path_a", "out_a", target="bonus", expression="1"),
+            _passthrough("pt_b", "path_b", "out_b"),
+            _value_transform("vt_c", "path_c", "out_c", target="bonus2", expression=_LOSE_ROW_2),
+            _passthrough("pt_after", "unioned", "out"),
+        ],
+        "row_unions": [
+            {
+                "name": "union_results",
+                "branches": {"path_a": "out_a", "path_b": "out_b", "path_c": "out_c"},
+                "on_success": "unioned",
+            }
+        ],
+    }
+    run = _run(tmp_path, monkeypatch, _settings(tmp_path, source=_csv_source(tmp_path), body=body))
+
+    # row 2: the discarded path_c token + its 2 held members; rows 1 and 3 release.
+    _assert_counted_once_per_token(run, exit_code=1, rows_failed=3, coalesce_failed=1)
+    assert _failure_reasons_at_barrier(run.db_path) == {"row_union_branch_lost"}

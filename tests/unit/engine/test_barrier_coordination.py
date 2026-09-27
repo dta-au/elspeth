@@ -771,6 +771,35 @@ class TestRowUnionLossReplay:
         assert [result.counts_failed_barrier for result in outcome.results] == [True]
         assert [result.error.exception_type if result.error else None for result in outcome.results] == ["RowUnionFailure"]
 
+    def test_follower_loss_surfaces_every_leader_held_sibling(self) -> None:
+        """Two held siblings: the replayed failure surfaces one result per
+        consumed token, exactly one carrying the failed-group count."""
+        held = (_token(token_id="held-a", row_id="row-1"), _token(token_id="held-b", row_id="row-1"))
+        loss = SimpleNamespace(
+            loss_id="loss-1",
+            closer_name="variant_union",
+            token_id="lost-token",
+            group_id="fg-barrier-coordination-test",
+            member_key="control",
+            reason="error_routed",
+        )
+        row_union = RecordingRowUnionExecutor(
+            RowUnionOutcome(
+                held=False,
+                consumed_tokens=held,
+                failure_reason="row_union_branch_lost",
+                row_union_name="variant_union",
+                outcomes_recorded=True,
+            )
+        )
+        coordinator = _make_coordinator(scheduler=RecordingScheduler(pending=[], losses=[loss]), row_union_executor=row_union)
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert [result.token.token_id for result in outcome.results] == ["held-a", "held-b"]
+        assert {(result.outcome, result.path) for result in outcome.results} == {(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)}
+        assert [result.counts_failed_barrier for result in outcome.results] == [True, False]
+
 
 class TestRowUnionIntake:
     def test_arrival_completed_group_failure_is_an_executor_contract_break(self) -> None:

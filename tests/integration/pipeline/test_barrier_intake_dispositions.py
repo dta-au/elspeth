@@ -98,7 +98,7 @@ def _usurp_seat(db: LandscapeDB) -> None:
     RunCoordinationRepository(db.engine).acquire_run_leadership(run_id=RUN_ID, worker_id=USURPER, window_seconds=300)
 
 
-def _real_coalesce_executor(factory: Any, clock: MockClock, *, policy: str) -> CoalesceExecutor:
+def _real_coalesce_executor(factory: Any, clock: MockClock, *, policy: str, branches: tuple[str, ...] = ("a", "b")) -> CoalesceExecutor:
     token_manager = TokenManager(factory.data_flow, step_resolver=lambda node_id: 2)
     executor = CoalesceExecutor(
         execution=factory.execution,
@@ -113,7 +113,7 @@ def _real_coalesce_executor(factory: Any, clock: MockClock, *, policy: str) -> C
     executor.register_coalesce(
         CoalesceSettings(
             name="merge",
-            branches=["a", "b"],
+            branches=list(branches),
             policy=policy,
             merge="union",
             on_success="out",
@@ -765,6 +765,46 @@ class TestBranchLossReplay:
         (loss_row,) = _loss_rows(db)
         assert loss_row["adopted_epoch"] == 1
         assert loss_row["reason"] == "quarantined:boom"
+        _assert_quiescent_and_finalize_ready(processor)
+
+    def test_must_fail_replay_surfaces_every_held_sibling(self) -> None:
+        """The replay arm with TWO held siblings: a and b arrive and are held,
+        c's loss is recorded follower-style. The replayed require_all failure
+        must surface one (FAILURE, UNROUTED) result per consumed sibling, with
+        exactly one carrying the failed-group count — surfacing only the first
+        leaves the live rows_failed below the audit derive (exit 4)."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor = _real_coalesce_executor(factory, clock, policy="require_all", branches=("a", "b", "c"))
+        processor = _coalesce_processor(factory, executor, clock)
+
+        assert _arrive_via_intake(factory, processor, _branch_token("a")) == []
+        assert _arrive_via_intake(factory, processor, _branch_token("b"), ingest_sequence=1) == []
+        _record_foreign_loss(db, clock, factory, branch="c", token_id="tok-branch-c", reason="quarantined:boom")
+
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
+        results = processor.run_barrier_intake(ctx)
+
+        assert sorted(result.token.token_id for result in results) == ["tok-branch-a", "tok-branch-b"]
+        assert {(result.outcome, result.path) for result in results} == {(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)}
+        assert [result.counts_failed_barrier for result in results].count(True) == 1
+        for token_id in ("tok-branch-a", "tok-branch-b"):
+            assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.TERMINAL.value
+        with db.connection() as conn:
+            failed_outcomes = (
+                conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                    .where(token_outcomes_table.c.outcome == "failure")
+                )
+                .scalars()
+                .all()
+            )
+        assert sorted(failed_outcomes) == ["tok-branch-a", "tok-branch-b"]
         _assert_quiescent_and_finalize_ready(processor)
 
     def test_best_effort_merge_carries_branches_lost_from_the_table(self) -> None:

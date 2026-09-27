@@ -272,10 +272,18 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 # members, or on the first straggler's late-arrival result when the group
 # failed with none (``counts_failed_barrier``; ``first_failure_evidence`` on the
 # executors' late-arrival outcomes). The corners:
-#   1. a straggler whose group closure is known only through the Landscape
-#      fallback (its key was evicted from the executor's bounded completed-key
-#      FIFO) cannot tell whether its state is the group's first, so it never
-#      counts — the audit MAY EXCEED live;
+#   1. a straggler into a group that failed with no arrived member counts only
+#      when THIS executor instance recorded that zero-arrival failure (its
+#      in-memory ``_failed_without_member_state``). Otherwise it cannot tell
+#      whether its state is the group's first, so it never counts — the audit
+#      MAY EXCEED live. Three ways to get there: the key was evicted from the
+#      bounded completed-key FIFO and is rediscovered through the Landscape
+#      fallback; a row_union straggler closes the group through accept()'s
+#      durable ``has_group_loss`` fallback (a loss recorded by another worker
+#      and not yet replayed here); or the zero-arrival failure was recorded
+#      in another process — before a resume, or by the leader a takeover
+#      replaced — so this instance never held the fact (the journal does not
+#      carry it; the coalesce restore also clears the set);
 #   2. the derive's unit is a DISTINCT (barrier node, row_id) pair, so several
 #      fork groups of ONE source row (a fork downstream of an expansion)
 #      failing at the same barrier collapse to one, while live counts each

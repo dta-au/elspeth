@@ -379,9 +379,13 @@ drained and repair this release forward.
   but the run counted only the arriving one and stopped at the end with
   "Live-vs-audit terminal counter mismatch" (exit 4). Every failure path of a
   coalesce or row_union group now counts each consumed row once, and the run
-  ends PARTIAL (exit 1), or FAILED (exit 2) when no row succeeded. The failed-group count (`rows_coalesce_failed`) now also counts
-  failures completed by an arrival or a branch loss, including a group that
-  failed before any branch arrived.
+  ends PARTIAL (exit 1), or FAILED (exit 2) when no row succeeded. The
+  reported failed-group count (`rows_coalesce_failed`) is unchanged — it was
+  already taken from the audit trail; the run's internal cross-check of it now
+  agrees with the audit for a group failed by an arrival or a branch loss, so
+  it no longer logs a tolerated divergence for such a group (a group failed
+  before any branch arrived is counted when its first straggler arrives, as
+  the audit counts it).
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first
