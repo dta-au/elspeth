@@ -31,9 +31,10 @@
 > routes. **Batch:** the same classifier applies at the aggregation and collector input seams
 > (`batch_contract_validation.validate_batch_inputs` over `schema_required_input_fields()`, whose proof the builder
 > publishes from `NodeInfo.batch_required_input_fields`): an unproven absence fails the batch through `on_error` (B2);
-> a proven or divergent miss is the Tier-1 `BatchDeclaredInputFieldsViolation`. An aggregation records every buffered
-> token FAILURE before the abort; a collector leaves its members to the settle seam and the run-death finalizer
-> (ADR-038), as every collector Tier-1 does today. Batch-aware transforms still cannot declare
+> a proven or divergent miss is the Tier-1 `BatchDeclaredInputFieldsViolation`. Both seams record every buffered
+> token FAILURE before the abort through one recorder (`batch_violation_outcomes.record_batch_violation_failures`), so
+> no token is left without a terminal outcome; a collector also closes each member's hold FAILED first, since the WS3
+> settle seam never runs on a path that ends the run. Batch-aware transforms still cannot declare
 > `declared_input_fields`, and ADR-013's contract still does not dispatch at a batch seam.
 
 ## Context

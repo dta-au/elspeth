@@ -354,7 +354,8 @@ drained and repair this release forward.
   Aggregations and collectors classify a buffered
   row's missing `schema.required_fields` column with the same rule: an
   unproven absence fails the batch through `on_error`, and a proven one ends
-  the run with every buffered aggregation row recorded `failed` first. An
+  the run with every buffered row recorded `failed` first (aggregation
+  and collector alike). An
   `llm` `image_inputs` entry marked `required: false` is no longer treated as
   a required input, so a row without that image is sent without it instead of
   being refused.

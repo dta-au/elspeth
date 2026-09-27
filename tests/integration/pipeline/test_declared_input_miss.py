@@ -462,3 +462,152 @@ class TestBatchSeamParity:
         assert "Traceback" not in result.output
         assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
         assert {(reason["reason"], tuple(reason["fields"])) for reason in _routed_reasons(tmp_path)} == {("missing_field", ("v",))}
+
+
+def _collector_settings(tmp_path: Path, *, create_reading: bool) -> Path:
+    """One document exploded into two pages and closed by a batch_stats collector on ``reading``.
+
+    With ``create_reading`` a value_transform creates ``reading`` on every page,
+    so the build proves it at the collector; without it the pages pass through
+    an observed pass-through and the collector's required field is unproven.
+    """
+    (tmp_path / "in.jsonl").write_text(json.dumps({"doc_id": "D", "pages": [{"reading": 1}, {"reading": 2}]}) + "\n")
+    middle: dict[str, Any] = (
+        {
+            "name": "read_value",
+            "plugin": "value_transform",
+            "input": "page_in",
+            "on_success": "pages",
+            "on_error": "discard",
+            "options": {"schema": _OBSERVED, "operations": [{"target": "reading", "expression": "row['page']['reading'] + 0"}]},
+        }
+        if create_reading
+        else {
+            "name": "read_value",
+            "plugin": "passthrough",
+            "input": "page_in",
+            "on_success": "pages",
+            "on_error": "discard",
+            "options": {"schema": _OBSERVED},
+        }
+    )
+    settings: dict[str, Any] = {
+        "sources": {
+            "docs": {
+                "plugin": "json",
+                "on_success": "rows",
+                "options": {"path": str(tmp_path / "in.jsonl"), "format": "jsonl", "on_validation_failure": "discard", "schema": _OBSERVED},
+            }
+        },
+        "concurrency": {"max_workers": 1},
+        "transforms": [
+            {
+                "name": "explode_pages",
+                "plugin": "json_explode",
+                "input": "rows",
+                "on_success": "page_in",
+                "on_error": "discard",
+                "options": {"array_field": "pages", "output_field": "page", "schema": _OBSERVED},
+            },
+            middle,
+        ],
+        "collectors": [
+            {
+                "name": "page_stitcher",
+                "plugin": "batch_stats",
+                "input": "pages",
+                "on_success": "out",
+                "options": {"value_field": "reading", "schema": _OBSERVED},
+            }
+        ],
+        "scopes": [{"name": "document_pages", "opener": "explode_pages", "closer": "page_stitcher", "policy": "require_all"}],
+        "sinks": {"out": _json_sink(tmp_path / "out.jsonl")},
+        "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
+    }
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
+
+
+def _inject_before_collector_preflight(monkeypatch: pytest.MonkeyPatch, rewrite: Callable[[PipelineRow], PipelineRow]) -> None:
+    """Stand in for an engine defect that hands the collector's input check rows other than the buffered ones."""
+    import elspeth.engine.executors.collector as collector_module
+
+    original = collector_module.validate_batch_inputs
+
+    def validate(transform: Any, rows: Any, **kwargs: Any) -> None:
+        original(transform, [rewrite(row) for row in rows], **kwargs)
+
+    monkeypatch.setattr(collector_module, "validate_batch_inputs", validate)
+
+
+def _collector_member_hold_states(tmp_path: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for (status,) in _query(
+        tmp_path,
+        "select ns.status from node_states ns join nodes n on n.node_id = ns.node_id and n.run_id = ns.run_id "
+        "where n.plugin_name = 'batch_stats'",
+    ):
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _add_payload_field(field: str) -> Callable[[PipelineRow], PipelineRow]:
+    def rewrite(row: PipelineRow) -> PipelineRow:
+        return PipelineRow({**row.to_dict(), field: 1}, row.contract)
+
+    return rewrite
+
+
+class TestCollectorSeamParity:
+    """The collector input seam: same classifier as the aggregation seam, every member FAILED before a Tier-1 abort.
+
+    Review-R2 r1 F2: a proven miss at a collector used to end the run with every
+    member token outcomeless (the WS3 settle seam never runs on a Tier-1 path).
+    """
+
+    def test_a_proven_field_missing_is_tier_one_with_every_member_failed_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _inject_before_collector_preflight(monkeypatch, _drop("reading", from_payload=True))
+        settings = _collector_settings(tmp_path, create_reading=True)
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code == 4, result.output
+        assert "BatchDeclaredInputFieldsViolation" in result.output
+        # Never outcomeless: both page members FAILED; the opener's parent is transient.
+        assert _terminal_outcomes(tmp_path) == {"failure/unrouted": 2, "transient/expand_parent": 1}
+        contexts = [
+            json.loads(text)
+            for (text,) in _query(tmp_path, "select context_json from token_outcomes where completed = 1 and outcome = 'failure'")
+        ]
+        assert {(context["exception_type"], context["failure_kind"], tuple(context["missing"])) for context in contexts} == {
+            ("BatchDeclaredInputFieldsViolation", "proven_field_absent", ("reading",))
+        }
+        # Every member's accept-time hold is closed FAILED (none left open), beside the failed flush state.
+        assert _collector_member_hold_states(tmp_path) == {"failed": 3}
+
+    def test_a_payload_the_contract_lacks_is_tier_one_even_unproven(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _inject_before_collector_preflight(monkeypatch, _add_payload_field("reading"))
+        settings = _collector_settings(tmp_path, create_reading=False)
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code == 4, result.output
+        assert "BatchDeclaredInputFieldsViolation" in result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/unrouted": 2, "transient/expand_parent": 1}
+        assert _collector_member_hold_states(tmp_path) == {"failed": 3}
+
+    def test_the_unproven_absence_fails_the_group_without_ending_the_run(self, tmp_path: Path) -> None:
+        """Control (B2 kept): pages behind an abstaining pass-through lack ``reading``; the group fails, the run goes on."""
+        settings = _collector_settings(tmp_path, create_reading=False)
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code != 4, result.output
+        assert "Traceback" not in result.output
+        outcomes = _terminal_outcomes(tmp_path)
+        assert "NONTERMINAL" not in outcomes, outcomes
+        assert "BatchDeclaredInputFieldsViolation" not in result.output

@@ -31,6 +31,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
     ExecutionError,
     OrchestrationInvariantError,
     PluginContractViolation,
@@ -53,6 +54,7 @@ from elspeth.engine.executors.batch_contract_validation import (
     validate_batch_inputs,
     validate_success_outputs,
 )
+from elspeth.engine.executors.batch_violation_outcomes import record_batch_violation_failures
 from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
@@ -1047,6 +1049,12 @@ class CollectorExecutor:
     # the executor renders, WS3 settles. Do not add escalation logic here, do
     # not reintroduce a direct `record_token_outcome` call for arrived
     # members in this method, and do not resurrect `outcomes_recorded`.
+    # The one carve-out is not a group failure at all: a Tier-1
+    # BatchDeclaredInputFieldsViolation in `_execute_flush` ends the run, so
+    # no CollectorOutcome ever reaches the settle seam; that arm closes the
+    # member holds and records each member FAILED itself
+    # (record_batch_violation_failures, shared with the aggregation seam)
+    # before the violation propagates.
 
     def _execute_flush(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, ctx: PluginContext) -> CollectorOutcome:
         """end_of_group flush: opener-ordinal order, transform-only, audit-guarded."""
@@ -1164,6 +1172,44 @@ class CollectorExecutor:
                             result=result,
                             exc=exc,
                         ) from exc
+            except BatchDeclaredInputFieldsViolation as input_violation:
+                # Tier 1 (a required field the build proved present is missing,
+                # or a contract lost a field its payload carries): the run ends,
+                # but every member is recorded FAILED first, as at the
+                # aggregation seam, so no member is left without a terminal
+                # outcome (ADR-013 Amendment 2026-09-27). The WS3 settle seam
+                # never runs on this path — the run dies before this group's
+                # CollectorOutcome exists — so these writes are the only ones.
+                # Each member's accept()-time hold closes FAILED with the
+                # violation's value-free error first, as every other closure
+                # of a group closes it (success, quarantine, group verdict): a
+                # member recorded FAILED must not keep an open hold here.
+                hold_duration_ms = (self._clock.monotonic() - now) * 1000
+                hold_error = ExecutionError(
+                    exception=scrub_text_for_audit(str(input_violation)),
+                    exception_type=type(input_violation).__name__,
+                    phase="collector_flush",
+                    context=input_violation.to_audit_dict(),
+                )
+                for entry in entries:
+                    self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
+                        state_id=entry.state_id,
+                        status=NodeStateStatus.FAILED,
+                        error=hold_error,
+                        duration_ms=hold_duration_ms,
+                    )
+                record_batch_violation_failures(
+                    self._data_flow,
+                    coordination_token=ctx.require_coordination_token(),
+                    run_id=self._run_id,
+                    tokens=members,
+                    violation=input_violation,
+                    transform_name=transform.name,
+                    node_id=node_id,
+                    triggering_token_id=None,
+                )
+                raise
             except contract_errors.TIER_1_ERRORS:
                 raise
             except PluginContractViolation as violation:
