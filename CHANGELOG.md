@@ -636,8 +636,10 @@ drained and repair this release forward.
   already exists`, `Failing row contains (…)`, `invalid input syntax for type
   integer: "…"`, and with psycopg2 the statement with its parameters) and
   reached `node_states.error_json`: it names a stable kind and the driver's
-  condition, e.g. `Constraint violation: unique_violation (UniqueViolation)`
-  or, on SQLite, `(SQLITE_CONSTRAINT_UNIQUE)`.
+  condition and, on PostgreSQL, the violated constraint from the driver's
+  structured diagnostics, e.g. `Constraint violation: unique_violation
+  (UniqueViolation) on constraint orders_email_key` or, on SQLite,
+  `(SQLITE_CONSTRAINT_UNIQUE)`.
 
 ### Newly refused configurations
 

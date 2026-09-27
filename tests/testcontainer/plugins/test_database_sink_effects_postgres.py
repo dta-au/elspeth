@@ -188,8 +188,10 @@ def test_postgres_constraint_diversion_reasons_carry_no_row_value(postgres_url: 
     assert committed.diverted_ordinals == (1, 2, 3, 4)
     reasons = [item.reason for item in sink._get_diversions()]
     assert reasons == [
-        "Constraint violation: unique_violation (UniqueViolation)",
-        "Constraint violation: check_violation (CheckViolation)",
+        # The constraint name is the server's structured CONSTRAINT NAME field
+        # (a DDL identifier), not text from the message (review-codexfix-handoffs-r1 M2).
+        "Constraint violation: unique_violation (UniqueViolation) on constraint database_effect_reasons_email_key",
+        "Constraint violation: check_violation (CheckViolation) on constraint qty_non_negative",
         "Constraint violation: not_null_violation (NotNullViolation)",
         "Constraint violation: data_error (InvalidTextRepresentation)",
     ]

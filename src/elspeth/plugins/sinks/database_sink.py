@@ -90,6 +90,8 @@ _CONSTRAINT_KIND_BY_CONDITION: Mapping[str, str] = MappingProxyType(
         "SQLITE_CONSTRAINT_CHECK": "check_violation",
     }
 )
+# A PostgreSQL identifier as the server reports it (unquoted form, at most 63 bytes).
+_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,62}")
 
 
 @trust_boundary(
@@ -98,7 +100,8 @@ _CONSTRAINT_KIND_BY_CONDITION: Mapping[str, str] = MappingProxyType(
     source_param="exc",
     suppresses=("R5",),
     invariant=(
-        "returns a reason built only from the driver's error class or SQLite result-code name and a stable kind; "
+        "returns a reason built only from the driver's error class or SQLite result-code name, a stable kind and "
+        "the violated constraint's name when the PostgreSQL driver reports one as a plain SQL identifier; "
         "never reads or returns the driver's message; never raises on an unrecognised driver error"
     ),
     non_raising=True,
@@ -113,16 +116,33 @@ def _constraint_failure_reason(exc: IntegrityError | DataError) -> str:
     in the audit trail and routed, so it is built only from the driver's error
     class or SQLite's result-code name — closed driver vocabularies — plus the
     stable kind they map to.
+
+    On PostgreSQL the reason also names the violated constraint: psycopg and
+    psycopg2 report it as a structured diagnostic field (``diag.constraint_name``,
+    the server's CONSTRAINT NAME field), separate from the message. It is a DDL
+    identifier, never row content, and it tells an operator which of a table's
+    unique or check constraints refused the row. It is read by sentinel (the
+    field is driver-specific) and printed only when it is a plain SQL
+    identifier. SQLite has no such field — only its message, which is not read.
     """
     driver_error = exc.orig
-    condition = driver_error.sqlite_errorname if isinstance(driver_error, sqlite3.Error) else type(driver_error).__name__
+    if isinstance(driver_error, sqlite3.Error):
+        condition = driver_error.sqlite_errorname
+        constraint_name = None
+    else:
+        condition = type(driver_error).__name__
+        diagnostics = getattr(driver_error, "diag", None)
+        constraint_name = getattr(diagnostics, "constraint_name", None) if diagnostics is not None else None
     if condition in _CONSTRAINT_KIND_BY_CONDITION:
         kind = _CONSTRAINT_KIND_BY_CONDITION[condition]
     elif isinstance(exc, DataError):
         kind = "data_error"
     else:
         kind = "integrity_error"
-    return f"Constraint violation: {kind} ({condition})"
+    reason = f"Constraint violation: {kind} ({condition})"
+    if isinstance(constraint_name, str) and _SQL_IDENTIFIER.fullmatch(constraint_name) is not None:
+        reason += f" on constraint {constraint_name}"
+    return reason
 
 
 _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION = 1
@@ -269,7 +289,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b3a6120272a86bcc"
+    source_file_hash: str | None = "sha256:a795c378119554ea"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL

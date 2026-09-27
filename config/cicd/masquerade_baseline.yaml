@@ -299,6 +299,18 @@ entries:
     as PipelineRow.__getattr__. It exists because jinja2's `attr` filter asks hasattr
     before deferring to the sandbox, which resolves every lookup on this type to a
     field.
+- path: src/elspeth/plugins/sinks/database_sink.py
+  qualname: _constraint_failure_reason
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51a3e3cb4e2559d7cf6c6c2515df9450a52d01744c4d9f8b0e0d2017fc23df1c
+  - fc531815cf2a3c9ff475168b4a21c7a71f7e7ecd73e614e3ad8763d237f2b62b
+  classification: external-parse
+  justification: Parses the optional diag.constraint_name field of a foreign PostgreSQL
+    DBAPI exception (psycopg and psycopg2 expose it; other drivers may not) and retains
+    it only as an exact str matching the plain SQL identifier pattern, for a value-free
+    diversion reason.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
