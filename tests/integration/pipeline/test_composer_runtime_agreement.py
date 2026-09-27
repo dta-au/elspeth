@@ -8721,7 +8721,10 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
     dropping the carried-rename arm does the same for ``dotted`` only;
     dropping the policy gate turns ``control-first-policy`` red. The other
     controls stay green under every mutation. Measured 2026-09-27 (lane logs
-    round6/G2-coalesce-build/mut).
+    round6/G2-coalesce-build/mut). Dropping ``and mode == "edge"`` from the
+    composer's source-``any`` abstention (``state.py``, the source arm of the
+    producer type walk) makes the composer admit both ``source-declared-any``
+    cases that ``elspeth validate`` refuses (lane logs round6/B1-small-fixes).
     """
 
     @staticmethod
@@ -8784,6 +8787,20 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
     _PASSTHROUGH: ClassVar[dict[str, Any]] = {"plugin": "passthrough", "options": {"schema": {"mode": "observed"}}}
 
     @staticmethod
+    def _json_source_declaring_any(mode: str) -> dict[str, Any]:
+        """A source that DECLARES ``r: any`` beside ``s: int`` (fixed or flexible)."""
+        return {
+            "plugin": "json",
+            "on_success": "raw",
+            "options": {
+                "path": "/tmp/shape33-in.jsonl",
+                "format": "jsonl",
+                "on_validation_failure": "discard",
+                "schema": {"mode": mode, "fields": ["id: int", "r: any", "s: int"]},
+            },
+        }
+
+    @staticmethod
     def _rewrite(target: str, expression: str, schema: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
             "plugin": "value_transform",
@@ -8808,6 +8825,23 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
             ),
             "literal": (self._yaml(source=self._CSV, branch_a=self._rewrite("price", "'x'"), branch_b=self._PASSTHROUGH), "price"),
             "dotted": (self._yaml(source=self._JSON, branch_a=self._mapper({"meta.p": "q"}), branch_b=self._mapper({"r": "q"})), "q"),
+            # A SOURCE-declared ``any`` is a known type at a union merge (only an
+            # ``edge`` read abstains on it): renamed onto ``q`` beside an ``int``
+            # it is certain to conflict, for a fixed and a flexible source alike.
+            "source-declared-any-fixed": (
+                self._yaml(
+                    source=self._json_source_declaring_any("fixed"), branch_a=self._mapper({"r": "q"}), branch_b=self._mapper({"s": "q"})
+                ),
+                "q",
+            ),
+            "source-declared-any-flexible": (
+                self._yaml(
+                    source=self._json_source_declaring_any("flexible"),
+                    branch_a=self._mapper({"r": "q"}),
+                    branch_b=self._mapper({"s": "q"}),
+                ),
+                "q",
+            ),
             "control-both-any": (
                 self._yaml(source=self._CSV, branch_a=self._rewrite("bonus", "2"), branch_b=self._rewrite("bonus", "3")),
                 None,
@@ -8850,7 +8884,17 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         return graph, None, plugins
 
     @pytest.mark.parametrize(
-        "case", ["rewrite", "literal", "dotted", "control-both-any", "control-declared-every-branch", "control-first-policy"]
+        "case",
+        [
+            "rewrite",
+            "literal",
+            "dotted",
+            "source-declared-any-fixed",
+            "source-declared-any-flexible",
+            "control-both-any",
+            "control-declared-every-branch",
+            "control-first-policy",
+        ],
     )
     def test_both_surfaces_agree(self, case: str, tmp_path: Path) -> None:
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
