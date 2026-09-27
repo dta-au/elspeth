@@ -38,6 +38,7 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
@@ -2663,6 +2664,18 @@ class BaseSource(ABC):
 
     # Schema contract for row validation
     _schema_contract: SchemaContract | None = None
+
+    # The source's validated ``field_mapping`` (normalized external name ->
+    # row key), set at construction by every source whose config carries one
+    # (TabularSourceDataConfig and the json, aws_s3, azure_blob and dataverse
+    # configs); None for a source that renames nothing. Read through
+    # ``field_renames``.
+    _field_mapping: dict[str, str] | None = None
+
+    @property
+    def field_renames(self) -> Mapping[str, str]:
+        """The renames this source applies after normalizing an external name (``SourceProtocol.field_renames``)."""
+        return MappingProxyType({} if self._field_mapping is None else dict(self._field_mapping))
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         # Enforces the contract documented in contracts/enums.py:Determinism —

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar, get_args
 
 import pytest
@@ -46,6 +48,7 @@ class _BoundRegionMockSource:
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
 
 
 class _BoundRegionMockSink:

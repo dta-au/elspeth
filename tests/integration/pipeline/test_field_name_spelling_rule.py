@@ -568,3 +568,193 @@ def test_a_header_spelled_group_by_fails_the_batch_routed(tmp_path: Path) -> Non
     assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 3}
     [failure] = [r for r in _batch_failure_reasons(tmp_path) if r.get("reason") == _READ]
     assert (failure["fields"], failure["canonical_fields"]) == (["Name"], ["name"])
+
+
+# ---------------------------------------------------------------------------
+# A header the source's field_mapping renames (Codex final review, finding 1)
+# ---------------------------------------------------------------------------
+#
+# CSV header ``Name`` under ``field_mapping: {name: b}``: rows carry ``b``, the
+# contract records ``Name`` as its original name, and a lookup of ``Name``
+# reads ``b``. The predicate compared only ``normalize("Name")`` (``name``,
+# absent), so a declaration spelled by the mapped header walked past every
+# surface — the field_mapper shape delivered a str under a recorded
+# ``given: int`` with exit 0. The declaration is now resolved as the upstream
+# resolves it: the row's contract at run time, the sources' renames at build.
+# Each surface of the rule gets its source-field_mapping variant here.
+
+_MAPPED: dict[str, str] = {"name": "b"}
+_FIXED_ID_B: dict[str, Any] = {"mode": "fixed", "fields": ["id: str", "b: str"]}
+
+
+def _mapped_source(tmp_path: Path, *, schema: dict[str, Any] | None = None, text: str = _ID_NAME_CSV) -> dict[str, Any]:
+    source = _csv_source(tmp_path, text, schema=schema)
+    source["options"]["field_mapping"] = dict(_MAPPED)
+    return source
+
+
+def _mapped_surfaces(*, runtime: bool) -> list[Any]:
+    """One transform per declaration surface of the rule, each declaring the mapped header ``Name``: (transform, reason).
+
+    ``required_input_fields`` has no run-time residual to exercise: an
+    observed upstream guarantees nothing, so the build already refuses the
+    requirement as missing (and names the header spelling, below).
+    """
+    required = [
+        pytest.param(
+            _transform(
+                "value_transform",
+                {"required_input_fields": ["Name"], "operations": [{"target": "doubled", "expression": "row['b']"}], "schema": _OBSERVED},
+            ),
+            _READ,
+            id="required_input_fields",
+        )
+    ]
+    return [
+        pytest.param(
+            _transform(
+                "field_mapper",
+                {"mapping": {"Name": "given"}, "select_only": True, "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+            ),
+            _READ,
+            id="field_mapper-schema-field-codex-shape",
+        ),
+        pytest.param(
+            _transform(
+                "value_transform",
+                {"operations": [{"target": "doubled", "expression": "row['b']"}], "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+            ),
+            _READ,
+            id="value_transform-schema-field",
+        ),
+        *([] if runtime else required),
+        pytest.param(
+            _transform("keyword_filter", {"fields": ["Name"], "blocked_patterns": ["zzz"], "schema": _OBSERVED}),
+            _READ,
+            id="keyword_filter-scan-field",
+        ),
+        pytest.param(
+            _transform("type_coerce", {"conversions": [{"field": "Name", "to": "int"}], "schema": _OBSERVED}),
+            _READ,
+            id="type_coerce-conversion-field",
+        ),
+        pytest.param(_web_scrape("Name"), _READ, id="web_scrape-url_field"),
+        pytest.param(
+            _transform("value_transform", {"operations": [{"target": "Name", "expression": "row['b'] + '!'"}], "schema": _OBSERVED}),
+            _CREATE,
+            id="value_transform-target",
+        ),
+        pytest.param(
+            _transform("field_mapper", {"mapping": {"id": "Name"}, "schema": _OBSERVED}), _CREATE, id="field_mapper-rename-target"
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("transform", "reason"), _mapped_surfaces(runtime=True))
+def test_a_renamed_header_declaration_behind_an_observed_upstream_routes(tmp_path: Path, transform: dict[str, Any], reason: str) -> None:
+    """The run time resolves ``Name`` through the row's contract (recorded original of ``b``) and routes every row."""
+    result = _run(_settings(tmp_path, source=_mapped_source(tmp_path), transforms=[transform]))
+
+    _assert_routed(tmp_path, result, reason=reason, literal="Name", canonical="b")
+    assert not (tmp_path / "out.jsonl").exists() or (tmp_path / "out.jsonl").read_text() == ""
+
+
+@pytest.mark.parametrize(("transform", "reason"), _mapped_surfaces(runtime=False))
+def test_a_renamed_header_declaration_is_refused_at_build_behind_a_closed_upstream(
+    tmp_path: Path, transform: dict[str, Any], reason: str
+) -> None:
+    """The build resolves ``Name`` through the source's rename (``name`` -> ``b``) and refuses before any row exists."""
+    output = _refused_at_build(_settings(tmp_path, source=_mapped_source(tmp_path, schema=_FIXED_ID_B), transforms=[transform]))
+
+    if reason == _READ:
+        assert "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') and " in output
+        assert "the source's field_mapping renames 'name' to 'b'. Declare 'b'" in output
+    else:
+        assert "'Name' is a header spelling of the arriving field 'b'" in output
+
+
+def test_a_renamed_header_required_input_field_names_the_rename_target(tmp_path: Path) -> None:
+    """Behind a participating but OPEN upstream the requirement is merely missing; the verdict's hint resolves it to ``b``."""
+    vt = _transform(
+        "value_transform",
+        {"required_input_fields": ["Name"], "operations": [{"target": "doubled", "expression": "row['b']"}], "schema": _OBSERVED},
+    )
+    source = _mapped_source(tmp_path, schema={"mode": "flexible", "fields": ["id: str", "b: str"]})
+    validated = _cli("validate", "-s", str(_settings(tmp_path, source=source, transforms=[vt])))
+
+    assert validated.exit_code != 0
+    assert "Header spellings: 'Name' is a header spelling of 'b'" in _flat(validated.output)
+
+
+def test_the_mapping_key_itself_is_refused_at_build(tmp_path: Path) -> None:
+    """``name`` is its own normalized form, yet the source renames it: declaring it names ``b`` too."""
+    vt = _transform(
+        "value_transform",
+        {"operations": [{"target": "doubled", "expression": "row['b']"}], "schema": {"mode": "flexible", "fields": ["name: int?"]}},
+    )
+    output = _refused_at_build(_settings(tmp_path, source=_mapped_source(tmp_path, schema=_FIXED_ID_B), transforms=[vt]))
+
+    assert "'name' is a header spelling of 'b': the source's field_mapping renames 'name' to 'b'. Declare 'b'" in output
+
+
+def test_the_rename_target_is_the_canonical_declaration_and_delivers(tmp_path: Path) -> None:
+    """Control: the codex shape declared by the target ``b`` — the lookup ``Name`` keeps working, the str is delivered as a str."""
+    mapper = _transform(
+        "field_mapper", {"mapping": {"Name": "given"}, "select_only": True, "schema": {"mode": "flexible", "fields": ["b: str?"]}}
+    )
+    result = _run(_settings(tmp_path, source=_mapped_source(tmp_path), transforms=[mapper]))
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+    assert [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()] == [{"given": SENTINEL}, {"given": "Bob"}]
+
+
+def test_the_canonical_typed_declaration_of_the_codex_shape_is_refused_by_type(tmp_path: Path) -> None:
+    """Control: ``b: int?`` over the fixed ``b: str`` is the type refusal the header spelling used to walk past."""
+    mapper = _transform(
+        "field_mapper", {"mapping": {"Name": "given"}, "select_only": True, "schema": {"mode": "flexible", "fields": ["b: int?"]}}
+    )
+    validated = _cli("validate", "-s", str(_settings(tmp_path, source=_mapped_source(tmp_path, schema=_FIXED_ID_B), transforms=[mapper])))
+
+    assert validated.exit_code != 0
+    assert "Type mismatches: b (expected int | None, got str)" in _flat(validated.output)
+
+
+def test_a_renamed_header_sink_declaration_ends_the_run_with_every_token_terminal(tmp_path: Path) -> None:
+    sink = _json_sink(tmp_path / "out.jsonl", schema={"mode": "flexible", "fields": ["Name: int?"]})
+    result = _run(_settings(tmp_path, source=_mapped_source(tmp_path), out_sink=sink))
+
+    assert result.exit_code == 4, result.output
+    assert "'Name' is a header spelling of 'b'" in _flat(result.output)
+    assert SENTINEL not in result.output
+    assert _terminal_outcomes(tmp_path) == {"failure/unrouted": 2}
+
+
+def test_a_renamed_header_sink_declaration_is_refused_at_build(tmp_path: Path) -> None:
+    sink = _json_sink(tmp_path / "out.jsonl", schema={"mode": "flexible", "fields": ["Name: int?"]})
+    output = _refused_at_build(_settings(tmp_path, source=_mapped_source(tmp_path, schema=_FIXED_ID_B), out_sink=sink))
+
+    assert "'Name' is a header spelling of 'b'" in output
+
+
+def test_a_renamed_header_group_by_fails_the_batch_routed(tmp_path: Path) -> None:
+    source = _mapped_source(
+        tmp_path, schema={"mode": "flexible", "fields": ["amount: float"]}, text="ID,Name,Amount\n1,Ann,10\n2,Ann,20\n3,Bob,30\n"
+    )
+    aggregation = {
+        "name": "bs",
+        "plugin": "batch_stats",
+        "input": "rows",
+        "on_success": "out",
+        "on_error": "quarantine",
+        "output_mode": "transform",
+        "trigger": {"count": 3},
+        "options": {"value_field": "amount", "group_by": "Name", "schema": _OBSERVED},
+    }
+    result = _run(_settings(tmp_path, source=source, aggregations=[aggregation]))
+
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 3}
+    [failure] = [r for r in _batch_failure_reasons(tmp_path) if r.get("reason") == _READ]
+    assert (failure["fields"], failure["canonical_fields"]) == (["Name"], ["b"])

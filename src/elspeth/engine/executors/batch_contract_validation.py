@@ -105,7 +105,7 @@ def validate_batch_inputs(
         # the literal. Created names are not checked at a batch seam: its
         # output does not carry the buffered rows forward (the build's
         # TRANSFORM-only scope, elspeth-cfcd333f83).
-        spellings = declared_spellings.in_row(row_keys=frozenset(row.to_dict()), forwarded_keys=())
+        spellings = declared_spellings.in_row(row_keys=frozenset(row.to_dict()), forwarded_keys=(), contract=row.contract)
         if spellings:
             raise HeaderSpelledDeclarationViolation(
                 component=f"{node_kind} transform '{transform.name}' (buffered row {idx})",

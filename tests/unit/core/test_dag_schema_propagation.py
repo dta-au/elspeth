@@ -11,6 +11,8 @@ contracts from upstream transforms, so audit records reflect actual data contrac
 (P1-2026-02-05: pass-through nodes drop computed schema contracts)
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -104,6 +106,7 @@ class MockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed", "guaranteed_fields": ["source_field"]}}
     _on_validation_failure = "discard"
     on_success = "output"

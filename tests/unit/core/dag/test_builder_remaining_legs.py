@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -20,6 +22,7 @@ class _Source:
     _on_validation_failure = "discard"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config if config is not None else {"schema": {"mode": "observed"}}

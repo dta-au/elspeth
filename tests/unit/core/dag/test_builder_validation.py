@@ -8,6 +8,8 @@ union merge.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -29,12 +31,14 @@ class _BuilderValidationMockSource:
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
 
 
 class _BuilderValidationSourceImpostor:
     name = "source_impostor"
     output_schema = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "source_out"

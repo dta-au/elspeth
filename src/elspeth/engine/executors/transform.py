@@ -75,7 +75,7 @@ class TransformResultError(Exception):
 class _NodeSpellingSurface:
     """One transform's field-name spelling surface, as the preflight checks it per row.
 
-    ``spellings`` holds only the declarations the predicate can ever flag;
+    ``spellings`` holds the node's declarations, each reduced once from config;
     ``forwards_input`` is ``can_overwrite_input_fields`` (a created name can
     shadow only a field the node carries forward) and ``removed_input_fields``
     what it removes from that.
@@ -427,13 +427,17 @@ class TransformExecutor:
                 removed_input_fields=transform.removed_input_fields,
             )
         surface = self._spelling_surfaces[node_id]
-        # The usual node declares only canonical names and leaves no candidate:
-        # its rows pay nothing here.
-        if surface.spellings.reads or surface.spellings.creates:
+        # A node that declares nothing pays nothing here; otherwise a declared
+        # read the row carries costs one set test, and only a name it does not
+        # carry is resolved — through the row's own contract, the resolution
+        # its lookups use, so ``Name`` under a source ``field_mapping`` names
+        # the renamed field exactly as ``row['Name']`` would read it.
+        if not surface.spellings.is_empty:
             row_keys = frozenset(input_dict)
             spellings = surface.spellings.in_row(
                 row_keys=row_keys,
                 forwarded_keys=row_keys - surface.removed_input_fields if surface.forwards_input else frozenset(),
+                contract=token.row_data.contract,
             )
             if spellings:
                 raise HeaderSpelledDeclarationViolation(component=f"Transform '{transform.name}'", spellings=spellings)

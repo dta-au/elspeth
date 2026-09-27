@@ -314,7 +314,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:45320b13b23f6e0b"
+    source_file_hash: str | None = "sha256:d90eb880a10fca95"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -789,7 +789,7 @@ class FieldMapper(BaseTransform):
                     if "." not in source and source in row
                 }
                 forwarded = frozenset(row_data) - removed
-                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded)
+                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded, contract=row.contract)
                 if spellings:
                     raise HeaderSpelledDeclarationViolation(component=f"Transform '{self.name}'", spellings=spellings)
 

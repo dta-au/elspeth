@@ -167,6 +167,7 @@ class ExecutionGraph:
         removed_input_fields: frozenset[str] = frozenset(),
         preserves_input_values: bool = False,
         observed_value_type: str | None = None,
+        field_renames: Mapping[str, str] | None = None,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -250,6 +251,10 @@ class ExecutionGraph:
                 fact holds. Consumed by resolve_guaranteed_field_type's
                 structural source arm (elspeth-e6e552ce34). NodeInfo guards
                 against misuse.
+            field_renames: For SOURCE nodes only — the source's renames after
+                header normalization (SourceProtocol.field_renames), read by
+                the field-name spelling rule's build-time resolution. NodeInfo
+                guards against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -290,6 +295,7 @@ class ExecutionGraph:
             declared_created_fields=declared_created_fields,
             preserves_input_values=preserves_input_values,
             observed_value_type=observed_value_type,
+            field_renames={} if field_renames is None else field_renames,
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,

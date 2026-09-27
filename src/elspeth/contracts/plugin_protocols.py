@@ -204,6 +204,17 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # None. Consumed by resolve_guaranteed_field_type's structural source arm.
     observed_value_type: ClassVar[str | None]
 
+    # The renames this source applies after normalizing an external name — its
+    # validated ``field_mapping``, normalized name -> row key; empty when it
+    # renames nothing. Rows are keyed by ``field_renames.get(normalize(h),
+    # normalize(h))`` (``resolve_field_names``), so a declaration spelled by a
+    # header this source renames names the rename TARGET. Read by the
+    # field-name spelling rule's build-time resolution
+    # (``contracts.field_spelling.FieldNameResolution.of_source_renames``) on
+    # both the DAG builder and the Web Composer's source probe.
+    @property
+    def field_renames(self) -> Mapping[str, str]: ...
+
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
     # prefers this over re-parsing raw options so source-specific schema

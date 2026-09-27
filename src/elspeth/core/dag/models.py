@@ -324,6 +324,14 @@ class NodeInfo:
     # type only for fields in the source's own guaranteed set.
     observed_value_type: str | None = None
 
+    # A source's renames after header normalization (normalized name -> row
+    # key). Populated only for SOURCE nodes by the builder from
+    # SourceProtocol.field_renames. Consumed by validate_declared_field_spellings,
+    # which resolves a downstream declaration through the renames of every
+    # source whose rows reach it (field-name spelling rule): under
+    # field_mapping {name: b} the declaration 'Name' names 'b'.
+    field_renames: Mapping[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
@@ -480,6 +488,14 @@ class NodeInfo:
                 component_id=self.node_id,
                 component_type=component_type,
             )
+        # Same threading guard for the source's renames.
+        if self.field_renames and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.field_renames is only meaningful for SOURCE nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        freeze_fields(self, "field_renames")
         # Offensive programming: the forwarding declaration shares
         # passes_through_input's scope and rationale above — it too describes a
         # node executing a TransformProtocol plugin. Checking removed_input_fields

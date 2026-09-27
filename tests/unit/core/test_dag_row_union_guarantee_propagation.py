@@ -24,6 +24,8 @@ when every predecessor delivers the SAME row):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -51,6 +53,7 @@ class _SourceWithGuarantees:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: Mapping[str, str] = MappingProxyType({})
     _on_validation_failure = "discard"
 
     def __init__(self, guaranteed: tuple[str, ...]) -> None:

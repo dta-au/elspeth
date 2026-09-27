@@ -26,6 +26,7 @@ from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
     DeclaredSpellings,
+    FieldNameResolution,
     describe_header_spellings,
     header_spelled_declarations,
 )
@@ -7244,6 +7245,93 @@ def _check_schema_contracts(
     # makes unbounded.
     spelling_rule_abstains = _node_topology_cycle(nodes) is not None
 
+    # The rule resolves a declared name the way the upstream does: through the
+    # ``field_mapping`` of every source whose rows reach the consumer, read off
+    # a probe instance's ``field_renames`` exactly as the builder reads the real
+    # source's (``upstream_name_resolution`` in core/dag/schema_validation.py).
+    source_renames_memo: dict[str, Mapping[str, str]] = {}
+
+    def _source_field_renames(producer: ProducerEntry) -> Mapping[str, str]:
+        """A source producer's ``field_renames``; empty when its draft config does not construct.
+
+        A source that does not build is refused by its own validation, and the
+        build that would read its renames never runs, so it contributes none.
+        """
+        source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+        if source_name in source_renames_memo:
+            return source_renames_memo[source_name]
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+        source_spec = source_map[source_name]
+        probe: SourceProtocol | None = None
+        renames: Mapping[str, str]
+        try:
+            probe_options = prepare_validation_probe_options(source_spec.options, plugin=source_spec.plugin)
+            probe_options["on_validation_failure"] = source_spec.on_validation_failure
+            with plugin_preflight_mode(True):
+                probe = get_shared_plugin_manager().create_source(source_spec.plugin, probe_options)
+            renames = probe.field_renames
+        except Exception as exc:
+            if not _is_source_config_probe_exception(exc):
+                raise
+            renames = {}
+        finally:
+            if probe is not None:
+                probe.close()
+        source_renames_memo[source_name] = renames
+        return renames
+
+    def _node_input_connections(node: NodeSpec) -> tuple[str, ...]:
+        return _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+
+    def _publishes_live(entry: ProducerEntry, connection: str) -> bool:
+        """Whether the producer delivers ROWS on ``connection`` — success, a route or a fork, never ``on_error``.
+
+        The builder's non-DIVERT edges; a source registers only its ``on_success``.
+        """
+        if is_source_producer_id(entry.producer_id):
+            return True
+        node = node_by_id[entry.producer_id]
+        return (
+            connection == published_success_connection(node)
+            or (node.routes is not None and connection in node.routes.values())
+            or (node.fork_to is not None and connection in node.fork_to)
+        )
+
+    def _live_producers_of(connection: str) -> tuple[ProducerEntry, ...]:
+        if connection in sink_names:
+            return tuple(entry for entry in resolver.sink_producers(connection) if _publishes_live(entry, connection))
+        producer = resolver.find_producer_for(connection)
+        if producer is None:
+            return ()
+        if not is_source_producer_id(producer.producer_id) and node_by_id[producer.producer_id].node_type == "queue":
+            return tuple(
+                entry for entry in resolver.queue_predecessors(producer.producer_id) if _publishes_live(entry, producer.producer_id)
+            )
+        return (producer,) if _publishes_live(producer, connection) else ()
+
+    def _live_sources_reaching(connections: tuple[str, ...]) -> FieldNameResolution:
+        """The renames of every source whose rows reach ``connections`` over live wiring (the build's live walk)."""
+        renames: list[Mapping[str, str]] = []
+        seen_connections: set[str] = set()
+        seen_producers: set[str] = set()
+        pending = list(connections)
+        while pending:
+            connection = pending.pop()
+            if connection in seen_connections:
+                continue
+            seen_connections.add(connection)
+            for producer in _live_producers_of(connection):
+                if producer.producer_id in seen_producers:
+                    continue
+                seen_producers.add(producer.producer_id)
+                if is_source_producer_id(producer.producer_id):
+                    renames.append(_source_field_renames(producer))
+                else:
+                    pending.extend(_node_input_connections(node_by_id[producer.producer_id]))
+        return FieldNameResolution.of_source_renames(renames)
+
     def _header_spelling_error(
         *,
         component: str,
@@ -7252,6 +7340,7 @@ def _check_schema_contracts(
         declared: DeclaredSpellings,
         removed: frozenset[str],
         producer: ProducerEntry,
+        resolution: FieldNameResolution,
     ) -> ValidationEntry | None:
         participates, vote_fields = _effective_producer_vote(producer)
         producer_schema = _known_producer_schema_config(producer)
@@ -7261,6 +7350,7 @@ def _check_schema_contracts(
             forwarded=vote_fields - removed,
             participated=participates,
             closed=producer_schema is not None and not producer_schema.allows_extra_fields,
+            resolution=resolution,
         )
         if not spellings:
             return None
@@ -7324,8 +7414,8 @@ def _check_schema_contracts(
         if node.id in parse_failed_producers:
             continue
         surfaces = _probe_transform_spelling_surfaces(node.plugin, node)
-        # A node whose declarations are all canonical has nothing any upstream
-        # could make a header spelling, so no producer is walked for it.
+        # A node that declares nothing has nothing any upstream could make a
+        # header spelling, so no producer is walked for it.
         if surfaces is None or surfaces.declared.is_empty:
             continue
         spelling_producer = _walk_to_real_producer(node.input, warnings=spelling_walk_warnings)
@@ -7338,6 +7428,7 @@ def _check_schema_contracts(
             declared=surfaces.declared,
             removed=surfaces.removed,
             producer=spelling_producer,
+            resolution=_live_sources_reaching(_node_input_connections(node)),
         )
         if spelling_error is not None:
             errors.append(spelling_error)
@@ -7351,6 +7442,7 @@ def _check_schema_contracts(
             direct_producer = _walk_to_real_producer(output.name, warnings=spelling_walk_warnings)
             sink_spelling_producers = () if direct_producer is None else (direct_producer,)
         seen_spelling_producers: set[str] = set()
+        sink_resolution = _live_sources_reaching((output.name,))
         for sink_producer in sink_spelling_producers:
             real_producer = _walk_producer_entry_to_real_producer(
                 sink_producer,
@@ -7369,6 +7461,7 @@ def _check_schema_contracts(
                 declared=sink_declared,
                 removed=frozenset(),
                 producer=real_producer,
+                resolution=sink_resolution,
             )
             if spelling_error is not None:
                 errors.append(spelling_error)

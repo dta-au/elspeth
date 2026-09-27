@@ -154,7 +154,17 @@ drained and repair this release forward.
   `{id: Name}` or `{Name: ID}`, or two `value_transform` targets `total` and
   `Total` of one node, now refused at configuration), or crashed a csv/json sink's write (a header-spelled custom
   `headers` key). A `required_input_fields` verdict for a header spelling of a
-  guaranteed field now names the normalized spelling. Behaviour changes: a
+  guaranteed field now names the normalized spelling. A header the source's
+  `field_mapping` renames is a spelling of the rename's TARGET: under
+  `field_mapping: {name: b}` a declaration `Name`, `NAME` or the mapping key
+  `name` itself names `b` and is refused ("... and the source's field_mapping
+  renames 'name' to 'b'. Declare 'b'"). Only the normalized form used to be
+  compared, so `field_mapper` `{Name: given}` with `Name: int?` under that
+  mapping delivered a str under a recorded `given: int` with exit 0, and both
+  `elspeth validate` and the Composer admitted it. The build and the Composer
+  resolve a declaration through the `field_mapping` of every source whose rows
+  reach the node; the run time resolves it through the row's own contract,
+  exactly as a lookup does. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
   Price}]` over header `Price` worked as a lookup and now routes every row
   with `declared_field_is_header_spelling` — write `field: price`; and a

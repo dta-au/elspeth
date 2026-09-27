@@ -324,6 +324,7 @@ def build_execution_graph(
             output_schema=source_instance.output_schema,  # SourceProtocol requires this
             output_schema_config=source_schema_config,
             observed_value_type=source_instance.observed_value_type,
+            field_renames=source_instance.field_renames,
         )
 
     # Add sinks

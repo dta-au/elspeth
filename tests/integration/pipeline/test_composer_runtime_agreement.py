@@ -8210,7 +8210,7 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
 
     @staticmethod
-    def _value_transform(*, target: str, schema: dict[str, Any] | None = None) -> NodeSpec:
+    def _value_transform(*, target: str, schema: dict[str, Any] | None = None, reads: str = "name") -> NodeSpec:
         return NodeSpec(
             id="t",
             node_type="transform",
@@ -8218,7 +8218,7 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             input="t_in",
             on_success="main",
             on_error="discard",
-            options={"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": "row['name']"}]},
+            options={"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": f"row['{reads}']"}]},
             condition=None,
             routes=None,
             fork_to=None,
@@ -8347,6 +8347,114 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             node=self._keyword_filter("Name"),
         )
         self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
+
+    # --- A header the source's field_mapping renames (Codex final review, finding 1) ---
+    # CSV header 'Name' under field_mapping {name: b}: the row carries 'b', and
+    # a lookup of 'Name' reads it, so every spelling of the mapped header —
+    # 'Name', and the mapping key 'name' itself — declares 'b'. Both surfaces
+    # resolve the declaration through the renames of the sources reaching it;
+    # comparing only normalize(T) admitted the Codex shape on both, delivering
+    # a str under a recorded 'given: int'.
+
+    def _mapped_state(
+        self,
+        tmp_path: Path,
+        *,
+        node: NodeSpec | None,
+        output_schema: dict[str, Any] | None = None,
+        source_schema: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        source = SourceSpec(
+            plugin="csv",
+            on_success="t_in" if node is not None else "main",
+            options={
+                "path": str(self._csv_input(tmp_path)),
+                "field_mapping": {"name": "b"},
+                "schema": source_schema or {"mode": "fixed", "fields": ["id: str", "b: str"]},
+            },
+            on_validation_failure="discard",
+        )
+        return CompositionState(
+            source=source,
+            nodes=() if node is None else (node,),
+            edges=(),
+            outputs=(self._output(tmp_path, output_schema),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def test_both_reject_the_codex_shape_a_renamed_header_declared_on_a_field_mapper(self, tmp_path: Path) -> None:
+        node = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        node = replace(node, options={**node.options, "select_only": True})
+        self._assert_both_reject(
+            self._mapped_state(tmp_path, node=node),
+            tmp_path,
+            "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') "
+            "and the source's field_mapping renames 'name' to 'b'. Declare 'b'",
+        )
+
+    @pytest.mark.parametrize("declared", ["Name", "name"], ids=["the-header", "the-mapping-key"])
+    def test_both_reject_a_renamed_header_read_behind_a_closed_upstream(self, tmp_path: Path, declared: str) -> None:
+        state = self._mapped_state(
+            tmp_path,
+            node=self._value_transform(target="total", schema={"mode": "flexible", "fields": [f"{declared}: str?"]}, reads="b"),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert f"'{declared}' is a header spelling of 'b'" in entry.message
+        assert entry.contract is not None and declared in entry.contract.missing_fields
+        assert not runtime.is_valid
+        assert any(f"'{declared}' is a header spelling of 'b'" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_a_renamed_header_sink_declaration_behind_a_closed_upstream(self, tmp_path: Path) -> None:
+        self._assert_both_reject(
+            self._mapped_state(tmp_path, node=None, output_schema={"mode": "flexible", "fields": ["Name: str?"]}),
+            tmp_path,
+            "'Name' is a header spelling of 'b'",
+        )
+
+    def test_both_accept_the_rename_target_and_what_an_observed_upstream_cannot_prove(self, tmp_path: Path) -> None:
+        """Controls: declaring the target 'b' is canonical; an observed source proves no absence (the row settles it)."""
+        declares = {"mode": "flexible", "fields": ["b: str?"]}
+        self._assert_both_accept(
+            self._mapped_state(tmp_path, node=self._value_transform(target="total", schema=declares, reads="b")), tmp_path
+        )
+        header = {"mode": "flexible", "fields": ["Name: str?"]}
+        observed = self._mapped_state(
+            tmp_path, node=self._value_transform(target="total", schema=header, reads="b"), source_schema={"mode": "observed"}
+        )
+        self._assert_both_accept(observed, tmp_path)
+
+    def test_both_resolve_only_through_the_sources_whose_rows_reach_the_consumer(self, tmp_path: Path) -> None:
+        """A second source's rename does not reach a consumer fed only by the first.
+
+        Source 'plain' (header 'ID,B', no rename) feeds the transform; source
+        'mapped' renames name -> b but writes straight to its own sink. The
+        transform's optional 'Name' names nothing its rows carry, so neither
+        surface refuses it; resolving through every source in the pipeline
+        would have refused it as a spelling of 'b'.
+        """
+        plain_csv = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "plain.csv"
+        plain_csv.parent.mkdir(parents=True, exist_ok=True)
+        plain_csv.write_text("ID,B\n1,x\n", encoding="utf-8")
+        mapped = self._mapped_state(tmp_path, node=None)
+        state = CompositionState(
+            sources={
+                "plain": SourceSpec(
+                    plugin="csv",
+                    on_success="t_in",
+                    options={"path": str(plain_csv), "schema": {"mode": "fixed", "fields": ["id: str", "b: str"]}},
+                    on_validation_failure="discard",
+                ),
+                "mapped": mapped.sources["source"],
+            },
+            nodes=(self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b"),),
+            edges=(),
+            outputs=mapped.outputs,
+            metadata=mapped.metadata,
+            version=1,
+        )
+        self._assert_both_accept(state, tmp_path)
 
     @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
     def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:
