@@ -168,6 +168,12 @@ class TestShape:
         assert result.reason["cause"] == "batch_too_large"
         assert result.reason["batch_size"] == 3
 
+    def test_batch_of_exactly_the_cap_is_ranked(self, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("elspeth.plugins.transforms.batch_rank._MAX_BATCH_ROWS", 2)
+        rows = [_make_row({"score": value}) for value in (1, 2)]
+        result = BatchRank({"schema": OBSERVED, "value_field": "score"}).process(rows, ctx)
+        assert _column(result, "rank_rank") == [2, 1]
+
     @settings(max_examples=150, deadline=None)
     @given(
         values=st.lists(
