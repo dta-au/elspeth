@@ -82,7 +82,8 @@ elspeth run --settings examples/batch_rank_passthrough/settings.yaml --execute
 elspeth run --settings examples/batch_rank_passthrough/settings_transform.yaml --execute
 ```
 
-Expected summary line, the same for both configs (timing varies):
+Expected summary line, the same for both configs (the timing varies, and so
+does the order of the two routed sinks, `shortlist:7` and `remaining:5`):
 
 ```
 ✓ Run COMPLETED: 12 rows processed | ✓12 succeeded | ✗0 failed | ⚠0 quarantined | →12 routed (shortlist:7, remaining:5)
