@@ -33,16 +33,18 @@ fields and declare only the truly required subset in required_input_fields.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment, meta
 from jinja2.compiler import find_undeclared
 from jinja2.nodes import (
+    And,
     Assign,
     Call,
     CallBlock,
+    CondExpr,
     Const,
     Filter,
     For,
@@ -53,6 +55,7 @@ from jinja2.nodes import (
     Name,
     Node,
     NSRef,
+    Or,
     Pair,
     Tuple,
     With,
@@ -133,7 +136,7 @@ _DYNAMIC_ACCESS_EXAMPLES: dict[str, str] = {
 # kind's shape, never the template's own text, so a message stays one line.
 _ROW_API_MISUSE_EXAMPLES: dict[str, str] = {
     ROW_API_DYNAMIC_ACCESS: "row.contract, row.to_dict, row.to_checkpoint_format or a name starting with '_'",
-    ROW_FIELD_CALL_ACCESS: "a call on a row field, such as row.keys(), row.items(), row['keys']() or row.name()",
+    ROW_FIELD_CALL_ACCESS: "a call on a row field, such as row.keys(), row.items(), row['keys'](), row.name() or row.get('name')()",
     UNCALLED_GET_ACCESS: "row.get without a call",
 }
 
@@ -282,6 +285,7 @@ def extract_jinja2_field_usage(
         row_collection_aliases,
         row_container_aliases,
         carrier_limit_reached,
+        row_receivers,
     ) = _field_extraction_context(ast, namespace)
     fields: set[str] = set()
     dynamic_accesses: list[str] = []
@@ -296,6 +300,7 @@ def extract_jinja2_field_usage(
         fields,
         dynamic_accesses,
         _called_nodes(ast),
+        row_receivers,
     )
     for kind in _shifted_varargs_splat_kinds(
         ast, namespaces, api_aliases, row_api_container_aliases, row_collection_aliases, row_container_aliases
@@ -369,9 +374,16 @@ def extract_jinja2_fields(
     validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
-    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases, _ = (
-        _field_extraction_context(ast, namespace)
-    )
+    (
+        namespaces,
+        api_aliases,
+        row_api_container_aliases,
+        row_value_aliases,
+        row_collection_aliases,
+        row_container_aliases,
+        _,
+        row_receivers,
+    ) = _field_extraction_context(ast, namespace)
     fields: set[str] = set()
     dynamic_accesses: list[str] = []
     _walk_ast(
@@ -385,6 +397,7 @@ def extract_jinja2_fields(
         fields,
         dynamic_accesses,
         _called_nodes(ast),
+        row_receivers,
     )
     return frozenset(fields)
 
@@ -400,6 +413,39 @@ def extract_jinja2_fields(
 # syntax on a template row reads a field.
 _PIPELINE_ROW_API_NAMES: frozenset[str] = TEMPLATE_ROW_METHODS | RETIRED_ROW_API_NAMES
 
+# Literal expression nodes: their value is never callable.
+_LITERAL_NODES: tuple[type[Node], ...] = (Const, List, Tuple, DictNode)
+
+# The builtin filters whose result can be their operand's own element: over a
+# collection that may hold the row they may return the row object itself
+# (``([row] | first).keys()``). Every other builtin filter builds a new value
+# from its operand (``row | list`` a list of names, ``row | tojson`` a string,
+# ``row | safe`` markup), so a method on its result is that value's method.
+_ELEMENT_RETURNING_FILTERS: frozenset[str] = frozenset({"first", "last", "random", "min", "max"})
+
+# The builtin filters that can return their operand (or their default argument)
+# unchanged: ``(row | default({})).keys()`` still calls on the row object.
+_OPERAND_RETURNING_FILTERS: frozenset[str] = frozenset({"default", "d"})
+
+# A dict's own attributes. Attribute syntax on a dict finds one of these first
+# (``dict(row).items`` is the method) and reads a key for any other name
+# (``dict(row).note`` is the field).
+_DICT_ATTRIBUTE_NAMES: frozenset[str] = frozenset(name for name in dir(dict) if not name.startswith("_"))
+
+
+@dataclass(frozen=True, slots=True)
+class _RowReceiverNames:
+    """The names a call's receiver can be judged by: each a subset of the names that may carry the row's fields.
+
+    ``objects`` may hold the row object itself, on which attribute and item
+    syntax always read a field. ``mappings`` may hold a dict built from the
+    row (``{% set d = dict(row) %}``), on which a dict attribute is the dict's
+    own and any other name reads a field.
+    """
+
+    objects: frozenset[str]
+    mappings: frozenset[str]
+
 
 def _walk_ast(
     node: Node,
@@ -412,6 +458,7 @@ def _walk_ast(
     fields: set[str],
     dynamic_accesses: list[str],
     called: frozenset[int],
+    row_receivers: _RowReceiverNames,
 ) -> None:
     """Recursively walk AST to find namespace attribute/item accesses.
 
@@ -421,12 +468,13 @@ def _walk_ast(
         fields: Set to accumulate found field names (mutated)
         dynamic_accesses: List to accumulate dynamic access kinds (mutated)
         called: ``id`` of every node the template calls (``_called_nodes``)
+        row_receivers: names that may hold the row object or a dict built from it (``_RowReceiverNames``)
     """
     if isinstance(node, Call):
         alias_kind = _row_api_alias_expression_kind(node.node, api_aliases, row_api_container_aliases)
         if alias_kind is not None:
             _append_dynamic_access(dynamic_accesses, alias_kind)
-        if _is_row_field_call(node.node, namespaces, row_collection_aliases, row_container_aliases):
+        if _is_row_field_call(node.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases):
             _append_dynamic_access(dynamic_accesses, ROW_FIELD_CALL_ACCESS)
 
     if (
@@ -509,6 +557,7 @@ def _walk_ast(
             fields,
             dynamic_accesses,
             called,
+            row_receivers,
         )
 
 
@@ -523,48 +572,94 @@ def _called_nodes(ast: Node) -> frozenset[int]:
     source_param="callee",
     suppresses=("R5",),
     invariant=(
-        "classifies the callee by AST node type only: True for an attribute (other than the row's one method "
-        "or a reserved name), item or attr-filter lookup whose receiver can be the row object itself; every "
-        "other shape returns False, the explicit no-match result; nothing is evaluated or coerced"
+        "classifies the callee by AST node type only: True for an attribute or attr-filter lookup that reads a "
+        "field (any name but the row's one method or a reserved name on the row object; a name that is not a "
+        "dict attribute on a dict built from the row), an item lookup on anything carrying the row's fields, "
+        "or a row.get(...) whose default is absent or a literal; every other shape returns False, the explicit "
+        "no-match result; nothing is evaluated or coerced"
     ),
     non_raising=True,
 )
 def _is_row_field_call(
     callee: Node,
     namespaces: frozenset[str],
+    row_receivers: _RowReceiverNames,
     row_collection_aliases: frozenset[str],
     row_container_aliases: dict[str, frozenset[_CarrierPath]],
 ) -> bool:
-    """Whether a call's callee is a field of a row: ``row.keys()``, ``row['keys']()``, ``(row | attr('x'))()``.
+    """Whether a call's callee reads a row field: ``row.keys()``, ``row['keys']()``, ``(row | attr('x'))()``, ``row.get('x')()``.
 
-    Attribute and item syntax on a template row read a field, and a field
-    value is plain data (a string, number, boolean, None, list or mapping),
-    so calling it fails every row. ``row.get(...)`` is the row's one method;
-    a retired name (``row.to_dict()``) is reported as the row API instead. A
-    method on a field VALUE (``row.note.upper()``, ``(row.a ~ row.b).upper()``,
-    ``(row.a | default('')).strip()``) has the value, not the row, as its
-    receiver and is not a row call: the receiver must be an expression that
-    can yield the row object itself (``_node_is_row_object_expression``), not
-    merely one that mentions it.
+    A field value is plain data (a string, number, boolean, None, list or
+    mapping), so calling it fails every row. ``row.get(...)`` is the row's one
+    method; a retired name (``row.to_dict()``) is reported as the row API
+    instead.
+
+    Which attribute reads a field depends on the receiver. On the row object
+    itself (``_node_may_be_the_row``) every attribute does. On a dict built
+    from the row (``_node_may_be_a_row_mapping``: ``dict(row)``) a dict
+    attribute is the dict's own method (``dict(row).items()``) and any other
+    name reads a field (``dict(row).note()``). On any other value, a field's
+    (``row.note.upper()``, ``(row.a ~ row.b).upper()``) or a filter's over the
+    whole row (``(row | list).count(x)``, ``(row | tojson).upper()``), the
+    attribute is that value's own and not a row call.
+
+    An item of anything that carries the row's fields
+    (``_node_is_row_object_expression``) is data, a field value, a field name
+    or a character, so calling one is a row call whatever the receiver. So is
+    calling what ``get`` returns, a field value, when ``get`` cannot return its
+    default or the default is a literal: an operator-supplied default
+    (``row.get('x', range)``) may be callable.
     """
     if isinstance(callee, Getattr):
-        return (
-            _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
-            and callee.attr not in TEMPLATE_ROW_METHODS
-            and not _is_blocked_row_attribute_name(callee.attr)
+        return not _is_blocked_row_attribute_name(callee.attr) and _receiver_reads_field(
+            callee.node, callee.attr, row_receivers, namespaces, row_collection_aliases, row_container_aliases
         )
     if isinstance(callee, Filter) and callee.name == "attr":
         name = _filter_positional_or_keyword_value(callee, 0, "name")
-        if isinstance(name, Const) and isinstance(name.value, str) and name.value in _PIPELINE_ROW_API_NAMES:
-            # ``attr('get')`` / ``attr('to_dict')`` are reported as the uncalled method / the row API.
-            return False
+        if isinstance(name, Const) and isinstance(name.value, str):
+            if name.value in _PIPELINE_ROW_API_NAMES or _is_blocked_row_attribute_name(name.value):
+                # ``attr('get')`` / ``attr('to_dict')`` are reported as the uncalled method / the row API.
+                return False
+            literal_name: str | None = name.value
+        else:
+            literal_name = None
         # A filter's operand is None only inside a {% filter %} block, where no call can take it.
-        return callee.node is not None and _node_is_row_object_expression(
-            callee.node, namespaces, row_collection_aliases, row_container_aliases
+        return callee.node is not None and _receiver_reads_field(
+            callee.node, literal_name, row_receivers, namespaces, row_collection_aliases, row_container_aliases
         )
     if isinstance(callee, Getitem):
         return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+    if isinstance(callee, Call) and isinstance(callee.node, Getattr) and callee.node.attr in TEMPLATE_ROW_METHODS:
+        if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
+            return False
+        default = _call_positional_or_keyword_value(callee, 1, "default")
+        return (default is None or isinstance(default, _LITERAL_NODES)) and _node_is_row_object_expression(
+            callee.node.node, namespaces, row_collection_aliases, row_container_aliases
+        )
     return False
+
+
+def _receiver_reads_field(
+    receiver: Node,
+    name: str | None,
+    row_receivers: _RowReceiverNames,
+    namespaces: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether attribute ``name`` (``None``: computed) on ``receiver`` reads a row field rather than a method.
+
+    On the row object every name but ``get`` reads a field; on a dict built
+    from the row a literal name that is not a dict attribute does (a computed
+    one may name a method).
+    """
+    if _node_may_be_the_row(receiver, row_receivers.objects, row_collection_aliases, row_container_aliases):
+        return name not in TEMPLATE_ROW_METHODS
+    return (
+        name is not None
+        and name not in _DICT_ATTRIBUTE_NAMES
+        and _node_may_be_a_row_mapping(receiver, row_receivers.mappings, namespaces, row_collection_aliases, row_container_aliases)
+    )
 
 
 @trust_boundary(
@@ -809,8 +904,15 @@ def _field_extraction_context(
     frozenset[str],
     dict[str, frozenset[_CarrierPath]],
     bool,
+    _RowReceiverNames,
 ]:
-    """What every name may hold, to a fixpoint; the last element is whether any alias reached the path cap."""
+    """What every name may hold, to a fixpoint.
+
+    The seventh element is whether any alias reached the path cap; the last
+    is the names that may hold the row object itself or a dict built from it
+    (``_RowReceiverNames``), each a subset of the first, the names that may
+    carry the row's fields.
+    """
     namespaces = {namespace}
     api_aliases: dict[str, str] = {}
     row_api_container_aliases: dict[str, dict[_CarrierPath, str]] = {}
@@ -931,14 +1033,50 @@ def _field_extraction_context(
         len(recorded) >= _MAX_CARRIER_PATHS_PER_ALIAS
         for recorded in (*row_container_aliases.values(), *row_api_container_aliases.values(), *macro_container_aliases.values())
     )
+    final_row_collection_aliases = frozenset(row_collection_aliases)
+    final_row_container_aliases = {name: frozenset(paths) for name, paths in row_container_aliases.items()}
+    bindings: list[tuple[Node, Node]] = [
+        *_assignment_pairs(ast),
+        *_macro_argument_bindings(ast, macros, macro_aliases, macro_container_aliases),
+        *_callblock_argument_bindings(ast, macros, macro_aliases, macro_container_aliases),
+    ]
+    loops = list(ast.find_all(For))
+    frozen_namespaces = frozenset(namespaces)
+    row_object_names = _bound_names(
+        (
+            namespace,
+            *_macro_row_splat_targets(
+                ast, macros, macro_aliases, macro_container_aliases, final_row_collection_aliases, final_row_container_aliases
+            ),
+            *_callblock_row_splat_targets(
+                ast, macros, macro_aliases, macro_container_aliases, final_row_collection_aliases, final_row_container_aliases
+            ),
+        ),
+        bindings,
+        loops,
+        lambda value, names: _node_may_be_the_row(value, names, final_row_collection_aliases, final_row_container_aliases),
+        lambda iterable, names: _iter_may_yield_the_row(iterable, names, final_row_collection_aliases, final_row_container_aliases),
+    )
+    row_mapping_names = _bound_names(
+        (),
+        bindings,
+        loops,
+        lambda value, names: _node_may_be_a_row_mapping(
+            value, names, frozen_namespaces, final_row_collection_aliases, final_row_container_aliases
+        ),
+        lambda iterable, names: _iter_may_yield_a_row_mapping(
+            iterable, names, frozen_namespaces, final_row_collection_aliases, final_row_container_aliases
+        ),
+    )
     return (
         frozenset(namespaces),
         api_aliases,
         row_api_container_aliases,
         frozenset(row_value_aliases),
-        frozenset(row_collection_aliases),
-        {name: frozenset(paths) for name, paths in row_container_aliases.items()},
+        final_row_collection_aliases,
+        final_row_container_aliases,
         carrier_limit_reached,
+        _RowReceiverNames(objects=row_object_names, mappings=row_mapping_names),
     )
 
 
@@ -2142,6 +2280,230 @@ def _node_is_row_object_expression(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="one expression node of a parsed operator-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies the expression by AST node type only: True when evaluating it can yield the row object "
+        "itself (a name bound to the row, a collection element or container entry that may be the row, a "
+        "conditional or boolean operand that may be, an element- or operand-returning filter over one, or a "
+        "call on a non-name callee whose arguments may be); every other shape returns False, the explicit "
+        "no-match result; nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _node_may_be_the_row(
+    node: Node,
+    row_object_names: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether evaluating ``node`` can yield the row object itself, not merely a value built from it.
+
+    ``_node_is_row_object_expression`` answers a wider question, whether an
+    expression may carry the row's fields: it admits ``dict(row)`` and
+    ``row | list`` because a field read through them still names a row field.
+    A method call has a receiver, and only the row object reads a field for
+    every attribute; a builtin or a filter over the row builds a new value
+    whose methods are its own (``dict(row).items()``, ``(row | list).count(x)``).
+    """
+    if isinstance(node, Name):
+        return node.name in row_object_names
+    if isinstance(node, Getitem) and _iter_may_yield_the_row(node.node, row_object_names, row_collection_aliases, row_container_aliases):
+        return True
+    if isinstance(node, (Getattr, Getitem)):
+        return _row_object_container_access_matches(node, row_container_aliases)
+    if isinstance(node, CondExpr):
+        return _node_may_be_the_row(node.expr1, row_object_names, row_collection_aliases, row_container_aliases) or (
+            node.expr2 is not None and _node_may_be_the_row(node.expr2, row_object_names, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(node, (And, Or)):
+        return _node_may_be_the_row(node.left, row_object_names, row_collection_aliases, row_container_aliases) or _node_may_be_the_row(
+            node.right, row_object_names, row_collection_aliases, row_container_aliases
+        )
+    if isinstance(node, Filter):
+        if node.name in _ELEMENT_RETURNING_FILTERS:
+            return _iter_may_yield_the_row(node.node, row_object_names, row_collection_aliases, row_container_aliases)
+        if node.name in _OPERAND_RETURNING_FILTERS:
+            default_value = _filter_positional_or_keyword_value(node, 0, "default_value")
+            return (
+                node.node is not None and _node_may_be_the_row(node.node, row_object_names, row_collection_aliases, row_container_aliases)
+            ) or (
+                default_value is not None
+                and _node_may_be_the_row(default_value, row_object_names, row_collection_aliases, row_container_aliases)
+            )
+        return False
+    if isinstance(node, Call):
+        if isinstance(node.node, Name):
+            # A global (dict, range, namespace, cycler, ...) or a macro returns a value of its own.
+            return False
+        if isinstance(node.node, Getattr) and _node_may_be_the_row(
+            node.node.node, row_object_names, row_collection_aliases, row_container_aliases
+        ):
+            # ``row.get(...)`` returns a field value (every other method on the row is a row call).
+            return False
+        # A method on another value may hand back an argument (``loop.cycle(row, x)``).
+        return any(
+            _node_may_be_the_row(child, row_object_names, row_collection_aliases, row_container_aliases)
+            for child in node.iter_child_nodes()
+        )
+    return False
+
+
+@trust_boundary(
+    tier=3,
+    source="the iterable expression of a parsed operator-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies the iterable by AST node type only: True when an element of it can be the row object itself "
+        "(a row collection or container alias, a literal list or tuple holding an expression that may be the row, "
+        "or a collection filter over one); every other shape returns False, the explicit no-match result; "
+        "nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _iter_may_yield_the_row(
+    node: Node | None,
+    row_object_names: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """``_iter_may_yield_row_object`` with a literal list's elements judged by ``_node_may_be_the_row``."""
+    if isinstance(node, (List, Tuple)):
+        return any(_node_may_be_the_row(item, row_object_names, row_collection_aliases, row_container_aliases) for item in node.items)
+    if isinstance(node, Filter) and node.name not in {"map", "first", "last", "random"}:
+        return _iter_may_yield_the_row(node.node, row_object_names, row_collection_aliases, row_container_aliases)
+    return _iter_may_yield_row_object(node, row_object_names, row_collection_aliases, row_container_aliases)
+
+
+@trust_boundary(
+    tier=3,
+    source="one expression node of a parsed operator-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies the expression by AST node type only: True when evaluating it can yield a dict built from the "
+        "row's fields (a dict() call over one expression carrying them, a name bound to one, or a conditional, "
+        "boolean, default filter, element filter or literal-list item that may be one); every other shape "
+        "returns False, the explicit no-match result; nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _node_may_be_a_row_mapping(
+    node: Node,
+    row_mapping_names: frozenset[str],
+    namespaces: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether evaluating ``node`` can yield a dict whose keys are the row's fields: ``dict(row)``, ``dict(row | items)``.
+
+    Only a ``dict()`` call with one positional argument that carries the
+    row's fields counts: a keyword or splat adds keys that are not fields.
+    """
+    if isinstance(node, Name):
+        return node.name in row_mapping_names
+    if isinstance(node, Call) and isinstance(node.node, Name) and node.node.name == "dict":
+        return (
+            len(node.args) == 1
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and _node_is_row_object_expression(node.args[0], namespaces, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(node, CondExpr):
+        return _node_may_be_a_row_mapping(node.expr1, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases) or (
+            node.expr2 is not None
+            and _node_may_be_a_row_mapping(node.expr2, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(node, (And, Or)):
+        return _node_may_be_a_row_mapping(
+            node.left, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases
+        ) or _node_may_be_a_row_mapping(node.right, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+    if isinstance(node, Filter) and node.name in _OPERAND_RETURNING_FILTERS:
+        default_value = _filter_positional_or_keyword_value(node, 0, "default_value")
+        return (
+            node.node is not None
+            and _node_may_be_a_row_mapping(node.node, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+        ) or (
+            default_value is not None
+            and _node_may_be_a_row_mapping(default_value, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(node, Filter) and node.name in _ELEMENT_RETURNING_FILTERS:
+        return _iter_may_yield_a_row_mapping(node.node, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+    if isinstance(node, Getitem):
+        return _iter_may_yield_a_row_mapping(node.node, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+    return False
+
+
+@trust_boundary(
+    tier=3,
+    source="the iterable expression of a parsed operator-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies the iterable by AST node type only: True when it is a literal list or tuple holding an "
+        "expression that may be a dict built from the row; every other shape returns False, the explicit "
+        "no-match result; nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _iter_may_yield_a_row_mapping(
+    node: Node | None,
+    row_mapping_names: frozenset[str],
+    namespaces: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether an element of a literal list or tuple may be a dict built from the row (``[dict(row)][0]``)."""
+    return isinstance(node, (List, Tuple)) and any(
+        _node_may_be_a_row_mapping(item, row_mapping_names, namespaces, row_collection_aliases, row_container_aliases)
+        for item in node.items
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="the bindings and loops of a parsed operator-authored Jinja template",
+    source_param="bindings",
+    suppresses=("R5",),
+    invariant=(
+        "a fixpoint over the template's own bindings: a name joins only when a binding or loop can hand it a "
+        "value the caller's predicate accepts; a non-name target binds nothing here; nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _bound_names(
+    seed: Iterable[str],
+    bindings: list[tuple[Node, Node]],
+    loops: list[For],
+    binds: Callable[[Node, frozenset[str]], bool],
+    yields: Callable[[Node, frozenset[str]], bool],
+) -> frozenset[str]:
+    """The names that may hold one kind of value, to a fixpoint over the template's bindings and loops.
+
+    ``binds(value, names)`` says whether a bound value may be of that kind
+    given the names found so far; ``yields(iterable, names)`` whether a loop's
+    iterable may yield one. ``_field_extraction_context`` runs it twice beside
+    its own fixpoint (``_RowReceiverNames``).
+    """
+    names = set(seed)
+    changed = True
+    while changed:
+        current = frozenset(names)
+        for target, value in bindings:
+            if isinstance(target, Name) and binds(value, current):
+                names.add(target.name)
+        for loop in loops:
+            if yields(loop.iter, current):
+                names.update(_target_names(loop.target))
+        changed = names != current
+    return frozenset(names)
+
+
 def _node_is_row_collection_expression(
     node: Node,
     namespaces: frozenset[str],
@@ -2247,7 +2609,7 @@ def extract_jinja2_fields_with_details(
     validate_jinja_source(template_string)
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
-    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases, _ = (
+    namespaces, api_aliases, row_api_container_aliases, row_value_aliases, row_collection_aliases, row_container_aliases, _, _ = (
         _field_extraction_context(ast, namespace)
     )
     fields: dict[str, list[str]] = {}

@@ -127,6 +127,17 @@ _MISUSES = (
     pytest.param("{{ R['keys']() }}", "a call on a row field", id="item-call"),
     pytest.param("{{ R.F() }}", "a call on a row field", id="declared-field-called"),
     pytest.param("{% set r = R %}{{ r.keys() | list }}", "a call on a row field", id="aliased-call"),
+    pytest.param("{% for r in [R] %}{{ r.keys() | list }}{% endfor %}", "a call on a row field", id="loop-variable-call"),
+    pytest.param("{% macro m(r) %}{{ r.keys() | list }}{% endmacro %}{{ m(R) }}", "a call on a row field", id="macro-argument-call"),
+    pytest.param("{{ (R if R else {}).keys() }}", "a call on a row field", id="call-through-a-conditional"),
+    pytest.param("{{ (R | attr('keys'))() }}", "a call on a row field", id="attr-filter-call"),
+    pytest.param("{{ (R | default({})).keys() }}", "a call on a row field", id="call-through-default"),
+    pytest.param("{{ ([R] | max).keys() }}", "a call on a row field", id="call-on-a-collection-element"),
+    pytest.param("{{ R.get('F')() }}", "a call on a row field", id="get-result-called"),
+    pytest.param("{{ R.get('F', none)() }}", "a call on a row field", id="get-result-with-a-literal-default-called"),
+    pytest.param("{{ dict(R).F() }}", "a call on a row field", id="field-of-a-dict-built-from-the-row-called"),
+    pytest.param("{% set d = dict(R) %}{{ d.F() }}", "a call on a row field", id="field-of-an-aliased-dict-called"),
+    pytest.param("{{ dict(R)['F']() }}", "a call on a row field", id="item-of-a-whole-row-value-called"),
     pytest.param("{{ R.get }}", "row.get without a call", id="uncalled-get"),
     pytest.param("{{ R | attr('get') }}", "row.get without a call", id="uncalled-get-through-attr"),
 )
@@ -197,6 +208,42 @@ def test_a_method_on_a_value_is_not_a_row_call(template: str, row_attribute: str
     from elspeth.core.templates import extract_jinja2_field_usage
 
     assert extract_jinja2_field_usage(template, row_attribute=row_attribute).row_api_misuses == ()
+
+
+# A method on a whole-row value: the value a builtin or a filter builds from the
+# row has its own methods (G3 fix round 1, review F1).
+_WHOLE_ROW_VALUE_METHODS = (
+    pytest.param("{% for k, v in dict(R).items() %}{{ k }}={{ v }};{% endfor %}", id="dict-items"),
+    pytest.param("{{ dict(R).keys() | list }}", id="dict-keys"),
+    pytest.param("{{ dict(R).get('note') }}", id="dict-get"),
+    pytest.param("{{ (R | list).count('note') }}", id="list-count"),
+    pytest.param("{{ (R | list | join(',')).upper() }}", id="joined-names-upper"),
+    pytest.param("{{ (R | tojson).upper() }}", id="json-text-upper"),
+    pytest.param("{% set d = dict(R) %}{{ d.items() | list }}", id="aliased-dict-items"),
+    pytest.param("{% with d = dict(R) %}{{ d.values() | list }}{% endwith %}", id="with-dict-values"),
+    pytest.param("{% set names = R | list %}{{ names.count('note') }}", id="aliased-list-count"),
+    pytest.param("{% for d in [dict(R)] %}{{ d.items() | list }}{% endfor %}", id="looped-dict-items"),
+    pytest.param("{{ [dict(R)][0].items() | list }}", id="indexed-dict-items"),
+    pytest.param("{% macro m(d) %}{{ d.items() | list }}{% endmacro %}{{ m(dict(R)) }}", id="macro-dict-items"),
+)
+
+
+@pytest.mark.parametrize("receiver", [pytest.param("row", id="row"), pytest.param("row.source_row", id="source-row")])
+@pytest.mark.parametrize("form", _WHOLE_ROW_VALUE_METHODS)
+def test_a_method_on_a_whole_row_value_is_not_a_row_call(receiver: str, form: str) -> None:
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    row_attribute = "source_row" if receiver == "row.source_row" else None
+    assert extract_jinja2_field_usage(form.replace("R", receiver), row_attribute=row_attribute).row_api_misuses == ()
+
+
+@pytest.mark.parametrize("build", [pytest.param(_single, id="single-query-row"), pytest.param(_rag, id="rag-row")])
+@pytest.mark.parametrize("form", _WHOLE_ROW_VALUE_METHODS)
+def test_a_method_on_a_whole_row_value_is_admitted_by_the_opt_out_and_renders(build: Any, form: str) -> None:
+    """Configuration admits what the runtime delivers: the dict's, list's or string's own method on the projected view."""
+    template = form.replace("R", "row")
+    build(template, [])
+    assert _ADDRESS.search(_render(template, ALL_FIELDS)) is None
 
 
 def test_a_column_named_like_a_method_or_a_reserved_name_is_read_by_item_or_attribute() -> None:
