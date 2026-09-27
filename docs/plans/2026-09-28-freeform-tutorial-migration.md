@@ -48,8 +48,10 @@
 - [x] Prove Audit reads that exact run's Landscape summary and Graduation renames/reopens the same finished session before publishing completion.
 - [x] Cover Exit during compose and run, missing resumed session, failed readiness, retry, Skip, and Cancel. Run focused backend/frontend tests, typecheck, lint, and production build.
 - [x] Run affected whole-tree gates and PostgreSQL tests for the schema change; compare trust-tier findings against base without signing. Use the frozen full-suite gate before merge where required by shared contracts/schema reach.
-- [ ] Commit only task paths, run branch safety, merge into local `release/0.8.1`, verify ancestry and integrated tests. Do not push.
-- [ ] Rebuild served frontend and restart the local application. Create one disposable local account, complete Welcome→Build→Run→Audit→Graduate in a real browser, verify persisted session/audit evidence, then delete only that account.
+- [x] Commit only task paths, run branch safety, merge into local `release/0.8.1`, verify ancestry and integrated tests. Do not push.
+- [x] Rebuild served frontend and restart the local application. Create one disposable local account, complete Welcome→Build→Run→Audit→Graduate in a real browser, verify persisted session/audit evidence, then delete only that account.
+
+**Local acceptance:** `01d96af9a` was fast-forward merged into `release/0.8.1`; no push. The served build and `/api/ready` passed. A fresh account completed the real browser tutorial through Graduation. Sessions run `f630cfda-becb-4d7f-b164-85283149aab8` completed with 3/3 successful rows; its matching Landscape run contains 3 source rows and recorded LLM calls. The completed preference was persisted, the disposable credential removed and identity disabled, and `dta_user` remained active with admin role. The paired pre-reset databases were archived under `data/archives/freeform-tutorial-epoch70.0Z2OuANV/`.
 
 ## Acceptance invariants
 
