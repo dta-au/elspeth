@@ -437,7 +437,9 @@ drained and repair this release forward.
   live/audit divergence). It is now keyed by the fork group each merge
   actually waits on — the key the coalesce and row_union executors use — so
   that run reports two, matching the live count, and a resumed run
-  reconstructs the same number.
+  reconstructs the same number. A live count above the audit count is no
+  longer logged and tolerated: it ends the run as a counter-parity failure
+  (exit 4), like every other live/audit counter mismatch.
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first
