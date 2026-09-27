@@ -242,7 +242,7 @@ async def _publish_guided_full_terminal_preserving_primary(
     diagnostic; other ``BaseException`` subclasses still escape.
     """
     try:
-        await _await_guided_terminal_write(progress(event), child_cancel_is_integrity=False)
+        await _await_guided_terminal_write(progress(event), child_cancel_is_integrity=False, propagate_caller_cancellation=True)
     except contract_errors.TIER_1_ERRORS:
         raise
     except asyncio.CancelledError as progress_exc:

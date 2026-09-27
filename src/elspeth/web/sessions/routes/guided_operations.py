@@ -250,7 +250,12 @@ async def _join_shielded_task_after_cancellation[T](
         return None
 
 
-async def _await_guided_terminal_write[T](awaitable: Awaitable[T], *, child_cancel_is_integrity: bool = True) -> T:
+async def _await_guided_terminal_write[T](
+    awaitable: Awaitable[T],
+    *,
+    child_cancel_is_integrity: bool = True,
+    propagate_caller_cancellation: bool = False,
+) -> T:
     """Join a guided terminal write before its route releases the operation lease.
 
     A caller may be cancelled repeatedly while a database or progress write is
@@ -258,6 +263,10 @@ async def _await_guided_terminal_write[T](awaitable: Awaitable[T], *, child_canc
     cancels itself has not proved completion and is an integrity failure for
     required writes. A caller that is already preserving a stronger durable
     primary may instead treat a progress-only sink cancellation as secondary.
+    After the join, the caller chooses whether its injected cancellation or
+    an earlier primary failure remains the route outcome. In propagation mode,
+    an ordinary child failure is attached to the caller cancellation; an
+    integrity failure still escapes as primary.
     """
     write_task = asyncio.ensure_future(awaitable)
     try:
@@ -265,6 +274,16 @@ async def _await_guided_terminal_write[T](awaitable: Awaitable[T], *, child_canc
     except asyncio.CancelledError as exc:
         if write_task.cancelled() and child_cancel_is_integrity:
             raise AuditIntegrityError("Guided terminal write was cancelled before completion") from exc
+        if propagate_caller_cancellation:
+            try:
+                await _join_shielded_task_after_cancellation(write_task, primary_cancellation=exc)
+            except AuditIntegrityError:
+                if not child_cancel_is_integrity and write_task.cancelled():
+                    # A secondary progress sink may cancel itself. Preserve
+                    # the independent cancellation injected into the caller.
+                    raise exc from None
+                raise
+            raise exc
         try:
             return await _join_shielded_task_after_cancellation(write_task)
         except asyncio.CancelledError as child_cancel:

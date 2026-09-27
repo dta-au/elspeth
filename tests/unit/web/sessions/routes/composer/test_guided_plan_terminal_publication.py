@@ -17,6 +17,7 @@ from structlog.testing import capture_logs
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.routes.composer.guided_plan import _publish_guided_full_terminal_preserving_primary
+from elspeth.web.sessions.routes.guided_operations import _await_guided_terminal_write
 
 
 def _request() -> Request:
@@ -83,10 +84,12 @@ async def test_sink_internal_cancellation_is_a_secondary_failure_but_injected_ca
 
     started = asyncio.Event()
     release = asyncio.Event()
+    finished = asyncio.Event()
 
     async def blocking_sink(_event: ComposerProgressEvent) -> None:
         started.set()
         await release.wait()
+        finished.set()
 
     task = asyncio.create_task(
         _publish_guided_full_terminal_preserving_primary(
@@ -98,5 +101,110 @@ async def test_sink_internal_cancellation_is_a_secondary_failure_but_injected_ca
     )
     await started.wait()
     task.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=5)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_child_integrity_failure_outweighs_caller_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    integrity_failure = AuditIntegrityError("terminal write integrity failed")
+
+    async def failing_write() -> None:
+        started.set()
+        try:
+            await release.wait()
+            raise integrity_failure
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(_await_guided_terminal_write(failing_write(), propagate_caller_cancellation=True))
+    await started.wait()
+    task.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(AuditIntegrityError) as caught:
+        await asyncio.wait_for(task, timeout=5)
+    assert caught.value is integrity_failure
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_injected_cancellation_outweighs_an_ordinary_terminal_progress_failure() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    sink_failure = RuntimeError("SENSITIVE_SINK_DETAIL")
+
+    async def failing_sink(_event: ComposerProgressEvent) -> None:
+        started.set()
+        try:
+            await release.wait()
+            raise sink_failure
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(
+        _publish_guided_full_terminal_preserving_primary(
+            request=_request(),
+            progress=failing_sink,
+            primary_outcome="durable_complete",
+            event=_event(),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(task, timeout=5)
+    assert caught.value.__cause__ is sink_failure
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_success_preserves_an_existing_ordinary_failure() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    primary_failure = RuntimeError("ordinary primary failure")
+
+    async def terminal_write() -> None:
+        started.set()
+        await release.wait()
+        finished.set()
+
+    async def failure_settlement() -> None:
+        try:
+            raise primary_failure
+        except RuntimeError:
+            await _await_guided_terminal_write(terminal_write())
+            raise
+
+    task = asyncio.create_task(failure_settlement())
+    await started.wait()
+    task.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(RuntimeError) as caught:
+        await asyncio.wait_for(task, timeout=5)
+    assert caught.value is primary_failure
+    assert finished.is_set()
