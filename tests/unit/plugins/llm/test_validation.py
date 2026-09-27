@@ -14,10 +14,12 @@ from types import MappingProxyType
 
 import pytest
 
+from elspeth.contracts.hashing import canonical_json
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
 from elspeth.plugins.transforms.llm.validation import (
     ValidationError,
     ValidationSuccess,
+    extract_structured_fields,
     parse_field_value,
     reject_nonfinite_constant,
     strip_markdown_fences,
@@ -191,6 +193,43 @@ class TestRejectNonfiniteConstant:
         """-Infinity should raise ValueError."""
         with pytest.raises(ValueError, match="-Infinity"):
             reject_nonfinite_constant("-Infinity")
+
+
+# ── extract_structured_fields: json_parse_failed is value-free ──
+
+
+class TestExtractStructuredFieldsParseFailure:
+    """The json_parse_failed reason never carries the response text (C3 r3 F2).
+
+    The response is external content that echoes the prompt, i.e. row data: it
+    stays in the recorded call, never in the reason. The sentinel sits at the
+    start, the middle and the end of each malformed body so a preview of any
+    length or a tail would carry it.
+    """
+
+    _SENTINEL = "SNTL_LLM_RESPONSE_4417"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            f"{_SENTINEL} is not json",
+            f'{{"f": "{_SENTINEL}", "g": {_SENTINEL}}}',
+            f'{{"f": "{_SENTINEL} unterminated',
+            f'{{"f": NaN, "note": "{_SENTINEL}"}}',
+            f'{{"note": "{_SENTINEL}", "f": 1,}}',
+        ],
+        ids=["bare_text", "bare_token", "unterminated_string", "nonfinite_constant", "trailing_comma"],
+    )
+    def test_reason_carries_no_response_text(self, content: str) -> None:
+        fields = (OutputFieldConfig(suffix="f", type=OutputFieldType.STRING),)
+
+        extracted, reason = extract_structured_fields(content, fields)
+
+        assert extracted == {}
+        assert reason is not None
+        assert reason["reason"] == "json_parse_failed"
+        assert reason["content_length"] == len(content)
+        assert self._SENTINEL not in canonical_json(dict(reason))
 
 
 # ── parse_field_value tests ──────────────────────────────────
