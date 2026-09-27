@@ -628,7 +628,7 @@ class RunLifecycleCoordinator:
             # and sweep_deferred_invariants_or_crash committed, so every
             # outcome is visible to the derive. The live loop counters are
             # demoted to a parity cross-check (loud on unexplained mismatch;
-            # the two documented rows_coalesce_failed divergences are
+            # the one documented rows_coalesce_failed divergence is
             # tolerated — see assert_terminal_counter_parity).
             _check_combined_coordination_latch()
             # Durable post-condition beside the deferred-invariant sweep: no

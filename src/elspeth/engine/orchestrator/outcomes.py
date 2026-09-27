@@ -142,7 +142,7 @@ def _terminalize_swept_coalesce_failure(
     ``first_timeout_no_arrivals``) consumes no token and writes no node_state
     at the barrier, so it surfaces nothing and counts nothing HERE: the live
     ``rows_coalesce_failed`` unit is the audit derive's — a (barrier node,
-    row) pair with a FAILED state — and such a group's first FAILED state is
+    fork group) pair with a FAILED state — and such a group's first FAILED state is
     written only if a straggler later arrives, whose late-arrival result then
     carries the group's one count (``CoalesceOutcome.first_failure_evidence``).
     """

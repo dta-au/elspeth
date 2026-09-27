@@ -7,12 +7,13 @@ import json
 from sqlalchemy import func, select
 
 from elspeth.contracts import NodeStateStatus, NodeType
-from elspeth.contracts.enums import GroupSettlementReason
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.schema import (
     node_states_table,
     nodes_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     tokens_table,
 )
@@ -105,19 +106,28 @@ class AuditRunStatusProjection:
         return int(r[0])
 
     def count_failed_coalesce_barrier_rows(self, run_id: str) -> int:
-        """Count distinct (barrier node, source row) barriers that FAILED.
+        """Count distinct (barrier node, fork group) barriers that FAILED.
 
         ``rows_coalesce_failed`` semantics (elspeth-7294de558e): the counter is
-        per failed *barrier* — one pending key ``(barrier_name, row_id)`` that
-        failed to resolve — NOT per branch token.  The durable evidence is the
-        family of FAILED ``node_states`` that the coalesce and row_union
-        executors write at the barrier node: one
-        FAILED state per *arrived branch token*, all sharing the same
-        ``(node_id, row_id)``.  A naive count of FAILED states (or of the
-        per-branch ``(FAILURE, UNROUTED)`` ``token_outcomes``, which carry no
-        node attribution at all) over-reports a 2-branch barrier failure as 2;
-        the faithful reconstruction is the count of DISTINCT
-        ``(node_id, row_id)`` pairs.
+        per failed *barrier group* — one pending key ``(barrier_name,
+        fork_group_id)``, the key the coalesce and row_union executors hold a
+        group under — NOT per branch token.  The durable evidence is the
+        family of FAILED ``node_states`` those executors write at the barrier
+        node: one FAILED state per *arrived branch token*, all sharing the
+        same ``(node_id, fork group)``.  A naive count of FAILED states (or of
+        the per-branch ``(FAILURE, UNROUTED)`` ``token_outcomes``, which carry
+        no node attribution at all) over-reports a 2-branch barrier failure as
+        2; the faithful reconstruction is the count of DISTINCT
+        ``(node_id, fork group)`` pairs.
+
+        The group, not the source row: sibling EXPAND members share one
+        ``row_id``, and each opens its own fork group (the executors re-keyed
+        from ``row_id`` to ``fork_group_id`` for exactly this, spec §5 /
+        arch-M1). Keying on ``row_id`` collapsed two failed groups of one
+        exploded row into one while the live counter counted both — the
+        second tolerated live/audit corner, now closed. The fork group is the
+        token's innermost FORK lineage frame (``path_fork_group_id``, the
+        executors' own accessor), read from ``token_lineage_frames``.
 
         ANCHOR CHOICE (pinned by
         ``tests/unit/core/landscape/test_query_methods.py::TestAuditRunStatusProjection``):
@@ -125,9 +135,10 @@ class AuditRunStatusProjection:
         ``nodes.node_type IN ('coalesce', 'row_union')`` — indexed, structural columns —
         rather than on the ``failure_reason`` strings inside ``error_json``
         (stringly, unindexed, and ambiguous: ``all_branches_lost`` is written
-        by two different resolution paths).  ``row_id`` comes from the
-        ``tokens`` join (branch tokens of one barrier inherit the same source
-        ``row_id`` — the pending key is ``(barrier_name, row_id)``).
+        by two different resolution paths).  The fork group comes from the
+        ``token_lineage_frames`` join on the token's deepest FORK frame; a
+        FAILED barrier state whose token has no FORK frame is Tier-1
+        corruption (the executors refuse such a token before writing).
 
         ONE exclusion, applied Python-side on the parsed error payload: a
         ``late_arrival_after_merge`` state is a straggler token rejected AFTER
@@ -165,21 +176,39 @@ class AuditRunStatusProjection:
             AuditIntegrityError: If a FAILED barrier node_state carries no
                 parseable ``error_json`` — the write side requires an error
                 payload for FAILED states, so its absence is Tier-1
-                audit-database corruption.
+                audit-database corruption — or its token has no FORK lineage
+                frame to name the group.
         """
+        deeper_fork_frame = token_lineage_frames_table.alias("deeper_fork_frame")
+        innermost_fork_depth = (
+            select(func.max(deeper_fork_frame.c.depth))
+            .where(deeper_fork_frame.c.run_id == node_states_table.c.run_id)
+            .where(deeper_fork_frame.c.token_id == node_states_table.c.token_id)
+            .where(deeper_fork_frame.c.kind == FrameKind.FORK.value)
+            .scalar_subquery()
+        )
         query = (
             select(
                 node_states_table.c.node_id,
                 tokens_table.c.row_id,
+                token_lineage_frames_table.c.group_id.label("fork_group_id"),
                 node_states_table.c.error_json,
             )
             .select_from(
                 node_states_table.join(
                     nodes_table,
                     (node_states_table.c.node_id == nodes_table.c.node_id) & (node_states_table.c.run_id == nodes_table.c.run_id),
-                ).join(
+                )
+                .join(
                     tokens_table,
                     (node_states_table.c.token_id == tokens_table.c.token_id) & (node_states_table.c.run_id == tokens_table.c.run_id),
+                )
+                .outerjoin(
+                    token_lineage_frames_table,
+                    (token_lineage_frames_table.c.run_id == node_states_table.c.run_id)
+                    & (token_lineage_frames_table.c.token_id == node_states_table.c.token_id)
+                    & (token_lineage_frames_table.c.kind == FrameKind.FORK.value)
+                    & (token_lineage_frames_table.c.depth == innermost_fork_depth),
                 )
             )
             .where(node_states_table.c.run_id == run_id)
@@ -225,5 +254,11 @@ class AuditRunStatusProjection:
             # payload shapes without crashing on the keyless one.
             if error_payload.get("failure_reason") in {GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value, "late_arrival_after_release"}:
                 continue
-            failed_barriers.add((db_row.node_id, db_row.row_id))
+            if db_row.fork_group_id is None:
+                raise AuditIntegrityError(
+                    f"FAILED barrier node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
+                    f"{run_id!r} belongs to a token with no FORK lineage frame — a barrier holds only branch "
+                    f"tokens of a fork group, so this is a Tier-1 audit-database integrity violation."
+                )
+            failed_barriers.add((db_row.node_id, db_row.fork_group_id))
         return len(failed_barriers)

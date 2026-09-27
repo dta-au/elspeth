@@ -430,6 +430,14 @@ drained and repair this release forward.
   it no longer logs a tolerated divergence for such a group (a group failed
   before any branch arrived is counted when its first straggler arrives, as
   the audit counts it).
+- **`rows_coalesce_failed` counts each failed coalesce or row_union group.**
+  The audit count keyed a failed group by its source row, so when a
+  `json_explode` fed a fork and two exploded items of one row each failed
+  their merge, the run reported one failed group (and logged a tolerated
+  live/audit divergence). It is now keyed by the fork group each merge
+  actually waits on — the key the coalesce and row_union executors use — so
+  that run reports two, matching the live count, and a resumed run
+  reconstructs the same number.
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first

@@ -18,7 +18,9 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, CoalesceFailureReason, RowUnionFailureReason
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.payload_store import (
     IntegrityError as PayloadIntegrityError,
 )
@@ -2792,16 +2794,26 @@ def _coalesce_failure(reason: str = "quorum_not_met_at_timeout") -> CoalesceFail
     )
 
 
+def _fork(group_id: str, branch: str) -> LineageFrame:
+    return LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=branch)
+
+
 class TestAuditRunStatusProjection:
     """Pin the anchor for ``rows_coalesce_failed`` audit derivation (elspeth-7294de558e).
 
-    The counter is per failed BARRIER — one pending key ``(coalesce_name,
-    row_id)`` — reconstructed as DISTINCT ``(node_id, row_id)`` pairs over
-    FAILED node_states at nodes registered with ``node_type='coalesce'``
-    (the structural, indexed anchor), with the single
-    ``late_arrival_after_merge`` reason excluded (a straggler rejected after
-    the barrier resolved is not itself a barrier failure).
+    The counter is per failed BARRIER GROUP — the executors' pending key
+    ``(coalesce_name, fork_group_id)`` — reconstructed as DISTINCT
+    ``(node_id, fork group)`` pairs over FAILED node_states at nodes registered
+    with ``node_type='coalesce'`` or ``'row_union'`` (the structural, indexed
+    anchor), the fork group being the token's innermost FORK lineage frame,
+    with the late-arrival-after-resolution reasons excluded (a straggler
+    rejected after the barrier resolved is not itself a barrier failure).
     """
+
+    def _branch_token(self, factory, token_id: str, *frames: LineageFrame, row_id: str = "row-1", run_id: str = "run-1") -> None:
+        factory.data_flow.create_token(
+            row_id, token_id=token_id, lineage_path=frames, coordination_token=leader_coordination_token(factory, run_id)
+        )
 
     def _setup_coalesce(self, *, run_id: str = "run-1"):
         db, factory = _setup(run_id=run_id)
@@ -2836,12 +2848,54 @@ class TestAuditRunStatusProjection:
         branch token, same row) but counts as ONE failed barrier — the naive
         per-state (or per-token-outcome) tally over-reports it as 2."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-branch-a", coordination_token=leader_coordination_token(factory, "run-1"))
-        factory.data_flow.create_token("row-1", token_id="tok-branch-b", coordination_token=leader_coordination_token(factory, "run-1"))
+        self._branch_token(factory, "tok-branch-a", _fork("fg-1", "branch_a"))
+        self._branch_token(factory, "tok-branch-b", _fork("fg-1", "branch_b"))
         self._fail_state(factory, token_id="tok-branch-a", node_id="coalesce-1", state_id="cs-a")
         self._fail_state(factory, token_id="tok-branch-b", node_id="coalesce-1", state_id="cs-b")
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
+
+    def test_two_fork_groups_of_one_exploded_row_are_two_barriers(self):
+        """json_explode -> fork -> coalesce: sibling EXPAND members share one
+        ``row_id`` but each opens its own fork group, and the executors hold
+        each group under its own ``(coalesce, fork_group_id)`` key. Two such
+        groups failing are two failed barriers — the live counter counts two,
+        and a derive keyed on ``row_id`` collapsed them to one (the closed
+        live/audit corner 2)."""
+        _db, factory = self._setup_coalesce()
+        explode = LineageFrame(kind=FrameKind.EXPAND, group_id="xg-1", member_key="tok-member-1")
+        explode_2 = LineageFrame(kind=FrameKind.EXPAND, group_id="xg-1", member_key="tok-member-2")
+        self._branch_token(factory, "tok-m1-a", explode, _fork("fg-m1", "path_a"))
+        self._branch_token(factory, "tok-m2-a", explode_2, _fork("fg-m2", "path_a"))
+        self._fail_state(factory, token_id="tok-m1-a", node_id="coalesce-1", state_id="cs-m1")
+        self._fail_state(factory, token_id="tok-m2-a", node_id="coalesce-1", state_id="cs-m2")
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 2
+
+    def test_the_innermost_fork_frame_names_the_group(self):
+        """Nested forks: the barrier closes the INNERMOST open fork, exactly as
+        the executors' ``path_fork_group_id`` reads it. Two inner groups under
+        one outer fork are two barriers; two branches of one inner group are
+        one."""
+        _db, factory = self._setup_coalesce()
+        self._branch_token(factory, "tok-i1-a", _fork("fg-outer", "left"), _fork("fg-inner-1", "a"))
+        self._branch_token(factory, "tok-i1-b", _fork("fg-outer", "left"), _fork("fg-inner-1", "b"))
+        self._branch_token(factory, "tok-i2-a", _fork("fg-outer", "right"), _fork("fg-inner-2", "a"))
+        for token_id in ("tok-i1-a", "tok-i1-b", "tok-i2-a"):
+            self._fail_state(factory, token_id=token_id, node_id="coalesce-1", state_id=f"cs-{token_id}")
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 2
+
+    def test_failed_barrier_state_of_a_token_without_a_fork_frame_is_corruption(self):
+        """A barrier holds only branch tokens; the executors refuse a token with
+        no fork group before writing any state, so a FAILED barrier state on
+        one is Tier-1 corruption — never silently dropped from the count."""
+        _db, factory = self._setup_coalesce()
+        self._branch_token(factory, "tok-no-frame")
+        self._fail_state(factory, token_id="tok-no-frame", node_id="coalesce-1", state_id="cs-nf")
+
+        with pytest.raises(AuditIntegrityError, match="no FORK lineage frame"):
+            factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1")
 
     def test_row_union_failed_node_state_counts_as_failed_barrier(self):
         _db, factory = _setup(run_id="run-1")
@@ -2854,8 +2908,8 @@ class TestAuditRunStatusProjection:
             source_row_index=0,
             ingest_sequence=0,
             coordination_token=leader_coordination_token(factory, "run-1"),
-            token_id="tok-branch-a",
         )
+        self._branch_token(factory, "tok-branch-a", _fork("fg-1", "branch_a"))
 
         factory.execution.begin_node_state(
             "tok-branch-a",
@@ -2888,8 +2942,8 @@ class TestAuditRunStatusProjection:
             source_row_index=0,
             ingest_sequence=0,
             coordination_token=leader_coordination_token(factory, "run-1"),
-            token_id="tok-late",
         )
+        self._branch_token(factory, "tok-late", _fork("fg-1", "branch_a"))
 
         factory.execution.begin_node_state(
             "tok-late",
@@ -2931,9 +2985,9 @@ class TestAuditRunStatusProjection:
             source_row_index=1,
             ingest_sequence=1,
             coordination_token=leader_coordination_token(factory, "run-1"),
-            token_id="tok-r2",
         )
-        factory.data_flow.create_token("row-1", token_id="tok-r1", coordination_token=leader_coordination_token(factory, "run-1"))
+        self._branch_token(factory, "tok-r2", _fork("fg-r2", "branch_a"), row_id="row-2")
+        self._branch_token(factory, "tok-r1", _fork("fg-r1", "branch_a"))
 
         self._fail_state(factory, token_id="tok-r1", node_id="coalesce-1", state_id="cs-r1")
         self._fail_state(factory, token_id="tok-r2", node_id="coalesce-1", state_id="cs-r2")
@@ -2945,17 +2999,17 @@ class TestAuditRunStatusProjection:
         successful quorum merge) is not a barrier failure: counting it would
         report a coalesce-failure for a row whose coalesce SUCCEEDED."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-late", coordination_token=leader_coordination_token(factory, "run-1"))
+        self._branch_token(factory, "tok-late", _fork("fg-1", "branch_b"))
         self._fail_state(factory, token_id="tok-late", node_id="coalesce-1", state_id="cs-late", reason="late_arrival_after_merge")
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
 
     def test_late_arrival_does_not_mask_a_real_barrier_failure_on_same_pair(self):
         """A failed barrier followed by a late straggler still counts exactly
-        once — the DISTINCT pair collapse absorbs the straggler state."""
+        once — the DISTINCT (node, fork group) collapse absorbs the straggler."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-branch-a", coordination_token=leader_coordination_token(factory, "run-1"))
-        factory.data_flow.create_token("row-1", token_id="tok-late", coordination_token=leader_coordination_token(factory, "run-1"))
+        self._branch_token(factory, "tok-branch-a", _fork("fg-1", "branch_a"))
+        self._branch_token(factory, "tok-late", _fork("fg-1", "branch_b"))
         self._fail_state(factory, token_id="tok-branch-a", node_id="coalesce-1", state_id="cs-a")
         self._fail_state(factory, token_id="tok-late", node_id="coalesce-1", state_id="cs-late", reason="late_arrival_after_merge")
 

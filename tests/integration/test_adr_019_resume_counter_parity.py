@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import CoalesceFailureReason
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.run_result import RunResult
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -605,7 +607,7 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
 
     Engine-level rebuild (maintainer ruling 2026-08-23, WS2 controller):
     ``count_failed_coalesce_barrier_rows`` counts DISTINCT (coalesce node,
-    row_id) pairs over FAILED node_states — a PURE function of durable
+    fork group) pairs over FAILED node_states — a PURE function of durable
     state (see its own docstring, core/landscape/run_status_projection.py)
     with no concept of "before/after resume" at all; `derive_terminal_status_from_audit`
     (aliased `derive_resume_terminal_status_from_audit`) is likewise "pure
@@ -631,10 +633,17 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
             0,
             {"value": 1},
             row_id=row_id,
-            token_id=token_id,
             coordination_token=setup.coordination_token,
             source_row_index=sequence,
             ingest_sequence=sequence,
+        )
+        # The barrier holds a branch token of the row's fork group; that group
+        # is the derive's unit, so each row's failure is its own barrier.
+        factory.data_flow.create_token(
+            row_id,
+            token_id=token_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=f"fg-{row_id}", member_key="direct_branch"),),
+            coordination_token=setup.coordination_token,
         )
         factory.execution.begin_node_state(
             token_id, "coalesce-merge_paths", 0, {"value": 1}, state_id=state_id, member_token=setup.coordination_token.membership
