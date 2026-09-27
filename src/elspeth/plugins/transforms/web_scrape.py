@@ -61,6 +61,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
     UnauthorizedError,
     WebScrapeError,
+    row_url_rejection_message,
 )
 from elspeth.plugins.transforms.web_scrape_extraction import extract_content
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
@@ -491,7 +492,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:762a6fc3f8341dc1"
+    source_file_hash: str | None = "sha256:677e446d9571bd23"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -839,7 +840,7 @@ class WebScrapeTransform(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "validation_failed",
-                    "error": str(e),
+                    "error": row_url_rejection_message(e),
                     "error_type": type(e).__name__,
                 }
             )
@@ -851,12 +852,10 @@ class WebScrapeTransform(BaseTransform):
         except BodyTooLargeError as e:
             # Rebuild the message from structured fields — str(e) carries the
             # underlying HTTP-layer text, which embeds the raw hop URL.
-            safe_url = fingerprint_url(safe_request.original_url)
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes} for {safe_url}",
-                    "url": safe_url,
+                    "error": f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes}",
                     "body_size": e.body_size,
                     "max_body_bytes": e.max_body_bytes,
                 }
@@ -880,10 +879,8 @@ class WebScrapeTransform(BaseTransform):
         # produce mojibake fingerprints and corrupt change-detection. Only text/*
         # and application/xhtml+xml are accepted; an absent Content-Type header is
         # treated as unknown and rejected conservatively.
-        # Persistence-safe URL for every error dict below (eager fingerprint,
-        # elspeth-600360c72e): the executor scrubber cannot recognise arbitrary
-        # secret-bearing query values, so redaction happens at construction.
-        safe_url = fingerprint_url(safe_request.original_url)
+        # No error dict below names the URL: it is row data (the url_field
+        # value) and stays in the row carrier and the recorded call.
 
         content_type_raw = response.headers.get("content-type")
         content_type_lower = None if content_type_raw is None else content_type_raw.split(";", 1)[0].strip().lower()
@@ -892,9 +889,8 @@ class WebScrapeTransform(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "non_text_content_type",
-                    "error": f"non-text content-type {content_type_raw!r} returned by {safe_url}; expected text/*",
+                    "error": f"non-text content-type {content_type_raw!r}; expected text/*",
                     "content_type": content_type_raw,
-                    "url": safe_url,
                 }
             )
 
@@ -906,10 +902,9 @@ class WebScrapeTransform(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": (f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes} for {safe_url}"),
+                    "error": (f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes}"),
                     "body_size": body_size,
                     "max_body_bytes": self._max_body_bytes,
-                    "url": safe_url,
                 }
             )
 
@@ -927,7 +922,6 @@ class WebScrapeTransform(BaseTransform):
                     "reason": "content_extraction_failed",
                     "error": str(e),
                     "error_type": type(e).__name__,
-                    "url": safe_url,
                 }
             )
 
@@ -1005,11 +999,11 @@ class WebScrapeTransform(BaseTransform):
         # Infrastructure captured in on_start()
         if ctx.state_id is None:
             raise FrameworkBugError("ctx.state_id not set by executor — executor must set state_id before calling process().")
-        # Persistence-safe URL, computed eagerly (elspeth-600360c72e): every
-        # message raised below can be persisted via TransformResult.error()
-        # or the retry path, and the underlying httpx/SSRF exception text can
-        # embed raw hop URLs — so neither the raw URL nor str(e) may appear.
-        safe_url = fingerprint_url(safe_request.original_url)
+        # Every message raised below can be persisted via TransformResult.error()
+        # or the retry path (node_states.error_json), and the underlying
+        # httpx/SSRF exception text embeds the URL — row data that stays in the
+        # row carrier and the recorded call — so no message names the URL and
+        # none repeats str(e).
         limiter = self._limiter.get_limiter("web_scrape")
 
         # Create audited client (records to Landscape)
@@ -1043,18 +1037,18 @@ class WebScrapeTransform(BaseTransform):
 
             # Check status code and raise appropriate errors
             if response.status_code == 404:
-                raise NotFoundError(f"HTTP 404: {safe_url}")
+                raise NotFoundError("HTTP 404")
             elif response.status_code == 403:
-                raise ForbiddenError(f"HTTP 403: {safe_url}")
+                raise ForbiddenError("HTTP 403")
             elif response.status_code == 401:
-                raise UnauthorizedError(f"HTTP 401: {safe_url}")
+                raise UnauthorizedError("HTTP 401")
             elif response.status_code == 429:
-                raise RateLimitError(f"HTTP 429: {safe_url}")
+                raise RateLimitError("HTTP 429")
             elif 500 <= response.status_code < 600:
-                raise ServerError(f"HTTP {response.status_code}: {safe_url}")
+                raise ServerError(f"HTTP {response.status_code}")
             elif 300 <= response.status_code < 400:
                 # Unresolved redirect (e.g. 3xx without Location header) -- treat as error
-                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code}: {safe_url} (missing or empty Location header)")
+                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code} (missing or empty Location header)")
             elif 400 <= response.status_code < 500:
                 # Catch-all for unenumerated 4xx codes (400, 402, 405, 406, 408,
                 # 410, 418, 451, ...). Without this arm the response would be
@@ -1063,18 +1057,18 @@ class WebScrapeTransform(BaseTransform):
                 # 408 Request Timeout is retryable (transient server overload);
                 # all other unenumerated 4xx codes are non-retryable client errors.
                 retryable = response.status_code == 408
-                raise ClientError(f"HTTP {response.status_code}: {safe_url}", retryable=retryable)
+                raise ClientError(f"HTTP {response.status_code}", retryable=retryable)
 
             return response, final_hostname_url, call
 
         except httpx.TimeoutException as e:
-            raise NetworkError(f"Timeout fetching {safe_url}") from e
+            raise NetworkError("Timeout fetching the row's URL") from e
         except httpx.ConnectError as e:
-            raise NetworkError(f"Connection error fetching {safe_url}") from e
+            raise NetworkError("Connection error fetching the row's URL") from e
         except HTTPResponseBodyTooLargeError as e:
             # str(e) embeds the raw hop URL — rebuild from structured fields.
             raise BodyTooLargeError(
-                f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes} for {safe_url}",
+                f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes}",
                 body_size=e.body_size,
                 max_body_bytes=e.max_body_bytes,
             ) from e
@@ -1082,14 +1076,14 @@ class WebScrapeTransform(BaseTransform):
             # Redirect hop resolved to a blocked IP — non-retryable security violation
             from elspeth.plugins.transforms.web_scrape_errors import SSRFBlockedError as WSSRFBlockedError
 
-            raise WSSRFBlockedError(f"SSRF blocked during redirect while fetching {safe_url}") from e
+            raise WSSRFBlockedError("SSRF blocked during a redirect") from e
         except SSRFNetworkError as e:
             # DNS resolution failed during redirect hop
-            raise NetworkError(f"DNS resolution failed during redirect while fetching {safe_url}") from e
+            raise NetworkError("DNS resolution failed during a redirect") from e
         except httpx.TooManyRedirects as e:
-            raise InvalidURLError(f"Too many redirects while fetching {safe_url}") from e
+            raise InvalidURLError("Too many redirects") from e
         except httpx.RequestError as e:
-            raise NetworkError(f"HTTP request error fetching {safe_url} ({type(e).__name__})") from e
+            raise NetworkError(f"HTTP request error fetching the row's URL ({type(e).__name__})") from e
         finally:
             client.close()
 

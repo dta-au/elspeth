@@ -42,6 +42,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
     UnauthorizedError,
     WebScrapeError,
+    row_url_rejection_message,
 )
 
 DEFAULT_ALLOWED_CONTENT_TYPES: tuple[str, ...] = (
@@ -288,7 +289,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:04caeac653f577b2"
+    source_file_hash: str | None = "sha256:2fe816fc2a2e8747"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -522,7 +523,7 @@ class BlobFetch(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "validation_failed",
-                    "error": str(exc),
+                    "error": row_url_rejection_message(exc),
                     "error_type": type(exc).__name__,
                 }
             )
@@ -531,12 +532,10 @@ class BlobFetch(BaseTransform):
             response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
             final_resolved_ip = _final_response_ip(response)
         except BodyTooLargeError as exc:
-            safe_url = fingerprint_url(safe_request.original_url)
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes} for {safe_url}",
-                    "url": safe_url,
+                    "error": f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes}",
                     "body_size": exc.body_size,
                     "max_body_bytes": exc.max_body_bytes,
                 }
@@ -553,17 +552,14 @@ class BlobFetch(BaseTransform):
             )
 
         content_type = _parse_content_type(response)
-        safe_url = fingerprint_url(safe_request.original_url)
         if content_type.normalized not in self._allowed_content_types:
             return TransformResult.error(
                 {
                     "reason": "unsupported_content_type",
                     "error": (
-                        f"content-type {content_type.raw!r} returned by {safe_url}; "
-                        f"allowed values are {sorted(self._allowed_content_types)!r}"
+                        f"content-type {content_type.raw!r} is not allowed; allowed values are {sorted(self._allowed_content_types)!r}"
                     ),
                     "content_type": content_type.raw,
-                    "url": safe_url,
                 }
             )
 
@@ -573,10 +569,9 @@ class BlobFetch(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes} for {safe_url}",
+                    "error": f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes}",
                     "body_size": body_size,
                     "max_body_bytes": self._max_body_bytes,
-                    "url": safe_url,
                 }
             )
 
@@ -616,7 +611,7 @@ class BlobFetch(BaseTransform):
     def _fetch_url(self, safe_request: SSRFSafeRequest, ctx: TransformContext) -> tuple[httpx.Response, str, Call]:
         if ctx.state_id is None:
             raise FrameworkBugError("ctx.state_id not set by executor — executor must set state_id before calling process().")
-        safe_url = fingerprint_url(safe_request.original_url)
+        # No message raised below names the URL (row data; see web_scrape).
         limiter = self._limiter.get_limiter("blob_fetch")
         client = AuditedHTTPClient(
             member_token=ctx.require_member_token(),
@@ -644,40 +639,40 @@ class BlobFetch(BaseTransform):
                 allowed_ranges=self._allowed_ranges,
             )
             if response.status_code == 404:
-                raise NotFoundError(f"HTTP 404: {safe_url}")
+                raise NotFoundError("HTTP 404")
             if response.status_code == 403:
-                raise ForbiddenError(f"HTTP 403: {safe_url}")
+                raise ForbiddenError("HTTP 403")
             if response.status_code == 401:
-                raise UnauthorizedError(f"HTTP 401: {safe_url}")
+                raise UnauthorizedError("HTTP 401")
             if response.status_code == 429:
-                raise RateLimitError(f"HTTP 429: {safe_url}")
+                raise RateLimitError("HTTP 429")
             if 500 <= response.status_code < 600:
-                raise ServerError(f"HTTP {response.status_code}: {safe_url}")
+                raise ServerError(f"HTTP {response.status_code}")
             if 300 <= response.status_code < 400:
-                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code}: {safe_url} (missing or empty Location header)")
+                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code} (missing or empty Location header)")
             if 400 <= response.status_code < 500:
-                raise ClientError(f"HTTP {response.status_code}: {safe_url}", retryable=response.status_code == 408)
+                raise ClientError(f"HTTP {response.status_code}", retryable=response.status_code == 408)
             return response, final_hostname_url, call
         except httpx.TimeoutException as exc:
-            raise NetworkError(f"Timeout fetching {safe_url}") from exc
+            raise NetworkError("Timeout fetching the row's URL") from exc
         except httpx.ConnectError as exc:
-            raise NetworkError(f"Connection error fetching {safe_url}") from exc
+            raise NetworkError("Connection error fetching the row's URL") from exc
         except HTTPResponseBodyTooLargeError as exc:
             raise BodyTooLargeError(
-                f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes} for {safe_url}",
+                f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes}",
                 body_size=exc.body_size,
                 max_body_bytes=exc.max_body_bytes,
             ) from exc
         except SSRFBlockedError as exc:
             from elspeth.plugins.transforms.web_scrape_errors import SSRFBlockedError as WSSRFBlockedError
 
-            raise WSSRFBlockedError(f"SSRF blocked during redirect while fetching {safe_url}") from exc
+            raise WSSRFBlockedError("SSRF blocked during a redirect") from exc
         except SSRFNetworkError as exc:
-            raise NetworkError(f"DNS resolution failed during redirect while fetching {safe_url}") from exc
+            raise NetworkError("DNS resolution failed during a redirect") from exc
         except httpx.TooManyRedirects as exc:
-            raise InvalidURLError(f"Too many redirects while fetching {safe_url}") from exc
+            raise InvalidURLError("Too many redirects") from exc
         except httpx.RequestError as exc:
-            raise NetworkError(f"HTTP request error fetching {safe_url} ({type(exc).__name__})") from exc
+            raise NetworkError(f"HTTP request error fetching the row's URL ({type(exc).__name__})") from exc
         finally:
             client.close()
 

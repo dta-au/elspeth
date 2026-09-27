@@ -5,6 +5,8 @@ RetryManager, non-retryable errors return TransformResult.error().
 """
 
 from elspeth.contracts.errors import PluginRetryableError
+from elspeth.core.security.web import NetworkError as SSRFNetworkError
+from elspeth.core.security.web import SSRFBlockedError as PolicySSRFBlockedError
 
 
 class WebScrapeError(PluginRetryableError):
@@ -94,3 +96,19 @@ class BodyTooLargeError(WebScrapeError):
         super().__init__(message, retryable=False)
         self.body_size = body_size
         self.max_body_bytes = max_body_bytes
+
+
+def row_url_rejection_message(exc: KeyError | PolicySSRFBlockedError | SSRFNetworkError | TypeError) -> str:
+    """Value-free audit text for a row URL refused before any fetch.
+
+    The exceptions' own text names the URL, its host or the address it
+    resolved to — row data, which stays in the row carrier and never enters
+    the reason. ``error_type`` beside this message keeps the class.
+    """
+    if isinstance(exc, PolicySSRFBlockedError):
+        return "the row's URL is refused by the SSRF policy (malformed, forbidden scheme or credentials, or a blocked address)"
+    if isinstance(exc, SSRFNetworkError):
+        return "the row's URL host could not be resolved"
+    if isinstance(exc, TypeError):
+        return "the row's URL value is not a string"
+    return "the row has no URL field"

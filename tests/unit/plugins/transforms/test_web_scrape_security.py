@@ -205,7 +205,9 @@ def test_ssrf_blocks_file_scheme(transform, mock_ctx):
 
     assert result.status == "error"
     assert result.reason["error_type"] == "SSRFBlockedError"
-    assert "file" in result.reason["error"].lower()
+    assert "SSRF policy" in result.reason["error"]
+    # The refused URL is row data: the reason never repeats it (C3).
+    assert "/etc/passwd" not in repr(result.reason)
 
 
 def test_ssrf_blocks_private_ip(transform, mock_ctx):
@@ -215,6 +217,20 @@ def test_ssrf_blocks_private_ip(transform, mock_ctx):
 
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
+        # Neither the row's host nor the address it resolved to is persisted (C3).
+        assert "internal.example.com" not in repr(result.reason)
+        assert "192.168.1.1" not in repr(result.reason)
+
+
+def test_dns_failure_reason_does_not_name_the_host(transform, mock_ctx):
+    """An unresolvable row host routes value-free: the host is row data (C3)."""
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror(-2, "Name or service not known")):
+        result = transform.process(make_pipeline_row({"url": "https://sntlhost-h9.invalid/x"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "validation_failed"
+    assert result.reason["error"] == "the row's URL host could not be resolved"
+    assert "sntlhost" not in repr(result.reason)
 
 
 def test_ssrf_blocks_loopback(transform, mock_ctx):
@@ -593,7 +609,6 @@ class TestRedirectAllowedRangesBehavior:
         ``fingerprint_url`` returns unchanged; this one supplies the shape
         where redaction is observable.
         """
-        import urllib.parse
 
         from elspeth.core.security.web import SSRFSafeRequest
 
@@ -743,14 +758,13 @@ class TestRedirectAllowedRangesBehavior:
 
 
 class TestErrorPathURLRedaction:
-    """Error paths must never embed the raw request URL (elspeth-600360c72e).
+    """Error paths never name the request URL (elspeth-600360c72e, C3).
 
-    Secret-bearing query values (sensitive-named params), userinfo, and
-    fragments must be fingerprinted/stripped eagerly at construction — the
-    executor-level scrubber passes unknown-shaped URLs verbatim, so these
-    strings persist to transform_errors / node_states / payload-store blobs
-    as built here. Mirrors blob_fetch's eager safe_url = fingerprint_url()
-    pattern and its redaction tests.
+    The URL is row data (the url_field value): it stays in the row carrier and
+    the recorded call. Every string built here persists to transform_errors /
+    node_states / payload-store blobs, so no reason and no exception message
+    may carry any part of it — not its secrets, and not its host or path
+    either. Mirrors blob_fetch's redaction tests.
     """
 
     SECRET_URL = "https://example.com/hop?sig=ERRPATH_SIG_SECRET&view=full#ERRFRAG_SECRET"
@@ -779,14 +793,11 @@ class TestErrorPathURLRedaction:
         t.on_start(mock_ctx)
         return t
 
-    def _assert_no_secrets(self, text: str) -> None:
+    def _assert_no_url(self, text: str) -> None:
         assert "ERRPATH_SIG_SECRET" not in text
         assert "ERRFRAG_SECRET" not in text
-
-    @staticmethod
-    def _assert_fingerprinted(text: str) -> None:
-        # urlencode percent-encodes the <fingerprint:...> marker inside URLs
-        assert "<fingerprint:" in urllib.parse.unquote(text)
+        assert "example.com" not in text
+        assert "/hop" not in text
 
     @respx.mock
     def test_http_status_error_reason_redacts_url_secrets(self, mock_ctx):
@@ -798,8 +809,7 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["error_type"] == "NotFoundError"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(result.reason["error"])
+        self._assert_no_url(repr(result.reason))
 
     @respx.mock
     def test_retryable_error_message_redacts_url_secrets(self, mock_ctx):
@@ -811,8 +821,7 @@ class TestErrorPathURLRedaction:
         with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(ServerError) as exc_info:
             transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
 
-        self._assert_no_secrets(str(exc_info.value))
-        self._assert_fingerprinted(str(exc_info.value))
+        self._assert_no_url(str(exc_info.value))
 
     @respx.mock
     def test_network_error_message_redacts_url_secrets(self, mock_ctx):
@@ -824,7 +833,7 @@ class TestErrorPathURLRedaction:
         with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(NetworkError) as exc_info:
             transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
 
-        self._assert_no_secrets(str(exc_info.value))
+        self._assert_no_url(str(exc_info.value))
 
     @respx.mock
     def test_body_cap_error_reason_redacts_hop_url(self, mock_ctx):
@@ -839,8 +848,8 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["reason"] == "body_too_large"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(str(result.reason["url"]))
+        self._assert_no_url(repr(result.reason))
+        assert "url" not in result.reason
 
     @respx.mock
     def test_non_text_content_type_reason_redacts_url_secrets(self, mock_ctx):
@@ -852,5 +861,5 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["reason"] == "non_text_content_type"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(str(result.reason["url"]))
+        self._assert_no_url(repr(result.reason))
+        assert "url" not in result.reason

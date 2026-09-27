@@ -555,7 +555,12 @@ drained and repair this release forward.
   in their `invalid_blob_ref` reason; a well-formed payload-store hash is
   still named where it identifies the stored blob. `reference_join` no longer
   records the row's join key (`reference_key_value`, and the key inside the
-  miss message); the reason names the key field.
+  miss message); the reason names the key field. `web_scrape` and
+  `blob_fetch` no longer name the row's URL anywhere in a reason or a
+  persisted error message (the `url` key, `HTTP 404: <url>`, `Connection
+  error fetching <url>` — the last reached `node_states.error_json` with the
+  query string unredacted), and an SSRF or DNS refusal no longer repeats the
+  host or resolved address; the URL stays in the row and the recorded call.
 
 ### Newly refused configurations
 
