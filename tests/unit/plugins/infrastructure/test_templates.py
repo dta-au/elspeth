@@ -654,6 +654,24 @@ def test_sandboxed_template_reports_malformed_source_as_a_syntax_error() -> None
         pytest.param(
             "{{ row.q | truncate(False) }}", "truncate() length must be an integer literal, got bool.", id="truncate-length-false"
         ),
+        # A unary sign over a bool is a literal too: Jinja evaluates ``-True``
+        # to the int -1 without the row, so the build decides it
+        # (review-F1-final-minors-r2 L1).
+        pytest.param(
+            "{{ row.q | truncate(-True) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got -1",
+            id="truncate-unary-minus-bool",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(-True, end=row.e) }}",
+            "truncate() arguments can never be satisfied: expected length >= 0, got -1",
+            id="truncate-unary-minus-bool-beside-row-end",
+        ),
+        pytest.param(
+            "{{ row.q | truncate(+True, leeway=row.n) }}",
+            "truncate() arguments can never be satisfied: expected length >= 3, got 1",
+            id="truncate-unary-plus-bool-beside-row-leeway",
+        ),
         pytest.param(
             "{{ row.q | truncate(10, end=True) }}",
             "truncate() arguments can never be satisfied: object of type 'bool' has no len()",
