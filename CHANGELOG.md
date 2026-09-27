@@ -382,9 +382,11 @@ drained and repair this release forward.
   outcome: measured, a 2,730-row `batch_rank` passthrough batch, a
   33,000-row `batch_stats` batch, and a plain 40,000-row source-to-sink run.
   Every such statement now binds a fixed number of parameters, as chunked
-  reads or one executemany inside the same transaction. Measured on SQLite:
-  a 40,000-row `batch_stats` batch completes with every row recorded, and no
-  statement bound more than 903 parameters.
+  reads or one executemany inside the same transaction; multi-row inserts
+  stay paged by SQLAlchemy below the driver's ceiling. Measured on SQLite: a
+  40,000-row `batch_stats` batch completes with every row recorded; the
+  largest insert page bound 11,000 parameters and the largest other
+  statement 903.
 - **A database error is recorded without its SQL or bound values.** The
   audit trail recorded a failing statement's driver text as the operation's
   error message, bound row payloads included (up to 450,969 characters for
