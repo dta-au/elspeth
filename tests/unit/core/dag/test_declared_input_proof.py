@@ -361,6 +361,38 @@ class TestLostBranchIsARowFact:
         tail = graph.get_transform_name_id_map()["tail"]
         assert graph.get_declared_input_proof()[tail] == expected
 
+    @pytest.mark.parametrize(
+        ("policy", "timeout"),
+        [pytest.param("best_effort", "timeout_seconds: 5", id="best_effort"), pytest.param("first", "", id="first")],
+    )
+    def test_every_branch_guaranteeing_the_field_proves_it(self, tmp_path: Path, policy: str, timeout: str) -> None:
+        """The routed missing_field text's coalesce remedy (R2 review r2 F1): every branch guarantees y → proven.
+
+        The pa branch creates y too (value_transform guarantees its target), so
+        a merged row carries y whichever branches arrive and the build proves
+        it at the tail under a policy that can lose a branch.
+        """
+        input_path = tmp_path / "in.jsonl"
+        input_path.write_text('{"a": 1, "b": "2"}\n')
+        pa_passthrough = (
+            "    plugin: passthrough\n    input: pa\n    on_success: da\n    on_error: q\n    options: {schema: {mode: observed}}\n"
+        )
+        pa_creates_y = (
+            "    plugin: value_transform\n    input: pa\n    on_success: da\n    on_error: q\n"
+            '    options:\n      schema: {mode: observed}\n      operations: [{target: y, expression: "0"}]\n'
+        )
+        yaml_text = _LOST_BRANCH_YAML.format(
+            input_path=input_path,
+            output_path=tmp_path / "out.jsonl",
+            quarantine_path=tmp_path / "q.jsonl",
+            policy=policy,
+            timeout=timeout,
+        )
+        assert yaml_text.count(pa_passthrough) == 1
+        graph = _build(yaml_text.replace(pa_passthrough, pa_creates_y))
+        tail = graph.get_transform_name_id_map()["tail"]
+        assert graph.get_declared_input_proof()[tail] == frozenset({"y"})
+
 
 class TestPublishedOnTheFinalGraph:
     """The builder publishes the proof after the rule-9 DIVERT edges (architect A3/T6)."""

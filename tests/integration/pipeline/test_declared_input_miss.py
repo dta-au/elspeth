@@ -239,14 +239,46 @@ def test_on_error_discard_records_the_routed_miss_as_a_failure(tmp_path: Path) -
     assert sum(count for key, count in outcomes.items() if key.startswith("failure/")) == 2, outcomes
 
 
-def test_a_field_only_a_lost_branch_created_routes_after_a_best_effort_union(tmp_path: Path) -> None:
-    """Review-R2 r1 F1: a best-effort union's lost branch is a row fact, never a proven miss.
+def test_following_the_remedy_a_source_column_is_refused_at_the_source(tmp_path: Path) -> None:
+    """Review-R2 r2 F1: the routed text's source-column remedy yields a working pipeline.
 
-    fork → (pa: passthrough | pb: value_transform creating y) → best_effort
-    union → type_coerce on y. The row whose pb branch fails (a=3) merges as the
-    pa branch alone, without y. The build does not prove y (the pa branch
-    abstains), so that row routes as missing_field; before the fix the
-    coalesce published y as guaranteed and the run ended (exit 4).
+    Declaring b in the source's schema fields moves the refusal of a row
+    without b to the source (on_validation_failure), and the row carrying b
+    still reaches the sink; nothing routes as missing_field at the transform.
+    """
+    rows = [{"a": "1", "b": "2"}, *_missing_rows(2)]
+    settings = _settings(
+        tmp_path, rows, plugin="type_coerce", options=_CENSUS[0][2], source_schema={"mode": "flexible", "fields": ["b: str"]}
+    )
+
+    result = _cli("run", "-s", str(settings), "--execute")
+
+    assert "Traceback" not in result.output
+    outcomes = _terminal_outcomes(tmp_path)
+    assert "NONTERMINAL" not in outcomes, outcomes
+    # on_validation_failure: discard records each refused row as a source
+    # validation error (no token is created for it).
+    assert outcomes == {"success/default_flow": 1}, outcomes
+    assert _query(tmp_path, "select count(*) from validation_errors") == [(2,)]
+    assert _routed_reasons(tmp_path) == []
+    assert [row["b"] for row in _output_rows(tmp_path)] == [2]
+
+
+_PA_PASSTHROUGH: dict[str, Any] = {
+    "name": "ta",
+    "plugin": "passthrough",
+    "input": "pa",
+    "on_success": "da",
+    "on_error": "q",
+    "options": {"schema": _OBSERVED},
+}
+
+
+def _lost_branch_settings(tmp_path: Path, pa_transform: dict[str, Any]) -> Path:
+    """fork → (pa: ``pa_transform`` | pb: value_transform creating y) → best_effort union → type_coerce on y.
+
+    The row whose pb branch fails (a=3: floor division by zero) merges as the
+    pa branch alone.
     """
     (tmp_path / "in.jsonl").write_text('{"a": 1, "b": "2"}\n{"a": 3, "b": "4"}\n')
     settings: dict[str, Any] = {
@@ -260,7 +292,7 @@ def test_a_field_only_a_lost_branch_created_routes_after_a_best_effort_union(tmp
         "concurrency": {"max_workers": 1},
         "gates": [{"name": "g", "input": "rows", "condition": "True", "routes": {"true": "fork", "false": "out"}, "fork_to": ["pa", "pb"]}],
         "transforms": [
-            {"name": "ta", "plugin": "passthrough", "input": "pa", "on_success": "da", "on_error": "q", "options": {"schema": _OBSERVED}},
+            pa_transform,
             {
                 "name": "tb",
                 "plugin": "value_transform",
@@ -285,16 +317,79 @@ def test_a_field_only_a_lost_branch_created_routes_after_a_best_effort_union(tmp
     }
     path = tmp_path / "settings.yaml"
     path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
 
-    result = _cli("run", "-s", str(path), "--execute")
+
+def _output_rows(tmp_path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+
+
+def test_a_field_only_a_lost_branch_created_routes_after_a_best_effort_union(tmp_path: Path) -> None:
+    """Review-R2 r1 F1: a best-effort union's lost branch is a row fact, never a proven miss.
+
+    The a=3 row merges as the pa pass-through branch alone, without y. The
+    build does not prove y (the pa branch abstains), so that row routes as
+    missing_field; before the fix the coalesce published y as guaranteed and
+    the run ended (exit 4).
+
+    Review-R2 r2 F1: the routed text's remedy must hold for a field a
+    transform CREATES. It used to say only "declare the field(s) as required
+    in the source's schema fields" — followed here, that discards every row at
+    the source (no source row carries y) and the run reports success with 0
+    rows. The full text is pinned; the remedy it names for this shape is proved
+    by test_following_the_remedy_every_branch_guarantees_the_field.
+    """
+    result = _cli("run", "-s", str(_lost_branch_settings(tmp_path, _PA_PASSTHROUGH)), "--execute")
 
     assert "Traceback" not in result.output
     assert result.exit_code == 1, result.output
     outcomes = _terminal_outcomes(tmp_path)
     assert "NONTERMINAL" not in outcomes, outcomes
     assert outcomes.get("failure/on_error_routed") == 2, outcomes
-    reasons = [(reason["reason"], tuple(reason.get("fields", ()))) for reason in _routed_reasons(tmp_path)]
-    assert ("missing_field", ("y",)) in reasons, reasons
+    [missing] = [reason for reason in _routed_reasons(tmp_path) if reason["reason"] == "missing_field"]
+    assert missing == {
+        "reason": "missing_field",
+        "fields": ["y"],
+        "error": (
+            "Transform 'type_coerce' requires input field(s) ['y'] that the arriving row does not carry. The build proves "
+            "a field only when every path into this node guarantees it, and it could not prove these, so the row is "
+            "routed instead of processed. Where every row should carry them: declare a column the source reads in the "
+            "source's schema fields (a source row lacking it is then handled by the source's on_validation_failure); a "
+            "field a transform creates must be created on every row and guaranteed by that transform's output schema; "
+            "after a merge: union coalesce whose policy can lose a branch (best_effort, first, or a quorum below the "
+            "branch count), every branch must guarantee it."
+        ),
+    }
+
+
+def test_following_the_remedy_every_branch_guarantees_the_field(tmp_path: Path) -> None:
+    """Review-R2 r2 F1: the routed text's coalesce remedy yields a working pipeline.
+
+    Following it, the pa branch creates y on every row too (value_transform
+    guarantees its target), so every branch guarantees y, the build proves it
+    at the tail, and nothing routes as missing_field: the a=3 row's pb failure
+    is still routed by tb (its own error), and the pa-only merged row — now
+    carrying y — reaches the sink with the a=1 row.
+    """
+    pa_creates_y = {
+        "name": "ta",
+        "plugin": "value_transform",
+        "input": "pa",
+        "on_success": "da",
+        "on_error": "q",
+        "options": {"schema": _OBSERVED, "operations": [{"target": "y", "expression": "0"}]},
+    }
+    # The build's proof of y at the tail for this shape is pinned by
+    # TestLostBranchIsARowFact.test_every_branch_guaranteeing_the_field_proves_it.
+    result = _cli("run", "-s", str(_lost_branch_settings(tmp_path, pa_creates_y)), "--execute")
+
+    assert "Traceback" not in result.output
+    assert result.exit_code == 1, result.output
+    outcomes = _terminal_outcomes(tmp_path)
+    assert "NONTERMINAL" not in outcomes, outcomes
+    assert outcomes.get("failure/on_error_routed") == 1, outcomes
+    assert [reason["reason"] for reason in _routed_reasons(tmp_path)] == ["invalid_input"]
+    assert sorted((row["a"], row["y"]) for row in _output_rows(tmp_path)) == [(1, "-1"), (3, "0")]
 
 
 def _inject_before_transform(monkeypatch: pytest.MonkeyPatch, rewrite: Callable[[PipelineRow], PipelineRow]) -> None:

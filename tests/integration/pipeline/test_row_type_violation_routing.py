@@ -1213,16 +1213,20 @@ def test_a_buffered_row_missing_a_declared_field_routes_the_whole_batch_to_on_er
     [failed_state] = audit["failed_states"]
     reason = json.loads(failed_state.error_json)
     # ADR-013 Amendment 2026-09-27: the unproven absence routes as missing_field, config field names only.
+    # The full text is pinned for this SOURCE-column miss and, in
+    # test_declared_input_miss.py, for a field a lost coalesce branch creates:
+    # the remedy must hold for both (R2 review r2 F1).
     assert reason == {
         "reason": "missing_field",
         "fields": ["v"],
         "error": (
             f"Aggregation transform 'batch_threshold_summary' (buffered row {offending_index}) requires input field(s) ['v'] "
-            "that the arriving row does not carry. Its upstream does not guarantee them (an observed or open schema promises "
-            "nothing about a column it does not declare), so the row is routed instead of processed. The build refuses "
-            "such a pipeline only when a closed (mode: fixed) upstream omits the field(s). To reject rows lacking them "
-            "where they enter the pipeline instead, declare the field(s) as required in the source's schema fields; the "
-            "source's on_validation_failure then handles each such row."
+            "that the arriving row does not carry. The build proves a field only when every path into this node "
+            "guarantees it, and it could not prove these, so the row is routed instead of processed. Where every row "
+            "should carry them: declare a column the source reads in the source's schema fields (a source row lacking "
+            "it is then handled by the source's on_validation_failure); a field a transform creates must be created on "
+            "every row and guaranteed by that transform's output schema; after a merge: union coalesce whose policy can "
+            "lose a branch (best_effort, first, or a quorum below the branch count), every branch must guarantee it."
         ),
     }
     [routing] = audit["routing"]

@@ -1949,9 +1949,10 @@ class DeclaredInputFieldAbsentViolation(PluginContractViolation):
     The routed half of a declared-input miss (ADR-013 Amendment 2026-09-27).
     A node's option-derived input declaration (web_scrape's ``url_field``,
     type_coerce's ``conversions[].field``, a batch plugin's ``value_field`` …)
-    names a column. Behind an ``observed`` or otherwise open upstream the build
-    cannot settle that the column exists, so it admits the pipeline and the
-    engine settles each row: a row that does not carry the column is a fact
+    names a column. Behind an ``observed`` or otherwise open upstream, or a
+    ``merge: union`` coalesce whose policy can lose the branch that creates the
+    field, the build cannot settle that the column exists, so it admits the
+    pipeline and the engine settles each row: a row that does not carry the column is a fact
     about THAT row, like a wrong type, and is refused before the plugin runs
     and routed through ``on_error`` (operator ruling 2026-09-23 B2; Q4
     doctrine §4 cond. 2). The miss of a field the build PROVED present, or of
@@ -1970,6 +1971,13 @@ class DeclaredInputFieldAbsentViolation(PluginContractViolation):
     every row missing the same fields at a node records one ``error_hash`` and
     reads as one failure category. Reason ``missing_field``, the category the
     plugins' own absent-field guards already use.
+
+    The remedy in the message must hold for EVERY member of the routed class,
+    and the runtime cannot tell them apart: behind an observed source a column
+    the source reads and a field an undeclaring transform creates vote alike.
+    So it names each shape's own remedy instead of choosing one — "declare it
+    in the source's schema fields" alone discards every row at the source when
+    the field is created downstream (R2 review r2 F1).
     """
 
     def __init__(self, *, component: str, fields: tuple[str, ...]) -> None:
@@ -1979,11 +1987,12 @@ class DeclaredInputFieldAbsentViolation(PluginContractViolation):
         self.fields = fields
         super().__init__(
             f"{component} requires input field(s) {list(fields)} that the arriving row does not carry. "
-            "Its upstream does not guarantee them (an observed or open schema promises nothing about a column it "
-            "does not declare), so the row is routed instead of processed. The build refuses such a pipeline only "
-            "when a closed (mode: fixed) upstream omits the field(s). To reject rows lacking them where they enter "
-            "the pipeline instead, declare the field(s) as required in the source's schema fields; the source's "
-            "on_validation_failure then handles each such row."
+            "The build proves a field only when every path into this node guarantees it, and it could not prove "
+            "these, so the row is routed instead of processed. Where every row should carry them: declare a column "
+            "the source reads in the source's schema fields (a source row lacking it is then handled by the source's "
+            "on_validation_failure); a field a transform creates must be created on every row and guaranteed by that "
+            "transform's output schema; after a merge: union coalesce whose policy can lose a branch (best_effort, "
+            "first, or a quorum below the branch count), every branch must guarantee it."
         )
 
     def to_transform_error_reason(self) -> TransformErrorReason:
