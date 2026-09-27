@@ -450,6 +450,48 @@ def test_complete_barrier_crash_atomicity() -> None:
     assert len(_events(engine)) == events_before
 
 
+def test_complete_barrier_refuses_when_durable_rows_outnumber_the_consumed_set() -> None:
+    """The repository is the ONE authority for a barrier's consumed-set count.
+
+    0806d6506 deleted the engine's post-commit copies of this check, so the
+    guard in ``_terminalize_consumed_barrier_rows`` is the only thing that
+    notices a consumed token backed by more than one durable BLOCKED row
+    (here: a second BLOCKED row for ``t1`` at the next attempt). Terminalizing
+    both would record one live consumption as two durable ones. The whole
+    completion must refuse and roll back: no status flips, no scheduler event,
+    no terminal outcome. Without the guard the completion commits (mutant
+    ``if False:`` at the count check -> this test goes red).
+    """
+    engine, repo = _make_repo()
+    _seed_three_blocked(engine, repo)
+    with engine.begin() as conn:
+        duplicate = dict(conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == "t1")).mappings().one())
+        duplicate["work_item_id"] = f"{duplicate['work_item_id']}-second"
+        duplicate["attempt"] = duplicate["attempt"] + 1
+        conn.execute(insert(token_work_items_table).values(**duplicate))
+    events_before = len(_events(engine))
+
+    with pytest.raises(AuditIntegrityError, match=r"live consumed 3 token\(s\), but durable scheduler terminalized 4"):
+        repo.complete_barrier(
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=["t1", "t2", "t3"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
+            coordination_token=COORD_TOKEN,
+            terminal_outcomes=tuple(
+                BarrierTerminalOutcomeSpec(token_id=token_id, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.FILTER_DROPPED)
+                for token_id in ("t1", "t2", "t3")
+            ),
+        )
+
+    with engine.connect() as conn:
+        statuses = conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == RUN_ID)).scalars().all()
+        assert tuple(conn.execute(select(token_outcomes_table.c.token_id))) == ()
+    assert sorted(statuses) == [TokenWorkStatus.BLOCKED.value] * 4
+    assert len(_events(engine)) == events_before
+
+
 def test_complete_barrier_passthrough_handoff_counts_toward_blocked_coverage() -> None:
     """A buffered token handed off via emitted_pending_sink transitions its OWN BLOCKED row."""
     engine, repo = _make_repo()
