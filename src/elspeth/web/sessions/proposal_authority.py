@@ -5,9 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -138,22 +137,6 @@ _PIPELINE_REJECTED_FIELDS = frozenset(
         "dispatch",
     }
 )
-
-
-class _GuidedOperationEventValues(TypedDict):
-    """One immutable guided_operation_events row, built without owning DML."""
-
-    session_id: str
-    operation_id: str
-    sequence: int
-    event_kind: Literal["claimed", "renewed", "taken_over", "completed", "failed"]
-    actor: str
-    attempt: int
-    prior_attempt: int | None
-    lease_expires_at: datetime | None
-    request_hash: str
-    failure_audit_cohort: dict[str, object] | None
-    occurred_at: datetime
 
 
 class _PipelineCreatedEventPayload(TypedDict):

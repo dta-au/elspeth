@@ -1027,6 +1027,8 @@ files:
     dict[str, Any]: 2
   src/elspeth/web/sessions/guided_audit.py:
     dict[str, Any]: 3
+  src/elspeth/web/sessions/guided_operation_rules.py:
+    dict[str, object]: 1
   src/elspeth/web/sessions/guided_operations.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/guided_payloads.py:
@@ -1042,7 +1044,6 @@ files:
     dict[str, object]: 1
   src/elspeth/web/sessions/proposal_authority.py:
     Mapping[str, Any]: 8
-    dict[str, object]: 1
   src/elspeth/web/sessions/proposal_blob_refs.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:

@@ -35,6 +35,11 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.guided_operation_rules import (
+    _guided_failure_diagnostics,
+    _guided_in_progress_expiry,
+    _guided_terminal_outcome,
+)
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.models import (
     chat_messages_table,
@@ -507,11 +512,11 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
     }
 
     with pytest.raises(AuditIntegrityError, match=r"kind.*locator"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", completed))
+        _guided_terminal_outcome(cast("Any", completed))
     with pytest.raises(AuditIntegrityError, match=r"failure.*residue"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", failed))
+        _guided_terminal_outcome(cast("Any", failed))
     with pytest.raises(AuditIntegrityError, match=r"in-progress.*lease"):
-        SessionServiceImpl._guided_in_progress_expiry(
+        _guided_in_progress_expiry(
             cast(
                 "Any",
                 {
@@ -556,7 +561,7 @@ def test_failed_operation_decoder_rejects_malformed_output_field_enrichment(raw_
     }
 
     with pytest.raises(AuditIntegrityError, match="malformed unproducible output fields"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", row))
+        _guided_terminal_outcome(cast("Any", row))
 
 
 @pytest.mark.asyncio
@@ -2685,4 +2690,4 @@ def test_failure_diagnostics_reject_malformed_or_unbounded_carriers(diagnostics:
 @pytest.mark.parametrize("raw_diagnostics", [[], {}, "note", [1], [""], ["x" * 513], ["note"] * 33])
 def test_failure_diagnostics_decoder_rejects_malformed_storage(raw_diagnostics: object) -> None:
     with pytest.raises(AuditIntegrityError, match="diagnostic"):
-        SessionServiceImpl._guided_failure_diagnostics(cast(Any, {"failure_diagnostics": raw_diagnostics}))
+        _guided_failure_diagnostics(cast(Any, {"failure_diagnostics": raw_diagnostics}))

@@ -33,6 +33,13 @@ from elspeth.web.coordination.repository import (
     _RepositoryMutationState,
 )
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.guided_operation_rules import (
+    _guided_completion_values,
+    _guided_operation_event_values,
+    _merge_guided_binding,
+    _validate_guided_actor,
+    _validate_guided_hash,
+)
 from elspeth.web.sessions.models import (
     blobs_table,
     composition_proposals_table,
@@ -752,7 +759,7 @@ class _GuidedSessionMutations:
         request_hash: str,
         occurred_at: datetime,
     ) -> None:
-        service, connection, fence, row, _now = self.__state._require_exact()
+        _service, connection, fence, row, _now = self.__state._require_exact()
         if event_kind not in {"claimed", "renewed", "taken_over"}:
             raise ValueError("guided nonterminal event kind is unsupported")
         if row["request_hash"] != request_hash or row["attempt"] != attempt:
@@ -767,7 +774,7 @@ class _GuidedSessionMutations:
         self.__state._require_exact()
         connection.execute(
             insert(guided_operation_events_table).values(
-                **service._guided_operation_event_values(
+                **_guided_operation_event_values(
                     session_id=str(fence.session_id),
                     operation_id=fence.operation_id,
                     sequence=int(next_sequence),
@@ -791,16 +798,14 @@ class _GuidedSessionMutations:
         result_state_id: UUID | None = None,
         result_session_id: UUID | None = None,
     ) -> None:
-        service, connection, fence, row, now = self.__state._require_exact()
+        _service, connection, fence, row, now = self.__state._require_exact()
         values = {
-            "originating_message_id": service._merge_guided_binding(
+            "originating_message_id": _merge_guided_binding(
                 current=row["originating_message_id"], requested=originating_message_id, label="originating message"
             ),
-            "proposal_id": service._merge_guided_binding(current=row["proposal_id"], requested=proposal_id, label="proposal"),
-            "result_state_id": service._merge_guided_binding(
-                current=row["result_state_id"], requested=result_state_id, label="result state"
-            ),
-            "result_session_id": service._merge_guided_binding(
+            "proposal_id": _merge_guided_binding(current=row["proposal_id"], requested=proposal_id, label="proposal"),
+            "result_state_id": _merge_guided_binding(current=row["result_state_id"], requested=result_state_id, label="result state"),
+            "result_session_id": _merge_guided_binding(
                 current=row["result_session_id"], requested=result_session_id, label="result session"
             ),
             "updated_at": now,
@@ -850,7 +855,7 @@ class _GuidedSessionMutations:
             raise GuidedOperationSettlementConflictError()
 
     def claim_confirmation(self, *, proposal_id: UUID, now: datetime) -> None:
-        service, connection, fence, row, _database_now = self.__state._require_exact()
+        _service, connection, fence, row, _database_now = self.__state._require_exact()
         if row["kind"] != "guided_respond":
             raise AuditIntegrityError("guided confirmation admission requires guided_respond")
         if type(proposal_id) is not UUID:
@@ -879,7 +884,7 @@ class _GuidedSessionMutations:
         if owner is not None and owner != fence.operation_id:
             raise GuidedOperationSettlementConflictError()
         _service, connection, fence, current, database_now = self.__state._require_exact()
-        bound = service._merge_guided_binding(current=current["proposal_id"], requested=proposal_id, label="proposal")
+        bound = _merge_guided_binding(current=current["proposal_id"], requested=proposal_id, label="proposal")
         changed = connection.execute(
             update(guided_operations_table)
             .where(
@@ -903,9 +908,9 @@ class _GuidedSessionMutations:
         response_hash: str,
         actor: str,
     ) -> GuidedOperationCompleted:
-        service, connection, fence, row, now = self.__state._require_exact()
-        service._validate_guided_actor(actor)
-        service._validate_guided_hash(response_hash, label="guided operation response_hash")
+        _service, connection, fence, row, now = self.__state._require_exact()
+        _validate_guided_actor(actor)
+        _validate_guided_hash(response_hash, label="guided operation response_hash")
         if type(result) is GuidedSessionResult:
             parent = (
                 connection.execute(
@@ -935,7 +940,7 @@ class _GuidedSessionMutations:
                 or child["auth_provider_type"] != parent["auth_provider_type"]
             ):
                 raise AuditIntegrityError("Guided fork result session failed lineage or principal custody validation")
-        locator_values, normalized = service._guided_completion_values(row=row, result=result)
+        locator_values, normalized = _guided_completion_values(row=row, result=result)
         # The exact pair is checked again immediately before terminal DML.
         _service, connection, fence, row, now = self.__state._require_exact()
         try:
@@ -972,7 +977,7 @@ class _GuidedSessionMutations:
             ).scalar_one()
             connection.execute(
                 insert(guided_operation_events_table).values(
-                    **service._guided_operation_event_values(
+                    **_guided_operation_event_values(
                         session_id=str(fence.session_id),
                         operation_id=fence.operation_id,
                         sequence=int(next_sequence),
@@ -1002,8 +1007,8 @@ class _GuidedSessionMutations:
         unproducible_output_fields: tuple[str, ...],
         failure_diagnostics: tuple[str, ...] = (),
     ) -> GuidedOperationFailed:
-        service, connection, fence, row, now = self.__state._require_exact()
-        service._validate_guided_actor(actor)
+        _service, connection, fence, row, now = self.__state._require_exact()
+        _validate_guided_actor(actor)
         if failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
             raise ValueError("unsupported guided operation failure code")
         if type(failure_audit_cohort) is not GuidedFailureAuditCohort:
@@ -1053,7 +1058,7 @@ class _GuidedSessionMutations:
             ).scalar_one()
             connection.execute(
                 insert(guided_operation_events_table).values(
-                    **service._guided_operation_event_values(
+                    **_guided_operation_event_values(
                         session_id=str(fence.session_id),
                         operation_id=fence.operation_id,
                         sequence=int(next_sequence),
