@@ -87,7 +87,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/service.py", "_state_payload_for_compose_turn", "error.error_code"),
         ("composer/pipeline_planner.py", "_build_valid_pipeline_plan", "exc.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
-        ("composer/service.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
+        ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
         # Planner / discovery feedback that projects an already-produced code,
         # a closed ``ToolArgumentError.code`` or a closed category value.
         ("composer/pipeline_planner.py", "_allowlisted_candidate_feedback", "code"),

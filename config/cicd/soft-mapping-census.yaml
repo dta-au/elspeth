@@ -726,8 +726,14 @@ files:
   src/elspeth/web/composer/_validation_probe.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
+  src/elspeth/web/composer/advisor_context.py:
+    Mapping[str, Any]: 4
+    dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 1
+  src/elspeth/web/composer/advisor_policy.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 1
   src/elspeth/web/composer/advisor_request.py:
     dict[str, object]: 2
   src/elspeth/web/composer/audit.py:
@@ -852,10 +858,10 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 25
+    Mapping[str, Any]: 20
     Mapping[str, object]: 1
     boundary: 1
-    dict[str, Any]: 38
+    dict[str, Any]: 36
   src/elspeth/web/composer/source_demand.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 1

@@ -296,7 +296,9 @@ async def test_every_invalid_contract_uses_format_retry_then_malformed(make_serv
     assert verdict.failure_class == "malformed"
     assert service._call_advisor_with_audit.await_count == 2
     first, retry = service._call_advisor_with_audit.calls
-    reprompts = (service_module._ADVISOR_VERDICT_FORMAT_REPROMPT, service_module._ADVISOR_VERDICT_CONTRACT_REPROMPT)
+    from elspeth.web.composer import advisor_policy
+
+    reprompts = (advisor_policy._ADVISOR_VERDICT_FORMAT_REPROMPT, advisor_policy._ADVISOR_VERDICT_CONTRACT_REPROMPT)
     assert all(reprompt not in first.args[0]["problem_summary"] for reprompt in reprompts)
     assert sum(reprompt in retry.args[0]["problem_summary"] for reprompt in reprompts) == 1
 
