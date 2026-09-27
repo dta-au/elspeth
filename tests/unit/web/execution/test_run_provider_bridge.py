@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Coroutine
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from typing import Any, Never
+from unittest.mock import patch
 
 import pytest
 import structlog
@@ -43,6 +45,18 @@ from tests.fixtures.landscape import leader_coordination_token, make_factory, ma
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.plugins.clients.test_audited_llm_client import FakeExecutionRepository, FakeOpenAIClient, provider_response
+
+
+class _ForbiddenAsyncBridge:
+    """Count an accidental legacy bridge call and fail at that boundary."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, coro: Coroutine[Any, Any, Any]) -> Never:
+        self.calls += 1
+        coro.close()
+        raise AssertionError("run quota entered the async bridge")
 
 
 @pytest.mark.asyncio
@@ -87,7 +101,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
         run = await service.create_run(session.id, state.id, session_operation_context=execute_lease.context)
         entered = threading.Event()
         release = threading.Event()
-        bridge_call = Mock(side_effect=AssertionError("run quota entered the async bridge"))
+        bridge_call = _ForbiddenAsyncBridge()
         bridge = SimpleNamespace(_session_service=service, _call_async=bridge_call)
 
         if pause in {"before_commit", "rollback"}:
@@ -133,7 +147,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
                 await asyncio.wait_for(admitted, 5)
             with engine.connect() as connection:
                 assert connection.execute(select(quota_provider_attempts_table)).all() == []
-            bridge_call.assert_not_called()
+            assert bridge_call.calls == 0
         else:
             attempt_id = await asyncio.wait_for(admitted, 5)
             with engine.connect() as connection:
@@ -141,7 +155,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
             assert after.attempt_id == attempt_id
             assert after.source == "run" and after.run_id == str(run.id)
             assert after.settled_at is None
-            bridge_call.assert_not_called()
+            assert bridge_call.calls == 0
     engine.dispose()
 
 
@@ -186,10 +200,11 @@ async def test_run_refusal_stops_dispatch_and_records_owner_quota(tmp_path, monk
         lease_seconds=service.session_operation_lease_seconds,
     ) as execute_lease:
         run = await service.create_run(session.id, state.id, session_operation_context=execute_lease.context)
-        bridge = SimpleNamespace(_session_service=service, _call_async=Mock(side_effect=AssertionError("async bridge")))
-        provider_entry = Mock()
+        bridge_call = _ForbiddenAsyncBridge()
+        bridge = SimpleNamespace(_session_service=service, _call_async=bridge_call)
+        provider_entries: list[str] = []
         attempt_id = await run_sync_in_worker(ExecutionServiceImpl._admit_run_llm_call, bridge, run.id, execute_lease)
-        provider_entry(attempt_id)
+        provider_entries.append(attempt_id)
         actual_entry = TokenUsageEntry(
             model="test/model",
             prompt_tokens=1000,
@@ -260,7 +275,7 @@ async def test_run_refusal_stops_dispatch_and_records_owner_quota(tmp_path, monk
         with pytest.raises(ChargeableAdmissionRefused) as caught:
             await run_sync_in_worker(ExecutionServiceImpl._admit_run_llm_call, bridge, run.id, execute_lease)
         assert caught.value.decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED
-        provider_entry.assert_called_once_with(attempt_id)
+        assert provider_entries == [attempt_id]
         assert len(refusals) == 1
         assert refusals[0].identity_id == "alice" and refusals[0].operation == "run"
         with engine.connect() as connection:
@@ -269,7 +284,7 @@ async def test_run_refusal_stops_dispatch_and_records_owner_quota(tmp_path, monk
         assert len(attempts) == len(ledger) == 1
         assert attempts[0].settled_at is not None
         assert ledger[0].run_id == str(run.id) and ledger[0].prompt_tokens == 1000
-        bridge._call_async.assert_not_called()
+        assert bridge_call.calls == 0
     engine.dispose()
 
 
@@ -318,9 +333,14 @@ async def test_committed_run_admission_lost_receipt_is_integrity_failure_without
             raise OperationalError("COMMIT", None, RuntimeError("injected lost commit acknowledgement"))
 
         monkeypatch.setattr(service, "_session_process_locked_begin", lost_receipt)
-        bridge = SimpleNamespace(_session_service=service, _call_async=Mock(side_effect=AssertionError("async bridge")))
+        bridge_call = _ForbiddenAsyncBridge()
+        bridge = SimpleNamespace(_session_service=service, _call_async=bridge_call)
         provider = FakeOpenAIClient(response=provider_response())
         execution = FakeExecutionRepository()
+
+        def unexpected_settlement(_attempt_id: str, _call_id: str) -> Never:
+            raise AssertionError("no settlement without provider call")
+
         client = AuditedLLMClient(
             execution=execution,
             state_id="state-1",
@@ -329,7 +349,7 @@ async def test_committed_run_admission_lost_receipt_is_integrity_failure_without
             underlying_client=provider,
             llm_call_governance=LLMCallGovernance(
                 partial(ExecutionServiceImpl._admit_run_llm_call, bridge, run.id, execute_lease),
-                Mock(side_effect=AssertionError("no settlement without provider call")),
+                unexpected_settlement,
             ),
             **mock_audit_authority(),
         )
@@ -341,7 +361,7 @@ async def test_committed_run_admission_lost_receipt_is_integrity_failure_without
             ledger = connection.execute(select(token_usage_ledger_table)).all()
         assert attempt.settled_at is None and ledger == []
         assert provider.create_calls == [] and execution.recorded_calls == []
-        bridge._call_async.assert_not_called()
+        assert bridge_call.calls == 0
     engine.dispose()
 
 
@@ -379,7 +399,8 @@ async def test_run_settlement_lost_receipt_replays_exact_real_landscape_call(tmp
         lease_seconds=service.session_operation_lease_seconds,
     ) as execute_lease:
         run = await service.create_run(session.id, state.id, session_operation_context=execute_lease.context)
-        bridge = SimpleNamespace(_session_service=service, _call_async=Mock(side_effect=AssertionError("async bridge")))
+        bridge_call = _ForbiddenAsyncBridge()
+        bridge = SimpleNamespace(_session_service=service, _call_async=bridge_call)
         attempt_id = await run_sync_in_worker(ExecutionServiceImpl._admit_run_llm_call, bridge, run.id, execute_lease)
 
         landscape = make_landscape_db()
@@ -538,5 +559,5 @@ async def test_run_settlement_lost_receipt_replays_exact_real_landscape_call(tmp
                 landscape_db=landscape,
                 landscape_run_id=landscape_run_id,
             )
-        bridge._call_async.assert_not_called()
+        assert bridge_call.calls == 0
     engine.dispose()

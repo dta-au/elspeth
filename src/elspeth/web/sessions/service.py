@@ -6441,6 +6441,35 @@ class SessionServiceImpl:
         )
         return msg_id
 
+    def _insert_message_ingress_receipt(
+        self,
+        conn: Connection,
+        /,
+        *,
+        session_id: str,
+        client_request_id: str,
+        user_message_id: str,
+        requested_state_id: str | None,
+        created_at: datetime,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Bind one accepted route user row to its request key under COMPOSE authority."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        self._assert_session_write_lock_held(conn, session_id, caller="_insert_message_ingress_receipt")
+        self._require_session_write_authority_on_connection(conn, session_operation_context, session_id=session_id)
+        conn.execute(
+            insert(message_ingress_receipts_table).values(
+                session_id=session_id,
+                client_request_id=client_request_id,
+                user_message_id=user_message_id,
+                requested_state_id=requested_state_id,
+                created_at=created_at,
+            )
+        )
+
     def _insert_transition_assistant(
         self,
         conn: Connection,
@@ -9744,14 +9773,14 @@ class SessionServiceImpl:
                     created_at=now,
                     session_operation_context=session_operation_context,
                 )
-                conn.execute(
-                    insert(message_ingress_receipts_table).values(
-                        session_id=sid,
-                        client_request_id=request_id,
-                        user_message_id=msg_id_holder["id"],
-                        requested_state_id=requested_sid,
-                        created_at=now,
-                    )
+                self._insert_message_ingress_receipt(
+                    conn,
+                    session_id=sid,
+                    client_request_id=request_id,
+                    user_message_id=msg_id_holder["id"],
+                    requested_state_id=requested_sid,
+                    created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._session_mutations(
                     conn, session_id=sid, session_operation_context=session_operation_context

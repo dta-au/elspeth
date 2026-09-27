@@ -373,7 +373,7 @@ def test_messages_same_content_checkpoint_keeps_guided_review_readable(
     if route == "recompose":
         service = client.app.state.session_service
 
-        async def add_user_message() -> None:
+        async def add_user_message() -> UUID:
             lease = await SessionOperationLease.acquire(
                 service.session_operation_authority,
                 session_id=UUID(session_id),
@@ -382,7 +382,7 @@ def test_messages_same_content_checkpoint_keeps_guided_review_readable(
                 lease_seconds=service.session_operation_lease_seconds,
             )
             try:
-                await service.add_message(
+                user_message = await service.add_message(
                     UUID(session_id),
                     "user",
                     "Explain this proposal without changing it.",
@@ -390,11 +390,15 @@ def test_messages_same_content_checkpoint_keeps_guided_review_readable(
                     writer_principal="route_user_message",
                     session_operation_context=lease.context,
                 )
+                return user_message.id
             finally:
                 await lease.close()
 
-        asyncio.run(add_user_message())
-    response = client.post(f"/api/sessions/{session_id}/{route}", json={"content": "Explain this proposal without changing it."})
+        user_message_id = asyncio.run(add_user_message())
+        request_body = {"expected_user_message_id": str(user_message_id)}
+    else:
+        request_body = {"content": "Explain this proposal without changing it.", "client_request_id": str(uuid4())}
+    response = client.post(f"/api/sessions/{session_id}/{route}", json=request_body)
     assert response.status_code == 200, response.json()
     after = _head_record(client, session_id)
     assert after.id != before.id

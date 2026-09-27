@@ -1,6 +1,7 @@
 """Advisor-only decisions survive real route, fenced write, and DB reload seams."""
 
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -71,17 +72,18 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
 
     app.state.composer_service = InterruptedComposer()
     if route == "recompose":
-        await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
+        user_message = await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
+        request_body = {"expected_user_message_id": str(user_message.id)}
+    else:
+        request_body = {"content": "Revise the intent", "client_request_id": str(uuid4())}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            f"/api/sessions/{session.id}/{route}",
-            **({"json": {"content": "Revise the intent"}} if route == "messages" else {}),
-        )
+        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
     assert response.status_code == 422, response.text
     after = await service.get_current_state(session.id)
     assert after is not None
     assert after.id != before.id
     assert after.version == before.version + 1
+    assert response.json()["detail"]["error_type"] == "convergence"
     assert response.json()["detail"]["partial_state"]["id"] == str(after.id)
     rebuilt = state_from_record(after)
     assert rebuilt.metadata == reviewed.with_metadata(patch).metadata
@@ -167,12 +169,12 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
 
     app.state.composer_service = DecisionComposer()
     if route == "recompose":
-        await service.add_message(session.id, "user", "Please retry the review", writer_principal="route_user_message")
+        user_message = await service.add_message(session.id, "user", "Please retry the review", writer_principal="route_user_message")
+        request_body = {"expected_user_message_id": str(user_message.id)}
+    else:
+        request_body = {"content": "Please retry the review", "client_request_id": str(uuid4())}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            f"/api/sessions/{session.id}/{route}",
-            **({"json": {"content": "Please retry the review"}} if route == "messages" else {}),
-        )
+        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
     assert response.status_code == 200, response.text
     assert calls == [before.version]
     after = await service.get_current_state(session.id)
@@ -245,10 +247,11 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
             (AdvisorBlockCause.MALFORMED, False),
         ):
             if route == "recompose":
-                await service.add_message(session.id, "user", "Retry review", writer_principal="route_user_message")
-            response = await client.post(
-                f"/api/sessions/{session.id}/{route}", **({"json": {"content": "Retry review"}} if route == "messages" else {})
-            )
+                user_message = await service.add_message(session.id, "user", "Retry review", writer_principal="route_user_message")
+                request_body = {"expected_user_message_id": str(user_message.id)}
+            else:
+                request_body = {"content": "Retry review", "client_request_id": str(uuid4())}
+            response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
             assert response.status_code == 200, response.text
             record = await service.get_current_state(session.id)
             assert record is not None

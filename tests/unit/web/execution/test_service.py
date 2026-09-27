@@ -12278,7 +12278,9 @@ def test_per_call_quota_admission_persists_pending_under_transferred_lease(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del real_loop
-    monkeypatch.setattr(service, "_call_async", MagicMock(side_effect=AssertionError("run admission entered async bridge")))
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     run_uuid = uuid4()
     attempt = ProviderAttempt(attempt_id="provider-attempt", started_at=datetime.now(UTC))
     mock_session_service.begin_run_provider_attempt_sync.return_value = attempt
@@ -12293,7 +12295,9 @@ def test_per_call_quota_refusal_propagates_before_dispatch(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del real_loop
-    monkeypatch.setattr(service, "_call_async", MagicMock(side_effect=AssertionError("run admission entered async bridge")))
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     refusal = ChargeableAdmissionRefused(
         ChargeableAdmissionDecision(
             refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
@@ -12314,7 +12318,9 @@ def test_per_call_settlement_uses_exact_durable_call_identity(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del real_loop
-    monkeypatch.setattr(service, "_call_async", MagicMock(side_effect=AssertionError("run settlement entered async bridge")))
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run settlement entered async bridge"))
+    )
     entry = TokenUsageEntry(
         model="model",
         prompt_tokens=3,

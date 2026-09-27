@@ -24,6 +24,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -1862,6 +1863,61 @@ class TestAddMessageWithTranscript:
     performs both on one connection in one write-locked transaction, so
     the returned transcript ends at the inserted row by construction.
     """
+
+    @pytest.mark.asyncio
+    async def test_ingress_receipt_writer_requires_same_connection_lock_and_live_compose_fence(self, engine, service) -> None:
+        session = await service.create_session("alice", "Receipt authority", "local")
+        message = await service.add_message(session.id, "user", "canonical", writer_principal="route_user_message")
+        sid = str(session.id)
+
+        def insert_receipt(conn, context) -> None:
+            service._insert_message_ingress_receipt(
+                conn,
+                session_id=sid,
+                client_request_id=str(uuid.uuid4()),
+                user_message_id=str(message.id),
+                requested_state_id=None,
+                created_at=datetime.now(UTC),
+                session_operation_context=context,
+            )
+
+        compose_context = service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            with service._session_process_locked_begin(sid) as conn, pytest.raises(RuntimeError, match="_session_write_lock"):
+                insert_receipt(conn, compose_context)
+        finally:
+            service.session_operation_authority.release(compose_context)
+
+        with (
+            service._session_process_locked_begin(sid) as conn,
+            service._session_write_lock(conn, sid),
+            pytest.raises(SessionOperationFenceLost),
+        ):
+            insert_receipt(conn, compose_context)
+
+        proposal_context = service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            with (
+                service._session_process_locked_begin(sid) as conn,
+                service._session_write_lock(conn, sid),
+                pytest.raises(SessionOperationFenceLost),
+            ):
+                insert_receipt(conn, proposal_context)
+        finally:
+            service.session_operation_authority.release(proposal_context)
+
+        with engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(message_ingress_receipts_table)).scalar_one() == 0
 
     @pytest.mark.asyncio
     async def test_returns_inserted_record_and_full_ordered_transcript(self, service) -> None:
