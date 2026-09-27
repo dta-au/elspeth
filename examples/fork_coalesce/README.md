@@ -132,7 +132,7 @@ Three additional configurations demonstrate `union_collision_policy` — a `Coal
 |---------|--------|------------------------------|------|
 | `settings_union_last_wins.yaml` | `last_wins` (default) | last branch in declaration order (`path_b`) | 0 |
 | `settings_union_first_wins.yaml` | `first_wins` | first branch in declaration order (`path_a`) | 0 |
-| `settings_union_fail.yaml` | `fail` | none — raises `CoalesceCollisionError` | non-zero (**deliberate**) |
+| `settings_union_fail.yaml` | `fail` | none — every colliding row's group fails (`union_field_collision`) | 2, run `FAILED` (**deliberate**) |
 
 **Orthogonality note:** `union_collision_policy` is independent of the arrival `policy` (`require_all`, `quorum`, `best_effort`, `first`). Arrival policy decides **when** to merge; collision policy decides **how** to reconcile overlapping field names once merging begins. All three variants use `policy: require_all`.
 
@@ -164,10 +164,12 @@ Expected output excerpt (`output/union_first_wins.json`):
 
 ### `settings_union_fail.yaml` — fail (deliberate failure)
 
-**This pipeline is designed to fail.** Any overlap in field names raises `CoalesceCollisionError`. The orchestrator catches the first collision, marks that coalesce group `FAILED`, persists the collision record, and aborts the run. Because both branches emit the same column set, the first source row is sufficient to demonstrate the policy.
+**Every row of this pipeline is designed to fail at the coalesce.** Any field name carried by both arriving branches fails that row's merge group: each consumed branch row is recorded `FAILED` with the closed, value-free reason `union_field_collision`, the collision record is persisted on each FAILED hold, and the run moves on to the next row — it never aborts. Because both branches carry the same column set, every row collides, so the run ends `FAILED` (exit 2) with nothing written to the sink.
+
+The source is `observed`, so the build cannot know which columns a row carries and the collision is a per-row fault. With a `fixed` source both branches would *guarantee* the same columns, every merge would be certain to collide, and `elspeth validate` refuses the pipeline before any row is read, naming the colliding fields and the remedies.
 
 ```bash
-elspeth run --settings examples/fork_coalesce/settings_union_fail.yaml --execute || echo "expected non-zero exit"
+elspeth run --settings examples/fork_coalesce/settings_union_fail.yaml --execute || echo "expected exit 2 (run FAILED)"
 ```
 
 Use this variant when you want the pipeline to reject overlap rather than silently pick a winner — for example, when two enrichment APIs are supposed to return disjoint fields and any overlap indicates a misconfiguration.
@@ -203,7 +205,7 @@ for (ctx_json,) in db.execute(
     break
 ```
 
-For the `fail` variant, look for `status = 'failed'` on the `coalesce_merge_results_*` `node_id` — the same collision record is preserved even though the pipeline aborted.
+For the `fail` variant, look for `status = 'failed'` on the `coalesce_merge_results_*` `node_id` — one per consumed branch row, each carrying the same collision record, with `failure_reason` `union_field_collision` in `error_json`.
 
 ## See Also
 

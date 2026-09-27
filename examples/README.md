@@ -167,7 +167,7 @@ Some examples deliberately exercise failure accounting:
 |--------------------|-----------------|
 | `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
 | `pdf_rasterize` | `PARTIAL`, exit 1; 1 malformed PDF is quarantined by design (3 page rows still succeed) |
-| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
+| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, exit 2; every row's group fails `union_field_collision` (the run never aborts) |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
 | `scope_collector/settings.yaml` | `PARTIAL`, exit 1; one page is malformed by construction and `require_all` withholds that document's statistics |
 | `scope_collector/settings_best_effort.yaml` | `PARTIAL`, exit 1; the same lost page, but `best_effort` still reports over the survivors |

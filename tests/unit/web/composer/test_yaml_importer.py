@@ -952,6 +952,30 @@ sinks:
         )
 
 
+def test_composer_cannot_author_union_collision_policy_fail() -> None:
+    """Composer/runtime agreement for the union-collision refusal: the runtime
+    refuses a union coalesce under ``union_collision_policy: fail`` whose every
+    merge is certain to collide (``certain_union_collisions``). The composer
+    has no mirror of that predicate because it cannot express the shape at
+    all — NodeSpec carries no collision policy (every composer coalesce runs
+    the default ``last_wins``) and importing one is refused. If the composer
+    ever gains the field, this pin fails and the predicate must be mirrored."""
+    from dataclasses import fields
+
+    assert "union_collision_policy" not in {field.name for field in fields(NodeSpec)}
+    with pytest.raises(RuntimeYamlImportError, match=r"unsupported coalesce field.*union_collision_policy"):
+        composition_state_from_runtime_yaml(
+            """
+coalesce:
+  - name: joined
+    branches: [a, b]
+    policy: require_all
+    merge: union
+    union_collision_policy: fail
+"""
+        )
+
+
 def test_composition_state_from_runtime_yaml_preserves_coalesce_timeout() -> None:
     state = composition_state_from_runtime_yaml(
         """

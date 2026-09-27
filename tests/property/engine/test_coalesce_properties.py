@@ -221,9 +221,17 @@ class TestCoalesceAuditCleanupFailures:
             branches=["branch_a", "branch_b"],
             policy="require_all",
             merge="union",
-            union_collision_policy="fail",
         )
         executor.register_coalesce(settings, node_id=NodeID("node-001"))
+
+        # An unexpected merge exception is what reaches the merge cleanup arm
+        # (a union collision under union_collision_policy=fail is a routed
+        # group failure, never this path).
+        def fail_merge_data(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise RuntimeError("merge blew up")
+
+        executor._merge_data = fail_merge_data
 
         token_a = make_token(
             token_id="token-a",

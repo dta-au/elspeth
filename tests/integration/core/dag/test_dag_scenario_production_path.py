@@ -857,8 +857,6 @@ def test_b2_coalesce_failure_and_collision_cases_declare_exact_run_oracles(
     if case_id == "union-collision-fail":
         assert isinstance(case.expected, RunExpectation)
         assert case.expected.status == "failed"
-        assert case.expected.expected_error is not None
-        assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
     else:
         assert isinstance(case.expected, SemanticRunExpectation)
 
@@ -927,11 +925,23 @@ def test_b2_coalesce_full_matrix_declares_exact_contracts(tmp_path: Path) -> Non
             if collision_policy == "fail":
                 assert isinstance(case.expected, RunExpectation)
                 projection = case.expected.projection
-                assert case.expected.status == "failed"
-                assert case.expected.expected_error is not None
-                assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
+                # A data-dependent collision (the observed source's fields,
+                # carried on every branch) is a routed row fault: every token
+                # terminal, every consumed token failed with the closed reason
+                # and its FAILED hold carrying the collision record — never an
+                # abort (the case pinned the abort-at-row-1 defect before E7).
+                assert (case.expected.status, case.expected.rows_succeeded, case.expected.rows_failed) == ("failed", 0, 3)
                 assert case.expected.sink_outputs == ()
-                assert all(work.final_status == "blocked" for work in projection.scheduler_work[1:])
+                assert all(work.final_status == "terminal" for work in projection.scheduler_work)
+                assert [(d.outcome, d.path) for d in projection.terminal_dispositions].count(("failure", "unrouted")) == 3
+                failed_holds = [
+                    state for state in projection.node_states if state.node_key.startswith("coalesce:") and state.status == "failed"
+                ]
+                assert len(failed_holds) == 3
+                for state in failed_holds:
+                    assert state.error is not None and state.context_after is not None
+                    assert json.loads(state.error)["failure_reason"] == "union_field_collision"
+                    assert set(json.loads(state.context_after)["union_field_collisions"]) == {"id", "value"}
             else:
                 assert isinstance(case.expected, SemanticRunExpectation)
                 assert (case.expected.status, case.expected.rows_succeeded, case.expected.rows_failed) == ("completed", 1, 0)
@@ -1420,13 +1430,11 @@ def _assert_declared_run_evidence(
     assert evidence.runtime.sink_outputs == case.expected.sink_outputs
     if isinstance(case.expected, RunExpectation):
         assert evidence.runtime.durable_projection == case.expected.projection
-        assert evidence.runtime.observed_error == case.expected.expected_error
     else:
         assert evidence.runtime.durable_projection is not None
         semantic_projection = semantic_runtime_projection(evidence.runtime.durable_projection)
         assert semantic_runtime_projection_sha256(semantic_projection) == case.expected.projection_sha256
         assert semantic_runtime_projection_counts(semantic_projection) == case.expected.projection_counts
-        assert evidence.runtime.observed_error is None
 
     assert evidence.audit.attempted is True
     assert evidence.audit.total_records > 0
@@ -1439,7 +1447,7 @@ def _assert_declared_run_evidence(
         assert evidence.audit.kind == "exact"
         assert evidence.audit.portable_projection == evidence.runtime.durable_projection
         assert evidence.audit.portable_export_unavailable is None
-    elif case.expected.expected_error is None:
+    elif case.expected.status != "failed":
         assert evidence.audit.kind == "exact"
         assert evidence.audit.portable_projection == case.expected.projection
         assert evidence.audit.portable_export_unavailable is None

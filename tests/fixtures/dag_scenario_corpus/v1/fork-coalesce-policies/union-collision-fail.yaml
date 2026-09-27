@@ -5,7 +5,7 @@ sources:
     options:
       path: ${input_primary}
       on_validation_failure: discard
-      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+      schema: {mode: observed}
 gates:
   - name: fork_gate
     input: fork_input
@@ -20,7 +20,7 @@ transforms:
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "'a'"}]
+      operations: [{target: marker_a, expression: "'a'"}]
   - name: mark_c
     plugin: value_transform
     input: path_c
@@ -28,7 +28,7 @@ transforms:
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "'c'"}]
+      operations: [{target: marker_c, expression: "'c'"}]
   - name: mark_b
     plugin: value_transform
     input: path_b
@@ -36,7 +36,7 @@ transforms:
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "'b'"}]
+      operations: [{target: marker_b, expression: "'b'"}]
 coalesce:
   - name: merge_paths
     branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}

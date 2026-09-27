@@ -29,7 +29,6 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.contracts.errors import CoalesceCollisionError
 from elspeth.contracts.export_records import AuditExportConfigRecord, AuthEventCoverageExportRecord
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
@@ -144,7 +143,6 @@ from tests.fixtures.dag_scenario_corpus.schema import (
 )
 from tests.fixtures.landscape import expire_lease, expire_worker
 
-EXPECTED_RUN_ERROR_TYPES: Mapping[str, type[BaseException]] = MappingProxyType({"CoalesceCollisionError": CoalesceCollisionError})
 CORPUS_EXPORT_COMPARTMENT_ID = "dag-corpus"
 
 
@@ -2793,44 +2791,44 @@ def _audit_evidence(
     )
 
 
-def _run_expected_error_case(
+def _run_failed_case(
     scenario: ScenarioSpec,
     case: HarnessCaseSpec,
     tmp_path: Path,
 ) -> ScenarioRunEvidence:
+    """A run that RETURNS with status FAILED (every row failed; none succeeded
+    or was quarantined). A FAILED run is not export-terminal, so the audit
+    evidence is the durable projection plus the exporter's by-policy refusal.
+    An exception escaping the run is never an expected outcome here: it
+    propagates and fails the case."""
     expected = case.expected
-    if not isinstance(expected, RunExpectation) or expected.expected_error is None:
-        raise AssertionError("expected-error runner requires an exact run expectation with expected_error")
-    expected_type = EXPECTED_RUN_ERROR_TYPES[expected.expected_error.exception_type]
+    if not isinstance(expected, RunExpectation) or expected.status != "failed":
+        raise AssertionError("failed-run runner requires an exact run expectation with status=failed")
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
         catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
         payload_store = FilesystemPayloadStore(tmp_path / "payloads")
-        try:
-            Orchestrator(db).run(
-                built.config,
-                graph=built.graph,
-                settings=built.rendered.settings,
-                payload_store=payload_store,
-                openrouter_catalog_sha256=catalog_sha256,
-                openrouter_catalog_source=catalog_source,
-            )
-        except expected_type as exc:
-            if type(exc) is not expected_type:
-                raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, got subclass {type(exc).__name__}") from exc
-        else:
-            raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, but production run returned")
+        result = Orchestrator(db).run(
+            built.config,
+            graph=built.graph,
+            settings=built.rendered.settings,
+            payload_store=payload_store,
+            openrouter_catalog_sha256=catalog_sha256,
+            openrouter_catalog_source=catalog_source,
+        )
+        if result.status is not RunStatus.FAILED:
+            raise AssertionError(f"DAG failed-run corpus expected a FAILED run result, got {result.status.value!r}")
 
         sink_outputs = _sink_outputs(rendered)
         repositories = RecorderFactory.read_only(db, payload_store=payload_store)
         runs = repositories.run_lifecycle.list_runs()
         if len(runs) != 1:
-            raise AssertionError(f"DAG expected-error corpus expected exactly one persisted run, got {len(runs)}")
+            raise AssertionError(f"DAG failed-run corpus expected exactly one persisted run, got {len(runs)}")
         failed_run = runs[0]
         if failed_run.status is not RunStatus.FAILED:
-            raise AssertionError(f"DAG expected-error corpus expected failed run, got {failed_run.status.value!r}")
+            raise AssertionError(f"DAG failed-run corpus expected failed run, got {failed_run.status.value!r}")
 
         counter_factory = RecorderFactory(db, payload_store=payload_store)
         _derived_status, counters = derive_terminal_status_from_audit(counter_factory, failed_run.run_id)
@@ -2845,7 +2843,7 @@ def _run_expected_error_case(
             if type(export_exc) is not ValueError or str(export_exc) != export_reason:
                 raise
         else:
-            raise AssertionError("DAG expected-error corpus failed run unexpectedly allowed portable export")
+            raise AssertionError("DAG failed-run corpus failed run unexpectedly allowed portable export")
         audit = _audit_evidence(
             durable_records,
             portable_export_unavailable=PortableExportUnavailableByPolicy(
@@ -2871,7 +2869,6 @@ def _run_expected_error_case(
                 output_rows=sum(len(output.rows) for output in sink_outputs),
                 sink_outputs=sink_outputs,
                 durable_projection=durable_projection,
-                observed_error=expected.expected_error,
             ),
             audit=audit,
             recovery=RecoveryEvidence(
@@ -2888,8 +2885,8 @@ def _run_expected_error_case(
 
 
 def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
-    if isinstance(case.expected, RunExpectation) and case.expected.expected_error is not None:
-        return _run_expected_error_case(scenario, case, tmp_path)
+    if isinstance(case.expected, RunExpectation) and case.expected.status == "failed":
+        return _run_failed_case(scenario, case, tmp_path)
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")

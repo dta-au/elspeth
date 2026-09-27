@@ -315,3 +315,111 @@ def test_row_union_group_lost_after_two_arrivals_counts_every_held_member(tmp_pa
     # row 2: the discarded path_c token + its 2 held members; rows 1 and 3 release.
     _assert_counted_once_per_token(run, exit_code=1, rows_failed=3, coalesce_failed=1)
     assert _failure_reasons_at_barrier(run.db_path) == {"row_union_branch_lost"}
+
+
+# ---------------------------------------------------------------------------
+# union_collision_policy: fail — certain collisions refused at build, observed
+# collisions routed per row (never a run abort).
+# ---------------------------------------------------------------------------
+
+
+def _collision_body(*, policy: str) -> dict[str, Any]:
+    coalesce: dict[str, Any] = {
+        "name": "merge_results",
+        "branches": {"path_a": "out_a", "path_b": "out_b"},
+        "policy": policy,
+        "merge": "union",
+        "union_collision_policy": "fail",
+        "on_success": "out",
+    }
+    if policy == "first":
+        coalesce["timeout_seconds"] = 5
+    return {
+        "gates": [_fork_gate(["path_a", "path_b"])],
+        "transforms": [
+            _value_transform("vt_a", "path_a", "out_a", target="marker_a", expression="'a'"),
+            _passthrough("pt_b", "path_b", "out_b"),
+        ],
+        "coalesce": [coalesce],
+    }
+
+
+def _observed_source(tmp_path: Path) -> dict[str, Any]:
+    source_path = tmp_path / "in.jsonl"
+    source_path.write_text('{"id": 1, "q": 10}\n{"id": 2, "q": 20}\n{"id": 3, "q": 30}\n')
+    return {
+        "plugin": "json",
+        "on_success": "raw",
+        "options": {"path": str(source_path), "format": "jsonl", "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+    }
+
+
+def test_collision_certain_from_config_is_refused_before_any_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixed source's id/price are forwarded on BOTH fork branches, so every
+    merge collides by name: refused at build with the remedies named, before
+    a single row is read (was: CoalesceCollisionError abort at row 1, exit 4,
+    rows 2-3 never ingested)."""
+    settings = _settings(tmp_path, source=_csv_source(tmp_path), body=_collision_body(policy="require_all"))
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+
+    validated = CliRunner().invoke(app, ["--no-dotenv", "validate", "--settings", str(settings_path)])
+    run = _run(tmp_path, monkeypatch, settings)
+
+    for output in (validated.output, run.output):
+        assert "Coalesce 'merge_results' uses union_collision_policy 'fail'" in output
+        assert "'id' (branches ['path_a', 'path_b'])" in output
+        assert "'price' (branches ['path_a', 'path_b'])" in output
+        assert "first_wins" in output
+    assert validated.exit_code != 0
+    assert run.exit_code not in (0, 4)
+    assert run.parity == ()
+    assert not run.db_path.exists() or _non_terminal_token_count(run.db_path) == 0
+
+
+def test_refusal_is_sound_every_row_would_have_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Soundness control for the build refusal: with the refusal disabled, the
+    very pipeline it refuses fails EVERY row at the coalesce — the refusal
+    moves a certain per-row failure to build, it never refuses a pipeline a
+    row could pass."""
+    from elspeth.core.dag import builder
+
+    monkeypatch.setattr(builder, "certain_union_collisions", lambda *args, **kwargs: {})
+    run = _run(tmp_path, monkeypatch, _settings(tmp_path, source=_csv_source(tmp_path), body=_collision_body(policy="require_all")))
+
+    _assert_counted_once_per_token(run, exit_code=2, rows_failed=6, coalesce_failed=3)
+    assert _failure_reasons_at_barrier(run.db_path) == {"union_field_collision"}
+
+
+def test_collision_on_observed_fields_routes_every_row_and_never_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An observed source guarantees nothing, so the build cannot know the
+    rows' fields: the collision is a row fault. Each group fails with the
+    closed, value-free reason, every token terminates, all three rows are
+    processed (was: abort at row 1 with the collided names in the error)."""
+    run = _run(tmp_path, monkeypatch, _settings(tmp_path, source=_observed_source(tmp_path), body=_collision_body(policy="require_all")))
+
+    _assert_counted_once_per_token(run, exit_code=2, rows_failed=6, coalesce_failed=3)
+    assert _failure_reasons_at_barrier(run.db_path) == {"union_field_collision"}
+    with sqlite3.connect(run.db_path) as conn:
+        (rows,) = conn.execute("SELECT count(*) FROM rows").fetchone()
+        contexts = [
+            json.loads(context)
+            for (context,) in conn.execute(
+                "SELECT ns.context_after_json FROM node_states ns JOIN nodes n ON n.node_id = ns.node_id AND n.run_id = ns.run_id "
+                "WHERE n.node_type = 'coalesce' AND ns.status = 'failed'"
+            ).fetchall()
+        ]
+    assert rows == 3
+    assert contexts and all(
+        context["union_field_collisions"] == {"id": ["path_a", "path_b"], "q": ["path_a", "path_b"]} for context in contexts
+    )
+
+
+def test_first_policy_is_never_refused_for_collisions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: ``first`` merges a single arrived branch, which cannot collide,
+    so the same shared guarantees build and every row merges."""
+    run = _run(tmp_path, monkeypatch, _settings(tmp_path, source=_csv_source(tmp_path), body=_collision_body(policy="first")))
+
+    assert run.exit_code in (0, 1), run.output
+    assert _non_terminal_token_count(run.db_path) == 0
+    assert (tmp_path / "out.jsonl").read_text().count("\n") == 3

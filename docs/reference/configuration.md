@@ -2235,7 +2235,7 @@ When `merge: union` is used and two or more branches emit the same field name, `
 |-------|----------|
 | `last_wins` *(default)* | The last branch in declaration order wins. Matches the historical behavior of union merges. |
 | `first_wins` | The first branch in declaration order wins. |
-| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. Field origins and contributing branch names are still written to the failed node state. |
+| `fail` | Any field two arriving branches both carry fails that row's merge group: no merged row is produced, each consumed branch row is recorded `FAILED` with the closed reason `union_field_collision`, and field origins and contributing branch names are written to each failed node state. The run continues with the next row. A collision that is certain from config — every merge the arrival policy can perform sees two branches that both *guarantee* the same field (for example fields a `fixed` source forwards on every branch) — is refused at build, before any row is read. |
 
 > **Note on `fail`:** Collision detection is **name-based**, not value-based. Two branches that both emit a field called `id` with the *same* value still trigger `fail` — the executor does not compare values to decide whether the overlap is "real." If your branches share trivially-identical fields (like an `id` carried unchanged through both transforms), use `last_wins` or `first_wins` instead, or rename the shared fields out of one branch.
 
@@ -2259,7 +2259,7 @@ coalesce:
       - entity_path
     policy: require_all          # branch-level arrival policy
     merge: union
-    union_collision_policy: fail  # field-level collision policy — abort on overlap
+    union_collision_policy: fail  # field-level collision policy — fail the row's group on overlap
     on_success: output
 ```
 

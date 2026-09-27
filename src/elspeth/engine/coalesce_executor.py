@@ -53,6 +53,13 @@ if TYPE_CHECKING:
 slog = structlog.get_logger(__name__)
 
 
+UNION_FIELD_COLLISION_REASON = "union_field_collision"
+"""Closed failure reason of a coalesce group failed by a union field collision
+under ``union_collision_policy: fail``. Value-free: the collided names (row-
+derived keys under observed schemas) live only in the structured collision
+record on each FAILED hold's ``context_after``."""
+
+
 @dataclass(frozen=True, slots=True)
 class CoalesceOutcome:
     """Result of a coalesce accept operation.
@@ -1078,6 +1085,7 @@ class CoalesceExecutor:
         is_timeout: bool = False,
         select_branch: str | None = None,
         metadata: CoalesceMetadata | None = None,
+        context_after: CoalesceMetadata | None = None,
     ) -> CoalesceOutcome:
         """Fail all arrived tokens in a pending coalesce and clean up.
 
@@ -1097,6 +1105,11 @@ class CoalesceExecutor:
                 to CoalesceFailureReason).
             metadata: Pre-built CoalesceMetadata. When provided, used instead of
                 the default CoalesceMetadata.for_failure() construction.
+            context_after: Written as each FAILED hold's ``context_after``.
+                Only the union-collision failure passes it (its collision
+                record — field origins and the collided names — whose audit
+                readers query exactly that location); every other failure
+                arm records no context, as before.
 
         Returns:
             CoalesceOutcome with failure_reason set. The caller terminalizes
@@ -1129,6 +1142,7 @@ class CoalesceExecutor:
                 status=NodeStateStatus.FAILED,
                 error=error,
                 duration_ms=(now - entry.arrival_time) * 1000,
+                context_after=context_after,
             )
             # Terminal write retired (WS3 Task 6, spec §6.1 item 1): this
             # arm no longer calls record_token_outcome directly for the
@@ -1210,11 +1224,12 @@ class CoalesceExecutor:
             )
 
         completed_state_ids: set[str] = set()
-        # Captured so the failure cleanup handler can persist value-independent
-        # collision provenance (union_field_origins, union_field_collisions) to the audit trail
-        # when CoalesceCollisionError is raised under union_collision_policy=fail,
-        # or when any other exception happens after metadata was built. Stays None
-        # for early failures (e.g., contract merge) where no metadata exists yet.
+        # Captured so the failure cleanup handler can persist the merge's
+        # value-independent provenance (union_field_origins) to the audit trail
+        # when an exception happens after metadata was built. Stays None for
+        # failures before the plan exists. (A union collision under
+        # union_collision_policy=fail never reaches the cleanup: it is a routed
+        # group failure above, recording its collision record itself.)
         metadata_for_audit: CoalesceMetadata | None = None
         try:
             try:
@@ -1236,6 +1251,27 @@ class CoalesceExecutor:
                     step=step,
                     failure_reason=f"contract_type_conflict: {e}",
                     coordination_token=coordination_token,
+                )
+            except CoalesceCollisionError as collision:
+                # union_collision_policy=fail met a field name two ARRIVED
+                # branches both carry. A collision certain from config (two
+                # branches that both guarantee the name) is refused at build
+                # (``certain_union_collisions``); what reaches here depends on
+                # the rows' observed fields, so it is a row fault: the group
+                # fails and every consumed token terminates, the run goes on.
+                # The reason is a closed, value-free token (under observed
+                # schemas the collided names are row-derived keys); which
+                # fields collided and which branch carried each stays in the
+                # structured collision record on every FAILED hold
+                # (context_after), where the explain/MCP readers find it.
+                return self._fail_pending(
+                    settings=settings,
+                    key=key,
+                    step=step,
+                    failure_reason=UNION_FIELD_COLLISION_REASON,
+                    coordination_token=coordination_token,
+                    metadata=collision.metadata,
+                    context_after=collision.metadata,
                 )
             coalesce_metadata = plan.metadata
             metadata_for_audit = coalesce_metadata
@@ -1306,8 +1342,6 @@ class CoalesceExecutor:
             # recording any further FAILED states to the untrustworthy DB.
             raise
         except Exception as merge_exc:
-            if metadata_for_audit is None and isinstance(merge_exc, CoalesceCollisionError):
-                metadata_for_audit = merge_exc.metadata
             # Generate error_hash once for all branches (consistent audit trail).
             error_hash = compute_error_hash(str(merge_exc), exception_type=type(merge_exc).__name__)
 
@@ -1317,10 +1351,9 @@ class CoalesceExecutor:
                 # (Happy path already recorded COALESCED outcome for these.)
                 if entry.state_id in completed_state_ids:
                     continue
-                # Pass metadata_for_audit so union_collision_policy=fail's
-                # collision provenance (field origins + contributing branches) reaches
+                # Pass metadata_for_audit so the built merge's provenance reaches
                 # the Landscape audit trail via context_after. None is acceptable for
-                # early failures (e.g., contract merge) where no metadata exists.
+                # failures before the plan was built.
                 self._execution.complete_node_state(
                     member_token=coordination_token.membership,
                     state_id=entry.state_id,

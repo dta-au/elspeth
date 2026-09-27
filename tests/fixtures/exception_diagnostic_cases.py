@@ -412,7 +412,7 @@ DIAGNOSTIC_CASES = (
         errors.CoalesceCollisionError,
         frozenset({"metadata"}),
         "structured",
-        "Actual coalesce failure cleanup persists metadata through Landscape.",
+        "Actual coalesce union-collision group failure persists metadata through Landscape.",
         exercise_coalesce_metadata,
     ),
     *_text_cases(errors.EmptyResumeStateError, {"run_id": "fixed-run"}, "run_id"),

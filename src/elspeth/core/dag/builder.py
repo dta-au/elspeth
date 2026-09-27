@@ -39,7 +39,7 @@ from elspeth.core.dag.bound_regions import (
     validate_openers_bound_in_region,
     validate_sese_regions,
 )
-from elspeth.core.dag.coalesce_merge import merge_coalesce_schema
+from elspeth.core.dag.coalesce_merge import certain_union_collisions, merge_coalesce_schema
 from elspeth.core.dag.group_bindings import build_group_binding_registry
 from elspeth.core.dag.guarantees import (
     EffectiveGuaranteeVote,
@@ -250,6 +250,49 @@ def _refuse_certain_union_type_conflict(
             component_id=str(coalesce_id),
             component_type="coalesce",
         )
+
+
+def _refuse_certain_union_name_collision(
+    *,
+    coalesce_id: NodeID,
+    coal_config: CoalesceSettings,
+    branch_producer_votes: Mapping[str, tuple[NodeID, EffectiveGuaranteeVote]],
+) -> None:
+    """Refuse a ``union_collision_policy: fail`` coalesce every merge of which would collide (S3).
+
+    ``fail`` is name-based: a field two ARRIVED branches both carry fails the
+    group. When every merge the arrival policy can perform is certain to see
+    two branches that both GUARANTEE the same name, every row would fail
+    here — a config-determined failure, refused at construction rather than
+    paid per row. The per-branch input is the presence vote the guarantee
+    merge already uses (a branch whose vote does not participate guarantees
+    nothing); the decision is ``certain_union_collisions``. Collisions on
+    fields observed only at runtime stay the executor's routed group failure
+    (``union_field_collision``), never a run abort.
+    """
+    branch_guarantees: dict[str, frozenset[str]] = {branch: frozenset() for branch in coal_config.branches}
+    for branch_name, (_producer, vote) in branch_producer_votes.items():
+        if vote.participated:
+            branch_guarantees[branch_name] = vote.fields
+    certain = certain_union_collisions(
+        branch_guarantees,
+        require_all=coal_config.has_all_branch_semantics,
+        policy=coal_config.policy,
+        quorum_count=coal_config.quorum_count,
+    )
+    if not certain:
+        return
+    collided = "; ".join(f"'{field_name}' (branches {list(branches)})" for field_name, branches in certain.items())
+    raise GraphValidationError(
+        f"Coalesce '{coal_config.name}' uses union_collision_policy 'fail', but every merge it can perform "
+        f"is certain to collide: {collided} are guaranteed on more than one branch. 'fail' rejects any "
+        "field name two arriving branches both carry — including fields every branch forwards from the "
+        "fork — so every row would fail here. Use union_collision_policy 'first_wins' or 'last_wins' to "
+        "choose a winner, merge 'nested' to keep each branch's row under its branch name, or 'select' "
+        "to keep one branch.",
+        component_id=str(coalesce_id),
+        component_type="coalesce",
+    )
 
 
 def _parse_contract_schema_config(
@@ -1826,6 +1869,10 @@ def build_execution_graph(
                 branch_producer_votes=branch_producer_votes,
                 node_labels=plugin_node_labels,
             )
+            if coal_config.union_collision_policy == "fail":
+                _refuse_certain_union_name_collision(
+                    coalesce_id=coalesce_id, coal_config=coal_config, branch_producer_votes=branch_producer_votes
+                )
 
     # Update branch_info on the graph now that schemas are populated.
     # The initial set_branch_info (line ~821) stored entries without schemas.

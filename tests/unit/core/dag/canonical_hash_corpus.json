@@ -34,7 +34,7 @@
     "examples/explicit_routing/settings.yaml": "f83c436db817784ce0855e41a9ae1273e976dac2faa9cee07a58f3ec740112ff",
     "examples/fork_coalesce/settings.yaml": "ab7ab69db8ed7ca7d728f0f5b7dbd3911777c91cda7f1796cadf2793f83fe03e",
     "examples/fork_coalesce/settings_per_branch.yaml": "e0d9c20f3762f6d7aa4d7e80caf93d03c9d624b63a82230a8da3acded8bec30c",
-    "examples/fork_coalesce/settings_union_fail.yaml": "be0ab09fdb63795cc872b509ad03052022af6949e7ba74cd53d81b13497e5fda",
+    "examples/fork_coalesce/settings_union_fail.yaml": "b51304102f449ded963c53b87d02864c89c3ab4c1e54735ca068baedeb95b9d8",
     "examples/fork_coalesce/settings_union_first_wins.yaml": "b05693d1b199fd2d12118e9ac27c632cb6746ce51ea0381d2cfc59087f97d7c7",
     "examples/fork_coalesce/settings_union_last_wins.yaml": "445379c27caa1fd5dfbfa02e0145035d98284410f8c9c767dabd74e80dd9a845",
     "examples/join_refused/settings.yaml": "0ee1ab521f1a5a253988d12621bb0a62850e62f3e5e55be976b7b6c636a89529",

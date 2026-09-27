@@ -466,7 +466,13 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # manifest verified against this commit's harness run (real observed
 # projection_sha256/counts captured via the corpus harness, never hand-computed).
 # Current scheduler authority test names; scenario and runtime oracle bytes are unchanged.
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33bdc51e5e2823d80fe8da2"
+# Rotated 2026-09-27 (elspeth-5887fb7928 G1 E7, union_collision_policy: fail;
+# lane ruling option B): only the harness-fork-coalesce-policies-union-
+# collision-fail claim moved — the case now proves a routed data-dependent
+# collision (every consumed token failed union_field_collision, collision
+# record on each FAILED hold, FAILED run, export unavailable by policy)
+# instead of pinning the abort-at-row-1 CoalesceCollisionError.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48fbc55f6810c9554198fbc4"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -870,7 +876,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # source_file_hash moved 45320b13b23f6e0b -> b96c5b5e88bcd1eb
 # (scripts/cicd/plugin_hash); no manifest literal, resume digest, registry
 # digest or oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
+# Rotated 2026-09-27 (elspeth-5887fb7928 G1 E7, union_collision_policy: fail;
+# lane ruling option B): fork-coalesce-policies/union-collision-fail was
+# reshaped to a DATA-DEPENDENT collision (observed source, marker_a/b/c) —
+# the certain-from-config shape is now refused at build — and its exact
+# expectation re-captured through the corpus harness (never hand-computed):
+# status failed, 3 tokens failed union_field_collision, every scheduler row
+# terminal. The corpus's exception-expectation mechanism (expected_error /
+# observed_error), whose only user pinned the abort, is deleted, so its nine
+# `"expected_error": null` manifest literals dropped. Exactly one oracle_freeze
+# snapshot moved (this case's), sanctioned by the same ruling.
+EXPECTED_CASE_REGISTRY_SHA256 = "7c11c485d085d128914319b804a8e1121f191d9e254aa0812b176ac534acd620"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -934,7 +950,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:first-all-lost": "36d4b7a025847dd3a5ad0f7c066e9f260e7a16c1267a3010f329995ce730fb1e",
     "fork-coalesce-policies:union-collision-last-wins": "986df56cc9ca6ceeab7ccd5472f0c5605e296d48054112487d72b05174d2a6dd",
     "fork-coalesce-policies:union-collision-first-wins": "8a20e5eceb01859427ac5e60d0e370f8ba100a7b9ce0903b2ca6e28f288073c7",
-    "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
+    "fork-coalesce-policies:union-collision-fail": "536ae1b00e0e74c4cc5e0da9c7e064d5320ae206cddde761b237762307c05a57",
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "sequential-nested-fork-coalesce:reopen-terminal-publication": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "parallel-coalesces:two-parallel-require-all": "41399be936e2425b392b5b241c2b2a87f69e6a2d3423dcd6519b2b99701614df",
@@ -1593,10 +1609,17 @@ EXPECTED_COALESCE_NEGATIVE_YAMLS = {
         b"    merge: union\n",
         b"    merge: union\n    union_collision_policy: first_wins\n",
     ),
+    # E7 (ruling 2026-09-27): the collision is DATA-DEPENDENT — an observed
+    # source (nothing guaranteed) and a distinct marker per branch — so the
+    # build cannot refuse it and every row's group routes union_field_collision.
     "union-collision-fail": _EXPECTED_COLLISION_UNION.replace(
         b"    merge: union\n",
         b"    merge: union\n    union_collision_policy: fail\n",
-    ),
+    )
+    .replace(b'      schema: {mode: fixed, fields: ["id: int", "value: int"]}\n', b"      schema: {mode: observed}\n")
+    .replace(b"target: branch_marker, expression: \"'a'\"", b"target: marker_a, expression: \"'a'\"")
+    .replace(b"target: branch_marker, expression: \"'b'\"", b"target: marker_b, expression: \"'b'\"")
+    .replace(b"target: branch_marker, expression: \"'c'\"", b"target: marker_c, expression: \"'c'\""),
 }
 EXPECTED_COALESCE_YAMLS = EXPECTED_COALESCE_MATRIX_YAMLS | EXPECTED_COALESCE_NEGATIVE_YAMLS
 
@@ -3669,48 +3692,20 @@ def test_exact_runtime_evidence_allows_intentionally_absent_sink_artifacts() -> 
     assert runtime.output_rows == 0
 
 
-def test_exact_failed_run_expectation_declares_exact_production_exception() -> None:
+def test_exact_failed_run_expectation_declares_no_exception() -> None:
+    """A failed run is an outcome the run RETURNS; the manifest never declares
+    an escaped exception as an expected result (the key is refused)."""
     values = _exact_run_expectation_values()
     values["status"] = "failed"
+
+    assert RunExpectation.model_validate(values).status == "failed"
+
     values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    expectation = RunExpectation.model_validate(values)
-
-    assert expectation.status == "failed"
-    assert expectation.expected_error is not None
-    assert expectation.expected_error.exception_type == "CoalesceCollisionError"
-
-
-def test_expected_run_error_is_forbidden_for_nonfailed_status() -> None:
-    values = _exact_run_expectation_values()
-    values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    with pytest.raises(ValidationError, match="expected_error requires status=failed"):
+    with pytest.raises(ValidationError, match="expected_error"):
         RunExpectation.model_validate(values)
 
 
-def test_observed_run_error_is_forbidden_for_completed_runtime() -> None:
-    values = _exact_runtime_evidence_values(_exact_runtime_projection_values())
-    values["observed_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    with pytest.raises(ValidationError, match="observed_error requires status=failed"):
-        RuntimeEvidence.model_validate(values)
-
-
-def test_observed_run_error_is_forbidden_for_summary_runtime() -> None:
-    values = {
-        "kind": "summary",
-        "attempted": True,
-        "run_id": "run-1",
-        "status": "failed",
-        "observed_error": {"exception_type": "CoalesceCollisionError"},
-    }
-
-    with pytest.raises(ValidationError, match="observed_error requires kind=exact"):
-        RuntimeEvidence.model_validate(values)
-
-
-def test_failed_expected_error_evidence_types_portable_export_unavailable_by_policy() -> None:
+def test_failed_run_evidence_types_portable_export_unavailable_by_policy() -> None:
     projection = _failed_runtime_projection_values()
     runtime = _exact_runtime_evidence_values(projection)
     runtime.update(
@@ -3719,7 +3714,6 @@ def test_failed_expected_error_evidence_types_portable_export_unavailable_by_pol
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3734,9 +3728,27 @@ def test_failed_expected_error_evidence_types_portable_export_unavailable_by_pol
 
     evidence = ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
-    assert evidence.runtime.observed_error is not None
+    assert evidence.runtime.status == "failed"
     assert evidence.audit.kind == "unavailable_by_policy"
     assert evidence.audit.portable_export_unavailable is not None
+
+
+def test_portable_export_unavailable_by_policy_requires_failed_runtime() -> None:
+    projection = _exact_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    audit = _exact_audit_evidence_values(projection)
+    audit.update(
+        kind="unavailable_by_policy",
+        portable_projection=None,
+        portable_export_unavailable={
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="portable export unavailable_by_policy requires failed runtime"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
 def test_portable_export_unavailable_by_policy_rejects_completed_terminal() -> None:
@@ -3784,7 +3796,6 @@ def test_unavailable_export_audit_counts_must_match_exact_durable_projection() -
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3814,7 +3825,6 @@ def test_unavailable_export_source_operation_count_must_match_exact_durable_proj
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3832,7 +3842,7 @@ def test_unavailable_export_source_operation_count_must_match_exact_durable_proj
         ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
-def test_expected_error_runtime_rejects_exportable_exact_audit() -> None:
+def test_failed_runtime_rejects_exportable_exact_audit() -> None:
     projection = _failed_runtime_projection_values()
     runtime = _exact_runtime_evidence_values(projection)
     runtime.update(
@@ -3841,11 +3851,10 @@ def test_expected_error_runtime_rejects_exportable_exact_audit() -> None:
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
 
-    with pytest.raises(ValidationError, match="observed expected-error runtime requires portable export unavailable_by_policy"):
+    with pytest.raises(ValidationError, match="failed runtime requires portable export unavailable_by_policy"):
         ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 

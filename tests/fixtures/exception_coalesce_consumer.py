@@ -1,13 +1,10 @@
-"""Exercise collision diagnostics through the durable coalesce cleanup consumer."""
+"""Exercise collision diagnostics through the durable coalesce group-failure consumer."""
 
 from __future__ import annotations
 
 import json
 
-import pytest
-
-from elspeth.contracts.enums import FrameKind, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import CoalesceCollisionError
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, NodeType
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID
@@ -43,7 +40,12 @@ def make_diagnostic_recorder(*, run_id: str | None = None) -> RecorderSetup:
 
 
 def exercise_coalesce_metadata() -> None:
-    """Require both failed siblings to retain changing branch provenance without values."""
+    """Require both failed siblings to retain changing branch provenance without values.
+
+    ``CoalesceCollisionError.metadata``'s consumer is the executor's routed
+    union-collision group failure: it writes the collision record to every
+    FAILED hold's context_after and fails the group with a closed reason,
+    leaving the members' terminals to the settlement channel."""
     for branches in (("left", "right"), ("north", "south")):
         setup = make_diagnostic_recorder()
         try:
@@ -91,8 +93,9 @@ def exercise_coalesce_metadata() -> None:
                     )
                 )
             assert executor.accept(tokens[0], "merge", coordination_token=setup.coordination_token).held
-            with pytest.raises(CoalesceCollisionError):
-                executor.accept(tokens[1], "merge", coordination_token=setup.coordination_token)
+            outcome = executor.accept(tokens[1], "merge", coordination_token=setup.coordination_token)
+            assert outcome.failure_reason == "union_field_collision"
+            assert [consumed.token_id for consumed in outcome.consumed_tokens] == [token.token_id for token in tokens]
 
             token_ids = [token.token_id for token in tokens]
             states = setup.query.get_node_states_for_tokens(setup.run_id, token_ids)
@@ -108,11 +111,10 @@ def exercise_coalesce_metadata() -> None:
                 assert "union_field_collision_values" not in persisted
                 assert all(value not in state.context_after_json for value in values)
                 assert state.error_json is not None
+                assert json.loads(state.error_json)["failure_reason"] == "union_field_collision"
                 assert all(value not in state.error_json for value in values)
-            outcomes = setup.query.get_token_outcomes_for_tokens(setup.run_id, token_ids)
-            assert len(outcomes) == 2
-            assert {(outcome.token_id, outcome.outcome, outcome.path) for outcome in outcomes} == {
-                (token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED) for token_id in token_ids
-            }
+            # The executor writes no terminal: the caller settles every consumed
+            # token through RowProcessor.settle_failed_coalesce_group.
+            assert setup.query.get_token_outcomes_for_tokens(setup.run_id, token_ids) == []
         finally:
             setup.db.close()

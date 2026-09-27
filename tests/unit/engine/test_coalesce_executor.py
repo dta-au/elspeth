@@ -27,7 +27,6 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
-    CoalesceCollisionError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
     RunMembershipLostError,
@@ -44,6 +43,7 @@ from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import (
+    UNION_FIELD_COLLISION_REASON,
     CoalesceExecutor,
     CoalesceMergePlan,
     CoalesceOutcome,
@@ -1265,15 +1265,13 @@ class TestUnionMerge:
     # union_collision_policy=fail
     # ------------------------------------------------------------------
 
-    def test_union_collision_policy_fail_raises_on_collision(self):
-        """fail: CoalesceCollisionError raised with redacted metadata attached.
-
-        Propagation only — see the sibling
-        test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises
-        below for the paired WS3 Task 6 (Ruling 36) pin: every consumed
-        token's durable terminal by set equality, in the SAME test as this
-        exception's propagation.
-        """
+    def test_union_collision_policy_fail_fails_the_group_value_free(self):
+        """fail: a collision on fields the rows carry is a ROW fault — the group
+        fails with the closed, value-free ``union_field_collision`` reason and
+        both arrived members consumed; nothing raises (a collision certain
+        from config is refused at build instead). The collision record
+        (which names collided, which branches carried them) rides the
+        outcome's metadata, never the reason text."""
         executor, _, _, _, _ = _make_executor()
         s = _settings(
             branches=["a", "b"],
@@ -1284,11 +1282,15 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
         executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
-        with pytest.raises(CoalesceCollisionError) as exc_info:
-            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
-        # Metadata must be attached so the orchestrator's failure path
-        # can persist value-independent collision provenance to the audit trail.
-        md = exc_info.value.metadata
+
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+
+        assert outcome.failure_reason == UNION_FIELD_COLLISION_REASON == "union_field_collision"
+        assert outcome.merged_token is None
+        assert outcome.late_arrival is False
+        assert [token.token_id for token in outcome.consumed_tokens] == ["t1", "t2"]
+        md = outcome.coalesce_metadata
+        assert md is not None
         assert md.union_field_origins is not None
         assert md.union_field_collisions == {"shared": ("a", "b")}
         assert "union_field_collision_values" not in md.to_dict()
@@ -1313,7 +1315,7 @@ class TestUnionMerge:
         assert o.coalesce_metadata.union_field_origins == {"x": "a", "y": "b"}
 
     def test_union_collision_policy_fail_records_metadata_to_audit(self):
-        """fail policy must propagate collision metadata to complete_node_state(context_after=...).
+        """fail policy must write its collision record to complete_node_state(context_after=...).
 
         Without this propagation, the audit trail loses the field-level provenance
         that union_collision_policy=fail exists to capture. The stringified exception
@@ -1330,13 +1332,14 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
         executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
-        with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
-        # Inspect complete_node_state calls: the failure cleanup handler must have
-        # recorded at least one FAILED node state carrying the collision metadata.
+        # Inspect complete_node_state calls: the routed group failure must have
+        # recorded a FAILED hold per arrived member, each carrying the collision
+        # record and the closed failure reason.
         fail_calls = [call for call in execution.complete_node_state.call_args_list if call.kwargs.get("status") == NodeStateStatus.FAILED]
-        assert fail_calls, "expected at least one FAILED node state on union_collision_policy=fail"
+        assert len(fail_calls) == 2, "expected one FAILED hold per arrived member on union_collision_policy=fail"
+        assert {call.kwargs["error"].failure_reason for call in fail_calls} == {"union_field_collision"}
 
         metadata_calls = [
             call
@@ -1356,24 +1359,13 @@ class TestUnionMerge:
         assert md.union_field_origins is not None
         assert md.union_field_origins["shared"] == "b"
 
-    def test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises(self):
-        """union_collision_policy=fail must record FAILURE/UNROUTED for consumed tokens.
-
-        Bug: The exception handler in _execute_merge only calls complete_node_state(FAILED)
-        but never calls record_token_outcome(FAILED). Without terminal outcomes:
-        - Recovery treats the row as incomplete (key remains in _pending)
-        - Lineage resolution can't find a terminal token
-
-        WS3 Task 6, Ruling 36: this merge-exception cleanup arm is the ONE
-        direct-write site Task 6 deliberately keeps (crash-path cleanup
-        ahead of a re-raise nothing catches — no live caller to hand a
-        settlement-channel record to). This test pins BOTH halves in ONE
-        test, as the ruling's condition requires: every consumed token gets
-        a durable FAILED terminal by SET EQUALITY (not just no-duplicates,
-        not just presence), AND the exception still propagates — the
-        assertions below only execute because pytest.raises caught exactly
-        the expected exception from the same call whose writes they check.
-        """
+    def test_union_collision_policy_fail_leaves_member_terminals_to_the_settlement_channel(self):
+        """A collision is a routed group failure like every other failure arm
+        (spec §6.1): the executor records the FAILED holds but NO terminal
+        outcome — the caller terminalizes every consumed token through the
+        settlement channel (RowProcessor.settle_failed_coalesce_group), which
+        also walks their remaining lineage for an enclosing bound frame. The
+        consumed set is the full arrived set, so none is left without one."""
         executor, _, data_flow, _, _ = _make_executor()
         s = _settings(
             branches=["a", "b"],
@@ -1384,20 +1376,42 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
         executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
-        with pytest.raises(CoalesceCollisionError):
+
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+
+        assert data_flow.record_token_outcome_leader.call_args_list == []
+        assert {token.token_id for token in outcome.consumed_tokens} == {"t1", "t2"}
+
+    def test_merge_exception_cleanup_records_every_consumed_terminal_and_still_raises(self):
+        """WS3 Task 6, Ruling 36: the merge-exception cleanup arm is the ONE
+        direct-write site kept (crash-path cleanup ahead of a re-raise nothing
+        catches). This pins BOTH halves in ONE test, as the ruling requires:
+        every consumed token gets a durable FAILED terminal by SET EQUALITY,
+        AND the exception still propagates. (Until the union collision became
+        a routed group failure this was pinned through a collision; an
+        unexpected merge exception is now the only way into this arm.)"""
+        executor, _, data_flow, _, _ = _make_executor()
+        s = _settings(branches=["a", "b"], merge="union")
+        executor.register_coalesce(s, "node_1")
+
+        def fail_merge_data(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise RuntimeError("merge blew up")
+
+        executor._merge_data = fail_merge_data
+        t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
+        t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        with pytest.raises(RuntimeError, match="merge blew up"):
             executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
-        # All consumed tokens must have terminal FAILED outcomes recorded
         outcome_calls = data_flow.record_token_outcome_leader.call_args_list
-        assert len(outcome_calls) == 2, f"expected record_token_outcome(FAILED) for both consumed tokens; got {len(outcome_calls)} calls"
+        assert {c.kwargs["ref"].token_id for c in outcome_calls} == {"t1", "t2"}
+        assert len(outcome_calls) == 2
         for c in outcome_calls:
             assert c.kwargs["coordination_token"] is _COORDINATION_TOKEN
             assert c.kwargs["outcome"] == TerminalOutcome.FAILURE
             assert c.kwargs["path"] == TerminalPath.UNROUTED
-            assert "error_hash" in c.kwargs
-
-        token_ids = {c.kwargs["ref"].token_id for c in outcome_calls}
-        assert token_ids == {"t1", "t2"}
 
     def test_union_collision_policy_fail_cleans_up_pending(self):
         """union_collision_policy=fail must remove key from _pending after failure.
@@ -1422,8 +1436,7 @@ class TestUnionMerge:
         assert len(executor._pending) == 1
         key = next(iter(executor._pending.keys()))
 
-        with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # After failure, _pending should be empty
         assert key not in executor._pending, (
@@ -1474,7 +1487,7 @@ class TestUnionMerge:
     # ------------------------------------------------------------------
 
     def test_union_collision_policy_independent_of_require_all(self):
-        """union_collision_policy=fail with require_all still raises on collisions.
+        """union_collision_policy=fail with require_all still fails on collisions.
 
         The two policy axes (arrival policy and collision policy) are independent:
         require_all governs branch arrival; union_collision_policy governs
@@ -1491,8 +1504,8 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": 2})
         executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
-        with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        assert outcome.failure_reason == "union_field_collision"
 
     def test_union_collision_policy_with_best_effort_records_arrived_only(self):
         """best_effort with one lost branch: field_origins reflects arrived branches only.

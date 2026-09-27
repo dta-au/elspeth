@@ -29,6 +29,7 @@ elspeth.contracts.union_merge; import it from there.
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping, Sequence
+from itertools import combinations
 from typing import Literal
 
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
@@ -39,10 +40,65 @@ from elspeth.contracts.union_merge import (
 from elspeth.core.dag.models import GraphValidationError
 
 __all__ = [
+    "certain_union_collisions",
     "merge_coalesce_schema",
     "merge_guaranteed_fields",
     "merge_union_fields",
 ]
+
+
+def certain_union_collisions(
+    branch_guarantees: Mapping[str, frozenset[str]],
+    *,
+    require_all: bool,
+    policy: Literal["require_all", "quorum", "best_effort", "first"],
+    quorum_count: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Field collisions a ``union_collision_policy: fail`` coalesce hits on EVERY merge.
+
+    ``fail`` is name-based: any field two ARRIVED branches both carry fails the
+    group. A collision is certain from config only when every arrival set the
+    policy can merge contains two branches that both GUARANTEE the same field
+    (``branch_guarantees`` holds each declared branch's presence lower bound —
+    the propagation-walked effective guarantee; a branch that guarantees
+    nothing maps to an empty set). Which arrival sets can merge is the arrival
+    policy's fact:
+
+    - all branches (``require_all``, or a quorum equal to the branch count);
+    - exactly ``quorum_count`` branches for a smaller quorum (the merge fires
+      on the arrival that reaches the count), so EVERY such subset must hold a
+      shared guarantee;
+    - ``best_effort`` / ``first`` can merge a single arrived branch, which
+      never collides — nothing is certain.
+
+    Returns ``{field: branches that guarantee it}`` for every field guaranteed
+    by two or more branches when the collision is certain, else ``{}``. The
+    caller refuses the pipeline on a non-empty result; whatever this cannot
+    prove (fields observed only at runtime) stays a per-row group failure.
+    """
+    shared: dict[str, list[str]] = {}
+    for branch, fields in branch_guarantees.items():
+        for field_name in fields:
+            shared.setdefault(field_name, []).append(branch)
+    colliding = {field_name: tuple(branches) for field_name, branches in sorted(shared.items()) if len(branches) > 1}
+    if not colliding:
+        return {}
+    if require_all:
+        return colliding
+    if policy != "quorum":
+        return {}
+    if quorum_count is None:
+        raise RuntimeError(
+            "A quorum coalesce reached certain_union_collisions without a quorum_count. This indicates a config validation bug."
+        )
+    branches = tuple(branch_guarantees)
+
+    def has_shared_guarantee(arrived: tuple[str, ...]) -> bool:
+        return any(branch_guarantees[left] & branch_guarantees[right] for left, right in combinations(arrived, 2))
+
+    if all(has_shared_guarantee(arrived) for arrived in combinations(branches, quorum_count)):
+        return colliding
+    return {}
 
 
 def merge_coalesce_schema(

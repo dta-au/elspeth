@@ -399,6 +399,21 @@ drained and repair this release forward.
   schema (`mode: flexible`) or write the computed value under a new name.
   A type known only from the rows (an observed upstream) still fails each row
   at the merge, and that reason now names `any` rather than `object`.
+- **`union_collision_policy: fail` no longer ends the run on a collision.**
+  A field name two arriving branches both carried raised
+  `CoalesceCollisionError` out of the run at the first colliding row (exit 4,
+  a traceback, the remaining rows never read). When the collision is certain
+  from config — every merge the arrival policy can perform sees two branches
+  that both guarantee the same field, as when a `fixed` source's columns are
+  forwarded on every branch — `elspeth validate` and the build now refuse the
+  pipeline, naming each field and its branches and the remedies (`first_wins`
+  / `last_wins`, `merge: nested` or `select`). A collision on fields the rows
+  carry (an observed upstream) fails that row's group: each consumed branch row
+  is recorded failed with the value-free reason `union_field_collision`, the
+  collision record stays on each failed coalesce state, and the run goes on.
+  `best_effort` and `first`, which can merge a single branch, are never
+  refused. The composer cannot author this policy (its import is refused),
+  so it has no second surface to agree with.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
@@ -656,7 +671,9 @@ These already failed and are now refused earlier or routed, with no loss:
 buffered row (ended the run with the batch's rows left without an outcome);
 a `value_transform` target
 spelled exactly as the header of the field it would overwrite (crashed with
-`Duplicate original_name`, leaving the row without an outcome). Each of
+`Duplicate original_name`, leaving the row without an outcome); a
+`union_collision_policy: fail` coalesce whose branches all guarantee a shared
+field (ended the run with exit 4 at the first row). Each of
 these failed every row: a template number literal that overflows to
 infinity; a `truncate` length shorter than its ending; a `<response>_usage`
 schema type other than `any`; a header-spelled scan field over a non-string
