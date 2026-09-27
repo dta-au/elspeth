@@ -7311,8 +7311,16 @@ def _check_schema_contracts(
             )
         return (producer,) if _publishes_live(producer, connection) else ()
 
+    live_reach_memo: dict[tuple[str, ...], FieldNameResolution] = {}
+
     def _live_sources_reaching(connections: tuple[str, ...]) -> FieldNameResolution:
-        """The renames of every source whose rows reach ``connections`` over live wiring (the build's live walk)."""
+        """The renames of every source whose rows reach ``connections`` over live wiring (the build's live walk).
+
+        Asked only once a producer vote participates (``_header_spelling_error``),
+        so a source is probed only when a verdict can depend on its renames.
+        """
+        if connections in live_reach_memo:
+            return live_reach_memo[connections]
         renames: list[Mapping[str, str]] = []
         seen_connections: set[str] = set()
         seen_producers: set[str] = set()
@@ -7330,7 +7338,8 @@ def _check_schema_contracts(
                     renames.append(_source_field_renames(producer))
                 else:
                     pending.extend(_node_input_connections(node_by_id[producer.producer_id]))
-        return FieldNameResolution.of_source_renames(renames)
+        live_reach_memo[connections] = FieldNameResolution.of_source_renames(renames)
+        return live_reach_memo[connections]
 
     def _header_spelling_error(
         *,
@@ -7340,9 +7349,13 @@ def _check_schema_contracts(
         declared: DeclaredSpellings,
         removed: frozenset[str],
         producer: ProducerEntry,
-        resolution: FieldNameResolution,
+        reach: tuple[str, ...],
     ) -> ValidationEntry | None:
         participates, vote_fields = _effective_producer_vote(producer)
+        # An abstaining vote settles nothing (``header_spelled_declarations``),
+        # so no source is probed for its renames.
+        if not participates:
+            return None
         producer_schema = _known_producer_schema_config(producer)
         spellings = header_spelled_declarations(
             spellings=declared,
@@ -7350,7 +7363,7 @@ def _check_schema_contracts(
             forwarded=vote_fields - removed,
             participated=participates,
             closed=producer_schema is not None and not producer_schema.allows_extra_fields,
-            resolution=resolution,
+            resolution=_live_sources_reaching(reach),
         )
         if not spellings:
             return None
@@ -7428,7 +7441,7 @@ def _check_schema_contracts(
             declared=surfaces.declared,
             removed=surfaces.removed,
             producer=spelling_producer,
-            resolution=_live_sources_reaching(_node_input_connections(node)),
+            reach=_node_input_connections(node),
         )
         if spelling_error is not None:
             errors.append(spelling_error)
@@ -7442,7 +7455,6 @@ def _check_schema_contracts(
             direct_producer = _walk_to_real_producer(output.name, warnings=spelling_walk_warnings)
             sink_spelling_producers = () if direct_producer is None else (direct_producer,)
         seen_spelling_producers: set[str] = set()
-        sink_resolution = _live_sources_reaching((output.name,))
         for sink_producer in sink_spelling_producers:
             real_producer = _walk_producer_entry_to_real_producer(
                 sink_producer,
@@ -7461,7 +7473,7 @@ def _check_schema_contracts(
                 declared=sink_declared,
                 removed=frozenset(),
                 producer=real_producer,
-                resolution=sink_resolution,
+                reach=(output.name,),
             )
             if spelling_error is not None:
                 errors.append(spelling_error)

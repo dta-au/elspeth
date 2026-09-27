@@ -245,6 +245,14 @@ source boundary contract. Sources derive it from their effective
 source's observed-mode column heuristic must be reflected here, not only in the
 raw config dict.
 
+`field_renames: Mapping[str, str]` (a property; `BaseSource` provides it from
+the `_field_mapping` a mapping-bearing source sets at construction) is the
+source's `field_mapping`: normalized external name -> row key, empty when the
+source renames nothing. The field-name spelling rule resolves every downstream
+declaration through it at build time, in the pipeline build and the Web
+Composer alike, so a source that renames after normalizing must expose its
+renames here.
+
 #### Required Configuration
 
 ```yaml

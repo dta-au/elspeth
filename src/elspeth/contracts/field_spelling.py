@@ -354,8 +354,9 @@ class DeclaredSpellings:
     makes a normalization fixed point a header spelling too (under
     ``field_mapping: {name: b}`` the declaration ``name`` names ``b``), so no
     declaration can be dropped from config alone. What a row pays is bounded
-    instead: a declared read the row carries is settled by one set test, and
-    only a name the row does not carry is resolved (``_spelled``).
+    instead: a declared read the row carries, and a created name it forwards
+    as written, are settled by set tests; only a read the row lacks or a name
+    new to the row is resolved (``in_row``).
     """
 
     reads: tuple[DeclaredName, ...]
@@ -386,12 +387,20 @@ class DeclaredSpellings:
         ``contract`` is the row's own ``SchemaContract``, the resolution its
         lookups use (``FieldNameResolution.of_contract``).
         """
-        if self.is_empty:
+        # A declared read the row carries, and a created name the node forwards
+        # as written (an overwrite), are settled by set tests; only a read the
+        # row lacks or a name new to the row is resolved, through the row's
+        # contract. A node declaring only reads its rows carry pays the set
+        # tests alone; one that creates a new field resolves that name per row
+        # (two dict lookups).
+        missing_reads = tuple(name for name in self.reads if name.literal not in row_keys)
+        new_creates = tuple(name for name in self.creates if name.literal not in forwarded_keys)
+        if not missing_reads and not new_creates:
             return ()
         resolution = FieldNameResolution.of_contract(contract)
         return _merge_spellings(
-            _spelled(self.creates, forwarded_keys, resolution, kind="create"),
-            _spelled(self.reads, row_keys, resolution, kind="read"),
+            _spelled(new_creates, forwarded_keys, resolution, kind="create"),
+            _spelled(missing_reads, row_keys, resolution, kind="read"),
         )
 
 

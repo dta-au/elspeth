@@ -1388,23 +1388,18 @@ def _live_predecessors(graph: ExecutionGraph, node_id: str) -> list[str]:
     pair, so a predecessor counts as live when ANY of its edges is non-DIVERT;
     filtering edge-wise without regrouping would drop a live predecessor.
 
-    REACHABILITY, stated honestly: ``build_execution_graph`` cannot currently
-    produce a DIVERT edge INTO a transform — that claim is what THIS
-    function's every caller relies on (each filters to ``NodeType.TRANSFORM``
-    before calling this helper, below), and it still holds. Error routing in
-    ELSPETH is no longer uniformly terminal, though: since spec §7 rule 9
-    (Task 11), an in-region transform/gate's ``on_error`` may target its
-    enclosing bound region's closer (coalesce/row_union/collector), so a
-    DIVERT edge can now land on one of THOSE node kinds too, not only a sink
-    (source quarantine, transform/gate ``on_error``, sink failsink, and now
-    an in-region closer). None of that widens what THIS function sees,
-    because it is never called for a coalesce/row_union/collector node — so
-    on today's production path this filter is still equivalent to bare
-    ``.predecessors()`` for every node it actually examines. It is kept as
-    defence-in-depth for the public ``add_edge`` surface — which tests and any
-    future "route errors into a repair transform" topology use — and pinned by
-    ``test_divert_only_predecessor_is_not_checked``. Do not read it as
-    guarding a live production path.
+    REACHABILITY: ``build_execution_graph`` cannot produce a DIVERT edge INTO
+    a transform, but DIVERT edges do land on sinks (source quarantine,
+    transform/gate ``on_error``, sink failsink) and, since spec §7 rule 9
+    (Task 11), on an enclosing bound region's closer
+    (coalesce/row_union/collector). The filter is LIVE for two callers:
+    ``validate_declared_field_spellings`` walks the votes of sink, aggregation
+    and collector consumers through it, and ``upstream_name_resolution``
+    walks every ancestor of every kind through it, so a source whose rows reach
+    a node only as an error envelope (a closer's ``on_error`` arm, a quarantine
+    sink) contributes no renames. Pinned by
+    ``test_divert_only_predecessor_is_not_checked`` and, for the resolution,
+    by the composer/runtime agreement test on live-source reach.
 
     Deliberately NOT shared with ``validate_sink_required_fields``, which uses
     bare ``.predecessors()`` and IS DIVERT-reachable (sink → failsink sink):

@@ -8425,6 +8425,32 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
         self._assert_both_accept(observed, tmp_path)
 
+    def test_a_source_that_does_not_construct_contributes_no_renames(self, tmp_path: Path) -> None:
+        """Composer only: the renames probe tolerates a draft source config, as the other source probes do.
+
+        The source's schema parses (so its vote participates and the probe
+        runs) but an unknown option fails construction: ``validate()`` returns
+        without a spelling verdict (the same config with a constructible source
+        refuses ``Name`` as a spelling of ``b``, above) and never raises. The
+        unknown option itself is Stage 2's to refuse.
+        """
+        state = self._mapped_state(
+            tmp_path, node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b")
+        )
+        [source] = state.sources.values()
+        broken = CompositionState(
+            source=replace(source, options={**source.options, "not_a_csv_option": 1}),
+            nodes=state.nodes,
+            edges=(),
+            outputs=state.outputs,
+            metadata=state.metadata,
+            version=1,
+        )
+
+        result = broken.validate()
+
+        assert not [e for e in result.errors if e.error_code == "field_name_header_spelling"], result.errors
+
     def test_both_resolve_only_through_the_sources_whose_rows_reach_the_consumer(self, tmp_path: Path) -> None:
         """A second source's rename does not reach a consumer fed only by the first.
 
