@@ -6,7 +6,7 @@
 passthrough path use this identity plugin instead, registered through a test
 plugin manager, so what they assert is the engine's carriage of each buffered
 row and not a plugin's annotations. ``batch_rank`` itself is exercised under
-passthrough by its own tests.
+passthrough by its own tests and ``examples/batch_rank_passthrough``.
 """
 
 from __future__ import annotations

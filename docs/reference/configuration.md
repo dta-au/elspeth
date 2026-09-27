@@ -2164,8 +2164,8 @@ trigger:
 buffered row, in order (the plugin class declares
 `flush_emits_one_row_per_buffered_row`). One shipped batch plugin does:
 `batch_rank`, which adds each row's rank and percentile within the batch and
-emits every buffered row, an unranked one (null or non-finite value) included.
-Every other
+emits every buffered row, an unranked one (null or non-finite value) included
+([example](../../examples/batch_rank_passthrough/README.md)). Every other
 shipped batch plugin reduces the batch (`batch_stats`, `report_assemble`, …),
 replicates rows (`batch_replicate`) or skips rows (`batch_outlier_annotator`
 skips a null or non-finite value), so `elspeth validate` and the composer

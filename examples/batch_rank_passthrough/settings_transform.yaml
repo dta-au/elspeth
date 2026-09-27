@@ -1,0 +1,72 @@
+# Batch Rank, transform mode — the same pipeline as settings.yaml, new tokens
+#
+#   source (12 candidates) ─(candidates)─> [rank_per_prompt: batch_rank, count=4, transform]
+#       ─(ranked)─> [shortlist_gate: rank <= 2] ─┬─ true  ─> shortlist
+#                                                └─ false ─> remaining
+#
+# Identical to settings.yaml except for `output_mode: transform` and the output
+# paths. The plugin, its rows and the routing are the same, and so are the two
+# CSV files. What differs is the lineage: in transform mode each source token
+# ENDS at the aggregation (consumed into the batch) and every row the flush
+# emits is a NEW child token whose parent is the token that triggered the
+# flush. The README's audit queries show both runs side by side.
+
+sources:
+  candidates:
+    plugin: json
+    on_success: candidates
+    options:
+      path: examples/batch_rank_passthrough/candidates.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+        fields:
+        - 'prompt_id: str'
+        - 'candidate_id: str'
+        - 'model: str'
+        - 'judge_score: float?'
+      on_validation_failure: discard
+
+aggregations:
+- name: rank_per_prompt
+  plugin: batch_rank
+  input: candidates
+  on_success: ranked
+  on_error: discard
+  trigger:
+    count: 4
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    value_field: judge_score
+    output_prefix: score
+    order: descending
+    ties: competition
+
+gates:
+- name: shortlist_gate
+  input: ranked
+  condition: row['score_rank'] is not None and row['score_rank'] <= 2
+  routes:
+    'true': shortlist
+    'false': remaining
+
+sinks:
+  shortlist:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_rank_passthrough/output/shortlist_transform.csv
+      schema:
+        mode: observed
+  remaining:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_rank_passthrough/output/remaining_transform.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/batch_rank_passthrough/runs/audit_transform.db

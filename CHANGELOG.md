@@ -367,6 +367,9 @@ drained and repair this release forward.
   batch plugin that declares `flush_emits_one_row_per_buffered_row`, so it
   runs under `output_mode: passthrough`, where the same tokens continue
   downstream, as well as under `transform`.
+  `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
+  shortlists the top two per prompt, and contrasts the lineage of the two
+  modes.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

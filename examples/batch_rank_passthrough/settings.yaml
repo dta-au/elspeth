@@ -1,0 +1,83 @@
+# Batch Rank Passthrough — rank each prompt's candidates, keep the same tokens
+#
+#   source (12 candidates) ─(candidates)─> [rank_per_prompt: batch_rank, count=4, passthrough]
+#       ─(ranked)─> [shortlist_gate: rank <= 2] ─┬─ true  ─> shortlist
+#                                                └─ false ─> remaining
+#
+# Twelve candidate responses to three prompts arrive four per prompt, each with
+# a judge score. The aggregation flushes every 4 rows, so each batch is one
+# prompt's candidates. batch_rank adds score_rank, score_percentile,
+# score_ranked_count and score_batch_size to every row and emits all four rows
+# of the batch, in order.
+#
+# output_mode: passthrough: each buffered token continues downstream with its
+# own annotated row. No new tokens are created and none are consumed, so the
+# token that reaches a sink is the token the source created. Compare
+# settings_transform.yaml, which runs the same plugin in output_mode:
+# transform and ends every source token at the aggregation.
+#
+# P-102-b has no judge score (null). It is not dropped: it passes through with
+# a null rank, is not counted in score_ranked_count (3 for that prompt), and
+# the gate sends it to `remaining`. P-103 has a tie for second place, so under
+# the default competition ties its ranks are 1, 2, 2, 4 and three of its
+# candidates reach the shortlist.
+
+sources:
+  candidates:
+    plugin: json
+    on_success: candidates
+    options:
+      path: examples/batch_rank_passthrough/candidates.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+        fields:
+        - 'prompt_id: str'
+        - 'candidate_id: str'
+        - 'model: str'
+        - 'judge_score: float?'
+      on_validation_failure: discard
+
+aggregations:
+- name: rank_per_prompt
+  plugin: batch_rank
+  input: candidates
+  on_success: ranked
+  on_error: discard
+  trigger:
+    count: 4
+  output_mode: passthrough
+  options:
+    schema:
+      mode: observed
+    value_field: judge_score
+    output_prefix: score
+    order: descending
+    ties: competition
+
+gates:
+- name: shortlist_gate
+  input: ranked
+  condition: row['score_rank'] is not None and row['score_rank'] <= 2
+  routes:
+    'true': shortlist
+    'false': remaining
+
+sinks:
+  shortlist:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_rank_passthrough/output/shortlist.csv
+      schema:
+        mode: observed
+  remaining:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/batch_rank_passthrough/output/remaining.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/batch_rank_passthrough/runs/audit.db
