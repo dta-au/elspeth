@@ -42,7 +42,7 @@ from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReaso
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, innermost_own_frame, path_fork_group_id
-from elspeth.contracts.results import FailureInfo
+from elspeth.contracts.results import FailureInfo, failed_barrier_group_results
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
@@ -277,7 +277,7 @@ class BarrierIntakeCoordinator:
         complete_coalesce_fire: Callable[..., None],
         terminal_coalesce_row_result: Callable[..., RowResult],
         emit_token_completed: Callable[..., None],
-        mark_coalesce_consumed_terminal: Callable[..., None],
+        settle_failed_coalesce_group: Callable[..., list[RowResult]],
         record_group_member_terminals: Callable[..., list[RowResult]],
         take_pending_group_losses: Callable[[], tuple[GroupLossSpec, ...]],
         row_union_executor: RowUnionExecutor | None = None,
@@ -316,7 +316,7 @@ class BarrierIntakeCoordinator:
         self._complete_coalesce_fire = complete_coalesce_fire
         self._terminal_coalesce_row_result = terminal_coalesce_row_result
         self._emit_token_completed = emit_token_completed
-        self._mark_coalesce_consumed_terminal = mark_coalesce_consumed_terminal
+        self._settle_failed_coalesce_group = settle_failed_coalesce_group
         self._record_group_member_terminals = record_group_member_terminals
         self._take_pending_group_losses = take_pending_group_losses
         self._row_union_executor = row_union_executor
@@ -684,6 +684,12 @@ class BarrierIntakeCoordinator:
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.UNROUTED,
                         error=FailureInfo(exception_type="CoalesceFailure", message=late_reason),
+                        # A group that failed with zero arrived members wrote
+                        # nothing at the barrier; this straggler's FAILED
+                        # state is its first failure evidence, so it is the
+                        # group's one counted failed barrier (the audit
+                        # derive's unit). Every other straggler is not.
+                        counts_failed_barrier=outcome.first_failure_evidence,
                     ),
                     *late_cascaded_results,
                 ),
@@ -694,52 +700,26 @@ class BarrierIntakeCoordinator:
             return self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=row.row_id)
 
         if outcome.failure_reason:
-            error_msg = outcome.failure_reason
-            # The executor no longer writes any consumed branch's terminal
-            # outcome itself (Task 6, spec §6.1) — every consumed token
-            # (the arriving token included; it is a member of
-            # outcome.consumed_tokens too) is terminalized here, through the
-            # settlement channel, which also walks each one's REMAINING
-            # lineage for an enclosing bound frame (escalation). Fix round 3
-            # (Ruling 43): runs BEFORE the durable "release them all" below
-            # so any escalated loss it stages is drained and threaded into
-            # THAT SAME call — see the late-arrival arm's comment above for
-            # the full rationale (this intake pass is out-of-claim too).
-            self._note_coalesce_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=error_msg)
+            # Group failure completed by this arrival. Every consumed token —
+            # the arriving one AND each held sibling; all hold BLOCKED rows —
+            # is terminalized and surfaced through the ONE failed-group seam
+            # (RowProcessor.settle_failed_coalesce_group): one result per
+            # consumed token, so the live counters match the audit derive.
+            # Out-of-claim: an escalated loss the settlement walk stages is
+            # drained into THIS release's transaction (Ruling 43).
+            self._note_coalesce_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=outcome.failure_reason)
             cascade_child_items: list[WorkItem] = []
-            cascaded_results = self._record_group_member_terminals(
+            failure_results = self._settle_failed_coalesce_group(
                 tuple(outcome.consumed_tokens),
-                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
-                failure_reason=error_msg,
-                child_items=cascade_child_items,
-                group_failed=True,
-            )
-            # Group failure completed by this arrival: every consumed branch
-            # (this one included) holds a BLOCKED row — release them all.
-            self._mark_coalesce_consumed_terminal(
                 coalesce_name=coalesce_name,
-                consumed_tokens=tuple(outcome.consumed_tokens),
-                group_losses=self._take_pending_group_losses(),
+                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
+                failure_reason=outcome.failure_reason,
+                child_items=cascade_child_items,
+                losses_ride_claim=False,
             )
-            # Emit TokenCompleted telemetry AFTER Landscape recording. Only
-            # the arriving token surfaces a RowResult of its own (the held
-            # siblings' outcomes are recorded above with no RowResult of
-            # their own) — the pre-§E.2 shape, unchanged by Task 6; any
-            # cascaded consequence from the escalation walk above DOES
-            # surface below.
-            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
             return BarrierIntakeDisposition(
                 kind=BarrierIntakeDispositionKind.TERMINAL,
-                results=(
-                    RowResult(
-                        token=token,
-                        final_data=token.row_data,
-                        outcome=TerminalOutcome.FAILURE,
-                        path=TerminalPath.UNROUTED,
-                        error=FailureInfo(exception_type="CoalesceFailure", message=error_msg),
-                    ),
-                    *cascaded_results,
-                ),
+                results=tuple(failure_results),
                 child_items=tuple(cascade_child_items),
             )
 
@@ -816,6 +796,10 @@ class BarrierIntakeCoordinator:
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.UNROUTED,
                         error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason or "late_arrival_after_release"),
+                        # The first straggler of a group closed by a branch
+                        # loss before any arrival is that group's one counted
+                        # failed barrier (its FAILED state is the first).
+                        counts_failed_barrier=outcome.first_failure_evidence,
                     ),
                 ),
             )
@@ -836,34 +820,13 @@ class BarrierIntakeCoordinator:
                 child_items=released_items,
             )
 
-        if outcome.failure_reason:
-            # Whole-group failure completed by this arrival (v1 fail-closed):
-            # every held branch — this one included — holds a BLOCKED row.
-            self._note_row_union_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
-            self._scheduler.mark_blocked_barrier_terminal(
-                barrier_key=str(row_union_name),
-                token_ids=tuple(consumed.token_id for consumed in outcome.consumed_tokens),
-                coordination_token=coordination_token,
-                release_context={
-                    "reason": outcome.failure_reason,
-                    "released_by": self._scheduler_lease_owner,
-                    "scope_row_id": row.row_id,
-                },
-            )
-            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-            return BarrierIntakeDisposition(
-                kind=BarrierIntakeDispositionKind.TERMINAL,
-                results=(
-                    RowResult(
-                        token=token,
-                        final_data=token.row_data,
-                        outcome=TerminalOutcome.FAILURE,
-                        path=TerminalPath.UNROUTED,
-                        error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason),
-                    ),
-                ),
-            )
-
+        # No arrival-completed FAILURE arm, by construction: RowUnionExecutor.accept
+        # returns only held, a late-arrival failure (above) or a release — a
+        # v1 row_union group fails only by timeout/EOF sweep or branch loss,
+        # both of which surface one result per consumed token elsewhere. An
+        # accept() that ever returned a whole-group failure here is an
+        # executor contract break and must not be surfaced as a one-token
+        # result: it falls through to the invalid-state raise.
         raise OrchestrationInvariantError(
             f"RowUnionOutcome for token {token.token_id} in row_union '{row_union_name}' is in invalid state: "
             f"held={outcome.held}, released={len(outcome.released_tokens)}, failure_reason={outcome.failure_reason!r}"
@@ -1324,22 +1287,14 @@ class BarrierIntakeCoordinator:
                     consumed_tokens=consumed_tokens,
                     scope_row_id=row_id,
                 )
-                row_union_failure_results: list[RowResult] = []
                 for consumed_token in consumed_tokens:
                     self._emit_token_completed(consumed_token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-                    row_union_failure_results.append(
-                        RowResult(
-                            token=consumed_token,
-                            final_data=consumed_token.row_data,
-                            outcome=TerminalOutcome.FAILURE,
-                            path=TerminalPath.UNROUTED,
-                            error=FailureInfo(exception_type="RowUnionFailure", message=row_union_outcome.failure_reason),
-                        )
-                    )
                 dispositions.append(
                     BarrierIntakeDisposition(
                         kind=BarrierIntakeDispositionKind.TERMINAL,
-                        results=tuple(row_union_failure_results),
+                        results=failed_barrier_group_results(
+                            consumed_tokens, exception_type="RowUnionFailure", failure_reason=row_union_outcome.failure_reason
+                        ),
                     )
                 )
                 continue
@@ -1364,48 +1319,27 @@ class BarrierIntakeCoordinator:
                 continue
             if outcome.failure_reason:
                 # Replayed must-fail (§6.2: a must-fail group fails within one
-                # drain iteration of the loss becoming visible): mirror the
-                # group-loss notification failure arm — RowResults for the
-                # held siblings the failure consumed. The executor no longer
-                # writes their terminal outcomes itself (Task 6, spec §6.1);
-                # terminalized here through the settlement channel, which
-                # also walks each one's REMAINING lineage for an enclosing
-                # bound frame (escalation). Fix round 3 (Ruling 43): runs
-                # BEFORE the durable "release them all" below so any
-                # escalated loss it stages is drained and threaded into
-                # THAT SAME call — this replay loop is out-of-claim too.
-                # loss.group_id IS the failed group's own id — no need to
-                # re-derive it from a consumed token's lineage.
+                # drain iteration of the loss becoming visible): the SAME
+                # failed-group seam as the live notification and the intake
+                # arm — one result per consumed held sibling. Out-of-claim
+                # (Ruling 43): an escalated loss the settlement walk stages is
+                # drained into this release's transaction. loss.group_id IS
+                # the failed group's own id — no need to re-derive it from a
+                # consumed token's lineage.
                 self.note_group_failed(closer_name=loss.closer_name, group_id=loss.group_id, reason=outcome.failure_reason)
                 replay_child_items: list[WorkItem] = []
-                cascaded_replay_results = self._record_group_member_terminals(
+                replay_results = self._settle_failed_coalesce_group(
                     tuple(outcome.consumed_tokens),
+                    coalesce_name=coalesce_name,
                     group_id=loss.group_id,
                     failure_reason=outcome.failure_reason,
                     child_items=replay_child_items,
-                    group_failed=True,
+                    losses_ride_claim=False,
                 )
-                self._mark_coalesce_consumed_terminal(
-                    coalesce_name=coalesce_name,
-                    consumed_tokens=tuple(outcome.consumed_tokens),
-                    group_losses=self._take_pending_group_losses(),
-                )
-                coalesce_failure_results: list[RowResult] = []
-                for consumed_token in outcome.consumed_tokens:
-                    self._emit_token_completed(consumed_token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-                    coalesce_failure_results.append(
-                        RowResult(
-                            token=consumed_token,
-                            final_data=consumed_token.row_data,
-                            outcome=TerminalOutcome.FAILURE,
-                            path=TerminalPath.UNROUTED,
-                            error=FailureInfo(exception_type="CoalesceFailure", message=outcome.failure_reason),
-                        )
-                    )
                 dispositions.append(
                     BarrierIntakeDisposition(
                         kind=BarrierIntakeDispositionKind.TERMINAL,
-                        results=(*coalesce_failure_results, *cascaded_replay_results),
+                        results=tuple(replay_results),
                         child_items=tuple(replay_child_items),
                     )
                 )

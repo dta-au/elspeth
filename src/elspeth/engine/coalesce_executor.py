@@ -71,6 +71,14 @@ class CoalesceOutcome:
             release context instead of the standard group-failure consumption.
         join_group_id: Merge-event identity of the coalesce, set iff
             merged_token is set.
+        first_failure_evidence: Late-arrival arm only. True when this
+            straggler's FAILED node_state is the FIRST durable failure
+            evidence of its group — the group failed closed with ZERO arrived
+            members (a loss or timeout before any arrival), so nothing was
+            written at the barrier when it failed. The audit derive counts a
+            failed barrier per (node, row) pair with a FAILED state, so this
+            straggler is where the live ``rows_coalesce_failed`` must count
+            that group, exactly once.
     """
 
     held: bool
@@ -81,8 +89,11 @@ class CoalesceOutcome:
     coalesce_name: str | None = None
     late_arrival: bool = False
     join_group_id: str | None = None
+    first_failure_evidence: bool = False
 
     def __post_init__(self) -> None:
+        if self.first_failure_evidence and not self.late_arrival:
+            raise OrchestrationInvariantError("CoalesceOutcome: first_failure_evidence is only valid on a late-arrival outcome")
         # Validate mutual exclusivity of states
         if self.held:
             if self.merged_token is not None:
@@ -536,6 +547,14 @@ class CoalesceExecutor:
         # Maximum completed keys to retain (prevents OOM in long-running pipelines).
         # Configurable to match source cardinality and memory budget.
         self._max_completed_keys: int = max_completed_keys
+        # FAILED keys whose failure consumed no arrived member, so no FAILED
+        # node_state exists at the barrier yet: the first straggler's
+        # late-arrival state becomes the group's failure evidence
+        # (``CoalesceOutcome.first_failure_evidence``). Bounded with
+        # ``_completed_keys`` — an evicted key is dropped here too, and a
+        # straggler rediscovered through the Landscape fallback then reports
+        # False (the one tolerated live/audit rows_coalesce_failed corner).
+        self._failed_without_member_state: set[tuple[str, str]] = set()
 
     def register_coalesce(
         self,
@@ -689,6 +708,7 @@ class CoalesceExecutor:
         # a failed restore leaves the executor's in-memory state intact).
         self._pending.clear()
         self._completed_keys.clear()
+        self._failed_without_member_state.clear()
         for completed_key in restored.completed_keys:
             # The restorer enumerates COMPLETED keys (merged OR failed); the
             # flavor is resolved lazily by the late-arrival arm's released-
@@ -765,7 +785,8 @@ class CoalesceExecutor:
         # Eviction is harmless: Landscape fallback in accept() catches
         # late arrivals for evicted keys.
         while len(self._completed_keys) > self._max_completed_keys:
-            self._completed_keys.popitem(last=False)
+            evicted_key, _flavor = self._completed_keys.popitem(last=False)
+            self._failed_without_member_state.discard(evicted_key)
 
     def accept(
         self,
@@ -854,6 +875,8 @@ class CoalesceExecutor:
             # durable discriminator is a status-COMPLETED node_state at the
             # closer (a failed closure sets completed_at too).
             merged = self._completed_keys[key]
+            first_failure_evidence = key in self._failed_without_member_state
+            self._failed_without_member_state.discard(key)
             if merged is None:
                 merged = self._barrier_restore_reads.has_released_group_for_node(
                     run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id
@@ -907,6 +930,7 @@ class CoalesceExecutor:
                 ),
                 coalesce_name=coalesce_name,
                 late_arrival=True,
+                first_failure_evidence=first_failure_evidence,
             )
 
         if key not in self._pending:
@@ -1115,6 +1139,8 @@ class CoalesceExecutor:
 
         del self._pending[key]
         self._mark_completed(key, merged=False)
+        if not consumed_tokens:
+            self._failed_without_member_state.add(key)
 
         if metadata is None:
             metadata = CoalesceMetadata.for_failure(
@@ -1537,6 +1563,7 @@ class CoalesceExecutor:
         # detection is no longer needed. This prevents O(rows) memory accumulation
         # in long-running pipelines.
         self._completed_keys.clear()
+        self._failed_without_member_state.clear()
 
         return results
 

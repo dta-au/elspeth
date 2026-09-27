@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -501,3 +501,108 @@ def test_group_bindings_registry_identity_survives_processor_factory_wiring() ->
     registry = graph.get_group_bindings()
     assert processor._group_bindings is registry
     assert processor._token_manager._group_bindings is registry
+
+
+# ---------------------------------------------------------------------------
+# settle_failed_coalesce_group: the ONE seam every coalesce group-failure arm
+# (arrival intake, durable loss replay, live loss notification, sweeps) uses.
+# ---------------------------------------------------------------------------
+
+
+def _settle_call_recorder(proc: Any, *, staged: tuple[Any, ...], cascaded: list[Any]) -> tuple[Mock, Any]:
+    manager = Mock()
+    manager.record.return_value = cascaded
+    manager.take.return_value = staged
+    manager.mark.return_value = 2
+    patches = (
+        patch.object(proc, "_record_group_member_terminals", manager.record),
+        patch.object(proc, "_take_pending_group_losses", manager.take),
+        patch.object(proc, "mark_blocked_barrier_terminal", manager.mark),
+        patch.object(proc, "_emit_token_completed", manager.emit),
+    )
+    return manager, patches
+
+
+def test_settle_failed_coalesce_group_out_of_claim_records_drains_releases_then_emits(processor_with_bindings) -> None:
+    """Out of claim (intake, replay, sweeps): terminals are recorded first
+    (the escalation walk may stage a loss), the staged losses are drained
+    into the SAME release that terminalizes the BLOCKED rows, and
+    TokenCompleted follows the audit record — once per consumed token. The
+    surfaced results are one per consumed token (one group marker) followed
+    by the cascaded results."""
+    proc = processor_with_bindings({})
+    token_a = make_token(lineage_path=(INNER_FORK,), token_id="tok-a")
+    token_b = make_token(lineage_path=(INNER_FORK,), token_id="tok-b")
+    staged_loss = object()
+    cascaded_result = object()
+    manager, patches = _settle_call_recorder(proc, staged=(staged_loss,), cascaded=[cascaded_result])
+    child_items: list[Any] = []
+
+    with patches[0], patches[1], patches[2], patches[3]:
+        results = proc.settle_failed_coalesce_group(
+            (token_a, token_b),
+            coalesce_name=CoalesceName("merge"),
+            group_id=INNER_FORK.group_id,
+            failure_reason="select_branch_not_arrived",
+            child_items=child_items,
+            losses_ride_claim=False,
+        )
+
+    assert [name for name, _args, _kwargs in manager.mock_calls] == ["record", "take", "mark", "emit", "emit"]
+    record_call = manager.mock_calls[0]
+    assert record_call.args == ((token_a, token_b),)
+    assert record_call.kwargs == {
+        "group_id": INNER_FORK.group_id,
+        "failure_reason": "select_branch_not_arrived",
+        "child_items": child_items,
+        "group_failed": True,
+    }
+    mark_call = manager.mock_calls[2]
+    assert mark_call.args == ("merge", ("tok-a", "tok-b"))
+    assert mark_call.kwargs == {"group_losses": (staged_loss,)}
+    assert [call.args[0].token_id for call in manager.mock_calls[3:]] == ["tok-a", "tok-b"]
+    assert [result.token.token_id for result in results[:2]] == ["tok-a", "tok-b"]
+    assert [result.counts_failed_barrier for result in results[:2]] == [True, False]
+    assert results[2] is cascaded_result
+
+
+def test_settle_failed_coalesce_group_in_claim_leaves_staged_losses_to_the_claim(processor_with_bindings) -> None:
+    """In a claim (the live loss notification) the staged list rides the
+    claim's disposition transaction — including the claimed token's own
+    triggering loss — so the seam must not drain it."""
+    proc = processor_with_bindings({})
+    token_a = make_token(lineage_path=(INNER_FORK,), token_id="tok-a")
+    manager, patches = _settle_call_recorder(proc, staged=(object(),), cascaded=[])
+
+    with patches[0], patches[1], patches[2], patches[3]:
+        proc.settle_failed_coalesce_group(
+            (token_a,),
+            coalesce_name=CoalesceName("merge"),
+            group_id=INNER_FORK.group_id,
+            failure_reason="branch_lost",
+            child_items=[],
+            losses_ride_claim=True,
+        )
+
+    assert [name for name, _args, _kwargs in manager.mock_calls] == ["record", "mark", "emit"]
+    assert manager.mock_calls[1].kwargs == {"group_losses": ()}
+
+
+def test_settle_failed_coalesce_group_with_no_consumed_token_touches_nothing(processor_with_bindings) -> None:
+    """A zero-arrival failure has nothing to terminalize or surface; it must
+    not drain a staged loss it would never commit."""
+    proc = processor_with_bindings({})
+    manager, patches = _settle_call_recorder(proc, staged=(object(),), cascaded=[])
+
+    with patches[0], patches[1], patches[2], patches[3]:
+        results = proc.settle_failed_coalesce_group(
+            (),
+            coalesce_name=CoalesceName("merge"),
+            group_id=INNER_FORK.group_id,
+            failure_reason="best_effort_timeout_no_arrivals",
+            child_items=[],
+            losses_ride_claim=False,
+        )
+
+    assert results == []
+    assert manager.mock_calls == []

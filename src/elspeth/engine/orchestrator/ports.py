@@ -187,32 +187,25 @@ class CoalesceCompletionPort(Protocol):
         """Atomically consume coalesce inputs, emit the merge, and continue."""
         raise NotImplementedError
 
-    def record_group_member_terminals(
+    def settle_failed_coalesce_group(
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        coalesce_name: CoalesceName,
         group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
-        group_failed: bool,
+        losses_ride_claim: bool,
     ) -> list[RowResult]:
-        """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
-        caller names the closer's own group (``group_id``, META-38: never
-        re-derived from a consumed token's innermost frame, which may be a
-        collector release-group frame) and the
-        executor no longer writes their outcomes itself. When
-        ``group_failed`` (this call IS the group's failure, never a late
-        arrival against an already-closed group) it also walks the members'
-        REMAINING lineage for an enclosing bound frame; any cascaded
-        RowResults/child_items surface via the out params."""
-        raise NotImplementedError
-
-    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
-        """Drain any group losses staged (but not yet durably committed) by
-        the caller's own prior work (Ruling 39): the out-of-claim sweep
-        counterpart to `take_claim_group_losses`. The caller must commit the
-        drained spec(s) durably in the same transaction as its own
-        disposition (e.g. `mark_blocked_barrier_terminal(group_losses=...)`)."""
+        """Terminalize and surface a FAILED coalesce group — the one seam every
+        coalesce group-failure arm uses: record each consumed token's
+        terminal through the settlement channel (escalating to an enclosing
+        bound frame; cascaded RowResults/child_items surface), release their
+        BLOCKED scheduler rows, emit TokenCompleted per token, and return one
+        (FAILURE, UNROUTED) RowResult per consumed token (exactly one
+        carrying ``counts_failed_barrier``) followed by any cascaded results.
+        Sweep callers pass ``losses_ride_claim=False``: they run outside any
+        claim, so a staged escalation loss commits with this release."""
         raise NotImplementedError
 
 

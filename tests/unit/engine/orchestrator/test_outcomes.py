@@ -20,6 +20,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.results import RowResult, failed_barrier_group_results
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
@@ -49,6 +50,7 @@ class _FakeRowResult:
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
     join_group_id: str | None = None
+    counts_failed_barrier: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,14 +126,12 @@ class _FakeProcessor:
     complete_coalesce_merge_results: list[_FakeRowResult] = field(default_factory=list)
     complete_coalesce_merge_side_effect: BaseException | None = None
     mark_blocked_barrier_terminal_result: int = 1
-    record_group_member_terminals_result: list[_FakeRowResult] = field(default_factory=list)
-    take_pending_group_losses_result: tuple[Any, ...] = ()
+    settle_cascaded_results: list[_FakeRowResult] = field(default_factory=list)
     process_token_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
     complete_coalesce_merge_calls: list[dict[str, Any]] = field(default_factory=list)
     mark_blocked_barrier_terminal_calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
     mark_blocked_barrier_terminal_group_losses_calls: list[tuple[Any, ...]] = field(default_factory=list)
-    record_group_member_terminals_calls: list[dict[str, Any]] = field(default_factory=list)
-    take_pending_group_losses_calls: int = 0
+    settle_failed_coalesce_group_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def process_token(self, *args: Any, **kwargs: Any) -> list[_FakeRowResult]:
         self.process_token_calls.append((args, kwargs))
@@ -170,28 +170,32 @@ class _FakeProcessor:
         self.mark_blocked_barrier_terminal_group_losses_calls.append(group_losses)
         return self.mark_blocked_barrier_terminal_result
 
-    def take_pending_group_losses(self) -> tuple[Any, ...]:
-        self.take_pending_group_losses_calls += 1
-        return self.take_pending_group_losses_result
-
-    def record_group_member_terminals(
+    def settle_failed_coalesce_group(
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        coalesce_name: CoalesceName,
         group_id: str,
         failure_reason: str,
         child_items: list[Any],
-        group_failed: bool,
-    ) -> list[_FakeRowResult]:
-        self.record_group_member_terminals_calls.append(
+        losses_ride_claim: bool,
+    ) -> list[RowResult | _FakeRowResult]:
+        """Stands in for RowProcessor.settle_failed_coalesce_group: records the
+        call and surfaces what the real seam surfaces — one result per
+        consumed token (one group marker), then any cascaded results."""
+        self.settle_failed_coalesce_group_calls.append(
             {
                 "consumed_tokens": consumed_tokens,
+                "coalesce_name": coalesce_name,
+                "group_id": group_id,
                 "failure_reason": failure_reason,
-                "child_items": child_items,
-                "group_failed": group_failed,
+                "losses_ride_claim": losses_ride_claim,
             }
         )
-        return list(self.record_group_member_terminals_result)
+        return [
+            *failed_barrier_group_results(consumed_tokens, exception_type="CoalesceFailure", failure_reason=failure_reason),
+            *self.settle_cascaded_results,
+        ]
 
 
 @dataclass
@@ -200,28 +204,33 @@ class _FakeProcessorWithUndrainableChildItem(_FakeProcessor):
     child_item — the shape `_terminalize_swept_coalesce_failure` has no
     drain seam for (Ruling 34)."""
 
-    def record_group_member_terminals(
+    def settle_failed_coalesce_group(
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        coalesce_name: CoalesceName,
         group_id: str,
         failure_reason: str,
         child_items: list[Any],
-        group_failed: bool,
-    ) -> list[_FakeRowResult]:
-        super().record_group_member_terminals(
-            consumed_tokens, group_id=group_id, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
+        losses_ride_claim: bool,
+    ) -> list[RowResult | _FakeRowResult]:
+        results = super().settle_failed_coalesce_group(
+            consumed_tokens,
+            coalesce_name=coalesce_name,
+            group_id=group_id,
+            failure_reason=failure_reason,
+            child_items=child_items,
+            losses_ride_claim=losses_ride_claim,
         )
         child_items.append(object())
-        return []
+        return results
 
 
 def _assert_no_processor_work(processor: _FakeProcessor) -> None:
     assert processor.process_token_calls == []
     assert processor.complete_coalesce_merge_calls == []
     assert processor.mark_blocked_barrier_terminal_calls == []
-    assert processor.record_group_member_terminals_calls == []
-    assert processor.take_pending_group_losses_calls == 0
+    assert processor.settle_failed_coalesce_group_calls == []
 
 
 def _make_result(
@@ -482,6 +491,7 @@ class TestAccumulateAuthoritativeErrorHash:
             scheduler_pending_sink=True,
             authoritative_error_hash=authoritative_error_hash,
             join_group_id=None,
+            counts_failed_barrier=False,
         )
 
     def test_replayed_pending_sink_prefers_persisted_hash(self) -> None:
@@ -1209,7 +1219,6 @@ class TestHandleCoalesceTimeouts:
         executor, processor, counters, pending, node_map = self._setup(
             timed_out_outcomes=[outcome],
         )
-        processor.mark_blocked_barrier_terminal_result = 3
 
         handle_coalesce_timeouts(
             coalesce_executor=executor,
@@ -1223,12 +1232,13 @@ class TestHandleCoalesceTimeouts:
         assert counters.rows_coalesce_failed == 1
         assert counters.rows_failed == 3  # one per consumed token
         assert counters.rows_coalesced == 0
-        assert processor.mark_blocked_barrier_terminal_calls == [("merge_1", ("token-a", "token-b", "token-c"))]
+        assert [call["coalesce_name"] for call in processor.settle_failed_coalesce_group_calls] == ["merge_1"]
 
     def test_failed_timeout_terminalizes_every_consumed_member_exactly_once(self) -> None:
         """WS3 Task 6 (Ruling 33): the executor no longer records a timed-out
-        group's consumed tokens' terminals itself — this sweep must, through
-        the settlement channel, EVERY consumed token, exactly once.
+        group's consumed tokens' terminals itself — this sweep must hand EVERY
+        consumed token, exactly once, to the one failed-group seam, out of
+        claim (a staged escalation loss commits with the sweep's release).
         Completeness by set equality, not just no-duplicates (recent-code-hints
         2026-08-21: the zero-write direction has no automatic detection)."""
         tokens = (
@@ -1241,7 +1251,6 @@ class TestHandleCoalesceTimeouts:
         executor, processor, counters, pending, node_map = self._setup(
             timed_out_outcomes=[outcome],
         )
-        processor.mark_blocked_barrier_terminal_result = 3
 
         handle_coalesce_timeouts(
             coalesce_executor=executor,
@@ -1252,10 +1261,12 @@ class TestHandleCoalesceTimeouts:
             pending_tokens=pending,
         )
 
-        assert len(processor.record_group_member_terminals_calls) == 1
-        call = processor.record_group_member_terminals_calls[0]
+        assert len(processor.settle_failed_coalesce_group_calls) == 1
+        call = processor.settle_failed_coalesce_group_calls[0]
         assert {t.token_id for t in call["consumed_tokens"]} == {"token-a", "token-b", "token-c"}
         assert call["failure_reason"] == "quorum_not_met"
+        assert call["group_id"] == "fg-outcomes-test"
+        assert call["losses_ride_claim"] is False
 
     def test_failed_timeout_folds_cascaded_escalation_into_counters(self) -> None:
         """Ruling 34: a cascaded RowResult from the settlement channel's
@@ -1271,8 +1282,7 @@ class TestHandleCoalesceTimeouts:
         executor, processor, counters, pending, node_map = self._setup(
             timed_out_outcomes=[outcome],
         )
-        processor.mark_blocked_barrier_terminal_result = 1
-        processor.record_group_member_terminals_result = [cascaded_result]
+        processor.settle_cascaded_results = [cascaded_result]
 
         handle_coalesce_timeouts(
             coalesce_executor=executor,
@@ -1287,6 +1297,36 @@ class TestHandleCoalesceTimeouts:
         assert counters.rows_failed == 2
         assert counters.rows_coalesce_failed == 1
 
+    def test_failed_timeout_counts_an_enclosing_group_failed_by_escalation(self) -> None:
+        """An ENCLOSING coalesce the escalation walk fails surfaces its own
+        group marker through the same seam; the sweep counts it through the
+        same accumulator (the retired M1 gap: it reached rows_failed but was
+        never counted as a failed barrier)."""
+        outcome = _make_failed_coalesce_outcome(
+            failure_reason="quorum_not_met",
+            consumed_tokens=(_branch_token("token-a"),),
+        )
+        outer_member = make_token_info(token_id="outer-sibling")
+
+        executor, processor, counters, pending, node_map = self._setup(
+            timed_out_outcomes=[outcome],
+        )
+        processor.settle_cascaded_results = list(
+            failed_barrier_group_results((outer_member,), exception_type="CoalesceFailure", failure_reason="scope_group_failed")
+        )
+
+        handle_coalesce_timeouts(
+            coalesce_executor=executor,
+            coalesce_node_map=node_map,
+            processor=processor,
+            ctx=_FakeContext(),
+            counters=counters,
+            pending_tokens=pending,
+        )
+
+        assert counters.rows_failed == 2
+        assert counters.rows_coalesce_failed == 2
+
     def test_failed_timeout_raises_if_escalation_yields_an_undrainable_child_item(self) -> None:
         """Ruling 34: a cascaded child_item (a continuation this sweep layer
         cannot drive through the traversal engine) has genuinely nowhere to
@@ -1299,7 +1339,7 @@ class TestHandleCoalesceTimeouts:
         executor, processor, counters, pending, node_map = self._setup(
             timed_out_outcomes=[outcome],
         )
-        processor = _FakeProcessorWithUndrainableChildItem(mark_blocked_barrier_terminal_result=1)
+        processor = _FakeProcessorWithUndrainableChildItem()
 
         with pytest.raises(OrchestrationInvariantError, match="no drain seam"):
             handle_coalesce_timeouts(
@@ -1312,7 +1352,11 @@ class TestHandleCoalesceTimeouts:
             )
 
     def test_failed_timeout_with_no_arrivals_does_not_terminalize_empty_barrier(self) -> None:
-        """A zero-arrival timeout has no blocked scheduler rows to terminalize."""
+        """A zero-arrival timeout has no blocked scheduler rows to terminalize
+        and writes no FAILED state at the barrier, so it is not counted HERE:
+        the live rows_coalesce_failed uses the audit derive's evidence, and
+        such a group is counted by its first straggler's late-arrival result
+        (CoalesceOutcome.first_failure_evidence) if one ever arrives."""
         outcome = _make_failed_coalesce_outcome(failure_reason="best_effort_timeout_no_arrivals")
 
         executor, processor, counters, pending, node_map = self._setup(
@@ -1328,72 +1372,12 @@ class TestHandleCoalesceTimeouts:
             pending_tokens=pending,
         )
 
-        assert counters.rows_coalesce_failed == 1
+        assert counters.rows_coalesce_failed == 0
         assert counters.rows_failed == 0
         assert counters.rows_coalesced == 0
         assert processor.mark_blocked_barrier_terminal_calls == []
-        assert processor.record_group_member_terminals_calls == []
+        assert processor.settle_failed_coalesce_group_calls == []
         assert processor.process_token_calls == []
-
-    def test_failed_timeout_raises_when_scheduler_terminal_count_does_not_match_live_tokens(self) -> None:
-        """Failed timeout coalesces must reconcile durable scheduler rows before accepting counters."""
-        outcome = _make_failed_coalesce_outcome(
-            failure_reason="quorum_not_met",
-            consumed_tokens=(
-                _branch_token("token-a"),
-                _branch_token("token-b"),
-            ),
-        )
-
-        executor, processor, counters, pending, node_map = self._setup(
-            timed_out_outcomes=[outcome],
-        )
-        processor.mark_blocked_barrier_terminal_result = 1
-
-        with pytest.raises(AuditIntegrityError, match=r"live consumed 2 token.*durable scheduler terminalized 1"):
-            handle_coalesce_timeouts(
-                coalesce_executor=executor,
-                coalesce_node_map=node_map,
-                processor=processor,
-                ctx=_FakeContext(),
-                counters=counters,
-                pending_tokens=pending,
-            )
-
-        assert counters.rows_coalesce_failed == 0
-        assert counters.rows_failed == 0
-        assert processor.process_token_calls == []
-
-    def test_failure_emits_token_completed_telemetry_for_each_consumed_token(self) -> None:
-        """Timeout-driven coalesce failures must surface in telemetry once per token."""
-        tokens = (
-            _branch_token("token-1", row_id="row-1"),
-            _branch_token("token-2", row_id="row-2"),
-        )
-        outcome = _make_failed_coalesce_outcome(failure_reason="quorum_not_met", consumed_tokens=tokens)
-
-        executor, processor, counters, pending, node_map = self._setup(
-            timed_out_outcomes=[outcome],
-        )
-        processor.mark_blocked_barrier_terminal_result = 2
-
-        ctx = _FakeContext(run_id="run-1")
-
-        handle_coalesce_timeouts(
-            coalesce_executor=executor,
-            coalesce_node_map=node_map,
-            processor=processor,
-            ctx=ctx,
-            counters=counters,
-            pending_tokens=pending,
-        )
-
-        assert len(ctx.emitted_events) == 2
-        emitted = ctx.emitted_events
-        assert [event.token_id for event in emitted] == ["token-1", "token-2"]
-        assert all(event.run_id == "run-1" for event in emitted)
-        assert all(event.outcome == TerminalOutcome.FAILURE for event in emitted)
-        assert all(event.path == TerminalPath.UNROUTED for event in emitted)
 
 
 # =============================================================================
@@ -1528,7 +1512,7 @@ class TestFlushCoalescePending:
 
         counters = _make_counters()
         pending = _make_pending()
-        processor = _FakeProcessor(mark_blocked_barrier_terminal_result=2)
+        processor = _FakeProcessor()
 
         flush_coalesce_pending(
             coalesce_executor=coalesce_executor,
@@ -1541,7 +1525,7 @@ class TestFlushCoalescePending:
 
         assert counters.rows_coalesce_failed == 1
         assert counters.rows_failed == 2
-        assert processor.mark_blocked_barrier_terminal_calls == [("merge_1", ("token-a", "token-b"))]
+        assert [call["coalesce_name"] for call in processor.settle_failed_coalesce_group_calls] == ["merge_1"]
 
     def test_failed_flush_terminalizes_every_consumed_member_exactly_once(self) -> None:
         """WS3 Task 6 (Ruling 33): the executor no longer records a flushed
@@ -1562,7 +1546,7 @@ class TestFlushCoalescePending:
 
         counters = _make_counters()
         pending = _make_pending()
-        processor = _FakeProcessor(mark_blocked_barrier_terminal_result=2)
+        processor = _FakeProcessor()
 
         flush_coalesce_pending(
             coalesce_executor=coalesce_executor,
@@ -1573,44 +1557,15 @@ class TestFlushCoalescePending:
             pending_tokens=pending,
         )
 
-        assert len(processor.record_group_member_terminals_calls) == 1
-        call = processor.record_group_member_terminals_calls[0]
+        assert len(processor.settle_failed_coalesce_group_calls) == 1
+        call = processor.settle_failed_coalesce_group_calls[0]
         assert {t.token_id for t in call["consumed_tokens"]} == {"token-a", "token-b"}
         assert call["failure_reason"] == "incomplete_branches"
+        assert call["losses_ride_claim"] is False
+        assert counters.rows_failed == 2
+        assert counters.rows_coalesce_failed == 1
 
-    def test_failure_emits_token_completed_telemetry_for_each_consumed_token(self) -> None:
-        """Flush-driven coalesce failures must surface in telemetry once per token."""
-        tokens = (
-            _branch_token("token-1", row_id="row-1"),
-            _branch_token("token-2", row_id="row-2"),
-        )
-        outcome = _make_failed_coalesce_outcome(failure_reason="incomplete_branches", coalesce_name="merge_1", consumed_tokens=tokens)
-
-        coalesce_executor = _FakeCoalesceExecutor(registered_names=[], flush_outcomes=[outcome])
-
-        counters = _make_counters()
-        pending = _make_pending()
-        ctx = _FakeContext(run_id="run-1")
-        processor = _FakeProcessor(mark_blocked_barrier_terminal_result=2)
-
-        flush_coalesce_pending(
-            coalesce_executor=coalesce_executor,
-            coalesce_node_map={},
-            processor=processor,
-            ctx=ctx,
-            counters=counters,
-            pending_tokens=pending,
-        )
-
-        assert len(ctx.emitted_events) == 2
-        emitted = ctx.emitted_events
-        assert [event.token_id for event in emitted] == ["token-1", "token-2"]
-        assert all(event.run_id == "run-1" for event in emitted)
-        assert all(event.outcome == TerminalOutcome.FAILURE for event in emitted)
-        assert all(event.path == TerminalPath.UNROUTED for event in emitted)
-        assert processor.mark_blocked_barrier_terminal_calls == [("merge_1", ("token-1", "token-2"))]
-
-    def test_failed_flush_with_consumed_tokens_requires_coalesce_name(self) -> None:
+    def test_failed_flush_requires_coalesce_name(self) -> None:
         """Failed flush outcomes need an explicit barrier key before counters move."""
         tokens = (make_token_info(token_id="token-1"),)
         outcome = _make_failed_coalesce_outcome(failure_reason="incomplete_branches", consumed_tokens=tokens)
@@ -1621,7 +1576,7 @@ class TestFlushCoalescePending:
         pending = _make_pending()
         processor = _FakeProcessor()
 
-        with pytest.raises(AuditIntegrityError, match="consumed tokens but no coalesce_name"):
+        with pytest.raises(AuditIntegrityError, match="carries no coalesce_name"):
             flush_coalesce_pending(
                 coalesce_executor=coalesce_executor,
                 coalesce_node_map={},
@@ -1632,7 +1587,7 @@ class TestFlushCoalescePending:
             )
 
         assert processor.mark_blocked_barrier_terminal_calls == []
-        assert processor.record_group_member_terminals_calls == []
+        assert processor.settle_failed_coalesce_group_calls == []
         assert counters.rows_coalesce_failed == 0
         assert counters.rows_failed == 0
 

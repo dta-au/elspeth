@@ -169,6 +169,7 @@ def _row_result(
         scheduler_pending_sink=False,
         authoritative_error_hash=None,
         join_group_id="join-1" if path is TerminalPath.COALESCED else None,
+        counts_failed_barrier=False,
     )
 
 

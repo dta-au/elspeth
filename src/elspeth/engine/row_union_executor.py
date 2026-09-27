@@ -81,6 +81,13 @@ class RowUnionOutcome:
             by the executor — the caller MUST NOT record them again.
         late_arrival: True when this failure is the late-arrival arm (token
             arrived after its group already released/failed).
+        first_failure_evidence: Late-arrival arm only. True when this
+            straggler's FAILED node_state is the FIRST durable failure
+            evidence of its group — the group was closed by a branch loss
+            before any sibling arrived, so nothing was written at the barrier.
+            The live ``rows_coalesce_failed`` counts that group here, exactly
+            once (the audit derive's unit is a (node, row) pair with a FAILED
+            state).
     """
 
     held: bool
@@ -90,8 +97,11 @@ class RowUnionOutcome:
     row_union_name: str | None = None
     outcomes_recorded: bool = False
     late_arrival: bool = False
+    first_failure_evidence: bool = False
 
     def __post_init__(self) -> None:
+        if self.first_failure_evidence and not self.late_arrival:
+            raise OrchestrationInvariantError("RowUnionOutcome: first_failure_evidence is only valid on a late-arrival outcome")
         if self.held and (self.released_tokens or self.failure_reason is not None):
             raise OrchestrationInvariantError("RowUnionOutcome: held=True excludes released_tokens/failure_reason")
         if self.released_tokens and self.failure_reason is not None:
@@ -172,6 +182,12 @@ class RowUnionExecutor:
         # generic late-arrival message.
         self._completed_keys: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._max_completed_keys = max_completed_keys
+        # Groups closed by a branch loss before any sibling arrived: no FAILED
+        # node_state exists at the barrier yet, so the first straggler's
+        # late-arrival state is the group's failure evidence
+        # (``RowUnionOutcome.first_failure_evidence``). Bounded with
+        # ``_completed_keys`` (an evicted key is dropped here too).
+        self._failed_without_member_state: set[tuple[str, str]] = set()
         # Recent branch losses for §E.5 replay dedup, bounded like the
         # completion cache. Durable storage remains the source of truth.
         # (row_union_name, fork_group_id, branch_name)
@@ -428,6 +444,7 @@ class RowUnionExecutor:
                 step,
                 # Cached with its true reason by whichever arm of the test
                 # above fired — see restore_from_journal's closed-key loop.
+                key=key,
                 closed_reason=self._completed_keys[key],
                 coordination_token=coordination_token,
             )
@@ -440,6 +457,7 @@ class RowUnionExecutor:
                 settings,
                 node_id,
                 step,
+                key=key,
                 closed_reason=_CLOSED_BY_BRANCH_LOSS,
                 coordination_token=coordination_token,
             )
@@ -605,6 +623,7 @@ class RowUnionExecutor:
         node_id: NodeID,
         step: int,
         *,
+        key: tuple[str, str],
         coordination_token: CoordinationToken,
         closed_reason: str = _CLOSED_BY_RELEASE,
     ) -> RowUnionOutcome:
@@ -617,6 +636,8 @@ class RowUnionExecutor:
         non-release closure must carry the group's true closure reason.
         """
         failure_reason = "late_arrival_after_release" if closed_reason == _CLOSED_BY_RELEASE else closed_reason
+        first_failure_evidence = key in self._failed_without_member_state
+        self._failed_without_member_state.discard(key)
         error_hash = compute_error_hash(failure_reason)
         state = self._execution.begin_node_state(
             token_id=token.token_id,
@@ -653,6 +674,7 @@ class RowUnionExecutor:
             row_union_name=settings.name,
             outcomes_recorded=True,
             late_arrival=True,
+            first_failure_evidence=first_failure_evidence,
         )
 
     # ------------------------------------------------------------------
@@ -722,6 +744,7 @@ class RowUnionExecutor:
             # Nothing held yet: mark the group dead so future arrivals
             # fail closed instead of holding forever.
             self._mark_completed(key, _CLOSED_BY_BRANCH_LOSS)
+            self._failed_without_member_state.add(key)
             slog.info(
                 "row_union branch lost before any sibling arrived; group marked dead",
                 row_union=row_union_name,
@@ -767,7 +790,8 @@ class RowUnionExecutor:
         """Mark a group closed, with its cause, under bounded memory."""
         self._completed_keys[key] = reason
         while len(self._completed_keys) > self._max_completed_keys:
-            self._completed_keys.popitem(last=False)
+            evicted_key, _reason = self._completed_keys.popitem(last=False)
+            self._failed_without_member_state.discard(evicted_key)
 
     def _remember_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> None:
         """Cache recent loss identities for replay dedup and fast group checks."""

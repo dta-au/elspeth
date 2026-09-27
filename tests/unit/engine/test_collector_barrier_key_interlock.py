@@ -225,7 +225,7 @@ def _make_collector_coordinator(
         complete_coalesce_fire=lambda **kwargs: None,
         terminal_coalesce_row_result=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
-        mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        settle_failed_coalesce_group=lambda consumed_tokens, **kwargs: [],
         record_group_member_terminals=lambda *args, **kwargs: [],
         take_pending_group_losses=lambda: (),
         collector_executor=collector_executor,  # type: ignore[arg-type]

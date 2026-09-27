@@ -8842,9 +8842,10 @@ class TestMaybeCoalesceToken:
 
         with (
             patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
-            # The intake path emits through the BarrierIntakeCoordinator's
-            # construction-bound seam, not the processor attribute.
-            patch.object(processor._barrier_intake, "_emit_token_completed") as emit_token_completed,
+            # A group failure is terminalized and surfaced by the processor's
+            # one failed-group seam (settle_failed_coalesce_group), which
+            # emits through the processor attribute at call time.
+            patch.object(processor, "_emit_token_completed") as emit_token_completed,
         ):
             results, child_items = processor._run_barrier_intake_pass(ctx)
 

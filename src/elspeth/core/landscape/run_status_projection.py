@@ -137,18 +137,18 @@ class AuditRunStatusProjection:
         straggler); after a *successful* merge the pair must not be counted at
         all, which only the reason exclusion guarantees.
 
-        DELIBERATE breadth: arrival-time barrier failures (branch-lost
-        cascades via ``_evaluate_after_loss``, immediate merge failures such
-        as ``select_branch_not_arrived``) ARE counted here even though the
-        live accumulator only increments ``rows_coalesce_failed`` for barriers
-        resolved by the timeout/flush sweeps (``outcomes.py``) — those
-        arrival-time failures are real failed barriers and the durable record
-        is the broader truth.  Conversely zero-arrival timeout failures
-        (``best_effort_timeout_no_arrivals`` or ``first_timeout_no_arrivals``)
-        consume no tokens and leave no node_states, so they are invisible here
-        by construction.  Reconciling the live accumulator with this durable
-        breadth is tracked:
-        elspeth-ff6d48c180.
+        Breadth: every failed barrier with a FAILED state is counted —
+        arrival-time failures (branch-lost cascades via
+        ``_evaluate_after_loss``, immediate merge failures such as
+        ``select_branch_not_arrived``) as well as timeout/flush sweeps. A group
+        that failed with ZERO arrived members (a loss or a
+        ``best_effort_timeout_no_arrivals`` / ``first_timeout_no_arrivals``
+        timeout before any arrival) leaves no state when it fails; it becomes
+        visible here only through a later straggler's late-arrival FAILED
+        state. The live accumulator counts the same evidence (the
+        ``counts_failed_barrier`` result marker); the remaining tolerated
+        corners are documented at ``_PARITY_EXCLUDED_FIELDS``
+        (elspeth-ff6d48c180).
 
         Cumulativity: resume re-drives record under the SAME ``run_id``
         (resume provenance lives in ``resume_checkpoint_id``), so a single

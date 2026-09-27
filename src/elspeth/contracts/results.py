@@ -556,6 +556,13 @@ class RowResult:
             (archived issue elspeth-d74d19f901). None for live results.
         join_group_id: For COALESCED results, the merge-event identity of the
             coalesce that produced this token. None for all other paths.
+        counts_failed_barrier: True on exactly ONE result per failed
+            coalesce/row_union group — the live ``rows_coalesce_failed`` unit
+            (one per failed barrier group, never one per consumed token). Set
+            only by the failed-group surfacing helpers; every consumed token
+            still surfaces its own (FAILURE, UNROUTED) result, so
+            ``rows_failed`` counts tokens while this counts groups. Legal only
+            on (FAILURE, UNROUTED).
     """
 
     token: TokenInfo
@@ -567,8 +574,17 @@ class RowResult:
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
     join_group_id: str | None = None
+    counts_failed_barrier: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.counts_failed_barrier) is not bool:
+            raise OrchestrationInvariantError(
+                f"RowResult.counts_failed_barrier must be bool, got {type(self.counts_failed_barrier).__name__}"
+            )
+        if self.counts_failed_barrier and (self.outcome, self.path) != (TerminalOutcome.FAILURE, TerminalPath.UNROUTED):
+            raise OrchestrationInvariantError(
+                f"RowResult.counts_failed_barrier is only valid for (FAILURE, UNROUTED) results, got ({self.outcome!r}, {self.path!r})"
+            )
         if type(self.scheduler_pending_sink) is not bool:
             raise OrchestrationInvariantError(
                 f"RowResult.scheduler_pending_sink must be bool, got {type(self.scheduler_pending_sink).__name__}"
@@ -610,6 +626,36 @@ class RowResult:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires join_group_id to be set")
         if self.path != TerminalPath.COALESCED and self.join_group_id is not None:
             raise OrchestrationInvariantError(f"RowResult.join_group_id is only valid for COALESCED results, got path={self.path!r}")
+
+
+def failed_barrier_group_results(
+    consumed_tokens: Sequence[TokenInfo],
+    *,
+    exception_type: Literal["CoalesceFailure", "RowUnionFailure"],
+    failure_reason: str,
+) -> tuple[RowResult, ...]:
+    """Surface a failed coalesce/row_union group: one result PER consumed token.
+
+    The single shape every group-failure arm returns (intake, durable loss
+    replay, live loss, timeout/EOF sweeps): each consumed token gets its own
+    (FAILURE, UNROUTED) result — the live ``rows_failed`` unit, matching the
+    one terminal outcome the audit derive counts per token — and exactly ONE
+    of them (the first) carries ``counts_failed_barrier``, the live
+    ``rows_coalesce_failed`` unit (one per failed group). An empty
+    ``consumed_tokens`` (a zero-arrival failure) surfaces nothing.
+    """
+    error = FailureInfo(exception_type=exception_type, message=failure_reason)
+    return tuple(
+        RowResult(
+            token=token,
+            final_data=token.row_data,
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+            error=error,
+            counts_failed_barrier=index == 0,
+        )
+        for index, token in enumerate(consumed_tokens)
+    )
 
 
 @dataclass(frozen=True, slots=True)

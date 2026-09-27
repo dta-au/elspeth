@@ -296,7 +296,7 @@ def _coordinator(
         complete_coalesce_fire=lambda **kwargs: None,
         terminal_coalesce_row_result=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
         emit_token_completed=recorder.emit_token_completed,
-        mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        settle_failed_coalesce_group=lambda consumed_tokens, **kwargs: [],
         record_group_member_terminals=recorder.record_group_member_terminals,
         take_pending_group_losses=recorder.take_pending_group_losses,
         collector_executor=executor,  # type: ignore[arg-type]

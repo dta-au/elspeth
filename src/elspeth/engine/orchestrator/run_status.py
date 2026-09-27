@@ -264,16 +264,23 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 # ExecutionCounters is the authoritative field list. Every field is strict by
 # default; add an entry here only when the exception is documented and handled
 # below.
-# rows_coalesce_failed is EXCLUDED — its two documented divergences (ADR-030 §D,
-# bug elspeth-ff6d48c180) are tolerated and logged instead:
-#   1. arrival-time barrier failures (branch-lost cascades, merge-exception
-#      cleanup) write FAILED node_states the derive counts but the live
-#      accumulator misses (it only counts the timeout/EOF sweeps) — audit MAY
-#      EXCEED live, and the audit value is the owned improvement;
-#   2. a zero-arrival best_effort_timeout_no_arrivals or
-#      first_timeout_no_arrivals failure consumes no tokens and writes no
-#      node_states — live counts it, the derive cannot, so live MAY EXCEED
-#      audit (accepted, audit-is-truth doctrine).
+# rows_coalesce_failed is EXCLUDED — tolerated and logged, never raised — for
+# TWO documented corners (ADR-030 §D, bug elspeth-ff6d48c180). The live counter
+# otherwise uses the audit derive's own evidence: a failed barrier group is
+# counted where its FIRST FAILED node_state at the barrier is written — on the
+# first consumed token's result when the group failure consumed arrived
+# members, or on the first straggler's late-arrival result when the group
+# failed with none (``counts_failed_barrier``; ``first_failure_evidence`` on the
+# executors' late-arrival outcomes). The corners:
+#   1. a straggler whose group closure is known only through the Landscape
+#      fallback (its key was evicted from the executor's bounded completed-key
+#      FIFO) cannot tell whether its state is the group's first, so it never
+#      counts — the audit MAY EXCEED live;
+#   2. the derive's unit is a DISTINCT (barrier node, row_id) pair, so several
+#      fork groups of ONE source row (a fork downstream of an expansion)
+#      failing at the same barrier collapse to one, while live counts each
+#      group — live MAY EXCEED audit.
+# The audit value is the terminal record either way.
 #
 # collector_groups_failed is audit-only: live row accumulation has no
 # group-verdict unit, and failed groups may have no terminal member tokens.

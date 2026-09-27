@@ -148,7 +148,7 @@ from elspeth.contracts.errors import (
     TransformErrorReason,
 )
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.results import FailureInfo
+from elspeth.contracts.results import FailureInfo, failed_barrier_group_results
 from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
@@ -906,7 +906,7 @@ class RowProcessor:
             complete_coalesce_fire=self._complete_coalesce_fire,
             terminal_coalesce_row_result=self._terminal_coalesce_row_result,
             emit_token_completed=self._emit_token_completed,
-            mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
+            settle_failed_coalesce_group=self.settle_failed_coalesce_group,
             record_group_member_terminals=self.record_group_member_terminals,
             take_pending_group_losses=self.take_pending_group_losses,
             row_union_executor=self._row_union_executor,
@@ -3846,8 +3846,9 @@ class RowProcessor:
 
     def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
         """Public surface for `_take_pending_group_losses` (Ruling 39): the
-        `CoalesceCompletionPort` injection point for out-of-claim sweep
-        callers."""
+        BarrierIntakeCoordinator injection point for its out-of-claim
+        collector and late-arrival arms (coalesce group failures drain inside
+        `settle_failed_coalesce_group`)."""
         return self._take_pending_group_losses()
 
     def _record_group_member_terminals(
@@ -4027,9 +4028,9 @@ class RowProcessor:
         already_terminal: frozenset[str] = frozenset(),
     ) -> list[RowResult]:
         """Public surface for `_record_group_member_terminals` (spec §6.1
-        Task 6): the CoalesceCompletionPort / BarrierIntakeCoordinator
-        injection point, mirroring how `emit_token_completed` and
-        `mark_coalesce_consumed_terminal` are already threaded to callers
+        Task 6): the BarrierIntakeCoordinator injection point for its
+        collector and late-arrival arms, mirroring how `emit_token_completed` and
+        `settle_failed_coalesce_group` are already threaded to callers
         outside this class.
         """
         return self._record_group_member_terminals(
@@ -4043,6 +4044,71 @@ class RowProcessor:
             path=path,
             already_terminal=already_terminal,
         )
+
+    def settle_failed_coalesce_group(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        coalesce_name: CoalesceName,
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        losses_ride_claim: bool,
+    ) -> list[RowResult]:
+        """Terminalize a FAILED coalesce group and surface it — the ONE seam
+        every coalesce group-failure arm uses (arrival intake, durable loss
+        replay, live loss notification, timeout/EOF sweeps).
+
+        In order: (1) record every consumed token's terminal through the
+        settlement channel, which also walks their REMAINING lineage for an
+        enclosing bound frame (escalation; cascaded results/child_items
+        surface); (2) release every consumed token's BLOCKED scheduler row;
+        (3) emit TokenCompleted per consumed token, AFTER the audit record;
+        (4) return one (FAILURE, UNROUTED) result PER consumed token
+        (``failed_barrier_group_results``: exactly one carries the
+        ``rows_coalesce_failed`` marker) followed by any cascaded results.
+        Per-token surfacing is what keeps the live ``rows_failed`` equal to
+        the audit derive, which counts one terminal per consumed token.
+
+        ``losses_ride_claim`` names who commits a loss the escalation walk
+        stages — it is NOT an optimisation switch. True for the loss
+        notification (``_notify_coalesce_closer_of_loss``): in a claim, the
+        staged list rides the CLAIM's disposition transaction
+        (``take_claim_group_losses``, frame-authenticated; the claimed token's
+        own triggering loss is staged in the same list, so draining it here
+        would steal that loss from its claim); reached through another
+        settlement's escalation walk, the OUTER out-of-claim caller drains
+        after its walk returns. False for the out-of-claim roots (intake,
+        durable replay, sweeps): there is no claim to ride, so the staged
+        losses are drained and committed in the SAME transaction as this
+        release (Rulings 39/43).
+
+        An empty ``consumed_tokens`` (a zero-arrival failure) has nothing to
+        terminalize or surface and returns before touching the staged-loss
+        list, so an out-of-claim caller never drains a loss it would not
+        commit.
+        """
+        if not consumed_tokens:
+            return []
+        cascaded = self._record_group_member_terminals(
+            consumed_tokens,
+            group_id=group_id,
+            failure_reason=failure_reason,
+            child_items=child_items,
+            group_failed=True,
+        )
+        group_losses = () if losses_ride_claim else self._take_pending_group_losses()
+        self._mark_coalesce_consumed_scheduler_work_terminal(
+            coalesce_name=coalesce_name,
+            consumed_tokens=consumed_tokens,
+            group_losses=group_losses,
+        )
+        for consumed in consumed_tokens:
+            self._emit_token_completed(consumed, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
+        return [
+            *failed_barrier_group_results(consumed_tokens, exception_type="CoalesceFailure", failure_reason=failure_reason),
+            *cascaded,
+        ]
 
     def _notify_closer_of_loss(
         self,
@@ -4113,8 +4179,15 @@ class RowProcessor:
         )
         if outcome is None or not outcome.consumed_tokens:
             return []
-        if outcome.failure_reason:
-            self._barrier_intake.note_group_failed(closer_name=str(row_union_name), group_id=frame.group_id, reason=outcome.failure_reason)
+        # notify_branch_lost only ever fails a v1 row_union group closed
+        # (``_fail_pending``); refuse before any journal write otherwise.
+        failure_reason = outcome.failure_reason
+        if not failure_reason:
+            raise OrchestrationInvariantError(
+                f"row_union {row_union_name!r} branch-loss notification consumed {len(outcome.consumed_tokens)} token(s) "
+                "without a failure_reason; a v1 row_union loss only ever fails the group closed."
+            )
+        self._barrier_intake.note_group_failed(closer_name=str(row_union_name), group_id=frame.group_id, reason=failure_reason)
         self._complete_row_union_fire(
             row_union_name=row_union_name,
             consumed_tokens=outcome.consumed_tokens,
@@ -4132,15 +4205,7 @@ class RowProcessor:
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
                 )
-        return [
-            RowResult(
-                token=consumed,
-                final_data=consumed.row_data,
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.UNROUTED,
-            )
-            for consumed in outcome.consumed_tokens
-        ]
+        return list(failed_barrier_group_results(outcome.consumed_tokens, exception_type="RowUnionFailure", failure_reason=failure_reason))
 
     def _notify_coalesce_closer_of_loss(
         self,
@@ -4266,42 +4331,16 @@ class RowProcessor:
 
         if outcome.failure_reason:
             self._barrier_intake.note_group_failed(closer_name=str(coalesce_name), group_id=frame.group_id, reason=outcome.failure_reason)
-            self._mark_coalesce_consumed_scheduler_work_terminal(
-                coalesce_name=coalesce_name,
-                consumed_tokens=tuple(outcome.consumed_tokens),
-            )
-            # Merge failed — build RowResults for held sibling tokens. The
-            # executor no longer writes their terminal outcomes itself
-            # (Task 6, spec §6.1); this caller records them through the
-            # settlement channel, which also walks each sibling's REMAINING
-            # lineage for an enclosing bound frame (escalation).
-            cascaded_results = self._record_group_member_terminals(
+            # A staged escalation loss is committed by this call's context
+            # (the claim, or the outer out-of-claim settlement) — see the helper.
+            return self.settle_failed_coalesce_group(
                 tuple(outcome.consumed_tokens),
+                coalesce_name=coalesce_name,
                 group_id=frame.group_id,
                 failure_reason=outcome.failure_reason,
                 child_items=child_items,
-                group_failed=True,
+                losses_ride_claim=True,
             )
-            sibling_results: list[RowResult] = []
-            for consumed_token in outcome.consumed_tokens:
-                self._emit_token_completed(
-                    consumed_token,
-                    outcome=TerminalOutcome.FAILURE,
-                    path=TerminalPath.UNROUTED,
-                )
-                sibling_results.append(
-                    RowResult(
-                        token=consumed_token,
-                        final_data=consumed_token.row_data,
-                        outcome=TerminalOutcome.FAILURE,
-                        path=TerminalPath.UNROUTED,
-                        error=FailureInfo(
-                            exception_type="CoalesceFailure",
-                            message=outcome.failure_reason,
-                        ),
-                    )
-                )
-            return sibling_results + cascaded_results
 
         return []
 

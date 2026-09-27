@@ -371,6 +371,17 @@ drained and repair this release forward.
   `flush_emits_one_row_per_buffered_row = True` on its class; the default is
   `False`, and an undeclared plugin is refused with a message naming the
   attribute (`docs/contracts/plugin-protocol.md` § Output Mode).
+- **A failed coalesce group no longer ends a healthy run with exit 4.** When
+  an arriving branch completed a group failure that consumed two or more
+  arrived branches (a `select` branch that never arrived under `quorum`, or a
+  type conflict between branches such as a `value_transform` rewrite beside a
+  passthrough of the same field), every consumed row was recorded `failed`,
+  but the run counted only the arriving one and stopped at the end with
+  "Live-vs-audit terminal counter mismatch" (exit 4). Every failure path of a
+  coalesce or row_union group now counts each consumed row once, and the run
+  ends PARTIAL (exit 1), or FAILED (exit 2) when no row succeeded. The failed-group count (`rows_coalesce_failed`) now also counts
+  failures completed by an arrival or a branch loss, including a group that
+  failed before any branch arrived.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

@@ -37,7 +37,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.results import RowResult
+from elspeth.contracts.results import RowResult, failed_barrier_group_results
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
@@ -201,9 +201,21 @@ class RecordingCoalesceExecutor:
 
 
 class RecordingRowUnionExecutor:
-    def __init__(self, outcome: RowUnionOutcome | None) -> None:
+    def __init__(self, outcome: RowUnionOutcome | None, *, accept_outcome: RowUnionOutcome | None = None) -> None:
         self.outcome = outcome
+        self.accept_outcome = accept_outcome
         self.notifications: list[dict[str, object]] = []
+
+    def accept(
+        self,
+        *,
+        token: TokenInfo,
+        row_union_name: str,
+        arrival_time: float,
+        coordination_token: CoordinationToken,
+    ) -> RowUnionOutcome:
+        assert self.accept_outcome is not None, "test did not configure an accept outcome"
+        return self.accept_outcome
 
     def has_recorded_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> bool:
         return False
@@ -250,7 +262,7 @@ def _make_coordinator(
     flush_calls: list[tuple[NodeID, TriggerType]] | None = None,
     fire_calls: list[dict[str, object]] | None = None,
     record_group_member_terminals_calls: list[dict[str, object]] | None = None,
-    mark_coalesce_consumed_terminal_calls: list[dict[str, object]] | None = None,
+    settle_failed_coalesce_group_calls: list[dict[str, object]] | None = None,
     take_pending_group_losses_result: tuple[GroupLossSpec, ...] = (),
     take_pending_group_losses_calls: list[int] | None = None,
 ) -> BarrierIntakeCoordinator:
@@ -291,16 +303,26 @@ def _make_coordinator(
             )
         return []
 
-    def _mark_coalesce_consumed_terminal(
+    def _settle_failed_coalesce_group(
+        consumed_tokens: tuple[TokenInfo, ...],
         *,
         coalesce_name: CoalesceName,
-        consumed_tokens: tuple[TokenInfo, ...],
-        group_losses: tuple[GroupLossSpec, ...] = (),
-    ) -> None:
-        if mark_coalesce_consumed_terminal_calls is not None:
-            mark_coalesce_consumed_terminal_calls.append(
-                {"coalesce_name": coalesce_name, "consumed_tokens": consumed_tokens, "group_losses": group_losses}
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        losses_ride_claim: bool,
+    ) -> list[RowResult]:
+        if settle_failed_coalesce_group_calls is not None:
+            settle_failed_coalesce_group_calls.append(
+                {
+                    "consumed_tokens": consumed_tokens,
+                    "coalesce_name": coalesce_name,
+                    "group_id": group_id,
+                    "failure_reason": failure_reason,
+                    "losses_ride_claim": losses_ride_claim,
+                }
             )
+        return list(failed_barrier_group_results(consumed_tokens, exception_type="CoalesceFailure", failure_reason=failure_reason))
 
     def _take_pending_group_losses() -> tuple[GroupLossSpec, ...]:
         if take_pending_group_losses_calls is not None:
@@ -347,7 +369,7 @@ def _make_coordinator(
         complete_coalesce_fire=_complete_coalesce_fire,
         terminal_coalesce_row_result=_terminal_coalesce_row_result,
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
-        mark_coalesce_consumed_terminal=_mark_coalesce_consumed_terminal,
+        settle_failed_coalesce_group=_settle_failed_coalesce_group,
         record_group_member_terminals=_record_group_member_terminals,
         take_pending_group_losses=_take_pending_group_losses,
         row_union_executor=row_union_executor,
@@ -581,6 +603,71 @@ class TestCoalesceIntakeTaxonomy:
             coordinator.run_intake_pass(_ctx())
         assert scheduler.release_contexts == []
 
+    def test_late_arrival_first_failure_evidence_counts_the_failed_barrier(self) -> None:
+        """A straggler into a group that failed with ZERO arrived members is
+        the group's first FAILED barrier state — the audit derive's unit — so
+        its result carries the group's one ``counts_failed_barrier``."""
+        row = _blocked_row(barrier_key=str(_COALESCE))
+        scheduler = RecordingScheduler(pending=[row])
+        coalesce = RecordingCoalesceExecutor(
+            CoalesceOutcome(held=False, failure_reason="scope_group_failed", late_arrival=True, first_failure_evidence=True)
+        )
+        holds = {
+            row.token_id: _LiveBarrierHold(token=_branch_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)
+        }
+        coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert [result.counts_failed_barrier for result in outcome.results] == [True]
+
+    def test_late_arrival_after_a_member_bearing_failure_is_not_counted_again(self) -> None:
+        row = _blocked_row(barrier_key=str(_COALESCE))
+        scheduler = RecordingScheduler(pending=[row])
+        coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=False, failure_reason="scope_group_failed", late_arrival=True))
+        holds = {
+            row.token_id: _LiveBarrierHold(token=_branch_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)
+        }
+        coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert [result.counts_failed_barrier for result in outcome.results] == [False]
+
+    def test_arrival_completed_group_failure_surfaces_every_consumed_token(self) -> None:
+        """An arrival that completes a group FAILURE (e.g. select_branch_not_arrived
+        under quorum) surfaces one result per consumed token — the arriving
+        token AND each held sibling — through the one failed-group seam, never
+        the arriving token alone (the live rows_failed would then undercount
+        the audit derive and the run would end on a counter mismatch)."""
+        row = _blocked_row(barrier_key=str(_COALESCE))
+        scheduler = RecordingScheduler(pending=[row])
+        arriving = _branch_token("tok-1", branch="b")
+        sibling = _branch_token("tok-sibling", branch="c")
+        coalesce = RecordingCoalesceExecutor(
+            CoalesceOutcome(held=False, failure_reason="select_branch_not_arrived", consumed_tokens=(arriving, sibling))
+        )
+        holds = {row.token_id: _LiveBarrierHold(token=arriving, barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
+        settle_calls: list[dict[str, object]] = []
+        coordinator = _make_coordinator(
+            scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds, settle_failed_coalesce_group_calls=settle_calls
+        )
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert settle_calls == [
+            {
+                "consumed_tokens": (arriving, sibling),
+                "coalesce_name": _COALESCE,
+                "group_id": "fg-barrier-coordination-test",
+                "failure_reason": "select_branch_not_arrived",
+                "losses_ride_claim": False,
+            }
+        ]
+        assert [result.token.token_id for result in outcome.results] == ["tok-1", "tok-sibling"]
+        assert [(result.outcome, result.path) for result in outcome.results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)] * 2
+        assert [result.counts_failed_barrier for result in outcome.results] == [True, False]
+
     def test_nonterminal_merge_returns_ready_continuation(self) -> None:
         row = _blocked_row(barrier_key=str(_COALESCE))
         scheduler = RecordingScheduler(pending=[row])
@@ -681,6 +768,51 @@ class TestRowUnionLossReplay:
         ]
         assert [item.kind for item in outcome.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
         assert [result.token.token_id for result in outcome.results] == ["held-token"]
+        assert [result.counts_failed_barrier for result in outcome.results] == [True]
+        assert [result.error.exception_type if result.error else None for result in outcome.results] == ["RowUnionFailure"]
+
+
+class TestRowUnionIntake:
+    def test_arrival_completed_group_failure_is_an_executor_contract_break(self) -> None:
+        """RowUnionExecutor.accept returns only held / late arrival / release;
+        a v1 row_union group fails only by sweep or branch loss. A whole-group
+        failure out of accept() is therefore refused, never surfaced as a
+        one-token result that would undercount its consumed members."""
+        row = _blocked_row(barrier_key="variant_union", branch_name="control")
+        scheduler = RecordingScheduler(pending=[row])
+        consumed = (_token("tok-1"), _token("tok-2"))
+        row_union = RecordingRowUnionExecutor(
+            None,
+            accept_outcome=RowUnionOutcome(
+                held=False, consumed_tokens=consumed, failure_reason="row_union_branch_lost", row_union_name="variant_union"
+            ),
+        )
+        coordinator = _make_coordinator(scheduler=scheduler, row_union_executor=row_union)
+
+        with pytest.raises(OrchestrationInvariantError, match="invalid state"):
+            coordinator.run_intake_pass(_ctx())
+        assert scheduler.release_contexts == []
+
+    def test_late_arrival_first_failure_evidence_counts_the_failed_barrier(self) -> None:
+        row = _blocked_row(barrier_key="variant_union", branch_name="control")
+        scheduler = RecordingScheduler(pending=[row])
+        row_union = RecordingRowUnionExecutor(
+            None,
+            accept_outcome=RowUnionOutcome(
+                held=False,
+                consumed_tokens=(_token("tok-1"),),
+                failure_reason="row_union_branch_lost",
+                row_union_name="variant_union",
+                outcomes_recorded=True,
+                late_arrival=True,
+                first_failure_evidence=True,
+            ),
+        )
+        coordinator = _make_coordinator(scheduler=scheduler, row_union_executor=row_union)
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert [result.counts_failed_barrier for result in outcome.results] == [True]
 
 
 class TestGroupLossReplayAndRestore:
