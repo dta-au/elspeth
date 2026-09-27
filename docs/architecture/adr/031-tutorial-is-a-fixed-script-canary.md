@@ -1,6 +1,6 @@
 # ADR-031: The Tutorial Is a Fixed-Script Canary for Freeform Composer
 
-**Date:** 2026-07-22
+**Date:** 2026-09-28
 **Status:** Accepted
 **Deciders:** ELSPETH maintainer
 **Tags:** composer, tutorial, freeform, backend-parity, testing-doctrine
@@ -38,6 +38,10 @@ cannot be hidden by rephrasing or an adaptive scripted driver.
   adaptive planner can repair around a defect that the fixed walk exposes.
 - Repeated identical planner rejections call for boundary diagnosis before
   increasing a repair budget.
+- `tests/integration/web/test_tutorial_routes.py` pins the ordinary
+  freeform backend transitions, while
+  `src/elspeth/web/frontend/tests/e2e/tutorial.spec.ts` pins the complete
+  browser walk through Run, Audit, and Graduation.
 
 ## Alternatives considered
 
