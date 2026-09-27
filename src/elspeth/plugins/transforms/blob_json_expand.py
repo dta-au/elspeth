@@ -374,7 +374,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:882daa33b903b38a"
+    source_file_hash: str | None = "sha256:5bc93feb6e7900bd"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -865,8 +865,9 @@ class BlobJSONExpand(BaseTransform):
                     _json_error_reason(
                         "invalid_input",
                         error_type="data_key_not_found",
+                        # The object's own keys are row data (they are not
+                        # emitted as field names): never listed in the reason.
                         error=f"data_key {self._data_key!r} not found in the JSON object",
-                        available_fields=sorted(str(key) for key in document),
                     )
                 )
             document = document[self._data_key]

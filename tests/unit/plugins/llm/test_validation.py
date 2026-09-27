@@ -329,9 +329,11 @@ class TestParseFieldValue:
         assert parse_field_value("A", self._field("enum", values=["A", "B"])) == ("A", None)
 
     def test_enum_rejects_invalid_value(self) -> None:
-        _, err = parse_field_value("C", self._field("enum", values=["A", "B"]))
+        _, err = parse_field_value("SENTINEL_C", self._field("enum", values=["A", "B"]))
         assert err is not None
         assert "not in allowed values" in err
+        # The rejected value is model output echoing row data: never in the text (C3).
+        assert "SENTINEL_C" not in err
 
     def test_enum_rejects_non_string(self) -> None:
         _, err = parse_field_value(1, self._field("enum", values=["1", "2"]))

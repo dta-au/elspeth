@@ -1101,7 +1101,8 @@ class TestHTTPSpecificBehavior:
         assert result.reason is not None
         assert result.reason["reason"] == "missing_output_field"
         assert result.reason["field"] == "rationale"
-        assert "score" in result.reason["available_fields"]
+        # The response's own keys are external content: never listed (C3).
+        assert "available_fields" not in result.reason
 
     def test_handles_connection_error(
         self,

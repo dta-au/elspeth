@@ -674,7 +674,6 @@ class TransformErrorReason(TypedDict):
         completion_tokens: Actual tokens used in response
         prompt_tokens: Tokens used in prompt
         raw_response: Truncated raw LLM response content
-        raw_response_preview: Alternative name for truncated preview
         content_after_fence_strip: Content after markdown fence removal
         usage: Token usage stats from LLM response
         response: Full response object for debugging
@@ -686,7 +685,6 @@ class TransformErrorReason(TypedDict):
         expected: Expected type or value
         actual: Actual type or value received
         actual_type: Actual Python type name for type checks
-        value: The actual value (truncated for audit)
 
     Contract violation context:
         violation_type: Specific ContractViolation subclass name
@@ -785,7 +783,6 @@ class TransformErrorReason(TypedDict):
     prompt_tokens: NotRequired[int | None]
     finish_reason: NotRequired[str | None]  # LLM finish reason (e.g., "stop", "length")
     raw_response: NotRequired[str]  # LLM response text; absent = empty/unavailable
-    raw_response_preview: NotRequired[str]  # Truncated preview; absent = empty/unavailable
     content_after_fence_strip: NotRequired[str]
     usage: NotRequired[UsageStats | dict[str, int]]
     response: NotRequired[dict[str, Any]]
@@ -818,7 +815,6 @@ class TransformErrorReason(TypedDict):
     expected: NotRequired[str]
     actual: NotRequired[str]
     actual_type: NotRequired[str]
-    value: NotRequired[str]
     emitted_index: NotRequired[int]  # Which emitted row broke a declared output type (ADR-050)
     authorship: NotRequired[Literal["computed", "carried"]]  # Transform created the field / rewrote an input field (ADR-050)
     declared_by: NotRequired[Literal["operator", "plugin", "upstream"]]  # Who declared the violated type (ADR-050 D6)

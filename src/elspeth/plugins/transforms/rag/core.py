@@ -514,9 +514,10 @@ class RetrievalTransformBase(BaseTransform):
         if not chunks:
             if self._retrieval_config.on_no_results == "quarantine":
                 self._quarantine_count += 1
+                # The query text is built from row data: it stays in the row
+                # carrier and the recorded retrieval call, never in the reason.
                 no_results_error_reason: TransformErrorReason = {
                     "reason": "no_results",
-                    "query": query,
                     "provider": self._provider_label,
                 }
                 if skipped_count > 0:

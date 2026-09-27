@@ -561,6 +561,13 @@ drained and repair this release forward.
   error fetching <url>` — the last reached `node_states.error_json` with the
   query string unredacted), and an SSRF or DNS refusal no longer repeats the
   host or resolved address; the URL stays in the row and the recorded call.
+  The `llm` structured-output reasons no longer carry response content
+  (`raw_response_preview` becomes `content_length`; a type mismatch drops
+  `value`, an enum miss drops the value from its message, a missing field
+  drops the response's `available_fields`) — the response can echo the
+  prompt's row data and stays in the recorded call. `rag_retrieval`'s
+  `no_results` reason drops the query text, and `blob_json_expand`'s
+  `data_key_not_found` no longer lists the document's own keys.
 
 ### Newly refused configurations
 
