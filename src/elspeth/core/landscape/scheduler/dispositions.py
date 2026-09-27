@@ -12,12 +12,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
-from sqlalchemy import and_, case, select, update
+from sqlalchemy import and_, bindparam, case, select, update
 from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import BarrierEmission, GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
@@ -475,12 +476,6 @@ class SchedulerDispositionRepository:
                 )
             seen_token_ids.add(token_id)
 
-        predicates = [
-            token_work_items_table.c.run_id == coordination_token.run_id,
-            token_work_items_table.c.token_id.in_(requested_token_ids),
-            token_work_items_table.c.status.in_((TokenWorkStatus.PENDING_SINK.value, TokenWorkStatus.LEASED.value)),
-            token_work_items_table.c.pending_sink_name.is_not(None),
-        ]
         complete_bundle = pending_sink_bundle_clause()
         with fenced_leader_transaction(
             self._engine,
@@ -489,18 +484,25 @@ class SchedulerDispositionRepository:
             verb="mark_pending_sink_terminal_many",
         ) as conn:
             database_now = read_landscape_transaction_time(conn)
-            rows = (
-                conn.execute(
-                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
-                    .where(and_(*predicates))
-                    .order_by(
-                        token_work_items_table.c.ingest_sequence,
-                        token_work_items_table.c.step_index,
-                        token_work_items_table.c.work_item_id,
+            # The token set is caller-sized: the read runs in chunks of the
+            # shared bind budget on this connection, then restores the
+            # (ingest_sequence, step_index, work_item_id) order.
+            rows = sorted(
+                (
+                    row
+                    for chunk in bind_budget_chunks(requested_token_ids)
+                    for row in conn.execute(
+                        select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete")).where(
+                            token_work_items_table.c.run_id == coordination_token.run_id,
+                            token_work_items_table.c.token_id.in_(chunk),
+                            token_work_items_table.c.status.in_((TokenWorkStatus.PENDING_SINK.value, TokenWorkStatus.LEASED.value)),
+                            token_work_items_table.c.pending_sink_name.is_not(None),
+                        )
                     )
-                )
-                .mappings()
-                .all()
+                    .mappings()
+                    .all()
+                ),
+                key=lambda row: (row["ingest_sequence"], row["step_index"], row["work_item_id"]),
             )
             rows_by_token_id: dict[str, list[RowMapping]] = {}
             for row in rows:
@@ -536,38 +538,36 @@ class SchedulerDispositionRepository:
 
             terminalized = 0
             if rows:
-                changed_ids = frozenset(
-                    conn.execute(
-                        update(token_work_items_table)
-                        .where(token_work_items_table.c.work_item_id.in_(tuple(row["work_item_id"] for row in rows)))
-                        .where(token_work_items_table.c.run_id == coordination_token.run_id)
-                        .where(
-                            token_work_items_table.c.status
-                            == case({row["work_item_id"]: row["status"] for row in rows}, value=token_work_items_table.c.work_item_id)
-                        )
-                        .where(
-                            token_work_items_table.c.token_id
-                            == case({row["work_item_id"]: row["token_id"] for row in rows}, value=token_work_items_table.c.work_item_id)
-                        )
-                        .where(token_work_items_table.c.pending_sink_name.is_not(None))
-                        .where(token_work_items_table.c.lease_owner == expected_lease_owner)
-                        .where(complete_bundle)
-                        .values(
-                            status=TokenWorkStatus.TERMINAL.value,
-                            row_payload_json=case(
-                                {row["token_id"]: scrubbed_row_payload_json(row["token_id"]) for row in rows},
-                                value=token_work_items_table.c.token_id,
-                            ),
-                            lease_owner=None,
-                            lease_expires_at=None,
-                            updated_at=database_now,
-                        )
-                        .returning(token_work_items_table.c.work_item_id)
-                    )
-                    .scalars()
-                    .all()
-                )
-                if len(changed_ids) != len(rows):
+                # One statement per row, executed as one executemany: its bind
+                # count does not grow with the batch (core/landscape/bind_budget.py),
+                # and both dialects report the summed rowcount.
+                changed = conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.work_item_id == bindparam("b_work_item_id"))
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.status == bindparam("b_status"))
+                    .where(token_work_items_table.c.token_id == bindparam("b_token_id"))
+                    .where(token_work_items_table.c.pending_sink_name.is_not(None))
+                    .where(token_work_items_table.c.lease_owner == expected_lease_owner)
+                    .where(complete_bundle)
+                    .values(
+                        status=TokenWorkStatus.TERMINAL.value,
+                        row_payload_json=bindparam("b_row_payload_json"),
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        updated_at=database_now,
+                    ),
+                    [
+                        {
+                            "b_work_item_id": row["work_item_id"],
+                            "b_status": row["status"],
+                            "b_token_id": row["token_id"],
+                            "b_row_payload_json": scrubbed_row_payload_json(row["token_id"]),
+                        }
+                        for row in rows
+                    ],
+                ).rowcount
+                if changed != len(rows):
                     raise AuditIntegrityError(
                         "Scheduler pending-sink batch CAS missed a complete owner-matched member; refusing partial terminalization"
                     )
@@ -592,10 +592,9 @@ class SchedulerDispositionRepository:
                             caller_owner=expected_lease_owner,
                         )
                         for row in rows
-                        if row["work_item_id"] in changed_ids
                     ],
                 )
-                terminalized = len(changed_ids)
+                terminalized = changed
         return terminalized
 
     def terminalize_pending_sinks_with_terminal_outcomes(
@@ -635,6 +634,7 @@ class SchedulerDispositionRepository:
                     .where(token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value)
                     .where(token_work_items_table.c.pending_sink_name.is_not(None))
                     .where(terminal_outcome_exists)
+                    .with_for_update(of=token_work_items_table)
                     .order_by(
                         token_work_items_table.c.ingest_sequence,
                         token_work_items_table.c.step_index,
@@ -646,28 +646,34 @@ class SchedulerDispositionRepository:
             )
             terminalized = 0
             if rows:
-                changed_ids = frozenset(
-                    conn.execute(
-                        update(token_work_items_table)
-                        .where(token_work_items_table.c.work_item_id.in_(tuple(row["work_item_id"] for row in rows)))
-                        .where(token_work_items_table.c.run_id == coordination_token.run_id)
-                        .where(token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value)
-                        .where(token_work_items_table.c.pending_sink_name.is_not(None))
-                        .values(
-                            status=TokenWorkStatus.TERMINAL.value,
-                            row_payload_json=case(
-                                {row["token_id"]: scrubbed_row_payload_json(row["token_id"]) for row in rows},
-                                value=token_work_items_table.c.token_id,
-                            ),
-                            lease_owner=None,
-                            lease_expires_at=None,
-                            updated_at=database_now,
-                        )
-                        .returning(token_work_items_table.c.work_item_id)
+                # A crash between sink durability and the handoff mark can leave
+                # a whole sink write's rows here, so the repair is one
+                # executemany of a fixed-size statement (core/landscape/bind_budget.py)
+                # over the rows the locking read above holds; every one of
+                # them changes, or the repair rolls back before an event.
+                changed = conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.work_item_id == bindparam("b_work_item_id"))
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value)
+                    .where(token_work_items_table.c.pending_sink_name.is_not(None))
+                    .values(
+                        status=TokenWorkStatus.TERMINAL.value,
+                        row_payload_json=bindparam("b_row_payload_json"),
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        updated_at=database_now,
+                    ),
+                    [
+                        {"b_work_item_id": row["work_item_id"], "b_row_payload_json": scrubbed_row_payload_json(row["token_id"])}
+                        for row in rows
+                    ],
+                ).rowcount
+                if changed != len(rows):
+                    raise AuditIntegrityError(
+                        f"Scheduler pending-sink repair for run_id={coordination_token.run_id!r} changed {changed} of "
+                        f"{len(rows)} locked PENDING_SINK rows; refusing partial repair"
                     )
-                    .scalars()
-                    .all()
-                )
                 self._events.record_many(
                     conn,
                     records=[
@@ -689,10 +695,9 @@ class SchedulerDispositionRepository:
                             caller_owner=caller_owner,
                         )
                         for row in rows
-                        if row["work_item_id"] in changed_ids
                     ],
                 )
-                terminalized = len(changed_ids)
+                terminalized = changed
         return terminalized
 
     def _transition(
@@ -756,16 +761,18 @@ class SchedulerDispositionRepository:
             )
             events_by_id = {event.work_item_id: event for _values, event in children}
             self._events.record_many(conn, records=[event for identity, event in events_by_id.items() if identity in inserted_ids])
-            persisted_children = (
-                conn.execute(
+            persisted_children = [
+                row
+                for chunk in bind_budget_chunks(tuple(events_by_id))
+                for row in conn.execute(
                     select(token_work_items_table).where(
                         token_work_items_table.c.run_id == member_token.run_id,
-                        token_work_items_table.c.work_item_id.in_(tuple(events_by_id)),
+                        token_work_items_table.c.work_item_id.in_(chunk),
                     )
                 )
                 .mappings()
                 .all()
-            )
+            ]
             rows_by_id = {row["work_item_id"]: row for row in persisted_children}
             child_rows = tuple(rows_by_id[event.work_item_id] for _values, event in children)
             parent_row = self._transition_on(

@@ -1,10 +1,14 @@
 """A test-only batch plugin whose flush emits exactly one row per buffered row.
 
 ``output_mode: passthrough`` admits only a batch-aware plugin that declares
-``flush_emits_one_row_per_buffered_row``. No shipped plugin does (each one
-reduces, replicates or skips rows), so tests that exercise the passthrough
-path register this identity plugin through a test plugin manager instead of
-using a shipped plugin in a shape it cannot honour.
+``flush_emits_one_row_per_buffered_row``. The one shipped plugin that does,
+``batch_rank``, adds four annotation fields to every row; engine tests of the
+passthrough path use this identity plugin instead, registered through a test
+plugin manager, so what they assert is the engine's carriage of each buffered
+row and not a plugin's annotations. ``batch_rank`` itself is run under
+passthrough (and transform) by
+``tests/integration/pipeline/test_batch_rank_output_modes.py`` and by
+``examples/batch_rank_passthrough``.
 """
 
 from __future__ import annotations

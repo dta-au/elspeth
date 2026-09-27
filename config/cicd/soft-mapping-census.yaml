@@ -510,6 +510,8 @@ files:
     dict[str, object]: 1
   src/elspeth/plugins/transforms/batch_paired_preference.py:
     dict[str, Any]: 2
+  src/elspeth/plugins/transforms/batch_rank.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_replicate.py:
     dict[str, Any]: 4
   src/elspeth/plugins/transforms/batch_stats.py:
@@ -1076,6 +1078,6 @@ totals:
   Mapping[str, object]: 311
   MutableMapping[str, Any]: 13
   boundary: 66
-  dict[str, Any]: 1180
+  dict[str, Any]: 1182
   dict[str, object]: 410
-  soft: 2847
+  soft: 2849

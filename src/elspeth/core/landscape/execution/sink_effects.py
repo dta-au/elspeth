@@ -24,6 +24,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
 )
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.execution.sink_effect_finalization import (
     SinkEffectFinalization,
@@ -248,16 +249,21 @@ class SinkEffectRepository:
         requested = tuple(token_ids)
         if not requested:
             return ()
-        rows = self._ops.execute_fetchall(
-            select(sink_effect_members_table)
-            .where(
-                sink_effect_members_table.c.run_id == run_id,
-                sink_effect_members_table.c.sink_node_id == sink_node_id,
-                sink_effect_members_table.c.role == role.value,
-                sink_effect_members_table.c.token_id.in_(requested),
-            )
-            .order_by(sink_effect_members_table.c.effect_id, sink_effect_members_table.c.ordinal)
+        # One sink write carries every pending token of that sink, so the token
+        # set is data-sized: the read runs in chunks of the shared bind budget
+        # through one read snapshot, then restores the (effect_id, ordinal) order.
+        chunk_rows = self._ops.execute_fetchall_many(
+            [
+                select(sink_effect_members_table).where(
+                    sink_effect_members_table.c.run_id == run_id,
+                    sink_effect_members_table.c.sink_node_id == sink_node_id,
+                    sink_effect_members_table.c.role == role.value,
+                    sink_effect_members_table.c.token_id.in_(chunk),
+                )
+                for chunk in bind_budget_chunks(requested)
+            ]
         )
+        rows = sorted((row for chunk in chunk_rows for row in chunk), key=lambda row: (row.effect_id, row.ordinal))
         return tuple(self._member_loader.load(row) for row in rows)
 
     def get_stream(self, stream_id: str | None) -> SinkEffectStream | None:

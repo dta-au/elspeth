@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import ColumnElement, and_, case, or_, select, update
+from sqlalchemy import ColumnElement, and_, bindparam, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import (
@@ -21,6 +21,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
@@ -635,12 +636,16 @@ class SchedulerLeaseRepository:
             .order_by(run_workers_table.c.worker_id)
             .with_for_update(read=True, of=run_workers_table)
         ).fetchall()
-        conn.execute(
-            select(token_work_items_table.c.work_item_id)
-            .where(token_work_items_table.c.run_id == run_id, token_work_items_table.c.work_item_id.in_(candidate_ids))
-            .order_by(token_work_items_table.c.work_item_id)
-            .with_for_update(of=token_work_items_table)
-        ).fetchall()
+        # A lost owner can hold a whole sink write's items, so the item lock
+        # read runs in ascending chunks of the shared bind budget: every id in
+        # one chunk sorts before the next chunk's, keeping the lock order.
+        for chunk in bind_budget_chunks(candidate_ids):
+            conn.execute(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.run_id == run_id, token_work_items_table.c.work_item_id.in_(chunk))
+                .order_by(token_work_items_table.c.work_item_id)
+                .with_for_update(of=token_work_items_table)
+            ).fetchall()
         database_now = read_landscape_decision_time(conn)
         grace_threshold = database_now - timedelta(seconds=grace_seconds)
         owner_registry_dead = ~(
@@ -656,33 +661,35 @@ class SchedulerLeaseRepository:
         lease_stalled: ColumnElement[bool] = token_work_items_table.c.lease_expires_at < stall_threshold
         reap_eligible = or_(owner_registry_dead, lease_stalled)
 
-        expired_rows = conn.execute(
-            select(
-                token_work_items_table,
-                owner_registry_dead.label("owner_is_dead"),
-                sink_redrive_shaped.label("_sink_redrive_shaped"),
-                complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
-            )
-            .where(token_work_items_table.c.run_id == coordination_token.run_id)
-            .where(token_work_items_table.c.work_item_id.in_(candidate_ids))
-            .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
-            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-            .where(token_work_items_table.c.lease_expires_at < database_now)
-            .where(lease_owner_not_caller)
-            .where(reap_eligible)
-            .order_by(
-                token_work_items_table.c.ingest_sequence,
-                token_work_items_table.c.step_index,
-                # Stable last-resort tiebreaker for cross-source same-tick
-                # collisions (archived issue elspeth-6cb89db535, G3 M1).
-                token_work_items_table.c.work_item_id,
-            )
-        ).mappings()
-        # Materialise into a list: the connection must remain open for the
-        # per-row UPDATEs below, but lazy iteration over the SELECT cursor
-        # would be invalidated by the first write on the same connection
-        # (SQLite WAL mode). Collect all eligible rows first, then update.
-        expired = list(expired_rows)
+        # Chunked like the lock read, then ordered by (ingest_sequence,
+        # step_index, work_item_id); work_item_id is the stable last-resort
+        # tiebreaker for cross-source same-tick collisions (archived issue
+        # elspeth-6cb89db535, G3 M1). Every chunk is materialised before the
+        # UPDATEs below run on the same connection.
+        expired = sorted(
+            (
+                row
+                for chunk in bind_budget_chunks(candidate_ids)
+                for row in conn.execute(
+                    select(
+                        token_work_items_table,
+                        owner_registry_dead.label("owner_is_dead"),
+                        sink_redrive_shaped.label("_sink_redrive_shaped"),
+                        complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+                    )
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.work_item_id.in_(chunk))
+                    .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .where(token_work_items_table.c.lease_expires_at < database_now)
+                    .where(lease_owner_not_caller)
+                    .where(reap_eligible)
+                )
+                .mappings()
+                .all()
+            ),
+            key=lambda row: (row["ingest_sequence"], row["step_index"], row["work_item_id"]),
+        )
 
         if not expired:
             return 0
@@ -701,25 +708,37 @@ class SchedulerLeaseRepository:
             next_attempts[prior_id] = next_attempt
             next_statuses[prior_id] = TokenWorkStatus.PENDING_SINK.value if is_sink_redrive else TokenWorkStatus.READY.value
             (sink_ids if is_sink_redrive else transform_ids).append(prior_id)
-        changed_ids = frozenset(
+        # The two item kinds rotate in two statements, each binding a count
+        # that does not grow with a sink write. A sink-redrive item keeps its
+        # identity and attempt, so its UPDATE needs no per-item value: it
+        # re-selects by the discovery predicates (lease_expires_at <
+        # discovery_now bounds the sweep to the discovered candidates, and the
+        # owner set is worker-sized) and RETURNING names exactly the rows it
+        # changed; a lost owner can hold a whole sink write's items, so no
+        # per-item list is bound. A transform item takes a fresh identity per
+        # item, so its rotation is one executemany of a fixed-size statement
+        # (core/landscape/bind_budget.py); the rows it changed are the fresh
+        # identities now present, read back in chunks, since no other
+        # transaction can rotate an item this one holds locked.
+        rotation_filters = (
+            token_work_items_table.c.run_id == coordination_token.run_id,
+            token_work_items_table.c.status == TokenWorkStatus.LEASED.value,
+            token_work_items_table.c.lease_expires_at < database_now,
+            lease_owner_not_caller,
+            reap_eligible,
+        )
+        # Runs even when no sink-redrive item was selected: the same predicates
+        # then match nothing, and any row they do match is refused below.
+        sink_changed = frozenset(
             conn.execute(
                 update(token_work_items_table)
-                .where(token_work_items_table.c.work_item_id.in_(tuple(next_ids)))
-                .where(token_work_items_table.c.run_id == coordination_token.run_id)
-                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-                .where(token_work_items_table.c.lease_expires_at < database_now)
-                .where(lease_owner_not_caller)
-                .where(reap_eligible)
-                .where(
-                    or_(
-                        and_(token_work_items_table.c.work_item_id.in_(sink_ids), complete_pending_sink_bundle),
-                        and_(token_work_items_table.c.work_item_id.in_(transform_ids), ~sink_redrive_shaped),
-                    )
-                )
+                .where(*rotation_filters)
+                .where(token_work_items_table.c.lease_expires_at < discovery_now)
+                .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
+                .where(sink_redrive_shaped)
+                .where(complete_pending_sink_bundle)
                 .values(
-                    work_item_id=case(next_ids, value=token_work_items_table.c.work_item_id),
-                    attempt=case(next_attempts, value=token_work_items_table.c.work_item_id),
-                    status=case(next_statuses, value=token_work_items_table.c.work_item_id),
+                    status=TokenWorkStatus.PENDING_SINK.value,
                     lease_owner=None,
                     lease_expires_at=None,
                     updated_at=database_now,
@@ -729,9 +748,54 @@ class SchedulerLeaseRepository:
             .scalars()
             .all()
         )
+        if not sink_changed.issubset(sink_ids):
+            raise AuditIntegrityError(
+                f"Lease recovery for run {coordination_token.run_id!r} rotated a pending-sink item it had not "
+                "selected; the leader-fenced transaction must hold every row it rotates."
+            )
+        transform_changed: frozenset[str] = frozenset()
+        if transform_ids:
+            rotated = conn.execute(
+                update(token_work_items_table)
+                .where(*rotation_filters)
+                .where(token_work_items_table.c.work_item_id == bindparam("b_prior_work_item_id"))
+                .where(~sink_redrive_shaped)
+                .values(
+                    work_item_id=bindparam("b_next_work_item_id"),
+                    attempt=bindparam("b_next_attempt"),
+                    status=TokenWorkStatus.READY.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
+                ),
+                [
+                    {"b_prior_work_item_id": prior_id, "b_next_work_item_id": next_ids[prior_id], "b_next_attempt": next_attempts[prior_id]}
+                    for prior_id in transform_ids
+                ],
+            ).rowcount
+            transform_changed = frozenset(
+                work_item
+                for chunk in bind_budget_chunks(sorted(next_ids[prior_id] for prior_id in transform_ids))
+                for work_item in conn.execute(
+                    select(token_work_items_table.c.work_item_id).where(
+                        token_work_items_table.c.run_id == coordination_token.run_id,
+                        token_work_items_table.c.work_item_id.in_(chunk),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(transform_changed) != rotated:
+                raise AuditIntegrityError(
+                    f"Lease recovery for run {coordination_token.run_id!r} rotated {rotated} transform items but "
+                    f"{len(transform_changed)} fresh identities are present; the leader-fenced transaction holds every row it rotates."
+                )
+        changed_ids = sink_changed | transform_changed
         missed = [row for row in expired if next_ids[row["work_item_id"]] not in changed_ids]
-        current_rows = (
-            conn.execute(
+        current_rows = [
+            row
+            for chunk in bind_budget_chunks(tuple(row["work_item_id"] for row in missed))
+            for row in conn.execute(
                 select(
                     token_work_items_table.c.work_item_id,
                     token_work_items_table.c.status,
@@ -739,12 +803,12 @@ class SchedulerLeaseRepository:
                     complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
                 ).where(
                     token_work_items_table.c.run_id == coordination_token.run_id,
-                    token_work_items_table.c.work_item_id.in_(tuple(row["work_item_id"] for row in missed)),
+                    token_work_items_table.c.work_item_id.in_(chunk),
                 )
             )
             .mappings()
             .all()
-        )
+        ]
         current_by_id = {row["work_item_id"]: row for row in current_rows}
         for row in missed:
             prior_id = row["work_item_id"]
@@ -858,16 +922,22 @@ class SchedulerLeaseRepository:
                     "completed outcome but their row payload was purged. A FAILED item keeps its payload until its "
                     "token is decided."
                 )
-            token_ids = tuple(row["token_id"] for row in undecided)
+            # Every FAILED item of the run can be undecided at once, so the
+            # group-loss read runs in chunks of the shared bind budget.
+            token_ids = tuple(sorted({row["token_id"] for row in undecided}))
             lost = sorted(
-                conn.execute(
-                    select(group_losses_table.c.token_id)
-                    .where(group_losses_table.c.run_id == run_id)
-                    .where(group_losses_table.c.token_id.in_(token_ids))
-                    .distinct()
-                )
-                .scalars()
-                .all()
+                {
+                    token_id
+                    for chunk in bind_budget_chunks(token_ids)
+                    for token_id in conn.execute(
+                        select(group_losses_table.c.token_id)
+                        .where(group_losses_table.c.run_id == run_id)
+                        .where(group_losses_table.c.token_id.in_(chunk))
+                        .distinct()
+                    )
+                    .scalars()
+                    .all()
+                }
             )
             if lost:
                 raise AuditIntegrityError(
@@ -876,28 +946,28 @@ class SchedulerLeaseRepository:
                 )
             database_now = read_landscape_decision_time(conn)
             next_ids = {row["work_item_id"]: work_item_id(run_id, row["token_id"], row["node_id"], row["attempt"] + 1) for row in undecided}
-            changed_ids = frozenset(
-                conn.execute(
-                    update(token_work_items_table)
-                    .where(token_work_items_table.c.run_id == run_id)
-                    .where(token_work_items_table.c.work_item_id.in_(tuple(next_ids)))
-                    .where(undecided_failed_work_clause())
-                    .values(
-                        work_item_id=case(next_ids, value=token_work_items_table.c.work_item_id),
-                        attempt=token_work_items_table.c.attempt + 1,
-                        status=TokenWorkStatus.READY.value,
-                        lease_owner=None,
-                        lease_expires_at=None,
-                        updated_at=database_now,
-                    )
-                    .returning(token_work_items_table.c.work_item_id)
-                )
-                .scalars()
-                .all()
-            )
-            if changed_ids != frozenset(next_ids.values()):
+            # One rotation per item, executed as one executemany of a fixed-size
+            # statement (core/landscape/bind_budget.py): its bind count does not
+            # grow with the number of FAILED items, and both dialects report
+            # the summed rowcount.
+            changed = conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.work_item_id == bindparam("b_prior_work_item_id"))
+                .where(undecided_failed_work_clause())
+                .values(
+                    work_item_id=bindparam("b_next_work_item_id"),
+                    attempt=token_work_items_table.c.attempt + 1,
+                    status=TokenWorkStatus.READY.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
+                ),
+                [{"b_prior_work_item_id": prior_id, "b_next_work_item_id": next_id} for prior_id, next_id in next_ids.items()],
+            ).rowcount
+            if changed != len(next_ids):
                 raise AuditIntegrityError(
-                    f"Resume re-drive of FAILED scheduler work for run {run_id!r} rotated {len(changed_ids)} of "
+                    f"Resume re-drive of FAILED scheduler work for run {run_id!r} rotated {changed} of "
                     f"{len(next_ids)} locked items; the leader-fenced transaction held every row it selected."
                 )
             self._events.record_many(

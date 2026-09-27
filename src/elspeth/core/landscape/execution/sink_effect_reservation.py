@@ -29,6 +29,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectState,
 )
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.model_loaders import SinkEffectLoader
@@ -748,12 +749,17 @@ class SinkEffectReservation:
     def _effect_rows(conn: Connection, effect_ids: Sequence[str], *, lock: bool) -> tuple[Row[Any], ...]:
         if not effect_ids:
             return ()
-        statement = (
-            select(sink_effects_table).where(sink_effects_table.c.effect_id.in_(tuple(effect_ids))).order_by(sink_effects_table.c.effect_id)
-        )
+        # The requested tokens may carry bindings to any number of earlier
+        # effects, so the read runs in ascending chunks of the shared bind
+        # budget; ascending order keeps the effect_id lock order when locking.
+        statement = select(sink_effects_table).order_by(sink_effects_table.c.effect_id)
         if lock:
             statement = statement.with_for_update()
-        rows = tuple(conn.execute(statement).fetchall())
+        rows = tuple(
+            row
+            for chunk in bind_budget_chunks(sorted(effect_ids))
+            for row in conn.execute(statement.where(sink_effects_table.c.effect_id.in_(chunk))).fetchall()
+        )
         if len(rows) != len(effect_ids):
             raise ValueError("sink effect membership references a missing effect")
         return rows

@@ -18303,6 +18303,26 @@ class TestPreviewProofStep:
 
             assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in [d["code"] for d in diagnostics]
 
+    def test_batch_rank_numeric_value_field_blocks_behind_observed_csv(self) -> None:
+        """batch_rank ranks a numeric value_field: an observed CSV string there fails every batch, so the proof fires."""
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            diagnostics = self._proof_codes(
+                authority,
+                context,
+                self._batch_barrier_behind_expand_opener(
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                    barrier_node_type="aggregation",
+                    plugin="batch_rank",
+                    options={"schema": {"mode": "observed"}, "value_field": "price"},
+                ),
+            )
+
+            mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+            assert mismatch, [d["code"] for d in diagnostics]
+            assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+            assert mismatch[0]["evidence_locator"]["field"] == "price"
+
     # -- declared-input-type mismatch against observed CSV (elspeth-e6e552ce34) --
 
     @staticmethod

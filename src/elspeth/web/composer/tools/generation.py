@@ -2963,6 +2963,7 @@ _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS: Final[frozenset[str]] = frozenset(
     {
         "batch_distribution_profile",
         "batch_outlier_annotator",
+        "batch_rank",
         "batch_stats",
         "batch_threshold_summary",
     }

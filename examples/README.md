@@ -54,6 +54,7 @@ These examples run locally with no credentials or external services.
 | [`document_review_panel`](document_review_panel/) | The combined example — a two-reviewer LLM fork nested inside an EXPAND group of pages, closed by a collector, summarised by a run-level aggregation. Shows one lost token unrolling into a lost page, a refused document verdict, and a short corpus number — and how encapsulating the run as one row makes the whole thing fail closed |
 | [`batch_aggregation`](batch_aggregation/) | Count-triggered aggregation with group-by statistics |
 | [`batch_error_routing`](batch_error_routing/) | One wrongly typed value fails its whole aggregation batch: every row of it goes to the `on_error` sink with its original values and a value-free reason; three configs — a quarantine sink, `on_error: discard`, and a declared `value_transform` output type that routes the bad row before the batch (all exit 1 by design) |
+| [`batch_rank_passthrough`](batch_rank_passthrough/) | Aggregation `output_mode: passthrough`: `batch_rank` ranks each prompt's candidates by judge score within the batch and the SAME tokens continue to a shortlist gate; a null score passes through unranked. `settings_transform.yaml` runs the same pipeline in `transform` mode to contrast the lineage (both exit 0) |
 | [`report_assemble`](report_assemble/) | Assemble text rows into paginated markdown reports with flush metadata |
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |
 | [`deaggregation`](deaggregation/) | 1-to-N row expansion via `batch_replicate` |
@@ -213,6 +214,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Error handling / quarantine** | [`error_routing`](error_routing/) — `on_error` diversion pattern |
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
 | **A failed batch (N rows, one bad)** | [`batch_error_routing`](batch_error_routing/) — the whole batch fails and `on_error` takes every row of it; the reason names field and types, never the value |
+| **Annotating a batch but keeping every row (passthrough)** | [`batch_rank_passthrough`](batch_rank_passthrough/) — rank within a batch, then route on the rank; the token that reaches the sink is the one the source created |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
 | **PDF to page images** | [`pdf_rasterize`](pdf_rasterize/) — one PNG page row per page, with malformed-document quarantine |

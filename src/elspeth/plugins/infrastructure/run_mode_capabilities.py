@@ -53,6 +53,7 @@ _TRANSFORM_CLASSES = {
     "batch_experiment_compare": ("elspeth.plugins.transforms.batch_experiment_compare", "BatchExperimentCompare"),
     "batch_outlier_annotator": ("elspeth.plugins.transforms.batch_outlier_annotator", "BatchOutlierAnnotator"),
     "batch_paired_preference": ("elspeth.plugins.transforms.batch_paired_preference", "BatchPairedPreference"),
+    "batch_rank": ("elspeth.plugins.transforms.batch_rank", "BatchRank"),
     "batch_replicate": ("elspeth.plugins.transforms.batch_replicate", "BatchReplicate"),
     "batch_stats": ("elspeth.plugins.transforms.batch_stats", "BatchStats"),
     "batch_threshold_summary": ("elspeth.plugins.transforms.batch_threshold_summary", "BatchThresholdSummary"),

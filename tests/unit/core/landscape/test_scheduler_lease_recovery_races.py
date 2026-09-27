@@ -66,6 +66,7 @@ layer.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -102,7 +103,13 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, on_fresh_database_second
+from tests.fixtures.landscape import (
+    assert_stamped_between,
+    expire_lease,
+    landscape_database_now,
+    lowered_sqlite_variable_limit,
+    on_fresh_database_second,
+)
 
 RUN_ID = "run-rc6-lease-races"
 _RECOVERY_TOKEN = CoordinationToken(run_id=RUN_ID, worker_id="sweeper", leader_epoch=2)
@@ -1344,3 +1351,117 @@ def test_crash_mid_sweep_rolls_back_atomically_and_repeat_sweep_completes(
         assert final_states[token_id]["lease_owner"] is None
         assert final_states[token_id]["work_item_id"] != originals[token_id].work_item_id
     assert _event_counts(engine)[SchedulerEventType.RECOVER_EXPIRED_LEASE.value] == 3
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# A lost owner can hold any number of leased items (a whole sink write's
+# pending-sink items), and a resume re-drives every undecided FAILED item, so
+# neither verb may bind a list that grows with the item count. These run on
+# SQLite connections that refuse a statement over 99 binds, with the shared
+# budget lowered to 60: 120 items bind at most 60 per chunked read and a fixed
+# count per executemany row.
+
+_BOUNDED_TOKENS = tuple(f"token-{index:03d}" for index in range(120))
+
+
+@pytest.fixture
+def bounded_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Tier1Engine]:
+    from elspeth.core.landscape import bind_budget
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    with lowered_sqlite_variable_limit(monkeypatch, 99):
+        url = f"sqlite:///{tmp_path / 'bounded.db'}"
+        raw = create_engine(url, echo=False)
+        LandscapeDB._configure_sqlite(raw)
+        LandscapeDB._verify_sqlite_pragmas(raw, url)
+        metadata.create_all(raw)
+        engine = Tier1Engine(raw)
+        # Control: this connection refuses a statement that binds one parameter per item.
+        with engine.connect() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.token_id.in_(_BOUNDED_TOKENS)))
+        try:
+            yield engine
+        finally:
+            raw.dispose()
+
+
+def _assert_rotated_to_ready(engine: Tier1Engine, originals: dict[str, TokenWorkItem]) -> None:
+    for token_id, original in originals.items():
+        row = _work_item_row(engine, token_id)
+        assert row["status"] == TokenWorkStatus.READY.value
+        assert row["attempt"] == original.attempt + 1
+        assert row["work_item_id"] == work_item_id(RUN_ID, token_id, "normalize", original.attempt + 1)
+        assert row["lease_owner"] is None
+
+
+def test_recovering_many_expired_leases_binds_a_bounded_count(bounded_engine: Tier1Engine) -> None:
+    scheduler = TokenSchedulerRepository(bounded_engine)
+    _seed_run_rows_tokens(bounded_engine, _BOUNDED_TOKENS, leader_worker_id="leader")
+    originals = _enqueue_tokens(scheduler, _BOUNDED_TOKENS)
+    _expire_leases(bounded_engine, scheduler, _BOUNDED_TOKENS)
+
+    recovered = scheduler.recover_expired_leases(
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1), stall_budget_seconds=0
+    )
+
+    assert recovered == len(_BOUNDED_TOKENS)
+    _assert_rotated_to_ready(bounded_engine, originals)
+    assert _event_counts(bounded_engine)[SchedulerEventType.RECOVER_EXPIRED_LEASE.value] == len(_BOUNDED_TOKENS)
+
+
+def test_requeueing_many_undecided_failed_items_binds_a_bounded_count(bounded_engine: Tier1Engine) -> None:
+    scheduler = TokenSchedulerRepository(bounded_engine)
+    _seed_run_rows_tokens(bounded_engine, _BOUNDED_TOKENS, leader_worker_id="leader")
+    originals = _enqueue_tokens(scheduler, _BOUNDED_TOKENS)
+    # A claim that raised out of its traversal leaves its item FAILED with its
+    # row payload kept; no token has an outcome, so every item is undecided.
+    with bounded_engine.begin() as conn:
+        conn.execute(
+            update(token_work_items_table).where(token_work_items_table.c.run_id == RUN_ID).values(status=TokenWorkStatus.FAILED.value)
+        )
+
+    requeued = scheduler.leases.requeue_undecided_failed_work(
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1)
+    )
+
+    assert requeued == len(_BOUNDED_TOKENS)
+    _assert_rotated_to_ready(bounded_engine, originals)
+    assert _event_counts(bounded_engine)[SchedulerEventType.RESUME_REQUEUE_FAILED.value] == len(_BOUNDED_TOKENS)
+
+
+def test_rechecking_many_raced_leases_binds_a_bounded_count(bounded_engine: Tier1Engine) -> None:
+    """Every expired item a peer re-leases between the sweep's read and its UPDATE is a miss the sweep re-reads in chunks."""
+    scheduler = TokenSchedulerRepository(bounded_engine)
+    _seed_run_rows_tokens(bounded_engine, _BOUNDED_TOKENS, leader_worker_id="leader")
+    originals = _enqueue_tokens(scheduler, _BOUNDED_TOKENS)
+    _expire_leases(bounded_engine, scheduler, _BOUNDED_TOKENS)
+    fresh_expires_at = landscape_database_now(bounded_engine) + timedelta(seconds=300)
+    raced: list[bool] = []
+
+    @event.listens_for(bounded_engine, "before_cursor_execute")
+    def peer_re_leases_every_item_before_the_update(
+        _conn: object, cursor: sqlite3.Cursor, statement: str, _parameters: object, _context: object, _executemany: bool
+    ) -> None:
+        if raced or not _is_token_work_items_update(statement):
+            return
+        raced.append(True)
+        cursor.execute(
+            "UPDATE token_work_items SET lease_owner = ?, lease_expires_at = ? WHERE run_id = ?",
+            ("peer-claimant", fresh_expires_at.isoformat(sep=" "), RUN_ID),
+        )
+
+    try:
+        recovered = scheduler.recover_expired_leases(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1), stall_budget_seconds=0
+        )
+    finally:
+        event.remove(bounded_engine, "before_cursor_execute", peer_re_leases_every_item_before_the_update)
+
+    assert raced == [True]
+    assert recovered == 0
+    for token_id, original in originals.items():
+        row = _work_item_row(bounded_engine, token_id)
+        assert row["status"] == TokenWorkStatus.LEASED.value
+        assert row["work_item_id"] == original.work_item_id
+        assert row["lease_owner"] == "peer-claimant"
+    assert SchedulerEventType.RECOVER_EXPIRED_LEASE.value not in _event_counts(bounded_engine)

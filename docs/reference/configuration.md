@@ -1484,6 +1484,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `batch_stats` | Compute statistics over a batch, optionally one row per `group_by` value |
 | `batch_replicate` | Batch deaggregation; configure as an aggregation with `output_mode: transform` |
 | `batch_distribution_profile` | Numeric-only batch distribution statistics; use `batch_top_k` for categorical counts/frequencies |
+| `batch_rank` | Add each row's rank and percentile of a numeric field within its batch, keeping every row; the batch plugin `output_mode: passthrough` accepts |
 | `report_assemble` | Assemble a batch of text rows into one report/text row with pagination metadata |
 | `web_scrape` | HTML content extraction with SSRF prevention |
 | `llm` | Unified LLM transform (azure/openrouter/bedrock providers, single/multi-query) |
@@ -2198,11 +2199,14 @@ trigger:
 
 `passthrough` carries only a plugin whose flush emits exactly one row per
 buffered row, in order (the plugin class declares
-`flush_emits_one_row_per_buffered_row`). No shipped batch plugin does: each
-one reduces the batch (`batch_stats`, `report_assemble`, …), replicates rows
-(`batch_replicate`) or skips rows (`batch_outlier_annotator` skips a null or
-non-finite value). `elspeth validate` and the composer therefore refuse every
-shipped batch plugin under `passthrough`, with "Use output_mode: transform".
+`flush_emits_one_row_per_buffered_row`). One shipped batch plugin does:
+`batch_rank`, which adds each row's rank and percentile within the batch and
+emits every buffered row, an unranked one (null or non-finite value) included
+([example](../../examples/batch_rank_passthrough/README.md)). Every other
+shipped batch plugin reduces the batch (`batch_stats`, `report_assemble`, …),
+replicates rows (`batch_replicate`) or skips rows (`batch_outlier_annotator`
+skips a null or non-finite value), so `elspeth validate` and the composer
+refuse it under `passthrough`, with "Use output_mode: transform".
 A plugin that declares the capability and then returns another shape is a
 plugin bug: every row of the batch is recorded failed and the run aborts
 (exit 4).

@@ -69,6 +69,14 @@ Tier1Engine = NewType("Tier1Engine", Engine)
 # lock at BEGIN.
 WRITE_INTENT_OPTION = "elspeth_write_intent"
 
+# Every Landscape engine withholds bound parameters from SQLAlchemy's error
+# text. Landscape statements bind row payloads, row-derived fields and token
+# ids; with parameters rendered, a database error's str() carried every bound
+# value of the failing statement (measured: a 4096-row batch release put
+# 450,969 characters, row JSON included, into operations.error_message), and
+# that text reaches exception chains, logs and any wrap that interpolates it.
+LANDSCAPE_HIDE_BOUND_PARAMETERS = True
+
 _JOURNAL_WORKER_SUFFIX_RE = re.compile(r"[0-9a-f]+")
 
 # Canonical SQLite PRAGMA invariants for the Landscape audit DB.
@@ -1064,6 +1072,7 @@ class LandscapeDB:
             self._engine = create_engine(
                 self.connection_string,
                 echo=False,  # Set True for SQL debugging
+                hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS,
                 **engine_kwargs,
             )
             # SQLite-specific configuration
@@ -1356,7 +1365,7 @@ class LandscapeDB:
             conn.execute(f'PRAGMA key = "{escaped}"')
             return conn
 
-        return create_engine("sqlite:///", creator=_creator, echo=False)
+        return create_engine("sqlite:///", creator=_creator, echo=False, hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS)
 
     def _create_tables(self) -> None:
         """Create all tables if they don't exist."""
@@ -1861,6 +1870,7 @@ class LandscapeDB:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
             echo=False,
+            hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS,
         )
         cls._configure_sqlite(engine)
         cls._verify_sqlite_pragmas(engine, "sqlite:///:memory:")
@@ -1955,7 +1965,7 @@ class LandscapeDB:
             engine = cls._create_sqlcipher_engine(url, passphrase, read_only=read_only)
         else:
             engine_url = cls._sqlite_read_only_url(url) if read_only and url.startswith("sqlite") else url
-            engine = create_engine(engine_url, echo=False, **engine_kwargs)
+            engine = create_engine(engine_url, echo=False, hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS, **engine_kwargs)
 
         try:
             # SQLite-specific configuration

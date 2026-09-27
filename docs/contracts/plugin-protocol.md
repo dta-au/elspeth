@@ -1592,8 +1592,10 @@ aggregations:
   `flush_emits_one_row_per_buffered_row = True`. The default (`False`, on
   `BaseTransform`) is refused by `elspeth validate` and by the web composer
   under `output_mode: passthrough`, with the remedy "Use output_mode:
-  transform"; every shipped batch plugin declares `False`, because each reduces,
-  replicates or skips rows. A plugin that declares `True` and then returns a
+  transform". One shipped batch plugin declares `True`: `batch_rank`, which
+  emits every buffered row with its rank annotations (an unranked row with a
+  null rank). Every other shipped batch plugin declares `False`, because each
+  reduces, replicates or skips rows. A plugin that declares `True` and then returns a
   different row count, a single-row result, or `quarantined_indices` is a
   plugin bug: every buffered token is recorded as a failure with
   `BatchPassthroughShapeError` evidence, then the run aborts.

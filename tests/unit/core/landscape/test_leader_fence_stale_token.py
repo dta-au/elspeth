@@ -1604,6 +1604,32 @@ class TestValidTokenFenceSemantics:
         )
         assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
 
+    def test_reset_adoption_marker_to_pending_counts_each_distinct_row_once(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The reset runs as one executemany (X1 fix round 2); its count is the distinct rows reset.
+
+        The IN-list form it replaced counted a repeated id once. A repeated id
+        in the executemany would match its BLOCKED row again, so the ids are
+        de-duplicated first.
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        blocked_ids = [self._adopt_blocked_row(db, repo, sequence=sequence, token=token) for sequence in (0, 1)]
+        terminal_token_id, terminal_work_item_id = self._adopt_blocked_row(db, repo, sequence=2, token=token)
+        with db.engine.begin() as conn:
+            conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == terminal_work_item_id)
+                .values(status=TokenWorkStatus.TERMINAL.value)
+            )
+
+        reset = repo.reset_adoption_marker_to_pending(
+            work_item_ids=[blocked_ids[0][1], terminal_work_item_id, blocked_ids[1][1], blocked_ids[0][1]],
+            coordination_token=token,
+        )
+
+        assert reset == 2
+        assert [_work_item_row(db, token_id)["barrier_adopted_epoch"] for token_id, _work_item_id in blocked_ids] == [None, None]
+        assert _work_item_row(db, terminal_token_id)["barrier_adopted_epoch"] == token.leader_epoch
+
     def test_reset_adoption_marker_to_pending_empty_ids_opens_no_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """No ids means no database effect, so the early return precedes the fence entirely.
 

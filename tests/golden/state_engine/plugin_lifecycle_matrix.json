@@ -1016,6 +1016,35 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "transform:batch_rank",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_rank",
+      "qualname": "BatchRank",
+      "source_path": "src/elspeth/plugins/transforms/batch_rank.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_rank:BatchRank",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_rank:BatchRank"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:batch_replicate",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.batch_replicate",

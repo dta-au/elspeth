@@ -73,8 +73,8 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 # Plugins whose config validation REJECTS the armed config below. Each rejection
 # is a fail-closed answer to an author error, not a coverage gap:
 #
-# * ``batch_outlier_annotator`` / ``batch_replicate`` forbid DECLARING the fields
-#   they add while the option that adds them is on — the strongest possible
+# * ``batch_outlier_annotator`` / ``batch_rank`` / ``batch_replicate`` forbid
+#   DECLARING the fields they add while the option that adds them is on — the strongest possible
 #   answer to this defect class, refusing the trap shape outright.
 # * ``json_explode`` / ``line_explode`` require their source column to appear in
 #   ``fields``, and a probe schema that declares none leaves the armed config
@@ -85,6 +85,7 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 _EXPECTED_ARMING_REJECTIONS = frozenset(
     {
         "batch_outlier_annotator",
+        "batch_rank",
         "batch_replicate",
         "json_explode",
         "line_explode",

@@ -412,12 +412,13 @@ drained and repair this release forward.
   is claimed quarantined. Every buffered row is recorded `failed` before the
   run ends.
 - **`output_mode: passthrough` admits only a batch plugin that emits one row
-  per buffered row; no shipped plugin does.** Every batch plugin now declares
+  per buffered row.** Every batch plugin now declares
   whether its flush emits exactly one row per buffered row
   (`flush_emits_one_row_per_buffered_row`), and `elspeth validate`, `elspeth
-  run` and the composer read that one declaration. None of the 13 shipped
-  batch plugins does: they reduce the batch, replicate rows (`batch_replicate`)
-  or skip rows (`batch_outlier_annotator` skips a null or non-finite value).
+  run` and the composer read that one declaration. None of the 13 existing
+  batch plugins does (the new `batch_rank`, below, does): they reduce the
+  batch, replicate rows (`batch_replicate`) or skip rows
+  (`batch_outlier_annotator` skips a null or non-finite value).
   So an aggregation of any of them under `output_mode: passthrough` is now
   refused at config with "Use output_mode: transform". Before, any batch
   plugin under `passthrough` passed `elspeth validate`. A flush that returned
@@ -489,6 +490,50 @@ drained and repair this release forward.
   `best_effort` and `first`, which can merge a single branch, are never
   refused. The composer cannot author this policy (its import is refused),
   so it has no second surface to agree with.
+- **New batch plugin `batch_rank`: rank rows within a batch and keep every
+  row.** It adds `<prefix>_rank`, `<prefix>_percentile`,
+  `<prefix>_ranked_count` and `<prefix>_batch_size` (default prefix `rank`)
+  to every buffered row, ranking a numeric `value_field` (`order:
+  descending|ascending`, `ties: competition|dense`), and emits exactly one row
+  per buffered row, in order. A null, absent or non-finite value keeps its row
+  with a null rank and percentile; a present text or boolean value fails the
+  whole batch (routed by `on_error`, value-free reason). It is the one shipped
+  batch plugin that declares `flush_emits_one_row_per_buffered_row`, so it
+  runs under `output_mode: passthrough`, where the same tokens continue
+  downstream, as well as under `transform`.
+  `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
+  shortlists the top two per prompt, and contrasts the lineage of the two
+  modes.
+- **A large aggregation batch, sink write or expansion no longer stops the
+  run on the database's bound-parameter limit.** Audit statements bound one
+  or more parameters per row: the barrier release of an aggregation batch,
+  the member locks and outcome checks of its result or failure verdict, the
+  read of one sink write's members, the read-back of a flush's or an
+  expansion's children, and, on recovery, lease rotation, the resume re-drive
+  of failed work and group-loss adoption. SQLite refuses a statement above
+  32,766 bound parameters and PostgreSQL above 65,535, so a large enough
+  batch stopped the run with exit 4 and left every buffered row with no
+  outcome: measured, a 2,730-row `batch_rank` passthrough batch, a
+  33,000-row `batch_stats` batch, and a plain 40,000-row source-to-sink run.
+  Every such statement now binds a fixed number of parameters, as chunked
+  reads or one executemany inside the same transaction; multi-row inserts
+  stay paged by SQLAlchemy below the driver's ceiling. Measured on SQLite: a
+  40,000-row `batch_stats` batch completes with every row recorded; the
+  largest insert page bound 11,000 parameters and the largest other
+  statement 903.
+- **A database error is recorded without its SQL or bound values.** The
+  audit trail recorded a failing statement's driver text as the operation's
+  error message, bound row payloads included (up to 450,969 characters for
+  one refused batch release). Landscape connections no longer render bound
+  parameters into error text, and the audit trail records a database error
+  by its type name.
+- **Known limit: one local-file sink write of more than about 12,600 rows
+  still stops the run.** The json, csv, text and document sinks record every
+  row's ordinal in the write's recovery evidence, which is capped at 64 KiB,
+  so a single write that large fails with `safe_evidence canonical JSON
+  exceeds the 64 KiB limit` and leaves its rows with no outcome (measured: a plain
+  15,000-row run on release/0.8.1). Aggregation batches that emit a summary
+  row are not affected.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
@@ -828,19 +873,20 @@ These ran and delivered rows before:
   sources, because the engine checks every mapping source before the
   mapping runs. Remove the key.
 
-These already failed and are now refused earlier or routed, with no loss:
+These already failed, or recorded a false type, and are now refused earlier
+or routed, with no loss:
 `output_mode: passthrough` over a flush that did not return one row per
-buffered row (ended the run with the batch's rows left without an outcome);
-a `value_transform` target
-spelled exactly as the header of the field it would overwrite (crashed with
-`Duplicate original_name`, leaving the row without an outcome); a
-`union_collision_policy: fail` coalesce whose branches all guarantee a shared
-field (ended the run with exit 4 at the first row). Each of
-these failed every row: a template number literal that overflows to
-infinity; a `truncate` length shorter than its ending; a `<response>_usage`
-schema type other than `any`; a header-spelled scan field over a non-string
-column; and in a RAG `query_template`, a dynamic `row[...]` key or a
-top-level name other than `query` or `row`. A header-spelled `web_scrape`
+buffered row — every batch plugin but the new `batch_rank` (ended the run with
+the batch's rows left without an outcome); a `value_transform` or
+`field_mapper` target spelled as the header of the field it would overwrite
+(crashed with `Duplicate original_name` or recorded a false type, leaving the
+row without an outcome); a `union_collision_policy: fail` coalesce whose
+branches all guarantee a shared field (ended the run with exit 4 at the first
+row). Each of these failed every row: a template number literal that
+overflows to infinity; a `truncate` length shorter than its ending; a
+`<response>_usage` schema type other than `any`; a header-spelled scan field
+over a non-string column; and in a RAG `query_template`, a dynamic `row[...]`
+key or a top-level name other than `query` or `row`. A header-spelled `web_scrape`
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).

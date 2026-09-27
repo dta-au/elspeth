@@ -13,8 +13,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import bindparam, func, select, update
 from sqlalchemy.engine import Connection, RowMapping
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
@@ -30,9 +31,11 @@ from elspeth.contracts.scheduler import (
     TokenWorkItem,
     TokenWorkStatus,
 )
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcomes_guarded
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventRecord, SchedulerEventStore
@@ -54,6 +57,13 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+
+# No statement here may bind a list that grows with the batch: one barrier
+# releases a whole aggregation batch or coalesce group, whose size the operator
+# configures (a batch plugin may admit 4096 rows; batch_stats has no cap). The
+# per-token UPDATEs run as one executemany of a fixed-size statement; the
+# per-token IN reads run in ascending chunks of the shared Landscape bind budget
+# (core/landscape/bind_budget.py).
 
 
 @dataclass(frozen=True)
@@ -288,12 +298,19 @@ class BarrierJournalRepository:
             # decided on the same clock.
             database_now = read_landscape_transaction_time(conn)
             if terminal_outcome_token_ids:
-                locked_tokens = conn.execute(
-                    select(tokens_table.c.token_id, tokens_table.c.run_id)
-                    .where(tokens_table.c.token_id.in_(sorted(terminal_outcome_token_ids)))
-                    .order_by(tokens_table.c.token_id)
-                    .with_for_update(of=tokens_table)
-                ).all()
+                sorted_terminal_token_ids = sorted(terminal_outcome_token_ids)
+                # Ascending chunks keep the global tokens.token_id lock order:
+                # every id in chunk N sorts before every id in chunk N+1.
+                locked_tokens = [
+                    row
+                    for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1)
+                    for row in conn.execute(
+                        select(tokens_table.c.token_id, tokens_table.c.run_id)
+                        .where(tokens_table.c.token_id.in_(chunk))
+                        .order_by(tokens_table.c.token_id)
+                        .with_for_update(of=tokens_table)
+                    ).all()
+                ]
                 if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {
                     (token_id, run_id) for token_id in terminal_outcome_token_ids
                 }:
@@ -301,12 +318,16 @@ class BarrierJournalRepository:
                         f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
                         "received a terminal outcome for a missing or foreign token."
                     )
-                existing_terminal_rows = conn.execute(
-                    select(token_outcomes_table.c.token_id)
-                    .where(token_outcomes_table.c.run_id == coordination_token.run_id)
-                    .where(token_outcomes_table.c.token_id.in_(terminal_outcome_token_ids))
-                    .where(token_outcomes_table.c.completed == 1)
-                ).all()
+                existing_terminal_rows = [
+                    row
+                    for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1)
+                    for row in conn.execute(
+                        select(token_outcomes_table.c.token_id)
+                        .where(token_outcomes_table.c.run_id == coordination_token.run_id)
+                        .where(token_outcomes_table.c.token_id.in_(chunk))
+                        .where(token_outcomes_table.c.completed == 1)
+                    ).all()
+                ]
                 if existing_terminal_rows:
                     raise AuditIntegrityError(
                         f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
@@ -358,13 +379,17 @@ class BarrierJournalRepository:
                         # durably BLOCKED under this barrier_key but in a DIFFERENT
                         # row group is a cross-group mis-inclusion by the flush
                         # caller — name it precisely, never silently intersect.
-                        cross_group_rows = conn.execute(
-                            select(token_work_items_table.c.token_id, token_work_items_table.c.row_id)
-                            .where(token_work_items_table.c.run_id == coordination_token.run_id)
-                            .where(token_work_items_table.c.barrier_key == barrier_key)
-                            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
-                            .where(token_work_items_table.c.token_id.in_(sorted(unknown_snapshot_token_ids)))
-                        ).all()
+                        cross_group_rows = [
+                            row
+                            for chunk in bind_budget_chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1)
+                            for row in conn.execute(
+                                select(token_work_items_table.c.token_id, token_work_items_table.c.row_id)
+                                .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                                .where(token_work_items_table.c.barrier_key == barrier_key)
+                                .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+                                .where(token_work_items_table.c.token_id.in_(chunk))
+                            ).all()
+                        ]
                         cross_group = {row.token_id: row.row_id for row in cross_group_rows if row.row_id != scope_row_id}
                         if cross_group:
                             raise AuditIntegrityError(
@@ -516,27 +541,32 @@ class BarrierJournalRepository:
         )
         if not candidate_rows:
             return 0
-        changed_ids = frozenset(
-            conn.execute(
-                update(token_work_items_table)
-                .where(token_work_items_table.c.work_item_id.in_(tuple(row["work_item_id"] for row in candidate_rows)))
-                .where(token_work_items_table.c.run_id == run_id)
-                .where(token_work_items_table.c.barrier_key == barrier_key)
-                .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
-                .where(token_work_items_table.c.token_id.in_(consumed))
-                .values(
-                    status=TokenWorkStatus.TERMINAL.value,
-                    row_payload_json=scrubbed_row_payload_json(barrier_key),
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=database_now,
-                )
-                .returning(token_work_items_table.c.work_item_id)
+        # One statement per row, executed as one executemany: its bind count
+        # does not grow with the batch (see core/landscape/bind_budget.py), and
+        # both dialects report the summed rowcount (supports_sane_multi_rowcount).
+        terminalized = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == bindparam("b_work_item_id"))
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.barrier_key == barrier_key)
+            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+            .where(token_work_items_table.c.token_id == bindparam("b_token_id"))
+            .values(
+                status=TokenWorkStatus.TERMINAL.value,
+                row_payload_json=scrubbed_row_payload_json(barrier_key),
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=database_now,
+            ),
+            [{"b_work_item_id": row["work_item_id"], "b_token_id": row["token_id"]} for row in candidate_rows],
+        ).rowcount
+        # Every candidate row changes, one per consumed token; anything else
+        # rolls the whole completion back before an event is written.
+        if terminalized != len(consumed_set) or terminalized != len(candidate_rows):
+            raise AuditIntegrityError(
+                f"Scheduler barrier terminalization mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: "
+                f"live consumed {len(consumed_set)} token(s), but durable scheduler terminalized {terminalized}."
             )
-            .scalars()
-            .all()
-        )
-        terminalized = len(changed_ids)
         self._events.record_many(
             conn,
             records=[
@@ -558,14 +588,8 @@ class BarrierJournalRepository:
                     context=terminal_event_context,
                 )
                 for row in candidate_rows
-                if row["work_item_id"] in changed_ids
             ],
         )
-        if consumed_set and terminalized != len(consumed_set):
-            raise AuditIntegrityError(
-                f"Scheduler barrier terminalization mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: "
-                f"live consumed {len(consumed_set)} token(s), but durable scheduler terminalized {terminalized}."
-            )
         return terminalized
 
     def _transition_passthrough_pending_sink(
@@ -591,51 +615,61 @@ class BarrierJournalRepository:
         if not emission_by_token:
             return
         candidates = [row for row in blocked_rows if row["token_id"] in emission_by_token]
-        changed_ids = frozenset(
-            conn.execute(
-                update(token_work_items_table)
-                .where(token_work_items_table.c.work_item_id.in_(tuple(row["work_item_id"] for row in candidates)))
-                .where(token_work_items_table.c.run_id == run_id)
-                .where(
-                    token_work_items_table.c.token_id
-                    == case({row["work_item_id"]: row["token_id"] for row in candidates}, value=token_work_items_table.c.work_item_id)
-                )
-                .where(token_work_items_table.c.barrier_key == barrier_key)
-                .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
-                .values(
-                    status=TokenWorkStatus.PENDING_SINK.value,
-                    row_payload_json=case(
-                        {emission.token_id: emission.row_payload_json for emission in passthrough_emissions},
-                        value=token_work_items_table.c.token_id,
-                    ),
-                    pending_sink_name=case(
-                        {emission.token_id: emission.sink_name for emission in passthrough_emissions},
-                        value=token_work_items_table.c.token_id,
-                    ),
-                    pending_outcome=case(
-                        {emission.token_id: emission.outcome for emission in passthrough_emissions}, value=token_work_items_table.c.token_id
-                    ),
-                    pending_path=case(
-                        {emission.token_id: emission.path for emission in passthrough_emissions}, value=token_work_items_table.c.token_id
-                    ),
-                    pending_error_hash=case(
-                        {emission.token_id: emission.error_hash for emission in passthrough_emissions},
-                        value=token_work_items_table.c.token_id,
-                    ),
-                    pending_error_message=case(
-                        {emission.token_id: emission.error_message for emission in passthrough_emissions},
-                        value=token_work_items_table.c.token_id,
-                    ),
-                    lease_owner=parked_lease_owner,
-                    lease_expires_at=None,
-                    updated_at=database_now,
-                )
-                .returning(token_work_items_table.c.work_item_id)
+        # One statement per row, executed as one executemany: its bind count
+        # does not grow with the batch (see core/landscape/bind_budget.py), and
+        # both dialects report the summed rowcount (supports_sane_multi_rowcount).
+        handoff = (
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == bindparam("b_work_item_id"))
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.token_id == bindparam("b_token_id"))
+            .where(token_work_items_table.c.barrier_key == barrier_key)
+            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+            .values(
+                status=TokenWorkStatus.PENDING_SINK.value,
+                row_payload_json=bindparam("b_row_payload_json"),
+                pending_sink_name=bindparam("b_sink_name"),
+                pending_outcome=bindparam("b_outcome"),
+                pending_path=bindparam("b_path"),
+                pending_error_hash=bindparam("b_error_hash"),
+                pending_error_message=bindparam("b_error_message"),
+                lease_owner=parked_lease_owner,
+                lease_expires_at=None,
+                updated_at=database_now,
             )
-            .scalars()
-            .all()
         )
-        transitioned = len(changed_ids)
+        try:
+            transitioned = conn.execute(
+                handoff,
+                [
+                    {
+                        "b_work_item_id": row["work_item_id"],
+                        "b_token_id": row["token_id"],
+                        "b_row_payload_json": emission_by_token[row["token_id"]].row_payload_json,
+                        "b_sink_name": emission_by_token[row["token_id"]].sink_name,
+                        "b_outcome": emission_by_token[row["token_id"]].outcome,
+                        "b_path": emission_by_token[row["token_id"]].path,
+                        "b_error_hash": emission_by_token[row["token_id"]].error_hash,
+                        "b_error_message": emission_by_token[row["token_id"]].error_message,
+                    }
+                    for row in candidates
+                ],
+            ).rowcount
+        except SQLAlchemyError as exc:
+            # The statement binds each token's live row payload; the driver's
+            # text would carry those values into the operation's audit error
+            # message. Same value-free wrap as insert_work_items and
+            # SchedulerEventStore.record_many.
+            raise LandscapeRecordError(
+                f"Scheduler barrier pending-sink handoff for barrier_key={barrier_key!r} failed; database rejected audit write"
+            ) from exc
+        # complete_barrier admitted exactly one BLOCKED row per handed-off token, so
+        # an exact count means every candidate changed; anything else rolls back.
+        if transitioned != len(emission_by_token):
+            raise AuditIntegrityError(
+                f"Scheduler barrier pending-sink handoff mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: "
+                f"requested {len(emission_by_token)} token(s), transitioned {transitioned}."
+            )
         self._events.record_many(
             conn,
             records=[
@@ -657,14 +691,8 @@ class BarrierJournalRepository:
                     context=emission_context,
                 )
                 for row in candidates
-                if row["work_item_id"] in changed_ids
             ],
         )
-        if transitioned != len(emission_by_token):
-            raise AuditIntegrityError(
-                f"Scheduler barrier pending-sink handoff mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: "
-                f"requested {len(emission_by_token)} token(s), transitioned {transitioned}."
-            )
 
     def _prepare_fresh_pending_sink_emission(
         self,
@@ -1232,11 +1260,15 @@ class BarrierJournalRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="reset_adoption_marker_to_pending",
         ) as conn:
+            # One executemany over the distinct ids (an IN list would grow with
+            # the coalesce's pending groups); the summed rowcount counts each
+            # distinct reset row once, as the IN form did.
             result = conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.run_id == coordination_token.run_id)
-                .where(token_work_items_table.c.work_item_id.in_(list(work_item_ids)))
+                .where(token_work_items_table.c.work_item_id == bindparam("b_work_item_id"))
                 .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
-                .values(barrier_adopted_epoch=None)
+                .values(barrier_adopted_epoch=None),
+                [{"b_work_item_id": work_item_id} for work_item_id in dict.fromkeys(work_item_ids)],
             )
         return result.rowcount

@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.operations import track_operation
 from tests.fixtures.factories import make_context
@@ -165,6 +168,50 @@ def test_track_operation_marks_failed_for_exception() -> None:
     assert factory.complete_calls[0]["status"] == "failed"
     assert factory.complete_calls[0]["error"] == "boom"
     assert ctx.operation_id is None
+
+
+def test_track_operation_records_a_database_error_without_its_bound_values_or_sql() -> None:
+    """A failed Landscape statement leaves only its error type in ``operations.error_message``.
+
+    A database error's text is the failing statement's SQL plus, unless the
+    engine hides them, every bound value: a 4,096-row batch release once put
+    450,969 characters of row JSON into ``operations.error_message``. Landscape
+    engines withhold bound parameters, and the audit renderer records a
+    database error by its type name.
+    """
+    sentinel = "row-value-sentinel-4b1d"
+    statement = text("SELECT :value FROM table_that_does_not_exist")
+
+    # Control: an engine that renders bound parameters puts the value in the error text.
+    plain_engine = create_engine("sqlite://")
+    try:
+        with plain_engine.connect() as conn, pytest.raises(OperationalError) as rendered:
+            conn.execute(statement, {"value": sentinel})
+    finally:
+        plain_engine.dispose()
+    assert sentinel in str(rendered.value)
+
+    factory = _FakeFactory()
+    db = LandscapeDB.in_memory()
+    try:
+        with (
+            pytest.raises(OperationalError) as raised,
+            track_operation(
+                recorder=cast(ExecutionRepository, factory),
+                run_id="run-001",
+                node_id="node-001",
+                operation_type="source_load",
+                ctx=make_context(run_id="run-001"),
+            ),
+            db.connection() as conn,
+        ):
+            conn.execute(statement, {"value": sentinel})
+    finally:
+        db.close()
+
+    assert sentinel not in str(raised.value)
+    assert factory.complete_calls[0]["status"] == "failed"
+    assert factory.complete_calls[0]["error"] == "OperationalError"
 
 
 def test_track_operation_marks_failed_for_base_exception() -> None:

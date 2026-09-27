@@ -491,7 +491,7 @@ Current plugin families include:
 | Sources and sinks | CSV, JSON, text, null, Azure Blob, AWS S3, Dataverse, database, Chroma, local file outputs |
 | Row transforms | Field mapping, type coercion, value transforms, keyword filtering, truncation, line/json expansion, report assembly |
 | LLM, safety, and document ingestion | Regular `llm` transform with Azure OpenAI, OpenRouter, AWS Bedrock, and gateway provider support, multi-query and provider pooling, RAG retrieval, Azure Content Safety, Prompt Shield, AWS Bedrock content safety and prompt shield, Azure Document Intelligence extraction, AWS Textract document analysis, `blob_fetch`, `blob_csv_expand` |
-| Batch analytics | `batch_distribution_profile`, `batch_experiment_compare`, `batch_classifier_metrics`, `batch_paired_preference`, `batch_drift_compare`, `batch_outlier_annotator`, `batch_data_quality_report`, `batch_top_k`, `batch_threshold_summary`, `batch_effect_size` |
+| Batch analytics | `batch_distribution_profile`, `batch_experiment_compare`, `batch_classifier_metrics`, `batch_paired_preference`, `batch_drift_compare`, `batch_outlier_annotator`, `batch_rank`, `batch_data_quality_report`, `batch_top_k`, `batch_threshold_summary`, `batch_effect_size` |
 
 The old batch-specific LLM transforms, `azure_batch_llm` and
 `openrouter_batch_llm`, were retired. Use the regular `llm` transform with

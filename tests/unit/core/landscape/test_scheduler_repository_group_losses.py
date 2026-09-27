@@ -18,7 +18,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -37,7 +38,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, lowered_sqlite_variable_limit, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-group-loss-1"
@@ -307,3 +308,44 @@ def test_mark_failed_records_every_staged_group_loss_in_one_transaction(seeded_c
         ("page_stitcher", "eg_outer", claimed.token_id),
     }
     assert all(loss.recorded_by for loss in ledger)
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# One batch may name every lost member of an expansion, and a resume adopts
+# every recorded loss of the run, so neither statement may bind a list that
+# grows with the loss count. SQLite here refuses a statement over 99 binds,
+# with the shared budget lowered to 60.
+
+
+def test_recording_and_adopting_many_group_losses_binds_a_bounded_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape import bind_budget
+    from elspeth.core.landscape.scheduler.group_losses import record_group_losses
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    members = 120
+    with lowered_sqlite_variable_limit(monkeypatch, 99):
+        db = make_landscape_db()
+        _seed_run_and_nodes(db)
+        for index in range(members):
+            _seed_row_and_token(db, row_id=f"row-{index}", token_id=f"tok_{index}", source_row_index=index)
+        seat = register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
+        # Control: this connection refuses a statement that binds one parameter per member.
+        with db.engine.connect() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.token_id.in_([f"tok_{index}" for index in range(members)])))
+
+        with db.engine.begin() as conn:
+            recorded = record_group_losses(
+                conn,
+                run_id=RUN_ID,
+                specs=[_spec(member_key=f"member_{index:03d}", token_id=f"tok_{index}") for index in range(members)],
+                recorded_by="w1",
+                now=_NOW,
+            )
+        repo = GroupLossRepository(db.engine)
+        unadopted = repo.list_unadopted_group_losses(run_id=RUN_ID)
+        adopted = repo.adopt_group_losses(loss_ids=[loss.loss_id for loss in unadopted], coordination_token=seat)
+
+        assert recorded == members
+        assert len(unadopted) == members
+        assert adopted == members
+        assert repo.list_unadopted_group_losses(run_id=RUN_ID) == []
