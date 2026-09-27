@@ -23,6 +23,8 @@ from typing import Any
 import pytest
 from sqlalchemy import event, insert, select
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
+from sqlalchemy.engine import Engine, ExecutionContext
+from sqlalchemy.engine.interfaces import ExecuteStyle
 from sqlalchemy.pool import Pool
 
 from elspeth.contracts import NodeType
@@ -116,6 +118,50 @@ def lowered_sqlite_variable_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -
         yield
     finally:
         event.remove(Pool, "connect", _lower)
+
+
+@dataclass
+class StatementBinds:
+    """The most parameters one statement execution bound inside ``record_statement_binds``."""
+
+    max_binds: int = 0
+    statement: str = ""
+    executions: int = 0
+
+
+@contextmanager
+def record_statement_binds() -> Iterator[StatementBinds]:
+    """Record the largest bind count of any one statement execution, on every engine, inside the block.
+
+    The dialect-agnostic half of the bind-budget proof: SQLite's ceiling can be
+    lowered (``lowered_sqlite_variable_limit``), PostgreSQL's cannot, so a test
+    asserts on the count recorded here instead. An ``executemany`` counts one
+    row's parameter set (its statement is fixed-size). A SQLAlchemy
+    insertmanyvalues page is not counted: the driver pages it by the dialect's
+    own ceiling, so it cannot outgrow the database. ``executions`` counts the
+    recorded executions, so a caller can prove the listener fired.
+    """
+    seen = StatementBinds()
+
+    def _record(
+        _conn: object, _cursor: object, statement: str, parameters: Any, context: ExecutionContext | None, executemany: bool
+    ) -> None:
+        if context is not None and context.execute_style is ExecuteStyle.INSERTMANYVALUES:
+            return
+        if executemany:
+            binds = max((len(row) for row in parameters), default=0)
+        else:
+            binds = 0 if parameters is None else len(parameters)
+        seen.executions += 1
+        if binds > seen.max_binds:
+            seen.max_binds = binds
+            seen.statement = " ".join(statement.split())[:300]
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
 
 
 def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) -> datetime:

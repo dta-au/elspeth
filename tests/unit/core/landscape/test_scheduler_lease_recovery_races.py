@@ -66,6 +66,7 @@ layer.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1426,3 +1427,41 @@ def test_requeueing_many_undecided_failed_items_binds_a_bounded_count(bounded_en
     assert requeued == len(_BOUNDED_TOKENS)
     _assert_rotated_to_ready(bounded_engine, originals)
     assert _event_counts(bounded_engine)[SchedulerEventType.RESUME_REQUEUE_FAILED.value] == len(_BOUNDED_TOKENS)
+
+
+def test_rechecking_many_raced_leases_binds_a_bounded_count(bounded_engine: Tier1Engine) -> None:
+    """Every expired item a peer re-leases between the sweep's read and its UPDATE is a miss the sweep re-reads in chunks."""
+    scheduler = TokenSchedulerRepository(bounded_engine)
+    _seed_run_rows_tokens(bounded_engine, _BOUNDED_TOKENS, leader_worker_id="leader")
+    originals = _enqueue_tokens(scheduler, _BOUNDED_TOKENS)
+    _expire_leases(bounded_engine, scheduler, _BOUNDED_TOKENS)
+    fresh_expires_at = landscape_database_now(bounded_engine) + timedelta(seconds=300)
+    raced: list[bool] = []
+
+    @event.listens_for(bounded_engine, "before_cursor_execute")
+    def peer_re_leases_every_item_before_the_update(
+        _conn: object, cursor: sqlite3.Cursor, statement: str, _parameters: object, _context: object, _executemany: bool
+    ) -> None:
+        if raced or not _is_token_work_items_update(statement):
+            return
+        raced.append(True)
+        cursor.execute(
+            "UPDATE token_work_items SET lease_owner = ?, lease_expires_at = ? WHERE run_id = ?",
+            ("peer-claimant", fresh_expires_at.isoformat(sep=" "), RUN_ID),
+        )
+
+    try:
+        recovered = scheduler.recover_expired_leases(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1), stall_budget_seconds=0
+        )
+    finally:
+        event.remove(bounded_engine, "before_cursor_execute", peer_re_leases_every_item_before_the_update)
+
+    assert raced == [True]
+    assert recovered == 0
+    for token_id, original in originals.items():
+        row = _work_item_row(bounded_engine, token_id)
+        assert row["status"] == TokenWorkStatus.LEASED.value
+        assert row["work_item_id"] == original.work_item_id
+        assert row["lease_owner"] == "peer-claimant"
+    assert SchedulerEventType.RECOVER_EXPIRED_LEASE.value not in _event_counts(bounded_engine)

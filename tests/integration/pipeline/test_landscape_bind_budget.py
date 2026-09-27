@@ -14,8 +14,8 @@ These runs lower SQLite's variable ceiling to 999 on every connection
 SQLite itself refuses any statement that binds one parameter per row. Every
 case is a real ``elspeth run --execute`` (the in-process CLI) with the built-in
 plugins. ``tests/testcontainer/core/test_landscape_bind_budget_postgres.py``
-runs the same cases on PostgreSQL with the shared budget lowered, so every
-chunked read and executemany runs in several chunks there.
+runs the same cases on PostgreSQL, whose ceiling cannot be lowered, and
+asserts instead on the most parameters any one statement bound during the run.
 """
 
 from __future__ import annotations
