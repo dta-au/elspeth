@@ -1396,12 +1396,12 @@ def test_complete_barrier_passthrough_handoff_fits_the_historical_sqlite_variabl
 
 def test_complete_barrier_consumed_batch_with_outcomes_is_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
     """The lock read and the duplicate-outcome read run in budget-sized chunks; the terminalize UPDATE is one executemany."""
-    from elspeth.core.landscape.scheduler import barrier as barrier_module
+    from elspeth.core.landscape import bind_budget
 
     # Budget 60 under a 99-bind connection: 120 consumed tokens bind 120 (lock
     # read) and 120 (duplicate check) parameters unchunked, and the pre-fix
     # terminalize UPDATE bound 240.
-    monkeypatch.setattr(barrier_module, "_BIND_BUDGET_PER_STATEMENT", 60)
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
     engine, repo = _make_bounded_repo(variable_limit=99)
     token_ids, _payload = _seed_blocked(engine, repo, count=120)
 
@@ -1520,9 +1520,9 @@ def test_complete_barrier_passthrough_handoff_failure_is_value_free() -> None:
 
 def test_complete_barrier_cross_group_snapshot_read_is_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
     """The §E.3 cross-group read over a large unknown snapshot still names the mis-included token."""
-    from elspeth.core.landscape.scheduler import barrier as barrier_module
+    from elspeth.core.landscape import bind_budget
 
-    monkeypatch.setattr(barrier_module, "_BIND_BUDGET_PER_STATEMENT", 60)
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
     engine, repo = _make_bounded_repo(variable_limit=99)
     _seed_two_coalesce_groups(engine, repo)
     # 120 snapshot ids the journal does not hold, plus t2a from the sibling group:

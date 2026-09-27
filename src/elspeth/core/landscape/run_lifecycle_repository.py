@@ -515,7 +515,7 @@ class RunLifecycleRepository:
             # Preserve the pre-epoch-21 error contract: begin_run surfaced
             # constraint violations (e.g. duplicate run_id) as
             # LandscapeRecordError via DatabaseOps.execute_insert.
-            raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}: {exc}") from exc
+            raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}") from exc
 
         return run
 

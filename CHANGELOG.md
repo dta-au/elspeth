@@ -370,15 +370,34 @@ drained and repair this release forward.
   `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
   shortlists the top two per prompt, and contrasts the lineage of the two
   modes.
-- **Releasing a large aggregation batch no longer stops the run.** The
-  release wrote every buffered row in one statement with several bound
-  parameters per row, so SQLite (32,766 bound parameters) refused a large
-  batch: measured, 2,730 rows under `output_mode: passthrough` and 20,000
-  under `transform` stopped the run with exit 4, and passthrough left every
-  buffered row with no outcome and recorded the driver's error text, bound
-  row payloads included, as the operation's audit error message. The release
-  now runs in bounded statements inside the same transaction, and a refused
-  passthrough hand-off is recorded without the bound values.
+- **A large aggregation batch, sink write or expansion no longer stops the
+  run on the database's bound-parameter limit.** Audit statements bound one
+  or more parameters per row: the barrier release of an aggregation batch,
+  the member locks and outcome checks of its result or failure verdict, the
+  read of one sink write's members, the read-back of a flush's or an
+  expansion's children, and, on recovery, lease rotation, the resume re-drive
+  of failed work and group-loss adoption. SQLite refuses a statement above
+  32,766 bound parameters and PostgreSQL above 65,535, so a large enough
+  batch stopped the run with exit 4 and left every buffered row with no
+  outcome: measured, a 2,730-row `batch_rank` passthrough batch, a
+  33,000-row `batch_stats` batch, and a plain 40,000-row source-to-sink run.
+  Every such statement now binds a fixed number of parameters, as chunked
+  reads or one executemany inside the same transaction. Measured on SQLite:
+  a 40,000-row `batch_stats` batch completes with every row recorded, and no
+  statement bound more than 903 parameters.
+- **A database error is recorded without its SQL or bound values.** The
+  audit trail recorded a failing statement's driver text as the operation's
+  error message, bound row payloads included (up to 450,969 characters for
+  one refused batch release). Landscape connections no longer render bound
+  parameters into error text, and the audit trail records a database error
+  by its type name.
+- **Known limit: one local-file sink write of more than about 12,600 rows
+  still stops the run.** The json, csv, text and document sinks record every
+  row's ordinal in the write's recovery evidence, which is capped at 64 KiB,
+  so a single write that large fails with `safe_evidence canonical JSON
+  exceeds the 64 KiB limit` and leaves its rows with no outcome (measured: a plain
+  15,000-row run on release/0.8.1). Aggregation batches that emit a summary
+  row are not affected.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

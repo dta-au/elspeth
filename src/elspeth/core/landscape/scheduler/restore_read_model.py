@@ -49,6 +49,7 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids, recorded_failure_verdict_condition
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.collector_group_failure_holds import RecordedCollectorGroupFailureHold, parse_collector_group_failure_hold
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
 from elspeth.core.landscape.schema import (
@@ -804,15 +805,20 @@ class BarrierRestoreReadModel:
         """
         if not token_ids:
             return frozenset()
-        query = (
-            select(token_outcomes_table.c.token_id)
-            .where(token_outcomes_table.c.run_id == run_id)
-            .where(token_outcomes_table.c.token_id.in_(tuple(token_ids)))
-            .where(token_outcomes_table.c.completed == 1)
-            .where(token_outcomes_table.c.outcome == TerminalOutcome.FAILURE.value)
-            .where(token_outcomes_table.c.path == TerminalPath.UNROUTED.value)
+        # A barrier's member set has no row cap: the read runs in chunks of the
+        # shared bind budget through one read snapshot.
+        chunk_rows = self._ops.execute_fetchall_many(
+            [
+                select(token_outcomes_table.c.token_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.token_id.in_(chunk))
+                .where(token_outcomes_table.c.completed == 1)
+                .where(token_outcomes_table.c.outcome == TerminalOutcome.FAILURE.value)
+                .where(token_outcomes_table.c.path == TerminalPath.UNROUTED.value)
+                for chunk in bind_budget_chunks(tuple(token_ids))
+            ]
         )
-        return frozenset(row.token_id for row in self._ops.execute_fetchall(query))
+        return frozenset(row.token_id for rows in chunk_rows for row in rows)
 
     def get_committed_coalesce_residual(
         self,
@@ -1512,7 +1518,15 @@ class BarrierRestoreReadModel:
                 )
                 .where(transform_errors_table.c.run_id == run_id)
                 .where(transform_errors_table.c.transform_id == aggregation_node_id)
-                .where(transform_errors_table.c.token_id.in_(member_ids))
+                # A batch has no row cap: select its members with a subquery
+                # over the recorded membership instead of binding each id.
+                .where(
+                    transform_errors_table.c.token_id.in_(
+                        select(batch_members_table.c.token_id)
+                        .where(batch_members_table.c.batch_id == batch_id)
+                        .where(batch_members_table.c.run_id == run_id)
+                    )
+                )
             )
             if sorted(str(row.token_id) for row in error_rows) != sorted(member_ids):
                 raise AuditIntegrityError(

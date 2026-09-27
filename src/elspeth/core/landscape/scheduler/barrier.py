@@ -9,7 +9,7 @@ and the barrier-hold read surface. Extracted from
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -31,6 +31,7 @@ from elspeth.contracts.scheduler import (
     TokenWorkItem,
     TokenWorkStatus,
 )
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcomes_guarded
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -57,25 +58,12 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 
-# Bound-parameter budget per statement. One barrier releases a whole
-# aggregation batch or coalesce group, whose size the operator configures (a
-# batch plugin may admit 4096 rows; batch_stats has no cap). SQLite refuses a
-# statement above SQLITE_MAX_VARIABLE_NUMBER (historical default 999, 32766
-# since 3.32) and PostgreSQL's extended protocol carries a 16-bit bind count,
-# so no statement here may bind a list that grows with the batch. The
+# No statement here may bind a list that grows with the batch: one barrier
+# releases a whole aggregation batch or coalesce group, whose size the operator
+# configures (a batch plugin may admit 4096 rows; batch_stats has no cap). The
 # per-token UPDATEs run as one executemany of a fixed-size statement; the
-# per-token IN reads run in ascending chunks whose binds fit this budget,
-# leaving headroom under 999 for the fixed predicates (the node_states.py /
-# read_model.py convention). Every chunk runs on the caller's one connection
-# and transaction, so chunking changes no atomicity.
-_BIND_BUDGET_PER_STATEMENT = 900
-
-
-def _chunks[ItemT](items: Sequence[ItemT], *, binds_per_item: int) -> Iterator[Sequence[ItemT]]:
-    """Split ``items`` in order so ``binds_per_item`` binds each fit the statement budget."""
-    size = _BIND_BUDGET_PER_STATEMENT // binds_per_item
-    for offset in range(0, len(items), size):
-        yield items[offset : offset + size]
+# per-token IN reads run in ascending chunks of the shared Landscape bind budget
+# (core/landscape/bind_budget.py).
 
 
 @dataclass(frozen=True)
@@ -315,7 +303,7 @@ class BarrierJournalRepository:
                 # every id in chunk N sorts before every id in chunk N+1.
                 locked_tokens = [
                     row
-                    for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1)
+                    for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1)
                     for row in conn.execute(
                         select(tokens_table.c.token_id, tokens_table.c.run_id)
                         .where(tokens_table.c.token_id.in_(chunk))
@@ -332,7 +320,7 @@ class BarrierJournalRepository:
                     )
                 existing_terminal_rows = [
                     row
-                    for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1)
+                    for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1)
                     for row in conn.execute(
                         select(token_outcomes_table.c.token_id)
                         .where(token_outcomes_table.c.run_id == coordination_token.run_id)
@@ -393,7 +381,7 @@ class BarrierJournalRepository:
                         # caller — name it precisely, never silently intersect.
                         cross_group_rows = [
                             row
-                            for chunk in _chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1)
+                            for chunk in bind_budget_chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1)
                             for row in conn.execute(
                                 select(token_work_items_table.c.token_id, token_work_items_table.c.row_id)
                                 .where(token_work_items_table.c.run_id == coordination_token.run_id)
@@ -554,7 +542,7 @@ class BarrierJournalRepository:
         if not candidate_rows:
             return 0
         # One statement per row, executed as one executemany: its bind count
-        # does not grow with the batch (see _BIND_BUDGET_PER_STATEMENT), and
+        # does not grow with the batch (see core/landscape/bind_budget.py), and
         # both dialects report the summed rowcount (supports_sane_multi_rowcount).
         terminalized = conn.execute(
             update(token_work_items_table)
@@ -628,7 +616,7 @@ class BarrierJournalRepository:
             return
         candidates = [row for row in blocked_rows if row["token_id"] in emission_by_token]
         # One statement per row, executed as one executemany: its bind count
-        # does not grow with the batch (see _BIND_BUDGET_PER_STATEMENT), and
+        # does not grow with the batch (see core/landscape/bind_budget.py), and
         # both dialects report the summed rowcount (supports_sane_multi_rowcount).
         handoff = (
             update(token_work_items_table)

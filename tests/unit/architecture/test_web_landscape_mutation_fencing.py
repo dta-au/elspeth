@@ -631,7 +631,13 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # returns an outcomeless FAILED item to READY), and SchedulerDispositionRepository.
 # _transition_on's FailedImage UPDATE (a FAILED item purges its row payload only when
 # its token is decided). Measured by scripts/fencing_inventory.py --baseline HEAD.
-_EXPECTED_DML_COUNT = 163
+# elspeth-5887 X2 (no statement binds a list that grows with a batch): 163 -> 164,
+# +1 identity, write set UNCHANGED (72/72). SchedulerLeaseRepository.
+# _rotate_expired_leases now rotates in two statements: a predicate UPDATE ...
+# RETURNING for sink-redrive items (no per-item binds) and one executemany of a
+# fixed-size UPDATE for transform items. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of 55dbdf290: arrived 6, departed 5, moved 0.
+_EXPECTED_DML_COUNT = 164
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -750,7 +756,15 @@ _EXPECTED_DML_COUNT = 163
 # statement in place of IN lists and CASE maps whose binds grew with the batch.
 # Measured by scripts/fencing_inventory.py --baseline against a git archive of
 # 4fa8e7451: arrived 3, departed 3, moved 0.
-_EXPECTED_DML_INVENTORY_SHA256 = "7ff0f6ac6cd53b099461b4bd614fe4885659dbd6ef7b9bcbbc6665b7caa4c334"
+# elspeth-5887 X2: 7ff0f6ac… -> the value below at count 164, write shapes 72/72
+# unchanged. Five UPDATEs whose IN lists or CASE maps bound per row became one
+# executemany of a per-row statement (dispositions mark_pending_sink_terminal_many
+# and terminalize_pending_sinks_with_terminal_outcomes, leases
+# requeue_undecided_failed_work, group_losses adopt_group_losses) and
+# _rotate_expired_leases split into two statements (see _EXPECTED_DML_COUNT).
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 55dbdf290: arrived 6, departed 5, moved 0.
+_EXPECTED_DML_INVENTORY_SHA256 = "6a08f6514612bdcedbf2a323519f811e663f0ad92d39427bf7ee6e53abb4db40"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -907,8 +921,15 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "7683d3e0cfefa635a465005c75805f5aa666f027bc
 # now records an event for every candidate row after its exact-count check instead
 # of filtering on a RETURNING image. Measured by scripts/fencing_inventory.py
 # --baseline against a git archive of 4fa8e7451: moved 2, arrived 0, departed 0.
+# elspeth-5887 X2: cc66a10d… -> the value below at count 147. Two edges keep their
+# endpoints and move fingerprint: mark_pending_sink_terminal_many and
+# terminalize_pending_sinks_with_terminal_outcomes -> SchedulerEventStore.record_many;
+# each UPDATE is now one executemany with an exact-count check, so the events cover
+# every selected row instead of filtering on a RETURNING image. Measured by
+# scripts/fencing_inventory.py --baseline against a git archive of 55dbdf290:
+# moved 2, arrived 0, departed 0.
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 147
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "cc66a10dd8a76fe2c1de847bafd2ea2fa5966885ab2959df0fed24b6a696217b"
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "9c79b6105ca800b35388bb874da517202998b85758c77ae4ed71945799341dfe"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -7855,7 +7876,12 @@ _REVIEWED_REGISTRY_MODULES = {
     # _REQUIRED_CHECK_CONSTRAINTS (the collector group-failure reason CHECK
     # folded into epoch 45); the diff is that tuple row alone, so construction,
     # guard installation and clock issuance are unchanged.
-    "src/elspeth/core/landscape/database.py": "5c51a6e6fbfd1b7009180f4db671f4aaf474b3df22a1f3345f6f5d626777caa0",
+    # 5c51a6e6… -> the value below (elspeth-5887 X2): every create_engine call
+    # passes hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS (one new module
+    # constant) so a database error's text never carries bound row values;
+    # the diff is that keyword and the constant, so construction order, guard
+    # installation and clock issuance are unchanged.
+    "src/elspeth/core/landscape/database.py": "a27f58772ba30c96454a9605b47b7fb127e20987b067121e1f769c7397f3cacd",
 }
 
 
@@ -9304,7 +9330,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
                 if existing is not None:
                     return existing
-        raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}: {exc}') from exc
+        raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}') from exc
     return run
 """,
 }
@@ -10466,7 +10492,7 @@ def insert_work_items_idempotent(conn: Connection, *, values: list[dict[str, obj
         raise LandscapeRecordError(f'Scheduler {operation} failed; database rejected audit write') from exc
     if len(inserted) != len(set(inserted)) or not set(inserted).issubset(by_id):
         raise LandscapeRecordError(f'Scheduler {operation} returned unexpected work_item_id')
-    existing_rows = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(tuple(by_id)))).mappings().all()
+    existing_rows = [row for chunk in bind_budget_chunks(tuple(by_id)) for row in conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(chunk))).mappings().all()]
     if len(existing_rows) != len(by_id):
         raise LandscapeRecordError(f'Scheduler {operation} failed; no matching row could be read back')
     for row in existing_rows:
@@ -10537,7 +10563,7 @@ def _transition_with_ready_children(self, *, work_item_id: str, emitted_ready: S
         inserted_ids = insert_work_items_idempotent(conn, values=[values for values, _event in children], operation=f'atomic child enqueue for parent work_item_id={work_item_id!r}')
         events_by_id = {event.work_item_id: event for _values, event in children}
         self._events.record_many(conn, records=[event for identity, event in events_by_id.items() if identity in inserted_ids])
-        persisted_children = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == member_token.run_id, token_work_items_table.c.work_item_id.in_(tuple(events_by_id)))).mappings().all()
+        persisted_children = [row for chunk in bind_budget_chunks(tuple(events_by_id)) for row in conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == member_token.run_id, token_work_items_table.c.work_item_id.in_(chunk))).mappings().all()]
         rows_by_id = {row['work_item_id']: row for row in persisted_children}
         child_rows = tuple((rows_by_id[event.work_item_id] for _values, event in children))
         parent_row = self._transition_on(conn, work_item_id=work_item_id, status=status, image=image, expected_lease_owner=expected_lease_owner, group_losses=group_losses, member_token=member_token, require_complete_pending_sink_bundle=require_complete_pending_sink_bundle)
@@ -10608,10 +10634,10 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
         database_now = read_landscape_transaction_time(conn)
         if terminal_outcome_token_ids:
             sorted_terminal_token_ids = sorted(terminal_outcome_token_ids)
-            locked_tokens = [row for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(chunk)).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()]
+            locked_tokens = [row for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(chunk)).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()]
             if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {(token_id, run_id) for token_id in terminal_outcome_token_ids}:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received a terminal outcome for a missing or foreign token.')
-            existing_terminal_rows = [row for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(chunk)).where(token_outcomes_table.c.completed == 1)).all()]
+            existing_terminal_rows = [row for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(chunk)).where(token_outcomes_table.c.completed == 1)).all()]
             if existing_terminal_rows:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} would duplicate terminal outcomes for token_ids={sorted((str(row.token_id) for row in existing_terminal_rows))!r}.')
         blocked_rows = conn.execute(select(token_work_items_table.c.work_item_id, token_work_items_table.c.token_id, token_work_items_table.c.node_id, token_work_items_table.c.attempt, token_work_items_table.c.lease_owner, token_work_items_table.c.lease_expires_at).where(*blocked_predicates).order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.step_index, token_work_items_table.c.work_item_id)).mappings().all()
@@ -10628,7 +10654,7 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
             unknown_snapshot_token_ids = intake_snapshot_token_ids - durable_token_ids
             if unknown_snapshot_token_ids:
                 if scope_row_id is not None:
-                    cross_group_rows = [row for chunk in _chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1) for row in conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(chunk))).all()]
+                    cross_group_rows = [row for chunk in bind_budget_chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1) for row in conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(chunk))).all()]
                     cross_group = {row.token_id: row.row_id for row in cross_group_rows if row.row_id != scope_row_id}
                     if cross_group:
                         raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} scope_row_id={scope_row_id!r} received intake snapshot token(s) whose durable BLOCKED rows belong to a DIFFERENT row group: {dict(sorted(cross_group.items()))!r}; the flush caller built its firing-group snapshot across row groups (ADR-030 §E.3 scope validation).')
@@ -10717,6 +10743,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.freeze', names=[alias(name='freeze_fields')], level=0)",
         "ImportFrom(module='elspeth.contracts.hashing', names=[alias(name='canonical_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.sink_effects', names=[alias(name='SINK_EFFECT_PROTOCOL_VERSION'), alias(name='AuditExportSignedManifestInput'), alias(name='AuditExportSigningMode'), alias(name='SinkEffectInputKind'), alias(name='SinkEffectMember'), alias(name='SinkEffectReservationRequest'), alias(name='SinkEffectState')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='LandscapeDB')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.model_loaders', names=[alias(name='SinkEffectLoader')], level=0)",
@@ -10736,6 +10763,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame'), alias(name='lineage_path_from_json'), alias(name='lineage_path_to_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='nodes_table'), alias(name='rows_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
     ),
@@ -10762,11 +10790,12 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='collections.abc', names=[alias(name='Sequence')], level=0)",
         "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
         "ImportFrom(module='typing', names=[alias(name='ClassVar')], level=0)",
-        "ImportFrom(module='sqlalchemy', names=[alias(name='and_'), alias(name='case'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='and_'), alias(name='bindparam'), alias(name='case'), alias(name='select'), alias(name='update')], level=0)",
         "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken'), alias(name='WorkerMembershipToken')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction'), alias(name='fenced_member_transaction')], level=0)",
@@ -10779,7 +10808,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
     ),
     "src/elspeth/core/landscape/scheduler/barrier.py": (
         "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
-        "ImportFrom(module='collections.abc', names=[alias(name='Iterator'), alias(name='Mapping'), alias(name='Sequence')], level=0)",
+        "ImportFrom(module='collections.abc', names=[alias(name='Mapping'), alias(name='Sequence')], level=0)",
         "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
         "ImportFrom(module='datetime', names=[alias(name='UTC'), alias(name='datetime'), alias(name='timedelta')], level=0)",
         "ImportFrom(module='sqlalchemy', names=[alias(name='bindparam'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
@@ -10789,6 +10818,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='lineage_path_to_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='BarrierTerminalOutcomeSpec'), alias(name='BatchMembershipSpec'), alias(name='BlockedPendingSinkHandoff'), alias(name='BufferedOutcomeSpec'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",

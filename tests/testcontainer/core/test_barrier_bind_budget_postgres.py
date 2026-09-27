@@ -74,9 +74,9 @@ def _block_tokens(factory: RecorderFactory, *, run_id: str, barrier: str, source
 
 @pytest.mark.timeout(180)
 def test_chunked_barrier_release_on_postgres(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
-    from elspeth.core.landscape.scheduler import barrier as barrier_module
+    from elspeth.core.landscape import bind_budget
 
-    monkeypatch.setattr(barrier_module, "_BIND_BUDGET_PER_STATEMENT", _BUDGET)
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", _BUDGET)
     factory = make_factory(postgres_db)
     run = factory.run_lifecycle.begin_run(config={"case": "bind-budget"}, canonical_version="v1")
     coordination = leader_coordination_token(factory, run.run_id)
