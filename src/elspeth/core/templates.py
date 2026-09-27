@@ -136,7 +136,10 @@ _DYNAMIC_ACCESS_EXAMPLES: dict[str, str] = {
 # kind's shape, never the template's own text, so a message stays one line.
 _ROW_API_MISUSE_EXAMPLES: dict[str, str] = {
     ROW_API_DYNAMIC_ACCESS: "row.contract, row.to_dict, row.to_checkpoint_format or a name starting with '_'",
-    ROW_FIELD_CALL_ACCESS: "a call on a row field, such as row.keys(), row.items(), row['keys'](), row.name() or row.get('name')()",
+    ROW_FIELD_CALL_ACCESS: (
+        "a call on a row field or on part of its value, such as row.keys(), row.items(), row['keys'](), row.name(), "
+        "row.get('name')() or row.name[0]()"
+    ),
     UNCALLED_GET_ACCESS: "row.get without a call",
 }
 
@@ -453,6 +456,11 @@ _LITERAL_NODES: tuple[type[Node], ...] = (Const, List, Tuple, DictNode)
 # ``row | safe`` markup), so a method on its result is that value's method.
 _ELEMENT_RETURNING_FILTERS: frozenset[str] = frozenset({"first", "last", "random", "min", "max"})
 
+# The builtin filters that return a collection of their operand's own elements,
+# reordered or deduplicated: over a field's value (``row.tags | list``) every
+# element is still that value's data, so an element of the result is too.
+_ELEMENT_KEEPING_FILTERS: frozenset[str] = frozenset({"list", "sort", "reverse", "unique"})
+
 # The builtin filters that can return their operand (or their default argument)
 # unchanged: ``(row | default({})).keys()`` still calls on the row object.
 _OPERAND_RETURNING_FILTERS: frozenset[str] = frozenset({"default", "d"})
@@ -605,9 +613,9 @@ def _called_nodes(ast: Node) -> frozenset[int]:
         "classifies the callee by AST node type only: True for an attribute or attr-filter lookup that reads a "
         "field (any name but the row's one method or a reserved name on the row object; a name that is not a "
         "dict attribute on a dict built from the row), an item lookup or element filter on anything carrying the "
-        "row's fields, or a row.get(...) or default filter whose fallback is absent, a literal or itself row data "
-        "by this same test; every other shape returns False, the explicit no-match result; nothing is evaluated "
-        "or coerced"
+        "row's fields or on row data by this same test (also through list, sort, reverse or unique), or a "
+        "row.get(...) or default filter whose fallback is absent, a literal or itself row data by this same "
+        "test; every other shape returns False, the explicit no-match result; nothing is evaluated or coerced"
     ),
     non_raising=True,
 )
@@ -638,7 +646,12 @@ def _is_row_field_call(
     (``_node_is_row_object_expression``) is data, a field value, a field name
     or a character, so calling one is a row call whatever the receiver; so is
     an element one of ``first``, ``last``, ``random``, ``min`` or ``max``
-    takes from it (``(row | first)()`` calls a field name). So is calling what
+    takes from it (``(row | first)()`` calls a field name). A field's value is
+    row data too, and so is an item or such an element of it, directly or
+    through ``list``, ``sort``, ``reverse`` or ``unique``
+    (``row.tags[0]()``, ``(row.tags | first)()``, ``(row.tags | list | last)()``):
+    row data is never callable. A method on it is the value's own
+    (``row.tags[0].upper()``). So is calling what
     ``get`` returns, a field value, when ``get`` cannot return its default or
     the default is a literal or is itself row data by this same test
     (``row.get('x', row.y)()``): any other default (``row.get('x', range)``)
@@ -663,10 +676,17 @@ def _is_row_field_call(
             callee.node, literal_name, row_receivers, namespaces, row_collection_aliases, row_container_aliases
         )
     if isinstance(callee, Getitem):
-        return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+        return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases) or _is_row_field_call(
+            callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
+        )
     if isinstance(callee, Filter) and callee.name in _ELEMENT_RETURNING_FILTERS:
-        return callee.node is not None and _node_is_row_object_expression(
-            callee.node, namespaces, row_collection_aliases, row_container_aliases
+        return callee.node is not None and (
+            _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+            or _is_row_field_call(callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(callee, Filter) and callee.name in _ELEMENT_KEEPING_FILTERS:
+        return callee.node is not None and _is_row_field_call(
+            callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
         )
     if isinstance(callee, Filter) and callee.name in _OPERAND_RETURNING_FILTERS:
         if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):

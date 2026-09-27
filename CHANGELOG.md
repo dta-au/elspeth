@@ -304,7 +304,8 @@ drained and repair this release forward.
   `row.source_row` and a RAG `query_template`, and under `required_input_fields:
   []` too, a call on a row field (`row.keys()`, `row.items()`,
   `row['keys']()`, `row.note()`, `dict(row).note()`, calling an element of
-  the row such as `(row | first)()`, and calling what `row.get('note')`
+  the row such as `(row | first)()` or part of a field's value such as
+  `row.tags[0]()` or `(row.tags | first)()`, and calling what `row.get('note')`
   returns, also when its default is a row field, `row.get('note', row.id)()`),
   `row.get` without a call, and the reserved
   names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
@@ -1041,6 +1042,9 @@ row without an outcome); a `union_collision_policy: fail` coalesce whose
 branches all guarantee a shared field (ended the run with exit 4 at the first
 row). Each of these failed every row: a template number literal that
 overflows to infinity; a `truncate` length shorter than its ending; a
+call on part of a field's value in an LLM prompt, a query or a RAG
+`query_template` (`row.tags[0]()`, `(row.tags | first)()`,
+`(row.get('tags') | list | last)()`), under every declaration; a
 `<response>_usage` schema type other than `any`; a header-spelled scan field
 over a non-string column; and in a RAG `query_template`, a dynamic `row[...]`
 key or a top-level name other than `query` or `row`. A header-spelled `web_scrape`

@@ -145,6 +145,17 @@ _MISUSES = (
     pytest.param("{{ R.get('F', R.get('F'))() }}", "a call on a row field", id="get-result-with-a-get-result-default-called"),
     pytest.param("{{ (R.F | default('x'))() }}", "a call on a row field", id="defaulted-field-called"),
     pytest.param("{{ R.get('F', R.F | default('x'))() }}", "a call on a row field", id="get-result-with-a-defaulted-field-default-called"),
+    # Every element filter, pinned (review-G3-template-api-r3 F1: min and random survived deletion).
+    pytest.param("{{ (R | min)() }}", "a call on a row field", id="min-element-of-the-row-called"),
+    pytest.param("{{ (R | random)() }}", "a call on a row field", id="random-element-of-the-row-called"),
+    # A field's value is row data, and so is part of it: row data is never callable (r3 F3).
+    pytest.param("{{ R.F[0]() }}", "a call on a row field", id="item-of-a-field-value-called"),
+    pytest.param("{{ (R.F | first)() }}", "a call on a row field", id="element-of-a-field-value-called"),
+    pytest.param("{{ (R.get('F') | first)() }}", "a call on a row field", id="element-of-a-get-result-called"),
+    pytest.param("{{ (R.get('F', 'x') | last)() }}", "a call on a row field", id="element-of-a-defaulted-get-result-called"),
+    pytest.param("{{ (R.F | list | first)() }}", "a call on a row field", id="element-of-a-listed-field-value-called"),
+    pytest.param("{{ (R.F | sort | last)() }}", "a call on a row field", id="element-of-a-sorted-field-value-called"),
+    pytest.param("{{ (R.F | list)() }}", "a call on a row field", id="a-listed-field-value-called"),
     pytest.param("{{ R.get }}", "row.get without a call", id="uncalled-get"),
     pytest.param("{{ R | attr('get') }}", "row.get without a call", id="uncalled-get-through-attr"),
 )
@@ -182,6 +193,9 @@ def test_the_row_used_as_an_object_is_refused_under_every_declaration(
         pytest.param("{{ R.get('F', 'none') }}", id="get-with-default"),
         pytest.param("{{ R.F.upper() }}", id="a-method-on-a-field-value"),
         pytest.param("{{ R['F'].split() | list }}", id="a-method-on-an-item-value"),
+        pytest.param("{{ R.F[0].upper() }}", id="a-method-on-part-of-a-field-value"),
+        pytest.param("{{ (R.F | first) }} {{ R.F[0] }}", id="part-of-a-field-value-read"),
+        pytest.param("{{ (R.F | attr('upper'))() }}", id="a-field-value-method-through-attr"),
         pytest.param("{% for k, v in R | items %}{{ k }}={{ v }};{% endfor %}", id="items-filter"),
         pytest.param("{{ R | dictsort }}", id="dictsort-filter"),
         pytest.param("{{ R | list }}", id="list-filter"),

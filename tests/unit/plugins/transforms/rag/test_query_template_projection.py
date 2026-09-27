@@ -157,8 +157,9 @@ def test_the_query_template_projection_is_the_declaration(required_input_fields:
         pytest.param(
             "{{ query }} {{ row.items() | list }}",
             ["question"],
-            "query_template uses its row as an object (a call on a row field, such as row.keys(), row.items(), "
-            "row['keys'](), row.name() or row.get('name')()). A template's row holds fields and one method, get",
+            "query_template uses its row as an object (a call on a row field or on part of its value, such as "
+            "row.keys(), row.items(), row['keys'](), row.name(), row.get('name')() or row.name[0]()). A template's "
+            "row holds fields and one method, get",
             id="probe-rag-items-is-a-field-call",
         ),
         pytest.param(
