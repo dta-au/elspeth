@@ -715,21 +715,6 @@ GuidedStartOperationReconciliationResponse = Annotated[
 ]
 
 
-class TutorialSampleResponse(_StrictResponse):
-    """Response for GET /api/sessions/{id}/guided/tutorial-sample.
-
-    Runtime-derived inputs for the tutorial's prefilled worked example: the 3
-    synthetic sample-page URLs (appended to the locked STEP_1 prompt the learner
-    sends verbatim) for the active tutorial session's resolved origin. The URLs
-    are computed from the resolved base at request time (they cannot ride the
-    frozen profile constants). The tutorial's ``web_scrape`` node relies on the
-    plugin default ``allowed_hosts="public_only"`` — the pages are publicly
-    hosted, so the server injects no SSRF allowlist.
-    """
-
-    sample_urls: list[str]
-
-
 class GuidedEditTargetRequest(BaseModel):
     """Closed stable component target reserved for proposal/edit actions."""
 

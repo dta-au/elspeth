@@ -1315,7 +1315,7 @@ def test_late_tutorial_progress_cannot_overwrite_committed_completion(postgres_e
         asyncio.run(
             service.update_composer_preferences(
                 user_id,
-                UpdateComposerPreferencesRequest(default_mode="guided", tutorial_stage="guided", tutorial_session_id="tutorial-session"),
+                UpdateComposerPreferencesRequest(default_mode="guided", tutorial_stage="build", tutorial_session_id="tutorial-session"),
             )
         )
 

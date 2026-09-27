@@ -1,10 +1,16 @@
-# ADR-031: The Tutorial Is a Fixed-Script Canary for the General Guided Surface
+# ADR-031: The Tutorial Is a Fixed-Script Canary for the General Composer Surface
 
 **Date:** 2026-07-22
 **Status:** Accepted
 **Deciders:** ELSPETH maintainer
-**Tags:** composer, tutorial, guided, backend-parity, testing-doctrine,
+**Tags:** composer, tutorial, freeform, guided, backend-parity, testing-doctrine,
           silent-degradation
+
+**Current application (2026-09-28):** Build now uses the ordinary freeform
+Composer; the historical guided-surface evidence and collector amendment below
+remain as the rationale for keeping the fixed-input canary. The Run, Audit,
+and Graduation capstone still exercises the committed session and its live
+Landscape evidence.
 
 ## Context
 
@@ -92,6 +98,21 @@ with doctrine status:
 - **Retiring the fixed walk in favour of adaptive acceptance tests only.**
   Rejected: the campaign demonstrated that adaptive tests structurally
   cannot detect the masked-defect class the tutorial catches.
+
+## Amendment: freeform Build with the same capstone (2026-09-28)
+
+The first-run tutorial now sends its fixed, complete example brief through the
+ordinary freeform message action. The public sample-page addresses are resolved
+at runtime, but the server neither composes nor repairs a tutorial pipeline.
+The learner reviews the planner's proposal and any interpretation decisions;
+the same committed-state readiness check guards both the Build-to-Run handoff
+and the explicit Run click. A failed check leaves the learner in Build to amend
+the ordinary session. The run, audit story, and graduation continue to refer
+to that session and the actual run ID; they are not simulated tutorial steps.
+
+This moves the fixed-input canary from the guided authoring surface to the
+freeform authoring surface. Guided-specific coverage, including the collector
+contract described below, must stand on its own until guided mode is retired.
 
 ## Amendment: collector authoring is canaried without touching the frozen script (2026-08-25)
 

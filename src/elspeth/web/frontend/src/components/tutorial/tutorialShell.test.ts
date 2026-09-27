@@ -115,7 +115,7 @@ describe("the progress row spans the card it reports on (elspeth-0c11a9cf90)", (
   // shrink-to-fits and centres beside the 920px card instead of over it — and
   // .tutorial-exit-button's `margin-left: auto` then has no free space to push
   // against, so a PERSISTENT chrome control changes position turn by turn.
-  const bookendProgress = ".tutorial-shell:not(.tutorial-shell--guided) .tutorial-progress";
+  const bookendProgress = ".tutorial-shell:not(.tutorial-shell--workspace) .tutorial-progress";
 
   it("adopts the card's own width expression, not a width of its own", () => {
     expect(
@@ -130,17 +130,17 @@ describe("the progress row spans the card it reports on (elspeth-0c11a9cf90)", (
     expect(declaredValues(bookendProgress, "width")).toHaveLength(1);
   });
 
-  it("leaves the guided step's full-bleed band uncapped", () => {
-    // The guided override (tutorial.css `.tutorial-shell--guided
+  it("leaves the Build workspace's full-bleed band uncapped", () => {
+    // The workspace override (tutorial.css `.tutorial-shell--workspace
     // .tutorial-progress`) sets flex-shrink and padding but no width, and the
-    // guided shell is `align-items: stretch` — it is the one step that already
+    // workspace shell is `align-items: stretch` — it is the one step that already
     // right-anchored correctly. An unscoped width on the base selector would
     // reach it and cap it at the card width.
     expect(
       declaredValues(".tutorial-progress", "width"),
-      "a width on the base selector reaches the guided step too — keep it :not()-scoped",
+      "a width on the base selector reaches Build too — keep it :not()-scoped",
     ).toEqual([]);
-    expect(declaredValues(".tutorial-shell--guided .tutorial-progress", "width")).toEqual([]);
+    expect(declaredValues(".tutorial-shell--workspace .tutorial-progress", "width")).toEqual([]);
   });
 });
 

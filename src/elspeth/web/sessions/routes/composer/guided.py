@@ -18,7 +18,7 @@ from elspeth.plugins.infrastructure.validation import get_sink_config_model, get
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.compartments import chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
-from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
+from elspeth.web.composer.guided.profile import WorkflowProfileKind, profile_for_kind
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GUIDED_GOAL_ACKNOWLEDGEMENT, Turn, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
@@ -60,10 +60,6 @@ from elspeth.web.composer.source_inspection import (
     resolve_source_inspection_blob_id,
 )
 from elspeth.web.composer.tools._common import validate_composer_file_sink_collision_policy
-from elspeth.web.composer.tutorial_sample import (
-    resolve_tutorial_sample_urls,
-    tutorial_sample_base_url,
-)
 from elspeth.web.interpretation_state import refine_prompt_shield_warnings_for_availability
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS, allowed_sink_directories, resolve_sink_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -102,7 +98,6 @@ from elspeth.web.sessions.schemas import (
     GuidedStartOperationReconciliationResponse,
     ReenterGuidedRequest,
     StartGuidedRequest,
-    TutorialSampleResponse,
 )
 
 from .._helpers import (
@@ -988,55 +983,6 @@ async def get_guided(
             else None,
             composition_state=composition_state_out,
         )
-
-
-@router.get("/{session_id}/guided/tutorial-sample", response_model=TutorialSampleResponse)
-async def get_guided_tutorial_sample(
-    session_id: UUID,
-    request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
-) -> TutorialSampleResponse:
-    """Return the runtime-derived synthetic-scrape inputs for a TUTORIAL session.
-
-    Exposes the 3 synthetic sample-page URLs for the active tutorial session.
-    The base is resolved via ``tutorial_sample_base_url`` (a configured
-    ``WebSettings.tutorial_sample_base_url`` wins, else the canonical public
-    GitHub Pages copy). The URLs are a runtime-derived payload computed by the
-    server seam. The pages are publicly hosted, so the tutorial's ``web_scrape``
-    node needs no server-injected SSRF allowlist (it uses the plugin default
-    ``allowed_hosts="public_only"``).
-
-    Read-only: this route never mutates state. Returns 404 if the session does
-    not exist or does not belong to the requesting user. Returns 400 if the
-    session has no guided session, or is not a tutorial session (a
-    live/freeform session has no tutorial sample surface).
-    """
-    await _verify_session_ownership(session_id, user, request)
-    service: SessionServiceProtocol = request.app.state.session_service
-
-    state_record = await service.get_current_state(session_id)
-    if state_record is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No active guided session for this session; start a tutorial session first.",
-        )
-    state = _state_from_record(state_record)
-    guided = state.guided_session
-    if guided is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Session is not in guided mode; the tutorial sample surface is guided-only.",
-        )
-    if guided.profile != TUTORIAL_PROFILE:
-        raise HTTPException(
-            status_code=400,
-            detail="Session is not a tutorial session; no tutorial sample surface is available.",
-        )
-
-    settings = request.app.state.settings
-    base_url = tutorial_sample_base_url(settings=settings)
-    sample_urls = resolve_tutorial_sample_urls(base_url=base_url)
-    return TutorialSampleResponse(sample_urls=list(sample_urls))
 
 
 @router.post("/{session_id}/guided/reenter", response_model=GetGuidedResponse)

@@ -1900,7 +1900,7 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-in-progress",
       tutorialRunId: null,
       tutorialSourceDataHash: null,

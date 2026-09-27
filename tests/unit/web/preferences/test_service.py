@@ -439,7 +439,7 @@ def test_tutorial_exit_patch_clears_resume_fields(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-exit-1"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-exit-1"),
         )
     )
 
@@ -932,17 +932,17 @@ def test_patch_persists_tutorial_progress_fields(service):
         service.update_composer_preferences(
             user,
             UpdateComposerPreferencesRequest(
-                tutorial_stage="guided",
+                tutorial_stage="build",
                 tutorial_session_id="sess-1",
             ),
         )
     )
-    assert result.current.tutorial_stage == "guided"
+    assert result.current.tutorial_stage == "build"
     assert result.current.tutorial_session_id == "sess-1"
     assert result.current.tutorial_run_id is None
 
     prefs = asyncio.run(service.get_composer_preferences(user))
-    assert prefs.tutorial_stage == "guided"
+    assert prefs.tutorial_stage == "build"
     assert prefs.tutorial_session_id == "sess-1"
     assert prefs.tutorial_run_id is None
     assert prefs.tutorial_source_data_hash is None
@@ -955,7 +955,7 @@ def test_patch_advances_tutorial_stage_and_records_run_identity(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-2"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-2"),
         )
     )
     asyncio.run(
@@ -1060,13 +1060,13 @@ def test_progress_only_patch_is_not_treated_as_empty(service, engine):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-6"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-6"),
         )
     )
     with engine.connect() as conn:
         row = conn.execute(select(user_preferences_table).where(user_preferences_table.c.user_id == user)).first()
     assert row is not None
-    assert row.tutorial_stage == "guided"
+    assert row.tutorial_stage == "build"
 
 
 def test_explicit_null_clears_tutorial_progress(service):
@@ -1075,7 +1075,7 @@ def test_explicit_null_clears_tutorial_progress(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-7"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-7"),
         )
     )
     asyncio.run(
@@ -1103,7 +1103,7 @@ def test_corrupt_tutorial_stage_crashes_with_named_error(service):
     asyncio.run(
         service.update_composer_preferences(
             user,
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-8"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-8"),
         )
     )
     with service._engine.begin() as conn:
@@ -1122,7 +1122,7 @@ def test_patch_progress_emits_counter_with_progress_changed_label(service, prefe
     asyncio.run(
         service.update_composer_preferences(
             "alice-tutorial-progress-counter",
-            UpdateComposerPreferencesRequest(tutorial_stage="guided", tutorial_session_id="sess-9"),
+            UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="sess-9"),
         )
     )
 

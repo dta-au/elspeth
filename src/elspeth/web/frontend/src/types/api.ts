@@ -86,7 +86,12 @@ export type ComposerMode = "guided" | "freeform";
 // backend `TutorialStage` Literal (preferences/models.py) — the frontend
 // TutorialStep union minus "welcome" (never persisted; null is the
 // no-in-progress-tutorial state).
-export type PersistedTutorialStage = "guided" | "run" | "audit" | "graduation";
+export type PersistedTutorialStage = "build" | "run" | "audit" | "graduation";
+
+/** Runtime-served sample pages for the ordinary freeform tutorial brief. */
+export interface TutorialSampleResponse {
+  sample_urls: string[];
+}
 
 export interface UserComposerPreferencesPayload {
   default_mode: ComposerMode;
@@ -130,6 +135,11 @@ export interface UpdateUserComposerPreferencesPayload {
 
 export interface TutorialRunRequest {
   session_id: string;
+}
+
+/** Read-only admission of the exact saved state that Run will recheck. */
+export interface TutorialReadinessResponse {
+  state_id: string;
 }
 
 /** Response of POST /api/tutorial/cancel. Idempotent best-effort cancel:

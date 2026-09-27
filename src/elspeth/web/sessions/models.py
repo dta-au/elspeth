@@ -370,7 +370,7 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # 69: message ingress receipts bind each accepted freeform send UUID to one
 #     immutable user row and its originally requested nullable state.
 #     Pre-1.0 delete/recreate, no legacy path.
-SESSION_SCHEMA_EPOCH = 69
+SESSION_SCHEMA_EPOCH = 70
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3417,7 +3417,7 @@ user_preferences_table = Table(
         name="ck_user_preferences_default_composer_mode",
     ),
     CheckConstraint(
-        "tutorial_stage IS NULL OR tutorial_stage IN ('guided', 'run', 'audit', 'graduation')",
+        "tutorial_stage IS NULL OR tutorial_stage IN ('build', 'run', 'audit', 'graduation')",
         name="ck_user_preferences_tutorial_stage",
     ),
     # Empty-string user_id would silently key a "shared" preferences row

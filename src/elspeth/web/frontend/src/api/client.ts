@@ -54,7 +54,6 @@ import type {
   GuidedRespondRequest,
   GuidedRespondResponse,
   GuidedStartOperationReconciliation,
-  TutorialSampleResponse,
 } from "@/types/guided";
 import {
   decodeCompositionState,
@@ -80,6 +79,8 @@ import type {
   TutorialOrphanCleanupResponse,
   TutorialRunRequest,
   TutorialRunResponse,
+  TutorialReadinessResponse,
+  TutorialSampleResponse,
   UserComposerPreferencesPayload,
   UpdateUserComposerPreferencesPayload,
 } from "@/types/api";
@@ -974,21 +975,15 @@ export async function getGuided(
 }
 
 /**
- * Fetch the runtime-derived synthetic-scrape sample URLs for the active
- * TUTORIAL session's resolved origin (p4 Task 8a GET surface).
- *
- * Consumed by `TutorialGuidedShell`: the URLs are computed server-side from the
- * resolved base at request time (they cannot ride the frozen profile
- * constants), so the shell fetches them and appends them to the locked STEP_1
- * prompt. The synthetic pages are publicly hosted, so the tutorial's web_scrape
- * node carries no SSRF allowlist (it uses the plugin default `public_only`).
+ * Fetch runtime-derived sample URLs for the freeform tutorial brief.
+ * They are data, not a server-authored pipeline proposal.
  */
 export async function getTutorialSample(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TutorialSampleResponse> {
   const response = await authFetch(
-    `/api/sessions/${sessionId}/guided/tutorial-sample`,
+    `/api/tutorial/${sessionId}/sample`,
     {
       method: "GET",
       headers: authHeaders(),
@@ -996,6 +991,18 @@ export async function getTutorialSample(
     },
   );
   return parseResponse<TutorialSampleResponse>(response);
+}
+
+export async function getTutorialReadiness(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<TutorialReadinessResponse> {
+  const response = await authFetch(`/api/tutorial/${sessionId}/readiness`, {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  return parseResponse<TutorialReadinessResponse>(response);
 }
 
 /**

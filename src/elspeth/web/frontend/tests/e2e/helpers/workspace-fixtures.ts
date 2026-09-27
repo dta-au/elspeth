@@ -359,6 +359,7 @@ function validationIssues(): ValidationResult {
         component_type: "source",
         detail: `Deterministic validation issue ${index + 1}`,
         suggestion: null,
+        note: null,
       })),
     },
   };

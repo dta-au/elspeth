@@ -583,7 +583,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       default_mode: "guided",
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
-      tutorial_stage: "guided",
+      tutorial_stage: "build",
       tutorial_session_id: "sess-2",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
@@ -592,20 +592,20 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
     });
 
     await usePreferencesStore.getState().saveTutorialProgress({
-      stage: "guided",
+      stage: "build",
       sessionId: "sess-2",
       runId: null,
       sourceDataHash: null,
     });
 
     expect(mockUpdate).toHaveBeenCalledWith({
-      tutorial_stage: "guided",
+      tutorial_stage: "build",
       tutorial_session_id: "sess-2",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
     });
     const state = usePreferencesStore.getState();
-    expect(state.tutorialStage).toBe("guided");
+    expect(state.tutorialStage).toBe("build");
     expect(state.tutorialSessionId).toBe("sess-2");
   });
 

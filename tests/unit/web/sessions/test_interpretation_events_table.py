@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_69() -> None:
+def test_current_session_schema_epoch_is_70() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -247,7 +247,7 @@ def test_current_session_schema_epoch_is_69() -> None:
     # mapping-branch order and multi-source sources order. Stores recreated.
     # 68: guided and ordinary proposal checkpoint rebase reasons are persisted.
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
-    assert SESSION_SCHEMA_EPOCH == 69
+    assert SESSION_SCHEMA_EPOCH == 70
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

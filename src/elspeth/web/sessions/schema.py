@@ -39,7 +39,8 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # vocabulary additions, so this semantic JSON cut requires store recreation.
 # Epoch 69 adds immutable freeform message ingress receipts and their same-session
 # bindings. Existing session stores cannot satisfy the new admission contract.
-_COORDINATION_HARD_CUT_EPOCH = 69
+# Epoch 70 replaces the persisted tutorial Build stage's guided label with build.
+_COORDINATION_HARD_CUT_EPOCH = 70
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",

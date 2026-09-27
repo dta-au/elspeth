@@ -115,11 +115,13 @@ function entry(ordinal: number, endpoint: TransitionLedgerEntry["endpoint"], ove
 }
 
 describe("classifyTransitionRequest", () => {
-  it("recognises the four transition boundaries, POST only", () => {
+  it("recognises guided and freeform authoring boundaries, POST only", () => {
     expect(classifyTransitionRequest(`${BASE}/guided/start`, "POST")).toBe("guided/start");
     expect(classifyTransitionRequest(`${BASE}/guided/respond`, "POST")).toBe("guided/respond");
     expect(classifyTransitionRequest(`${BASE}/guided/chat?x=1`, "POST")).toBe("guided/chat");
     expect(classifyTransitionRequest("https://elspeth.example.test/api/tutorial/run", "POST")).toBe("tutorial/run");
+    expect(classifyTransitionRequest(`${BASE}/messages`, "POST")).toBe("freeform/compose");
+    expect(sessionIdFromTransitionUrl(`${BASE}/messages`)).toBe(SID);
     expect(classifyTransitionRequest(`${BASE}/guided/respond`, "GET")).toBeNull();
   });
 
@@ -127,7 +129,7 @@ describe("classifyTransitionRequest", () => {
     expect(classifyTransitionRequest(`${BASE}/guided/start/abc/reconcile`, "POST")).toBeNull();
     expect(classifyTransitionRequest(`${BASE}/guided`, "GET")).toBeNull();
     expect(classifyTransitionRequest(`${BASE}/guided/tutorial-sample`, "POST")).toBeNull();
-    expect(classifyTransitionRequest(`${BASE}/messages`, "POST")).toBeNull();
+    expect(classifyTransitionRequest(`${BASE}/messages`, "GET")).toBeNull();
   });
 
   it("extracts the session id from guided urls only", () => {
@@ -219,6 +221,16 @@ describe("transitionViolations", () => {
     expect(rerender.violations).toEqual([]);
   });
 
+  it("rejects a freeform state or proposal published without a planner call", () => {
+    const bypass = entry(1, "freeform/compose", {
+      response: { next_turn_type: "freeform_state", new_turn_occurrence: true },
+      evidence: completeEvidence({ provider_calls: 1, planner_calls: 0 }),
+    });
+    expect(bypass.violations).toEqual([
+      expect.stringMatching(/freeform\/compose.*zero planner provider calls/),
+    ]);
+  });
+
   it("treats unavailable evidence on a guided transition as a violation, not a pass", () => {
     const gap = entry(2, "guided/respond", { evidence: unavailableTransitionEvidence("audit read failed") });
     expect(gap.violations).toEqual([
@@ -275,6 +287,17 @@ function walk(): TransitionLedgerEntry[] {
 }
 
 describe("ledgerTotals", () => {
+  it("counts the first freeform compose gesture in time-to-run", () => {
+    const totals = ledgerTotals([
+      entry(1, "freeform/compose", {
+        gestures: [{ label: "Send tutorial brief", at_ms: 10_000 }],
+        evidence: completeEvidence({ provider_calls: 1, planner_calls: 1, planner_runs: 1 }),
+      }),
+      entry(2, "tutorial/run", { gestures: [{ label: "Run", at_ms: 20_000 }] }),
+    ], [], []);
+    expect(totals.gestures_to_run).toBe(2);
+    expect(totals.wall_clock_to_run_ms).toBe(10_100);
+  });
   it("sums the walk and measures gestures / wall clock from the first build gesture to the run", () => {
     const totals = ledgerTotals(walk(), [{ label: "Continue (audit story)", at_ms: 90_000 }], [
       row("c1"),

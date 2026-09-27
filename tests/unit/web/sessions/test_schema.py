@@ -367,7 +367,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # authority hashes; stored epoch-66 preimages cannot be re-verified.
     # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
     # Epoch 69 adds immutable freeform message ingress receipts.
-    assert SESSION_SCHEMA_EPOCH == 69
+    # Epoch 70 replaces the persisted tutorial stage's guided label with build.
+    assert SESSION_SCHEMA_EPOCH == 70
     expected_tables = frozenset(
         {
             "web_instances",

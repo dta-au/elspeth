@@ -130,7 +130,7 @@ _VALID_MODES: frozenset[ComposerMode] = frozenset({"guided", "freeform"})
 # Tier-1 read-guard set for ``tutorial_stage``; lockstep with the
 # ``TutorialStage`` Literal (models.py) and the
 # ``ck_user_preferences_tutorial_stage`` CHECK (sessions/models.py).
-_VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"guided", "run", "audit", "graduation"})
+_VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"build", "run", "audit", "graduation"})
 
 
 def _utcnow() -> datetime:

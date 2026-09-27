@@ -4087,7 +4087,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "730473cf9d5628ab",
         1,
         "SessionSchemaAuthority",
-        line=282,
+        line=283,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4097,7 +4097,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         1,
         "SessionSchemaAuthority",
-        line=300,
+        line=301,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4107,7 +4107,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         2,
         "SessionSchemaAuthority",
-        line=301,
+        line=302,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -4117,7 +4117,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "dc1da0e98009a36e",
         1,
         "SessionSchemaAuthority",
-        line=304,
+        line=305,
     ),
     # src/elspeth/web/sessions/dead_site_supersession.py :: SessionInterpretationAuthority
     WriterIdentity(
@@ -5001,7 +5001,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d7ac5811a7ee7916",
         1,
         "SessionSchemaAuthority",
-        line=317,
+        line=318,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -5011,7 +5011,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c574ef34dc69761e",
         1,
         "SessionSchemaAuthority",
-        line=434,
+        line=435,
     ),
     # src/elspeth/web/sessions/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -6079,7 +6079,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5684c68046118475",
         1,
         None,
-        line=496,
+        line=527,
         connection_escape=True,
     ),
 )
@@ -18971,7 +18971,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "730473cf9d5628ab",
             1,
             "SessionSchemaAuthority",
-            line=282,
+            line=283,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -18981,7 +18981,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "d7ac5811a7ee7916",
             1,
             "SessionSchemaAuthority",
-            line=317,
+            line=318,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
@@ -18991,7 +18991,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "c574ef34dc69761e",
             1,
             "SessionSchemaAuthority",
-            line=434,
+            line=435,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable

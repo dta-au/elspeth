@@ -402,23 +402,6 @@ export interface GuidedRespondResponse {
 }
 
 /**
- * Response for GET /api/sessions/{id}/guided/tutorial-sample
- * (sessions/schemas.py — TutorialSampleResponse, p4 Task 8a).
- *
- * Runtime-derived inputs for the tutorial worked example: the 3 synthetic
- * sample-page URLs (`sample_urls`) computed from the active tutorial session's
- * resolved origin and appended to the locked STEP_1 prompt so the source driver
- * can parse the runtime-served addresses.
- *
- * No `allowed_hosts` is carried: the synthetic pages are publicly hosted, so the
- * tutorial's web_scrape node relies on the plugin default
- * `allowed_hosts="public_only"` — the client never sets an SSRF allowlist.
- */
-export interface TutorialSampleResponse {
-  sample_urls: string[];
-}
-
-/**
  * Request body for POST /api/sessions/{id}/guided/chat (schemas.py — GuidedChatRequest).
  *
  * The server derives the stage from the checkpoint occurrence identified by
