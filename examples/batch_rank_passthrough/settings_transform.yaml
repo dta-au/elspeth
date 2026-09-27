@@ -8,8 +8,8 @@
 # paths. The plugin, its rows and the routing are the same, and so are the two
 # CSV files. What differs is the lineage: in transform mode each source token
 # ENDS at the aggregation (consumed into the batch) and every row the flush
-# emits is a NEW child token whose parent is the token that triggered the
-# flush. The README's audit queries show both runs side by side.
+# emits is a NEW child token whose parent is the batch's first buffered token.
+# The README's audit queries show both runs side by side.
 
 sources:
   candidates:
