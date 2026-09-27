@@ -553,7 +553,9 @@ drained and repair this release forward.
   `blob_csv_expand`, `blob_json_expand`, `blob_text_expand` and
   `pdf_rasterize` no longer echo a malformed `blob_ref` (arbitrary row text)
   in their `invalid_blob_ref` reason; a well-formed payload-store hash is
-  still named where it identifies the stored blob.
+  still named where it identifies the stored blob. `reference_join` no longer
+  records the row's join key (`reference_key_value`, and the key inside the
+  miss message); the reason names the key field.
 
 ### Newly refused configurations
 

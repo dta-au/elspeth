@@ -199,8 +199,10 @@ class TestMissPolicy:
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "reference_miss"
-        assert result.reason["reference_key_value"] == "gloves"
         assert result.reason["unresolved_fields"] == ["product_description"]
+        # The join key is row data: named by field, never by value.
+        assert result.reason["field"] == "product"
+        assert "gloves" not in repr(result.reason)
 
     def test_key_miss_writes_null(self, ctx: "PluginContext") -> None:
         transform = build(on_miss="null")
@@ -232,6 +234,7 @@ class TestMissPolicy:
         assert result.reason["reason"] == "reference_miss"
         assert result.reason["unresolved_fields"] == ["tax_rate"]
         assert "did not resolve" in result.reason["error"]
+        assert "socks" not in repr(result.reason)
 
     def test_unresolved_path_nulls_only_that_field(self, ctx: "PluginContext") -> None:
         transform = build(

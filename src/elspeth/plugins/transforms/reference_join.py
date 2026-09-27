@@ -549,7 +549,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a864826e20d79d4a"
+    source_file_hash: str | None = "sha256:46245d6f287224d6"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -688,12 +688,13 @@ class ReferenceJoin(BaseTransform):
                     {
                         "reason": "reference_miss",
                         "field": self._key_field,
-                        "reference_key_value": key,
                         "unresolved_fields": missed,
+                        # The join key is row data: it stays in the row carrier,
+                        # never in the reason (the key field is named above).
                         "error": (
-                            f"no reference entry for {key!r}{self._reference_origin}"
+                            f"no reference entry for the row's {self._key_field!r}{self._reference_origin}"
                             if entry is None
-                            else f"reference entry {key!r}{self._reference_origin} did not resolve {missed}"
+                            else f"the reference entry for the row's {self._key_field!r}{self._reference_origin} did not resolve {missed}"
                         ),
                     },
                     retryable=False,

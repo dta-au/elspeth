@@ -806,7 +806,6 @@ class TransformErrorReason(TypedDict):
     rows_skipped: NotRequired[int]  # Actual rows skipped before exhaustion
 
     # Reference-table join context (reference_join)
-    reference_key_value: NotRequired[str]  # The row's join key, as matched against the table
     unresolved_fields: NotRequired[list[str]]  # Output fields the lookup could not produce
 
     # PDF rasterization context
