@@ -1472,6 +1472,65 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     assert not any(str(_NON_CANONICAL_SUM).encode() in payload for payload in payloads)
 
 
+_NON_CANONICAL_SOURCE_INT = 9_182_737_777_777_777_777_777_777_777_777
+
+
+def test_a_source_row_the_ingest_hash_refuses_ends_the_run_without_the_value(tmp_path: Any) -> None:
+    """The fourth non-canonical seam: a VALID source row hashed at ingest (C3 fix round 1).
+
+    A json source passes an integer beyond the JSON safe range as a valid row;
+    the ingest transaction's hash refuses it and the run ends (the source's
+    contract breach). rfc8785's own text is the integer, and it reached the
+    source operation's error and the printed traceback. The violation names the
+    row index, withholds the observed (data-derived) field name, and carries
+    neither the value nor a chained cause.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    (tmp_path / "input.jsonl").write_text('{"id": 1, "n": ' + str(_NON_CANONICAL_SOURCE_INT) + "}\n")
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code not in (0, cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1]), cli.output
+    assert (
+        "Source 'json' emitted a valid row with non-canonical data at emitted row 0, in a field its output schema does not declare (IntegerDomainError)."
+        in cli.output
+    )
+    assert str(_NON_CANONICAL_SOURCE_INT) not in cli.output
+    assert "direct cause" not in cli.output
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    # Positive control: the violation text reaches the very cell the leak reached.
+    assert ("operations", "error_message") in _audit_cells_containing(db, "emitted a valid row with non-canonical data")
+    assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == []
+
+
 # ---------------------------------------------------------------------------
 # The batch plugins' own row checks (elspeth-5887fb7928 plugin half, and the
 # collision ruling on elspeth-d90495084c): a wrong-typed value, or a row that

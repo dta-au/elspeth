@@ -581,6 +581,11 @@ drained and repair this release forward.
   returns an unconfigured route label or a value that is not a bool or string
   no longer records a preview or a hash of that value (a short value printed
   whole); the failure names its type, a string's length and the condition.
+  A source that passes an integer beyond the JSON safe range as a valid row
+  still ends the run at ingest, but the failure (the source operation's error
+  and the printed traceback) no longer is that integer: it names the row
+  index, a declared field and the error type, as the transform, aggregation
+  and collector seams already did.
 
 ### Newly refused configurations
 

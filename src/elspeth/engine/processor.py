@@ -19,6 +19,8 @@ from hashlib import sha256
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+from rfc8785 import CanonicalizationError
+
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import (
     AggregationMemberAction,
@@ -180,6 +182,7 @@ from elspeth.engine.executors import (
     TransformExecutor,
 )
 from elspeth.engine.executors.declaration_dispatch import run_batch_flush_checks, run_boundary_checks
+from elspeth.engine.executors.non_canonical_output import non_canonical_source_row_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard, stamped_node_state_id
 from elspeth.engine.executors.transform import record_transform_error_with_routing
 from elspeth.engine.retry import RetryManager
@@ -3055,15 +3058,31 @@ class RowProcessor:
         )
 
         # Source ingest always uses the acquired leader's fenced transaction.
-        preclaimed = self._ingest_source_row_with_initial_claim(
-            item=initial_item,
-            source_node_id=effective_source_node_id,
-            row_index=row_index,
-            source_row_index=source_row_index,
-            ingest_sequence=ingest_sequence,
-            data=pipeline_row.to_dict(),
-            source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
-        )
+        try:
+            preclaimed = self._ingest_source_row_with_initial_claim(
+                item=initial_item,
+                source_node_id=effective_source_node_id,
+                row_index=row_index,
+                source_row_index=source_row_index,
+                ingest_sequence=ingest_sequence,
+                data=pipeline_row.to_dict(),
+                source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
+            )
+        except CanonicalizationError as exc:
+            # The ingest transaction hashes the valid row (a valid row is
+            # trusted canonical, so this is the source's contract breach and
+            # the run ends). rfc8785's text is the offending value itself
+            # (``<the integer> exceeds safe integer domain``), so it is never
+            # the message and never chained: the abort prints the traceback.
+            # Caught by rfc8785's class, not the (TypeError, ValueError) the
+            # other non-canonical seams catch: they wrap only a hash call,
+            # this wraps a whole fenced transaction.
+            raise non_canonical_source_row_violation(
+                producer=f"Source {effective_source_plugin.name!r}" if effective_source_plugin is not None else "Source",
+                declared_fields=(effective_source_plugin.output_schema.model_fields if effective_source_plugin is not None else ()),
+                row=pipeline_row,
+                exc=exc,
+            ) from None
         return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)
 
     def process_existing_row(
