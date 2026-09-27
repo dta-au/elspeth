@@ -1614,11 +1614,11 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
 
     Input-side twin of ``validate_transform_output_field_collisions``. A
     transform's ``declared_input_fields`` are fields it REQUIRES on every
-    arriving row; ``DeclaredRequiredFieldsContract.pre_emission_check``
-    (engine/executors/declared_required_fields.py) subtracts them from the
-    row's effective fields and raises ``DeclaredRequiredInputFieldsViolation``
-    before ``process()`` runs. A declaration the upstream cannot satisfy
-    therefore fails 100% of rows, first row onward — a pipeline
+    arriving row; the executor subtracts them from the row's effective fields
+    before ``process()`` runs and refuses the row on a miss (routed, or the
+    Tier-1 ``DeclaredRequiredInputFieldsViolation`` for a proven field — see
+    below). A declaration the upstream certainly cannot satisfy therefore
+    fails 100% of rows, first row onward — a pipeline
     *configuration* error, so it belongs on the build-time surface both
     ``elspeth run`` and the web ``POST /validate`` reach (elspeth-ada5a60249).
 
@@ -1654,10 +1654,15 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
       reject more. ``closed`` derives from ``SchemaConfig.allows_extra_fields``
       — the extras-firewall authority the contract layer owns.
 
-    An upstream that is abstaining OR open stays enforced per-row by the
-    executor contract (``DeclaredRequiredFieldsContract.pre_emission_check``),
+    An upstream that is abstaining OR open is settled per row by the executor,
     so nothing is unguarded — enforcement moves to the surface that can see
-    the row, which is the only surface that can settle a dynamic schema.
+    the row, which is the only surface that can settle a dynamic schema. The
+    executor classifies a row's miss against the PROOF this same walk yields
+    (``declared_input_disposition``; ADR-013 Amendment 2026-09-27): a field
+    the build proved present, or one the payload carries while the contract
+    lost it, still meets ``DeclaredRequiredFieldsContract`` and aborts (Tier
+    1); an unproven field the row does not carry is a fact about that row and
+    is routed through ``on_error`` (``missing_field``).
 
     ``_live_predecessors`` filters DIVERT edges for the same never-reject-a-
     runnable-pipeline reason the output twin cites, reached by the opposite

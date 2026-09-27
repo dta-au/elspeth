@@ -160,9 +160,11 @@ drained and repair this release forward.
   with `declared_field_is_header_spelling` — write `field: price`; and a
   conversion field is now a declared input, so one no
   row carries is refused at build against a `fixed` upstream and otherwise
-  ends the run as a `DeclaredRequiredInputFieldsViolation` with the row's
-  outcome recorded (it was routed `missing_field`), as `web_scrape`'s
-  `url_field` always has. The named scan `fields` of `keyword_filter` and
+  routes each row lacking it as `missing_field`, as before (see the
+  declared-input bullet below). The same holds for `json_explode`'s
+  `array_field`, now a declared input: `array_field: Name` over header `Name`
+  resolved by lookup and now routes every row with
+  `declared_field_is_header_spelling` — write `array_field: name`. The named scan `fields` of `keyword_filter` and
   of the Bedrock and Azure content-safety and prompt-shield guardrails are
   declarations too: `fields: [Count]` over a source typing `count` as `int`
   passed `elspeth validate` (while `fields: [count]` was refused as a
@@ -325,6 +327,30 @@ drained and repair this release forward.
   disagrees with its group's verdict is refused as audit corruption. A
   collector plugin's returned error is now scrubbed and stored structurally
   on the flush state, as the aggregation seam already did.
+- **A row missing an input field a transform's options name is routed, not
+  a run-ending error.** Behind an observed or open upstream the build cannot
+  prove that a field a transform derives from its options is present, so a
+  row lacking it used to end the run with exit 4
+  (`DeclaredRequiredInputFieldsViolation`, or a raw `KeyError` in
+  `json_explode`). Such a row is now refused before the transform runs and
+  routed through `on_error` with reason `missing_field`, naming only the
+  configured fields, never a row value (ADR-013 Amendment 2026-09-27). This
+  covers `field_mapper` mapping sources, `reference_join` `key_field`,
+  `blob_csv_expand` and `blob_json_expand` (`text_field`, `blob_ref_field`,
+  `content_type_field`), `blob_text_expand`, `pdf_rasterize` and
+  `aws_textract_inline_analysis` `blob_ref_field`,
+  `aws_textract_document_analysis` `key_field`/`bucket_field`/`version_field`,
+  `azure_document_intelligence` `source_field`, `rag_retrieval` and
+  `azure_ai_search` `query_field`, `blob_fetch` and `web_scrape` `url_field`,
+  `llm` `image_inputs` columns, and `json_explode` `array_field`. A field the build did prove present (every upstream
+  guarantees it), or one the row carries while its contract lost it, is still
+  our defect and ends the run. Aggregations and collectors classify a buffered
+  row's missing `schema.required_fields` column with the same rule: an
+  unproven absence fails the batch through `on_error`, and a proven one ends
+  the run with every buffered aggregation row recorded `failed` first. An
+  `llm` `image_inputs` entry marked `required: false` is no longer treated as
+  a required input, so a row without that image is sent without it instead of
+  being refused.
 - **A batch mixing rows with and without an optional field no longer ends
   the run.** A `batch_replicate` batch where some rows carry `copies_field`
   and others do not (each of those uses `default_copies`) used to end the run
@@ -584,7 +610,8 @@ These ran and delivered rows before:
   `HeaderSpelledDeclarationViolation` and every token's outcome recorded.
   Before, the declaration was ignored (`value_transform` or sink `Name:
   int?`, `batch_stats` `group_by: Name`) or matched by lookup (`type_coerce`
-  `field: Price`, `keyword_filter` `fields: [Count]`), and every row was
+  `field: Price`, `keyword_filter` `fields: [Count]`, `json_explode`
+  `array_field: Name`), and every row was
   delivered. A `value_transform` target or `field_mapper` rename target
   spelled by the header of a differently spelled arriving field routes every
   row with `target_is_header_spelling` (refused with
@@ -597,10 +624,6 @@ These ran and delivered rows before:
   targets of one node that spell one another (`total`, then `Total`) are
   refused at configuration ("target 'Total' is a header spelling of target
   'total'"); before, both keys were written to the row.
-- **A `type_coerce` conversion field that some rows lack** ends the run
-  with `DeclaredRequiredInputFieldsViolation` at the first such row behind
-  an observed source, and is refused at build behind a `fixed` one. Before,
-  those rows were routed `missing_field` and the rest converted.
 - **A template test or read of a field the node does not declare** (the
   ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
   or a `row.source_row` column read through a `set` alias fails each row
