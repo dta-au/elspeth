@@ -92,15 +92,6 @@ entries:
     at module initialization. Absence selects the explicit portable fallback; no arbitrary
     attribute name or masquerader-controlled object is used.
 - path: src/elspeth/contracts/composer_llm_audit.py
-  qualname: ComposerChatTurn.to_dict
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e4b10dfc7bc9e8f0816a9d1aa93008ec5828fcaf5bdb9f5176c4fbbc67da076c
-  classification: reflection-owned-table
-  justification: Serializes the dataclass_fields table of this owned frozen audit
-    carrier; both the field names and receiver are ELSPETH-owned.
-- path: src/elspeth/contracts/composer_llm_audit.py
   qualname: ComposerLLMCall.to_dict
   kind: getattr
   occurrences: 1
@@ -338,19 +329,6 @@ entries:
     via getattr_static, which silently rejected valid forwarding exporters and vanished
     their delivery accounting). Do not re-litigate; do not "harden" back into a Protocol
     check.'
-- path: src/elspeth/web/composer/guided/chat_solver.py
-  qualname: _admit_deferred_intent_repair_thread
-  kind: getattr
-  occurrences: 5
-  probe_shapes:
-  - 1f69ba680d07143896dcd1151761f28d41183a680c756c9d25587c3c4363b392
-  - 1fab5e2cd0c15355ca00ce24014de2097c5214b46fced64132caf783125c91ae
-  - 8923dbae997288081cf903ae25b0685eaf68f4c703847ba2cc97e11ecc2138af
-  - a905194a017472185413fa6095a1c43d4c5fafccbba44e15c3720633640dda81
-  - ecb38be7903352a060352d3db42e1dbef66165c5dd79f830e3a0bc8101d31d76
-  classification: external-parse
-  justification: Sentinel-parses LiteLLM repair-thread objects, validates every retained
-    value, and constructs owned repair-thread carriers before downstream use.
 - path: src/elspeth/web/composer/provider_gateway.py
   qualname: _capture_composer_llm_completion_fields
   kind: getattr
@@ -1362,28 +1340,26 @@ entries:
     an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
     an absent name raises AttributeError and fails the test loudly; there is no sentinel
     and no fallback arm.'
-- path: tests/unit/web/sessions/guided_test_authority.py
-  qualname: DualFencedSessionServiceHarness._kw_writer._wrapped
+- path: tests/unit/web/sessions/session_test_authority.py
+  qualname: FencedSessionServiceHarness._kw_writer._wrapped
   kind: getattr
   occurrences: 1
   probe_shapes:
   - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
   classification: reflection-owned-table
-  justification: 'Test-harness writer factory (P4-E8 elspeth-9b14a7a804, reviewed
-    2026-09-05): getattr(super(), name) with the literal method name the factory was
-    called with, over the owned SessionServiceImpl base; an absent name raises AttributeError
-    at first call. Two-argument form, no sentinel.'
-- path: tests/unit/web/sessions/guided_test_authority.py
-  qualname: DualFencedSessionServiceHarness._run_writer._wrapped
+  justification: Test-harness writer factory dispatches a fixed literal method name
+    to the owned SessionServiceImpl base. The two-argument lookup raises on an
+    absent method; no external or masquerader-controlled object is accepted.
+- path: tests/unit/web/sessions/session_test_authority.py
+  qualname: FencedSessionServiceHarness._run_writer._wrapped
   kind: getattr
   occurrences: 1
   probe_shapes:
   - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
   classification: reflection-owned-table
-  justification: 'Test-harness writer factory (P4-E8 elspeth-9b14a7a804, reviewed
-    2026-09-05): getattr(super(), name) with the literal method name the factory was
-    called with, over the owned SessionServiceImpl base; an absent name raises AttributeError
-    at first call. Two-argument form, no sentinel.'
+  justification: Test-harness run-writer factory dispatches a fixed literal method
+    name to the owned SessionServiceImpl base. The two-argument lookup raises
+    on an absent method; no external or masquerader-controlled object is accepted.
 - path: tests/unit/web/sessions/test_archive_quarantine.py
   qualname: _inject_helper_fault_once
   kind: getattr
@@ -1452,20 +1428,3 @@ entries:
     an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
     an absent name raises AttributeError and fails the test loudly; there is no sentinel
     and no fallback arm.'
-- path: tests/unit/web/sessions/test_routes.py
-  qualname: TestLiteLLMErrorRedaction.test_guided_source_commit_failure_requires_tool_result_contract._ForgedToolResult.__getattr__
-  kind: dunder_getattr
-  occurrences: 1
-  probe_shapes:
-  - c24d9e914960e322d8a4059792ac0e6fadccb6fca8753a54d21fb83187423229
-  classification: approved-introspection
-  justification: 'The dynamic hook IS the subject under test, not a convenience. The
-    production helper `_guided_source_commit_failure_detail` (src/elspeth/web/sessions/routes/_helpers.py)
-    opens with `if type(tool_result) is not ToolResult: raise TypeError`, and this
-    test''s whole claim is that it reaches that raise WITHOUT touching a single attribute
-    of the forged object; the `__getattr__` that raises AssertionError is the tripwire
-    that makes a regression observable. It is not a forwarding delegate — it delegates
-    to nothing and resolves no name. Every explicit-contract alternative is strictly
-    weaker: per-field tripwire properties, `__slots__ = ()`, or a spec-bound mock
-    all let `getattr(obj, "<unenumerated name>", None)` return a default silently,
-    which is precisely the probe shape the test exists to forbid.'

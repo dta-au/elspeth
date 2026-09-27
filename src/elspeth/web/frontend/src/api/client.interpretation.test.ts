@@ -1,11 +1,3 @@
-/**
- * Tests for the Phase 5b interpretation-event client surface.
- *
- * Strategy mirrors client.guided.test.ts: spy on globalThis.fetch (NOT
- * vi.mock("./client")) so the real `parseResponse<T>()` + `authHeaders()`
- * code paths execute.  Consumer tests (stores/components) mock the
- * client module; producer tests exercise it.
- */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {

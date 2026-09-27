@@ -29,7 +29,7 @@ import { describe, expect, it } from "vitest";
 // fixed 19 real holes before this gate landed:
 //
 //   - A class whose element gets its chrome from a DEFINED co-class (.btn,
-//     .btn-compact, .guided-turn, .alert-banner-action, .link-button,
+//     .btn-compact, .alert-banner-action, .link-button,
 //     .message-row…) is a hook/identity token and needs no rule. Watch
 //     Button variant="bare": it emits ONLY the caller's className, so a bare
 //     Button whose classes are all undefined is a RAW UA-DEFAULT BUTTON —
@@ -69,7 +69,7 @@ const definedClasses = new Set(
 /**
  * Blank comments while preserving newlines (the primitiveCensus.test.ts
  * idiom): doc comments legitimately NAME class tokens ("see
- * .chat-panel-guided-log"), and a census that flagged prose would teach
+ * .chat-panel-messages"), and a census that flagged prose would teach
  * people to stop writing it. Same known-and-accepted limits as
  * primitiveCensus: an unterminated block-open inside a string could
  * over-strip, and the failure mode is a visible false finding, not a silent
@@ -186,12 +186,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "ack-card-submit-btn":
     "Button variant=primary hook — .btn/.btn-primary carry the chrome; the " +
     "token adds no treatment.",
-  "guided-explain-btn":
-    "Compact-Button hook; .btn-compact carries all chrome and " +
-    "ChatPanel.test.tsx queries the token as a selector.",
-  "guided-schema-edit-toggle":
-    "Bare Button whose chrome is the defined co-class .guided-turn-secondary " +
-    "— the house idiom for secondary guided controls; token is a hook.",
   "inline-source-fallback-prompt-accept":
     "Compact primary Button composing .btn-compact + .btn-primary (documented " +
     "in-file); the token is a per-instance hook.",
@@ -242,18 +236,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
     "Identity token on the resolve-confirmation bubble; the defined " +
     ".message-row/.message-row--assistant + .bubble co-classes carry the " +
     "treatment and tests query the data-testid.",
-  "guided-inspect-turn":
-    "Turn-identity hook; the shared defined .guided-turn co-class carries " +
-    "the card treatment (pattern across the guided turn family).",
-  "guided-single-select":
-    "Turn-identity hook; .guided-turn carries the card treatment.",
-  "guided-multi-select":
-    "Turn-identity hook; .guided-turn carries the card treatment.",
-  "guided-schema-form":
-    "Turn-identity hook; .guided-turn carries the card treatment.",
-  "guided-component-review":
-    "Turn-identity hook; .guided-turn carries the card and every child in " +
-    "the subtree has its own guided.css rule.",
   "composing-indicator":
     "Identity hook beside the defined .composing-row; also the base the " +
     "defined .composing-indicator--terminal compound builds on, and " +
@@ -289,10 +271,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
     "Tone modifier whose siblings only tint a glyph descendant; the neutral " +
     "branch renders no glyph, so there is nothing for a rule to tint. Base " +
     ".pipeline-validation-summary supplies the shared treatment.",
-  "wire-stage__blockers-list--issues":
-    "Constant (unconditional) modifier with no sibling variant anywhere; " +
-    "the defined base class carries the list treatment. Vestigial — delete " +
-    "the token rather than write a rule if it ever gets in the way.",
   // --- Text/layout members that inherit their whole treatment ------------
   "audit-icon-label":
     "Inner text span filling the .audit-icon chip; every visual property " +
@@ -317,16 +295,9 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "interpretation-review-confirmation-node":
     "Semantic <em> supplies the intended emphasis for the node the approval " +
     "bound to (elspeth-52be5924d7); the class adds no treatment of its own.",
-  "wire-review-route":
-    "Grouping span around the row's primary from→to text, which correctly " +
-    "renders in the list's base register; row rhythm comes from the defined " +
-    ".guided-wire-review li rule.",
   "discard-summary-reasons":
     "Span inside the defined .discard-summary-warning grid, which supplies " +
     "spacing, tint and type. Also recorded in executionClassNames.test.ts.",
-  "guided-proposal-revision-scope":
-    "Wrapping <label> whose text and nested <select> inherit the composer's " +
-    "form register; the control carries the visible chrome.",
   // --- Layout-neutral containers and grouping elements -------------------
   "run-diagnostics":
     "Disclosure container; collapsed state is the [hidden] attribute and " +
@@ -335,20 +306,10 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "inline-source-created-turn-header":
     "Layout-neutral <header> wrapper; the child .inline-source-created-turn-" +
     "facts rule supplies the whole layout.",
-  "chat-panel-guided-log":
-    "Live-region/focus container addressed by a React ref; scroll ownership " +
-    "belongs to .guided-authoring-scroll and each appended turn carries its " +
-    "own .guided-turn card.",
   "composing-status-summary":
     "role=status live-region boundary nested in the defined " +
     ".composing-working-view; its .composing-label child carries the text " +
     "treatment.",
-  "guided-readonly-graph__edges":
-    "SVG <g> grouping/z-order container with no box model; every edge child " +
-    "carries its own defined class.",
-  "guided-readonly-graph__nodes":
-    "SVG <g> grouping container; node children carry defined classes and " +
-    "positioning is per-node transform attributes, not CSS.",
 };
 
 const componentSources = walkProductTsxFiles(srcRoot).map((path) => ({
@@ -372,10 +333,6 @@ describe("every emitted class name is backed by a stylesheet (elspeth-729872658a
   });
 
   it("does not read comparison operands or comments as class names", () => {
-    // Pins the two extractor behaviours that separate this gate from the
-    // catalog prototype: ternary-condition operands ("failed"/"guided"
-    // shipped as phantom findings of the prototype extractor) and doc
-    // comments naming real class tokens.
     const ternary = classNamesIn(
       'const x = <a className={copyState === "failed" ? "real-class" : undefined} />;',
     );

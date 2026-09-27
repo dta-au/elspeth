@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "@/stores/sessionStore";
-import { clearAllGuidedRetries } from "@/stores/guidedOperationRetry";
+import { clearAllSessionOperationRetries } from "@/stores/sessionOperationRetry";
 import fixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
 import emptyStateResponse from "../../../../../../tests/fixtures/web/composer/empty_composition_state_response.json";
 
 import { fetchCompositionState, fetchStateVersions, importCompositionYaml, revertToVersion } from "./client";
-import { decodeCompositionState } from "./guidedDecoder";
+import { decodeCompositionState } from "./compositionDecoder";
 
 function stateWithErrors(validation_errors: unknown) {
   return {
@@ -24,7 +24,7 @@ describe("composition state HTTP admission", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
     localStorage.clear();
-    clearAllGuidedRetries();
+    clearAllSessionOperationRetries();
   });
 
   const operations = [
@@ -109,17 +109,20 @@ describe("composition state HTTP admission", () => {
   it("stores a decoded revert response and refuses a malformed replacement", async () => {
     const current = decodeCompositionState(fixture.states.coded);
     useSessionStore.setState({ activeSessionId: "00000000-0000-4000-8000-000000000001", compositionState: null, error: null });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(new Response(JSON.stringify(current)))
-      .mockResolvedValueOnce(new Response("null", { status: 200 }))
-      .mockImplementation(async () => new Response(JSON.stringify({ events: [] })));
+    let revertCount = 0;
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).endsWith("/state/revert")) {
+        revertCount += 1;
+        return new Response(revertCount === 1 ? JSON.stringify(current) : JSON.stringify(stateWithErrors(["legacy"])));
+      }
+      return new Response(JSON.stringify({ events: [] }));
+    });
     await useSessionStore.getState().revertToVersion("state-1");
     expect(fetch).toHaveBeenCalledWith(
-      "/api/sessions/00000000-0000-4000-8000-000000000001/guided?probe=true",
-      expect.objectContaining({ method: "GET" }),
+      expect.stringContaining("/state/revert"),
+      expect.objectContaining({ method: "POST" }),
     );
     expect(useSessionStore.getState().compositionState).toEqual(current);
-    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(stateWithErrors(["legacy"]))));
     await useSessionStore.getState().revertToVersion("state-2");
     expect(useSessionStore.getState().compositionState).toEqual(current);
     expect(useSessionStore.getState().error).toContain("Failed to revert");

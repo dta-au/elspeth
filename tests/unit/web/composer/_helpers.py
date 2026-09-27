@@ -126,14 +126,14 @@ def _composer_service_with_session(catalog: CatalogService, settings: WebSetting
     from elspeth.web.sessions.schema import initialize_session_schema
     from elspeth.web.sessions.telemetry import build_sessions_telemetry
     from tests.unit.web.conftest import _make_session
-    from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+    from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
     engine = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     initialize_session_schema(engine)
     session_id = str(uuid4())
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id="test-user")
-    sessions = DualFencedSessionServiceHarness(
+    sessions = FencedSessionServiceHarness(
         engine,
         data_dir=Path(settings.data_dir),
         telemetry=build_sessions_telemetry(),

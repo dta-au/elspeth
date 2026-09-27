@@ -22,17 +22,17 @@ import yaml
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import CheckConstraint, insert
+from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord, BlobServiceProtocol, BlobStatus
+from elspeth.contracts.blobs import BlobRecord, BlobServiceProtocol, BlobStatus
 from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
 )
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSurfaceOrigin
-from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
@@ -56,11 +56,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.resolved import SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep, TerminalKind, TerminalReason, TerminalState
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
@@ -90,15 +86,8 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
-from elspeth.web.sessions._guided_step_chat import (
-    _MODEL_SHAPE_REJECTED_MESSAGE,
-    GuidedStepChatOnlyResult,
-    Step1SourceResolvedResult,
-    StepChatResult,
-)
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
@@ -110,7 +99,6 @@ from elspeth.web.sessions.protocol import (
     MessageIngressFresh,
     SessionRecord,
     TransitionResponseSettlement,
-    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -119,7 +107,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # Sentinel empty state for mock composer responses
 _EMPTY_STATE = CompositionState(
@@ -296,44 +284,6 @@ def _ready_blob_record(
     )
 
 
-def _guided_chat_body(guided_response: Mapping[str, Any], message: str) -> dict[str, Any]:
-    turn = guided_response["next_turn"]
-    assert turn is not None
-    return {
-        "operation_id": str(uuid.uuid4()),
-        "turn_token": turn["turn_token"],
-        "message": message,
-    }
-
-
-def _start_live_guided_session(client: TestClient, session_id: uuid.UUID, intent: str) -> Any:
-    """Start the authoritative guided checkpoint used by later chat turns."""
-    response = client.post(
-        f"/api/sessions/{session_id}/guided/start",
-        json={"operation_id": str(uuid.uuid4()), "profile": "live", "intent": intent},
-    )
-    assert response.status_code == 200, response.json()
-    return response
-
-
-def _guided_respond_body(guided_response: Mapping[str, Any], **overrides: Any) -> dict[str, Any]:
-    turn = guided_response["next_turn"]
-    assert turn is not None
-    body = {
-        "operation_id": str(uuid.uuid4()),
-        "turn_token": turn["turn_token"],
-        "chosen": None,
-        "edited_values": None,
-        "custom_inputs": None,
-        "control_signal": None,
-        "proposal_id": None,
-        "draft_hash": None,
-        "edit_target": None,
-    }
-    body.update(overrides)
-    return body
-
-
 def _ready_readiness() -> ValidationReadiness:
     return ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[])
 
@@ -479,12 +429,11 @@ class _BlockingRecordingComposer:
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress=None,
-        guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         completion_gates=None,
     ) -> ComposerResult:
-        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates
 
         self.calls.append(
@@ -522,12 +471,11 @@ class _ProgressAwareComposer:
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress=None,
-        guided_terminal=None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         completion_gates=None,
     ) -> ComposerResult:
-        del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id, completion_gates
+        del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -747,25 +695,6 @@ class _ProgressRouteSessionService:
         self.current_state = record
         return record
 
-    async def commit_transition_response(
-        self,
-        *,
-        session_id: uuid.UUID,
-        expected_current_state_id: uuid.UUID | None,
-        state: CompositionStateData,
-        assistant_content: str,
-        raw_content: str | None,
-        session_operation_context: SessionOperationContext,
-    ) -> TransitionResponseSettlement:
-        return await self.commit_composition_response(
-            session_id=session_id,
-            expected_current_state_id=expected_current_state_id,
-            state=state,
-            assistant_content=assistant_content,
-            raw_content=raw_content,
-            session_operation_context=session_operation_context,
-        )
-
     async def commit_composition_response(
         self,
         *,
@@ -843,47 +772,6 @@ def _make_progress_route_app(
     return app, service
 
 
-async def _insert_legacy_composition_state(
-    service: SessionServiceImpl,
-    session_id: uuid.UUID,
-    state: CompositionStateData,
-    *,
-    provenance: str,
-    version: int = 1,
-) -> None:
-    """Seed a composition_states row exactly as a pre-gate deployment persisted it.
-
-    ``save_composition_state`` now refuses an active guided pair whose reviewed
-    custody cannot bind (elspeth-4c442aaaa8), so tests that pin the READ-side
-    rejection of such a row have to bypass the write boundary.
-    """
-    from elspeth.web.sessions.service import _enveloped_state_column
-
-    def _sync() -> None:
-        with service._engine.begin() as conn:
-            conn.execute(
-                insert(composition_states_table).values(
-                    id=str(uuid.uuid4()),
-                    session_id=str(session_id),
-                    version=version,
-                    source=None,
-                    sources=_enveloped_state_column(state.sources),
-                    nodes=_enveloped_state_column(state.nodes),
-                    edges=_enveloped_state_column(state.edges),
-                    outputs=_enveloped_state_column(state.outputs),
-                    metadata_=_enveloped_state_column(state.metadata_),
-                    is_valid=state.is_valid,
-                    validation_errors=serialize_composition_validation_errors(state.validation_errors),
-                    composer_meta=_enveloped_state_column(state.composer_meta),
-                    derived_from_state_id=None,
-                    provenance=provenance,
-                    created_at=datetime.now(UTC),
-                )
-            )
-
-    await run_sync_in_worker(_sync)
-
-
 def _make_app(
     tmp_path: Path,
     user_id: str = "alice",
@@ -914,7 +802,7 @@ def _make_app(
             identity_token_quota_configured=True,
             secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash,
         )
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
@@ -1066,7 +954,7 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    app.state.session_service = DualFencedSessionServiceHarness(
+    app.state.session_service = FencedSessionServiceHarness(
         engine,
         telemetry=app.state.sessions_telemetry,
         log=structlog.get_logger("test"),
@@ -1288,7 +1176,6 @@ def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
         service.get_authoritative_composition_proposal(
             session_id=session_id,
             proposal_id=proposal.id,
-            reviewed_facts=None,
         )
     ).row
     assert (response.status_code, persisted.status) == (422, "rejected"), response.text
@@ -1343,9 +1230,7 @@ def test_accept_failed_proposal_uses_only_the_rejection_detail(tmp_path, monkeyp
         f"The composer's proposed change could not be applied: {expected} "
         "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
     )
-    persisted = asyncio.run(
-        service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=proposal.id, reviewed_facts=None)
-    ).row
+    persisted = asyncio.run(service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=proposal.id)).row
     assert persisted.status == "rejected"
 
 
@@ -1359,7 +1244,7 @@ async def _create_canonical_pipeline_route_proposal(
     with_review_site: bool = False,
 ) -> tuple[FastAPI, SessionServiceImpl, dict[str, Any], uuid.UUID, Any, str]:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -1438,12 +1323,8 @@ async def _create_canonical_pipeline_route_proposal(
     proposal = PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     row = await _create_test_pipeline_composition_proposal(
         service,
@@ -1821,7 +1702,6 @@ async def test_cancel_after_pipeline_commit_still_surfaces_durable_review_eviden
     persisted = await service.get_authoritative_composition_proposal(
         session_id=session_id,
         proposal_id=proposal.id,
-        reviewed_facts=None,
     )
     assert persisted.row.status == "committed"
     assert surfaced.is_set()
@@ -2094,7 +1974,6 @@ async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
-        reviewed_facts={},
     )
     recovery = await service.get_pipeline_dispatch_recovery(authority=authority)
     assert recovery is not None
@@ -2243,7 +2122,7 @@ def test_canonical_pipeline_accept_terminalizes_audited_executor_failure(
 
     assert response.status_code == 422, response.text
     assert asyncio.run(service.get_current_state(session_id)) is None
-    terminal_row = asyncio.run(service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=row.id, reviewed_facts={}))
+    terminal_row = asyncio.run(service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=row.id))
     assert terminal_row.row.status == "rejected"
     events = asyncio.run(service.list_proposal_events(session_id))
     assert events[-1].payload["reason_code"] == reason_code
@@ -2541,7 +2420,7 @@ async def test_canonical_pipeline_cancel_then_settlement_failure_preserves_cance
 
 def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monkeypatch) -> None:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -2586,12 +2465,8 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     proposal_envelope = PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     plan = PipelinePlanResult(
         proposal=proposal_envelope,
@@ -2771,101 +2646,12 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
     assert await service.get_current_state(session_id) is None
 
 
-@pytest.mark.parametrize(
-    "surface",
-    [
-        pytest.param(PlannerSurface.GUIDED_STAGED, id="GUIDED_STAGED"),
-        pytest.param(PlannerSurface.TUTORIAL_PROFILE, id="TUTORIAL_PROFILE"),
-    ],
-)
-def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_path, monkeypatch, surface: PlannerSurface) -> None:
-    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
-    from elspeth.web.composer.redaction import redact_tool_call_arguments
-    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-
-    app, service = _make_app(tmp_path)
-    pipeline = {"sources": {}, "nodes": [], "edges": [], "outputs": []}
-    proposal_envelope = PipelineProposal.create(
-        pipeline=pipeline,
-        base=AbsentBase(),
-        reviewed_facts={"checkpoint": "server-owned"},
-        surface=surface,
-        repair_count=0,
-        skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
-    )
-    plan = PipelinePlanResult(
-        proposal=proposal_envelope,
-        tool_call_id=f"{surface.name.lower()}-call",
-        custody_result="not_required",
-        model_identifier="planner-model",
-        model_version="planner-model-v1",
-        provider="test",
-    )
-    client = TestClient(app)
-    session = client.post("/api/sessions", json={"title": "Guided pipeline"}).json()
-    session_id = uuid.UUID(session["id"])
-    row = asyncio.run(
-        _create_test_pipeline_composition_proposal(
-            service,
-            session_id=session_id,
-            plan=plan,
-            summary="Replace the pipeline.",
-            rationale="Requested by the guided workflow.",
-            affects=("graph",),
-            arguments_redacted_json=redact_tool_call_arguments(
-                "set_pipeline",
-                pipeline,
-                telemetry=NoopRedactionTelemetry(),
-            ),
-            actor="composer-web:user:alice",
-            composer_model_identifier="planner-model",
-            composer_model_version="planner-model-v1",
-            composer_provider="provider",
-        )
-    )
-    from elspeth.web.sessions.routes.composer import pipeline_settlement
-
-    prepare = AsyncMock(
-        spec=pipeline_settlement.prepare_pipeline_proposal_commit,
-        side_effect=AssertionError("generic route dispatched guided proposal"),
-    )
-    monkeypatch.setattr(
-        "elspeth.web.sessions.routes.composer.pipeline_settlement.prepare_pipeline_proposal_commit",
-        prepare,
-    )
-
-    response = client.post(
-        f"/api/sessions/{session['id']}/proposals/{row.id}/accept",
-        json={"draft_hash": proposal_envelope.draft_hash},
-    )
-
-    assert response.status_code == 409
-    prepare.assert_not_awaited()
-    assert asyncio.run(service.get_current_state(session_id)) is None
-    assert asyncio.run(service.get_messages(session_id, limit=None)) == []
-    assert (asyncio.run(service.list_composition_proposals(session_id)))[0].status == "pending"
-
-    rejected = client.post(
-        f"/api/sessions/{session['id']}/proposals/{row.id}/reject",
-        json={},
-    )
-
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"] == "This pipeline proposal must be rejected through its guided workflow."
-    events = asyncio.run(service.list_proposal_events(session_id))
-    assert [event.event_type for event in events] == ["proposal.created"]
-    assert (asyncio.run(service.list_composition_proposals(session_id)))[0].status == "pending"
-
-
 def test_malformed_canonical_creation_event_fails_closed_without_legacy_fallback(tmp_path, monkeypatch) -> None:
     from sqlalchemy import select, update
 
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
     from elspeth.web.sessions.models import proposal_events_table
@@ -2875,12 +2661,8 @@ def test_malformed_canonical_creation_event_fails_closed_without_legacy_fallback
     proposal_envelope = PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     plan = PipelinePlanResult(
         proposal=proposal_envelope,
@@ -3108,10 +2890,8 @@ def test_accept_inline_blob_proposal_without_composer_provenance_fails_closed(tm
 def test_accept_refuses_server_provider_proposal_provenance(tmp_path, monkeypatch) -> None:
     """provider='server' is never valid proposal provenance (elspeth-b4a286d517).
 
-    The guided synthesis gate that wrote it is deleted; no code path can stage
-    such a row any more, so one that carries it is invalid provenance — not
-    merely legacy-incomplete — and acceptance must refuse it even though every
-    provenance field is present and non-null.
+    A server-authored row is invalid provenance even when every provenance
+    field is present and non-null.
     """
     from elspeth.web.catalog.schemas import PluginSchemaInfo
 
@@ -3169,8 +2949,8 @@ def test_accept_refuses_server_provider_proposal_provenance(tmp_path, monkeypatc
             base_state_id=None,
             actor="composer-web:user:alice",
             user_message_id=user_message.id,
-            composer_model_identifier="composer-guided-passthrough-synthesis",
-            composer_model_version="composer.guided-passthrough-synthesis.v1",
+            composer_model_identifier="composer-server-synthesis",
+            composer_model_version="composer.server-synthesis.v1",
             composer_provider="server",
             composer_skill_hash="deadbeef" * 8,
             tool_arguments_hash="feedface" * 8,
@@ -3610,7 +3390,7 @@ class TestSessionCRUDRoutes:
         ) as client:
             create_resp = await client.post("/api/sessions", json={"title": "Archive Failure"})
             session_id = create_resp.json()["id"]
-            admission_key = f"{session_id}:guided-respond-admission"
+            admission_key = str(session_id)
             admission = await registry.get_lock(admission_key)
 
             service.archive_session = AsyncMock(spec=service.archive_session, side_effect=RuntimeError("archive unavailable"))  # type: ignore[method-assign]
@@ -4216,22 +3996,6 @@ class TestIDORCoverageDrift:
             "get_state_yaml",
             "import_state_yaml",
             "fork_from_message",
-            "get_guided",
-            "post_guided_start",
-            "post_guided_reenter",
-            "post_guided_respond",
-            "post_guided_chat",
-            # Guided-start reconciliation is session-scoped and admits or
-            # rejects a caller-supplied operation id only after proving the
-            # caller owns this session.
-            "reconcile_guided_start_operation",
-            # Freeform→guided convert endpoint (``POST /api/sessions/
-            # {session_id}/guided/convert``, elspeth-e2c3dba6b5). Gates on
-            # ``_verify_session_ownership`` like every other session-scoped
-            # guided route; the inventory entry was missed when the endpoint
-            # landed and caught by this drift-guard during the 0.7.1 review
-            # sweep.
-            "post_guided_convert",
             # Phase 5b Task 6 / Task 7: interpretation event HTTP surface
             # (resolve / list) and opt-out endpoints, added in
             # ``sessions/routes.py`` and gated through
@@ -4330,10 +4094,10 @@ class TestIDORCoverageDrift:
     def test_sessions_routes_ownership_call_sites(self) -> None:
         """sessions/routes/ — _verify_session_ownership inventory."""
         from elspeth.web.sessions.routes import interpretation, messages, runs, sessions
-        from elspeth.web.sessions.routes.composer import compose, guided, proposals, state
+        from elspeth.web.sessions.routes.composer import compose, proposals, state
 
         found = set()
-        for routes_module in (sessions, state, proposals, compose, guided, messages, runs, interpretation):
+        for routes_module in (sessions, state, proposals, compose, messages, runs, interpretation):
             found.update(_collect_ownership_call_site_identities(routes_module, "_verify_session_ownership"))
         self._assert_inventory(
             "sessions/routes/",
@@ -4458,11 +4222,7 @@ class TestIDORProtection:
     - ``GET  /{session_id}/state/yaml``      (get_state_yaml)
     - ``POST /{session_id}/state/yaml``      (import_state_yaml)
     - ``POST /{session_id}/fork``            (fork_from_message)
-    - ``GET  /{session_id}/guided``          (get_guided)
     - ``POST /{session_id}/state/e2e-seed``  (seed_state_for_e2e)
-    - ``POST /{session_id}/guided/reenter``  (post_guided_reenter)
-    - ``POST /{session_id}/guided/respond``  (post_guided_respond)
-    - ``POST /{session_id}/guided/chat``     (post_guided_chat)
 
     Counter-test: alice's own access continues to return 200 at the end,
     guarding against the regression where an over-eager 404 breaks
@@ -4480,7 +4240,7 @@ class TestIDORProtection:
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
             ensure_test_identity(conn, identity_id="bob")
-        service = DualFencedSessionServiceHarness(
+        service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -4640,69 +4400,6 @@ class TestIDORProtection:
         )
         assert resp.status_code == 404
 
-        # Bob tries to GET guided state -- should be 404.  The guided
-        # endpoint reveals wizard step, history, and pending turn payloads.
-        # An ownership bypass would let an attacker read Alice's pipeline
-        # wizard state without authorization.  The ownership check in
-        # ``get_guided`` runs before the compose lock or catalog access.
-        resp = bob_client.get(f"/api/sessions/{session_id}/guided")
-        assert resp.status_code == 404
-
-        # Bob tries to POST guided/start -- should be 404. The start entry
-        # endpoint (P6.4) constructs a server-owned WorkflowProfile and seeds
-        # the guided session; an ownership bypass would let an attacker
-        # re-seed / reset the profile and CompositionState of Alice's session.
-        # A VALID body is sent so the request reaches the in-handler ownership
-        # check (a missing body would 422 at FastAPI validation first); with a
-        # valid body, the ownership check returns 404 for the non-owner.
-        resp = bob_client.post(
-            f"/api/sessions/{session_id}/guided/start",
-            json={"profile": "live", "operation_id": str(uuid.uuid4())},
-        )
-        assert resp.status_code == 404
-
-        # Bob tries to POST guided/reenter -- should be 404. Re-entry is
-        # a mode transition that can reveal and mutate Alice's guided
-        # session terminal state if ownership is bypassed.
-        resp = bob_client.post(
-            f"/api/sessions/{session_id}/guided/reenter",
-            json={"operation_id": str(uuid.uuid4())},
-        )
-        assert resp.status_code == 404
-
-        # Bob tries to POST guided/respond — should be 404.  The respond
-        # endpoint can mutate pipeline state by driving step handlers.
-        # An ownership bypass would let an attacker submit guided responses
-        # against Alice's session and corrupt her pipeline state.  The
-        # ownership check in ``post_guided_respond`` runs before any state
-        # load or dispatch.
-        resp = bob_client.post(
-            f"/api/sessions/{session_id}/guided/respond",
-            json={
-                "operation_id": str(uuid.uuid4()),
-                "turn_token": None,
-                "control_signal": "exit_to_freeform",
-            },
-        )
-        assert resp.status_code == 404
-
-        # Bob tries to POST guided/chat — should be 404.  Phase A slice 3
-        # introduced the per-step chat endpoint; it sends user-typed text to
-        # an LLM scoped to Alice's session step, costing LLM credits and
-        # surfacing Alice's wizard step in the reply path.  Slice 5 also
-        # made it mutate chat_history on the GuidedSession (an audit-write).
-        # An ownership bypass would let bob burn LLM budget against Alice's
-        # session AND inject conversational turns into her audit trail.
-        resp = bob_client.post(
-            f"/api/sessions/{session_id}/guided/chat",
-            json={
-                "operation_id": str(uuid.uuid4()),
-                "turn_token": "0" * 64,
-                "message": "hi",
-            },
-        )
-        assert resp.status_code == 404
-
         # Bob tries to POST state/e2e-seed — should be 404. The Playwright
         # seed endpoint is a full composition-state write; with the flag
         # enabled (see WebSettings above) an ownership bypass would let an
@@ -4795,7 +4492,7 @@ class TestSendMessageStateIdValidation:
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
             ensure_test_identity(conn, identity_id="bob")
-        service = DualFencedSessionServiceHarness(
+        service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -6196,497 +5893,6 @@ class TestMessageRoutes:
 
         assert send_resp.status_code == 500
 
-    def test_guided_chat_turn_persistence_failure_raises_on_success_path(self, tmp_path) -> None:
-        """Guided chat audit rows must not disappear after chat_history is persisted."""
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = []
-        app.state.catalog_service = catalog
-        client = TestClient(app, raise_server_exceptions=False)
-
-        resp = client.post("/api/sessions", json={"title": "Guided chat"})
-        session_id = uuid.UUID(resp.json()["id"])
-
-        guided_resp = _start_live_guided_session(client, session_id, "help me")
-
-        async def failing_settlement(*args: Any, **kwargs: Any) -> Any:
-            del args, kwargs
-            raise OperationalError("INSERT INTO composer_chat_turns", {}, Exception("db unavailable"))
-
-        service.settle_guided_state_operation = failing_settlement  # type: ignore[method-assign]
-
-        with patch(
-            "elspeth.web.sessions.routes.composer.guided._run_guided_chat_provider_attempt",
-            new=_async_return(
-                GuidedStepChatOnlyResult(
-                    chat=StepChatResult(
-                        assistant_message="Use the source form first.",
-                        status=ComposerChatTurnStatus.SUCCESS,
-                        latency_ms=7,
-                        error_class=None,
-                    ),
-                )
-            ),
-        ):
-            send_resp = client.post(
-                f"/api/sessions/{session_id}/guided/chat",
-                json=_guided_chat_body(guided_resp.json(), "help me"),
-            )
-
-        assert send_resp.status_code == 500
-
-    def test_client_disconnect_cancels_guided_chat_turn(self, tmp_path) -> None:
-        """A client disconnect mid-guided-chat must cancel the server turn.
-
-        Guided sibling of test_client_disconnect_cancels_compose_turn
-        (elspeth-b2d9e4d084): without the watcher, an aborted guided chat
-        (Stop button / SPA compose timeout / closed tab) left the step
-        solver running to completion as a zombie — burning LLM budget,
-        holding the per-session compose lock, and appending chat turns the
-        client never sees. The route's cancelled-path bookkeeping (shielded
-        cancelled progress publish + unwind audit drain) already existed;
-        the watcher supplies the missing trigger, and the 499 conversion
-        keeps the unwind quiet instead of an ASGI crash log per Stop click.
-        """
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = []
-        app.state.catalog_service = catalog
-        client = TestClient(app)
-        resp = client.post("/api/sessions", json={"title": "Guided chat"})
-        session_id = resp.json()["id"]
-        guided_resp = _start_live_guided_session(client, uuid.UUID(session_id), "help me")
-        chat_body = _guided_chat_body(guided_resp.json(), "help me")
-        state_versions_before = asyncio.run(service.get_state_versions(uuid.UUID(session_id)))
-        messages_before = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
-
-        async def drive() -> tuple[list[dict[str, Any]], bool]:
-            solver_started = asyncio.Event()
-            solver_cancelled = {"flag": False}
-
-            async def hanging_solver(*args: Any, **kwargs: Any) -> Any:
-                del args, kwargs
-                solver_started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    solver_cancelled["flag"] = True
-                    raise
-                raise AssertionError("unreachable — the solver never completes")
-
-            request_messages = [
-                {
-                    "type": "http.request",
-                    "body": json.dumps(chat_body).encode(),
-                    "more_body": False,
-                }
-            ]
-            sent: list[dict[str, Any]] = []
-
-            async def receive() -> dict[str, Any]:
-                if request_messages:
-                    return request_messages.pop(0)
-                # Second receive() is the disconnect watcher: report the
-                # client gone once the solver is running.
-                await solver_started.wait()
-                return {"type": "http.disconnect"}
-
-            async def send(message: dict[str, Any]) -> None:
-                sent.append(message)
-
-            scope = {
-                "type": "http",
-                "asgi": {"version": "3.0"},
-                "http_version": "1.1",
-                "method": "POST",
-                "scheme": "http",
-                "path": f"/api/sessions/{session_id}/guided/chat",
-                "raw_path": f"/api/sessions/{session_id}/guided/chat".encode(),
-                "query_string": b"",
-                "root_path": "",
-                "headers": [(b"content-type", b"application/json")],
-                "client": ("testclient", 50000),
-                "server": ("testserver", 80),
-            }
-            with patch(
-                # The fresh step-1 session takes the step-1 source-chat
-                # resolver (awaited inline in the route task), not the
-                # generic advisory solver.
-                "elspeth.web.sessions.routes.composer.guided._run_guided_chat_provider_attempt",
-                new=hanging_solver,
-            ):
-                # Pre-fix behaviour is an unbounded hang (nothing observes
-                # the disconnect); the wait_for turns that into a bounded
-                # failure.
-                await asyncio.wait_for(app(scope, receive, send), timeout=5.0)
-            return sent, solver_cancelled["flag"]
-
-        loop = asyncio.new_event_loop()
-        try:
-            sent, solver_cancelled = loop.run_until_complete(drive())
-        finally:
-            loop.close()
-
-        assert solver_cancelled, "guided chat solver must be cancelled when the client disconnects"
-        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
-        assert status == 499, f"disconnect-cancel must unwind as a quiet 499, got {status}"
-
-        from sqlalchemy import select
-
-        from elspeth.web.sessions.models import guided_operations_table
-
-        with service._engine.connect() as connection:
-            cancelled_operation = (
-                connection.execute(
-                    select(guided_operations_table).where(
-                        guided_operations_table.c.session_id == session_id,
-                        guided_operations_table.c.operation_id == chat_body["operation_id"],
-                    )
-                )
-                .mappings()
-                .one()
-            )
-        assert cancelled_operation["status"] == "failed"
-        # A client disconnect is a cancellation, not a server failure (#24).
-        assert cancelled_operation["failure_code"] == "request_cancelled"
-        assert cancelled_operation["originating_message_id"] is None
-        assert cancelled_operation["result_state_id"] is None
-        assert cancelled_operation["response_hash"] is None
-        assert asyncio.run(service.get_state_versions(uuid.UUID(session_id))) == state_versions_before
-        assert asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None)) == messages_before
-
-        from elspeth.web.sessions.routes.composer import guided
-
-        old_provider = AsyncMock(
-            spec=guided._run_guided_chat_provider_attempt,
-            side_effect=AssertionError("terminal replay called provider"),
-        )
-        with patch(
-            "elspeth.web.sessions.routes.composer.guided._run_guided_chat_provider_attempt",
-            new=old_provider,
-        ):
-            first_replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=chat_body)
-            second_replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=chat_body)
-
-        assert first_replay.status_code == second_replay.status_code == 499
-        assert first_replay.json() == second_replay.json()
-        assert first_replay.json()["detail"]["failure_code"] == "request_cancelled"
-        old_provider.assert_not_awaited()
-
-        retry_body = {**chat_body, "operation_id": str(uuid.uuid4())}
-        retry_provider = AsyncMock(
-            spec=guided._run_guided_chat_provider_attempt,
-            return_value=GuidedStepChatOnlyResult(
-                chat=StepChatResult(
-                    assistant_message="Use the current source form.",
-                    status=ComposerChatTurnStatus.SUCCESS,
-                    latency_ms=1,
-                    error_class=None,
-                ),
-            ),
-        )
-        with patch(
-            "elspeth.web.sessions.routes.composer.guided._run_guided_chat_provider_attempt",
-            new=retry_provider,
-        ):
-            intentional_retry = client.post(f"/api/sessions/{session_id}/guided/chat", json=retry_body)
-
-        assert intentional_retry.status_code == 200, intentional_retry.json()
-        retry_provider.assert_awaited_once()
-
-    def test_guided_chat_source_commit_failure_does_not_leak_tool_result_repr(self, tmp_path) -> None:
-        """Step-1 chat source commit failures must not return ToolResult reprs."""
-        from datetime import UTC, datetime
-
-        from elspeth.contracts.blobs import BlobRecord
-        from elspeth.contracts.enums import CreationModality
-        from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-        from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
-        from elspeth.web.composer.tools import ToolResult
-
-        app, _ = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = [
-            PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[]),
-        ]
-        catalog.list_sinks.return_value = []
-        catalog.get_schema.return_value = PluginSchemaInfo(
-            name="csv",
-            plugin_type="source",
-            description="CSV source",
-            json_schema={"title": "CSV", "type": "object", "properties": {}},
-            knob_schema={"fields": []},
-        )
-        app.state.catalog_service = catalog
-
-        async def fake_create_blob(
-            session_uuid,
-            filename,
-            content,
-            mime_type,
-            created_by="user",
-            source_description=None,
-            *,
-            session_operation_context,
-        ):
-            return BlobRecord(
-                id=uuid.uuid4(),
-                session_id=session_uuid,
-                filename=filename,
-                mime_type=mime_type,
-                size_bytes=len(content),
-                content_hash=None,
-                storage_path="blobs/test",
-                created_at=datetime.now(UTC),
-                created_by=created_by,
-                source_description=source_description,
-                status="ready",
-                creation_modality=CreationModality.VERBATIM,
-                created_from_message_id=None,
-                creating_model_identifier=None,
-                creating_model_version=None,
-                creating_provider=None,
-                creating_composer_skill_hash=None,
-                creating_arguments_hash=None,
-            )
-
-        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
-        app.state.blob_service.list_blobs.return_value = []
-        app.state.blob_service.create_blob.side_effect = fake_create_blob
-        client = TestClient(app, raise_server_exceptions=False)
-
-        resp = client.post("/api/sessions", json={"title": "Guided chat source failure"})
-        session_id = uuid.UUID(resp.json()["id"])
-        guided_resp = _start_live_guided_session(client, session_id, "Use this source")
-        raw_row_secret = "raw-customer-ssn-123-45-6789"
-        tool_result_private_detail = "REDACTED tool result detail"
-        failing_tool_result = ToolResult(
-            success=False,
-            updated_state=_EMPTY_STATE,
-            validation=ValidationSummary(is_valid=False, errors=()),
-            affected_nodes=(),
-            data={"internal_detail": tool_result_private_detail},
-        )
-
-        with (
-            patch(
-                "elspeth.web.sessions.routes.composer.guided._run_guided_chat_provider_attempt",
-                new=_async_return(
-                    Step1SourceResolvedResult(
-                        chat=StepChatResult(
-                            assistant_message="I created the source.",
-                            status=ComposerChatTurnStatus.SUCCESS,
-                            latency_ms=5,
-                            error_class=None,
-                        ),
-                        resolution=Step1SourceChatResolution(
-                            assistant_message="I created the source.",
-                            plugin="csv",
-                            filename="source.csv",
-                            mime_type="text/csv",
-                            content="name,value\nalice,1\n",
-                            options={"path": "inline://source.csv"},
-                            observed_columns=("name", "value"),
-                            sample_rows=({"name": raw_row_secret, "value": "1"},),
-                            on_validation_failure="discard",
-                        ),
-                        deferred_actions=(),
-                    )
-                ),
-            ),
-            patch(
-                "elspeth.web.sessions.routes.composer.guided._schema8_answer_and_project_next",
-                side_effect=InvariantError(f"{failing_tool_result!r} {raw_row_secret} {tool_result_private_detail}"),
-            ),
-        ):
-            send_resp = client.post(
-                f"/api/sessions/{session_id}/guided/chat",
-                json=_guided_chat_body(guided_resp.json(), "Use this source"),
-            )
-
-        # A broken owned transition aborts; it must not settle as user-fixable
-        # input. Its raw tool result can carry row data and stays out of HTTP.
-        assert send_resp.status_code == 500
-        body = send_resp.text
-        assert "ToolResult(" not in body
-        assert raw_row_secret not in body
-        assert tool_result_private_detail not in body
-
-    def test_guided_chat_malformed_source_tool_args_return_model_shape_rejection(self, tmp_path) -> None:
-        """Malformed Step-1 source resolver tool output must not escape as HTTP 500.
-
-        Since the GuidedToolArgumentShapeError reclassification, non-JSON tool
-        arguments are a MODEL defect with honest copy — not "unavailable".
-        """
-        from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = [
-            PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[]),
-        ]
-        catalog.list_sinks.return_value = []
-        catalog.get_schema.return_value = PluginSchemaInfo(
-            name="csv",
-            plugin_type="source",
-            description="CSV source",
-            json_schema={"title": "CSV", "type": "object", "properties": {}},
-            knob_schema={"fields": []},
-        )
-        app.state.catalog_service = catalog
-        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
-        app.state.blob_service.list_blobs.return_value = []
-        client = TestClient(app, raise_server_exceptions=False)
-
-        resp = client.post("/api/sessions", json={"title": "Guided malformed source tool args"})
-        session_id = uuid.UUID(resp.json()["id"])
-        assert client.get(f"/api/sessions/{session_id}/guided").status_code == 200
-        choose_source_resp = client.post(
-            f"/api/sessions/{session_id}/guided/respond",
-            json=_guided_respond_body(
-                client.get(f"/api/sessions/{session_id}/guided").json(),
-                chosen=["csv"],
-            ),
-        )
-        assert choose_source_resp.status_code == 200
-        assert choose_source_resp.json()["next_turn"]["type"] == "schema_form"
-
-        malformed_tool_response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        tool_calls=[
-                            SimpleNamespace(
-                                function=SimpleNamespace(
-                                    name="resolve_source",
-                                    arguments="{not-json",
-                                )
-                            )
-                        ]
-                    )
-                )
-            ]
-        )
-
-        with patch(
-            "litellm.acompletion",
-            new=_async_return(malformed_tool_response),
-        ):
-            send_resp = client.post(
-                f"/api/sessions/{session_id}/guided/chat",
-                json=_guided_chat_body(choose_source_resp.json(), "Use this CSV: name,value\\nalice,1"),
-            )
-
-        assert send_resp.status_code == 200
-        body = send_resp.json()
-        assert body["assistant_message"] == _MODEL_SHAPE_REJECTED_MESSAGE
-        assert body["guided_session"]["step"] == "step_1_source"
-        assert body["next_turn"]["turn_token"] == choose_source_resp.json()["next_turn"]["turn_token"]
-        app.state.blob_service.reserve_inline_custody.assert_not_called()
-
-        loop = asyncio.new_event_loop()
-        try:
-            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
-        finally:
-            loop.close()
-        llm_audit_rows = _llm_call_audit_rows(persisted)
-        assert len(llm_audit_rows) == 1
-        assert llm_audit_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.MALFORMED_RESPONSE.value
-        assert llm_audit_rows[0][1]["call"]["error_class"] == "GuidedToolArgumentShapeError"
-
-    def test_guided_chat_source_plugin_mismatch_returns_model_shape_rejection(self, tmp_path) -> None:
-        """Step-1 source resolver plugin mismatch must not commit source state."""
-        from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = [
-            PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[]),
-        ]
-        catalog.list_sinks.return_value = []
-        catalog.get_schema.return_value = PluginSchemaInfo(
-            name="csv",
-            plugin_type="source",
-            description="CSV source",
-            json_schema={"title": "CSV", "type": "object", "properties": {}},
-            knob_schema={"fields": []},
-        )
-        app.state.catalog_service = catalog
-        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
-        app.state.blob_service.list_blobs.return_value = []
-        client = TestClient(app, raise_server_exceptions=False)
-
-        resp = client.post("/api/sessions", json={"title": "Guided source plugin mismatch"})
-        session_id = uuid.UUID(resp.json()["id"])
-        assert client.get(f"/api/sessions/{session_id}/guided").status_code == 200
-        choose_source_resp = client.post(
-            f"/api/sessions/{session_id}/guided/respond",
-            json=_guided_respond_body(
-                client.get(f"/api/sessions/{session_id}/guided").json(),
-                chosen=["csv"],
-            ),
-        )
-        assert choose_source_resp.status_code == 200
-
-        valid_but_mismatched_args = json.dumps(
-            {
-                "resolution": "source",
-                "plugin": "json",
-                "filename": "source.csv",
-                "mime_type": "text/csv",
-                "content": "name,value\\nalice,1\\n",
-                "options": {},
-                "observed_columns": ["name", "value"],
-                "sample_rows": [{"name": "alice", "value": "1"}],
-                "assistant_message": "I created the source.",
-            }
-        )
-        mismatched_tool_response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        tool_calls=[
-                            SimpleNamespace(
-                                function=SimpleNamespace(
-                                    name="resolve_source",
-                                    arguments=valid_but_mismatched_args,
-                                )
-                            )
-                        ]
-                    )
-                )
-            ]
-        )
-
-        with patch(
-            "litellm.acompletion",
-            new=_async_return(mismatched_tool_response),
-        ):
-            send_resp = client.post(
-                f"/api/sessions/{session_id}/guided/chat",
-                json=_guided_chat_body(choose_source_resp.json(), "Use this JSON file"),
-            )
-
-        assert send_resp.status_code == 200
-        body = send_resp.json()
-        assert body["assistant_message"] == _MODEL_SHAPE_REJECTED_MESSAGE
-        assert body["guided_session"]["step"] == "step_1_source"
-        assert body["next_turn"]["turn_token"] == choose_source_resp.json()["next_turn"]["turn_token"]
-        app.state.blob_service.reserve_inline_custody.assert_not_called()
-
-        loop = asyncio.new_event_loop()
-        try:
-            current_state = loop.run_until_complete(service.get_current_state(session_id))
-            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
-        finally:
-            loop.close()
-        assert current_state is not None
-        assert not current_state.sources
-        llm_audit_rows = _llm_call_audit_rows(persisted)
-        assert len(llm_audit_rows) == 1
-        assert llm_audit_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.MALFORMED_RESPONSE.value
-        assert llm_audit_rows[0][1]["call"]["error_class"] == "GuidedToolArgumentShapeError"
-
     @pytest.mark.asyncio
     async def test_send_message_serializes_concurrent_requests_per_session(self, tmp_path) -> None:
         """Concurrent sends must not compose against an in-flight partial transcript."""
@@ -7254,17 +6460,6 @@ class TestLiteLLMErrorRedaction:
 
         assert secret not in str(detail)
         assert detail["provider_detail"] == "Provider detail redacted because it may contain secrets."
-
-    def test_guided_source_commit_failure_requires_tool_result_contract(self) -> None:
-        """The commit-failure helper must not inspect forged dynamic result shapes."""
-        from elspeth.web.sessions.routes._helpers import _guided_source_commit_failure_detail
-
-        class _ForgedToolResult:
-            def __getattr__(self, name: str) -> object:
-                raise AssertionError(f"dynamic attribute {name!r} must not be invoked")
-
-        with pytest.raises(TypeError, match="ToolResult"):
-            _guided_source_commit_failure_detail(_ForgedToolResult())
 
     def test_bad_request_llm_error_without_detail_yields_no_provider_fields(self) -> None:
         """When the carrier has no provider text, omit the optional fields rather than fabricating."""
@@ -7883,8 +7078,7 @@ class TestRecomposeConvergencePartialState:
         redacted by ``redact_source_storage_path``. But the same absolute path
         was ALSO flattened verbatim into
         ``composer_meta.implicit_decisions.entries[].value`` at write time by
-        ``merge_implicit_decisions_meta``, downstream of that projection and
-        outside the guided-only ``private_path_projections`` pass. The leak is
+        ``merge_implicit_decisions_meta``, downstream of that projection. The leak is
         not 422-specific — every state response for a freeform blob-backed
         source carried it — but the 422 is the widest reachable surface, so it
         is the regression anchor.
@@ -8143,106 +7337,6 @@ class TestStateRoutes:
         assert versions_resp.json() == []
 
 
-class TestGuidedBootstrapStateVersions:
-    """Regression coverage for guided bootstrap not polluting state history."""
-
-    def test_freeform_guided_probe_is_successful_and_non_mutating(self, tmp_path) -> None:
-        app, service = _make_app(tmp_path)
-        client = TestClient(app)
-        session_id = client.post("/api/sessions", json={"title": "Freeform"}).json()["id"]
-        asyncio.run(
-            service.save_composition_state(
-                uuid.UUID(session_id),
-                CompositionStateData(is_valid=True, metadata_={"name": "Freeform", "description": ""}),
-                provenance="session_seed",
-            )
-        )
-        before = client.get(f"/api/sessions/{session_id}/state/versions").json()
-        strict = client.get(f"/api/sessions/{session_id}/guided")
-        assert strict.status_code == 400
-        probe = client.get(f"/api/sessions/{session_id}/guided?probe=true")
-        assert probe.status_code == 200
-        assert probe.json() is None
-        assert client.get(f"/api/sessions/{session_id}/state/versions").json() == before
-
-    @pytest.mark.parametrize("query", ["", "?probe=true"])
-    def test_get_guided_does_not_persist_empty_initial_state(self, tmp_path, query) -> None:
-        """Auto-starting guided mode must not create an empty v1 graph.
-
-        The frontend calls GET /guided automatically when a session is created
-        or selected. That read path may return the deterministic first turn,
-        but it must not allocate a composition_state version before the user
-        submits an actual guided response.
-        """
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = []
-        app.state.catalog_service = catalog
-        app.state.session_engine = service._engine
-        client = TestClient(app)
-
-        resp = client.post("/api/sessions", json={"title": "Guided"})
-        session_id = resp.json()["id"]
-
-        guided_resp = client.get(f"/api/sessions/{session_id}/guided{query}")
-        assert guided_resp.status_code == 200
-        guided_body = guided_resp.json()
-        assert guided_body["next_turn"] is not None
-        history = guided_body["guided_session"]["history"]
-        assert len(history) == 1
-        assert history[0]["step"] == "step_1_source"
-        assert history[0]["turn_type"] == "single_select"
-        assert history[0]["response_hash"] is None
-        assert guided_body["composition_state"] is None
-        assert asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None)) == []
-
-        state_resp = client.get(f"/api/sessions/{session_id}/state")
-        assert state_resp.status_code == 200
-        assert state_resp.json() is None
-
-        versions_resp = client.get(f"/api/sessions/{session_id}/state/versions")
-        assert versions_resp.status_code == 200
-        assert versions_resp.json() == []
-
-    @pytest.mark.parametrize("query", ["", "?probe=true"])
-    def test_get_guided_rejected_proposal_reference_fails_closed_without_mutation(self, tmp_path, query) -> None:
-        """elspeth-4dc78b3897: GET must not reconcile a rejected reference.
-
-        A terminally rejected proposal row behind a still-active checkpoint
-        reference cannot arise from any fenced lifecycle — every
-        terminalization clears the reference in the same transaction — so
-        the read path fails closed and leaves the durable evidence exactly
-        as it found it, rather than writing a reconciliation state with no
-        operation fence.
-        """
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.sessions.converters import state_from_record
-        from tests.integration.web.composer.guided.test_pipeline_proposal_reference import _stage_and_reject
-
-        app, service = _make_app(tmp_path)
-        catalog = MagicMock(spec=CatalogService)
-        catalog.list_sources.return_value = []
-        catalog.list_transforms.return_value = []
-        catalog.list_sinks.return_value = []
-        app.state.catalog_service = catalog
-        app.state.session_engine = service._engine
-        payload_store = FilesystemPayloadStore(tmp_path / "stage-payloads")
-        command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-        before_versions = [record.id for record in asyncio.run(service.get_state_versions(session_id))]
-
-        client = TestClient(app)
-        with pytest.raises(AuditIntegrityError, match="unexpectedly terminal"):
-            client.get(f"/api/sessions/{session_id}/guided{query}")
-
-        after_versions = [record.id for record in asyncio.run(service.get_state_versions(session_id))]
-        assert after_versions == before_versions, "GET must not allocate a composition state"
-        current = asyncio.run(service.get_current_state(session_id))
-        assert current is not None and current.id == command.checkpoint_state_id
-        guided = state_from_record(current).guided_session
-        assert guided is not None and guided.active_proposal is not None
-        assert guided.active_proposal.proposal_id == command.proposal_id
-
-
 class TestRevertEndpoint:
     """Tests for POST /api/sessions/{id}/state/revert (R1)."""
 
@@ -8269,8 +7363,8 @@ class TestRevertEndpoint:
         compose_lock = await registry.get_lock(str(session.id))
         lock_observations: list[tuple[str, bool]] = []
         original_get_state = service.get_state
-        original_reserve = service.reserve_guided_operation
-        original_revert = service.revert_state_for_guided_operation
+        original_reserve = service.reserve_operation_receipt
+        original_revert = service.revert_state_for_operation_receipt
 
         async def observed_get_state(state_id):
             lock_observations.append(("target", compose_lock.locked()))
@@ -8286,8 +7380,8 @@ class TestRevertEndpoint:
 
         with (
             patch.object(service, "get_state", side_effect=observed_get_state),
-            patch.object(service, "reserve_guided_operation", side_effect=observed_reserve),
-            patch.object(service, "revert_state_for_guided_operation", side_effect=observed_revert),
+            patch.object(service, "reserve_operation_receipt", side_effect=observed_reserve),
+            patch.object(service, "revert_state_for_operation_receipt", side_effect=observed_revert),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.post(
@@ -8299,10 +7393,10 @@ class TestRevertEndpoint:
         assert lock_observations == [("target", True), ("reserve", False), ("mutation", True)]
 
     @pytest.mark.asyncio
-    async def test_revert_cancellation_terminalizes_guided_before_releasing_session_authority(self, tmp_path) -> None:
+    async def test_revert_cancellation_terminalizes_receipt_before_releasing_session_authority(self, tmp_path) -> None:
         from sqlalchemy import select
 
-        from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
+        from elspeth.web.sessions.models import session_operation_fences_table, session_operation_receipts_table
 
         app, service = _make_app(tmp_path)
         session = await service.create_session("alice", "Pipeline", "local")
@@ -8321,14 +7415,14 @@ class TestRevertEndpoint:
         operation_id = str(uuid.uuid4())
         mutation_started = asyncio.Event()
         release_mutation = asyncio.Event()
-        original_revert = service.revert_state_for_guided_operation
+        original_revert = service.revert_state_for_operation_receipt
 
         async def blocking_revert(*args, **kwargs):
             mutation_started.set()
             await release_mutation.wait()
             return await original_revert(*args, **kwargs)
 
-        with patch.object(service, "revert_state_for_guided_operation", side_effect=blocking_revert):
+        with patch.object(service, "revert_state_for_operation_receipt", side_effect=blocking_revert):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 request_task = asyncio.create_task(
                     client.post(
@@ -8346,9 +7440,9 @@ class TestRevertEndpoint:
         with service._engine.connect() as connection:
             operation = (
                 connection.execute(
-                    select(guided_operations_table).where(
-                        guided_operations_table.c.session_id == str(session.id),
-                        guided_operations_table.c.operation_id == operation_id,
+                    select(session_operation_receipts_table).where(
+                        session_operation_receipts_table.c.session_id == str(session.id),
+                        session_operation_receipts_table.c.operation_id == operation_id,
                     )
                 )
                 .mappings()
@@ -8371,13 +7465,21 @@ class TestRevertEndpoint:
         v1 = await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            CompositionStateData(
+                sources={"source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}},
+                metadata_={"name": "before"},
+                is_valid=True,
+            ),
             provenance="session_seed",
         )
         await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(source={"plugin": "json"}, is_valid=True),
+            CompositionStateData(
+                sources={"source": {"plugin": "json", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}},
+                metadata_={"name": "after"},
+                is_valid=True,
+            ),
             provenance="session_seed",
         )
 
@@ -8405,6 +7507,58 @@ class TestRevertEndpoint:
         assert [state.version for state in versions] == [1, 2, 3]
         messages = await service.get_messages(session.id, limit=None)
         assert [message.content for message in messages] == ["Pipeline reverted to version 1."]
+
+    @pytest.mark.asyncio
+    async def test_revert_replay_is_stable_after_plugin_policy_changes(self, tmp_path) -> None:
+        """A receipt replays its committed response, while GET reports live policy."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Policy drift", "local")
+        target = await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                sources={"source": {"plugin": "csv", "on_success": "main", "options": {}, "on_validation_failure": "discard"}},
+                metadata_={"name": "Policy drift", "description": None},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                sources={"source": {"plugin": "json", "on_success": "main", "options": {}, "on_validation_failure": "discard"}},
+                metadata_={"name": "Policy drift", "description": None},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+        body = {"operation_id": str(uuid.uuid4()), "state_id": str(target.id)}
+
+        first = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert first.status_code == 200, first.text
+        assert first.json()["plugin_policy_findings"] == []
+        versions_before = [record.id for record in await service.get_state_versions(session.id)]
+        messages_before = [message.id for message in await service.get_messages(session.id, limit=None)]
+
+        snapshot = _install_restricted_plugin_policy(app, PluginId("source", "csv"))
+        current = client.get(f"/api/sessions/{session.id}/state")
+        assert current.status_code == 200, current.text
+        assert current.json()["plugin_policy_findings"] == [
+            {
+                "component_id": "source",
+                "plugin_id": "source:csv",
+                "reason_code": "plugin_not_enabled",
+                "snapshot_fingerprint": snapshot.snapshot_hash,
+            }
+        ]
+
+        replay = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert replay.status_code == 200, replay.text
+        assert replay.content == first.content
+        assert [record.id for record in await service.get_state_versions(session.id)] == versions_before
+        assert [message.id for message in await service.get_messages(session.id, limit=None)] == messages_before
 
     @pytest.mark.asyncio
     async def test_revert_resurfaces_review_cards_for_restored_pending_state(self, tmp_path: Path) -> None:
@@ -8563,8 +7717,7 @@ transforms:
         clean replay, so the zero-write assertions above it are not vacuous.
 
         Sibling of
-        ``guided/test_respond.py::TestStep2IntraStep::test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches``,
-        which pins the same ordering on the guided RESPOND route.
+        the operation receipt's hash check must precede any replay repair.
         """
         from elspeth.web.sessions.routes.composer import state as state_module
 
@@ -8661,10 +7814,10 @@ transforms:
         } == stale_ids, "fixture cannot drive the supersession half: the settlement already retired the stale cards"
 
         # Corrupt the PROJECTION, not the stored row: terminal
-        # guided_operations rows are immutable by database trigger, and a
+        # Terminal operation receipt rows are immutable by database trigger, and a
         # corrupt projection is the failure this ordering actually guards.
         # ``validation_errors`` is inside the hash domain and survives the
-        # strict re-validation ``guided_response_hash`` performs.
+        # strict re-validation ``operation_receipt_response_hash`` performs.
         original_state_response = state_module._state_response
 
         def _corrupt_projection(record: Any, **kwargs: Any) -> Any:
@@ -8688,7 +7841,7 @@ transforms:
         # occur.
         #
         # ``match=`` pins the ONE raise this test exists for: the hash
-        # comparison in ``routes/guided_operations.py::_replay_completed``.
+        # comparison in the operation receipt replay path.
         # Four other AuditIntegrityError sites in ``state.py`` alone are
         # reachable from this POST, and each would satisfy a bare
         # ``pytest.raises`` while leaving both zero-write assertions trivially
@@ -8698,7 +7851,7 @@ transforms:
         #     unexpectedly has no current checkpoint", ``_replay``'s
         #     "non-state result locator" guard, and "operation was not
         #     reserved". Further reserve/lookup guards in
-        #     ``routes/guided_operations.py`` sit here too.
+        #     the operation receipt route helper sit here too.
         #   - AFTER a comparison that MATCHED: the locator guard in
         #     ``_repair_reverted_surfacing_debt``, which runs as
         #     ``after_verified`` and raises before the surfacing write. It
@@ -8708,7 +7861,7 @@ transforms:
         # a match on the comparison's own message discriminates.
         with (
             patch.object(state_module, "_state_response", _corrupt_projection),
-            pytest.raises(AuditIntegrityError, match="response hash does not match its stored response hash"),
+            pytest.raises(AuditIntegrityError, match="Operation receipt replay response hash does not match stored evidence"),
         ):
             client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
 
@@ -8776,7 +7929,7 @@ transforms:
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
             ensure_test_identity(conn, identity_id="bob")
-        service = DualFencedSessionServiceHarness(
+        service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -10745,536 +9898,6 @@ sinks:
         assert "path Field required" not in detail
 
     @pytest.mark.asyncio
-    async def test_yaml_export_scrubs_guided_blob_from_reviewed_public_sentinel(self, tmp_path: Path) -> None:
-        app, service = _make_app(tmp_path)
-        client = TestClient(app)
-        blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
-        session = await service.create_session("alice", "Guided blob pipeline", "local")
-        storage_path = str(tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv")
-        get_blob = AsyncMock(
-            spec=BlobServiceProtocol.get_blob,
-            return_value=_ready_blob_record(
-                blob_id=blob_id,
-                session_id=session.id,
-                storage_path=storage_path,
-            ),
-        )
-        app.state.blob_service = SimpleNamespace(get_blob=get_blob)
-        stable_id = "11111111-1111-4111-8111-111111111111"
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={
-                        "path": f"blob:{blob_id}",
-                        "blob_ref": str(blob_id),
-                        "schema": {"mode": "observed"},
-                    },
-                    observed_columns=("id",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        await _save_test_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {"path": storage_path, "blob_ref": str(blob_id), "schema": {"mode": "observed"}},
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Guided blob pipeline", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            exported = client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert exported.status_code == 200, exported.text
-        assert "source_blob_ids" not in exported.json()
-        assert str(blob_id) not in exported.text
-        assert storage_path not in exported.text
-        assert get_blob.await_count == 1
-        assert get_blob.await_args.args == (blob_id,)
-        record = await service.get_current_state(session.id)
-        assert record is not None
-        assert record.sources["source"]["options"]["path"] == storage_path
-
-    @pytest.mark.asyncio
-    async def test_yaml_export_after_guided_exit_verifies_but_scrubs_current_blob_binding(self, tmp_path: Path) -> None:
-        app, service = _make_app(tmp_path)
-        client = TestClient(app)
-        current_blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
-        stale_blob_id = "11111111-1111-4111-8111-111111111111"
-        session = await service.create_session("alice", "Freeform replacement", "local")
-        current_storage_path = str(tmp_path / "blobs" / str(session.id) / f"{current_blob_id}_current.csv")
-        app.state.blob_service = SimpleNamespace(
-            get_blob=AsyncMock(
-                spec=BlobServiceProtocol.get_blob,
-                return_value=_ready_blob_record(
-                    blob_id=current_blob_id,
-                    session_id=session.id,
-                    storage_path=current_storage_path,
-                ),
-            )
-        )
-        stable_id = "22222222-2222-4222-8222-222222222222"
-        exited_guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={
-                        "path": "/data/blobs/stale-session/stale.csv",
-                        "blob_ref": stale_blob_id,
-                    },
-                    observed_columns=("id",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-            terminal=TerminalState(
-                kind=TerminalKind.EXITED_TO_FREEFORM,
-                reason=TerminalReason.USER_PRESSED_EXIT,
-                pipeline_yaml=None,
-            ),
-        )
-        await _save_test_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {
-                        "path": current_storage_path,
-                        "blob_ref": str(current_blob_id),
-                        "schema": {"mode": "observed"},
-                    },
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Freeform replacement", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": exited_guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            response = client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 200, response.text
-        assert "source_blob_ids" not in response.json()
-        assert str(current_blob_id) not in response.text
-        assert stale_blob_id not in response.text
-        assert current_storage_path not in response.text
-        assert app.state.blob_service.get_blob.await_count == 1
-        assert app.state.blob_service.get_blob.await_args.args == (current_blob_id,)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "custody_failure",
-        [
-            "foreign_session",
-            "wrong_id",
-            "wrong_path",
-            "non_ready",
-            "missing",
-            "malformed_record",
-            "service_unavailable",
-            "noncanonical",
-        ],
-    )
-    async def test_yaml_export_rejects_invalid_blob_custody_with_safe_500(self, tmp_path, custody_failure: str) -> None:
-        app, service = _make_app(tmp_path)
-        client = TestClient(app, raise_server_exceptions=False)
-        blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
-        session = await service.create_session("alice", "Pipeline", "local")
-        foreign_session_id = uuid.uuid4()
-        storage_path = "/data/blobs/foreign/private.csv"
-        get_blob = AsyncMock(
-            spec=BlobServiceProtocol.get_blob,
-            return_value=_ready_blob_record(
-                blob_id=uuid.uuid4() if custody_failure == "wrong_id" else blob_id,
-                session_id=foreign_session_id if custody_failure == "foreign_session" else session.id,
-                storage_path="/data/blobs/same-session/wrong.csv" if custody_failure == "wrong_path" else storage_path,
-                status="pending" if custody_failure == "non_ready" else "ready",
-            ),
-        )
-        if custody_failure == "missing":
-            get_blob.side_effect = BlobNotFoundError(str(blob_id))
-        if custody_failure == "malformed_record":
-            get_blob.return_value = SimpleNamespace()
-        if custody_failure != "service_unavailable":
-            app.state.blob_service = SimpleNamespace(
-                get_blob=get_blob,
-            )
-        blob_ref = "NOT-A-CANONICAL-UUID" if custody_failure == "noncanonical" else str(blob_id)
-        await _save_test_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {"path": storage_path, "blob_ref": blob_ref, "mode": "bind_source"},
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Foreign binding", "description": ""},
-                is_valid=True,
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            response = client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 500
-        assert response.text == "Internal Server Error"
-        assert str(blob_id) not in response.text
-        assert storage_path not in response.text
-        if custody_failure in {"noncanonical", "service_unavailable"}:
-            get_blob.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "invalid_blob_ref",
-        [None, "", 123, "98B1357D-5AAB-4FB3-85B4-5AD643912E84"],
-        ids=["none", "empty", "wrong_type", "noncanonical_uuid"],
-    )
-    async def test_yaml_export_rejects_present_invalid_reviewed_blob_ref_before_audit(
-        self,
-        tmp_path: Path,
-        invalid_blob_ref: object,
-    ) -> None:
-        from sqlalchemy import select
-
-        from elspeth.web.sessions.models import composer_completion_events_table
-
-        app, service = _make_app(tmp_path)
-        stable_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
-        storage_path = "/data/blobs/foreign/private.csv"
-        session = await service.create_session("alice", "Pipeline", "local")
-        get_blob = AsyncMock(spec=BlobServiceProtocol.get_blob)
-        app.state.blob_service = SimpleNamespace(get_blob=get_blob)
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={"path": storage_path, "blob_ref": invalid_blob_ref},
-                    observed_columns=("value",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        await _insert_legacy_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {"path": storage_path},
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Invalid reviewed binding", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
-                response = await client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 500
-        assert response.text == "Internal Server Error"
-        assert storage_path not in response.text
-        if type(invalid_blob_ref) is str and invalid_blob_ref:
-            assert invalid_blob_ref not in response.text
-        get_blob.assert_not_awaited()
-        with app.state.session_engine.connect() as conn:
-            export_events = conn.execute(
-                select(composer_completion_events_table).where(
-                    composer_completion_events_table.c.session_id == str(session.id),
-                    composer_completion_events_table.c.event_type == "export_yaml",
-                )
-            ).all()
-        assert export_events == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "invalid_carriers",
-        [
-            {"path": ""},
-            {"file": ""},
-            {"path": None},
-            {"file": 123},
-            {"path": "/data/blobs/foreign/private.csv", "file": None},
-            {"path": "/data/blobs/foreign/pri\x00vate.csv"},
-        ],
-        ids=["empty_path", "empty_file", "none_path", "wrong_type_file", "valid_path_invalid_file", "nul_path"],
-    )
-    async def test_yaml_export_rejects_invalid_reviewed_path_carriers_before_audit(
-        self,
-        tmp_path: Path,
-        invalid_carriers: dict[str, object],
-    ) -> None:
-        from sqlalchemy import select
-
-        from elspeth.web.sessions.models import composer_completion_events_table
-
-        app, service = _make_app(tmp_path)
-        stable_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
-        storage_path = "/data/blobs/foreign/private.csv"
-        session = await service.create_session("alice", "Pipeline", "local")
-        get_blob = AsyncMock(spec=BlobServiceProtocol.get_blob)
-        app.state.blob_service = SimpleNamespace(get_blob=get_blob)
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={**invalid_carriers, "blob_ref": stable_id},
-                    observed_columns=("value",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        await _insert_legacy_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {"path": storage_path},
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Invalid reviewed carrier", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
-                response = await client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 500
-        assert response.text == "Internal Server Error"
-        assert stable_id not in response.text
-        assert storage_path not in response.text
-        get_blob.assert_not_awaited()
-        with app.state.session_engine.connect() as conn:
-            export_events = conn.execute(
-                select(composer_completion_events_table).where(
-                    composer_completion_events_table.c.session_id == str(session.id),
-                    composer_completion_events_table.c.event_type == "export_yaml",
-                )
-            ).all()
-        assert export_events == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("reviewed_carriers", "live_options"),
-        [
-            ({"path": " /data/blobs/foreign/bogus.csv "}, {"path": "/data/blobs/foreign/live.csv"}),
-            ({"path": " /data/blobs/foreign/bogus.csv "}, {"schema": {"mode": "observed"}}),
-            (
-                {"path": "/data/blobs/foreign/live.csv"},
-                {"path": "/data/blobs/foreign/live.csv", "file": "/data/blobs/foreign/secret.csv"},
-            ),
-            (
-                {"path": "/data/blobs/foreign/live.csv", "file": "/data/blobs/foreign/live-alias.csv"},
-                {"path": "/data/blobs/foreign/live.csv"},
-            ),
-        ],
-        ids=["mismatched_path", "missing_live_carrier", "extra_live_carrier", "missing_live_reviewed_carrier"],
-    )
-    async def test_yaml_export_rejects_same_name_without_exact_reviewed_path_before_audit(
-        self,
-        tmp_path: Path,
-        reviewed_carriers: dict[str, object],
-        live_options: dict[str, object],
-    ) -> None:
-        from sqlalchemy import select
-
-        from elspeth.web.sessions.models import composer_completion_events_table
-
-        app, service = _make_app(tmp_path)
-        client = TestClient(app, raise_server_exceptions=False)
-        stable_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
-        session = await service.create_session("alice", "Pipeline", "local")
-        get_blob = AsyncMock(
-            spec=BlobServiceProtocol.get_blob,
-            return_value=_ready_blob_record(
-                blob_id=uuid.UUID(stable_id),
-                session_id=session.id,
-                storage_path="/data/blobs/foreign/live.csv",
-            ),
-        )
-        app.state.blob_service = SimpleNamespace(get_blob=get_blob)
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={**reviewed_carriers, "blob_ref": stable_id},
-                    observed_columns=("value",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        await _insert_legacy_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": live_options,
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Inconsistent reviewed mapping", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            response = client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 500
-        assert response.text == "Internal Server Error"
-        assert stable_id not in response.text
-        for value in (*reviewed_carriers.values(), *live_options.values()):
-            if type(value) is str and value:
-                assert value not in response.text
-        get_blob.assert_not_awaited()
-        with app.state.session_engine.connect() as conn:
-            export_events = conn.execute(
-                select(composer_completion_events_table).where(
-                    composer_completion_events_table.c.session_id == str(session.id),
-                    composer_completion_events_table.c.event_type == "export_yaml",
-                )
-            ).all()
-        assert export_events == []
-
-    @pytest.mark.asyncio
-    async def test_yaml_export_rejects_reviewed_blob_ref_without_path_before_audit(self, tmp_path: Path) -> None:
-        from sqlalchemy import select
-
-        from elspeth.web.sessions.models import composer_completion_events_table
-
-        app, service = _make_app(tmp_path)
-        client = TestClient(app, raise_server_exceptions=False)
-        blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
-        storage_path = "/data/blobs/foreign/private.csv"
-        session = await service.create_session("alice", "Pipeline", "local")
-        get_blob = AsyncMock(spec=BlobServiceProtocol.get_blob)
-        app.state.blob_service = SimpleNamespace(get_blob=get_blob)
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(str(blob_id),),
-            reviewed_sources={
-                str(blob_id): SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={"blob_ref": str(blob_id)},
-                    observed_columns=("value",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        await _insert_legacy_composition_state(
-            service,
-            session.id,
-            CompositionStateData(
-                source={
-                    "plugin": "csv",
-                    "on_success": "out",
-                    "options": {"path": storage_path},
-                    "on_validation_failure": "discard",
-                },
-                outputs=[{"name": "out", "plugin": "csv", "options": {}, "on_write_failure": "discard"}],
-                metadata_={"name": "Pathless reviewed binding", "description": ""},
-                is_valid=True,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-            return ValidationResult(is_valid=True, checks=[], errors=[])
-
-        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
-            response = client.get(f"/api/sessions/{session.id}/state/yaml")
-
-        assert response.status_code == 500
-        assert response.text == "Internal Server Error"
-        assert str(blob_id) not in response.text
-        assert storage_path not in response.text
-        get_blob.assert_not_awaited()
-        with app.state.session_engine.connect() as conn:
-            export_events = conn.execute(
-                select(composer_completion_events_table).where(
-                    composer_completion_events_table.c.session_id == str(session.id),
-                    composer_completion_events_table.c.event_type == "export_yaml",
-                )
-            ).all()
-        assert export_events == []
-
-    @pytest.mark.asyncio
     async def test_yaml_allows_connection_valid_state_without_ui_edges(self, tmp_path) -> None:
         """Connection-defined pipelines should export even when the editor graph is incomplete."""
         app, service = _make_app(tmp_path)
@@ -12138,99 +10761,6 @@ class TestComposerProgressRoutes:
         assert progress["request_id"] == user_message_id
         assert progress["phase"] == "complete"
         assert progress["headline"] == "The composer has updated the pipeline."
-
-    @pytest.mark.asyncio
-    async def test_send_message_returns_transition_only_state_row(self, tmp_path) -> None:
-        """A guided->freeform transition save is still the session's new current state.
-
-        Regression for the live stale_compose_state loop: the first freeform
-        compose turn may only persist ``guided_session.transition_consumed`` and
-        leave ``CompositionState.version`` unchanged. The route must still return
-        the newly persisted state row so the SPA's next message uses the current
-        state id.
-        """
-        from elspeth.web.composer.state import CompositionState
-
-        app, service = _make_progress_route_app(tmp_path)
-        guided = GuidedSession(
-            step=GuidedStep.STEP_1_SOURCE,
-            history=(),
-            terminal=TerminalState(
-                kind=TerminalKind.EXITED_TO_FREEFORM,
-                reason=TerminalReason.USER_PRESSED_EXIT,
-                pipeline_yaml=None,
-            ),
-            transition_consumed=False,
-        )
-        initial_state = CompositionState(
-            source=None,
-            nodes=(),
-            edges=(),
-            outputs=(),
-            metadata=PipelineMetadata(),
-            version=1,
-            guided_session=guided,
-        )
-        initial_state_d = initial_state.to_dict()
-        await _save_test_composition_state(
-            service,
-            service.session.id,
-            CompositionStateData(
-                sources=initial_state_d["sources"],
-                nodes=initial_state_d["nodes"],
-                edges=initial_state_d["edges"],
-                outputs=initial_state_d["outputs"],
-                metadata_=initial_state_d["metadata"],
-                is_valid=False,
-                validation_errors=None,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-
-        class _NoGraphChangeComposer:
-            async def compose(
-                self,
-                message: str,
-                chat_messages: list[dict[str, object]],
-                state: CompositionState,
-                *,
-                session_id: str | None = None,
-                current_state_id: str | None = None,
-                user_id: str | None = None,
-                progress=None,
-                guided_terminal=None,
-                user_message_id: str | None = None,
-                session_operation_context: SessionOperationContext | None = None,
-                completion_gates=None,
-            ) -> ComposerResult:
-                del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id, completion_gates
-                assert session_operation_context is not None
-                assert guided_terminal == guided.terminal
-                return ComposerResult(message="Freeform response", state=state)
-
-        app.state.composer_service = _NoGraphChangeComposer()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post(
-                f"/api/sessions/{service.session.id}/messages",
-                json={"content": "continue in freeform", "client_request_id": str(uuid.uuid4())},
-            )
-            messages = (await client.get(f"/api/sessions/{service.session.id}/messages")).json()
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["state"] is not None
-        assert body["state"]["version"] == 2
-        assert body["state"]["id"] == messages[-1]["composition_state_id"]
-        assert body["state"]["validation_errors"] == [
-            {
-                "message": "guided_composition_invalid",
-                "error_code": "guided_composition_invalid",
-                "component": None,
-            }
-        ]
-        assert body["state"]["composer_meta"]["guided_session"]["transition_consumed"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("envelope_writer", ["production_writer", "carry_forward"])
@@ -15643,7 +14173,6 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
     """
     from elspeth.web.composer.protocol import ComposerConvergenceError
 
-    guided = GuidedSession.initial()
     partial = CompositionState(
         source=None,
         nodes=(),
@@ -15651,7 +14180,6 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
         outputs=(),
         metadata=PipelineMetadata(name="convergence-partial"),
         version=2,
-        guided_session=guided,
     )
     mock_composer = SimpleNamespace()
     mock_composer.compose = AsyncMock(
@@ -15675,17 +14203,9 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
         json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())},
     )
     assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert detail["partial_state"]["validation_errors"] == [
-        {
-            "message": "guided_composition_invalid",
-            "error_code": "guided_composition_invalid",
-            "component": None,
-        }
-    ]
+    assert response.json()["detail"]["partial_state"] is not None
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
 
     assert _read_persisted_provenance(service, session_id) == "convergence_persist"
 
@@ -15696,7 +14216,6 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
     preflight partial-state captures so remediation triage can discriminate
     bug-fix-required from retry/budget-tunable.
     """
-    guided = GuidedSession.initial()
     partial = CompositionState(
         source=None,
         nodes=(),
@@ -15704,7 +14223,6 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
         outputs=(),
         metadata=PipelineMetadata(name="plugin-crash-partial"),
         version=3,
-        guided_session=guided,
     )
     mock_composer = SimpleNamespace()
     mock_composer.compose = AsyncMock(
@@ -15730,16 +14248,8 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
     persisted_id, persisted_version = _read_persisted_state_identity(service, session_id)
     assert detail["partial_state"]["id"] == persisted_id
     assert detail["partial_state"]["version"] == persisted_version
-    assert detail["partial_state"]["validation_errors"] == [
-        {
-            "message": "guided_composition_invalid",
-            "error_code": "guided_composition_invalid",
-            "component": None,
-        }
-    ]
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
     assert _read_persisted_provenance(service, session_id) == "plugin_crash_persist"
 
 
@@ -15757,7 +14267,6 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
     """
     from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 
-    guided = GuidedSession.initial()
     partial = CompositionState(
         source=None,
         nodes=(),
@@ -15765,7 +14274,6 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
         outputs=(),
         metadata=PipelineMetadata(name="preflight-partial"),
         version=4,
-        guided_session=guided,
     )
     advanced_state = CompositionState(
         source=None,
@@ -15808,16 +14316,8 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
     persisted_id, persisted_version = _read_persisted_state_identity(service, session_id)
     assert detail["partial_state"]["id"] == persisted_id
     assert detail["partial_state"]["version"] == persisted_version
-    assert detail["partial_state"]["validation_errors"] == [
-        {
-            "message": "guided_composition_invalid",
-            "error_code": "guided_composition_invalid",
-            "component": None,
-        }
-    ]
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert deep_thaw(current.composer_meta["guided_session"]) == guided.to_dict()
     assert _read_persisted_provenance(service, session_id) == "preflight_persist"
 
 
@@ -15853,8 +14353,7 @@ def test_send_message_post_compose_state_advance_persists_post_compose_provenanc
 
 
 def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: Path) -> None:
-    """Version-changing freeform messages retain opaque guided lifecycle metadata."""
-    guided = GuidedSession.initial()
+    """Version-changing freeform messages retain opaque composer metadata."""
     advanced_state = CompositionState(
         source=None,
         nodes=(),
@@ -15862,7 +14361,6 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
         outputs=(),
         metadata=PipelineMetadata(name="post-compose"),
         version=2,
-        guided_session=guided,
     )
     mock_composer = _make_composer_mock(response_text="Updated.", state=advanced_state)
     marker = {"composition_hash": "seed-hash"}
@@ -15884,8 +14382,7 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
                 is_valid=False,
                 validation_errors=None,
                 composer_meta={
-                    "guided_session": guided.to_dict(),
-                    "guided_completed_terminal_before_user_exit": marker,
+                    "retained_context": marker,
                 },
             ),
             provenance="session_seed",
@@ -15897,10 +14394,7 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
     assert response.status_code == 200
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert current.validation_errors == (
-        CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),
-    )
-    assert current.composer_meta["guided_completed_terminal_before_user_exit"] == marker
+    assert deep_thaw(current.composer_meta["retained_context"]) == marker
 
 
 def test_recompose_post_compose_state_advance_persists_post_compose_provenance(tmp_path: Path) -> None:
@@ -15940,8 +14434,7 @@ def test_recompose_post_compose_state_advance_persists_post_compose_provenance(t
 
 
 def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path) -> None:
-    """Version-changing recompose retains opaque guided lifecycle metadata."""
-    guided = GuidedSession.initial()
+    """Version-changing recompose retains opaque composer metadata."""
     advanced_state = CompositionState(
         source=None,
         nodes=(),
@@ -15949,7 +14442,6 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
         outputs=(),
         metadata=PipelineMetadata(name="post-compose"),
         version=2,
-        guided_session=guided,
     )
     mock_composer = _make_composer_mock(response_text="Updated.", state=advanced_state)
     marker = {"composition_hash": "seed-hash"}
@@ -15971,8 +14463,7 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
                 is_valid=False,
                 validation_errors=None,
                 composer_meta={
-                    "guided_session": guided.to_dict(),
-                    "guided_completed_terminal_before_user_exit": marker,
+                    "retained_context": marker,
                 },
             ),
             provenance="session_seed",
@@ -15992,7 +14483,7 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
     assert response.status_code == 200
     current = asyncio.run(service.get_current_state(uuid.UUID(session_id)))
     assert current is not None
-    assert current.composer_meta["guided_completed_terminal_before_user_exit"] == marker
+    assert deep_thaw(current.composer_meta["retained_context"]) == marker
 
 
 def test_composition_state_provenance_python_and_sql_enums_agree() -> None:
@@ -16237,335 +14728,6 @@ def test_compose_that_authors_nothing_returns_200_with_null_state(tmp_path: Path
     assert current is None
 
 
-def test_send_message_refuses_an_active_unbindable_guided_tip_as_a_failed_turn(tmp_path) -> None:
-    """elspeth-4c442aaaa8 EXPECTED-1: the post-compose persist runs the custody
-    gate inside the write lock. A planner-authored source that cannot bind to the
-    retained ACTIVE review (incident v13 shape with terminal=None) is refused
-    before the row lands: the tip does not advance, the user row stays, and the
-    response is the ``audit_integrity_error`` failed-turn surface the frontend
-    already special-cases on the send path — not a bare 500."""
-    from dataclasses import replace
-
-    private = str(tmp_path / "blobs" / "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv")
-    stable_id = "11111111-1111-4111-8111-111111111111"
-    guided = replace(
-        GuidedSession.initial(),
-        source_order=(stable_id,),
-        reviewed_sources={
-            stable_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
-                observed_columns=("colour",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-    )
-    composed = CompositionState(
-        sources={
-            "source": SourceSpec(
-                plugin="csv",
-                on_success="out",
-                options={"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b", "schema": {"mode": "observed"}},
-                on_validation_failure="discard",
-            )
-        },
-        nodes=(),
-        edges=(),
-        outputs=(),
-        metadata=PipelineMetadata(),
-        version=2,
-        guided_session=guided,
-    )
-    app, _service = _make_app(tmp_path)
-    app.state.composer_service = _make_composer_mock(response_text="Pointed the source at colours.csv.", state=composed)
-    client = TestClient(app)
-    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
-    assert client.get(f"/api/sessions/{session_id}/state").json() is None
-
-    response = client.post(
-        f"/api/sessions/{session_id}/messages", json={"content": "use colours.csv", "client_request_id": str(uuid.uuid4())}
-    )
-
-    assert response.status_code == 500, response.text
-    detail = response.json()["detail"]
-    assert detail["error_type"] == "audit_integrity_error"
-    assert detail["failed_turn"] == {
-        "assistant_message_id": None,
-        "tool_calls_attempted": 0,
-        "tool_responses_persisted": 0,
-        "transcript_url": None,
-    }
-    assert private not in response.text
-    assert client.get(f"/api/sessions/{session_id}/state").json() is None
-    roles = [m["role"] for m in client.get(f"/api/sessions/{session_id}/messages").json()]
-    assert roles == ["user"]
-
-
-_LEGACY_PRIVATE_PATH = "/srv/elspeth/data/blobs/legacy/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
-
-
-def _legacy_unbindable_guided_state(*, terminal: TerminalState | None) -> CompositionStateData:
-    """Incident v13 shape (elspeth-201903a286) as a pre-gate row: a retained
-    sentinel review of ``source`` re-attached to a live ``source`` bound to a
-    different blob."""
-    stable_id = "11111111-1111-4111-8111-111111111111"
-    guided = replace(
-        GuidedSession.initial(),
-        source_order=(stable_id,),
-        reviewed_sources={
-            stable_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
-                observed_columns=("colour",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        terminal=terminal,
-    )
-    return CompositionStateData(
-        sources={
-            "source": {
-                "plugin": "csv",
-                "on_success": "out",
-                "options": {"path": _LEGACY_PRIVATE_PATH, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
-                "on_validation_failure": "discard",
-            }
-        },
-        nodes=[],
-        edges=[],
-        outputs=[],
-        metadata_={"name": "Legacy", "description": ""},
-        is_valid=False,
-        composer_meta={"guided_session": guided.to_dict()},
-    )
-
-
-@pytest.mark.asyncio
-async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> None:
-    """elspeth-4c442aaaa8 EXPECTED-3: a tip persisted before the write gate whose
-    ACTIVE review cannot bind still refuses to project. Every read arm names the
-    condition with a stable 409 instead of a bare 500, echoes no path, and a
-    revert onto the same row is refused by the write gate under the same name.
-    The frontend load path treats 409 like 500 today (declared non-goal)."""
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = await service.create_session("alice", "Legacy", "local")
-    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose")
-    tip = await service.get_current_state(session.id)
-    assert tip is not None
-
-    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/guided"):
-        response = client.get(path)
-        assert response.status_code == 409, (path, response.text)
-        detail = response.json()["detail"]
-        assert detail["error_type"] == "guided_custody_projection_failed"
-        assert detail["detail"] == (
-            "This session's retained guided source review no longer matches the files this pipeline uses; "
-            "restore an earlier version from Composition history to continue."
-        )
-        assert "binds" not in detail["detail"]
-        assert _LEGACY_PRIVATE_PATH not in response.text
-
-    revert = client.post(
-        f"/api/sessions/{session.id}/state/revert",
-        json={"operation_id": str(uuid.uuid4()), "state_id": str(tip.id)},
-    )
-    assert revert.status_code == 409, revert.text
-    assert revert.json()["detail"]["error_type"] == "guided_custody_projection_failed"
-    still_tip = await service.get_current_state(session.id)
-    assert still_tip is not None
-    assert still_tip.version == tip.version
-
-
-@pytest.mark.asyncio
-async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = await service.create_session("alice", "Legacy", "local")
-    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
-    legacy = _legacy_unbindable_guided_state(terminal=exited)
-    legacy = replace(
-        legacy,
-        validation_errors=[
-            CompositionValidationError(
-                message="Source 'source' has no reachable output (E_GRAPH)",
-                error_code=None,
-                component=None,
-            )
-        ],
-    )
-    await _insert_legacy_composition_state(service, session.id, legacy, provenance="post_compose")
-
-    response = client.get(f"/api/sessions/{session.id}/state")
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
-    assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
-    assert body["validation_errors"] == [
-        {
-            "message": "Source 'source' has no reachable output (E_GRAPH)",
-            "error_code": None,
-            "component": None,
-        }
-    ]
-    assert _LEGACY_PRIVATE_PATH not in response.text
-
-
-@pytest.mark.asyncio
-async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None:
-    """Re-entry turns the retained review back into ACTIVE authoring authority,
-    so a tip whose review cannot bind (incident v13, exited) must be refused
-    before settlement (adversary Critical 2): 409 with a stable error_type, no
-    new version, reviewed_sources intact (a /state/revert to a bindable version
-    re-enables re-entry), and GET /state still serves the degraded projection."""
-    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-    from elspeth.web.composer.guided.state_machine import TurnRecord
-
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = await service.create_session("alice", "Legacy", "local")
-    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
-    state_data = _legacy_unbindable_guided_state(terminal=exited)
-    guided_d = deep_thaw(state_data.composer_meta)["guided_session"]
-    guided = replace(
-        GuidedSession.from_dict(guided_d),
-        history=(
-            TurnRecord(
-                step=GuidedStep.STEP_1_SOURCE,
-                turn_type=TurnType.INSPECT_AND_CONFIRM,
-                payload_hash="a" * 64,
-                response_hash=None,
-                emitter="server",
-            ),
-        ),
-    )
-    tip = await service.save_composition_state(
-        session.id,
-        replace(state_data, composer_meta={"guided_session": guided.to_dict()}),
-        provenance="post_compose",
-    )
-
-    response = client.post(f"/api/sessions/{session.id}/guided/reenter", json={"operation_id": str(uuid.uuid4())})
-
-    assert response.status_code == 409, response.text
-    detail = response.json()["detail"]
-    assert detail["error_type"] == "guided_reenter_custody_unbindable"
-    assert detail["detail"] == (
-        "Guided mode can't resume: the files it reviewed are no longer the files this pipeline uses. "
-        "Restore an earlier version from Composition history, or keep working in freeform."
-    )
-    assert "binds" not in detail["detail"]
-    assert _LEGACY_PRIVATE_PATH not in response.text
-    current = await service.get_current_state(session.id)
-    assert current is not None
-    assert current.id == tip.id
-    persisted = GuidedSession.from_dict(deep_thaw(current.composer_meta)["guided_session"])
-    assert persisted.reviewed_sources == guided.reviewed_sources
-    assert persisted.terminal == exited
-    degraded = client.get(f"/api/sessions/{session.id}/state")
-    assert degraded.status_code == 200
-    assert degraded.json()["composer_meta"]["guided_session"]["custody_unavailable"] is True
-
-
-def test_send_message_post_persist_plain_audit_integrity_error_keeps_the_app_handler_surface(tmp_path) -> None:
-    """Only GuidedCustodyIntegrityError takes the failed-turn arm (fix round 1
-    F-A1): a plain AuditIntegrityError raised after the compose loop returned
-    falls through to the app-level handler exactly as at base, so non-custody
-    Tier-1 refusals keep their own diagnostics instead of a custody-shaped body."""
-    mock_composer = _make_composer_mock(response_text="Done.")
-    app, _service = _make_app(tmp_path)
-    app.state.composer_service = mock_composer
-    client = TestClient(app)
-    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
-
-    with (
-        patch(
-            "elspeth.web.sessions.routes.messages._pending_proposal_responses",
-            side_effect=AuditIntegrityError("post-persist non-custody refusal"),
-        ),
-        pytest.raises(AuditIntegrityError, match="post-persist non-custody refusal") as excinfo,
-    ):
-        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello", "client_request_id": str(uuid.uuid4())})
-    assert excinfo.value.failed_turn is None
-
-
-@pytest.mark.asyncio
-async def test_state_versions_serves_a_degraded_row_for_a_legacy_unbindable_version(tmp_path) -> None:
-    """Fix round 1 F-A2: /state/versions never 409s the whole history and never
-    omits a row. A version whose projection cannot bind serves the degraded
-    projection (mask-all + custody_unavailable) beside untouched siblings, so
-    the user can see the history and pick a bindable version to restore."""
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = await service.create_session("alice", "Legacy", "local")
-    good = await service.save_composition_state(
-        session.id,
-        CompositionStateData(
-            sources={"clean": {"plugin": "csv", "on_success": "out", "options": {"path": "clean.csv"}, "on_validation_failure": "discard"}},
-            metadata_={"name": "Good", "description": ""},
-            is_valid=True,
-        ),
-        provenance="session_seed",
-    )
-    await _insert_legacy_composition_state(
-        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
-    )
-
-    response = client.get(f"/api/sessions/{session.id}/state/versions")
-
-    assert response.status_code == 200, response.text
-    rows = {row["version"]: row for row in response.json()}
-    assert set(rows) == {1, 2}
-    assert rows[1]["id"] == str(good.id)
-    assert rows[1]["sources"]["clean"]["options"]["path"] == "clean.csv"
-    assert "guided_session" not in (rows[1]["composer_meta"] or {})
-    degraded = rows[2]
-    assert degraded["composer_meta"]["guided_session"]["custody_unavailable"] is True
-    assert degraded["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
-    assert _LEGACY_PRIVATE_PATH not in response.text
-    # The single-tip read keeps its named 409 for the active-unbindable tip.
-    assert client.get(f"/api/sessions/{session.id}/state").status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_state_revert_onto_a_legacy_unbindable_row_gets_revert_specific_wording(tmp_path) -> None:
-    """Fix round 1 F-A2 (python P5): the refusal detail must not tell the user
-    to "revert to an earlier version" when the refused action IS a revert."""
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = await service.create_session("alice", "Legacy", "local")
-    await service.save_composition_state(
-        session.id,
-        CompositionStateData(metadata_={"name": "Good", "description": ""}, is_valid=True),
-        provenance="session_seed",
-    )
-    await _insert_legacy_composition_state(
-        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
-    )
-    versions = client.get(f"/api/sessions/{session.id}/state/versions").json()
-    bad_id = next(row["id"] for row in versions if row["version"] == 2)
-
-    revert = client.post(
-        f"/api/sessions/{session.id}/state/revert",
-        json={"operation_id": str(uuid.uuid4()), "state_id": bad_id},
-    )
-
-    assert revert.status_code == 409, revert.text
-    detail = revert.json()["detail"]
-    assert detail["error_type"] == "guided_custody_projection_failed"
-    assert "revert to an earlier version" not in detail["detail"]
-    assert detail["detail"] == (
-        "This version can't be restored: its guided source review no longer matches "
-        "the files this pipeline uses. Choose a different version from Composition history."
-    )
-    assert _LEGACY_PRIVATE_PATH not in revert.text
-
-
 def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path) -> None:
     """The turn-end row carries the notice alone, not the planner's prose again.
 
@@ -16792,88 +14954,6 @@ async def test_get_state_yaml_is_409_while_another_compose_is_live(tmp_path) -> 
         assert client.get(f"/api/sessions/{session_id}/state/yaml").status_code != 409
     finally:
         service.session_operation_authority.release(reader)
-
-
-@pytest.mark.parametrize("recovery_handler", ["convergence", "plugin_crash", "runtime_preflight"])
-def test_recovery_partial_state_custody_integrity_failure_is_not_contained(tmp_path, recovery_handler: str) -> None:
-    """``GuidedCustodyIntegrityError`` from a recovery partial-state write must abort.
-
-    The three recovery handlers in ``routes/_helpers.py``
-    (``_handle_convergence_error``, ``_handle_plugin_crash``,
-    ``_handle_runtime_preflight_failure``) contain a *persistence* failure so a
-    secondary DB fault cannot mask the primary 422/500 — that containment is
-    scoped to ``SQLAlchemyError`` and is pinned by the sibling
-    ``partial_state_save_failed`` tests in this file.
-
-    ``GuidedCustodyIntegrityError`` is not a persistence fault. It is registered
-    Tier-1 (``@tier_1_error`` in ``contracts/errors.py``) and subclasses
-    ``AuditIntegrityError``: the guided reviewed-source custody could not be
-    proven against the live sources, so the audit trail's source provenance is
-    unprovable. Per ADR-008 that class must bubble and abort rather than be
-    reduced to a ``partial_state_save_error`` string on an otherwise-normal
-    error body. It therefore reaches the app-level ``AuditIntegrityError``
-    handler, which emits the fail-closed ``audit_integrity_error`` 500 with a
-    correlatable ``request_id``.
-    """
-    from elspeth.contracts.errors import GuidedCustodyIntegrityError
-    from elspeth.web.composer.protocol import ComposerConvergenceError
-
-    partial = _make_authoring_valid_partial("custody-unbindable-recovery")
-    mock_composer = SimpleNamespace()
-    if recovery_handler == "convergence":
-        mock_composer.compose = AsyncMock(
-            spec=ComposerService.compose,
-            side_effect=ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=partial),
-        )
-    elif recovery_handler == "plugin_crash":
-        mock_composer.compose = AsyncMock(
-            spec=ComposerService.compose,
-            side_effect=ComposerPluginCrashError(ValueError("plugin bug"), partial_state=partial),
-        )
-    else:
-        mock_composer.compose = AsyncMock(
-            spec=ComposerService.compose,
-            return_value=ComposerResult(message="ok", state=partial, runtime_preflight=None),
-        )
-
-    app, service = _make_app(tmp_path)
-    app.state.composer_service = mock_composer
-
-    async def _raise_custody(*_args, **_kwargs):
-        raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
-
-    service.save_composition_state = _raise_custody  # type: ignore[method-assign]
-
-    # ``raise_server_exceptions=True``: this harness app is a bare ``FastAPI()``
-    # without production's app-level ``AuditIntegrityError`` handler, so the
-    # escaping Tier-1 error is observable directly rather than as its 500.
-    client = TestClient(app)
-    session_id = client.post("/api/sessions", json={"title": "Custody"}).json()["id"]
-
-    async def _preflight_boom(state, *, settings, secret_service, user_id, session_id, **_policy_context):
-        raise RuntimeError("preflight crashed before save")
-
-    if recovery_handler == "runtime_preflight":
-        # ``compose`` returned, so send_message's own custody arm can attach
-        # failed-turn metadata and name the refusal as ``audit_integrity_error``
-        # — an explicit Tier-1 envelope, not a recovery-body downgrade.
-        with (
-            patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=_preflight_boom),
-        ):
-            response = client.post(
-                f"/api/sessions/{session_id}/messages", json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())}
-            )
-        assert response.status_code == 500, response.text
-        detail = response.json()["detail"]
-        assert detail["error_type"] == "audit_integrity_error", detail
-        assert "partial_state_save_failed" not in response.text
-        assert "partial_state_save_error" not in response.text
-        return
-
-    # ``compose`` raised, so there is no compose result to describe a failed
-    # turn from: the custody refusal must keep unwinding out of the route.
-    with pytest.raises(GuidedCustodyIntegrityError):
-        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build me a pipeline", "client_request_id": str(uuid.uuid4())})
 
 
 @pytest.mark.asyncio

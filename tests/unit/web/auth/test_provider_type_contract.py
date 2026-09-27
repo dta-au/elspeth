@@ -370,7 +370,7 @@ def test_secret_and_session_boundaries_do_not_widen_auth_provider_to_str() -> No
         ("SessionServiceImpl.list_sessions", SessionServiceImpl.list_sessions),
     ]
     # ``fork_session`` no longer takes a caller-supplied ``auth_provider_type``:
-    # it now accepts a ``GuidedOperationFence`` and derives the provider
+    # it now accepts ``SessionForkParentAuthority`` and derives the provider
     # discriminator internally from the fenced parent session row (a stricter,
     # not-caller-supplied boundary). There is no ``str``-widening seam to guard
     # here anymore, so it drops out of the closed-Literal contract list.

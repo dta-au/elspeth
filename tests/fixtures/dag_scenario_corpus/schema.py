@@ -39,7 +39,6 @@ Dimension = Literal[
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 ]
@@ -67,7 +66,6 @@ EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 )

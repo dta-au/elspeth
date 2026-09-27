@@ -9,12 +9,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import structlog
 from fastapi import FastAPI
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -29,406 +29,30 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
-    composition_proposals_table,
-    composition_states_table,
-    guided_operations_table,
     message_ingress_receipts_table,
-    proposal_events_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     sessions_table,
 )
+from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
-    GuidedForkSettlementCommand,
-    GuidedOperationClaimed,
-    GuidedOperationTakenOver,
-    GuidedOriginatingUserMessageDraft,
     InvalidForkTargetError,
     MessageIngressFresh,
+    OperationReceiptClaimed,
+    OperationReceiptTakenOver,
     SessionForkParentAuthority,
+    SessionForkSettlementCommand,
 )
 from elspeth.web.sessions.routes import create_session_router
-from elspeth.web.sessions.routes.guided_operations import guided_response_hash
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence, read_blob_content_under_fence
+from tests.helpers.session_fences import create_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
-
-_FORK_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
-_FORK_OUTPUT_ID = "22222222-2222-4222-8222-222222222222"
-_FORK_INTENT_ID = "33333333-3333-4333-8333-333333333333"
-_FORK_HASH_A = "a" * 64
-_FORK_HASH_B = "b" * 64
-
-
-def _guided_fork_checkpoint(
-    *,
-    step: str,
-    root_message_id: uuid.UUID,
-    deferred_message_id: uuid.UUID,
-    deferred_message_content: str,
-    current_turn: str,
-) -> Any:
-    """Build a schema-10 checkpoint containing the fork-sensitive fields."""
-    from elspeth.core.canonical import stable_hash
-    from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
-    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-    from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-    from elspeth.web.composer.guided.state_machine import (
-        ComponentTarget,
-        DeferredStageIntent,
-        GuidedProposalRef,
-        GuidedSession,
-        TurnRecord,
-        guided_reviewed_anchor_hash,
-    )
-    from elspeth.web.composer.pipeline_proposal import AbsentBase
-
-    guided_step = GuidedStep(step)
-    turn_type = TurnType(current_turn)
-    reviewed_sources = {
-        _FORK_SOURCE_ID: SourceResolved(
-            name="orders",
-            plugin="csv",
-            options={"path": "/data/orders.csv"},
-            observed_columns=("id", "total"),
-            sample_rows=({"id": 1, "total": 3},),
-            on_validation_failure="discard",
-        )
-    }
-    reviewed_outputs = {
-        _FORK_OUTPUT_ID: SinkOutputResolved(
-            name="archive",
-            plugin="json",
-            options={"path": "/data/archive.jsonl"},
-            required_fields=("id", "total"),
-            schema_mode="fixed",
-            on_write_failure="discard",
-        )
-    }
-    deferred = DeferredStageIntent.create(
-        intent_id=_FORK_INTENT_ID,
-        receiving_stage="source",
-        target_stage="topology",
-        catalog_kind="transform",
-        catalog_name="rename",
-        redacted_summary="Rename total before writing the archive.",
-        originating_message_id=str(deferred_message_id),
-        message_content_hash=stable_hash(deferred_message_content),
-        constraints=(),
-    )
-    active_proposal = None
-    if (guided_step, turn_type) in {
-        (GuidedStep.STEP_3_TRANSFORMS, TurnType.PROPOSE_PIPELINE),
-        (GuidedStep.STEP_4_WIRE, TurnType.CONFIRM_WIRING),
-    }:
-        active_proposal = GuidedProposalRef(
-            proposal_id=uuid.UUID("44444444-4444-4444-8444-444444444444"),
-            draft_hash=_FORK_HASH_A,
-            base=AbsentBase(),
-            reviewed_anchor_hash=guided_reviewed_anchor_hash(
-                source_order=(_FORK_SOURCE_ID,),
-                reviewed_sources=reviewed_sources,
-                output_order=(_FORK_OUTPUT_ID,),
-                reviewed_outputs=reviewed_outputs,
-            ),
-            covered_deferred_intent_ids=(),
-            creation_event_schema="pipeline_proposal_created.v1",
-        )
-    return GuidedSession(
-        step=guided_step,
-        history=(
-            TurnRecord(
-                step=guided_step,
-                turn_type=turn_type,
-                payload_hash=_FORK_HASH_A,
-                response_hash=_FORK_HASH_B,
-                emitter="server",
-                summary="Answered occurrence stays in fork history.",
-            ),
-            TurnRecord(
-                step=guided_step,
-                turn_type=turn_type,
-                payload_hash=_FORK_HASH_B,
-                response_hash=None,
-                emitter="server",
-                summary="Unanswered authority must not cross the fork.",
-            ),
-        ),
-        profile=TUTORIAL_PROFILE,
-        transition_consumed=True,
-        source_order=(_FORK_SOURCE_ID,),
-        reviewed_sources=reviewed_sources,
-        output_order=(_FORK_OUTPUT_ID,),
-        reviewed_outputs=reviewed_outputs,
-        deferred_intents=(deferred,),
-        active_proposal=active_proposal,
-        active_edit_target=ComponentTarget(kind="source", stable_id=_FORK_SOURCE_ID),
-        root_intent_message_id=str(root_message_id),
-    )
-
-
-async def _attach_mismatched_fork_proposal(
-    service: SessionServiceImpl,
-    *,
-    session_id: uuid.UUID,
-    state,
-    guided,
-    proposal_base_state=None,
-):
-    """Inject a historical wrong-base reference for the fork corruption test."""
-    from dataclasses import replace
-
-    from elspeth.contracts.freeze import deep_thaw
-    from elspeth.contracts.hashing import stable_hash
-    from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
-    from elspeth.web.composer.guided.state_machine import GuidedProposalRef
-    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase, composition_content_hash
-    from elspeth.web.composer.redaction import redact_tool_call_arguments
-    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-    from elspeth.web.sessions.converters import state_from_record
-
-    base_state = proposal_base_state or state
-    proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
-        base=PresentBase(
-            state_id=base_state.id,
-            composition_content_hash=composition_content_hash(state_from_record(base_state)),
-        ),
-        reviewed_facts=guided_private_reviewed_facts(guided),
-        surface=PlannerSurface.TUTORIAL_PROFILE,
-        repair_count=0,
-        skill_hash=stable_hash("guided-fork-test-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
-    )
-    plan = PipelinePlanResult(
-        proposal=proposal,
-        tool_call_id=f"guided-fork-{uuid.uuid4()}",
-        custody_result="not_required",
-        model_identifier="test-model",
-        model_version="test-model-v1",
-        provider="test",
-    )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Stage fork proposal.",
-        rationale="Exercise fork proposal integrity.",
-        affects=("graph",),
-        arguments_redacted_json=redact_tool_call_arguments(
-            "set_pipeline",
-            deep_thaw(proposal.pipeline),
-            telemetry=NoopRedactionTelemetry(),
-        ),
-        actor="composer-web:user:alice",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test",
-    )
-    active = replace(
-        guided,
-        active_proposal=GuidedProposalRef(
-            proposal_id=row.id,
-            draft_hash=proposal.draft_hash,
-            base=proposal.base,
-            reviewed_anchor_hash=proposal.reviewed_anchor_hash,
-            covered_deferred_intent_ids=proposal.covered_deferred_intent_ids,
-            creation_event_schema="pipeline_proposal_created.v1",
-        ),
-    )
-    with service._engine.begin() as conn:
-        conn.execute(
-            update(composition_states_table)
-            .where(composition_states_table.c.id == str(state.id))
-            .values(composer_meta={"_version": 1, "data": {"guided_session": active.to_dict()}})
-        )
-    refreshed = await service.get_state_in_session(state.id, session_id)
-    return row, refreshed, active
-
-
-async def _save_guided_fork_seed(service, session_id, state_data):
-    """Seed reviewed facts without fabricating pending proposal authority."""
-    from dataclasses import replace
-
-    from elspeth.contracts.freeze import deep_thaw
-    from elspeth.web.composer.guided.protocol import GuidedStep
-    from elspeth.web.composer.guided.state_machine import GuidedSession
-
-    guided = GuidedSession.from_dict(deep_thaw(state_data.composer_meta)["guided_session"])
-    seed = replace(guided, step=GuidedStep.STEP_2_SINK, active_proposal=None, history=guided.history[:-1])
-    seed_data = replace(state_data, composer_meta={"guided_session": seed.to_dict()})
-    state = await service.save_composition_state(session_id, seed_data, provenance="session_seed")
-    root = next(message for message in await service.get_messages(session_id, limit=None) if str(message.id) == seed.root_intent_message_id)
-    await _complete_guided_start_authority(service, session_id=session_id, root_message=root, state=state, state_data=seed_data)
-    return state
-
-
-async def _save_corrupt_guided_fork_checkpoint(service, session_id, state_data):
-    """Inject invalid historical metadata after a valid ordinary checkpoint.
-
-    These negative fork tests exercise persisted corruption that a current
-    ordinary save correctly refuses; this helper is never used for positives.
-    """
-    from dataclasses import replace
-
-    from elspeth.contracts.freeze import deep_thaw
-
-    state = await service.save_composition_state(session_id, replace(state_data, composer_meta={}), provenance="session_seed")
-    with service._engine.begin() as conn:
-        conn.execute(
-            update(composition_states_table)
-            .where(composition_states_table.c.id == str(state.id))
-            .values(composer_meta={"_version": 1, "data": deep_thaw(state_data.composer_meta)})
-        )
-    return await service.get_state_in_session(state.id, session_id)
-
-
-async def _attach_pending_fork_proposal(service, *, session_id, state, guided, payload_store):
-    """Stage proposal, checkpoint, durable turn and creation event atomically."""
-    from dataclasses import replace
-
-    from elspeth.contracts.freeze import deep_thaw
-    from elspeth.contracts.hashing import stable_hash
-    from elspeth.web.composer.guided.emitters import build_step_4_wire_turn
-    from elspeth.web.composer.guided.planning import (
-        build_guided_proposal_projection,
-        guided_candidate_state,
-        guided_private_reviewed_facts,
-        guided_reviewed_sink_options,
-    )
-    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-    from elspeth.web.composer.guided.state_machine import GuidedProposalRef
-    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase, composition_content_hash
-    from elspeth.web.composer.redaction import redact_tool_call_arguments
-    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-    from elspeth.web.sessions.converters import state_from_record
-    from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
-    from elspeth.web.sessions.protocol import GuidedPipelineProposalStageCommand, GuidedReplayTurn, GuidedResponseDescriptor
-
-    source = guided.reviewed_sources[_FORK_SOURCE_ID]
-    output = guided.reviewed_outputs[_FORK_OUTPUT_ID]
-    pipeline = {
-        "sources": {
-            source.name: {
-                "plugin": source.plugin,
-                "on_success": output.name,
-                "options": deep_thaw(source.options),
-                "on_validation_failure": source.on_validation_failure,
-            }
-        },
-        "nodes": [],
-        "edges": [],
-        "outputs": [
-            {
-                "sink_name": output.name,
-                "plugin": output.plugin,
-                "options": guided_reviewed_sink_options(output),
-                "on_write_failure": output.on_write_failure,
-            }
-        ],
-    }
-    checkpoint_id, proposal_id = uuid.uuid4(), uuid.uuid4()
-    composition = state_from_record(state)
-    checkpoint_data = composition.to_dict()
-    content_hash = composition_content_hash(composition)
-    proposal = PipelineProposal.create(
-        pipeline=pipeline,
-        base=PresentBase(state_id=checkpoint_id, composition_content_hash=content_hash),
-        reviewed_facts=guided_private_reviewed_facts(guided),
-        surface=PlannerSurface.TUTORIAL_PROFILE,
-        repair_count=0,
-        skill_hash=stable_hash("guided-fork-test-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
-    )
-    catalog = {"source": frozenset({source.plugin}), "transform": frozenset(), "sink": frozenset({output.plugin})}
-    projection = build_guided_proposal_projection(proposal_id=proposal_id, proposal=proposal, guided=guided, catalog_plugin_ids=catalog)
-    turn_type = guided.history[-1].turn_type
-    payload = projection
-    if turn_type is TurnType.CONFIRM_WIRING:
-        payload = build_step_4_wire_turn(guided_candidate_state(proposal), proposal_projection=projection, guided=guided, catalog=None)[
-            "payload"
-        ]
-    prepared = prepare_guided_json_payload(payload_store, purpose="turn", payload=payload)
-    active = replace(
-        guided,
-        active_proposal=GuidedProposalRef(
-            proposal_id=proposal_id,
-            draft_hash=proposal.draft_hash,
-            base=proposal.base,
-            reviewed_anchor_hash=proposal.reviewed_anchor_hash,
-            covered_deferred_intent_ids=(),
-            creation_event_schema="pipeline_proposal_created.v1",
-        ),
-        history=(*guided.history[:-1], replace(guided.history[-1], payload_hash=prepared.payload_id)),
-    )
-    operation_id = str(uuid.uuid4())
-    claimed = await service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_respond",
-        request_hash=stable_hash({"operation_id": operation_id}),
-        actor="test",
-        lease_seconds=300,
-    )
-    assert type(claimed) is GuidedOperationClaimed
-    settlement = await service.stage_guided_pipeline_proposal(
-        GuidedPipelineProposalStageCommand(
-            fence=claimed.fence,
-            expected_current_state_id=state.id,
-            expected_current_state_version=state.version,
-            expected_current_content_hash=content_hash,
-            checkpoint_state_id=checkpoint_id,
-            proposal_id=proposal_id,
-            state=CompositionStateData(
-                sources=checkpoint_data["sources"],
-                nodes=checkpoint_data["nodes"],
-                edges=checkpoint_data["edges"],
-                outputs=checkpoint_data["outputs"],
-                metadata_=checkpoint_data["metadata"],
-                is_valid=state.is_valid,
-                composer_meta={"guided_session": active.to_dict()},
-            ),
-            plan=PipelinePlanResult(
-                proposal=proposal,
-                tool_call_id=f"guided-fork-{uuid.uuid4()}",
-                custody_result="not_required",
-                model_identifier="test-model",
-                model_version="test-model-v1",
-                provider="test",
-            ),
-            summary="Stage fork proposal.",
-            rationale="Exercise fork proposal integrity.",
-            affects=("graph",),
-            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry()),
-            catalog_plugin_ids=catalog,
-            proposal_projection=projection,
-            actor="composer-web:user:alice",
-            user_message_id=None,
-            user_message_content_hash=None,
-            originating_message=None,
-            supersedes_proposal_id=None,
-            response=GuidedResponseDescriptor(
-                kind="guided_respond",
-                next_turn=GuidedReplayTurn(
-                    turn_type=turn_type, step_index=2 if guided.step is GuidedStep.STEP_3_TRANSFORMS else 3, payload_id=prepared.payload_id
-                ),
-                assistant_turn_seq=None,
-            ),
-            payloads=(prepared,),
-        ),
-        payload_store=payload_store,
-    )
-    context = await service._guided_test_context(session_id, "guided")
-    await service._run_sync(service.session_operation_authority.release, context)
-    return settlement.proposal, settlement.result_state, active
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -446,7 +70,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -476,7 +100,7 @@ async def _fork_session(
     )
     staged = None
     try:
-        reserved = await service.reserve_guided_operation(
+        reserved = await service.reserve_operation_receipt(
             session_id=source_session_id,
             operation_id=str(uuid.uuid4()),
             kind="session_fork",
@@ -485,18 +109,18 @@ async def _fork_session(
             lease_seconds=300,
             session_operation_context=parent_context,
         )
-        assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
+        assert type(reserved) in {OperationReceiptClaimed, OperationReceiptTakenOver}
         parent_authority = SessionForkParentAuthority(
             parent_context=parent_context,
-            guided_fence=reserved.fence,
+            receipt_fence=reserved.fence,
         )
         staged = await service.fork_session(
             parent_authority,
             fork_message_id=fork_message_id,
             new_message_content=new_message_content,
         )
-        active = await service.settle_guided_fork_operation(
-            GuidedForkSettlementCommand(
+        active = await service.settle_fork_operation_receipt(
+            SessionForkSettlementCommand(
                 authority=staged.authority,
                 expected_current_state_id=staged.state.id if staged.state is not None else None,
                 edited_message_id=staged.messages[-1].id,
@@ -517,134 +141,6 @@ async def _fork_session(
             service.session_operation_authority.release,
             parent_context,
         )
-
-
-async def _complete_guided_start_authority(
-    service: SessionServiceImpl,
-    *,
-    session_id: uuid.UUID,
-    root_message,
-    state,
-    state_data: CompositionStateData,
-) -> None:
-    """Bind a fixture root and existing guided head through the production start APIs."""
-    from elspeth.contracts.hashing import stable_hash
-    from elspeth.web.composer.guided.profile import kind_for_profile
-    from elspeth.web.sessions.converters import state_from_record
-    from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-    from elspeth.web.sessions.schemas import StartGuidedRequest
-
-    # Hash under the profile the checkpoint ACTUALLY carries. The custody
-    # helper recovers the discriminator from the start checkpoint rather than
-    # assuming "live" (goal-first, elspeth-378cfa0e18), so a tutorial-profile
-    # checkpoint whose start operation was hashed as live is a state no real
-    # start can produce — and pinning it would pin a fiction.
-    head_guided = state_from_record(state).guided_session
-    assert head_guided is not None
-    operation_id = str(uuid.uuid4())
-    request = StartGuidedRequest.model_validate(
-        {
-            "operation_id": operation_id,
-            "profile": kind_for_profile(head_guided.profile).value,
-            "intent": root_message.content,
-        },
-        strict=True,
-    )
-    claimed = await service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_start",
-        request_hash=guided_operation_request_hash(
-            session_id=session_id,
-            kind="guided_start",
-            request=request,
-        ),
-        actor="composer_route",
-        lease_seconds=300,
-    )
-    assert type(claimed) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    outcome = await service.seed_or_complete_guided_start_operation(
-        claimed.fence,
-        state=state_data,
-        provenance="session_seed",
-        actor="composer_route",
-        response_hash_factory=lambda record: stable_hash({"state_id": str(record.id)}),
-        originating_message=GuidedOriginatingUserMessageDraft(
-            message_id=root_message.id,
-            content=root_message.content,
-        ),
-    )
-    assert outcome.state.id == state.id
-
-
-async def _assert_fork_integrity_failure_is_atomic(
-    service: SessionServiceImpl,
-    *,
-    source_session_id: uuid.UUID,
-    fork_message_id: uuid.UUID,
-    match: str,
-) -> None:
-    from elspeth.contracts.errors import AuditIntegrityError
-
-    with service._engine.begin() as conn:
-        session_count = conn.execute(select(func.count()).select_from(sessions_table)).scalar_one()
-        state_count = conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one()
-
-    with pytest.raises(AuditIntegrityError, match=match):
-        await _fork_session(
-            service,
-            source_session_id=source_session_id,
-            fork_message_id=fork_message_id,
-            new_message_content="retry",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-    with service._engine.begin() as conn:
-        assert conn.execute(select(func.count()).select_from(sessions_table)).scalar_one() == session_count
-        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == state_count
-
-
-async def _canonical_guided_fork_source(service: SessionServiceImpl, payload_store):
-    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-    session = await service.create_session("alice", "Guided", "local")
-    root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-    guided = _guided_fork_checkpoint(
-        step=GuidedStep.STEP_3_TRANSFORMS.value,
-        root_message_id=root.id,
-        deferred_message_id=root.id,
-        deferred_message_content=root.content,
-        current_turn=TurnType.PROPOSE_PIPELINE.value,
-    )
-    state = await _save_guided_fork_seed(
-        service,
-        session.id,
-        CompositionStateData(
-            sources={},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            is_valid=True,
-            metadata_={"name": "Guided", "description": ""},
-            composer_meta={"guided_session": guided.to_dict()},
-        ),
-    )
-    proposal, state, guided = await _attach_pending_fork_proposal(
-        service,
-        session_id=session.id,
-        state=state,
-        guided=guided,
-        payload_store=payload_store,
-    )
-    fork_message = await service.add_message(
-        session.id,
-        "user",
-        "fork",
-        composition_state_id=state.id,
-        writer_principal="route_user_message",
-    )
-    return session, proposal, state, guided, fork_message
 
 
 class TestForkSession:
@@ -1297,717 +793,6 @@ class TestForkSession:
         assert len(audit_rows) == 2
 
     @pytest.mark.asyncio
-    async def test_fork_remaps_all_guided_message_references_and_preserves_reviewed_facts(self, service, payload_store) -> None:
-        """Schema-8 custody survives without parent chat or proposal authority."""
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root intent", writer_principal="route_user_message")
-        deferred_origin = await service.add_message(
-            session.id,
-            "user",
-            "deferred detail",
-            writer_principal="route_user_message",
-        )
-        source_guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=deferred_origin.id,
-            deferred_message_content=deferred_origin.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        state_data = CompositionStateData(
-            sources={},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            metadata_={"name": "Guided", "description": ""},
-            is_valid=True,
-            composer_meta={"guided_session": source_guided.to_dict()},
-        )
-        state = await _save_guided_fork_seed(service, session.id, state_data)
-        _proposal, state, source_guided = await _attach_pending_fork_proposal(
-            service,
-            session_id=session.id,
-            state=state,
-            guided=source_guided,
-            payload_store=payload_store,
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork here",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        _child, child_messages, copied_state = await _fork_session(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_msg.id,
-            new_message_content="changed root request",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-        assert copied_state is not None
-        copied_meta = dict(deep_thaw(copied_state.composer_meta))
-        copied_guided = GuidedSession.from_dict(copied_meta["guided_session"])
-        copied_root = next(message for message in child_messages if message.content == "root intent")
-        copied_deferred_origin = next(message for message in child_messages if message.content == "deferred detail")
-
-        assert copied_guided.profile == EMPTY_PROFILE
-        assert copied_guided.step is GuidedStep.STEP_2_SINK
-        assert copied_guided.reviewed_sources == source_guided.reviewed_sources
-        assert copied_guided.reviewed_outputs == source_guided.reviewed_outputs
-        assert copied_guided.deferred_intents[0].redacted_summary == source_guided.deferred_intents[0].redacted_summary
-        assert copied_guided.root_intent_message_id == str(copied_root.id)
-        assert copied_guided.root_intent_message_id != str(root.id)
-        assert copied_guided.deferred_intents[0].originating_message_id == str(copied_deferred_origin.id)
-        assert copied_guided.deferred_intents[0].originating_message_id != str(deferred_origin.id)
-        assert copied_guided.active_proposal is None
-        assert copied_guided.active_edit_target is None
-        assert copied_guided.transition_consumed is False
-        assert len(copied_guided.history) == 1
-        assert copied_guided.history[0].response_hash == _FORK_HASH_B
-        persisted_state = await service.get_current_state(copied_state.session_id)
-        assert persisted_state is not None
-        persisted_meta = dict(deep_thaw(persisted_state.composer_meta))
-        assert GuidedSession.from_dict(persisted_meta["guided_session"]) == copied_guided
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("step", "turn_type"),
-        [
-            ("step_3_transforms", "propose_pipeline"),
-            ("step_4_wire", "confirm_wiring"),
-        ],
-    )
-    async def test_fork_rewinds_proposal_and_wire_stages_without_fabricating_answers(
-        self,
-        service,
-        payload_store,
-        step: str,
-        turn_type: str,
-    ) -> None:
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=step,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=turn_type,
-        )
-        state_data = CompositionStateData(
-            is_valid=True,
-            metadata_={"name": "Guided", "description": ""},
-            composer_meta={"guided_session": guided.to_dict()},
-        )
-        state = await _save_guided_fork_seed(service, session.id, state_data)
-        _proposal, state, guided = await _attach_pending_fork_proposal(
-            service,
-            session_id=session.id,
-            state=state,
-            guided=guided,
-            payload_store=payload_store,
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        _, _, copied_state = await _fork_session(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_msg.id,
-            new_message_content="retry",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-        assert copied_state is not None
-        copied_meta = dict(deep_thaw(copied_state.composer_meta))
-        copied_guided = GuidedSession.from_dict(copied_meta["guided_session"])
-        assert copied_guided.step is GuidedStep.STEP_2_SINK
-        assert copied_guided.active_proposal is None
-        assert copied_guided.active_edit_target is None
-        assert copied_guided.transition_consumed is False
-        assert len(copied_guided.history) == 1
-        assert copied_guided.history[0].response_hash == _FORK_HASH_B
-        assert copied_guided.history[0].summary == "Answered occurrence stays in fork history."
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_missing_active_proposal_authority_before_creating_child(self, service) -> None:
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        state = await _save_corrupt_guided_fork_checkpoint(
-            service,
-            session.id,
-            CompositionStateData(
-                is_valid=True,
-                metadata_={"name": "Guided", "description": ""},
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        with pytest.raises(AuditIntegrityError, match="missing or cross-session"):
-            await _fork_session(
-                service,
-                source_session_id=session.id,
-                fork_message_id=fork_msg.id,
-                new_message_content="retry",
-                user_id="alice",
-                auth_provider_type="local",
-            )
-
-        sessions = await service.list_sessions("alice", "local")
-        assert [record.id for record in sessions] == [session.id]
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_cross_session_active_proposal_before_creating_child(self, service, payload_store) -> None:
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Source", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        state = await _save_guided_fork_seed(
-            service,
-            session.id,
-            CompositionStateData(
-                sources={},
-                nodes=[],
-                edges=[],
-                outputs=[],
-                is_valid=True,
-                metadata_={"name": "Source", "description": ""},
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-        )
-        _foreign_session, _proposal, _foreign_state, foreign_guided, _foreign_fork = await _canonical_guided_fork_source(
-            service, payload_store
-        )
-        assert foreign_guided.active_proposal is not None
-        cross_session_guided = replace(guided, active_proposal=foreign_guided.active_proposal)
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_states_table)
-                .where(composition_states_table.c.id == str(state.id))
-                .values(composer_meta={"_version": 1, "data": {"guided_session": cross_session_guided.to_dict()}})
-            )
-        fork_message = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        await _assert_fork_integrity_failure_is_atomic(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_message.id,
-            match="missing or cross-session",
-        )
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_ambiguous_creation_authority_before_creating_child(self, service, payload_store) -> None:
-        session, proposal, _state, _guided, fork_message = await _canonical_guided_fork_source(service, payload_store)
-        with service._engine.begin() as conn:
-            creation = conn.execute(
-                select(proposal_events_table)
-                .where(proposal_events_table.c.proposal_id == str(proposal.id))
-                .where(proposal_events_table.c.event_type == "proposal.created")
-            ).one()
-            conn.execute(
-                insert(proposal_events_table).values(
-                    id=str(uuid.uuid4()),
-                    session_id=str(session.id),
-                    proposal_id=str(proposal.id),
-                    event_type=creation.event_type,
-                    actor=creation.actor,
-                    payload=creation.payload,
-                    created_at=creation.created_at,
-                )
-            )
-
-        await _assert_fork_integrity_failure_is_atomic(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_message.id,
-            match="exactly one creation event",
-        )
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_terminal_active_proposal_before_creating_child(self, service, payload_store) -> None:
-        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
-
-        session, proposal, _state, guided, fork_message = await _canonical_guided_fork_source(service, payload_store)
-        assert guided.active_proposal is not None
-        await service.reject_pipeline_composition_proposal(
-            session_id=session.id,
-            proposal_id=proposal.id,
-            draft_hash=guided.active_proposal.draft_hash,
-            reviewed_facts=guided_private_reviewed_facts(guided),
-            reason="superseded",
-            dispatch=None,
-            actor="test",
-        )
-
-        await _assert_fork_integrity_failure_is_atomic(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_message.id,
-            match="terminal pipeline proposal",
-        )
-        with service._engine.begin() as conn:
-            status = conn.execute(
-                select(composition_proposals_table.c.status).where(composition_proposals_table.c.id == str(proposal.id))
-            ).scalar_one()
-        assert status == "rejected"
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_active_proposal_with_wrong_checkpoint_base(self, service) -> None:
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        target = await _save_guided_fork_seed(
-            service,
-            session.id,
-            CompositionStateData(
-                sources={},
-                nodes=[],
-                edges=[],
-                outputs=[],
-                is_valid=True,
-                metadata_={"name": "Target", "description": ""},
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-        )
-        other = await service.save_composition_state(
-            session.id,
-            CompositionStateData(
-                sources={
-                    "other": {
-                        "plugin": "csv",
-                        "on_success": "discard",
-                        "options": {},
-                        "on_validation_failure": "discard",
-                    }
-                },
-                nodes=[],
-                edges=[],
-                outputs=[],
-                is_valid=True,
-                metadata_={"name": "Other", "description": ""},
-                composer_meta={"guided_session": None},
-            ),
-            provenance="session_seed",
-        )
-        _proposal, target, _guided = await _attach_mismatched_fork_proposal(
-            service,
-            session_id=session.id,
-            state=target,
-            guided=guided,
-            proposal_base_state=other,
-        )
-        from elspeth.web.composer.pipeline_proposal import composition_content_hash
-        from elspeth.web.sessions.converters import state_from_record
-
-        assert composition_content_hash(state_from_record(target)) != composition_content_hash(state_from_record(other))
-        fork_message = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=target.id,
-            writer_principal="route_user_message",
-        )
-
-        await _assert_fork_integrity_failure_is_atomic(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_message.id,
-            match="checkpoint base",
-        )
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_active_proposal_with_changed_checkpoint_content(self, service, payload_store) -> None:
-        session, _proposal, state, _guided, fork_message = await _canonical_guided_fork_source(service, payload_store)
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_states_table)
-                .where(composition_states_table.c.id == str(state.id))
-                .values(metadata_={"_version": 1, "data": {"name": "Tampered", "description": ""}})
-            )
-
-        await _assert_fork_integrity_failure_is_atomic(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_message.id,
-            match="base content binding",
-        )
-
-    @pytest.mark.asyncio
-    async def test_fork_topology_rewind_clears_terminal_state(self, service) -> None:
-        from dataclasses import replace
-
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-        from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalKind, TerminalState
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        completed = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_4_WIRE.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.CONFIRM_WIRING.value,
-        )
-        guided = replace(
-            completed,
-            history=(*completed.history[:-1], replace(completed.history[-1], response_hash="c" * 64)),
-            terminal=TerminalState(
-                kind=TerminalKind.COMPLETED,
-                reason=None,
-                pipeline_yaml="nodes: []",
-            ),
-            active_proposal=None,
-            active_edit_target=None,
-        )
-        state_data = CompositionStateData(
-            sources={},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            metadata_={"name": "Guided", "description": ""},
-            is_valid=True,
-            composer_meta={"guided_session": guided.to_dict()},
-        )
-        state = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        await _complete_guided_start_authority(
-            service,
-            session_id=session.id,
-            root_message=root,
-            state=state,
-            state_data=state_data,
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        _, _, copied_state = await _fork_session(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_msg.id,
-            new_message_content="retry",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-        assert copied_state is not None
-        copied_meta = dict(deep_thaw(copied_state.composer_meta))
-        copied_guided = GuidedSession.from_dict(copied_meta["guided_session"])
-        assert copied_guided.terminal is None
-
-    @pytest.mark.asyncio
-    async def test_fork_topology_rewind_removes_trailing_step3_edit_turn(self, service) -> None:
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.SCHEMA_FORM.value,
-        )
-        state_data = CompositionStateData(
-            sources={},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            metadata_={"name": "Guided", "description": ""},
-            is_valid=True,
-            composer_meta={"guided_session": guided.to_dict()},
-        )
-        state = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        await _complete_guided_start_authority(
-            service,
-            session_id=session.id,
-            root_message=root,
-            state=state,
-            state_data=state_data,
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        _, _, copied_state = await _fork_session(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_msg.id,
-            new_message_content="retry",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-        assert copied_state is not None
-        copied_meta = dict(deep_thaw(copied_state.composer_meta))
-        copied_guided = GuidedSession.from_dict(copied_meta["guided_session"])
-        assert len(copied_guided.history) == 1
-        assert copied_guided.history[0].response_hash == _FORK_HASH_B
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("malformation", ["non_trailing", "multiple"])
-    async def test_fork_rejects_malformed_unanswered_history_before_creating_child(
-        self,
-        service,
-        malformation: str,
-    ) -> None:
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=root.id,
-            deferred_message_content=root.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        answered, unanswered = guided.history
-        malformed_history = (unanswered, answered) if malformation == "non_trailing" else (unanswered, unanswered)
-        state = await _save_corrupt_guided_fork_checkpoint(
-            service,
-            session.id,
-            CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
-        )
-        malformed_meta = deep_thaw(state.composer_meta)
-        malformed_meta["guided_session"]["history"] = [record.to_dict() for record in malformed_history]
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_states_table)
-                .where(composition_states_table.c.id == str(state.id))
-                .values(composer_meta={"_version": 1, "data": malformed_meta})
-            )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        with pytest.raises(AuditIntegrityError, match="schema-10 authority is malformed"):
-            await _fork_session(
-                service,
-                source_session_id=session.id,
-                fork_message_id=fork_msg.id,
-                new_message_content="retry",
-                user_id="alice",
-                auth_provider_type="local",
-            )
-
-        sessions = await service.list_sessions("alice", "local")
-        assert [record.id for record in sessions] == [session.id]
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_out_of_slice_guided_message_reference_before_creating_child(self, service) -> None:
-        """A child checkpoint can never point back to the excluded fork row."""
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        fork_msg = await service.add_message(session.id, "user", "fork", writer_principal="route_user_message")
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=fork_msg.id,
-            deferred_message_id=fork_msg.id,
-            deferred_message_content=fork_msg.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        state = await _save_corrupt_guided_fork_checkpoint(
-            service,
-            session.id,
-            CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
-        )
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(chat_messages_table).where(chat_messages_table.c.id == str(fork_msg.id)).values(composition_state_id=str(state.id))
-            )
-
-        with pytest.raises(AuditIntegrityError, match="outside copied slice"):
-            await _fork_session(
-                service,
-                source_session_id=session.id,
-                fork_message_id=fork_msg.id,
-                new_message_content="retry",
-                user_id="alice",
-                auth_provider_type="local",
-            )
-
-        sessions = await service.list_sessions("alice", "local")
-        assert [record.id for record in sessions] == [session.id]
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_non_user_guided_lineage_before_creating_child(self, service) -> None:
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        assistant = await service.add_message(
-            session.id,
-            "assistant",
-            "assistant-authored lineage",
-            writer_principal="compose_loop",
-        )
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=assistant.id,
-            deferred_message_id=assistant.id,
-            deferred_message_content=assistant.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        state = await _save_corrupt_guided_fork_checkpoint(
-            service,
-            session.id,
-            CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        with pytest.raises(AuditIntegrityError, match="must identify user messages"):
-            await _fork_session(
-                service,
-                source_session_id=session.id,
-                fork_message_id=fork_msg.id,
-                new_message_content="retry",
-                user_id="alice",
-                auth_provider_type="local",
-            )
-
-        sessions = await service.list_sessions("alice", "local")
-        assert [record.id for record in sessions] == [session.id]
-
-    @pytest.mark.asyncio
-    async def test_fork_rejects_deferred_content_hash_mismatch_before_creating_child(self, service) -> None:
-        from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-
-        session = await service.create_session("alice", "Guided", "local")
-        root = await service.add_message(session.id, "user", "root", writer_principal="route_user_message")
-        deferred_origin = await service.add_message(
-            session.id,
-            "user",
-            "deferred detail",
-            writer_principal="route_user_message",
-        )
-        guided = _guided_fork_checkpoint(
-            step=GuidedStep.STEP_3_TRANSFORMS.value,
-            root_message_id=root.id,
-            deferred_message_id=deferred_origin.id,
-            deferred_message_content=deferred_origin.content,
-            current_turn=TurnType.PROPOSE_PIPELINE.value,
-        )
-        guided_meta = guided.to_dict()
-        guided_meta["deferred_intents"][0]["message_content_hash"] = "0" * 64
-        state = await _save_corrupt_guided_fork_checkpoint(
-            service,
-            session.id,
-            CompositionStateData(is_valid=True, composer_meta={"guided_session": guided_meta}),
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        with pytest.raises(AuditIntegrityError, match="content hash mismatch"):
-            await _fork_session(
-                service,
-                source_session_id=session.id,
-                fork_message_id=fork_msg.id,
-                new_message_content="retry",
-                user_id="alice",
-                auth_provider_type="local",
-            )
-
-        sessions = await service.list_sessions("alice", "local")
-        assert [record.id for record in sessions] == [session.id]
-
-    @pytest.mark.asyncio
     async def test_fork_and_archive_parent_session_with_durable_history(self, service) -> None:
         """Archiving a fork parent with durable history soft-archives the parent."""
         session = await service.create_session("alice", "Original", "local")
@@ -2066,82 +851,8 @@ class TestForkSession:
         assert child.forked_from_session_id == session.id
 
     @pytest.mark.asyncio
-    async def test_fork_strips_tutorial_profile_from_guided_session(self, service) -> None:
-        """Forking a tutorial-profile guided session yields the EMPTY profile.
-
-        Critical case (finding 10, rev 4 — CORRECTED). The canonical tutorial
-        source MATERIALISES (set_pipeline from ``source.inline_blob``) to a real
-        ``json`` source whose ``options`` carry ``blob_ref``
-        (``composer/tools/sessions.py:425``), so the route-layer blob-rewrite save
-        DOES fire (``rewritten=True``). This fixture uses that real shape on
-        purpose: it proves the strip survives EVEN on the path that re-saves the
-        state — because the blob-rewrite re-save preserves ``composer_meta``
-        verbatim (``sessions/routes/sessions.py:479-480``) and never strips the
-        profile. The strip therefore lives in ``fork_session`` (both the :5150
-        persist copy and the :5227 return copy) and is independent of
-        ``rewritten``. (The earlier "no blob_ref => rewritten=False" framing was a
-        false premise — see the spec's two-objects ``blob_ref`` note in §5/B4.)
-        """
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session = await service.create_session("alice", "Tutorial", "local")
-        tutorial_guided = GuidedSession.initial(profile=TUTORIAL_PROFILE)
-        state = await service.save_composition_state(
-            session.id,
-            CompositionStateData(
-                # Materialised canonical URL source (sessions.py:420-427): a real
-                # ``json`` plugin with ``blob_ref`` in options => rewritten=True.
-                # The blob-rewrite save fires but preserves composer_meta verbatim,
-                # so the profile strip must still come from fork_session.
-                sources={
-                    "urls": {
-                        "plugin": "json",
-                        "options": {
-                            "path": "composer_blobs/canonical-url-list.json",
-                            "blob_ref": "a1b2c3d4-0000-0000-0000-000000000099",
-                        },
-                    }
-                },
-                is_valid=True,
-                composer_meta={"guided_session": tutorial_guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-        fork_msg = await service.add_message(
-            session.id,
-            "user",
-            "Build this",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-
-        _, _, copied_state = await _fork_session(
-            service,
-            source_session_id=session.id,
-            fork_message_id=fork_msg.id,
-            new_message_content="Build something else",
-            user_id="alice",
-            auth_provider_type="local",
-        )
-
-        assert copied_state is not None
-        # Returned record (the :5227 copy) carries the EMPTY profile. The record
-        # freezes composer_meta (CompositionStateRecord.__post_init__), so thaw
-        # before GuidedSession.from_dict — the canonical read in converters.py:67.
-        forked_meta = dict(deep_thaw(copied_state.composer_meta))
-        forked_guided = GuidedSession.from_dict(forked_meta["guided_session"])
-        assert forked_guided.profile == EMPTY_PROFILE
-        # And it is PERSISTED that way (the :5150 copy) — re-read from the DB.
-        persisted = await service.get_current_state(copied_state.session_id)
-        persisted_meta = dict(deep_thaw(persisted.composer_meta))
-        persisted_guided = GuidedSession.from_dict(persisted_meta["guided_session"])
-        assert persisted_guided.profile == EMPTY_PROFILE
-
-    @pytest.mark.asyncio
-    async def test_fork_without_guided_session_passes_meta_through(self, service) -> None:
-        """An ordinary (non-guided) fork is unaffected by the profile strip."""
+    async def test_fork_preserves_composer_meta(self, service) -> None:
+        """A fork preserves its mode-neutral composition metadata."""
         session = await service.create_session("alice", "Plain", "local")
         state = await service.save_composition_state(
             session.id,
@@ -2164,7 +875,6 @@ class TestForkSession:
             auth_provider_type="local",
         )
         assert copied_state is not None
-        # composer_meta passes through verbatim (no guided_session key to strip).
         assert copied_state.composer_meta == {"repair_turns_used": 2}
 
 
@@ -2181,17 +891,17 @@ def _expire_dead_fork_worker_leases(
 ) -> None:
     """Age every database-clocked lease a fork worker held past ``expired_at``.
 
-    Three rows, not two: the guided operation row, the parent's live
+    Three rows, not two: the durable receipt row, the parent's live
     SESSION_FORK fence, and the child's live SESSION_FORK fence, which
     ``_insert_fork_child`` mints as a shadow of the parent lease (same owner,
     same expiry). A worker that died holds none of them.
     """
     with service._engine.begin() as conn:
         conn.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent_id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent_id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(lease_expires_at=expired_at)
         )
@@ -2236,7 +946,7 @@ def _make_fork_app(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    session_service = DualFencedSessionServiceHarness(
+    session_service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -2357,9 +1067,9 @@ class TestForkEndpoint:
             await run_sync_in_worker(partial_copied.wait, 5)
             with service._engine.connect() as conn:
                 operation = conn.execute(
-                    select(guided_operations_table).where(
-                        guided_operations_table.c.session_id == str(parent.id),
-                        guided_operations_table.c.operation_id == operation_id,
+                    select(session_operation_receipts_table).where(
+                        session_operation_receipts_table.c.session_id == str(parent.id),
+                        session_operation_receipts_table.c.operation_id == operation_id,
                     )
                 ).one()
                 child_id = uuid.UUID(operation.result_session_id)
@@ -2370,7 +1080,7 @@ class TestForkEndpoint:
                     == 1
                 )
             # A dead worker loses EVERY database-clocked lease it held: the
-            # guided operation row, the parent's SESSION_FORK fence, and the
+            # receipt row, the parent's SESSION_FORK fence, and the
             # child's SESSION_FORK fence that was minted as a shadow of that
             # parent lease (same owner, same expiry). Expire all three so the
             # takeover winner acquires the parent lease honestly and then takes
@@ -2421,9 +1131,9 @@ class TestForkEndpoint:
                 == 1
             )
             operation = conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one()
             assert operation.status == "completed"
@@ -2499,9 +1209,9 @@ class TestForkEndpoint:
             await run_sync_in_worker(partial_copied.wait, 5)
             with service._engine.connect() as conn:
                 operation = conn.execute(
-                    select(guided_operations_table).where(
-                        guided_operations_table.c.session_id == str(parent.id),
-                        guided_operations_table.c.operation_id == operation_id,
+                    select(session_operation_receipts_table).where(
+                        session_operation_receipts_table.c.session_id == str(parent.id),
+                        session_operation_receipts_table.c.operation_id == operation_id,
                     )
                 ).one()
                 child_id = uuid.UUID(operation.result_session_id)
@@ -2547,17 +1257,17 @@ class TestForkEndpoint:
         assert winner_response.status_code == 500, diagnostic
         assert winner_response.json() == {
             "detail": {
-                "error_type": "guided_operation_terminal_failure",
+                "error_type": "session_operation_terminal_failure",
                 "failure_code": "integrity_error",
-                "detail": "The operation failed an integrity check.",
+                "detail": "The operation could not verify its audit evidence.",
             }
         }, diagnostic
         assert copy_calls == 1, diagnostic
         with service._engine.connect() as conn:
             operation = conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one()
             assert operation.status == "failed", diagnostic
@@ -2605,7 +1315,7 @@ class TestForkEndpoint:
         assert first.content == replay.content
         child_id = uuid.UUID(first.json()["session_id"])
         assert copy_calls == 1
-        expected_hash = guided_response_hash(ForkSessionResponse(session_id=child_id))
+        expected_hash = operation_receipt_response_hash(ForkSessionResponse(session_id=child_id))
         with service._engine.connect() as conn:
             assert (
                 conn.execute(
@@ -2614,20 +1324,20 @@ class TestForkEndpoint:
                 == 1
             )
             operation = conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one()
             assert operation.response_hash == expected_hash
 
         with service._engine.begin() as conn:
-            conn.execute(text("DROP TRIGGER trg_guided_operations_terminal_immutable"))
+            conn.execute(text("DROP TRIGGER trg_session_operation_receipts_terminal_immutable"))
             conn.execute(
-                update(guided_operations_table)
+                update(session_operation_receipts_table)
                 .where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
                 .values(response_hash="f" * 64)
             )
@@ -2699,9 +1409,9 @@ class TestForkEndpoint:
         assert len(cleanup_results) == 1
         with service._engine.connect() as conn:
             operation = conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one()
             assert operation.status == "failed"
@@ -2760,7 +1470,7 @@ class TestForkEndpoint:
                 lease_seconds=service.session_operation_lease_seconds,
             )
         )
-        claimed = await service.reserve_guided_operation(
+        claimed = await service.reserve_operation_receipt(
             session_id=parent.id,
             operation_id=str(uuid.uuid4()),
             kind="session_fork",
@@ -2769,9 +1479,9 @@ class TestForkEndpoint:
             lease_seconds=300,
             session_operation_context=parent_context,
         )
-        assert isinstance(claimed, GuidedOperationClaimed)
+        assert isinstance(claimed, OperationReceiptClaimed)
         staged = await service.fork_session(
-            SessionForkParentAuthority(parent_context=parent_context, guided_fence=claimed.fence),
+            SessionForkParentAuthority(parent_context=parent_context, receipt_fence=claimed.fence),
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
@@ -2811,236 +1521,6 @@ class TestForkEndpoint:
                 type("RequestStub", (), {"app": app})(),
             )
         assert shared_gate.value.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_pending_inspection_review_fork_rewrites_custody_and_commits_from_child_blob(self, tmp_path) -> None:
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-        from elspeth.web.composer.guided.stage_transitions import (
-            AnsweredTurn,
-            InspectionResponse,
-            transition_source_inspection_review,
-        )
-        from elspeth.web.composer.guided.state_machine import GuidedSession, SourceIntent, TurnRecord
-        from elspeth.web.composer.source_inspection import SourceInspectionFacts
-
-        app, service, blob_service = _make_fork_app(tmp_path)
-        parent = await service.create_session("alice", "Parent", "local")
-        root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
-        stable_id = str(uuid.uuid4())
-        guided = GuidedSession(
-            step=GuidedStep.STEP_1_SOURCE,
-            history=(
-                TurnRecord(
-                    step=GuidedStep.STEP_1_SOURCE,
-                    turn_type=TurnType.INSPECT_AND_CONFIRM,
-                    payload_hash="a" * 64,
-                    response_hash=None,
-                    emitter="server",
-                ),
-            ),
-            source_order=(stable_id,),
-            pending_source_intents={
-                stable_id: SourceIntent(
-                    name="orders",
-                    phase="inspection_review",
-                    plugin="csv",
-                    options={
-                        "path": f"blob:{parent_blob.id}",
-                        "blob_ref": str(parent_blob.id),
-                        "on_validation_failure": "discard",
-                    },
-                    inspection_facts=SourceInspectionFacts(
-                        source_kind="csv",
-                        redacted_identity={
-                            "filename": "orders.csv",
-                            "mime_type": "text/csv",
-                            "blob_id": str(parent_blob.id),
-                        },
-                        byte_range_inspected=(0, parent_blob.size_bytes),
-                        sample_row_count=1,
-                        observed_headers=("id", "name"),
-                        inferred_types={"id": "int", "name": "str"},
-                        url_candidates=(),
-                        warnings=(),
-                    ),
-                    observed_columns=("id", "name"),
-                    sample_rows=({"id": 1, "name": "Ada"},),
-                )
-            },
-            root_intent_message_id=str(root.id),
-        )
-        state_data = CompositionStateData(
-            sources={},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            metadata_={"name": "Guided", "description": ""},
-            is_valid=True,
-            composer_meta={"guided_session": guided.to_dict()},
-        )
-        state = await service.save_composition_state(
-            parent.id,
-            state_data,
-            provenance="session_seed",
-        )
-        await _complete_guided_start_authority(
-            service,
-            session_id=parent.id,
-            root_message=root,
-            state=state,
-            state_data=state_data,
-        )
-        fork_message = await service.add_message(
-            parent.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-        response = TestClient(app).post(
-            f"/api/sessions/{parent.id}/fork",
-            json={
-                "operation_id": str(uuid.uuid4()),
-                "from_message_id": str(fork_message.id),
-                "new_message_content": "edited",
-            },
-        )
-        assert response.status_code == 201
-        child_id = uuid.UUID(response.json()["session_id"])
-        child_state = await service.get_current_state(child_id)
-        assert child_state is not None
-        child_guided = GuidedSession.from_dict(deep_thaw(child_state.composer_meta["guided_session"]))
-        child_intent = child_guided.pending_source_intents[stable_id]
-        child_blob_id = child_intent.inspection_facts.redacted_identity["blob_id"]
-        assert child_blob_id != str(parent_blob.id)
-        assert child_intent.options["blob_ref"] == child_blob_id
-        assert child_intent.options["path"] == f"blob:{child_blob_id}"
-        assert child_intent.sample_rows == ({"id": 1, "name": "Ada"},)
-        child_blob = await get_blob_under_fence(service, blob_service, child_id, uuid.UUID(child_blob_id))
-        assert child_blob.session_id == child_id
-        assert await read_blob_content_under_fence(service, blob_service, child_id, child_blob.id) == b"id,name\n1,Ada\n"
-
-        committed = transition_source_inspection_review(
-            child_guided,
-            target_id=stable_id,
-            turn=AnsweredTurn(history_index=0),
-            response=InspectionResponse(columns=("id", "name")),
-        )
-        assert stable_id not in committed.pending_source_intents
-        assert committed.reviewed_sources[stable_id].options["blob_ref"] == child_blob_id
-        assert str(parent_blob.id) not in str(committed.to_dict())
-        committed_state = await service.save_composition_state(
-            child_id,
-            CompositionStateData(is_valid=True, composer_meta={"guided_session": committed.to_dict()}),
-            provenance="post_compose",
-        )
-        reloaded = await service.get_state_in_session(committed_state.id, child_id)
-        reloaded_guided = GuidedSession.from_dict(deep_thaw(reloaded.composer_meta["guided_session"]))
-        assert stable_id not in reloaded_guided.pending_source_intents
-        assert reloaded_guided.reviewed_sources[stable_id].options["blob_ref"] == child_blob_id
-        assert str(parent_blob.id) not in str(reloaded_guided.to_dict())
-
-    @pytest.mark.asyncio
-    async def test_explicit_blob_ref_reviewed_source_fork_child_projects_redacted(self, tmp_path) -> None:
-        """A fork rewrites BOTH the reviewed snapshot and the live source to the
-        child blob's private path plus ``blob_ref``. The projection must correlate
-        that binding on the persisted values and serve the child with the path
-        masked (elspeth-75d320fb25: correlating on the generic-redacted copy
-        rejected this consistent shape as a custody mismatch)."""
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-        from elspeth.web.composer.guided.resolved import SourceResolved
-        from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
-        from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
-        from elspeth.web.dependencies import create_catalog_service
-        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-
-        app, service, blob_service = _make_fork_app(tmp_path)
-        catalog = create_catalog_service()
-        app.state.catalog_service = catalog
-        app.state.operator_profile_registry = MagicMock(spec=OperatorProfileRegistry)
-        app.state.plugin_snapshot_factory = lambda _user: PluginAvailabilitySnapshot.for_trained_operator(catalog)
-        parent = await service.create_session("alice", "Parent", "local")
-        root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
-        stable_id = str(uuid.uuid4())
-        options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
-        guided = GuidedSession(
-            step=GuidedStep.STEP_2_SINK,
-            history=(
-                TurnRecord(
-                    step=GuidedStep.STEP_2_SINK,
-                    turn_type=TurnType.INSPECT_AND_CONFIRM,
-                    payload_hash="a" * 64,
-                    response_hash=None,
-                    emitter="server",
-                ),
-            ),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="orders",
-                    plugin="csv",
-                    options=options,
-                    observed_columns=("id", "name"),
-                    sample_rows=({"id": 1, "name": "Ada"},),
-                    on_validation_failure="discard",
-                )
-            },
-            root_intent_message_id=str(root.id),
-        )
-        state_data = CompositionStateData(
-            sources={"orders": {"plugin": "csv", "on_success": "out", "options": dict(options), "on_validation_failure": "discard"}},
-            nodes=[],
-            edges=[],
-            outputs=[],
-            metadata_={"name": "Guided", "description": ""},
-            is_valid=True,
-            composer_meta={"guided_session": guided.to_dict()},
-        )
-        state = await service.save_composition_state(parent.id, state_data, provenance="session_seed")
-        await _complete_guided_start_authority(
-            service,
-            session_id=parent.id,
-            root_message=root,
-            state=state,
-            state_data=state_data,
-        )
-        fork_message = await service.add_message(
-            parent.id,
-            "user",
-            "fork",
-            composition_state_id=state.id,
-            writer_principal="route_user_message",
-        )
-        client = TestClient(app)
-        response = client.post(
-            f"/api/sessions/{parent.id}/fork",
-            json={
-                "operation_id": str(uuid.uuid4()),
-                "from_message_id": str(fork_message.id),
-                "new_message_content": "edited",
-            },
-        )
-        assert response.status_code == 201
-        child_id = uuid.UUID(response.json()["session_id"])
-        child_state = await service.get_current_state(child_id)
-        assert child_state is not None
-        child_options = deep_thaw(child_state.sources)["orders"]["options"]
-        child_reviewed = deep_thaw(child_state.composer_meta)["guided_session"]["reviewed_sources"][stable_id]["options"]
-        assert child_options["blob_ref"] == child_reviewed["blob_ref"] != str(parent_blob.id)
-        assert child_options["path"] == child_reviewed["path"] != parent_blob.storage_path
-
-        projected = client.get(f"/api/sessions/{child_id}/state")
-        assert projected.status_code == 200, projected.text
-        body = projected.json()
-        assert body["sources"]["orders"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
-        assert body["composer_meta"]["guided_session"]["reviewed_sources"][stable_id]["options"]["path"] == (REDACTED_BLOB_SOURCE_PATH)
-        assert child_options["path"] not in projected.text
-        assert parent_blob.storage_path not in projected.text
 
     @pytest.mark.asyncio
     async def test_fork_endpoint_creates_session(self, tmp_path) -> None:
@@ -3499,7 +1979,7 @@ class TestForkEndpoint:
         initialize_session_schema(engine)
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -3576,7 +2056,7 @@ class TestForkEndpoint:
             == replay.json()
             == {
                 "detail": {
-                    "error_type": "guided_operation_terminal_failure",
+                    "error_type": "session_operation_terminal_failure",
                     "failure_code": "quota_exceeded",
                     "detail": "The operation exceeded the session storage quota.",
                 }
@@ -3799,13 +2279,13 @@ class TestForkEndpoint:
         # HTTP response rather than propagated as a Python exception.
         client = TestClient(app, raise_server_exceptions=False)
 
-        async def fail_settle_guided_fork_operation(*args: Any, **kwargs: Any) -> None:
+        async def fail_settle_fork_operation_receipt(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("DB write failed")
 
         with patch.object(
             service,
-            "settle_guided_fork_operation",
-            new=fail_settle_guided_fork_operation,
+            "settle_fork_operation_receipt",
+            new=fail_settle_fork_operation_receipt,
         ):
             response = client.post(
                 f"/api/sessions/{session.id}/fork",
@@ -3922,7 +2402,7 @@ class TestForkEndpoint:
         with (
             patch.object(blob_service, "copy_blobs_for_fork", new=fail_copy),
             patch.object(blob_service, "cleanup_blobs_for_fork", new=fail_cleanup),
-            patch.object(service, "fail_guided_fork_operation", new=fail_settlement),
+            patch.object(service, "fail_fork_operation_receipt", new=fail_settlement),
             pytest.raises(AuditIntegrityError) as caught,
         ):
             TestClient(app).post(

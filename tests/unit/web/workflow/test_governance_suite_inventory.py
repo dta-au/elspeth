@@ -193,7 +193,7 @@ CATALOG: Final[tuple[Item, ...]] = (
     Item(
         "R13 inline custody",
         (Pin(SITES, "test_composer_inline_custody_uses_shared_reservation_gate"),),
-        (Pin(SITES, "test_guided_full_inline_settlement_admits_on_held_connection"),),
+        (Pin(SITES, "test_inline_settlement_admits_on_held_connection"),),
     ),
     Item(
         "R13 run-output finalize",

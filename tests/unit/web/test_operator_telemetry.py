@@ -232,7 +232,7 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
             attributes={
                 "elspeth.acceptance.namespace": "acceptance-run-a",
                 "elspeth.acceptance.sentinel": "17",
-                "surface": "guided",
+                "surface": "freeform",
                 "run_id": "must-not-become-a-metric-dimension",
             },
         )
@@ -243,7 +243,7 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
         assert point.attributes == {
             "elspeth.acceptance.namespace": "acceptance-run-a",
             "elspeth.acceptance.sentinel": "17",
-            "surface": "guided",
+            "surface": "freeform",
         }
     finally:
         provider.shutdown()

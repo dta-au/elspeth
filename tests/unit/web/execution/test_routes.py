@@ -1719,7 +1719,7 @@ class TestRunDiagnosticsEndpoint:
     @pytest.mark.asyncio
     async def test_evaluate_diagnostics_persists_under_session_compose_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """elspeth-0fcf68d50f: the diagnostics audit persist must hold the
-        same per-session compose lock the compose/guided routes serialize
+        same per-session compose lock the composer routes serialize
         on, so its ``role=audit`` rows cannot interleave inside an
         in-flight compose turn's sequence range."""
         import time

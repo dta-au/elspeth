@@ -51,7 +51,7 @@ from elspeth.web.sessions.routes._helpers import _interpretation_event_response
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_interpretation_events_service import _seed_state_with_llm_node
 
 _NODE_ID = "pair_colours"
@@ -67,7 +67,7 @@ def session_service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),

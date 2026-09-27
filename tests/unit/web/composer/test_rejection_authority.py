@@ -9,11 +9,10 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.no_tool_policy import _tool_failure_detail
 from elspeth.web.composer.redaction import GetBlobContentResponseModel, redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.composer.tools import ToolResult, execute_tool
 from elspeth.web.composer.tools._common import _failure_result, _merged_component_rejection_result
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions.routes._helpers import _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL, _guided_source_commit_failure_detail
 from tests.unit.web.composer._helpers import _empty_state, _mock_catalog
 
 
@@ -82,23 +81,3 @@ def test_generic_failure_detail_accepts_empty_errors_and_preserves_control_error
     assert detail == "."
     assert _tool_failure_detail({"error": "bad arguments"}) == ": bad arguments"
     assert _tool_failure_detail(_failure_result(_empty_state(), "actual rejection").to_dict()) == ": actual rejection"
-
-
-@pytest.mark.parametrize("component", ["rejected_mutation", "pipeline"])
-def test_guided_source_detail_only_discloses_its_closed_rejection(component: str) -> None:
-    result = ToolResult(
-        success=False,
-        updated_state=_empty_state(),
-        validation=ValidationSummary(
-            is_valid=False,
-            errors=(ValidationEntry(component=component, message="Path violation (S2): Source file paths sentinel", severity="high"),),
-        ),
-        affected_nodes=(),
-    )
-    expected = _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL if component == "rejected_mutation" else "Step 1 source commit failed"
-    assert _guided_source_commit_failure_detail(result) == expected
-    assert _guided_source_commit_failure_detail(replace(result, success=True)) == "Step 1 source commit failed"
-    assert (
-        _guided_source_commit_failure_detail(replace(result, validation=ValidationSummary(is_valid=True, errors=())))
-        == "Step 1 source commit failed"
-    )

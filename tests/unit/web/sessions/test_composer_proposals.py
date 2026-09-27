@@ -22,7 +22,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.sessions.engine import create_session_engine
@@ -38,7 +38,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -171,12 +171,8 @@ def _pipeline_plan_result(
     proposal = PipelineProposal.create(
         pipeline=pipeline if pipeline is not None else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,
@@ -286,7 +282,8 @@ def test_composition_proposal_status_is_closed(engine) -> None:
             )
 
 
-def test_proposal_event_type_is_closed(engine) -> None:
+@pytest.mark.parametrize("event_type", ["proposal.maybe", "proposal.rebased"])
+def test_proposal_event_type_is_closed(engine, event_type: str) -> None:
     session_id = str(uuid4())
     with engine.begin() as conn:
         _insert_session(conn, session_id)
@@ -296,7 +293,7 @@ def test_proposal_event_type_is_closed(engine) -> None:
                     id=str(uuid4()),
                     session_id=session_id,
                     proposal_id=None,
-                    event_type="proposal.maybe",
+                    event_type=event_type,
                     actor="user:alice",
                     payload={"status": "unknown"},
                     created_at=datetime.now(UTC),
@@ -478,7 +475,6 @@ async def test_three_field_proposal_created_event_is_rejected_not_compatibly_rea
         await service.get_authoritative_composition_proposal(
             session_id=session_id,
             proposal_id=proposal.id,
-            reviewed_facts=None,
         )
 
 
@@ -517,6 +513,8 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
     assert row.tool_arguments_hash == stable_hash(plan.proposal.pipeline)
     assert row.pipeline_metadata is not None
     assert row.pipeline_metadata.draft_hash == plan.proposal.draft_hash
+    assert not hasattr(row.pipeline_metadata, "surface")
+    assert not hasattr(row.pipeline_metadata, "reviewed_anchor_hash")
     events = await service.list_proposal_events(session_id)
     assert len(events) == 1
     assert set(events[0].payload) == {
@@ -524,33 +522,27 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
         "tool_call_id",
         "tool_name",
         "status",
-        "surface",
         "draft_hash",
         "base",
-        "reviewed_anchor_hash",
         "repair_count",
         "skill_hash",
-        "covered_deferred_intent_ids",
-        "supersedes_draft_hash",
-        "supersedes_proposal_id",
         "custody_result",
         "private_arguments_hash",
         "provenance_hash",
         "audit_payload_hash",
     }
-    assert events[0].payload["schema"] == "pipeline_proposal_created.v1"
+    assert events[0].payload["schema"] == "pipeline_proposal_created.v2"
     assert events[0].payload["base"] == {"kind": "absent"}
 
     restored = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
-        reviewed_facts={},
     )
     assert restored.row == row
     assert ("inline_blob" in restored.row.arguments_redacted_json["source"]) is (inline_presence == "null")
     assert restored.proposal == plan.proposal
     assert restored.custody_result == "not_required"
-    assert restored.supersedes_proposal_id is None
+    assert not hasattr(restored, "supersedes_proposal_id")
 
 
 @pytest.mark.asyncio
@@ -590,7 +582,6 @@ async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -634,7 +625,6 @@ async def test_authoritative_pipeline_restore_rejects_non_first_coalesce_order_t
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -660,7 +650,6 @@ async def test_authoritative_pipeline_restore_rejects_coalesce_reorder_against_t
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -674,14 +663,15 @@ async def test_authoritative_pipeline_restore_rejects_coalesce_reorder_against_t
         ("row_rationale", "tampered rationale"),
         ("row_affects", ["tampered"]),
         ("row_provenance", "tampered-provider"),
-        ("event_surface", "guided_full"),
+        ("event_retired_surface", "guided_full"),
         ("event_draft_hash", "0" * 64),
         ("event_base", {"kind": "present", "state_id": str(uuid4()), "composition_content_hash": "0" * 64}),
-        ("event_anchor", "0" * 64),
+        ("event_retired_anchor", "0" * 64),
         ("event_repair_count", 1),
         ("event_skill_hash", "0" * 64),
-        ("event_covered_ids", [str(uuid4())]),
-        ("event_supersedes_hash", "0" * 64),
+        ("event_retired_deferred_ids", [str(uuid4())]),
+        ("event_retired_supersedes_hash", "0" * 64),
+        ("event_retired_supersedes_id", str(uuid4())),
         ("event_custody", "created"),
         ("event_private_hash", "0" * 64),
         ("event_provenance_hash", "0" * 64),
@@ -742,14 +732,15 @@ async def test_authoritative_pipeline_restore_rejects_every_tampered_binding(ser
             event = conn.execute(select(proposal_events_table).where(proposal_events_table.c.proposal_id == str(row.id))).one()
             payload = dict(event.payload)
             field = {
-                "event_surface": "surface",
+                "event_retired_surface": "surface",
                 "event_draft_hash": "draft_hash",
                 "event_base": "base",
-                "event_anchor": "reviewed_anchor_hash",
+                "event_retired_anchor": "reviewed_anchor_hash",
                 "event_repair_count": "repair_count",
                 "event_skill_hash": "skill_hash",
-                "event_covered_ids": "covered_deferred_intent_ids",
-                "event_supersedes_hash": "supersedes_draft_hash",
+                "event_retired_deferred_ids": "covered_deferred_intent_ids",
+                "event_retired_supersedes_hash": "supersedes_draft_hash",
+                "event_retired_supersedes_id": "supersedes_proposal_id",
                 "event_custody": "custody_result",
                 "event_private_hash": "private_arguments_hash",
                 "event_provenance_hash": "provenance_hash",
@@ -762,7 +753,6 @@ async def test_authoritative_pipeline_restore_rejects_every_tampered_binding(ser
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -796,7 +786,6 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
     assert row.audit_event_id is not None
     with service._engine.begin() as conn:
@@ -806,13 +795,12 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
             .values(audit_event_id=str(row.audit_event_id))
         )
 
-    restored = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id, reviewed_facts={})
+    restored = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
     assert restored.proposal == _pipeline_plan_result().proposal
     with pytest.raises(KeyError):
         await service.get_authoritative_pipeline_proposal(
             session_id=other_session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
     with service._engine.begin() as conn:
@@ -833,7 +821,6 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 

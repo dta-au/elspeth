@@ -392,49 +392,38 @@ describe("workspace pane state", () => {
       expect(result.current.activeArtifactTab).toBe("graph");
     });
 
-    it("does not persist artifact or inspector state", () => {
+    it("does not persist the active artifact tab", () => {
       const { result } = renderHook(() =>
         useWorkspacePaneState({ workspaceWidth: 1536, sessionId: "s1" }),
       );
 
       act(() => {
         result.current.selectArtifactTab("run");
-        result.current.openInspector("history");
       });
 
       expect(result.current.activeArtifactTab).toBe("run");
-      expect(result.current.activeInspectorTab).toBe("history");
-      expect(result.current.inspectorOpen).toBe(true);
       expect(localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY)).toBeNull();
-
-      act(() => result.current.closeInspector());
-      expect(result.current.activeInspectorTab).toBeNull();
-      expect(result.current.inspectorOpen).toBe(false);
     });
 
-    it("resets artifact and inspector state when the session changes", () => {
+    it("resets the active artifact tab when the session changes", () => {
       let sessionId: string | null = "s1";
       const { result, rerender } = renderHook(() =>
         useWorkspacePaneState({ workspaceWidth: 1536, sessionId }),
       );
       act(() => {
         result.current.selectArtifactTab("run");
-        result.current.openInspector("history");
       });
 
       sessionId = "s2";
       rerender();
 
       expect(result.current.activeArtifactTab).toBe("graph");
-      expect(result.current.activeInspectorTab).toBeNull();
-      expect(result.current.inspectorOpen).toBe(false);
     });
 
     it("exposes normalized ephemeral state to layout-effect consumers on the first transition commit", () => {
       interface Observation {
         sessionId: string;
         activeArtifactTab: ArtifactTab;
-        activeInspectorTab: WorkspacePaneState["activeInspectorTab"];
       }
 
       interface ObserverProps {
@@ -453,13 +442,11 @@ describe("workspace pane state", () => {
           observations.push({
             sessionId,
             activeArtifactTab: paneState.activeArtifactTab,
-            activeInspectorTab: paneState.activeInspectorTab,
           });
         }, [
           observations,
           paneState,
           paneState.activeArtifactTab,
-          paneState.activeInspectorTab,
           sessionId,
         ]);
         return null;
@@ -507,7 +494,6 @@ describe("workspace pane state", () => {
       act(() => {
         if (committedController === null) throw new Error("controller not committed");
         committedController.selectArtifactTab("run");
-        committedController.openInspector("history");
       });
       observations.length = 0;
 
@@ -522,7 +508,6 @@ describe("workspace pane state", () => {
       expect(observations[0]).toEqual({
         sessionId: "s2",
         activeArtifactTab: "graph",
-        activeInspectorTab: null,
       });
 
       act(() => {
@@ -542,7 +527,6 @@ describe("workspace pane state", () => {
       expect(observations[0]).toEqual({
         sessionId: "s2",
         activeArtifactTab: "graph",
-        activeInspectorTab: null,
       });
     });
 
@@ -778,8 +762,6 @@ describe("workspace pane state", () => {
         commitResize: result.current.commitResize,
         setAuthoringCollapsed: result.current.setAuthoringCollapsed,
         selectArtifactTab: result.current.selectArtifactTab,
-        openInspector: result.current.openInspector,
-        closeInspector: result.current.closeInspector,
       };
 
       workspaceWidth = 1100;
@@ -791,8 +773,6 @@ describe("workspace pane state", () => {
         actions.setAuthoringCollapsed,
       );
       expect(result.current.selectArtifactTab).toBe(actions.selectArtifactTab);
-      expect(result.current.openInspector).toBe(actions.openInspector);
-      expect(result.current.closeInspector).toBe(actions.closeInspector);
     });
   });
 });

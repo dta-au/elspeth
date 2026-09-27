@@ -25,14 +25,10 @@ function renderActionBar(
     authoringCollapsed: false,
     availableArtifactTabs: ["graph", "spec", "yaml", "checks", "run"],
     activeArtifactTab: "graph",
-    activeInspectorTab: null,
-    inspectorOpen: false,
     resizeTransient: vi.fn(),
     commitResize: vi.fn(),
     setAuthoringCollapsed: vi.fn(),
     selectArtifactTab: vi.fn(),
-    openInspector: vi.fn(),
-    closeInspector: vi.fn(),
   };
   return render(
     <WorkspacePaneProvider paneState={paneState}>

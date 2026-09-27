@@ -60,7 +60,7 @@ class NullSource(BaseSource):
         "trail supplies the schema and stored payloads supply row data."
     )
     usage_when_not_to_use: str | None = (
-        "Do not use for new ingestion or placeholder data. Guided Web Composer hides this internal resume-only source."
+        "Do not use for new ingestion or placeholder data. Web Composer hides this internal resume-only source."
     )
     example_use: str | None = """sources:
   resume_placeholder:

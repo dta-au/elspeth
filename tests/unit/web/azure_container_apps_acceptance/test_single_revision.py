@@ -7,7 +7,7 @@ import threading
 from functools import partial
 from itertools import count
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -109,7 +109,20 @@ class Routing:
             if request.url.path.endswith("/messages"):
                 assistant = {"id": INSTANCES[0], "role": "assistant", "content": "Acknowledged"}
                 if request.method == "POST":
-                    self.message_content = json.loads(request.content)["content"]
+                    body = json.loads(request.content)
+                    assert str(UUID(body["client_request_id"])) == body["client_request_id"]
+                    self.message_content = body["content"]
+                    if body["content"].startswith("P1 "):
+                        session = request.url.path.split("/")[3]
+                        with self.lock:
+                            event = self.won.setdefault(session, threading.Event())
+                        if assigned not in body["content"]:
+                            assert event.wait(2)
+                        with self.lock:
+                            if session in self.observer.owners:
+                                return httpx.Response(409, json={"detail": SESSION_OPERATION_CONFLICT_DETAIL}, headers=headers)
+                            self.observer.owners[session] = instance
+                            event.set()
                     return httpx.Response(200, json={"message": assistant}, headers=headers)
                 return httpx.Response(
                     200, json=[{"id": "new-user", "role": "user", "content": self.message_content}, assistant], headers=headers
@@ -124,18 +137,6 @@ class Routing:
                 return httpx.Response(200, content=self.uploaded, headers=headers)
             if request.url.path.startswith("/api/runs/"):
                 return httpx.Response(200, json={"run_id": INSTANCES[1], "status": "completed"}, headers=headers)
-            if request.url.path.endswith("/guided/respond"):
-                session = request.url.path.split("/")[3]
-                with self.lock:
-                    event = self.won.setdefault(session, threading.Event())
-                if json.loads(request.content)["winner"] != assigned:
-                    assert event.wait(2)
-                with self.lock:
-                    if session in self.observer.owners:
-                        return httpx.Response(409, json={"detail": SESSION_OPERATION_CONFLICT_DETAIL}, headers=headers)
-                    self.observer.owners[session] = instance
-                    event.set()
-                    return httpx.Response(200, json={}, headers=headers)
             return httpx.Response(
                 200,
                 json={
@@ -164,7 +165,7 @@ class Observer(EvidenceObserver):
     def fence_owner(self, session_id: str) -> str | None:
         return self.owners[session_id] if session_id in self.owners else None
 
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
         return 1 if session_id in self.owners else 0
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
@@ -179,14 +180,16 @@ class Observer(EvidenceObserver):
 
 def test_discovery_discards_duplicate_routes_and_retains_cookie_jars_for_all_twenty_trials() -> None:
     routing = Routing((REPLICAS[0], REPLICAS[0], REPLICAS[1]))
-    requests = tuple((str(uuid4()), {"operation_id": str(uuid4()), "winner": REPLICAS[i % 2]}) for i in range(20))
+    requests = tuple(
+        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())}) for i in range(20)
+    )
     with discover_pair(TOPOLOGY, routing.factory, attempts=3) as clients:
         assert clients[0].instance_id == INSTANCES[0]
         assert clients[1].instance_id == INSTANCES[1]
         result = run_fence_trials(clients, routing.observer, requests)
         assert result.outcome == "pass", result.reasons
         assert routing.created == 3
-    assert len([path for _, path in routing.paths if path.endswith("/guided/respond")]) == 40
+    assert len([path for _, path in routing.paths if path.endswith("/messages")]) == 40
 
 
 def test_discovery_is_bounded_when_all_cookies_route_to_one_replica() -> None:
@@ -228,7 +231,7 @@ def test_p1_refuses_insufficient_or_repeated_prepared_sessions(sessions: int) ->
     requests = tuple(("same-session", {}) for _ in range(sessions))
     with discover_pair(TOPOLOGY, routing.factory) as clients, pytest.raises(AcceptanceInputError):
         run_fence_trials(clients, routing.observer, requests)
-    assert all(not path.endswith("/guided/respond") for _, path in routing.paths)
+    assert all(not path.endswith("/messages") for _, path in routing.paths)
 
 
 @pytest.mark.parametrize("fault", ["same_replica", "revision"])
@@ -260,7 +263,15 @@ def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_reques
     evidence = tmp_path / "evidence"
     requests = tmp_path / "requests.json"
     requests.write_text(
-        json.dumps([{"session_id": str(uuid4()), "body": {"operation_id": str(uuid4()), "winner": REPLICAS[i % 2]}} for i in range(20)])
+        json.dumps(
+            [
+                {
+                    "session_id": str(uuid4()),
+                    "body": {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())},
+                }
+                for i in range(20)
+            ]
+        )
     )
     exit_code = main(
         [
@@ -328,7 +339,7 @@ def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_reques
             assert any(actual == replica and path.endswith("/content") for actual, path in routing.paths)
             assert any(actual == replica and path.endswith("/outputs") for actual, path in routing.paths)
     else:
-        assert len([path for _, path in routing.paths if path.endswith("/guided/respond")]) == 40
+        assert len([path for _, path in routing.paths if path.endswith("/messages")]) == 40
 
 
 def test_invalid_candidate_refused_before_discovery(monkeypatch: pytest.MonkeyPatch) -> None:

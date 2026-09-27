@@ -493,7 +493,7 @@ class _LLMProfileResolver:
         else:
             # Keep the established transform policy-view projection
             # byte-compatible. Source forms use the current-schema knob wire
-            # contract because Guided Step 1 consumes them directly.
+            # contract consumed by Composer and the catalog inspector.
             fields = [
                 {
                     "name": name,

@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
+from uuid import UUID
 
 from sqlalchemy import Engine, create_engine, text
 
@@ -293,11 +294,11 @@ def _trial_session_ids(path: str, *, trials: int) -> tuple[str, ...]:
 
 
 def _fence_trial_requests(path: str, *, trials: int) -> tuple[tuple[str, object], ...]:
-    """Each guided turn has its own session, operation ID and server-issued token."""
+    """Admit one fresh freeform message request per contention trial."""
 
     document = _list_document(path)
     if type(document) is not list or len(document) != trials:
-        raise AcceptanceInputError("--trial-requests must contain one prepared guided request per trial")
+        raise AcceptanceInputError("--trial-requests must contain one prepared freeform request per trial")
     requests: list[tuple[str, object]] = []
     for item in document:
         if type(item) is not dict or set(item) != {"session_id", "body"} or type(item["body"]) is not dict:
@@ -310,9 +311,21 @@ def _fence_trial_requests(path: str, *, trials: int) -> tuple[tuple[str, object]
             or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in session)
         ):
             raise AcceptanceInputError("--trial-requests contains an invalid session identifier")
-        requests.append((session, item["body"]))
+        body = item["body"]
+        if set(body) != {"content", "client_request_id"} or type(body["content"]) is not str or not body["content"].strip():
+            raise AcceptanceInputError("--trial-requests requires a nonempty freeform content body")
+        request_id = body["client_request_id"]
+        if type(request_id) is not str:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+        try:
+            parsed_id = UUID(request_id)
+        except ValueError as exc:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID") from exc
+        if str(parsed_id) != request_id:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+        requests.append((session, body))
     if len({session for session, _ in requests}) != trials:
-        raise AcceptanceInputError("guided contention trials require distinct sessions")
+        raise AcceptanceInputError("freeform contention trials require distinct sessions")
     return tuple(requests)
 
 
@@ -508,7 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--revision-suffix")
     probes.add_argument("--traffic", help="`az containerapp ingress traffic show` JSON")
     probes.add_argument("--session-ids", help="JSON array of distinct fresh, executable sessions, one per run-start trial")
-    probes.add_argument("--trial-requests", help="JSON array of distinct guided sessions and their current response bodies")
+    probes.add_argument("--trial-requests", help="JSON array of distinct sessions and freeform message bodies")
     probes.add_argument("--trials", type=_trials_argument, default=DEFAULT_TRIALS)
     probes.add_argument("--observation", help="P3 / P4a observation document assembled by the driver")
 
@@ -554,14 +567,14 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
             session_ids = _trial_session_ids(args.session_ids, trials=args.trials)
         else:
             if args.trial_requests is None:
-                raise AcceptanceInputError("--trial-requests is required for isolated guided trials")
+                raise AcceptanceInputError("--trial-requests is required for isolated freeform trials")
             fence_requests = _fence_trial_requests(args.trial_requests, trials=args.trials)
         controller, client_factory = _probe_pair(args, env)
         probe_topology_check(controller, client_factory, traffic=_list_document(args.traffic))
         driver = ReplicaProbeDriver(controller=controller, observer=_observer(env), client_factory=client_factory)
         if args.probe == "fence-conflict":
             trials = [
-                driver.fence_conflict_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/guided/respond", body))
+                driver.fence_conflict_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/messages", body))
                 for session_id, body in fence_requests
             ]
             result = decide_fence_conflict(trials, required_trials=args.trials)

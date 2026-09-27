@@ -37,7 +37,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 async def _save_composition_state(
@@ -76,7 +76,7 @@ async def test_create_composition_proposal_accepts_live_compose_context() -> Non
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-authority"),
@@ -121,7 +121,7 @@ async def test_create_pipeline_proposal_accepts_live_compose_context() -> None:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.pipeline-proposal-authority"),
@@ -188,7 +188,7 @@ async def test_reject_composition_proposal_accepts_exact_live_proposal_context()
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-reject-authority"),
@@ -289,13 +289,13 @@ async def test_reject_composition_proposal_invalid_authority_writes_nothing(inva
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    first = DualFencedSessionServiceHarness(
+    first = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-reject-invalid-authority"),
         owner_instance_id="proposal-reject-first",
     )
-    second = DualFencedSessionServiceHarness(
+    second = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-reject-successor"),
@@ -383,13 +383,13 @@ async def test_stale_compose_predecessor_creates_no_proposal_rows_after_takeover
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    first = DualFencedSessionServiceHarness(
+    first = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-predecessor"),
         owner_instance_id="composer-proposal-first",
     )
-    second = DualFencedSessionServiceHarness(
+    second = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-successor"),
@@ -557,7 +557,7 @@ async def test_accept_ordinary_proposal_atomically_inserts_state_event_and_pendi
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-authority"),
@@ -619,7 +619,7 @@ async def test_accept_ordinary_proposal_rolls_back_state_and_event_when_pending_
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-rollback"),
@@ -693,7 +693,7 @@ async def test_accept_ordinary_proposal_stale_predecessor_writes_nothing() -> No
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-stale-head"),
@@ -757,7 +757,7 @@ async def test_accept_ordinary_proposal_requires_absent_base_to_match_locked_hea
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-absent-base"),
@@ -822,7 +822,7 @@ async def test_accept_ordinary_proposal_rejects_tool_state_shape_mismatch(case: 
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-state-shape"),
@@ -889,7 +889,7 @@ async def test_accept_blob_only_proposal_binds_existing_or_inserts_initial_snaps
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-blob-state"),
@@ -956,13 +956,13 @@ async def test_accept_ordinary_proposal_invalid_authority_writes_nothing(invalid
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    first = DualFencedSessionServiceHarness(
+    first = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-invalid-authority"),
         owner_instance_id="proposal-accept-first",
     )
-    second = DualFencedSessionServiceHarness(
+    second = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-proposal-accept-successor"),

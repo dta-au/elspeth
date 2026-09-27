@@ -11,13 +11,13 @@ import contextlib
 import json
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal, cast, overload
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
@@ -37,14 +37,9 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationSource,
 )
-from elspeth.contracts.composer_llm_audit import (
-    ComposerChatInitiator,
-    ComposerChatTurn,
-    ComposerChatTurnStatus,
-    ComposerLLMCall,
-)
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, GuidedCustodyIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -57,7 +52,7 @@ from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.protocol import BlobQuotaExceededError, BlobServiceProtocol
+from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService as CatalogServiceProtocol
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input
@@ -71,39 +66,8 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
-from elspeth.web.composer.guided.audit import (
-    emit_dropped_to_freeform,
-    emit_step_advanced,
-    emit_turn_answered,
-    emit_turn_emitted,
-)
-from elspeth.web.composer.guided.chat_solver import maybe_resolve_step_1_source_chat
-from elspeth.web.composer.guided.emitters import (
-    _inspection_matches_source_plugin,
-    build_initial_step_1_turn,
-    build_step_1_inspect_and_confirm_turn_from_intent,
-    build_step_1_schema_form_turn,
-    build_step_1_schema_form_turn_from_resolved,
-    build_step_1_source_prefill,
-    build_step_2_multi_select_turn,
-    build_step_2_schema_form_turn,
-    build_step_2_schema_form_turn_from_resolved,
-    build_step_2_single_select_turn,
-    build_step_4_wire_turn,
-)
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.profile import EMPTY_PROFILE, WorkflowProfile
-from elspeth.web.composer.guided.protocol import ChatRole, ChatTurn, ControlSignal, GuidedStep, TurnType
-from elspeth.web.composer.guided.state_machine import (
-    GuidedSession,
-    SinkIntent,
-    SourceResolved,
-    TerminalKind,
-    TerminalReason,
-    TerminalState,
-    TurnRecord,
-)
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
@@ -130,15 +94,14 @@ from elspeth.web.composer.provider_telemetry import (
     finish_composer_request_metrics,
     mark_composer_request_terminal,
 )
-from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
-from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
+from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
 from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
     record_session_completed,
     record_session_switched,
 )
-from elspeth.web.composer.tools import ToolResult, execute_tool
+from elspeth.web.composer.tools import execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
@@ -157,21 +120,12 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
-from elspeth.web.sessions._guided_step_chat import (
-    _COMMIT_REJECTED_MESSAGE,
-    _SYNTHETIC_UNAVAILABLE_MESSAGE,
-    Step2SinkChatResult,
-    StepChatResult,
-    resolve_step_1_source_chat_with_auto_drop,
-    resolve_step_2_sink_chat_with_auto_drop,
-    solve_step_chat_with_auto_drop,
-)
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
 from elspeth.web.sessions.converters import state_from_record as _state_from_record
-from elspeth.web.sessions.guided_replay import project_composition_proposal, validation_errors_for_composer_surface
 from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.proposal_projection import project_composition_proposal
 from elspeth.web.sessions.protocol import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
@@ -206,7 +160,6 @@ from elspeth.web.sessions.schemas import (
     AcceptProposalRequest,
     ChatMessageResponse,
     ChatMessageSegmentResponse,
-    ChatTurnResponse,
     ComposerPreferencesResponse,
     CompositionObject,
     CompositionProposalResponse,
@@ -215,12 +168,6 @@ from elspeth.web.sessions.schemas import (
     CreateSessionRequest,
     ForkSessionRequest,
     ForkSessionResponse,
-    GetGuidedResponse,
-    GuidedChatRequest,
-    GuidedChatResponse,
-    GuidedRespondRequest,
-    GuidedRespondResponse,
-    GuidedSessionResponse,
     InterpretationEventResponse,
     InterpretationOptOutResponse,
     InterpretationResolveRequest,
@@ -235,14 +182,10 @@ from elspeth.web.sessions.schemas import (
     RunResponse,
     SendMessageRequest,
     SessionResponse,
-    TerminalStateResponse,
     ToolRejectionResponse,
-    TurnPayloadResponse,
-    TurnRecordResponse,
     UpdateComposerPreferencesRequest,
     UpdateSessionRequest,
     ValidationEntryResponse,
-    WorkflowProfileResponse,
 )
 
 slog = structlog.get_logger()
@@ -268,45 +211,6 @@ def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, 
 
 _REDACTED_SECRET_DETAIL = "<redacted-secret>"
 _PROVIDER_DETAIL_REDACTED = "Provider detail redacted because it may contain secrets."
-_GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
-    "Source path is outside the allowed upload area. "
-    "Upload the file through the composer or use a path under the configured blobs directory."
-)
-
-
-@trust_boundary(
-    tier=3,
-    source=(
-        "ToolResult validation messages from the guided source-commit tool path — "
-        "plugin/tool-produced text screened before this egress sanitizer emits a closed detail"
-    ),
-    source_param="tool_result",
-    suppresses=("R1", "R5"),
-    invariant=(
-        "raises TypeError when the carrier is not an exact ToolResult; any unrecognized "
-        "validation message yields the closed generic detail string, never a raw repr "
-        "(the raw tool_result repr can dump CompositionState with Tier-3 row data and must "
-        "not reach the HTTP body)"
-    ),
-    test_ref=(
-        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_guided_source_commit_failure_detail_rejects_non_tool_result"
-    ),
-    test_fingerprint="30d4ed69702aa3b786449e221203286bc29047cdc9a9318d42800affdd64abe2",
-)
-def _guided_source_commit_failure_detail(tool_result: object) -> str:
-    if type(tool_result) is not ToolResult:
-        raise TypeError(f"guided source commit failure detail requires ToolResult, got {type(tool_result).__name__}")
-    if not tool_result.success and tool_result.validation.errors:
-        entry = tool_result.validation.errors[0]
-        if (
-            entry.component == "rejected_mutation"
-            and entry.message.startswith("Path violation (S2):")
-            and "Source file paths" in entry.message
-        ):
-            return _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL
-    return "Step 1 source commit failed"
-
-
 _MAX_PROVIDER_DETAIL_CHARS = 1_000
 
 
@@ -999,22 +903,7 @@ def _state_response(
         redacted = redact_source_storage_path({"sources": sources_data})
         sources_data = redacted["sources"]
 
-    # B4 (guided): a guided blob-backed source is committed via the manual
-    # set_source path, which strips ``blob_ref`` (it cannot prove
-    # ``path == storage_path``). So the committed source AND the persisted
-    # GuidedSession snapshot in ``composer_meta`` both carry the absolute
-    # storage_path with no ``blob_ref`` for the source-keyed redaction above to
-    # key off, and the snapshot is serialised here unredacted. Cross-reference
-    # the snapshot's RETAINED ``blob_ref`` (a no-DB-lookup signal that the source
-    # is blob-backed) to mask the storage_path in both the snapshot and the
-    # committed source before either reaches the wire.
     composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(
-        sources_data,
-        composer_meta_data,
-        raw_sources=raw_sources,
-        degrade_unbindable=degrade_unbindable_custody,
-    )
 
     return CompositionStateResponse(
         id=str(state.id),
@@ -1151,42 +1040,12 @@ def merge_composer_meta_updates(
 ) -> CompositionObject:
     """Merge route-owned updates without dropping opaque lifecycle metadata.
 
-    ``composer_meta`` is a shared persistence envelope.  Version-changing
-    freeform writes must carry forward keys owned by guided mode and other
-    subsystems rather than rebuilding the envelope from only the keys they
-    understand.
+    ``composer_meta`` is a shared persistence envelope. Version-changing
+    writes retain keys owned by other subsystems.
     """
     merged = cast(CompositionObject, dict(deep_thaw(existing_meta))) if existing_meta is not None else {}
     merged.update(updates)
     return merged
-
-
-GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
-GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
-    "This session's retained guided source review no longer matches the files this pipeline uses; "
-    "restore an earlier version from Composition history to continue."
-)
-GUIDED_CUSTODY_REVERT_REFUSED_DETAIL = (
-    "This version can't be restored: its guided source review no longer matches "
-    "the files this pipeline uses. Choose a different version from Composition history."
-)
-
-
-@contextlib.contextmanager
-def _named_guided_custody_projection(detail: str = GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL) -> Iterator[None]:
-    """Name a custody-unbindable tip's read refusal instead of a bare 500.
-
-    Only a tip persisted BEFORE the write gate (elspeth-4c442aaaa8) can still
-    raise here: the gate refuses new active pairs and the projection degrades
-    terminal ones. The 409 carries a constant detail — never the path.
-    """
-    try:
-        yield
-    except GuidedCustodyIntegrityError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": detail},
-        ) from exc
 
 
 def _recovery_partial_state_response(state: CompositionStateRecord) -> dict[str, Any]:
@@ -1520,6 +1379,50 @@ def _freeform_child_result[T](outcome: T | _FreeformChildFailure) -> T:
             raise AuditIntegrityError("Freeform continuation cancelled before settlement") from outcome.error
         raise outcome.error
     return outcome
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T: ...
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError) -> T | None: ...
+
+
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError | None = None
+) -> T | None:
+    """Join an owned cleanup task despite repeated caller cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            if not task.done():
+                raise
+    try:
+        return task.result()
+    except BaseException as child_error:
+        if primary_cancellation is None:
+            raise
+        fatal = (
+            child_error.subgroup(contract_errors.TIER_1_ERRORS) is not None
+            if isinstance(child_error, BaseExceptionGroup)
+            else isinstance(child_error, contract_errors.TIER_1_ERRORS)
+        )
+        if fatal:
+            raise child_error from primary_cancellation
+        if isinstance(child_error, asyncio.CancelledError):
+            raise AuditIntegrityError("Shielded cleanup task was cancelled before completion") from primary_cancellation
+        if not isinstance(child_error, Exception):
+            raise
+        primary_cancellation.add_note(f"Shielded cleanup also failed with {type(child_error).__name__}.")
+        previous_cause = primary_cancellation.__cause__
+        primary_cancellation.__cause__ = (
+            child_error if previous_cause is None else BaseExceptionGroup("Shielded cleanup failures", [previous_cause, child_error])
+        )
+        return None
 
 
 async def _join_freeform_owned_task[T](task: asyncio.Task[T]) -> tuple[T, asyncio.CancelledError | None]:
@@ -2692,8 +2595,8 @@ async def _track_compose_inflight(
     registry = _get_composer_progress_registry(request)
     sid = str(session_id)
     # This dependency is mounted only on Composer endpoints. Collapse the
-    # route family to a closed surface label; never export the raw path.
-    surface: Literal["freeform", "guided"] = "guided" if "/guided/" in request.url.path else "freeform"
+    # Route family uses a closed surface label; never export the raw path.
+    surface: Literal["freeform"] = "freeform"
     timer = _COMPOSER_HEARTBEAT_TIMER
     # Read before the call that creates the lease: the database stamps its
     # expiry during that call, so the lease lasts at least
@@ -2966,8 +2869,6 @@ async def _state_data_from_composer_state(
     # carried forward from a mid-turn compose row (elspeth-67c6fa691d;
     # column doc at web/sessions/models.py ``composer_meta``).
     surface_meta["validation_lane"] = "strict"
-    if state.guided_session is not None and "guided_session" not in surface_meta:
-        surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
     # Runtime validation is not an advisor verdict. Only an explicit END
     # decision can replace a prior fact, including on graph-unchanged saves.
@@ -2979,11 +2880,6 @@ async def _state_data_from_composer_state(
         **persisted_composer_meta,
         COMPLETION_GATES_META_KEY: completion_gates_value,
     }
-    normalized_persisted_errors = validation_errors_for_composer_surface(
-        composer_meta=persisted_composer_meta,
-        is_valid=persisted_is_valid,
-        validation_errors=persisted_errors,
-    )
     return (
         CompositionStateData(
             sources=state_d["sources"],
@@ -2992,7 +2888,7 @@ async def _state_data_from_composer_state(
             outputs=state_d["outputs"],
             metadata_=state_d["metadata"],
             is_valid=persisted_is_valid,
-            validation_errors=normalized_persisted_errors,
+            validation_errors=persisted_errors,
             composer_meta=persisted_composer_meta,
         ),
         authoring,
@@ -3042,22 +2938,8 @@ async def _failed_turn_response_body(
     }
 
 
-# Freeform planner-failure taxonomy. Kept in lockstep with the guided path's
-# ``PipelinePlannerError`` sub-mapping in
-# ``routes/composer/guided_plan.py::_guided_full_failure_code`` and the
-# ``_SAFE_FAILURES`` status table in ``routes/guided_operations.py`` so a given
-# ``PipelinePlannerError.code`` yields the same closed failure code and HTTP
-# status on both surfaces. The freeform surface has no ``guided_operations``
-# lease to terminalize, so ``_handle_planner_failure`` writes an equivalent
-# durable disposition audit row instead of calling
-# ``fail_guided_operation_with_audit``.
-# Byte-identical to the guided set — do NOT add codes here without adding them
-# to guided's ``_guided_full_failure_code`` in the same change, or the two
-# surfaces return different closed codes (and HTTP statuses) for the same
-# ``PipelinePlannerError.code``, which is exactly the divergence Task 0 exists to
-# prevent. ``COST_CAP_EXCEEDED`` and ``REQUEST_BYTES_EXHAUSTED`` are deliberately
-# absent (they fall through to ``operation_failed`` on both surfaces), matching
-# guided.
+# Closed planner-failure taxonomy. ``COST_CAP_EXCEEDED`` and
+# ``REQUEST_BYTES_EXHAUSTED`` fall through to ``operation_failed``.
 #
 # ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
 # keyed on the rejection's ``detail_codes`` (see
@@ -3065,9 +2947,9 @@ async def _failed_turn_response_body(
 # surfaces under whichever planner code the refusal happened to exhaust
 # (``REPAIR_EXHAUSTED`` when the model burnt its budget re-authoring the same
 # prohibited component; ``VALIDATION_FAILED`` from commit-time re-validation, and
-# historically from the server-derived gate elspeth-b4a286d517 removed). The code
+# historically from the server-derived gate). The code
 # alone cannot distinguish "the model produced garbage" from "the deployment
-# forbids this", so the detail-code test runs FIRST on both surfaces.
+# forbids this", so the detail-code test runs first.
 _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
     {
         "COMPLETION_TOKENS_EXCEEDED",
@@ -3085,24 +2967,23 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
 # The closed validation codes that mean "a deployment policy categorically
 # refuses this component", as opposed to "this candidate is wired wrong". A
 # rejection carrying any of them is PERMANENT: no repair to the pipeline and no
-# retry of the request can clear it, so both surfaces must answer
+# retry of the request can clear it, so the route must answer
 # ``policy_blocked`` rather than a retryable provider fault.
 #
 # ``plugin_not_allowed_on_web`` is derived from
-# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated so the
-# two cannot drift; ``aws_s3_source_not_allowed`` is the authoritative source
+# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated;
+# ``aws_s3_source_not_allowed`` is the authoritative source
 # gate's own code (``composer/tools/sessions.py``, ``execution/validation.py``),
 # which predates the snapshot-level reason and is emitted by a different seam.
 # A new categorical policy refusal MUST be added here or it silently reads as a
-# provider fault on both surfaces.
+# provider fault.
 PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
     {
         "aws_s3_source_not_allowed",
         PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
     }
 )
-# ``failure_code -> (http_status, safe static detail)``. Mirrors the subset of
-# ``_SAFE_FAILURES`` the freeform planner can reach; the detail text is
+# ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     "cost_unavailable": (
@@ -3115,20 +2996,13 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     # Planner-owned non-convergence (elspeth-5904b1683a): the model answered
     # every repair turn; the planner loop could not produce a candidate that
     # passed validation. 500 (our loop, not a gateway fault) with an honest
-    # retry offer — the first candidate is model-stochastic. Kept in lockstep
-    # with the guided ``_SAFE_FAILURES["planner_repair_exhausted"]`` copy.
+    # retry offer — the first candidate is model-stochastic.
     "planner_repair_exhausted": (
         500,
         "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
     ),
-    # Same status and same message shape as the guided
-    # ``_SAFE_FAILURES["policy_blocked"]`` copy — a policy refusal is a
-    # property of the deployment and the pipeline, not of the authoring
-    # surface or the model — EXCEPT that freeform chat has no component
-    # highlight, so this copy must not say "highlighted" (the guided surface
-    # pins its blocked component in the review UI; here the detail text is
-    # the whole signal). Names neither the provider nor an operation id, and
-    # offers no retry.
+    # A deployment-policy refusal is not a provider failure. The detail names
+    # neither provider nor operation id and offers no retry.
     "policy_blocked": (
         422,
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
@@ -3141,10 +3015,8 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
 def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
     """Return whether a planner failure was a categorical deployment-policy refusal.
 
-    The single shared predicate behind both surfaces' failure-code mappers, so
-    the guided/freeform lockstep is mechanical rather than a comment: see
-    ``routes/composer/guided_plan.py::_guided_full_failure_code`` and
-    :func:`_freeform_planner_failure_code`.
+    This predicate is evaluated before mapping a planner error code because a
+    policy refusal may surface under several planner codes.
     """
     return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
 
@@ -3157,8 +3029,7 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
 # planner code, so a discovery-budget exhaustion, a tool-call cap and a real provider outage
 # were one indistinguishable reason (elspeth-ad5628ecda). The vocabulary already anticipated
 # the split — ``planner_repair_exhausted`` is documented in ``contracts/composer_progress.py``
-# as existing "so the failed progress event stops blaming the provider" — and the GUIDED path
-# already maps onto it (``routes/composer/guided_plan.py``). This is the freeform mirror.
+# as existing "so the failed progress event stops blaming the provider".
 #
 # ``PROVIDER_CALLS_EXHAUSTED`` is deliberately ABSENT: it is planner-owned (our budget on
 # physical provider attempts) but the closed vocabulary has no member for it, and widening
@@ -3184,9 +3055,7 @@ def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReaso
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
 
-    Byte-parity with the ``isinstance(exc, PipelinePlannerError)`` branch of the
-    guided ``_guided_full_failure_code``; kept as a separate function so the
-    guided path stays untouched.
+    Use closed, provider-safe codes for the HTTP response.
     """
     if planner_failure_is_policy_blocked(exc):
         return "policy_blocked"
@@ -3197,9 +3066,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     if exc.code == "COST_UNAVAILABLE":
         return "cost_unavailable"
     if exc.code == "REPAIR_EXHAUSTED":
-        # Honest exhaustion envelope (elspeth-5904b1683a) — byte-parity with
-        # the guided branch: the provider answered every repair turn; the
-        # planner loop is the actor that could not converge.
+        # The provider answered every repair turn; the planner loop could not
+        # converge.
         return "planner_repair_exhausted"
     if exc.code in _FREEFORM_PLANNER_INVALID_PROVIDER_CODES:
         return "invalid_provider_response"
@@ -3216,9 +3084,7 @@ async def _handle_planner_failure(
 ) -> tuple[int, dict[str, object]]:
     """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
 
-    Mirrors the guided path's ``fail_guided_operation_with_audit``
-    terminalization on the freeform surface, which has no guided-operation lease
-    to close: persists one durable, redacted terminal failure-disposition audit
+    Persists one durable, redacted terminal failure-disposition audit
     row carrying the mapped closed failure code, then returns the
     ``(status, body)`` the route raises. Shared by ``send_message`` and
     ``recompose`` so the two freeform routes cannot drift on planner-failure UX.
@@ -3371,16 +3237,8 @@ async def _handle_convergence_error(
         # bug and must propagate. This catch is the SQLAlchemy persistence
         # layer only.
         #
-        # ``GuidedCustodyIntegrityError`` is deliberately NOT caught here (nor
-        # in the two sibling recovery handlers). It is registered Tier-1 and
-        # subclasses ``AuditIntegrityError``: the guided reviewed-source
-        # custody could not be proven against the live sources, so the audit
-        # trail's source provenance is unprovable. ADR-008 requires that class
-        # to bubble and abort — it reaches the app-level ``AuditIntegrityError``
-        # handler and its fail-closed 500 — rather than be reduced to a
-        # ``partial_state_save_error`` string on an ordinary recovery body.
-        # Pinned by
-        # tests/unit/web/sessions/test_routes.py::test_recovery_partial_state_custody_integrity_failure_is_not_contained.
+        # Audit-integrity failures remain Tier 1: they must bubble through
+        # the app-level fail-closed handler, not become a recovery detail.
         try:
             state_data, _validation = await _state_data_from_composer_state(
                 exc.partial_state,
@@ -3871,7 +3729,7 @@ async def _handle_runtime_preflight_failure(
 
 
 def _initial_composition_state() -> CompositionState:
-    """Initialize freeform authoring without claiming a guided checkpoint."""
+    """Initialize freeform authoring."""
     return CompositionState(
         source=None,
         nodes=(),
@@ -3880,75 +3738,6 @@ def _initial_composition_state() -> CompositionState:
         metadata=PipelineMetadata(),
         version=1,
     )
-
-
-def _initial_composition_state_with_guided_session(*, profile: WorkflowProfile = EMPTY_PROFILE) -> CompositionState:
-    """Initialize the guided endpoint's wizard state with its explicit profile.
-
-    Persisted guided metadata is the frontend's resume authority. Freeform
-    lazy creation must use _initial_composition_state instead; attaching an
-    unused wizard here would switch that session to guided on reload.
-    """
-    return CompositionState(
-        source=None,
-        nodes=(),
-        edges=(),
-        outputs=(),
-        metadata=PipelineMetadata(),
-        version=1,
-        guided_session=GuidedSession.initial(profile=profile),
-    )
-
-
-def _workflow_profile_response(guided: GuidedSession) -> WorkflowProfileResponse | None:
-    """Project a GuidedSession's server-owned profile onto the wire subset.
-
-    Returns ``None`` for the empty/live-guided profile (== ``EMPTY_PROFILE``).
-    """
-    if guided.profile == EMPTY_PROFILE:
-        return None
-    return WorkflowProfileResponse(
-        coaching=guided.profile.coaching,
-        bookends=guided.profile.bookends,
-    )
-
-
-async def _inspect_latest_ready_session_blob(
-    blob_service: BlobServiceProtocol,
-    session_id: UUID,
-    *,
-    session_operation_context: SessionOperationContext,
-    filename: str | None = None,
-    source_plugin: str | None = None,
-) -> SourceInspectionFacts | None:
-    """Inspect the newest matching ready blob for Step-1 schema prefill.
-
-    Blob bytes are Tier 3 and ``inspect_blob_content`` is the source-boundary
-    validation/coercion point. If the session has no ready blob, the caller
-    falls back to the existing observed-schema prefill. When ``filename`` is
-    provided, only ready blobs whose stored filename exactly matches it are
-    eligible. When ``source_plugin`` is provided, inspection continues past
-    newer ready blobs of other source kinds and returns the newest ready blob
-    whose inspected content safely prefills that plugin.
-    """
-    records = await blob_service.list_blobs(session_id, limit=None)
-    for record in records:
-        if record.status != "ready":
-            continue
-        if filename is not None and record.filename != filename:
-            continue
-        content = await blob_service.read_blob_content(record.id, session_operation_context=session_operation_context)
-        facts = inspect_blob_content(
-            content=content,
-            filename=record.filename,
-            mime_type=record.mime_type,
-            blob_id=record.id,
-            content_hash=record.content_hash,
-        )
-        if source_plugin is not None and not _inspection_matches_source_plugin(source_plugin, facts):
-            continue
-        return facts
-    return None
 
 
 __all__ = [
@@ -3957,7 +3746,6 @@ __all__ = [
     "SESSION_TERMINAL_RUN_STATUS_VALUES",
     "UTC",
     "UUID",
-    "_COMMIT_REJECTED_MESSAGE",
     "_COMPOSER_AUTHORING_VALIDATION_COUNTER",
     "_COMPOSER_EXCEPTION_CLASS_BUCKETS",
     "_COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER",
@@ -3972,7 +3760,6 @@ __all__ = [
     "_RUNTIME_PREFLIGHT_FAILED",
     "_RUNTIME_PREFLIGHT_FRAME_LIMIT",
     "_RUNTIME_PREFLIGHT_MESSAGE_LIMIT",
-    "_SYNTHETIC_UNAVAILABLE_MESSAGE",
     "APIRouter",
     "AcceptProposalRequest",
     "Any",
@@ -3980,18 +3767,11 @@ __all__ = [
     "AuditStoryIntegrityError",
     "AuditStoryService",
     "BlobQuotaExceededError",
-    "BlobServiceProtocol",
     "BufferingRecorder",
     "CatalogServiceProtocol",
     "ChatMessageRecord",
     "ChatMessageResponse",
     "ChatMessageRole",
-    "ChatRole",
-    "ChatTurn",
-    "ChatTurnResponse",
-    "ComposerChatInitiator",
-    "ComposerChatTurn",
-    "ComposerChatTurnStatus",
     "ComposerConvergenceError",
     "ComposerLLMCall",
     "ComposerPluginCrashError",
@@ -4012,21 +3792,12 @@ __all__ = [
     "CompositionStateData",
     "CompositionStateRecord",
     "CompositionStateResponse",
-    "ControlSignal",
     "CreateSessionRequest",
     "Depends",
     "FailedTurnMetadata",
     "ForkSessionRequest",
     "ForkSessionResponse",
-    "GetGuidedResponse",
     "GraphValidationError",
-    "GuidedChatRequest",
-    "GuidedChatResponse",
-    "GuidedRespondRequest",
-    "GuidedRespondResponse",
-    "GuidedSession",
-    "GuidedSessionResponse",
-    "GuidedStep",
     "HTTPException",
     "InterpretationChoice",
     "InterpretationEventAlreadyResolvedError",
@@ -4074,20 +3845,7 @@ __all__ = [
     "SessionResponse",
     "SessionServiceProtocol",
     "SessionsTelemetry",
-    "SinkIntent",
-    "SourceInspectionFacts",
-    "SourceResolved",
-    "Step2SinkChatResult",
-    "StepChatResult",
-    "TerminalKind",
-    "TerminalReason",
-    "TerminalState",
-    "TerminalStateResponse",
     "TransitionAssistantDraft",
-    "TurnPayloadResponse",
-    "TurnRecord",
-    "TurnRecordResponse",
-    "TurnType",
     "UpdateComposerPreferencesRequest",
     "UpdateSessionRequest",
     "UserIdentity",
@@ -4132,8 +3890,6 @@ __all__ = [
     "_handle_plugin_crash",
     "_handle_runtime_preflight_failure",
     "_initial_composition_state",
-    "_initial_composition_state_with_guided_session",
-    "_inspect_latest_ready_session_blob",
     "_interpretation_event_response",
     "_is_client_disconnect_cancel",
     "_is_composer_audit_tool_message",
@@ -4164,20 +3920,9 @@ __all__ = [
     "_track_compose_inflight",
     "_validate_run_status_accounting_for_list",
     "_verify_session_ownership",
-    "_workflow_profile_response",
     "annotations",
     "asyncio",
     "audit_envelope",
-    "build_initial_step_1_turn",
-    "build_step_1_inspect_and_confirm_turn_from_intent",
-    "build_step_1_schema_form_turn",
-    "build_step_1_schema_form_turn_from_resolved",
-    "build_step_1_source_prefill",
-    "build_step_2_multi_select_turn",
-    "build_step_2_schema_form_turn",
-    "build_step_2_schema_form_turn_from_resolved",
-    "build_step_2_single_select_turn",
-    "build_step_4_wire_turn",
     "cast",
     "client_cancelled_progress_event",
     "composer_completion_events_table",
@@ -4186,22 +3931,16 @@ __all__ = [
     "dataclass",
     "datetime",
     "deep_thaw",
-    "emit_dropped_to_freeform",
-    "emit_step_advanced",
-    "emit_turn_answered",
-    "emit_turn_emitted",
     "execute_tool",
     "generate_public_yaml",
     "get_current_user",
     "get_rate_limiter",
     "insert",
-    "inspect_blob_content",
     "json",
     "llm_call_audit_envelope",
     "llm_call_audit_summary",
     "load_run_accounting_for_settings",
     "maybe_auto_title_session",
-    "maybe_resolve_step_1_source_chat",
     "merge_composer_meta_updates",
     "merge_implicit_decisions_meta",
     "metrics",
@@ -4209,17 +3948,13 @@ __all__ = [
     "record_session_completed",
     "record_session_switched",
     "redact_source_storage_path",
-    "resolve_step_1_source_chat_with_auto_drop",
-    "resolve_step_2_sink_chat_with_auto_drop",
     "run_sync_in_worker",
     "scrub_text_for_audit",
     "slog",
-    "solve_step_chat_with_auto_drop",
     "stable_hash",
     "structlog",
     "sys",
     "uuid4",
     "validate_pipeline",
-    "validation_errors_for_composer_surface",
     "yaml_generator",
 ]

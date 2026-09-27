@@ -50,7 +50,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # Distinctive token planted in every scripted provider payload / error so the
 # leak assertions distinguish deliberately withheld prose from public output
@@ -206,7 +206,7 @@ def _build_app(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    sessions = DualFencedSessionServiceHarness(
+    sessions = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.freeform.planner.failure"),

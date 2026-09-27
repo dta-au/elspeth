@@ -89,7 +89,7 @@ _INTENTIONALLY_DROPPED_SECTIONS: dict[str, str] = {
 # sections plus the explicitly invalid singular source and metadata surfaces.
 # ``CompositionState`` carries sources, nodes, edges and outputs and has no
 # field any of these could land in (its dataclass fields are nodes/edges/
-# outputs/metadata/version/guided_session/sources), so importing them would mean
+# outputs/metadata/version/sources), so importing them would mean
 # inventing state the composer cannot round-trip — which is how they came to be
 # dropped in the first place.
 #

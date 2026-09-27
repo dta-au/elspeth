@@ -1,4 +1,4 @@
-"""Planning application for Guided and empty-state freeform Composer requests."""
+"""Planning application for empty-state Composer requests."""
 
 from __future__ import annotations
 
@@ -7,23 +7,21 @@ import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import Any, Final, cast
 from uuid import UUID
 
 import structlog
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
@@ -40,17 +38,13 @@ from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
     is_referential_pipeline_mutation_intent,
     state_is_structurally_empty,
 )
 from elspeth.web.composer.pipeline_planner import (
-    DELTA_PLANNER_TERMINAL_INSTRUCTION,
-    GuidedPlannerDecline,
-    PipelineCandidatePolicyRejection,
-    PipelinePlannerError,
     PipelinePlanResult,
     PlannerBudgetPolicy,
     PlannerConversationContext,
@@ -60,17 +54,12 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
-    PlannerTerminalContract,
-    PlannerTerminalMaterialization,
     plan_pipeline,
 )
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
-    PipelineProposal,
-    PlannerSurface,
     PresentBase,
     composition_content_hash,
-    owned_composition_state_authority,
 )
 from elspeth.web.composer.prompts import project_server_owned_option_metadata
 from elspeth.web.composer.proposals import build_tool_proposal_summary
@@ -84,12 +73,10 @@ from elspeth.web.composer.protocol import (
     ComposerHistoryMessage,
     ComposerResult,
     ComposerRuntimePreflightError,
-    ComposerServiceError,
     ComposerSettings,
     PipelineCommitIntent,
 )
 from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS, LLM_API_RETRY_BASE_DELAY_SECONDS
-from elspeth.web.composer.provider_quota import composer_quota_scope
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
@@ -100,50 +87,10 @@ from elspeth.web.composer.withheld_replies import WithheldReply, withheld_reply_
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
-from elspeth.web.sessions.protocol import SessionServiceProtocol
-
-if TYPE_CHECKING:
-    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
-    from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence
+from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, SessionServiceProtocol
 
 slog = structlog.get_logger()
 _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
-
-
-def _log_guided_planner_failure(
-    exc: PipelinePlannerError,
-    *,
-    session_id: str,
-    operation_id: str,
-    surface: str,
-) -> None:
-    """Emit the typed planner disposition when a guided planner call fails.
-
-    The freeform surface records ``planner_code`` and the last candidate
-    rejection's ``rejection_codes`` in a durable ``planner_failure_disposition``
-    audit row (``routes/_helpers._handle_planner_failure``). The guided route's
-    terminal-failure ``slog`` carries only ``exc_class`` + frames (route-side,
-    signed), so a guided planner 5xx hid the closed ``PipelinePlannerError.code``
-    and the ``detail_codes`` that name the wall the repair loop hit — leaving a
-    churned failure (e.g. REPAIR_EXHAUSTED after the escape hatch) opaque. Emit
-    them here, the one in-fence site that holds the typed exception (it awaits
-    ``plan_pipeline``), so a guided failure is as diagnosable as a freeform one.
-    Structured and session/operation scoped; the caller re-raises so the
-    terminal-failure path is unchanged. This is a diagnostic log, not a durable
-    audit row — the guided cohort/terminalization is not reachable from in-fence.
-    """
-    slog.error(
-        "composer.guided_planner_failure",
-        session_id=session_id,
-        operation_id=operation_id,
-        surface=surface,
-        planner_code=exc.code,
-        rejection_codes=sorted(set(exc.detail_codes)),
-        # The typed message is module-authored (closed codes; the candidate
-        # construction path names the offending key) — bounded, never raw
-        # provider/row content.
-        error_detail=str(exc)[:300],
-    )
 
 
 async def _await_pipeline_staging_write_with_deferred_cancellation[T](
@@ -185,22 +132,18 @@ def _required_controls_candidate_finalizer(
     *,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
-    inner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
     """Planner candidate finalizer that auto-wires deployment-REQUIRED controls.
 
-    R2-F10 (elspeth-f99655f540): every planner surface runs the
+    R2-F10 (elspeth-f99655f540): the planner runs the
     ``wire_required_controls`` pass on its terminal candidate so uncovered
     graphs are repaired server-side (with acknowledgeable disclosure) instead
-    of shipping into the execution-time required-control block. ``inner``
-    composes a surface-specific finalizer (the guided reviewed-component
-    binder) BEFORE the pass, so wiring always sees the bound candidate. The
-    pass is idempotent, so re-finalizing a covered candidate is a no-op.
+    of shipping into the execution-time required-control block. The pass is
+    idempotent, so re-finalizing a covered candidate is a no-op.
     """
 
     def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        staged = inner(candidate) if inner is not None else candidate
-        return wire_required_controls(staged, plugin_snapshot, policy_catalog)
+        return wire_required_controls(candidate, plugin_snapshot, policy_catalog)
 
     return finalize
 
@@ -352,570 +295,6 @@ class PlanningApplication:
             on_settled=on_settled,
             progress=progress,
         )
-
-    @staticmethod
-    def _require_guided_planner_operation_context(
-        session_operation_context: SessionOperationContext,
-        *,
-        session_id: str,
-    ) -> None:
-        """A guided planner call runs under the route's live COMPOSE authority."""
-        if type(session_operation_context) is not SessionOperationContext:
-            raise TypeError("session_operation_context must be an exact SessionOperationContext")
-        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
-            raise TypeError("guided planner calls require a COMPOSE session operation context")
-        if session_operation_context.fence.session_id != session_id:
-            raise TypeError("guided planner session_operation_context is bound to a different session")
-
-    async def plan_guided_full_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        policy_catalog: PolicyCatalogView,
-        plugin_snapshot: PluginAvailabilitySnapshot,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Plan one ordinary guided-full proposal through the canonical core."""
-
-        from elspeth.web.sessions.protocol import GuidedOperationFence
-
-        if type(recorder) is not BufferingRecorder:
-            raise TypeError("recorder must be an exact BufferingRecorder")
-        self._require_guided_planner_operation_context(
-            session_operation_context,
-            session_id=originating_message.session_id,
-        )
-        await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._sessions_service, session_operation_context):
-            if type(operation_fence) is not GuidedOperationFence:
-                raise TypeError("operation_fence must be an exact GuidedOperationFence")
-            if str(operation_fence.session_id) != originating_message.session_id:
-                raise AuditIntegrityError("guided-full planner operation fence targets a different session")
-            if policy_catalog.snapshot is not plugin_snapshot:
-                raise ValueError("plugin_snapshot_catalog_mismatch")
-            if not self._availability.available:
-                raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
-
-            preview_preflight_callbacks = await self._planner_preview_preflight(
-                current_state,
-                user_id=originating_message.user_id,
-                session_id=originating_message.session_id,
-                plugin_snapshot=plugin_snapshot,
-                session_operation_context=session_operation_context,
-                llm_calls=recorder.llm_calls,
-            )
-            # Await inside a try so a typed planner failure is logged with its
-            # code+rejection_codes before re-raising to the (signed) guided route
-            # (see _log_guided_planner_failure); the coroutine runs nothing until
-            # awaited, so every PipelinePlannerError surfaces inside the guard.
-            guided_full_planner_call = plan_pipeline(
-                intent=intent,
-                current_state=current_state,
-                # Round-trippable planner projection (elspeth-c67fbbbd83): the
-                # provider both reads this as current_state and serves it back
-                # through its own get_pipeline_state palette tool, so server-owned
-                # option metadata must not reach it un-projected.
-                provider_current_state=project_server_owned_option_metadata(current_state.to_dict()),
-                # No reviewed guided source or output exists on the guided-FULL
-                # surface (reviewed_facts is empty by construction), so there is no
-                # declared output contract a gap could be computed against.
-                unproducible_output_fields=(),
-                reviewed_facts={},
-                reviewed_planner_context={},
-                schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(originating_message.session_id),
-                mark_schema_loaded=functools.partial(self._schema_disclosure.mark_plugin_schema_loaded, originating_message.session_id),
-                eligible_deferred_intent_ids=(),
-                claim_evaluator=None,
-                supersedes_draft_hash=None,
-                surface=PlannerSurface.GUIDED_FULL,
-                profile="ordinary",
-                policy_catalog=policy_catalog,
-                plugin_snapshot=plugin_snapshot,
-                originating_message=originating_message,
-                base=base,
-                model_config=PlannerModelConfig(
-                    completion=provider_gateway._litellm_acompletion,
-                    model_identifier=self._model,
-                    provider=self._availability.provider or "unknown",
-                    temperature=self._settings.composer_temperature,
-                    seed=self._settings.composer_seed,
-                    timeout_seconds=self._timeout_seconds,
-                    max_composition_turns=self._max_composition_turns,
-                    max_discovery_turns=self._max_discovery_turns,
-                    max_tool_calls_per_turn=self._max_tool_calls_per_turn,
-                    max_api_attempts=LLM_API_MAX_ATTEMPTS,
-                    api_retry_base_seconds=LLM_API_RETRY_BASE_DELAY_SECONDS,
-                    discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
-                    candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
-                    tool_contract_dialect=self._planner_dialect,
-                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
-                    pricing_model=self._settings.composer_pricing_model,
-                    escape_hatch_model=self._settings.composer_advisor_model,
-                    escape_hatch_provider=self._advisor_provider,
-                    escape_hatch_pricing_model=self._settings.composer_advisor_pricing_model,
-                    api_base=self._endpoint_base_url,
-                    api_key=self._endpoint_api_key,
-                    escape_hatch_api_base=self._advisor_endpoint_base_url,
-                    escape_hatch_api_key=self._advisor_endpoint_api_key,
-                ),
-                rendered_skill=self._composer_skill_text,
-                repair_budget=self._settings.composer_planner_repair_budget,
-                budget_policy=PlannerBudgetPolicy(
-                    max_total_provider_calls=self._settings.composer_planner_max_provider_calls,
-                    max_request_bytes=self._settings.composer_planner_max_request_bytes,
-                    max_completion_tokens=self._settings.composer_planner_max_completion_tokens,
-                    max_cumulative_provider_cost=self._settings.composer_planner_max_cumulative_provider_cost,
-                ),
-                custody_config=PlannerCustodyConfig(
-                    data_dir=self._data_dir,
-                    session_engine=self._session_engine,
-                    session_operation_context=session_operation_context,
-                    session_operation_authority=self._sessions_service.session_operation_authority,
-                    max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
-                    secret_service=self._secret_service,
-                    secret_wiring_policy=self._secret_wiring_policy,
-                    runtime_preflight=preview_preflight_callbacks.runtime,
-                    structural_preflight=preview_preflight_callbacks.structural,
-                    write_fence=BlobGuidedOperationWriteFence(
-                        session_id=operation_fence.session_id,
-                        operation_id=operation_fence.operation_id,
-                        lease_token=operation_fence.lease_token,
-                        attempt=operation_fence.attempt,
-                    ),
-                    # Guided-full inserts its originating chat message only inside
-                    # the atomic staging settlement; finalizing inline custody
-                    # mid-plan violates the blob lineage FK (elspeth-1e3ad83d89).
-                    defer_finalize=True,
-                ),
-                lifecycle=self._planner_request_lifecycle(progress),
-                recorder=recorder,
-                candidate_finalizer=_required_controls_candidate_finalizer(
-                    policy_catalog=policy_catalog,
-                    plugin_snapshot=plugin_snapshot,
-                ),
-            )
-            try:
-                plan = await guided_full_planner_call
-            except PlannerDeclined as declined:
-                # Honest decline: a successful conversational outcome, not a
-                # planner failure. Either origin lands here — an ordinary
-                # manifest-satisfied turn whose text reply led with the taught
-                # DECLINE: marker, or the escape-hatch advisor turn, which
-                # accepts any text.
-                # Return it (rather than letting it fall into the broad
-                # PipelinePlannerError handler below) so the caller can persist
-                # an ordinary assistant message and complete the guided
-                # operation instead of routing it into
-                # GuidedOperationFailureCode — mirrors the freeform surface's
-                # handling in ComposerServiceImpl.compose.
-                return GuidedPlannerDecline(decline_text=declined.decline_text)
-            except PipelinePlannerError as exc:
-                _log_guided_planner_failure(
-                    exc,
-                    session_id=originating_message.session_id,
-                    operation_id=str(operation_fence.operation_id),
-                    surface=PlannerSurface.GUIDED_FULL.value,
-                )
-                raise
-            return plan, {
-                "source": frozenset(item.name for item in policy_catalog.list_sources()),
-                "transform": frozenset(item.name for item in policy_catalog.list_transforms()),
-                "sink": frozenset(item.name for item in policy_catalog.list_sinks()),
-            }
-
-    async def plan_guided_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        guided: Any,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        user_id: str | None,
-        supersedes_draft_hash: str | None,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-        correction_target: GuidedCorrectionTarget | None = None,
-        revision_authority: GuidedRevisionAuthority | None = None,
-        root_goal: str | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run one shared planner call for the current guided checkpoint."""
-
-        self._require_guided_planner_operation_context(
-            session_operation_context,
-            session_id=originating_message.session_id,
-        )
-
-        await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._sessions_service, session_operation_context):
-            from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
-            from elspeth.web.composer.guided.planning import (
-                GuidedCorrectionTarget,
-                GuidedRevisionAuthority,
-                bind_guided_prose_revision_candidate,
-                build_guided_proposal_projection,
-                guided_authorized_pipeline_schema,
-                guided_private_reviewed_facts,
-                guided_redacted_current_state_context,
-                guided_redacted_planner_context,
-                guided_revision_execution_hash,
-                guided_unproducible_output_field_names,
-                guided_unproducible_output_fields,
-                materialize_guided_authorized_candidate,
-                require_guided_proposal_correction_target_changed,
-            )
-            from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
-            from elspeth.web.composer.guided.prompts import load_step_planner_skill
-            from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint, StatedPredicateConstraint
-            from elspeth.web.composer.guided.state_machine import GuidedSession
-
-            if type(guided) is not GuidedSession:
-                raise TypeError("guided must be an exact GuidedSession")
-            if type(recorder) is not BufferingRecorder:
-                raise TypeError("recorder must be an exact BufferingRecorder")
-            from elspeth.web.sessions.protocol import GuidedOperationFence
-
-            if type(operation_fence) is not GuidedOperationFence:
-                raise TypeError("operation_fence must be an exact GuidedOperationFence")
-            if correction_target is not None and type(correction_target) is not GuidedCorrectionTarget:
-                raise TypeError("correction_target must be an exact GuidedCorrectionTarget or None")
-            if revision_authority is not None and type(revision_authority) is not GuidedRevisionAuthority:
-                raise TypeError("revision_authority must be an exact GuidedRevisionAuthority or None")
-            if correction_target is not None and revision_authority is not None:
-                raise ValueError("guided selected correction and prose revision authority are mutually exclusive")
-            if root_goal is not None and (type(root_goal) is not str or not root_goal):
-                raise TypeError("root_goal must be a non-empty exact str or None")
-            if root_goal is not None and correction_target is None and revision_authority is None:
-                # The fresh-candidate run at the step-2 finish IS the goal being
-                # requested, so there it belongs in ``intent``. The named fact
-                # exists only where a LATER instruction supersedes it.
-                raise ValueError("root_goal names the standing goal behind a correction or revision, not a fresh-candidate request")
-            if str(operation_fence.session_id) != originating_message.session_id:
-                raise AuditIntegrityError("guided planner operation fence targets a different session")
-            if guided.active_proposal is not None:
-                raise AuditIntegrityError("guided planning requires no active proposal")
-            if guided.pending_source_intents or guided.pending_output_intents:
-                raise AuditIntegrityError("guided planning requires completed reviewed source/output facts")
-            if not guided.reviewed_sources or not guided.reviewed_outputs:
-                raise AuditIntegrityError("guided planning requires at least one reviewed source and output")
-            if not self._availability.available:
-                raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
-
-            plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
-            reviewed_facts = guided_private_reviewed_facts(guided)
-            reviewed_context = guided_redacted_planner_context(guided)
-            if correction_target is not None:
-                reviewed_context = {
-                    **reviewed_context,
-                    "correction_target": correction_target.planner_context(),
-                }
-            if revision_authority is not None:
-                if revision_authority.predecessor != current_state:
-                    raise AuditIntegrityError("guided prose revision predecessor differs from planner current state")
-                reviewed_context = {
-                    **reviewed_context,
-                    "revision_authority": revision_authority.planner_context(),
-                }
-            if root_goal is not None:
-                # The session's standing goal, named and ordered rather than
-                # concatenated into the request. Prepending it to ``intent`` made a
-                # revision that narrows, changes, or withdraws part of the goal
-                # argue against the goal inside the field that means "what is being
-                # asked for now" — the default amend policy pushes the same way, so
-                # the likely landing was a pipeline that kept the superseded part.
-                # It also fed the deterministic request guards that parse ``intent``
-                # as the current message: a threshold stated only in the goal
-                # resurrected as a stated_threshold on a revision that had just
-                # withdrawn it, and one stated in the revision went dark behind a
-                # revocation phrase in the goal.
-                #
-                # Same custody class as the intent itself: the author's own words,
-                # verbatim, already read by the planner on the run that produced the
-                # proposal being revised.
-                reviewed_context = {
-                    **reviewed_context,
-                    "root_goal": root_goal,
-                    "root_goal_usage": (
-                        "The outcome the author stated when this session started. It stays the pipeline's purpose, "
-                        "but the current instruction is the request: where the instruction narrows, changes, or "
-                        "withdraws part of the goal, follow the instruction."
-                    ),
-                }
-
-            def evaluate_claims(candidate: CompositionState, claimed_intent_ids: tuple[str, ...]) -> tuple[str, ...]:
-                required_intent_ids = tuple(
-                    intent.intent_id
-                    for intent in guided.deferred_intents
-                    if any(
-                        type(constraint) in {StatedPredicateConstraint, StatedGateRoutingConstraint} for constraint in intent.constraints
-                    )
-                )
-                return evaluate_deferred_intent_coverage(
-                    candidate=candidate,
-                    reviewed_guided=guided,
-                    claimed_intent_ids=claimed_intent_ids,
-                    required_intent_ids=required_intent_ids,
-                )
-
-            planner_surface = PlannerSurface.TUTORIAL_PROFILE if guided.profile == TUTORIAL_PROFILE else PlannerSurface.GUIDED_STAGED
-            planner_profile = "tutorial" if planner_surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"
-            catalog_ids: Mapping[str, frozenset[str]] = {
-                "source": frozenset(item.name for item in policy_catalog.list_sources()),
-                "transform": frozenset(item.name for item in policy_catalog.list_transforms()),
-                "sink": frozenset(item.name for item in policy_catalog.list_sinks()),
-            }
-            preview_preflight_callbacks = await self._planner_preview_preflight(
-                current_state,
-                user_id=user_id,
-                session_id=originating_message.session_id,
-                plugin_snapshot=plugin_snapshot,
-                session_operation_context=session_operation_context,
-                llm_calls=recorder.llm_calls,
-            )
-            custody_config = PlannerCustodyConfig(
-                data_dir=self._data_dir,
-                session_engine=self._session_engine,
-                session_operation_context=session_operation_context,
-                session_operation_authority=self._sessions_service.session_operation_authority,
-                max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
-                secret_service=self._secret_service,
-                secret_wiring_policy=self._secret_wiring_policy,
-                runtime_preflight=preview_preflight_callbacks.runtime,
-                structural_preflight=preview_preflight_callbacks.structural,
-                write_fence=BlobGuidedOperationWriteFence(
-                    session_id=operation_fence.session_id,
-                    operation_id=operation_fence.operation_id,
-                    lease_token=operation_fence.lease_token,
-                    attempt=operation_fence.attempt,
-                ),
-            )
-
-            # A zero-transform pipeline emits exactly what the reviewed source
-            # carries, so a declared sink field no source can supply makes it
-            # unbuildable. Validation cannot be the guard (R2-F4): the sink
-            # contract check fires only when the producer participates in
-            # propagation (an observed-schema source abstains under ADR-007), and
-            # even then as an opaque sink_contract_violation the planner cannot
-            # repair away. The gap is therefore named to the planner up front, and
-            # the planner loop refuses any zero-transform candidate carrying it
-            # (passthrough_cannot_produce_declared_fields). That is not a general
-            # satisfiability gate — with a transform present a field may
-            # legitimately be produced, and the loop's guard says nothing.
-            output_field_gaps = guided_unproducible_output_fields(guided)
-            unproducible_output_fields = guided_unproducible_output_field_names(guided)
-            if output_field_gaps:
-                # Name the gap to the provider planner rather than letting it
-                # rediscover the wall by rejection. Zero new egress: the source
-                # observed/declared field names and the output's required_fields
-                # are already members of guided_redacted_planner_context.
-                reviewed_context = {
-                    **reviewed_context,
-                    "unproducible_output_fields": [dict(gap) for gap in output_field_gaps],
-                    # States only what is KNOWN. An earlier draft asserted the
-                    # pipeline "will fail at runtime" — ELSPETH cannot know that
-                    # (a source with no observed columns and an observed-mode
-                    # schema has an unknown, not an empty, inventory), and the
-                    # over-claim pushes the planner toward fabricating transforms
-                    # to satisfy a prediction rather than closing a named gap.
-                    "unproducible_output_fields_usage": (
-                        "No reviewed source declares or observes these fields; a pass-through has nothing to "
-                        "produce them from. Propose the transform(s) that do. The final candidate must also "
-                        "preserve or produce every other reviewed output required field; adding any transform "
-                        "or renaming these fields into place is not, by itself, proof of a satisfiable output contract."
-                    ),
-                }
-
-            # Build the coroutine, then await inside a try so a typed planner failure
-            # is logged with its code+rejection_codes before it re-raises to the
-            # (signed) guided route. An ``async def`` runs nothing until awaited, so
-            # every PipelinePlannerError surfaces at ``await``, inside the guard.
-            pending_revision_rejection: Literal["guided_amend_contract_violation"] | None = None
-
-            terminal_contract: PlannerTerminalContract | None = None
-            if revision_authority is None:
-
-                def materialize_guided_delta(delta: Mapping[str, Any]) -> PlannerTerminalMaterialization:
-                    canonical = materialize_guided_authorized_candidate(
-                        delta,
-                        correction_target,
-                        guided,
-                        current_state,
-                    )
-                    config_owned_refs = {
-                        *(
-                            "source"
-                            if guided.reviewed_sources[stable_id].name == "source"
-                            else f"source:{guided.reviewed_sources[stable_id].name}"
-                            for stable_id in guided.source_order
-                        ),
-                        *(f"output:{guided.reviewed_outputs[stable_id].name}" for stable_id in guided.output_order),
-                    }
-                    if correction_target is not None:
-                        # Existing predecessor nodes were materialized from
-                        # private server authority (even when one routing scalar
-                        # was changed by the admitted delta). Mask their config
-                        # facts exactly as the former finalizer-owned binder did.
-                        config_owned_refs.update(f"node:{node.id}" for node in current_state.nodes)
-                    return PlannerTerminalMaterialization(
-                        pipeline=dict(canonical),
-                        config_owned_refs=frozenset(config_owned_refs),
-                    )
-
-                terminal_contract = PlannerTerminalContract(
-                    schema=guided_authorized_pipeline_schema(
-                        guided,
-                        correction_target=correction_target,
-                    ),
-                    materialize=materialize_guided_delta,
-                    instruction=DELTA_PLANNER_TERMINAL_INSTRUCTION,
-                )
-
-            def bind_guided_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-                nonlocal pending_revision_rejection
-                pending_revision_rejection = None
-                if revision_authority is not None:
-                    binding = bind_guided_prose_revision_candidate(
-                        candidate,
-                        guided,
-                        authority=revision_authority,
-                    )
-                    pending_revision_rejection = binding.rejection_code
-                    return binding.pipeline
-                # Initial/correction deltas have already passed through
-                # materialize_guided_authorized_candidate at the selected terminal
-                # seam.  Rebinding here would misclassify the canonical result as
-                # provider-authored authority and duplicate correction custody.
-                return candidate
-
-            candidate_acceptance: Callable[[CompositionState], None] | None = None
-            if correction_target is not None or revision_authority is not None:
-
-                def require_guided_revision_delta(candidate_state: CompositionState) -> None:
-                    if pending_revision_rejection is not None:
-                        raise PipelineCandidatePolicyRejection(pending_revision_rejection)
-                    if revision_authority is not None and guided_revision_execution_hash(candidate_state) == guided_revision_execution_hash(
-                        revision_authority.predecessor
-                    ):
-                        raise PipelineCandidatePolicyRejection("guided_revision_unchanged")
-                    if correction_target is not None:
-                        candidate_proposal = PipelineProposal.create(
-                            pipeline=owned_composition_state_authority(candidate_state),
-                            base=base,
-                            reviewed_facts=reviewed_facts,
-                            surface=planner_surface,
-                            repair_count=0,
-                            skill_hash=stable_hash("composer.guided-correction-candidate-check.v1"),
-                            covered_deferred_intent_ids=(),
-                            supersedes_draft_hash=supersedes_draft_hash,
-                        )
-                        candidate_projection = build_guided_proposal_projection(
-                            proposal_id=base.state_id,
-                            proposal=candidate_proposal,
-                            guided=guided,
-                            catalog_plugin_ids=catalog_ids,
-                        )
-                        try:
-                            require_guided_proposal_correction_target_changed(
-                                candidate_projection,
-                                correction_target,
-                                candidate_state,
-                            )
-                        except AuditIntegrityError as exc:
-                            if str(exc) != "guided correction planner did not change the selected component":
-                                raise
-                            raise PipelineCandidatePolicyRejection("guided_correction_unchanged") from exc
-
-                candidate_acceptance = require_guided_revision_delta
-
-            guided_planner_call = plan_pipeline(
-                intent=intent,
-                current_state=current_state,
-                provider_current_state=guided_redacted_current_state_context(current_state),
-                reviewed_facts=reviewed_facts,
-                reviewed_planner_context=reviewed_context,
-                unproducible_output_fields=unproducible_output_fields,
-                schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(originating_message.session_id),
-                mark_schema_loaded=functools.partial(self._schema_disclosure.mark_plugin_schema_loaded, originating_message.session_id),
-                eligible_deferred_intent_ids=tuple(item.intent_id for item in guided.deferred_intents),
-                claim_evaluator=evaluate_claims,
-                supersedes_draft_hash=supersedes_draft_hash,
-                surface=planner_surface,
-                profile=planner_profile,
-                policy_catalog=policy_catalog,
-                plugin_snapshot=plugin_snapshot,
-                originating_message=originating_message,
-                base=base,
-                model_config=PlannerModelConfig(
-                    completion=provider_gateway._litellm_acompletion,
-                    model_identifier=self._model,
-                    provider=self._availability.provider or "unknown",
-                    temperature=self._settings.composer_temperature,
-                    seed=self._settings.composer_seed,
-                    timeout_seconds=self._timeout_seconds,
-                    max_composition_turns=self._max_composition_turns,
-                    max_discovery_turns=self._max_discovery_turns,
-                    max_tool_calls_per_turn=self._max_tool_calls_per_turn,
-                    max_api_attempts=LLM_API_MAX_ATTEMPTS,
-                    api_retry_base_seconds=LLM_API_RETRY_BASE_DELAY_SECONDS,
-                    discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
-                    candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
-                    tool_contract_dialect=self._planner_dialect,
-                    escape_hatch_tool_contract_dialect=self._hatch_dialect,
-                    pricing_model=self._settings.composer_pricing_model,
-                    escape_hatch_model=self._settings.composer_advisor_model,
-                    escape_hatch_provider=self._advisor_provider,
-                    escape_hatch_pricing_model=self._settings.composer_advisor_pricing_model,
-                    api_base=self._endpoint_base_url,
-                    api_key=self._endpoint_api_key,
-                    escape_hatch_api_base=self._advisor_endpoint_base_url,
-                    escape_hatch_api_key=self._advisor_endpoint_api_key,
-                ),
-                rendered_skill=load_step_planner_skill(guided.step),
-                repair_budget=self._settings.composer_planner_repair_budget,
-                budget_policy=PlannerBudgetPolicy(
-                    max_total_provider_calls=self._settings.composer_planner_max_provider_calls,
-                    max_request_bytes=self._settings.composer_planner_max_request_bytes,
-                    max_completion_tokens=self._settings.composer_planner_max_completion_tokens,
-                    max_cumulative_provider_cost=self._settings.composer_planner_max_cumulative_provider_cost,
-                ),
-                custody_config=custody_config,
-                lifecycle=self._planner_request_lifecycle(progress),
-                recorder=recorder,
-                candidate_finalizer=_required_controls_candidate_finalizer(
-                    policy_catalog=policy_catalog,
-                    plugin_snapshot=plugin_snapshot,
-                    inner=bind_guided_candidate,
-                ),
-                candidate_acceptance=candidate_acceptance,
-                terminal_contract=terminal_contract,
-            )
-            try:
-                plan = await guided_planner_call
-            except PlannerDeclined as declined:
-                # Same decline handling as plan_guided_full_pipeline above —
-                # marker decline on an ordinary turn or the escape-hatch advisor
-                # turn alike: a decline is a conversational outcome, not a planner
-                # failure, so it must not fall into the broad
-                # PipelinePlannerError handler below and must never route
-                # through GuidedOperationFailureCode.
-                return GuidedPlannerDecline(decline_text=declined.decline_text)
-            except PipelinePlannerError as exc:
-                _log_guided_planner_failure(
-                    exc,
-                    session_id=originating_message.session_id,
-                    operation_id=str(operation_fence.operation_id),
-                    surface=planner_surface.value,
-                )
-                raise
-            return plan, catalog_ids
 
     async def _persist_pipeline_planner_audit(
         self,
@@ -1222,7 +601,6 @@ class PlanningApplication:
                         session_id=session_id,
                         proposal_id=row.id,
                         draft_hash=plan.proposal.draft_hash,
-                        reviewed_facts={},
                         reason="request_cancelled",
                         dispatch=None,
                         actor="system:auto_reject_request_cancelled",
@@ -1342,22 +720,10 @@ class PlanningApplication:
                 intent=message,
                 conversation_context=_freeform_planner_conversation_context(message, messages),
                 current_state=state,
-                # Round-trippable planner projection (elspeth-c67fbbbd83); see
-                # the guided-full call site above.
+                # Round-trippable planner projection (elspeth-c67fbbbd83).
                 provider_current_state=project_server_owned_option_metadata(state.to_dict()),
-                reviewed_facts={},
-                reviewed_planner_context={},
-                # Freeform has no reviewed guided output, so no operator
-                # has declared a sink field contract a gap could exist
-                # against.
-                unproducible_output_fields=(),
                 schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
                 mark_schema_loaded=functools.partial(self._schema_disclosure.mark_plugin_schema_loaded, session_id),
-                eligible_deferred_intent_ids=(),
-                claim_evaluator=None,
-                supersedes_draft_hash=None,
-                surface=PlannerSurface.FREEFORM,
-                profile="ordinary",
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
                 originating_message=origin,

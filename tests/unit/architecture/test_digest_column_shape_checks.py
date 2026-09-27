@@ -81,8 +81,6 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
     ("sessions", "blobs"): {"content_hash": "hex64", "creating_composer_skill_hash": "hex64", "creating_arguments_hash": "hex64"},
     ("sessions", "composer_completion_events"): {"payload_digest": "prefixed64"},
     ("sessions", "composition_proposals"): {"composer_skill_hash": "hex64", "tool_arguments_hash": "hex64"},
-    ("sessions", "guided_operation_events"): {"request_hash": "hex64"},
-    ("sessions", "guided_operations"): {"request_hash": "hex64", "response_hash": "hex64"},
     ("sessions", "interpretation_events"): {
         "composer_skill_hash": "hex64",
         "arguments_hash": "hex64",
@@ -112,6 +110,8 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
         "permit_subject_hash": "hex64",
         "admission_decision_hash": "hex64",
     },
+    ("sessions", "session_operation_receipt_events"): {"request_hash": "hex64", "terminal_hash": "hex64"},
+    ("sessions", "session_operation_receipts"): {"request_hash": "hex64", "response_hash": "hex64"},
     ("sessions", "skill_markdown_history"): {"hash": "hex64"},
     ("sessions", "sso_handoffs"): {"code_hash": "hex64"},
     ("sessions", "websocket_tickets"): {"ticket_digest": "hex64"},

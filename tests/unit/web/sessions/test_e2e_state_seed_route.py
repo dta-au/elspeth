@@ -26,7 +26,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _make_app(
@@ -44,7 +44,7 @@ def _make_app(
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
     telemetry = build_sessions_telemetry()
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test.e2e_state_seed"),

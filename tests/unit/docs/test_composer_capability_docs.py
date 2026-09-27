@@ -32,6 +32,9 @@ def test_user_manual_states_freeform_is_the_composer_authoring_path() -> None:
     assert "New sessions use freeform conversation" in manual
     assert "The LLM proposes the structure" in manual
     assert "Follow-up messages can refine the draft" in manual
+    assert "Auto-apply on" in manual
+    assert "Approval required" in manual
+    assert "green runtime preflight" in manual
     assert "guided" not in manual.lower()
 
 
@@ -42,6 +45,6 @@ def test_user_manual_lists_supported_canonical_structures() -> None:
 def test_user_manual_describes_tutorial_as_ordinary_freeform_with_capstone() -> None:
     manual = _manual()
     assert "ordinary freeform Composer" in manual
-    assert "same planner, proposal review, and validation as any other session" in manual
+    assert "same planner, authority mode, and validation as any other session" in manual
     assert "Continue through Run and Audit" in manual
     assert "Graduation then hands you to ordinary authoring" in manual

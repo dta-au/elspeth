@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
 
@@ -1629,7 +1628,6 @@ class ComposerService(Protocol):
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress: ComposerProgressSink | None = None,
-        guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         # Durable advisor gate fact from the prior state row (ruling
@@ -1653,9 +1651,6 @@ class ComposerService(Protocol):
                 persisted session row. Used as the stale-state guard for
                 compose-loop tool-call audit persistence.
             user_id: Current user ID. Passed through to secret tools.
-            guided_terminal: When set, the resolved TerminalState from the
-                completed guided session; triggers the layered mode-transition
-                prompt for this first freeform turn (spec §8.2).
             user_message_id: Database id of the just-persisted user
                 ``chat_messages`` row that triggered this compose call
                 (Phase 5a Task 2.5). Threaded through the compose loop into

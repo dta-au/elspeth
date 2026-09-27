@@ -33,11 +33,7 @@ from elspeth.engine.processor import DAGTraversalContext
 # the plugin at intake (spec §5), so for traversal it is a barrier exactly
 # like coalesce/row_union.
 # Named for the PREDICATE it answers — "node kinds with nothing for the
-# traversal to execute" — not for a family. The guided lane's plugin-free
-# teaching set shares no members with this beyond coincidence and answers a
-# different question (elspeth-ea38638721): same name there once invited a
-# symbol-name unification that would have handed the traversal invariant the
-# wrong membership.
+# traversal to execute" — not for a Composer teaching or presentation set.
 _TRAVERSAL_INERT_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE, NodeType.ROW_UNION, NodeType.COLLECTOR})
 
 

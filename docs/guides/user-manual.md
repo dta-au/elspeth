@@ -674,9 +674,15 @@ do not change the pipeline, session, validation, audit, or execution semantics.
 
 New sessions use freeform conversation. Describe the pipeline you want in the
 chat input, including the source, output, transformations, and any routing
-constraints. The LLM proposes the structure; ELSPETH validates it and shows
-the proposal's graph impact before you accept it. Follow-up messages can refine
-the draft without starting over. A proposal does not execute the pipeline.
+constraints. The LLM proposes the structure; ELSPETH validates and records
+applied changes. New sessions default to **Auto-apply on**: eligible changes
+commit as audited pipeline versions without a separate Accept click. A
+full-pipeline proposal auto-commits only after a green runtime preflight and
+while the session remains in auto-apply mode. Otherwise it remains pending for
+review. With **Approval required**, mutations wait as proposals for explicit
+Accept or Reject. The authority chip in the chat header shows the current mode.
+Follow-up messages can refine the draft without starting over. Committing a
+pipeline change never executes it; **Run pipeline** is a separate action.
 
 The first-run tutorial uses this same authoring path and a fixed example. It
 continues through **Run**, **Audit**, and **Graduation** so the user sees a real
@@ -718,8 +724,9 @@ the current composition and ELSPETH validates the result.
 ### Validation, interpretation, and sign-off
 
 The LLM proposes changes, but it is not the authority. ELSPETH validates and
-persists the resulting pipeline state, then shows a plain-language gloss,
-validation summary, and graph impact for review.
+records the result, then shows a plain-language gloss, validation summary, and
+graph impact. Depending on the authority mode and preflight result, that
+result is either an applied pipeline version or a proposal awaiting review.
 
 If a proposal depends on a subjective interpretation, Composer surfaces a
 review card and blocks the affected action until it is resolved. An advisory
@@ -727,8 +734,9 @@ review may also withhold completion until the current graph has been reviewed.
 
 ### Completion and execution
 
-When the proposal is accepted, you can validate the pipeline, preview the
-YAML, and execute it directly from Composer. The composer's `/validate` and
+Once a pipeline change commits, automatically or after explicit approval, you
+can validate the pipeline, preview the YAML, and execute it directly from
+Composer. The composer's `/validate` and
 `/execute`
 endpoints use the same runtime assembly and graph validation contracts as
 `elspeth validate` and `elspeth run` — there is no separate UI-only validator.
@@ -736,8 +744,8 @@ endpoints use the same runtime assembly and graph validation contracts as
 ### The first-run tutorial
 
 The first-run tutorial supplies fixed sample data and a fixed task to the
-ordinary freeform Composer. Its Build step uses the same planner, proposal
-review, and validation as any other session. Continue through Run and Audit to
+ordinary freeform Composer. Its Build step uses the same planner, authority
+mode, and validation as any other session. Continue through Run and Audit to
 see the pipeline execute and inspect its evidence; Graduation then hands you
 to ordinary authoring. The tutorial has no separate planner or reduced schema.
 

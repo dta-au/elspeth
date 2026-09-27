@@ -42,7 +42,7 @@ from tests.integration.web.conftest import (
     _save_composition_state_with_compose_authority,
 )
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -79,7 +79,7 @@ def _app(tmp_path: Path) -> FastAPI:
     )
     initialize_session_schema(engine)
     settings = _settings(tmp_path)
-    session_service = DualFencedSessionServiceHarness(
+    session_service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -168,17 +168,6 @@ def test_get_sample_uses_configured_public_base(tmp_path: Path) -> None:
             "https://example.gov.au/samples/tutorial-site/project-3.html",
         ]
     }
-
-
-def test_sample_is_not_exposed_through_guided_mode_route(tmp_path: Path) -> None:
-    app = _app(tmp_path)
-    session_id = uuid4()
-    with app.state.session_engine.begin() as conn:
-        _make_session(conn, session_id=str(session_id), user_id="alice")
-
-    response = TestClient(app).get(f"/api/sessions/{session_id}/guided/tutorial-sample")
-
-    assert response.status_code == 404
 
 
 def test_get_readiness_rejects_freeform_session_without_committed_state(tmp_path: Path) -> None:

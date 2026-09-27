@@ -10,7 +10,6 @@ import {
 } from "react";
 
 import { useAuditReadinessSync } from "@/components/audit/useAuditReadinessSync";
-import { projectCompletedGuidedHistory } from "@/components/chat/guided/GuidedHistory";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
 import { CatalogButton } from "@/components/sidebar/CatalogButton";
@@ -201,7 +200,7 @@ export function ArtifactWorkspace({
   runAvailable?: boolean;
   /** Mounts the Plugin-catalog trigger in the toolbar. App passes the same
    *  availability fact that used to gate the action bar's More-actions
-   *  popover (!guidedBuildActive); the tutorial shell leaves it false. */
+   *  popover; the tutorial shell leaves it false. */
   catalogAvailable?: boolean;
   /** Tutorial-shell content override for the Checks tab's validation half
    *  (PipelineValidationSummary); see ChecksView. */
@@ -287,15 +286,6 @@ export function ArtifactWorkspaceSurface({
   );
   const auditErrorsBySession = useAuditReadinessStore(
     (s) => s.errorBySession,
-  );
-  const hasGuidedHistory = useSessionStore(
-    (s) =>
-      s.guidedSession !== null &&
-      projectCompletedGuidedHistory(
-        s.guidedSession.history,
-        s.guidedSession.step,
-        s.guidedSession.terminal,
-      ).length > 0,
   );
   // Ambient audit sync for the badge: while the Checks panel is mounted its
   // own useAuditReadinessSync instance owns the fetch, so this one stands
@@ -569,23 +559,6 @@ export function ArtifactWorkspaceSurface({
         {/* Right cluster: session-wide tools only. The graph's Fullscreen
             control is one of the Workflow canvas's own controls (GraphView). */}
         <div className="artifact-toolbar-actions">
-          {/* Sole opener of the History drawer since the action-bar chips
-              retired with the Checks tab: gated on the same completed-history
-              fact the drawer itself closes on, and its id is the drawer's
-              focus-restore fallback (WorkspaceInspector). */}
-          {hasGuidedHistory && (
-            <Button
-              compact
-              id="artifact-history-trigger"
-              aria-expanded={state.inspectorOpen}
-              aria-controls="workspace-inspector"
-              onClick={(event) =>
-                actions.openInspector("history", event.currentTarget)
-              }
-            >
-              History
-            </Button>
-          )}
           {catalogAvailable && <CatalogButton />}
         </div>
       </div>

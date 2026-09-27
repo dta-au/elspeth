@@ -42,11 +42,6 @@ function compositionWithSource(version: number) {
   };
 }
 
-/**
- * The SAME authored content re-issued at a new version — a settlement that
- * wrote a row but authored nothing (a post-completion guided chat persists
- * exactly this, elspeth-986801d218).
- */
 function compositionAtNewVersion(version: number) {
   return {
     version,
@@ -892,7 +887,7 @@ describe("auto-validate on composition-state version change", () => {
     await waitFor(() => expect(validate).toHaveBeenCalledTimes(2));
   });
 
-  it("does not auto-validate a metadata-only guided exit state", async () => {
+  it("does not auto-validate a metadata-only state", async () => {
     const validate = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({ validate } as never);
 
@@ -1551,19 +1546,6 @@ describe("subscriptions — run rehydration on session activation", () => {
   });
 });
 
-// ── Content-equal version bumps (elspeth-986801d218) ─────────────────────────
-//
-// A settlement that writes a composition_states row but authors NOTHING still
-// bumps `version` — a post-completion guided chat does exactly that, so the
-// reply has a state to hang off. Both version-keyed subscribers used to treat
-// that as an edit: one cleared the validation verdict, the other POSTed
-// /validate, and `useCompletionOutcome` read executionReady=false in between,
-// flipping the completed heading off "Pipeline ready" for the round trip.
-// Asking a question about a pipeline must not un-verify it.
-//
-// Discrimination in every test below is the CONTENT, not the version: the
-// same version pair fires or skips depending only on whether the authored
-// sources/nodes/edges/outputs/metadata changed.
 describe("content-equal version bumps carry the verdict forward", () => {
   /** The cached readiness the badge, the Execute button and the ambient sync
    *  all match on `composition_version` before they will use. */

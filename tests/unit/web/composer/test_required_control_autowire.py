@@ -831,7 +831,7 @@ class TestAutoWireIdempotence:
     def test_every_no_op_path_is_identity_preserving(self, tmp_path: Path) -> None:
         """Regression (fix round 2): the pass returned a NEW equal dict on
         no-op paths, breaking the finalizer identity contract pinned by
-        tests/integration/web/composer/guided/test_shared_planner_surfaces.py.
+        the planner's ordinary authoring path.
         Every refusal path must return the input object itself — including for
         read-only mapping inputs such as a frozen proposal pipeline."""
         from types import MappingProxyType
@@ -1016,26 +1016,6 @@ class TestServiceFinalizerFactory:
         wired = finalize(_bare_llm_candidate())
 
         assert type(wired) is dict  # the planner's exact-dict finalizer contract
-        assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
-
-    def test_inner_finalizer_runs_before_the_pass(self, tmp_path: Path) -> None:
-        """The guided reviewed-component binder composes BEFORE wiring, so the
-        pass always sees the bound candidate."""
-        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
-
-        view, snapshot = _guardrail_profile_view(tmp_path)
-        seen: list[dict[str, Any]] = []
-
-        def inner(candidate: Any) -> Any:
-            seen.append(copy.deepcopy(dict(candidate)))
-            return candidate
-
-        finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot, inner=inner)
-        bare = _bare_llm_candidate()
-
-        wired = finalize(bare)
-
-        assert seen == [bare], "inner must receive the pre-wire candidate"
         assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
 
 

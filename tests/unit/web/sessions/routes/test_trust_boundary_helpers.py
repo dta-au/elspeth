@@ -17,13 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.routes._helpers import (
     _extract_runtime_model_snapshot,
-    _guided_source_commit_failure_detail,
 )
-
-
-def test_guided_source_commit_failure_detail_rejects_non_tool_result() -> None:
-    with pytest.raises(TypeError):
-        _guided_source_commit_failure_detail({"data": {"error": "Path violation (S2): Source file paths"}})
 
 
 def _state_with_options(options: object) -> CompositionStateRecord:

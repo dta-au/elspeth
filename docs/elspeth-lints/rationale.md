@@ -88,7 +88,7 @@ is a user-visible contract failure.
 
 ### Composer
 
-Composer rules enforce error-routing contracts around guided composition:
+Composer rules enforce error-routing contracts around Composer authoring:
 domain-specific exceptions must be caught before their supertypes, and
 LLM-argument failures must travel through `ToolArgumentError`. A missed
 violation can turn an actionable composer repair into a generic failure, or

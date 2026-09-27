@@ -6,7 +6,7 @@ import { ValidationResultBanner } from "./ValidationResult";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/pipelineGloss";
 import type { NodeSpec, ValidationResult } from "@/types/index";
 
 const READY_READINESS = {

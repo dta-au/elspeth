@@ -178,15 +178,6 @@ describe("ChatInput — controlled-mode prefill listener", () => {
   });
 });
 
-// ============================================================================
-// ChatInput — empty-state placeholder (Phase 5a Task 1).
-//
-// Primes the user to type data directly into the chat when the session is
-// fresh (no messages, no composition state).  Reverts to the canonical
-// "Describe the pipeline you want to build..." wording the moment either
-// signal flips.  An explicit `placeholder` prop continues to win — Phase A
-// slice 4 (guided-mode per-step nudge) depends on that override semantics.
-// ============================================================================
 
 describe("ChatInput empty-state placeholder", () => {
   const DATA_PRIMING =
@@ -265,9 +256,6 @@ describe("ChatInput empty-state placeholder", () => {
   });
 
   it("respects an explicit `placeholder` prop override even in empty state", () => {
-    // Empty state — store untouched — but the prop must still win.
-    // This pins the Phase A slice 4 contract: guided-mode per-step nudges
-    // override the empty-state default.
     render(<StandaloneHarness placeholder="custom" />);
 
     const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
@@ -309,7 +297,7 @@ describe("ChatInput upload identity", () => {
     resetStore(useInterpretationEventsStore);
   });
 
-  it("reports the exact uploaded blob metadata to the owning guided turn", async () => {
+  it("appends a successful upload to the ordinary composer draft", async () => {
     const sessionId = "00000000-0000-4000-8000-000000000811";
     const uploaded = {
       id: "00000000-0000-4000-8000-000000000812",
@@ -332,13 +320,11 @@ describe("ChatInput upload identity", () => {
     };
     useSessionStore.setState({ activeSessionId: sessionId });
     useBlobStore.setState({ uploadBlob: vi.fn().mockResolvedValue(uploaded) });
-    const onBlobUploaded = vi.fn();
     render(
       <ChatInput
         onSend={vi.fn()}
         disabled={false}
         inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
-        onBlobUploaded={onBlobUploaded}
       />,
     );
     const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
@@ -346,8 +332,11 @@ describe("ChatInput upload identity", () => {
 
     await userEvent.upload(fileInput!, new File(["id\n1\n"], "intended.csv", { type: "text/csv" }));
 
-    await waitFor(() => expect(onBlobUploaded).toHaveBeenCalledWith(uploaded));
-    const draft = (screen.getByLabelText(/message input/i) as HTMLTextAreaElement).value;
+    const draft = await waitFor(() => {
+      const value = (screen.getByLabelText(/message input/i) as HTMLTextAreaElement).value;
+      expect(value).toContain('I\'ve uploaded "intended.csv"');
+      return value;
+    });
     expect(draft).toContain('I\'ve uploaded "intended.csv"');
     expect(draft).toContain("pipeline input, reference table, or LLM prompt");
   });
@@ -377,10 +366,7 @@ describe("ChatInput upload identity", () => {
       creating_composer_skill_hash: null,
       creating_arguments_hash: null,
     };
-    const onBlobUploaded = vi.fn();
-    const onBlobUploadStarted = vi.fn();
     const onBlobUploadCompleted = vi.fn().mockReturnValue(false);
-    const onBlobUploadSettled = vi.fn();
     useSessionStore.setState({ activeSessionId: sessionId });
     useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
 
@@ -393,10 +379,7 @@ describe("ChatInput upload identity", () => {
           inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
           value={value}
           onChange={setValue}
-          onBlobUploaded={onBlobUploaded}
-          onBlobUploadStarted={onBlobUploadStarted}
           onBlobUploadCompleted={onBlobUploadCompleted}
-          onBlobUploadSettled={onBlobUploadSettled}
         />
       );
     }
@@ -408,16 +391,12 @@ describe("ChatInput upload identity", () => {
       fileInput!,
       new File(["id\n1\n"], "stale.csv", { type: "text/csv" }),
     );
-    expect(onBlobUploadStarted).toHaveBeenCalledOnce();
 
     await act(async () => {
       resolveUpload(uploaded);
       await uploadPromise;
     });
-    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
-
-    expect(onBlobUploadCompleted).toHaveBeenCalledOnce();
-    expect(onBlobUploaded).not.toHaveBeenCalled();
+    await waitFor(() => expect(onBlobUploadCompleted).toHaveBeenCalledOnce());
     expect(screen.getByLabelText(/message input/i)).toHaveValue("");
   });
 
@@ -428,7 +407,6 @@ describe("ChatInput upload identity", () => {
     });
     const sessionId = "00000000-0000-4000-8000-000000000831";
     const onBlobUploadRejected = vi.fn().mockReturnValue(false);
-    const onBlobUploadSettled = vi.fn();
     useSessionStore.setState({ activeSessionId: sessionId });
     useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
 
@@ -438,7 +416,6 @@ describe("ChatInput upload identity", () => {
         disabled={false}
         inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
         onBlobUploadRejected={onBlobUploadRejected}
-        onBlobUploadSettled={onBlobUploadSettled}
       />,
     );
     const fileInput = document.querySelector<HTMLInputElement>(
@@ -453,9 +430,7 @@ describe("ChatInput upload identity", () => {
     await act(async () => {
       rejectUpload(new Error("late upload failure"));
     });
-    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
-
-    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
     expect(
       screen.queryByText("Upload failed. Check the file manager for details."),
     ).not.toBeInTheDocument();
@@ -464,7 +439,6 @@ describe("ChatInput upload identity", () => {
   it("shows a current upload failure accepted by its owner fence", async () => {
     const uploadError = new Error("current upload failure");
     const onBlobUploadRejected = vi.fn().mockReturnValue(true);
-    const onBlobUploadSettled = vi.fn();
     useSessionStore.setState({ activeSessionId: "session-current" });
     useBlobStore.setState({ uploadBlob: vi.fn().mockRejectedValue(uploadError) });
 
@@ -474,7 +448,6 @@ describe("ChatInput upload identity", () => {
         disabled={false}
         inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
         onBlobUploadRejected={onBlobUploadRejected}
-        onBlobUploadSettled={onBlobUploadSettled}
       />,
     );
     const fileInput = document.querySelector<HTMLInputElement>(
@@ -486,8 +459,7 @@ describe("ChatInput upload identity", () => {
       new File(["id\n1\n"], "current.csv", { type: "text/csv" }),
     );
 
-    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
-    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
     expect(
       screen.getByText("Upload failed. Check the file manager for details."),
     ).toBeInTheDocument();
@@ -659,9 +631,6 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
     render(<StandaloneHarness />);
 
     const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
-    // Directionally neutral (elspeth-eba8820005): the review card sits in a
-    // different column in the guided workspace, so the cue names the card
-    // rather than pointing "above".
     expect(textarea.placeholder).toBe(
       'Reviewing your interpretation of "cool" — pick Acknowledge or Change… on the review card to continue.',
     );
@@ -887,9 +856,6 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
   });
 
   it("respects an explicit `placeholder` prop override even when a pending cue would otherwise fire", () => {
-    // Pins the precedence contract: explicit prop > pending-interpretation
-    // cue > empty-state.  Guided-mode per-step nudges (Phase A slice 4)
-    // remain authoritative even when an interpretation review is open.
     useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
     const event = makePendingEvent({ user_term: "cool" });
     useInterpretationEventsStore.setState({
@@ -903,68 +869,6 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
   });
 });
 
-// ============================================================================
-// ChatInput — tutorial readOnly lock.
-//
-// The guided tutorial reuses the REAL guided flow; the only difference is the
-// STEP_1 "Describe what you want" prompt is prepopulated AND locked, so the
-// learner steps through the normal flow but types nothing. This pins that lock:
-// the textarea shows the prepopulated value, is read-only, hides the
-// source-composition affordances, and Send still submits the locked value.
-// ============================================================================
-describe("ChatInput — tutorial readOnly lock (prepopulated + locked prompt)", () => {
-  beforeEach(() => {
-    resetStore(useSessionStore);
-    resetStore(useBlobStore);
-    resetStore(useInterpretationEventsStore);
-    // Post-boot: the backend wall clock has landed, so the readiness gate is
-    // open and the learner can press Send on the locked prompt.
-    useSessionStore.setState({ composeTimeoutReady: true });
-  });
-
-  const LOCKED = "Scrape these three synthetic project-brief pages.";
-
-  function LockedHarness({ onSend }: { onSend: (c: string) => void }) {
-    const inputRef = useRef<HTMLTextAreaElement>(
-      null,
-    ) as RefObject<HTMLTextAreaElement>;
-    return (
-      <ChatInput
-        onSend={onSend}
-        disabled={false}
-        inputRef={inputRef}
-        value={LOCKED}
-        onChange={() => undefined}
-        readOnly
-        onOpenSecrets={() => undefined}
-        onToggleBlobManager={() => undefined}
-      />
-    );
-  }
-
-  it("prepopulates the textarea, locks it read-only, and hides source-composition affordances", () => {
-    render(<LockedHarness onSend={() => undefined} />);
-    const textarea = screen.getByLabelText(
-      /message input/i,
-    ) as HTMLTextAreaElement;
-    expect(textarea.value).toBe(LOCKED);
-    expect(textarea.readOnly).toBe(true);
-    // The tutorial learner must not author a source by hand: the upload, file
-    // manager, and secrets affordances are hidden in locked mode.
-    expect(screen.queryByLabelText(/upload file/i)).toBeNull();
-    expect(
-      screen.queryByLabelText(/show file manager|hide file manager/i),
-    ).toBeNull();
-    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
-  });
-
-  it("Send submits the locked value (the learner presses Send, types nothing)", async () => {
-    const sent: string[] = [];
-    render(<LockedHarness onSend={(c) => sent.push(c)} />);
-    await userEvent.click(screen.getByLabelText(/send message/i));
-    expect(sent).toEqual([LOCKED]);
-  });
-});
 
 describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => {
   beforeEach(() => {
@@ -1038,7 +942,6 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
   function renderInput(overrides?: {
     onToggleBlobManager?: () => void;
     onOpenSecrets?: () => void;
-    readOnly?: boolean;
   }) {
     const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
     return render(
@@ -1048,7 +951,6 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
         inputRef={inputRef}
         onToggleBlobManager={overrides?.onToggleBlobManager}
         onOpenSecrets={overrides?.onOpenSecrets}
-        readOnly={overrides?.readOnly}
       />,
     );
   }
@@ -1098,15 +1000,8 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
     expect(onToggleBlobManager).not.toHaveBeenCalled();
   });
 
-  it("renders no More trigger when both rare actions are absent or locked", () => {
+  it("renders no More trigger when both rare actions are absent", () => {
     renderInput();
-    expect(screen.queryByLabelText(/more actions/i)).toBeNull();
-
-    renderInput({
-      onToggleBlobManager: vi.fn(),
-      onOpenSecrets: vi.fn(),
-      readOnly: true,
-    });
     expect(screen.queryByLabelText(/more actions/i)).toBeNull();
   });
 
@@ -1143,45 +1038,21 @@ describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
     resetStore(useInterpretationEventsStore);
   });
 
-  function renderInput(props?: { readOnly?: boolean; value?: string }) {
+  function renderInput() {
     const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
     return render(
       <ChatInput
         onSend={() => undefined}
         disabled={false}
         inputRef={inputRef}
-        readOnly={props?.readOnly}
-        value={props?.value}
         onChange={() => undefined}
       />,
     );
   }
 
-  // A placeholder produces NO scroll overflow — no scrollbar, no ellipsis — so
-  // a placeholder taller than the box is simply cut mid-word with no cue that
-  // anything is missing. Every shipped placeholder here is a full sentence
-  // (the four guided per-step nudges, the empty-state priming line, the
-  // pending-interpretation cue), and two rows clipped them in the 360px
-  // authoring pane. Autosizing cannot rescue this: there is no scrollHeight to
-  // measure when the box is empty. The row count IS the fix, so pin it.
   it("gives the editable composer four rows", () => {
     renderInput();
     expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "4");
-  });
-
-  it("still sizes the read-only tutorial prompt to its content", () => {
-    // The locked worked-example prompt is static and multi-line; it is sized
-    // to the content (capped at 10) rather than to the editable row count.
-    renderInput({ readOnly: true, value: "a\nb\nc\nd\ne" });
-    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "6");
-  });
-
-  it("caps read-only growth at ten rows", () => {
-    renderInput({ readOnly: true, value: Array(40).fill("line").join("\n") });
-    expect(screen.getByLabelText(/message input/i)).toHaveAttribute(
-      "rows",
-      "10",
-    );
   });
 
   // The growth ceiling pinned above ("bounds textarea growth against the
@@ -1221,28 +1092,6 @@ describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", 
     expect(row!.lastElementChild).toBe(hint);
   });
 
-  it("omits the hint in read-only mode, where Shift+Enter is a false affordance", () => {
-    // A read-only textarea (the tutorial's frozen prompt is the shipped case)
-    // accepts no typed input, so "Shift+Enter for new line" describes a
-    // keyboard action that does nothing. Rendering it anyway also overlapped
-    // the frozen prompt: the positioned hint assumes the Upload/More/Send
-    // cluster (~180px) beneath it, but read-only mode renders only the 68px
-    // Send button, so the hint's text hung ~50px over the textarea.
-    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
-    render(
-      <ChatInput
-        onSend={() => undefined}
-        disabled={false}
-        inputRef={inputRef}
-        readOnly
-      />,
-    );
-    expect(screen.queryByText(/shift\+enter for new line/i)).toBeNull();
-    // No hint element means no describedby target — the reference must go
-    // with it, or AT chases a dangling id.
-    const textarea = screen.getByLabelText(/message input/i);
-    expect(textarea.getAttribute("aria-describedby")).toBeNull();
-  });
 
   it("seats the hint above the buttons inside the textarea's height at ordinary pane widths", () => {
     // Operator request 2026-08-16: the composer region ends flush with the

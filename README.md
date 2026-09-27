@@ -165,7 +165,7 @@ contract and remaining acceptance limits are documented in
 acceptance is not claimed.
 
 **Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
-to 70 and Landscape epoch 38 to 46; archive or
+to 71 and Landscape epoch 38 to 46; archive or
 export required evidence, stop the old service, recreate both stale databases
 in the same service-stop window, and install 0.8.1.
 Preserve `data/auth.db` and follow the

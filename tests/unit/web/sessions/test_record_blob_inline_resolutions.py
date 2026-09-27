@@ -24,7 +24,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def engine():
 def service(engine):
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="writer-test-user")
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
@@ -124,7 +124,7 @@ async def test_record_blob_inline_resolutions_raises_audit_integrity_error_on_db
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         eng,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.record-blob-inline-resolutions"),
@@ -173,7 +173,7 @@ async def test_record_blob_inline_resolutions_empty_batch_wraps_cas_database_fai
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         eng,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.record-blob-inline-resolutions"),

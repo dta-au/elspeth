@@ -27,7 +27,7 @@ from a blank YAML file.
 |---|---|
 | Start from plain-language intent | Describe the workflow in chat and refine the model's proposal through follow-up instructions. |
 | Build with structure | Add or revise plural sources, sinks, transforms, queues, gates, forks, coalesces, final wiring, and plugin options through controlled UI turns. |
-| Keep the operator in control | Accept, reject, or edit proposed changes before they become part of the composition. |
+| Keep the operator in control | See the session's authority mode, inspect versioned changes, and accept or reject changes that require approval. |
 | Check readiness | Use the audit-readiness and live verification panels to see validation, plugin trust, provenance, retention, LLM interpretation, and secret status. |
 | Review the shape | Inspect the graph view and rendered YAML before running or sharing. |
 | Handle credentials safely | Reference secrets by name instead of placing secret values in pipeline configuration. |
@@ -44,12 +44,18 @@ through a real run, its audit story, and graduation to an ordinary session.
 | Path | Best for | How it feels |
 |---|---|---|
 | First-run tutorial | New users learning the vocabulary | A fixed example composed through the ordinary chat, followed by Run, Audit, and Graduation. |
-| Freeform Composer | Anyone building or revising a pipeline | Describe the intended result, review proposed changes, and refine in conversation. |
+| Freeform Composer | Anyone building or revising a pipeline | Describe the intended result, inspect applied changes or pending proposals, and refine in conversation. |
 
-The model proposes the pipeline structure. ELSPETH keeps the candidate separate
-from committed state, validates it, presents its plain-language and graph
-impact, and applies it only after operator review. A rejected proposal can be
-revised in the next turn without silently replacing the operator's intent.
+The model proposes the pipeline structure. New sessions default to
+**Auto-apply on**: eligible changes can become versioned, audited pipeline
+state without an Accept click. A full-pipeline proposal auto-commits only when
+a green runtime preflight validates the candidate and the session remains in
+auto-apply mode. The chat header shows the authority mode. With
+**Approval required**, changes
+wait as proposals for explicit Accept or Reject; a full-pipeline proposal also
+remains pending when auto-commit's conditions are not met. Inspect the graph and
+plain-language impact in either case. A rejected proposal can be revised in the
+next turn without silently replacing the operator's intent.
 
 The desktop workspace keeps authoring beside the pipeline artifact. Its
 resizable authoring pane can collapse and reopen while the Graph, Spec, YAML,

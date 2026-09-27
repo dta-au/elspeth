@@ -2527,7 +2527,7 @@ def test_closed_provider_discovery_payload_is_a_subset_of_the_registry(include_d
         validation,
         (),
         1,
-        provider_discovery_response.surface_projection_failure() if include_data else None,
+        provider_discovery_response.schema_projection_failure() if include_data else None,
     )
     keys = set(envelope.to_wire())
     assert set(env.TOOL_RESULT_REQUIRED_KEYS) <= keys <= set(env.tool_result_keys(data=include_data)), "unregistered provider envelope keys"
@@ -2727,12 +2727,12 @@ def test_names_two_modules_answer_to_reports_a_shadowed_name_for_both_attributio
     """
     shadowed = (
         _DataSite("sources.py", "tools/sources.py", "_execute_add_source", 1),
-        _DataSite("sources.py", "guided/sources.py", "_execute_shadow", 2),
+        _DataSite("sources.py", "alternate/sources.py", "_execute_shadow", 2),
         _DataSite("blobs.py", "tools/blobs.py", "_execute_delete_blob_locked", 3),
         _DataSite("sources.py", "tools/sources.py", "_execute_delete_blob_locked", 4),
     )
     by_file = ((site.file, site.module) for site in shadowed)
-    assert _names_two_modules_answer_to(by_file) == {"sources.py": ["guided/sources.py", "tools/sources.py"]}
+    assert _names_two_modules_answer_to(by_file) == {"sources.py": ["alternate/sources.py", "tools/sources.py"]}
     by_function = ((site.function, site.module) for site in shadowed)
     assert _names_two_modules_answer_to(by_function) == {"_execute_delete_blob_locked": ["tools/blobs.py", "tools/sources.py"]}
     clean = shadowed[:1] + shadowed[2:3]
@@ -3022,18 +3022,14 @@ def test_every_result_constructor_site_is_attributed() -> None:
 
     ``_all_data_sites`` walks the package recursively while ``_TOOL_DATA_FILES``
     names files under ``tools/``, so a base name does NOT identify a module. Two
-    distinct escapes came of keying on one, both measured against this file:
+    distinct escapes can come from keying on one:
 
-    * ``guided/sources.py`` shipping a ``data=`` payload counted itself as
-      walked — 33 passed, exit 0 — while ``_tool_data_sites`` only ever parsed
-      ``tools/sources.py``;
-    * ``guided/outputs.py`` did the same with no collision at all to notice,
-      because ``tools/outputs.py`` ships no ``data=`` site today, so the name is
-      one module's and the injectivity guard has nothing to refuse.
+    * another ``sources.py`` shipping a ``data=`` payload can count itself as
+      walked while ``_tool_data_sites`` parses only ``tools/sources.py``;
+    * another ``outputs.py`` can do the same with no collision to notice if
+      ``tools/outputs.py`` ships no ``data=`` site.
 
-    ``guided/`` already holds three base-name collisions with its parent package
-    (``audit.py``, ``prompts.py``, ``protocol.py``), so this is the tree's live
-    shape and not a hypothetical one. Hence ``walked`` keyed on the MODULE,
+    Hence ``walked`` is keyed on the MODULE,
     which is what the tool-data walker actually parses, plus an injectivity
     refusal for each bare name this file still attributes by, each with its own
     killing mutant:

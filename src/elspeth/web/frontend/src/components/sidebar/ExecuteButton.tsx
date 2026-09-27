@@ -510,9 +510,7 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
 export function ExecuteButton(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
-  const composerBusy = useSessionStore(
-    (s) => s.isComposing || s.guidedChatPending || s.guidedResponsePending,
-  );
+  const composerBusy = useSessionStore((s) => s.isComposing);
   const validationResult = useExecutionStore((s) => s.validationResult);
   const isExecuting = useExecutionStore((s) => s.isExecuting);
   const progress = useExecutionStore((s) => s.progress);

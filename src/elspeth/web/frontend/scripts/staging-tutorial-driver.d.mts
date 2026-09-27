@@ -12,3 +12,17 @@ export interface FreeformTutorialOptions {
 }
 
 export function driveFreeformTutorial(page: Page, options?: FreeformTutorialOptions): Promise<void>;
+
+export interface GraduationPreferences {
+  tutorial_completed_at: string | null;
+  tutorial_stage: string | null;
+  tutorial_session_id: string | null;
+  tutorial_run_id: string | null;
+  tutorial_source_data_hash: string | null;
+}
+
+export function finishTutorialAndVerifyGraduation(
+  page: Page,
+  sessionId: string | null,
+  loadPreferences: () => Promise<GraduationPreferences>,
+): Promise<{ completed_at: string; landed_session_id: string }>;

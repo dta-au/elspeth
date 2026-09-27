@@ -27,11 +27,9 @@ from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.protocol import (
     AuditAccessLogWriteError,
-    GuidedOperationFailed,
     RunAlreadyActiveError,
     StaleComposeStateError,
 )
-from elspeth.web.sessions.routes.guided_operations import raise_guided_operation_failure
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 
 
@@ -143,34 +141,6 @@ async def test_audit_integrity_error_handler_returns_degraded_body_without_faile
     assert event["exc_class"] == "AuditIntegrityError"
     assert event["message"] == "outside compose loop"
     assert event["failed_turn_present"] is False
-
-
-@pytest.mark.asyncio
-async def test_audit_integrity_log_distinguishes_snapshot_guard_from_cohort_poison(tmp_path: Path) -> None:
-    """The ~40 byte-identical fail-closed 500s are distinguishable in the LOG.
-
-    The response body is deliberately static, so the ONLY discriminator
-    between (a) the send_message transcript snapshot guard and (b) the
-    guided-failure cohort verifier refusing a poisoned session is the
-    server-authored exception message captured by the handler's
-    ``message`` field. Pin both raise-site phrasings so a refactor that
-    collapses them back into indistinguishable copy fails here.
-    """
-    app = create_app(_settings(tmp_path))
-    handler = app.exception_handlers[AuditIntegrityError]
-    snapshot_guard_message = (
-        "Tier 1 audit anomaly: send_message transcript snapshot for session s does not end at inserted user message m. "
-        "Refusing to compose against interleaved session history."
-    )
-    cohort_message = "guided failure audit cohort does not match the exact durable evidence rows"
-
-    with capture_logs() as logs:
-        await handler(_audit_request("req-a"), AuditIntegrityError(snapshot_guard_message))
-        await handler(_audit_request("req-b"), AuditIntegrityError(cohort_message))
-
-    messages = [log["message"] for log in logs if log["event"] == "http_audit_integrity_error"]
-    assert messages == [snapshot_guard_message, cohort_message]
-    assert messages[0] != messages[1]
 
 
 @pytest.mark.asyncio
@@ -296,15 +266,8 @@ async def test_audit_story_not_recorded_error_handler_returns_structured_404(tmp
 class TestHTTPExceptionRequestIdEnvelope:
     """Every dict-shaped error envelope carries the response's correlation id.
 
-    R2-F16b: ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every
-    response, and ``_audit_integrity_error_handler`` puts the same id in
-    its body — but the guided routes consume their terminal exception
-    in-route and re-raise a *closed* ``HTTPException``
-    (``raise_guided_operation_failure``). That envelope never passed
-    through an app-level handler, so the header correlated to nothing a
-    user could quote back.
-
-    The fix is ONE boundary rather than N routes: an app-level
+    ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response.
+    An app-level
     ``HTTPException`` handler writes the authoritative
     ``request.state.request_id`` into every dict detail, replacing any
     pre-correlated value, then delegates to FastAPI's default rendering.
@@ -336,12 +299,12 @@ class TestHTTPExceptionRequestIdEnvelope:
         with capture_logs() as logs:
             response = await handler(
                 _audit_request("req-dict-1"),
-                HTTPException(status_code=500, detail={"error_type": "guided_operation_terminal_failure"}),
+                HTTPException(status_code=500, detail={"error_type": "probe_failure"}),
             )
 
         assert response.status_code == 500
         assert json.loads(response.body)["detail"] == {
-            "error_type": "guided_operation_terminal_failure",
+            "error_type": "probe_failure",
             "request_id": "req-dict-1",
         }
         assert logs == [
@@ -477,30 +440,6 @@ class TestHTTPExceptionRequestIdEnvelope:
         assert response.headers["Retry-After"] == "30"
         assert json.loads(response.body)["detail"]["request_id"] == "req-hdr-1"
 
-    @pytest.mark.asyncio
-    async def test_the_guided_terminal_failure_envelope_is_covered_by_the_boundary(self, tmp_path: Path) -> None:
-        """The exact envelope ``raise_guided_operation_failure`` closes over.
-
-        The guided routes never reach an app-level handler for their own
-        exception class — they catch it, settle the operation, and raise
-        this. Pinning the composed result here is what makes the boundary
-        (rather than four route edits) the fix.
-        """
-        app = create_app(_settings(tmp_path))
-        handler = app.exception_handlers[StarletteHTTPException]
-
-        with pytest.raises(HTTPException) as caught:
-            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
-        response = await handler(_audit_request("req-guided-1"), caught.value)
-
-        assert response.status_code == 500
-        assert json.loads(response.body)["detail"] == {
-            "error_type": "guided_operation_terminal_failure",
-            "failure_code": "integrity_error",
-            "detail": "The operation failed an integrity check.",
-            "request_id": "req-guided-1",
-        }
-
     def test_the_body_request_id_equals_the_response_header_end_to_end(self, tmp_path: Path) -> None:
         """The finding, stated as a test: the header must correlate to something.
 
@@ -511,9 +450,9 @@ class TestHTTPExceptionRequestIdEnvelope:
         """
         app = create_app(_settings(tmp_path))
 
-        @app.get("/api/_probe/guided-terminal-failure")
-        async def _probe_guided_terminal_failure() -> None:
-            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
+        @app.get("/api/_probe/terminal-failure")
+        async def _probe_terminal_failure() -> None:
+            raise HTTPException(status_code=500, detail={"error_type": "probe_failure", "failure_code": "integrity_error"})
 
         @app.get("/api/_probe/string-detail")
         async def _probe_string_detail() -> None:
@@ -532,7 +471,7 @@ class TestHTTPExceptionRequestIdEnvelope:
 
         client = SyncASGITestClient(app)
 
-        response = client.get("/api/_probe/guided-terminal-failure")
+        response = client.get("/api/_probe/terminal-failure")
         assert response.status_code == 500
         detail = response.json()["detail"]
         assert detail["failure_code"] == "integrity_error"
@@ -541,7 +480,7 @@ class TestHTTPExceptionRequestIdEnvelope:
 
         # An inbound id is honoured, so the correlation works for a caller
         # that already owns a trace id.
-        supplied = client.get("/api/_probe/guided-terminal-failure", headers={"X-Request-ID": "trace-abc-123"})
+        supplied = client.get("/api/_probe/terminal-failure", headers={"X-Request-ID": "trace-abc-123"})
         assert supplied.json()["detail"]["request_id"] == "trace-abc-123"
 
         # ... and the string-detail contract is unchanged end to end.

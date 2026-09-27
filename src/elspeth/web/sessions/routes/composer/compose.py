@@ -24,10 +24,8 @@ from .._helpers import (
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
-    CompositionStateData,
     CompositionStateResponse,
     Depends,
-    GuidedSession,
     HTTPException,
     InvariantError,
     MessageWithStateResponse,
@@ -58,6 +56,7 @@ from .._helpers import (
     _initial_composition_state,
     _is_client_disconnect_cancel,
     _join_freeform_owned_task,
+    _join_shielded_task_after_cancellation,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -82,9 +81,7 @@ from .._helpers import (
     get_rate_limiter,
     merge_composer_meta_updates,
     slog,
-    validation_errors_for_composer_surface,
 )
-from ..guided_operations import _join_shielded_task_after_cancellation
 from .pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
 
 router = APIRouter()
@@ -188,15 +185,6 @@ async def recompose(
                 likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
             ),
         )
-        # Detect guided→freeform mode transition (spec §8.2).
-        # Recompose is a retried freeform chat call — progressive disclosure
-        # fires here on the same semantics as send_message (first freeform
-        # turn after guided_session.terminal is set uses the layered prompt).
-        _guided = state.guided_session
-        _guided_terminal_for_compose = (
-            _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
-        )
-
         _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "recompose"})
         terminal_status: _ComposerRequestTerminalStatus = "failed"
         try:
@@ -210,34 +198,11 @@ async def recompose(
             from openai import OpenAIError
 
             async def settle_post_provider(result: ComposerResult) -> _FreeformContinuationReceipt:
-                # Compute the post-compose guided_session and composer_meta.
-                # Mirror of send_message §5a-§5b: if the transition prompt fired
-                # this turn, flip transition_consumed so subsequent turns use the
-                # freeform-only prompt.  guided_session rides in composer_meta (not
-                # a first-class column) — any save must propagate it forward.
-                _post_compose_guided: GuidedSession | None = result.state.guided_session
-                if _guided_terminal_for_compose is not None:
-                    # transition_consumed flip — _guided is non-None because
-                    # _guided_terminal_for_compose was derived from _guided.terminal.
-                    if _guided is None:
-                        raise InvariantError(
-                            "guided_terminal_for_compose is set but guided_session is None — "
-                            "impossible state: transition gate should have blocked this path"
-                        )
-                    from dataclasses import replace as _replace_dc
-
-                    _post_compose_guided = _replace_dc(
-                        _guided,
-                        transition_consumed=True,
-                    )
-
                 _post_compose_updates: dict[str, Any] = {
                     "repair_turns_used": result.repair_turns_used,
                     "ingress": chat_ingress,
                     "chat_ingress_inputs": chat_ingress_inputs,
                 }
-                if _post_compose_guided is not None:
-                    _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
                 _post_compose_meta = merge_composer_meta_updates(
                     state_record.composer_meta if state_record is not None else None,
                     _post_compose_updates,
@@ -261,7 +226,6 @@ async def recompose(
                         intent=result.pipeline_commit_intent,
                         composer_meta=_post_compose_meta,
                         telemetry_source="recompose",
-                        transition_assistant=composer_turn_end_assistant_row(result) if _guided_terminal_for_compose is not None else None,
                     )
                     if type(settlement_outcome) is PipelineRouteSettlement:
                         route_settlement = settlement_outcome
@@ -361,61 +325,16 @@ async def recompose(
                             likely_next="The assistant response will appear after the save completes.",
                         ),
                     )
-                    if _guided_terminal_for_compose is not None:
-                        transition_settlement = await service.commit_transition_response(
-                            session_id=session.id,
-                            expected_current_state_id=pre_send_state_id,
-                            state=state_data,
-                            assistant_content=_turn_end.content,
-                            raw_content=_turn_end.raw_content,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                        new_state_record = transition_settlement.state
-                        assistant_msg = transition_settlement.message
-                    else:
-                        new_state_record = await service.save_composition_state(
-                            session.id,
-                            state_data,
-                            # Successful recompose state advance after the LLM
-                            # composer returns a newer state version.
-                            provenance="post_compose",
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    state_response = _state_response(new_state_record, live_validation=validation)
-                    post_compose_state_id = new_state_record.id
-                elif _guided_terminal_for_compose is not None and _post_compose_guided is not None:
-                    # Version unchanged but transition_consumed must be flipped.
-                    # Persist the updated guided_session in a new state row so
-                    # subsequent turns pick up transition_consumed=True.
-                    _transition_state = result.state
-                    _transition_state_d = _transition_state.to_dict()
-                    _transition_state_data = CompositionStateData(
-                        sources=_transition_state_d["sources"],
-                        nodes=_transition_state_d["nodes"],
-                        edges=_transition_state_d["edges"],
-                        outputs=_transition_state_d["outputs"],
-                        metadata_=_transition_state_d["metadata"],
-                        is_valid=False,
-                        validation_errors=validation_errors_for_composer_surface(
-                            composer_meta=_post_compose_meta,
-                            is_valid=False,
-                            validation_errors=None,
-                        ),
-                        composer_meta=_post_compose_meta,
-                    )
-                    transition_settlement = await service.commit_transition_response(
-                        session_id=session.id,
-                        expected_current_state_id=pre_send_state_id,
-                        state=_transition_state_data,
-                        assistant_content=_turn_end.content,
-                        raw_content=_turn_end.raw_content,
+                    new_state_record = await service.save_composition_state(
+                        session.id,
+                        state_data,
+                        # Successful recompose state advance after the LLM
+                        # composer returns a newer state version.
+                        provenance="post_compose",
                         session_operation_context=compose_operation_lease.context,
                     )
-                    _transition_record = transition_settlement.state
-                    assistant_msg = transition_settlement.message
-                    post_compose_state_id = _transition_record.id
-                    state_response = _state_response(_transition_record)
-
+                    state_response = _state_response(new_state_record, live_validation=validation)
+                    post_compose_state_id = new_state_record.id
                 # Persist assistant message
                 if assistant_msg is None:
                     assistant_msg = await service.add_message(
@@ -482,7 +401,6 @@ async def recompose(
                         current_state_id=str(pre_send_state_id) if pre_send_state_id is not None else None,
                         user_id=str(user.user_id),
                         progress=progress_sink,
-                        guided_terminal=_guided_terminal_for_compose,
                         user_message_id=request_id,
                         session_operation_context=compose_operation_lease.context,
                         completion_gates=prior_completion_gates_facts,
@@ -759,7 +677,7 @@ async def recompose(
             # B1-sanitization rationale. Static 500 detail; slog carries
             # exc_class + frames only.
             slog.error(
-                "guided.invariant_violated",
+                "composer.invariant_violated",
                 session_id=str(session_id),
                 user_id=user.user_id,
                 exc_class=type(exc).__name__,

@@ -4,7 +4,6 @@ import sys
 from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
-from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
@@ -29,11 +28,8 @@ from ._helpers import (
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
-    CompositionStateData,
     CompositionStateResponse,
     Depends,
-    FailedTurnMetadata,
-    GuidedSession,
     HTTPException,
     InvariantError,
     MessageWithStateResponse,
@@ -56,7 +52,6 @@ from ._helpers import (
     _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
-    _failed_turn_response_body,
     _freeform_child_result,
     _FreeformContinuationReceipt,
     _get_composer_progress_registry,
@@ -70,6 +65,7 @@ from ._helpers import (
     _initial_composition_state,
     _is_client_disconnect_cancel,
     _join_freeform_owned_task,
+    _join_shielded_task_after_cancellation,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -98,10 +94,8 @@ from ._helpers import (
     maybe_auto_title_session,
     merge_composer_meta_updates,
     slog,
-    validation_errors_for_composer_surface,
 )
 from .composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
-from .guided_operations import _join_shielded_task_after_cancellation
 
 
 def _requests_audit_grade_messages_view(
@@ -229,15 +223,6 @@ def register_message_routes(router: APIRouter) -> None:
             prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
             _policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
             profile_registry = request.app.state.operator_profile_registry
-
-            # 1b. Detect guided→freeform mode transition (spec §8.2).
-            # The first freeform chat turn after guided_session.terminal is set
-            # uses a layered system prompt. ``transition_consumed`` guards against
-            # re-firing on subsequent turns.
-            _guided = state.guided_session
-            _guided_terminal_for_compose = (
-                _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
-            )
 
             # 2. Persist user message with pre-send provenance AND take the
             # transcript snapshot in the SAME write-locked transaction.
@@ -387,43 +372,12 @@ def register_message_routes(router: APIRouter) -> None:
                     # as Starlette's bare 500 — partial_state is dropped from
                     # the audit trail and the frontend receives an opaque error.
                     #
-                    # 5a. Compute the post-compose guided_session.
-                    # If the transition prompt fired this turn, flip transition_consumed
-                    # on the guided_session so subsequent turns use the freeform-only
-                    # prompt.  The updated guided_session is included in composer_meta
-                    # for both the version-changed save path and the version-unchanged
-                    # standalone save below.
-                    _post_compose_guided: GuidedSession | None = result.state.guided_session
-                    if _guided_terminal_for_compose is not None:
-                        # transition_consumed flip — _guided is non-None because
-                        # _guided_terminal_for_compose was derived from _guided.terminal.
-                        # The explicit RuntimeError defends against an impossible state
-                        # (the gate above ensures _guided is not None when this fires)
-                        # and satisfies the type checker without defensive get() calls.
-                        if _guided is None:
-                            raise InvariantError(
-                                "guided_terminal_for_compose is set but guided_session is None — "
-                                "impossible state: transition gate should have blocked this path"
-                            )
-                        from dataclasses import replace as _replace_dc
-
-                        _post_compose_guided = _replace_dc(
-                            _guided,
-                            transition_consumed=True,
-                        )
-
-                    # 5b. Compute the composer_meta that carries both repair_turns_used
-                    # and guided_session.  Guided_session rides in composer_meta (not a
-                    # first-class column) so any save must propagate it forward — failing
-                    # to include it would silently drop the guided session from the DB on
-                    # every freeform compose turn that mutates state.
+                    # Compute the metadata carried into the post-compose state.
                     _post_compose_updates: dict[str, Any] = {
                         "repair_turns_used": result.repair_turns_used,
                         "ingress": chat_ingress,
                         "chat_ingress_inputs": chat_ingress_inputs,
                     }
-                    if _post_compose_guided is not None:
-                        _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
                     _post_compose_meta = merge_composer_meta_updates(
                         state_record.composer_meta if state_record is not None else None,
                         _post_compose_updates,
@@ -443,9 +397,6 @@ def register_message_routes(router: APIRouter) -> None:
                             intent=result.pipeline_commit_intent,
                             composer_meta=_post_compose_meta,
                             telemetry_source="compose",
-                            transition_assistant=composer_turn_end_assistant_row(result)
-                            if _guided_terminal_for_compose is not None
-                            else None,
                         )
                         if type(settlement_outcome) is PipelineRouteSettlement:
                             route_settlement = settlement_outcome
@@ -549,61 +500,16 @@ def register_message_routes(router: APIRouter) -> None:
                                 likely_next="The assistant response will appear after the save completes.",
                             ),
                         )
-                        if _guided_terminal_for_compose is not None:
-                            transition_settlement = await service.commit_transition_response(
-                                session_id=session.id,
-                                expected_current_state_id=compose_base_state_id,
-                                state=state_data,
-                                assistant_content=_turn_end.content,
-                                raw_content=_turn_end.raw_content,
-                                session_operation_context=compose_operation_lease.context,
-                            )
-                            new_state_record = transition_settlement.state
-                            assistant_msg = transition_settlement.message
-                        else:
-                            new_state_record = await service.save_composition_state(
-                                session.id,
-                                state_data,
-                                # Successful send-message state advance after the LLM
-                                # composer returns a newer state version.
-                                provenance="post_compose",
-                                session_operation_context=compose_operation_lease.context,
-                            )
-                        state_response = _state_response(new_state_record, live_validation=validation)
-                        post_compose_state_id = new_state_record.id
-                    elif _guided_terminal_for_compose is not None and _post_compose_guided is not None:
-                        # Version unchanged but transition_consumed must be flipped.
-                        # Persist the updated guided_session in a new state row so
-                        # subsequent turns pick up transition_consumed=True.
-                        _transition_state = result.state
-                        _transition_state_d = _transition_state.to_dict()
-                        _transition_state_data = CompositionStateData(
-                            sources=_transition_state_d["sources"],
-                            nodes=_transition_state_d["nodes"],
-                            edges=_transition_state_d["edges"],
-                            outputs=_transition_state_d["outputs"],
-                            metadata_=_transition_state_d["metadata"],
-                            is_valid=False,
-                            validation_errors=validation_errors_for_composer_surface(
-                                composer_meta=_post_compose_meta,
-                                is_valid=False,
-                                validation_errors=None,
-                            ),
-                            composer_meta=_post_compose_meta,
-                        )
-                        transition_settlement = await service.commit_transition_response(
-                            session_id=session.id,
-                            expected_current_state_id=compose_base_state_id,
-                            state=_transition_state_data,
-                            assistant_content=_turn_end.content,
-                            raw_content=_turn_end.raw_content,
+                        new_state_record = await service.save_composition_state(
+                            session.id,
+                            state_data,
+                            # Successful send-message state advance after the LLM
+                            # composer returns a newer state version.
+                            provenance="post_compose",
                             session_operation_context=compose_operation_lease.context,
                         )
-                        _transition_record = transition_settlement.state
-                        assistant_msg = transition_settlement.message
-                        post_compose_state_id = _transition_record.id
-                        state_response = _state_response(_transition_record)
-
+                        state_response = _state_response(new_state_record, live_validation=validation)
+                        post_compose_state_id = new_state_record.id
                     # 6. Persist assistant message with post-compose provenance
                     if assistant_msg is None:
                         assistant_msg = await service.add_message(
@@ -684,7 +590,6 @@ def register_message_routes(router: APIRouter) -> None:
                             current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None,
                             user_id=str(user.user_id),
                             progress=progress_sink,
-                            guided_terminal=_guided_terminal_for_compose,
                             session_operation_context=compose_operation_lease.context,
                             # Bind the freshly persisted user message id so any
                             # inline_blob created by
@@ -907,10 +812,8 @@ def register_message_routes(router: APIRouter) -> None:
                     # NOT caught by the generic ComposerServiceError arm below; without
                     # this clause it escaped as an unhandled 500 with no "failed"
                     # progress event and no closed failure-disposition record. The
-                    # guided-full route translates the same exception via
-                    # fail_guided_operation_with_audit; _handle_planner_failure is the
-                    # freeform mirror (persisting one durable, redacted disposition
-                    # row). The planner's LLM-call audit evidence is already durable
+                    # handler persists one durable, redacted disposition row.
+                    # The planner's LLM-call audit evidence is already durable
                     # (llm_calls_durable), so _handle_planner_failure MUST NOT — and
                     # does not — persist it again.
                     await _publish_progress(
@@ -929,8 +832,7 @@ def register_message_routes(router: APIRouter) -> None:
                                 else "Retry the request; if it keeps failing, simplify it or check the composer provider."
                             ),
                             # Attribute the failure to its actual actor rather than blaming the
-                            # provider for every planner code — the guided mirror already does
-                            # (guided_plan.py), and the closed vocabulary carries the codes.
+                            # provider for every planner code.
                             reason=freeform_planner_progress_reason(exc.code),
                         ),
                     )
@@ -1021,49 +923,11 @@ def register_message_routes(router: APIRouter) -> None:
                 if deferred_cancellation is not None:
                     raise deferred_cancellation
                 return continuation_receipt.response
-            except GuidedCustodyIntegrityError as exc:
-                # The pre-persist custody gate refused the post-compose tip
-                # (elspeth-4c442aaaa8): the user row is committed and the tip
-                # did not advance, so this is a failed turn — describe it from
-                # the compose result rather than let the app-level handler emit
-                # the no-metadata 500. Custody-only by design: every gate raise
-                # is Guided*, and any other AuditIntegrityError keeps the
-                # app-level handler surface with its own diagnostics.
-                if exc.failed_turn is None and _compose_result is not None:
-                    exc.failed_turn = FailedTurnMetadata(
-                        assistant_message_id=_compose_result.persisted_assistant_message_id,
-                        tool_calls_attempted=len(_compose_result.tool_invocations),
-                        tool_responses_persisted=None if _compose_result.persisted_tool_call_turn else 0,
-                    )
-                if exc.failed_turn is None or _compose_result is None:
-                    raise
-                slog.error(
-                    "http_audit_integrity_error",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    exc_class=type(exc).__name__,
-                    message=str(exc),
-                    site="send_message",
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error_type": "audit_integrity_error",
-                        "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
-                        "failed_turn": await _failed_turn_response_body(service, session.id, exc.failed_turn),
-                    },
-                ) from exc
             except InvariantError as exc:
-                # Same B1-sanitization rationale as the /guided/respond
-                # transition and settlement handlers: server-invariant
-                # violations route through a static 500 detail and a
-                # structured slog event so on-call dashboards can filter on
-                # ``guided.invariant_violated``.  Without this handler an
-                # InvariantError raised from the post-compose transition_consumed
-                # impossible-state guard would land at FastAPI's default 500
-                # ({"detail": "Internal Server Error"}) with no structured log.
+                # Invariant failures return a static detail; diagnostic frames
+                # remain in the structured log rather than the HTTP response.
                 slog.error(
-                    "guided.invariant_violated",
+                    "composer.invariant_violated",
                     session_id=str(session_id),
                     user_id=user.user_id,
                     exc_class=type(exc).__name__,

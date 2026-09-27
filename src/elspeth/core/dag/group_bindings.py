@@ -63,7 +63,7 @@ class CloserKind(StrEnum):
 
     StrEnum (2026-08-22 synthesis): members ARE their string values
     ("coalesce"/"row_union"/"collector"), so every serialized surface —
-    composer NodeSpec dicts, guidedDecoder wire shapes, audit JSON,
+    composer NodeSpec dicts, API wire shapes, audit JSON,
     ``GraphValidationError.component_type`` — keeps carrying plain strings
     with zero serialization change. WS3 compares against the MEMBERS
     (``binding.closer_kind is CloserKind.COLLECTOR``), never string

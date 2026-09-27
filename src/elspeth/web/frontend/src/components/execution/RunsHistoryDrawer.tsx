@@ -12,7 +12,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { makePhraseFor } from "@/lib/validationHumaniser";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/pipelineGloss";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
 import { DIAGNOSTIC_CAUSE_PHRASES, DIAGNOSTIC_REASON_PHRASES } from "./diagnosticPhrases";

@@ -3,17 +3,14 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";
 import { Button, Input } from "@/components/ui";
-import type { ComposerMode } from "@/types/api";
 
 /**
- * Inner radio-group form. Exported standalone so component tests can render
+ * Inner preferences form. Exported standalone so component tests can render
  * it without the modal chrome; the full panel embeds it.
- *
- * Returns null before bootstrap completes — defaultMode is null until then.
  *
  * Surfaces a role="alert" region (Panel a11y F2) for failed PATCH results
  * so the write failure is announced rather than silently logging to
- * console only. The preference applies to new sessions.
+ * console only.
  */
 interface ComposerPreferencesFormProps {
   onClose?: () => void;
@@ -24,11 +21,9 @@ export function ComposerPreferencesForm({
   onClose,
   onResetTutorialComplete,
 }: ComposerPreferencesFormProps = {}): JSX.Element | null {
-  const defaultMode = usePreferencesStore((s) => s.defaultMode);
   const loaded = usePreferencesStore((s) => s.loaded);
   const writing = usePreferencesStore((s) => s.writing);
   const writeError = usePreferencesStore((s) => s.writeError);
-  const setDefaultMode = usePreferencesStore((s) => s.setDefaultMode);
   const resetTutorial = usePreferencesStore((s) => s.resetTutorial);
   const showAdvanced = usePreferencesStore((s) => s.showAdvanced);
   const setShowAdvanced = usePreferencesStore((s) => s.setShowAdvanced);
@@ -38,20 +33,6 @@ export function ComposerPreferencesForm({
   // (run-bearing sessions archived from the switcher). The session switcher
   // can hide/show archived rows locally, but settings should become the
   // durable management surface for review/restore/delete policy.
-
-  // useCallback must be unconditional (React rules of hooks); the early-return
-  // for !loaded sits after the hook calls.
-  const onChange = useCallback(
-    async (mode: ComposerMode) => {
-      try {
-        await setDefaultMode(mode);
-      } catch (err) {
-        // Surfaced via writeError -> role="alert" region below.
-        console.error("[preferences] setDefaultMode failed:", err);
-      }
-    },
-    [setDefaultMode],
-  );
 
   const onResetTutorial = useCallback(async () => {
     try {
@@ -81,48 +62,10 @@ export function ComposerPreferencesForm({
     [setShowAdvanced],
   );
 
-  if (!loaded || defaultMode === null) return null;
+  if (!loaded) return null;
 
   return (
     <>
-      <fieldset
-        disabled={writing}
-        aria-busy={writing}
-        className="composer-preferences-fieldset"
-      >
-        <legend className="composer-preferences-legend">
-          Default mode for new sessions
-        </legend>
-        <label className="composer-preferences-option">
-          <Input
-            type="radio"
-            name="composer-default-mode"
-            value="freeform"
-            checked={defaultMode === "freeform"}
-            disabled={writing}
-            onChange={() => void onChange("freeform")}
-          />
-          <span>Freeform</span>
-        </label>
-        {/* Guided mode is being retired. This was the only way into it (ruling
-            D1), so the option is disabled rather than removed: a saved Guided
-            default still shows as selected, and Freeform stays selectable so
-            that user can switch away. The clean removal is separate work. */}
-        <label className="composer-preferences-option">
-          <Input
-            type="radio"
-            name="composer-default-mode"
-            value="guided"
-            checked={defaultMode === "guided"}
-            disabled
-            onChange={() => void onChange("guided")}
-          />
-          <span>Guided</span>
-        </label>
-        <p className="composer-preferences-hint">
-          Guided mode is being retired and can no longer be selected. Applies to sessions you start from now on.
-        </p>
-      </fieldset>
       <fieldset className="composer-preferences-fieldset">
         <legend className="composer-preferences-legend">Theme</legend>
         <label className="composer-preferences-option">
@@ -235,12 +178,10 @@ export function ComposerPreferencesPanel({
   onResetTutorialComplete,
 }: ComposerPreferencesPanelProps): JSX.Element {
   const modalRef = useRef<HTMLDivElement>(null);
-  // ``:enabled`` because the Guided option is disabled: a saved Guided default
-  // is checked but cannot take focus, and the dialog must still open focused.
   useFocusTrap(
     modalRef,
     true,
-    "input[name='composer-default-mode']:enabled",
+    "input[name='composer-theme']",
   );
 
   useEffect(() => {

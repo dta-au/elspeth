@@ -47,22 +47,10 @@ import type {
   SystemStatus,
   MessageWithStateResponse,
 } from "@/types/index";
-import type {
-  GetGuidedResponse,
-  GuidedChatRequest,
-  GuidedChatResponse,
-  GuidedRespondRequest,
-  GuidedRespondResponse,
-  GuidedStartOperationReconciliation,
-} from "@/types/guided";
 import {
   decodeCompositionState,
   decodeCompositionStateVersions,
-  decodeGetGuidedResponse,
-  decodeGuidedChatResponse,
-  decodeGuidedRespondResponse,
-  decodeGuidedStartOperationReconciliation,
-} from "./guidedDecoder";
+} from "./compositionDecoder";
 import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
@@ -214,16 +202,6 @@ export function isForkCommittedResponseError(error: unknown): error is ForkCommi
   return error instanceof ForkCommittedResponseError;
 }
 
-export class GuidedResponseReceiptError extends Error {
-  readonly received = true;
-  readonly cause: unknown;
-
-  constructor(cause: unknown) {
-    super("The guided response was received but could not be read.");
-    this.name = "GuidedResponseReceiptError";
-    this.cause = cause;
-  }
-}
 
 const CANONICAL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -942,37 +920,6 @@ export async function recompose(
   return parseResponse<MessageWithStateResponse>(response);
 }
 
-/**
- * Fetch the current guided-session state for a session.
- *
- * Returns the active GuidedSession (step + history + terminal), the
- * server-emitted next turn payload (if any), and the current composition
- * state.  When no guided session has started for the session, the server
- * returns an in-memory initial GuidedSession and Step 1 turn without creating
- * a composition-state version.
- */
-export function getGuided(
-  sessionId: string,
-  signal: AbortSignal | undefined,
-  probe: true,
-): Promise<GetGuidedResponse | null>;
-export function getGuided(
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse>;
-export async function getGuided(
-  sessionId: string,
-  signal?: AbortSignal,
-  probe = false,
-): Promise<GetGuidedResponse | null> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided${probe ? "?probe=true" : ""}`, {
-    method: "GET",
-    headers: authHeaders(),
-    signal,
-  });
-  const body = await parseResponse<unknown>(response);
-  return probe && body === null ? null : decodeGetGuidedResponse(body);
-}
 
 /**
  * Fetch runtime-derived sample URLs for the freeform tutorial brief.
@@ -1005,177 +952,12 @@ export async function getTutorialReadiness(
   return parseResponse<TutorialReadinessResponse>(response);
 }
 
-/**
- * Seed a guided session with a server-owned WorkflowProfile.
- *
- * The `profileKind` is a closed-enum discriminator ("live" | "tutorial"); the
- * SERVER constructs the concrete profile object and persists the GuidedSession.
- * Idempotent (D16): a second call for a session that already has a persisted
- * guided session returns the existing session unchanged.
- *
- * `intent` is required for BOTH profiles (goal-first start, elspeth-378cfa0e18
- * / elspeth-13579d1110). It is the session's visible root intent: the goal the
- * user typed on the goal card, or — for the tutorial — the frozen lesson prompt
- * the shell seeds, which is the same shape a live goal takes. The server 400s a
- * start with no intent for every profile, so a planner run can never be reached
- * without one. The old `profile === "live"` conditional that STRIPPED intent for
- * the tutorial is gone; sending it is not a tutorial-special path, it is the one
- * path (ADR-031).
- */
-interface GuidedStartCommand {
-  profile: "live" | "tutorial";
-  intent: string;
-  operationId: string;
-}
 
-export async function startGuidedSession(
-  sessionId: string,
-  command: GuidedStartCommand,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/start`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({
-      profile: command.profile,
-      intent: command.intent,
-      operation_id: command.operationId,
-    }),
-    signal,
-  });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
-}
 
-export async function reconcileGuidedStartOperation(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GuidedStartOperationReconciliation> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/guided/start/${operationId}/reconcile`,
-    {
-      method: "POST",
-      headers: authHeaders(),
-      signal,
-    },
-  );
-  return decodeGuidedStartOperationReconciliation(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a user response to the active guided turn.
- *
- * Server consumes the response, advances the state machine, and returns
- * the replacement GuidedSession + next turn (or terminal state).  The
- * client is expected to atomically replace its cached guided state with
- * the response shape — no optimistic updates (spec §7.3).
- */
-export async function respondGuided(
-  sessionId: string,
-  body: GuidedRespondRequest,
-  signal?: AbortSignal,
-): Promise<GuidedRespondResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/respond`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGuidedRespondResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
-}
 
-/**
- * Re-enter guided mode after a deliberate user exit to freeform.
- *
- * Server clears the reversible exited_to_freeform/user_pressed_exit terminal
- * and returns the same envelope shape as GET /guided.
- */
-export async function reenterGuided(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/reenter`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Convert a freeform session into guided mode.
- *
- * "Switch to guided" on a session that has already done freeform composition
- * work cannot go through GET /guided — that endpoint 400s by design for a
- * session with no persisted guided_session (and must, since it is also the
- * passive freeform-probe on session select). This POST is the explicit
- * conversion: it seeds a FRESH wizard as a new composition-state version,
- * setting the freeform pipeline aside (recoverable from version history), and
- * returns the same envelope shape as GET /guided.
- *
- * `intent` is REQUIRED (goal-first, elspeth-378cfa0e18): the converted wizard is
- * rooted on the goal the user stated in the mode-switch card, exactly as a live
- * start is. A convert is no longer idempotent-by-silence for an already-guided
- * session — the server 409s `guided_already_started` rather than discarding the
- * client's goal — so callers must probe GET /guided first (the store's GET-first
- * `enterGuided` does) and only convert on the documented 400.
- */
-export async function convertToGuided(
-  sessionId: string,
-  intent: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/convert`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId, intent }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a free-text chat message scoped to the user's current wizard step.
- *
- * The server runs bounded Step 1/2 provider work, projects supported results
- * through the schema-8 transition authority, and returns the authoritative
- * post-settlement session, turn, terminal, and composition state. Generated
- * inline source bytes are reported as a typed non-applying failure until blob
- * custody can join the same atomic settlement.
- *
- * The required turn token binds the request to the server-held current
- * unanswered occurrence; stale tokens return 409 before provider work.
- */
-export async function chatGuided(
-  sessionId: string,
-  body: GuidedChatRequest,
-  signal?: AbortSignal,
-): Promise<GuidedChatResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/chat`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  return decodeGuidedChatResponse(await parseResponse<unknown>(response));
-}
 
 /** Fork a session from a specific user message. */
 export async function forkFromMessage(
@@ -1301,9 +1083,7 @@ export interface ImportedCompositionState {
 /**
  * Import (replace) a session's composition state from hand-edited or
  * previously-exported YAML (elspeth-24c56585f9 T-1). This REPLACES the
- * current composition -- the backend does not merge -- and always resets
- * the session's guided_session to null server-side, landing the session in
- * freeform. The prior version remains reachable via `fetchStateVersions` /
+ * current composition -- the backend does not merge. The prior version remains reachable via `fetchStateVersions` /
  * `revertToVersion`. A 200 response does not imply the imported pipeline is
  * runnable: check `is_valid`/`validation_errors` on the result.
  */

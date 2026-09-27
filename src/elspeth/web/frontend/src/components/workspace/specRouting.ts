@@ -76,9 +76,8 @@ export interface ConnectionIndex {
  * of connection names; resolve through `consumers`.
  *
  * This is a SHAPE partition, not a direction one, and it is deliberately NOT
- * the same set as the backend's routing-field Literal
- * (web/composer/guided/planning.py, which enumerates
- * on_success | on_error | on_validation_failure | on_write_failure | routes |
+ * the same set as the backend's routing fields
+ * (on_success | on_error | on_validation_failure | on_write_failure | routes |
  * fork_to). `routes` is genuinely outbound and is missing here only because
  * it is MAP-shaped and handled below alongside `branches`; `branches` is
  * absent for the same shape reason, and is inbound as well. Do not "fix" this
@@ -183,7 +182,7 @@ function push(map: Map<string, string[]>, key: string, id: string): void {
 
 /** Connections this node READS. For a fan-in kind that is its branch
  *  connections and NOT its `input` — the canonical consumer projection
- *  (web/composer/guided/connection_consumers.py) skips `input` for
+ *  skips `input` for
  *  coalesce/row_union because it is only the first-branch placeholder. A
  *  fan-in node with no branches at all keeps ordinary `input` inference,
  *  matching GraphView's `aliasMappedFanInIds` guard. */

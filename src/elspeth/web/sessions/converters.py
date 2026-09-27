@@ -8,49 +8,14 @@ Both sessions/routes.py and execution/service.py need this conversion.
 It lives here (not in routes.py) to avoid forcing execution/ to import
 from a route module.
 
-GuidedSession persistence:
-  ``guided_session`` is NOT a first-class column in ``composition_states``; it
-  rides in ``composer_meta["guided_session"]`` as a serialised dict.  When
-  ``composer_meta`` is present and contains a ``"guided_session"`` key,
-  ``state_from_record`` reconstructs the full ``GuidedSession`` object and
-  attaches it to the returned ``CompositionState``.  The absence of the key is
-  honest (freeform session — ``guided_session`` stays ``None``).
 """
 
 from __future__ import annotations
 
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument, generate_pipeline_dict
 from elspeth.web.sessions.protocol import CompositionStateRecord
-
-
-def pending_guided_checkpoint(composer_meta: object) -> GuidedSession | None:
-    """Restore a checkpoint only when it carries a pending guided proposal.
-
-    Absent and null guided metadata make no pending-proposal claim. A present
-    active reference must parse as the complete owned guided state before a
-    writer may decide whether to carry it onto another checkpoint.
-    """
-    metadata = deep_thaw(composer_meta)
-    if metadata is None:
-        return None
-    if type(metadata) is not dict:
-        raise AuditIntegrityError("guided checkpoint metadata is malformed")
-    if "guided_session" not in metadata or metadata["guided_session"] is None:
-        return None
-    guided = metadata["guided_session"]
-    if type(guided) is not dict:
-        raise AuditIntegrityError("guided checkpoint is malformed")
-    if "active_proposal" not in guided or guided["active_proposal"] is None:
-        return None
-    try:
-        return GuidedSession.from_dict(guided)
-    except (InvariantError, KeyError, TypeError, ValueError) as exc:
-        raise AuditIntegrityError("pending guided checkpoint is malformed") from exc
 
 
 def state_from_record(record: CompositionStateRecord) -> CompositionState:
@@ -62,8 +27,6 @@ def state_from_record(record: CompositionStateRecord) -> CompositionState:
     Tier 1: metadata_ must always be populated. A None here indicates
     database corruption or a migration gap — crash immediately.
 
-    Guided-mode: if ``composer_meta["guided_session"]`` is present, the
-    GuidedSession is restored via ``GuidedSession.from_dict()``.
     """
     if record.metadata_ is None:
         msg = f"CompositionStateRecord {record.id} has None metadata_ — database corruption or migration gap"
@@ -84,23 +47,7 @@ def state_from_record(record: CompositionStateRecord) -> CompositionState:
         "outputs": [deep_thaw(o) for o in record.outputs] if record.outputs is not None else [],
         "metadata": deep_thaw(record.metadata_),
     }
-    state = CompositionState.from_dict(state_dict)
-
-    # Restore guided_session from composer_meta side-channel.
-    # Tier 1: any malformed guided_session dict is a corruption event — crash.
-    if record.composer_meta is not None:
-        thawed_meta = deep_thaw(record.composer_meta)
-        if "guided_session" in thawed_meta:
-            guided_session_raw = thawed_meta["guided_session"]
-            if guided_session_raw is None:
-                # Explicitly-null key: freeform session, no session to restore.
-                return state
-            guided_session = GuidedSession.from_dict(guided_session_raw)
-            from dataclasses import replace
-
-            state = replace(state, guided_session=guided_session)
-
-    return state
+    return CompositionState.from_dict(state_dict)
 
 
 def pipeline_dict_from_record(record: CompositionStateRecord) -> LoweredPipelineDocument:

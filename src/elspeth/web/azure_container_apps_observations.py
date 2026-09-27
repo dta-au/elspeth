@@ -305,7 +305,15 @@ def _fresh_message_visibility(
 ) -> float:
     path = f"/api/sessions/{session_id}/messages"
     content = f"Keep the current pipeline unchanged. Briefly acknowledge this visibility check: {uuid4()}."
-    written = _exchange(owner, "a", path, capture, post=True, body={"content": content}, clock=polling.clock)
+    written = _exchange(
+        owner,
+        "a",
+        path,
+        capture,
+        post=True,
+        body={"content": content, "client_request_id": str(uuid4())},
+        clock=polling.clock,
+    )
     if written.response.status != 200 or written.response.instance_id != owner_id:
         raise AcceptanceCheckError("probe_message_write")
     message = _MessageWrite.model_validate(written.body).message

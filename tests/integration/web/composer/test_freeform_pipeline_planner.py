@@ -41,7 +41,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @dataclass
@@ -198,7 +198,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -317,7 +317,7 @@ async def test_planner_llm_call_audit_persists_the_served_endpoint(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -401,7 +401,7 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -549,7 +549,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -790,7 +790,7 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -849,7 +849,7 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -922,7 +922,7 @@ async def _recipe_composer_context(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="planner-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -1148,14 +1148,8 @@ async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effe
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Freeform compose has exactly one planning path: plan_pipeline.
-
-    This test formerly guarded the excised recipe router's fallback seam with
-    a prepare_pipeline_plan never-called sentinel. The router died in
-    9700470e2 and prepare_pipeline_plan itself was deleted with the guided
-    sketch bypass (elspeth-b4a286d517), so no server-derived branch exists to
-    sentinel against; what survives is the routing half — compose reaches the
-    provider planner, and a planner failure leaves zero pipeline side effects.
+    """Freeform compose reaches the provider planner, and a planner failure
+    leaves zero pipeline side effects.
     """
     message = "Build the requested pipeline."
     engine, _sessions, session, user_message, composer = await _recipe_composer_context(

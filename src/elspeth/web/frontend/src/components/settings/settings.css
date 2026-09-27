@@ -253,19 +253,6 @@
   font-size: var(--font-size-xs);
 }
 
-/* ---------------------------------------------------------------------------
-   Composer preferences panel
-
-   ComposerPreferencesForm shipped with NO classes on its <fieldset> /
-   <legend> / <label> elements at all (elspeth-03f43bdef0), so ELSPETH's
-   primary settings surface rendered Chrome's 2px groove fieldset border and
-   its UA ~5px sibling margins on --color-surface. The rules below follow the
-   two fieldset idioms already shipped in this tree: .guided-chip-fieldset
-   (guided.css) strips the UA chrome, .tutorial-mode-fieldset (tutorial.css)
-   lays the options out on a token grid. The legend matches
-   .people-direction legend (admin.css) so the fieldsets in this dialog family
-   label their groups the same way.
-   --------------------------------------------------------------------------- */
 .composer-preferences-fieldset {
   display: grid;
   gap: var(--space-sm);

@@ -1,7 +1,8 @@
 import { type JSX, useEffect, useRef, useState } from "react";
 import { getTutorialReadiness, getTutorialSample } from "@/api/client";
-import { ChatPanel } from "@/components/chat/ChatPanel";
+import { ChatPanelContent } from "@/components/chat/ChatPanel";
 import { Button } from "@/components/ui";
+import { useComposer } from "@/hooks/useComposer";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -47,6 +48,8 @@ export function TutorialFreeformShell({
   onCompleted,
   onSessionMissing,
 }: TutorialFreeformShellProps): JSX.Element {
+  const composer = useComposer();
+  const composeTimeoutReady = useSessionStore((state) => state.composeTimeoutReady);
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   const compositionStateLoaded = useSessionStore((state) => state.compositionStateLoaded);
   const compositionState = useSessionStore((state) => state.compositionState);
@@ -74,7 +77,7 @@ export function TutorialFreeformShell({
     void (async () => {
       try {
         const store = useSessionStore.getState();
-        if (store.activeSessionId !== sessionId || !store.compositionStateLoaded) {
+        if (store.activeSessionId !== sessionId || !store.compositionStateLoaded || store.error !== null) {
           await store.selectSession(sessionId);
         }
         if (!active) return;
@@ -102,10 +105,11 @@ export function TutorialFreeformShell({
   }, [sessionId, onSessionMissing, sampleRetry]);
 
   const onSendBrief = (): void => {
-    if (sentRef.current || sampleUrls === null || hasUserMessage || isComposing || activeSessionId !== sessionId) return;
+    if (sentRef.current || sampleUrls === null || hasUserMessage || isComposing ||
+        !composeTimeoutReady || activeSessionId !== sessionId) return;
     sentRef.current = true;
     setSent(true);
-    void useSessionStore.getState().sendMessage(tutorialBrief(sampleUrls));
+    void composer.sendMessage(tutorialBrief(sampleUrls));
   };
 
   const onContinue = (): void => {
@@ -154,12 +158,12 @@ export function TutorialFreeformShell({
           <>
             <p>This brief goes through the ordinary freeform Composer. Review its proposal before running anything.</p>
             <pre className="tutorial-brief">{tutorialBrief(sampleUrls)}</pre>
-            <Button variant="primary" onClick={onSendBrief} disabled={activeSessionId !== sessionId || isComposing}>
+            <Button variant="primary" onClick={onSendBrief} disabled={activeSessionId !== sessionId || isComposing || !composeTimeoutReady}>
               Send tutorial brief
             </Button>
           </>
         )}
-        {(hasUserMessage || sent) && <ChatPanel />}
+        {(hasUserMessage || sent) && <ChatPanelContent composer={composer} allowFork={false} />}
         {sampleUrls !== null && (hasUserMessage || sent) && (
           <>
             <p>Review the graph, YAML, and any pending decisions. Continue only when this pipeline is ready to run.</p>

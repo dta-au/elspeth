@@ -92,3 +92,32 @@ export async function driveFreeformTutorial(page, options = {}) {
   }
   throw new Error("freeform tutorial Build never reached the Run turn before the deadline");
 }
+
+export async function finishTutorialAndVerifyGraduation(page, sessionId, loadPreferences) {
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw new Error("tutorial graduation has no session id to verify");
+  }
+  await page.getByRole("heading", { name: "You're ready to use the composer." })
+    .waitFor({ state: "visible", timeout: 60_000 });
+  await page.getByRole("button", { name: "Take me to the composer" })
+    .click({ timeout: 30_000 });
+  await page.getByLabel("Chat panel", { exact: true })
+    .waitFor({ state: "visible", timeout: 60_000 });
+  await page.waitForURL((url) => url.hash === `#/${sessionId}`, { timeout: 60_000 });
+
+  const preferences = await loadPreferences();
+  if (
+    typeof preferences?.tutorial_completed_at !== "string" ||
+    preferences.tutorial_completed_at.length === 0 ||
+    preferences.tutorial_stage !== null ||
+    preferences.tutorial_session_id !== null ||
+    preferences.tutorial_run_id !== null ||
+    preferences.tutorial_source_data_hash !== null
+  ) {
+    throw new Error("tutorial graduation completion did not persist cleanly");
+  }
+  return {
+    completed_at: preferences.tutorial_completed_at,
+    landed_session_id: sessionId,
+  };
+}

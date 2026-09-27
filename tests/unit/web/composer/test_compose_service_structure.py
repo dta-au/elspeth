@@ -16,8 +16,8 @@ import pytest
 # The prior hand-list silently missed every module added after its initial
 # authoring (elspeth-59cdfcaf67) — globbing closes the lifecycle hole.
 #
-# Subdirectory packages (``composer/tools/``, ``composer/skills/``,
-# ``composer/guided/``) are intentionally excluded: the forbidden pattern
+# Subdirectory packages (``composer/tools/``, ``composer/skills/``)
+# are intentionally excluded: the forbidden pattern
 # (``ComposerServiceImpl.<attr> = ...`` at module tail) is a top-level
 # service-surface concern, and the subdirectories are tool implementations
 # / skill graphs that never reference the service class identifier.

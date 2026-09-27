@@ -1,11 +1,3 @@
-// ============================================================================
-// AcknowledgementStack — stack-level behavioural coverage.
-//
-// Ports the retired GuidedInterpretationReviews tests (one card per pending
-// event; renders nothing when empty) and adds: pipeline-step ordering, the
-// count announce, no-focus-steal on mount, the foot-of-stack opt-out flow +
-// error mapping, tutorial suppression, and a jest-axe a11y assertion.
-// ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
@@ -430,20 +422,5 @@ describe("AcknowledgementStack — focus restoration", () => {
     expect(document.activeElement).toBe(
       document.getElementById("ack-card-e2"),
     );
-  });
-});
-
-describe("AcknowledgementStack — tutorial mode", () => {
-  it("hides the amend escape hatch and the opt-out link", () => {
-    seedPending([makeEvent("e1")]);
-    render(<AcknowledgementStack sessionId={SID} isTutorial />);
-    expect(
-      screen.queryByRole("button", { name: /edit the interpretation/i }),
-    ).toBeNull();
-    expect(
-      screen.queryByRole("button", {
-        name: /stop reviewing interpretations this session/i,
-      }),
-    ).toBeNull();
   });
 });

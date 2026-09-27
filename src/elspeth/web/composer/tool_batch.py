@@ -102,7 +102,6 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     PresentBase,
     composition_content_hash,
     owned_composition_state_authority,
@@ -1766,12 +1765,8 @@ async def run_tool_batch(
                     pipeline_proposal = PipelineProposal.create(
                         pipeline=proposal_arguments,
                         base=proposal_base,
-                        reviewed_facts={},
-                        surface=PlannerSurface.FREEFORM,
                         repair_count=0,
                         skill_hash=ctx.provenance.skill_hash,
-                        covered_deferred_intent_ids=(),
-                        supersedes_draft_hash=None,
                     )
                     if type(ctx.session_operation_context) is not SessionOperationContext:
                         raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")

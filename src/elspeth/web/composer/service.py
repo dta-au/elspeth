@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
@@ -90,8 +89,8 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
-from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
 )
@@ -905,7 +904,6 @@ class ComposerServiceImpl:
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress: ComposerProgressSink | None = None,
-        guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
         # Durable advisor gate fact from the prior state row (ruling
@@ -923,10 +921,6 @@ class ComposerServiceImpl:
             current_state_id: Database id of ``state`` when it came from a
                 persisted session row. Used as the stale-state guard for
                 compose-loop tool-call audit persistence.
-            guided_terminal: When set, the resolved TerminalState from the
-                completed guided session; triggers the layered mode-transition
-                prompt for this first freeform turn (spec §8.2). The caller
-                is responsible for gate logic and ``transition_consumed`` flip.
 
         Returns:
             ComposerResult with assistant message and updated state.
@@ -957,7 +951,7 @@ class ComposerServiceImpl:
                 # two are not equivalent: the planner is one bounded call, the
                 # compose loop is an iterative turn/wall-clock budget. Nothing else
                 # records the choice — the `surface` dimension on Composer
-                # telemetry is the SESSION surface (freeform/guided), not this one —
+                # telemetry records the authoring choice, not a session mode —
                 # so without this line a session's posture cannot be reconstructed
                 # after the fact (elspeth-7da4e52344). Booleans and closed vocab
                 # only: the message itself is Tier-3 authored text and must not be
@@ -975,7 +969,6 @@ class ComposerServiceImpl:
                 planner_eligible = (
                     state_is_empty
                     and intent_is_explicit_mutation is True
-                    and guided_terminal is None
                     and self._sessions_service is not None
                     and session_id is not None
                     and user_message_id is not None
@@ -985,7 +978,6 @@ class ComposerServiceImpl:
                     authoring_surface="planner" if planner_eligible else "compose_loop",
                     state_is_structurally_empty=state_is_empty,
                     intent_is_explicit_mutation=intent_is_explicit_mutation,
-                    is_guided_terminal=guided_terminal is not None,
                     session_id=session_id,
                 )
                 # Repeated rather than branching on ``planner_eligible`` so the
@@ -995,7 +987,6 @@ class ComposerServiceImpl:
                 if (
                     state_is_empty
                     and intent_is_explicit_mutation is True
-                    and guided_terminal is None
                     and self._sessions_service is not None
                     and session_id is not None
                     and user_message_id is not None
@@ -1023,7 +1014,6 @@ class ComposerServiceImpl:
                     user_id,
                     deadline,
                     progress,
-                    guided_terminal,
                     user_message_id,
                     recorder=recorder,
                     plugin_snapshot=plugin_snapshot,
@@ -1905,7 +1895,6 @@ class ComposerServiceImpl:
         user_id: str | None = None,
         deadline: float = 0.0,
         progress: ComposerProgressSink | None = None,
-        guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         recorder: BufferingRecorder | None = None,
         *,
@@ -1946,8 +1935,6 @@ class ComposerServiceImpl:
         can be safely cancelled.
 
         Args:
-            guided_terminal: When set, this is the first freeform turn after
-                guided-mode exit; the layered transition prompt is used.
             recorder: Optional request-scoped audit recorder. ``None`` creates
                 a fresh recorder for direct and test-only callers.
         """
@@ -1976,7 +1963,6 @@ class ComposerServiceImpl:
             messages,
             state,
             message,
-            guided_terminal,
             session_id=session_id,
             user_id=user_id,
             plugin_snapshot=plugin_snapshot,
@@ -2544,7 +2530,6 @@ class ComposerServiceImpl:
         chat_history: list[ComposerHistoryMessage],
         state: CompositionState,
         user_message: str,
-        guided_terminal: TerminalState | None = None,
         session_id: str | None = None,
         user_id: str | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
@@ -2572,9 +2557,6 @@ class ComposerServiceImpl:
         HTTP-path slog sites) — both narrow the HTTP surface to
         class-name-only while preserving structured server-side detail.
 
-        Args:
-            guided_terminal: When set, forward to ``build_messages`` so the
-                layered mode-transition prompt is used for this turn.
         """
         if plugin_snapshot is None or policy_catalog is None:
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
@@ -2587,7 +2569,6 @@ class ComposerServiceImpl:
                 data_dir=self._data_dir,
                 plugin_snapshot=plugin_snapshot,
                 rendered_skill=self._composer_skill_text,
-                guided_terminal=guided_terminal,
                 schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
             )
         except OSError as exc:

@@ -178,8 +178,7 @@ def _base_field(
         "name": wire_name,
         "label": info.title or wire_name,
         "kind": kind,
-        # ``tier`` is a required key of KnobField (elspeth-ca456d9d8d: the
-        # guided option summary reads it as a presentational tier), so the
+        # ``tier`` is a required key of KnobField, so the
         # literal seeds the same default ``_attach_tier`` lowers to; the call
         # below overwrites it from the field's ``composer_tier`` metadata.
         "tier": "common",
@@ -350,8 +349,7 @@ def _attach_default(field: KnobField, info: FieldInfo) -> None:
     default = info.default
     if isinstance(default, Enum):
         # The knob schema is a wire/persisted projection and may hold only
-        # plain JSON values (the guided turn validator rejects str subclasses,
-        # StrEnum included). Lower the member exactly as _kind_for_scalar
+        # plain JSON values. Lower the member exactly as _kind_for_scalar
         # lowers the choice set, so ``default`` stays inside ``enum``.
         # isinstance, not the house type()-is idiom: a member's concrete type
         # is always the plugin-authored subclass, never Enum itself, so
@@ -405,7 +403,7 @@ def _attach_tier(field: KnobField, info: FieldInfo) -> None:
 
     Plugins opt knobs OUT of the default view with
     ``json_schema_extra={"composer_tier": "advanced"}``; ``"essential"`` is
-    reserved for the knobs a guided step asks about by name. Every wire field
+    reserved for core authoring knobs. Every wire field
     carries a tier so the form never has to guess (elspeth-9cca900d41).
     An unrecognised tier string lowers to "common" rather than raising:
     tier is presentational, not audit-bearing.

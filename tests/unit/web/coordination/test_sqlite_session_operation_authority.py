@@ -32,21 +32,21 @@ from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     chat_messages_table,
     composition_states_table,
-    guided_operations_table,
     interpretation_events_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     session_read_admissions_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
-    GuidedOperationFence,
+    OperationReceiptFence,
     SessionArchiveDisposition,
     SessionForkAuthority,
     SessionForkChildCreation,
     SessionForkChildStateCreation,
     SessionForkParentAuthority,
-    SessionGuidedOperationInProgressError,
+    SessionReceiptInProgressError,
 )
 
 
@@ -423,17 +423,17 @@ def _seed_parent_messages(engine, *, session_id: str, messages: tuple[tuple[UUID
 def _seed_fork_operation(engine, *, session_id: str, operation_id: str, result_session_id: str | None = None) -> None:
     # SQLite's repository clock is second-precision. Keep fixture creation
     # strictly before that DB-owned mutation time so the real ordering CHECK
-    # remains active when a test exercises the guided binding UPDATE.
+    # remains active when a test exercises the receipt binding UPDATE.
     now = datetime.now(UTC) - timedelta(seconds=1)
     with engine.begin() as conn:
         conn.execute(
-            insert(guided_operations_table).values(
+            insert(session_operation_receipts_table).values(
                 session_id=session_id,
                 operation_id=operation_id,
                 kind="session_fork",
                 status="in_progress",
                 request_hash="a" * 64,
-                lease_token="guided-lease",
+                lease_token="receipt-lease",
                 lease_expires_at=now.replace(year=now.year + 1),
                 attempt=1,
                 result_session_id=result_session_id,
@@ -448,7 +448,7 @@ def _seed_completed_fork_result(engine, authority, *, result_session_id: UUID) -
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
-            insert(guided_operations_table).values(
+            insert(session_operation_receipts_table).values(
                 session_id=str(parent.id),
                 operation_id=str(uuid4()),
                 kind="session_fork",
@@ -457,7 +457,6 @@ def _seed_completed_fork_result(engine, authority, *, result_session_id: UUID) -
                 lease_token=None,
                 lease_expires_at=None,
                 attempt=1,
-                result_kind="session",
                 result_session_id=str(result_session_id),
                 response_hash="b" * 64,
                 created_at=now,
@@ -497,10 +496,10 @@ def _mutate_fork(
     return authority.mutate_fork_creation(
         SessionForkParentAuthority(
             parent_context=parent_context,
-            guided_fence=GuidedOperationFence(
+            receipt_fence=OperationReceiptFence(
                 session_id=parent.id,
                 operation_id=operation_id,
-                lease_token="guided-lease",
+                lease_token="receipt-lease",
                 attempt=1,
             ),
         ),
@@ -564,7 +563,7 @@ def test_sqlite_fenced_mutation_supports_same_session_crud(engine) -> None:
 
 
 @pytest.mark.parametrize("blocker_relation", ("own", "incoming"))
-def test_sqlite_archive_capability_rejects_active_guided_blockers(engine, blocker_relation: str) -> None:
+def test_sqlite_archive_capability_rejects_active_receipt_blockers(engine, blocker_relation: str) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     target = _created(authority)
     if blocker_relation == "own":
@@ -584,7 +583,7 @@ def test_sqlite_archive_capability_rejects_active_guided_blockers(engine, blocke
         lease_seconds=30,
     )
 
-    with pytest.raises(SessionGuidedOperationInProgressError):
+    with pytest.raises(SessionReceiptInProgressError):
         authority.mutate(
             context,
             lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
@@ -1084,20 +1083,20 @@ def test_fork_creation_callback_graph_has_no_database_handle_or_third_session_es
 
     def inspect_then_abort(transaction) -> None:
         child_mutations = transaction.child_mutations
-        parent_guided_mutations = transaction.parent_guided_mutations
-        reachable = _callback_slot_graph((transaction, child_mutations, parent_guided_mutations))
+        parent_receipt_mutations = transaction.parent_receipt_mutations
+        reachable = _callback_slot_graph((transaction, child_mutations, parent_receipt_mutations))
         assert not any(isinstance(value, (Connection, Engine, Transaction)) for value in reachable)
-        for capability in (transaction, child_mutations, parent_guided_mutations):
+        for capability in (transaction, child_mutations, parent_receipt_mutations):
             assert not hasattr(capability, "_active_connection")
             assert not hasattr(capability, "connection")
             assert not hasattr(capability, "engine")
             assert not hasattr(capability, "execute")
         assert not hasattr(transaction, "insert_child_state")
         assert not hasattr(transaction, "append_child_messages")
-        assert not hasattr(transaction, "bind_guided_fork")
-        assert not hasattr(child_mutations, "bind_guided_fork")
-        assert not hasattr(parent_guided_mutations, "insert_child_state")
-        assert not hasattr(parent_guided_mutations, "append_child_messages")
+        assert not hasattr(transaction, "bind_fork_receipt")
+        assert not hasattr(child_mutations, "bind_fork_receipt")
+        assert not hasattr(parent_receipt_mutations, "insert_child_state")
+        assert not hasattr(parent_receipt_mutations, "append_child_messages")
         captured_token.append(object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token"))
         with pytest.raises(AttributeError):
             leaked = object.__getattribute__(transaction, "_ForkCreationTransaction__connection")
@@ -1125,7 +1124,7 @@ def test_fork_creation_transaction_constructor_derives_pair_from_exact_authority
     assert tuple(parameters) == (
         "connection",
         "fork_authority",
-        "guided_operation",
+        "receipt",
         "database_now",
         "child_created",
     )
@@ -1168,10 +1167,10 @@ def test_captured_fork_mutation_facets_fail_closed_before_sql_after_callback(eng
 
     def capture_and_bind(transaction, _fork_authority) -> None:
         captured["child"] = transaction.child_mutations
-        captured["guided"] = transaction.parent_guided_mutations
+        captured["receipt"] = transaction.parent_receipt_mutations
         captured["token"] = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
 
     _mutate_fork(
         authority,
@@ -1190,7 +1189,7 @@ def test_captured_fork_mutation_facets_fail_closed_before_sql_after_callback(eng
         statements.append(statement)
 
     child = captured["child"]
-    guided = captured["guided"]
+    receipt = captured["receipt"]
     state = SessionForkChildStateCreation(
         id=uuid4(),
         data=CompositionStateData(),
@@ -1203,7 +1202,7 @@ def test_captured_fork_mutation_facets_fail_closed_before_sql_after_callback(eng
         with pytest.raises(RuntimeError, match="closed"):
             child.append_child_messages(())
         with pytest.raises(RuntimeError, match="closed"):
-            guided.bind_guided_fork(originating_message_id=fork_message_id)
+            receipt.bind_fork_receipt(originating_message_id=fork_message_id)
     finally:
         event.remove(engine, "before_cursor_execute", capture_statement)
     assert statements == []
@@ -1223,7 +1222,7 @@ def test_fork_child_facet_rejects_foreign_context_before_allocation_or_insert(en
         statements.append(statement)
 
     def reject_foreign_context(transaction, fork_authority) -> None:
-        _row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+        _row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         exact = fork_authority.child_context.fence
         foreign_context = SessionOperationContext(
             fence=SessionOperationFence(
@@ -1290,12 +1289,12 @@ def test_fork_pair_mint_rejects_valid_live_foreign_child_and_unbound_retokenizat
         statements.append(statement)
 
     def reject_foreign_pair(transaction, fork_authority) -> None:
-        row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+        row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         captured_token.append(token)
         connection = coordination_repository._resolve_mutation_connection(token)
         foreign_authority = SessionForkAuthority(parent=fork_authority.parent, child_context=third_context)
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
 
         statements.clear()
         foreign_transaction = None
@@ -1304,7 +1303,7 @@ def test_fork_pair_mint_rejects_valid_live_foreign_child_and_unbound_retokenizat
                 foreign_transaction = coordination_repository._ForkCreationTransaction(
                     connection,
                     fork_authority=foreign_authority,
-                    guided_operation=row,
+                    receipt=row,
                     database_now=database_now,
                     child_created=True,
                 )
@@ -1404,7 +1403,7 @@ def test_fork_callback_cannot_forge_secondary_transaction_for_unlocked_live_pair
         statements.append(statement)
 
     def reject_forged_mint(transaction, fork_authority) -> None:
-        row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+        row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(token)
         foreign_authority = SessionForkAuthority(parent=fork_authority.parent, child_context=third_context)
@@ -1415,7 +1414,7 @@ def test_fork_callback_cannot_forge_secondary_transaction_for_unlocked_live_pair
                 foreign_transaction = coordination_repository._ForkCreationTransaction(
                     connection,
                     fork_authority=foreign_authority,
-                    guided_operation=row,
+                    receipt=row,
                     database_now=database_now,
                     child_created=True,
                 )
@@ -1467,17 +1466,17 @@ def test_fork_secondary_transaction_cannot_reverse_parent_and_child_roles(engine
         statements.append(statement)
 
     def reject_role_reversal(transaction, fork_authority) -> None:
-        row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+        row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         canonical_token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(canonical_token)
-        guided_fence = fork_authority.parent.guided_fence
+        receipt_fence = fork_authority.parent.receipt_fence
         reversed_parent = SessionForkParentAuthority(
             parent_context=fork_authority.child_context,
-            guided_fence=GuidedOperationFence(
+            receipt_fence=OperationReceiptFence(
                 session_id=UUID(fork_authority.child_context.fence.session_id),
-                operation_id=guided_fence.operation_id,
-                lease_token=guided_fence.lease_token,
-                attempt=guided_fence.attempt,
+                operation_id=receipt_fence.operation_id,
+                lease_token=receipt_fence.lease_token,
+                attempt=receipt_fence.attempt,
             ),
         )
         reversed_authority = SessionForkAuthority(
@@ -1490,7 +1489,7 @@ def test_fork_secondary_transaction_cannot_reverse_parent_and_child_roles(engine
             reversed_transaction = coordination_repository._ForkCreationTransaction(
                 connection,
                 fork_authority=reversed_authority,
-                guided_operation=row,
+                receipt=row,
                 database_now=database_now,
                 child_created=True,
             )
@@ -1507,7 +1506,7 @@ def test_fork_secondary_transaction_cannot_reverse_parent_and_child_roles(engine
             if reversed_transaction is not None:
                 reversed_transaction._close()
         observed["target_statements"] = tuple(statements)
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
 
     event.listen(engine, "before_cursor_execute", capture_statement)
     try:
@@ -1557,7 +1556,7 @@ def test_fork_callback_cannot_seed_fresh_token_pair_for_unlocked_live_child(engi
         statements.append(statement)
 
     def reject_seeded_pair(transaction, fork_authority) -> None:
-        _row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+        _row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         canonical_token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(canonical_token)
         fresh_token = coordination_repository._register_mutation_connection(connection)
@@ -1622,8 +1621,8 @@ def test_fork_active_lock_scope_registry_cleans_up(engine, monkeypatch, outcome:
     class ConstructorFailure(Exception):
         pass
 
-    def bind_guided(transaction) -> None:
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
+    def bind_receipt(transaction) -> None:
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
 
     def fail_callback(_transaction) -> None:
         raise CallbackFailure
@@ -1640,7 +1639,7 @@ def test_fork_active_lock_scope_registry_cleans_up(engine, monkeypatch, outcome:
                 engine,
                 parent=parent,
                 operation_id=operation_id,
-                mutation=bind_guided,
+                mutation=bind_receipt,
                 fork_message_id=fork_message_id,
             )
     elif outcome == "callback_failure":
@@ -1659,7 +1658,7 @@ def test_fork_active_lock_scope_registry_cleans_up(engine, monkeypatch, outcome:
             engine,
             parent=parent,
             operation_id=operation_id,
-            mutation=bind_guided,
+            mutation=bind_receipt,
             fork_message_id=fork_message_id,
         )
 
@@ -1692,7 +1691,7 @@ def test_fork_mutation_missing_pair_revokes_underlying_connection(engine) -> Non
             coordination_repository._resolve_mutation_connection(token)
 
 
-def test_fork_parent_guided_facet_rejects_mismatched_authority_before_update(engine) -> None:
+def test_fork_parent_receipt_facet_rejects_mismatched_authority_before_update(engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     parent = _created(authority)
     operation_id = str(uuid4())
@@ -1706,27 +1705,27 @@ def test_fork_parent_guided_facet_rejects_mismatched_authority_before_update(eng
     def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
         statements.append(statement)
 
-    def reject_mismatched_guided(transaction, fork_authority) -> None:
-        row, database_now = transaction.require_parent_guided_operation(fork_authority.parent.guided_fence)
+    def reject_mismatched_receipt(transaction, fork_authority) -> None:
+        row, database_now = transaction.require_parent_fork_receipt(fork_authority.parent.receipt_fence)
         mismatched_parent = SessionForkParentAuthority(
             parent_context=fork_authority.parent.parent_context,
-            guided_fence=replace(fork_authority.parent.guided_fence, operation_id=str(uuid4())),
+            receipt_fence=replace(fork_authority.parent.receipt_fence, operation_id=str(uuid4())),
         )
         mismatched_authority = SessionForkAuthority(
             parent=mismatched_parent,
             child_context=fork_authority.child_context,
         )
         token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
-        mismatched_facet = coordination_repository._ForkParentGuidedMutations(
+        mismatched_facet = coordination_repository._ForkParentReceiptMutations(
             token,
             fork_authority=mismatched_authority,
-            guided_operation=row,
+            receipt=row,
             database_now=database_now,
         )
         statements.clear()
-        with pytest.raises(AuditIntegrityError, match="guided authority"):
-            mismatched_facet.bind_guided_fork(originating_message_id=fork_message_id)
-        assert not any("update guided_operations" in statement.lower() for statement in statements)
+        with pytest.raises(AuditIntegrityError, match="receipt authority"):
+            mismatched_facet.bind_fork_receipt(originating_message_id=fork_message_id)
+        assert not any("update session_operation_receipts" in statement.lower() for statement in statements)
         raise ProbeComplete
 
     event.listen(engine, "before_cursor_execute", capture_statement)
@@ -1738,14 +1737,14 @@ def test_fork_parent_guided_facet_rejects_mismatched_authority_before_update(eng
                 parent=parent,
                 operation_id=operation_id,
                 fork_message_id=fork_message_id,
-                mutation=reject_mismatched_guided,
+                mutation=reject_mismatched_receipt,
                 pass_authority=True,
             )
     finally:
         event.remove(engine, "before_cursor_execute", capture_statement)
 
 
-def test_fork_parent_guided_facet_rejects_live_binding_drift_before_update(engine) -> None:
+def test_fork_parent_receipt_facet_rejects_live_binding_drift_before_update(engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     parent = _created(authority)
     third = _created(authority)
@@ -1764,17 +1763,17 @@ def test_fork_parent_guided_facet_rejects_live_binding_drift_before_update(engin
         token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(token)
         connection.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(result_session_id=str(third.id))
         )
         statements.clear()
-        with pytest.raises(AuditIntegrityError, match="live guided authority"):
-            transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=fork_message_id)
-        assert not any("update guided_operations" in statement.lower() for statement in statements)
+        with pytest.raises(AuditIntegrityError, match="live receipt authority"):
+            transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=fork_message_id)
+        assert not any("update session_operation_receipts" in statement.lower() for statement in statements)
         raise ProbeComplete
 
     event.listen(engine, "before_cursor_execute", capture_statement)
@@ -1795,9 +1794,9 @@ def test_fork_parent_guided_facet_rejects_live_binding_drift_before_update(engin
     with engine.connect() as conn:
         assert (
             conn.execute(
-                select(guided_operations_table.c.result_session_id).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table.c.result_session_id).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).scalar_one()
             is None
@@ -1864,7 +1863,9 @@ def test_fork_creation_transaction_refuses_third_session_writes(engine, operatio
             )
         else:
             transaction.execute(
-                update(guided_operations_table).where(guided_operations_table.c.session_id == str(third.id)).values(status="failed")
+                update(session_operation_receipts_table)
+                .where(session_operation_receipts_table.c.session_id == str(third.id))
+                .values(status="failed")
             )
 
     with pytest.raises(AttributeError, match="execute"):
@@ -1887,10 +1888,10 @@ def test_fork_creation_transaction_refuses_third_session_update_values(engine, c
 
     def forbidden(transaction) -> None:
         transaction.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(**{column_name: str(third.id)})
         )
@@ -1905,7 +1906,7 @@ def test_fork_creation_transaction_refuses_third_session_update_values(engine, c
         )
 
 
-def test_fork_creation_transaction_refuses_sibling_guided_operation_update(engine) -> None:
+def test_fork_creation_transaction_refuses_sibling_receipt_update(engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     parent = _created(authority)
     operation_id = str(uuid4())
@@ -1920,10 +1921,10 @@ def test_fork_creation_transaction_refuses_sibling_guided_operation_update(engin
             parent=parent,
             operation_id=operation_id,
             mutation=lambda transaction: transaction.execute(
-                update(guided_operations_table)
+                update(session_operation_receipts_table)
                 .where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == sibling_operation_id,
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == sibling_operation_id,
                 )
                 .values(updated_at=datetime.now(UTC))
             ),
@@ -1943,17 +1944,17 @@ def test_fork_creation_transaction_refuses_dynamic_update_values(engine) -> None
             parent=parent,
             operation_id=operation_id,
             mutation=lambda transaction: transaction.execute(
-                update(guided_operations_table)
+                update(session_operation_receipts_table)
                 .where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
-                .values(result_session_id=guided_operations_table.c.session_id)
+                .values(result_session_id=session_operation_receipts_table.c.session_id)
             ),
         )
 
 
-def test_fork_creation_requires_exact_guided_row_before_callback(engine) -> None:
+def test_fork_creation_requires_exact_receipt_row_before_callback(engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     parent = _created(authority)
     callback_called = False
@@ -1962,7 +1963,7 @@ def test_fork_creation_requires_exact_guided_row_before_callback(engine) -> None
         nonlocal callback_called
         callback_called = True
 
-    with pytest.raises(AuditIntegrityError, match="guided operation"):
+    with pytest.raises(AuditIntegrityError, match="fork creation receipt"):
         _mutate_fork(
             authority,
             engine,
@@ -2030,7 +2031,7 @@ def test_fork_creation_mismatched_message_binding_rolls_back_fresh_child(engine)
                 created_at=datetime.now(UTC),
             )
         )
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=bound_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=bound_message_id)
 
     with pytest.raises(AuditIntegrityError, match="postcondition"):
         _mutate_fork(
@@ -2046,16 +2047,16 @@ def test_fork_creation_mismatched_message_binding_rolls_back_fresh_child(engine)
     with engine.connect() as conn:
         assert conn.execute(select(sessions_table.c.id).where(sessions_table.c.forked_from_session_id == str(parent.id))).first() is None
         assert conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.id == str(state_id))).first() is None
-        guided = conn.execute(
+        receipt = conn.execute(
             select(
-                guided_operations_table.c.originating_message_id,
-                guided_operations_table.c.result_session_id,
+                session_operation_receipts_table.c.originating_message_id,
+                session_operation_receipts_table.c.result_session_id,
             ).where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
         ).one()
-    assert guided == (None, None)
+    assert receipt == (None, None)
 
 
 def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engine) -> None:
@@ -2079,10 +2080,10 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
     )
     parent_authority = SessionForkParentAuthority(
         parent_context=parent_context,
-        guided_fence=GuidedOperationFence(
+        receipt_fence=OperationReceiptFence(
             session_id=parent.id,
             operation_id=operation_id,
-            lease_token="guided-lease",
+            lease_token="receipt-lease",
             attempt=1,
         ),
     )
@@ -2098,17 +2099,17 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
         parent_authority,
         child,
         lambda transaction, fork_authority: (
-            transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=requested_message_id),
+            transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=requested_message_id),
             fork_authority.child_context.fence.session_id,
         )[1],
     )
     expired_at = datetime.now(UTC) - timedelta(seconds=1)
     with engine.begin() as conn:
         conn.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(originating_message_id=None)
         )
@@ -2132,7 +2133,7 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
                 created_at=datetime.now(UTC),
             )
         )
-        transaction.parent_guided_mutations.bind_guided_fork(originating_message_id=bound_message_id)
+        transaction.parent_receipt_mutations.bind_fork_receipt(originating_message_id=bound_message_id)
 
     with pytest.raises(AuditIntegrityError, match="postcondition"):
         authority.mutate_fork_creation(
@@ -2143,13 +2144,13 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
 
     with engine.connect() as conn:
         child_row = conn.execute(select(sessions_table).where(sessions_table.c.id == child_session_id)).mappings().one()
-        guided = conn.execute(
+        receipt = conn.execute(
             select(
-                guided_operations_table.c.originating_message_id,
-                guided_operations_table.c.result_session_id,
+                session_operation_receipts_table.c.originating_message_id,
+                session_operation_receipts_table.c.result_session_id,
             ).where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
         ).one()
         fence_after = dict(
@@ -2159,7 +2160,7 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
         )
         state = conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.id == str(state_id))).first()
     assert child_row["forked_from_message_id"] == str(requested_message_id)
-    assert guided == (None, child_session_id)
+    assert receipt == (None, child_session_id)
     assert fence_after == fence_before
     assert state is None
 
@@ -2173,10 +2174,10 @@ def test_fork_creation_refuses_binding_to_caller_selected_child(engine) -> None:
 
     def bind_without_hidden_child(transaction) -> None:
         transaction.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(result_session_id=str(preexisting_candidate.id))
         )
@@ -2193,9 +2194,9 @@ def test_fork_creation_refuses_binding_to_caller_selected_child(engine) -> None:
     with engine.connect() as conn:
         assert (
             conn.execute(
-                select(guided_operations_table.c.result_session_id).where(
-                    guided_operations_table.c.session_id == str(parent.id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table.c.result_session_id).where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).scalar_one()
             is None

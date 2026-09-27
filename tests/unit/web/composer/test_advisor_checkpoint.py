@@ -45,7 +45,7 @@ from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGate
 from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL, ADVISOR_UNAVAILABLE_USER_DETAIL
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import CompositionCompletion
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import admit_llm_provider_metadata
 from elspeth.web.composer.no_tool_policy import (
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,

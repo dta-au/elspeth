@@ -1,7 +1,7 @@
 """The synthetic fixtures under website/tutorial-site/ (Phase p4 onwards).
 
 Reads the SOURCE files under website/tutorial-site/, which is the GitHub Pages
-publish tree. Two kinds live there: the 3 scrape pages the guided tutorial
+publish tree. Two kinds live there: the 3 scrape pages the tutorial
 fetches, which must be unmistakably marked test data, noindexed, and carry
 three tables whose values DIFFER across the three projects so the derived facts
 vary; and multi-doc-sections.json, the corpus the collector-authoring scenario

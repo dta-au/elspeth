@@ -45,7 +45,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
 _ENDPOINT = "https://planner-gateway.example.test/api/v1"
@@ -169,7 +169,7 @@ async def _run_production_turn(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="parity-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("parity-user", "Parity", "local")
     user_message = await sessions.add_message(session.id, "user", message, writer_principal="route_user_message")
     monkeypatch.setattr(

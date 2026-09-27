@@ -8,7 +8,7 @@ lives here and nowhere else:
   attributed to the session's owning identity, on the CALLER's connection so the
   accounting row commits with the audit row it was derived from. The three
   adapters are the Composer audit cohorts (``SessionServiceImpl.add_messages_atomic``,
-  ``_insert_prepared_guided_audit_rows_on_connection``,
+  prepared audit-row writers,
   ``RepositoryRunDiagnosticsAuditAuthority.append_audit_messages``), auto-title
   (``SessionServiceImpl.record_token_usage`` from ``_auto_title.py``) and run
   finalisation (the same service method from ``execution/service.py``).
@@ -459,8 +459,7 @@ def _daily_token_total_on_connection(
 def token_usage_entry_from_llm_call_envelope(envelope: Mapping[str, Any]) -> TokenUsageEntry | None:
     """Derive the ledger entry for one persisted ``llm_call_audit`` envelope.
 
-    ELSPETH wrote the envelope (``composer/audit.py`` ``llm_call_audit_envelope``
-    and the guided failure projection in ``sessions/guided_audit.py``), so its
+    ELSPETH wrote the envelope (``composer/audit.py`` ``llm_call_audit_envelope``), so its
     keys are read directly. Failed calls may have consumed provider tokens
     before their response was lost, so missing usage remains unknown too.
     """

@@ -727,7 +727,7 @@ def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str)
     """Persist one valid session-fork operation in the requested lifecycle state."""
     from datetime import UTC, datetime, timedelta
 
-    from elspeth.web.sessions.models import guided_operations_table
+    from elspeth.web.sessions.models import session_operation_receipts_table
 
     operation_id = str(uuid4())
     now = datetime.now(UTC)
@@ -761,14 +761,13 @@ def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str)
             )
         values.update(
             settled_at=now,
-            result_kind="session",
             result_session_id=target_session_id,
             response_hash="e" * 64,
         )
     else:
         raise AssertionError(f"unsupported test fork status {status!r}")
     with engine.begin() as conn:
-        conn.execute(guided_operations_table.insert().values(**values))
+        conn.execute(session_operation_receipts_table.insert().values(**values))
     return operation_id
 
 
@@ -11882,7 +11881,7 @@ class TestExplainValidationError:
     def test_unknown_error_teaches_closed_codes(self) -> None:
         """Unmatched text returns the closed-code catalogue, not a shrug.
 
-        Live guided sessions (bad64533-08a1, 2026-07-22) called the tool with
+        A planner can call the tool with
         exactly ``{"error_text": "ValidationError"}`` — the error_class from
         repair feedback, not a message or code — and got a generic non-answer
         mid-repair. The fallback now teaches usage: name the closed codes and
@@ -12154,9 +12153,7 @@ class TestExplainValidationCode:
         resolved = explain_validation_code("interpretation_requirements_invalid")
         assert resolved is not None
         explanation, fix = resolved
-        # The guided step skills carry no interpretation_requirements exemplar,
-        # so this guidance is the ONLY place the staged planner learns the
-        # authorable row shape after a rejection.
+        # The guidance teaches the planner an authorable row shape after a rejection.
         assert "user_term" in fix
         assert "kind" in fix and "draft" in fix
         # Escape valve is load-bearing: the shield review is advisory, so

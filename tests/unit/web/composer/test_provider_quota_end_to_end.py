@@ -22,7 +22,6 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope, quota_provider_calls
 from elspeth.web.coordination import chargeable_admission_authority, quota_authority
@@ -160,12 +159,10 @@ async def test_timeout_with_unknown_usage_blocks_next_physical_call(quota_servic
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", [PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL, PlannerSurface.TUTORIAL_PROFILE])
 async def test_second_planning_call_503_settles_before_quota_refuses_retry(
     quota_service,
     tmp_path: Path,
     tool_context,
-    surface: PlannerSurface,
 ) -> None:
     engine, service, _ = quota_service
     session = await service.create_session(user_id="alice", title="Planner quota", auth_provider_type="local")
@@ -200,7 +197,6 @@ async def test_second_planning_call_503_settles_before_quota_refuses_retry(
                 model_overrides={"max_api_attempts": 2},
                 originating_message=origin,
                 custody_config=custody,
-                surface=surface,
             )
 
     assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
@@ -229,7 +225,6 @@ async def test_second_planning_call_503_settles_before_quota_refuses_retry(
                 model_overrides={"max_api_attempts": 2},
                 originating_message=origin,
                 custody_config=fresh_custody,
-                surface=surface,
             )
     assert fresh_caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
     assert len(script.requests) == 2

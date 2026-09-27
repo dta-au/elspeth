@@ -26,3 +26,10 @@ def test_public_release_docs_do_not_route_readers_to_internal_tracker() -> None:
             offenders.append(f"{rel_path}: {match.group()}")
 
     assert offenders == []
+
+
+def test_composer_guide_distinguishes_auto_apply_from_explicit_approval() -> None:
+    guide = (REPO_ROOT / "docs" / "release" / "composer-guide.md").read_text(encoding="utf-8")
+    assert "Auto-apply on" in guide
+    assert "Approval required" in guide
+    assert "green runtime preflight" in guide

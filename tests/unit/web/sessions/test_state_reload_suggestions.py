@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import pytest
 
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
@@ -13,12 +12,10 @@ from tests.unit.web.sessions.test_routes import _make_app, _save_test_compositio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("guided", [False, True], ids=["freeform", "guided"])
-async def test_reload_recomputes_suggestions_and_discards_previous_state_advice(tmp_path: Path, guided: bool) -> None:
+async def test_reload_recomputes_suggestions_and_discards_previous_state_advice(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session = await service.create_session("alice", "Reload advice", "local")
-    composer_meta = {"guided_session": GuidedSession.initial().to_dict()} if guided else None
     private_source_path = str(tmp_path / "private-input.csv")
     initial = CompositionStateData(
         sources={
@@ -38,7 +35,6 @@ async def test_reload_recomputes_suggestions_and_discards_previous_state_advice(
             }
         ],
         metadata_={"name": "Reload advice", "description": ""},
-        composer_meta=composer_meta,
         is_valid=False,
     )
     first = await _save_test_composition_state(service, session.id, initial, provenance="session_seed")
@@ -69,7 +65,6 @@ async def test_reload_recomputes_suggestions_and_discards_previous_state_advice(
         },
         outputs=initial.outputs,
         metadata_=initial.metadata_,
-        composer_meta=composer_meta,
         is_valid=True,
     )
     second = await _save_test_composition_state(service, session.id, updated, provenance="session_seed")

@@ -1,166 +1,20 @@
-"""Immutable policy-owned state projections and restricted discovery envelopes."""
+"""Policy-owned discovery response envelopes."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import JsonValue
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer.response_contracts import AdmittedResponse, ResponseContract
-from elspeth.web.composer.state import COMPOSER_NODE_TYPES, NodeType, Severity, ValidationEntry
+from elspeth.web.composer.state import Severity, ValidationEntry
 from elspeth.web.composer.tools._common import ToolResult
 
 if TYPE_CHECKING:
     from elspeth.web.composer.planner_authoring_aids import PlannerPluginContract
     from elspeth.web.composer.protocol import ToolArgumentError
-
-
-def _bad() -> FrameworkBugError:
-    return FrameworkBugError("Malformed policy-owned provider current-state context")
-
-
-def _record(value: object, keys: tuple[str, ...]) -> Mapping[str, object]:
-    if type(value) is not dict and type(value) is not MappingProxyType:
-        raise _bad()
-    if set(value) != set(keys) or any(type(key) is not str for key in value):
-        raise _bad()
-    return cast(Mapping[str, object], value)
-
-
-def _items(value: object) -> tuple[object, ...]:
-    if type(value) is not list and type(value) is not tuple:
-        raise _bad()
-    return tuple(value)
-
-
-def _text(value: object) -> str:
-    if type(value) is not str:
-        raise _bad()
-    return value
-
-
-def _nullable(value: object) -> str | None:
-    return None if value is None else _text(value)
-
-
-def _texts(value: object) -> tuple[str, ...]:
-    return tuple(_text(item) for item in _items(value))
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderSource:
-    name: str
-    plugin: str
-    option_keys: tuple[str, ...]
-    on_success: str
-    on_validation_failure: str
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {
-            "name": self.name,
-            "plugin": self.plugin,
-            "option_keys": list(self.option_keys),
-            "on_success": self.on_success,
-            "on_validation_failure": self.on_validation_failure,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderNode:
-    id: str
-    node_type: NodeType
-    plugin: str | None
-    option_keys: tuple[str, ...]
-    input: str
-    on_success: str | None
-    on_error: str | None
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {
-            "id": self.id,
-            "node_type": self.node_type,
-            "plugin": self.plugin,
-            "option_keys": list(self.option_keys),
-            "input": self.input,
-            "on_success": self.on_success,
-            "on_error": self.on_error,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderOutput:
-    name: str
-    plugin: str
-    option_keys: tuple[str, ...]
-    on_write_failure: str
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {"name": self.name, "plugin": self.plugin, "option_keys": list(self.option_keys), "on_write_failure": self.on_write_failure}
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderStateContext:
-    schema: Literal["guided.current-state-context.v1"]
-    version: int
-    sources: tuple[ProviderSource, ...]
-    nodes: tuple[ProviderNode, ...]
-    outputs: tuple[ProviderOutput, ...]
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {
-            "schema": self.schema,
-            "version": self.version,
-            "sources": [source.to_wire() for source in self.sources],
-            "nodes": [node.to_wire() for node in self.nodes],
-            "outputs": [output.to_wire() for output in self.outputs],
-        }
-
-
-def admit_provider_current_state(value: object) -> ProviderStateContext:
-    """Parse the entire trusted projection, rejecting missing or corrupt fields."""
-    root = _record(value, ("schema", "version", "sources", "nodes", "outputs"))
-    if _text(root["schema"]) != "guided.current-state-context.v1" or type(root["version"]) is not int:
-        raise _bad()
-    sources = []
-    for item in _items(root["sources"]):
-        source = _record(item, ("name", "plugin", "option_keys", "on_success", "on_validation_failure"))
-        sources.append(
-            ProviderSource(
-                _text(source["name"]),
-                _text(source["plugin"]),
-                _texts(source["option_keys"]),
-                _text(source["on_success"]),
-                _text(source["on_validation_failure"]),
-            )
-        )
-    nodes = []
-    for item in _items(root["nodes"]):
-        node = _record(item, ("id", "node_type", "plugin", "option_keys", "input", "on_success", "on_error"))
-        kind = _text(node["node_type"])
-        if kind not in COMPOSER_NODE_TYPES:
-            raise _bad()
-        nodes.append(
-            ProviderNode(
-                _text(node["id"]),
-                cast(NodeType, kind),
-                _nullable(node["plugin"]),
-                _texts(node["option_keys"]),
-                _text(node["input"]),
-                _nullable(node["on_success"]),
-                _nullable(node["on_error"]),
-            )
-        )
-    outputs = []
-    for item in _items(root["outputs"]):
-        output = _record(item, ("name", "plugin", "option_keys", "on_write_failure"))
-        outputs.append(
-            ProviderOutput(_text(output["name"]), _text(output["plugin"]), _texts(output["option_keys"]), _text(output["on_write_failure"]))
-        )
-    return ProviderStateContext("guided.current-state-context.v1", root["version"], tuple(sources), tuple(nodes), tuple(outputs))
 
 
 class _UncachedProjection(AdmittedResponse):
@@ -200,54 +54,6 @@ class _ArgumentErrorResponse(_UncachedProjection):
 
 def argument_error_response(error: ToolArgumentError) -> AdmittedResponse:
     return _ArgumentErrorResponse(error.argument, error.code or "argument_error")
-
-
-@dataclass(frozen=True, slots=True)
-class _StateResponse(_UncachedProjection):
-    context: ProviderStateContext
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return self.context.to_wire()
-
-
-@dataclass(frozen=True, slots=True)
-class _SourcesResponse(_UncachedProjection):
-    sources: tuple[ProviderSource, ...]
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {"sources": [source.to_wire() for source in self.sources]}
-
-
-@dataclass(frozen=True, slots=True)
-class _NodeResponse(_UncachedProjection):
-    node: ProviderNode
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {"node": self.node.to_wire()}
-
-
-@dataclass(frozen=True, slots=True)
-class _OutputResponse(_UncachedProjection):
-    output: ProviderOutput
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        return {"output": self.output.to_wire()}
-
-
-def provider_state_response(context: ProviderStateContext) -> AdmittedResponse:
-    return _StateResponse(context)
-
-
-def provider_sources_response(context: ProviderStateContext) -> AdmittedResponse:
-    return _SourcesResponse(context.sources)
-
-
-def provider_node_response(node: ProviderNode) -> AdmittedResponse:
-    return _NodeResponse(node)
-
-
-def provider_output_response(output: ProviderOutput) -> AdmittedResponse:
-    return _OutputResponse(output)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,14 +128,9 @@ def closed_provider_envelope(
 
 @dataclass(frozen=True, slots=True)
 class _ProjectionFailure(_UncachedProjection):
-    kind: Literal["surface", "schema_unavailable", "schema_budget"]
+    kind: Literal["schema_unavailable", "schema_budget"]
 
     def to_wire(self) -> dict[str, JsonValue]:
-        if self.kind == "surface":
-            return {
-                "error": "The requested component is unavailable on this planner disclosure surface.",
-                "error_code": "surface_projection_unavailable",
-            }
         if self.kind == "schema_unavailable":
             message = "The selected plugin schema cannot be represented in the bounded planner projection. Use get_plugin_assistance."
             code = "schema_projection_unavailable"
@@ -337,10 +138,6 @@ class _ProjectionFailure(_UncachedProjection):
             message = "The selected plugin contracts exceed the aggregate planner schema budget. Use get_plugin_assistance."
             code = "schema_contract_budget_exceeded"
         return {"error": message, "error_code": code, "next_tool": "get_plugin_assistance"}
-
-
-def surface_projection_failure() -> AdmittedResponse:
-    return _ProjectionFailure("surface")
 
 
 def schema_projection_failure() -> AdmittedResponse:

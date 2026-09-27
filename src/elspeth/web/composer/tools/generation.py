@@ -685,18 +685,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "settles with what arrived). There is no default — the author decides.",
     ),
     (
-        # The guided binder's referential-integrity twin of the Stage-1
-        # scope_opener_unknown entry below. Containment-free by design (the
-        # catalogue forbids one code being a substring of another), so neither
-        # pattern can shadow the other.
-        r"guided_collector_opener_unresolved",
-        "A collector's scope_opener names a node id that does not exist in your candidate, so no "
-        "expansion opens the group the collector would close.",
-        "Re-emit with scope_opener set to one of the 'connectivity' facts' 'candidate_node_ids' — the exact "
-        "id of the multi-row transform whose expanded rows this collector reassembles. The "
-        "'dangling_scope_openers' facts are the values that matched nothing.",
-    ),
-    (
         r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
         "The collector's scope_opener does not name a transform node in the pipeline, so no expansion "
         "opens the group this collector would close.",
@@ -1086,156 +1074,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
-        r"guided_delta_unknown_stable_id",
-        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation "
-        "authority, or the node the correction targets no longer resolves to exactly one node in the current pipeline. "
-        "The rejection's 'connectivity' facts locate it: 'stable_id' is the value the delta carried ('invalid' when the "
-        "entry had no string stable_id); 'delta_member', when present, names the member the binder was reading "
-        "('source_routes', 'output_targets', or 'node_patch') — a bare 'stable_id' with no 'delta_member' means the "
-        "edge_patch names an edge other than the selected one; 'known_stable_ids', when present, lists every identity "
-        "that member may legally name. When 'node_id' and 'node_occurrences' appear instead of 'known_stable_ids', the "
-        "selected node's own id ('node_id') occurs 'node_occurrences' times — never exactly once — in the current "
-        "pipeline; nothing in your delta caused that and no delta content can fix it.",
-        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without "
-        "inventing or substituting an identity. When 'known_stable_ids' is present, set the offending entry's stable_id "
-        "to the identity in it that entry was meant to bind; when 'delta_member' is absent, set the edge_patch's "
-        "stable_id to the selected edge's own stable_id. When 'node_occurrences' is present instead, do not re-emit: this "
-        "fault has no delta-side fix — report that the current pipeline holds 'node_id' 'node_occurrences' times and must "
-        "be repaired before this correction can be applied.",
-    ),
-    (
-        r"guided_delta_duplicate_stable_id",
-        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it "
-        "exactly once. The rejection's 'connectivity' facts locate it: 'delta_member' names the delta array the binder "
-        "was reading ('source_routes', 'output_targets', 'edges', or 'nodes'), and exactly one of 'stable_id' (a reviewed "
-        "identity listed twice in that array), 'edge_id' (an edges[].id listed twice), or 'node_id' (a nodes[].id listed "
-        "twice, or one that already names a node in the current pipeline) carries the offending value.",
-        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta. Search the array "
-        "'delta_member' names for the value in 'stable_id', 'edge_id', or 'node_id'; when it is listed twice there, "
-        "remove the extra entry. For 'node_id', also check the current pipeline: when the id already names a node there, "
-        "either drop the entry from nodes[] together with every delta edge LEAVING that id, keeping only the edge(s) into "
-        "it (the existing node's own routing already lives in the pipeline), or give the new node a fresh id and rename "
-        "it in every edge that references it. Change nothing else.",
-    ),
-    (
-        r"guided_delta_authority_violation",
-        "The guided proposal has a field/component outside the reviewed mutation authority, or its delta ('pipeline' "
-        "argument) doesn't fit the schema. 'connectivity' facts, when present, say which — two disjoint families. "
-        "Delta-reader facts key by 'delta_member', the failing part: 'delta'; object members 'edge_patch'/'node_patch' "
-        "(nested: 'node_patch.options'); array members 'source_routes'/'output_targets'/'nodes'/'edges' (joint: "
-        "'source_routes/output_targets'). Beside it: 'expected_shape' ('array'/'object') on a shape mismatch; "
-        "'missing_keys', top-level members missing from the delta; 'allowed_keys', the only keys that part (or entry, for "
-        "an array member) may carry — alone, it wasn't an object; 'unexpected_keys', keys you wrote outside it; "
-        "'required_keys', keys that entry needs as strings ('edge_id' names it if known, else check every entry); "
-        "'missing_source_stable_ids'/'missing_output_stable_ids', reviewed ids absent once each from "
-        "source_routes/output_targets. 'owner_kind' ('source'/'node'/'output') beside delta_member 'edge_patch' alone: no "
-        "writable routing field — no edge_patch can retarget it. Binder facts key by 'component_kind' "
-        "('sources'/'outputs'/'nodes'), the refused candidate collection. 'sources': 'reviewed_source_names' is the "
-        "required name order; 'candidate_source_names' is what you sent; 'source_name'+'required_keys' flags one "
-        "correctly-keyed source missing a field. 'outputs': 'reviewed_output_names' fixes the entry count; "
-        "'candidate_output_count' is how many you sent. 'nodes': 'predecessor_node_ids' must each appear once; 'node_id' "
-        "with 'node_occurrences' (0=dropped, 2+=duplicated) and 'selected_node' (true = correction target) names which "
-        "and how; 'node_id' with 'candidate_node_type'/'candidate_plugin' means you edited its type or plugin.",
-        "Re-emit only schema-advertised fields; reviewed source/output config is server-owned. Repair only the "
-        "'delta_member' part: match 'expected_shape'; add 'missing_keys' members; drop 'unexpected_keys'. If "
-        "'allowed_keys' arrives alone the part wasn't an object: 'edge_patch' needs exactly {stable_id, to_node}; "
-        "'node_patch' needs 'stable_id' plus only the fields you mean to change — 'allowed_keys' is the menu, not a "
-        "requirement; extras are written through too. Give the entry at fault ('edge_id' if known, else all) "
-        "'required_keys' as strings. Add one entry per id in 'missing_source_stable_ids'/'missing_output_stable_ids'. "
-        "Facts only 'edge_patch'+'owner_kind': no edge_patch succeeds — decline in plain text, using the decline prefix "
-        "when this session taught one. 'sources'+'reviewed_source_names': key by exactly those names, in order — never "
-        "rename/add/drop. 'sources'+'source_name'+'required_keys': fix only that source's missing field. 'outputs': one "
-        "object per 'reviewed_output_names' entry — sink_name is yours, the server remaps it. 'nodes': keep each "
-        "'predecessor_node_ids' id present once; bad 'node_id': re-add if 'node_occurrences'=0, drop extra if 2+; "
-        "'selected_node' true: only that node's edits are yours, others restore server-side; "
-        "'candidate_node_type'/'candidate_plugin': keep type/plugin from current_state, edit only options. Only without "
-        "'connectivity' facts: give the selected node an 'options' object.",
-    ),
-    (
-        r"guided_delta_nonincident_route",
-        "A correction delta changes routing that is not incident to the selected component. The rejection's "
-        "'connectivity' facts name the offending edge under exactly one of two keys. 'edge_id' with 'incident_owners': "
-        "that list holds the ids an emitted edge must carry as its from_node or to_node — the selected component plus "
-        "any node this delta adds — and the named edge's own from_node and to_node are both outside it. "
-        "'reused_edge_id' with 'incident_owners' (node corrections only): the emitted edge's endpoints are fine, but "
-        "its id reuses an existing pipeline edge that touches none of those ids. When correcting an output, touching "
-        "is not enough: every edge must END at the selected output, and an edge that reaches it only as from_node is "
-        "rejected with 'edge_id' alone and no 'incident_owners'.",
-        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology "
-        "named by this correction. For 'edge_id' with 'incident_owners': re-point the edge so one endpoint is in that "
-        "list — for an output correction, set its to_node to the selected output — or remove it. For 'reused_edge_id': "
-        "keep the edge's endpoints and give it a fresh id that no existing pipeline edge uses. When 'incident_owners' "
-        "is absent, the edge already has the selected output as its from_node: reverse it — set from_node to the "
-        "producer (the source name or node id that feeds the output) and to_node to the selected output — or remove "
-        "it; setting only to_node leaves an output-to-output edge that fails the next turn. Change nothing else.",
-    ),
-    (
-        r"guided_delta_unknown_reference",
-        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor. "
-        "The rejection's 'connectivity' facts echo the rejected edge: 'from_node' is its origin and 'edge_type' its route "
-        "kind. The binder admits only an existing source name with 'edge_type' 'on_success', or a node id that exactly "
-        "one node in the current pipeline carries with 'edge_type' 'on_success' or 'on_error'; the pair is rejected as a "
-        "whole, so either value alone may be the fault.",
-        "Re-emit with 'from_node' set to an exact existing source name or node id from current_state and 'edge_type' set "
-        "to a route kind that origin owns ('on_success' for a source; 'on_success' or 'on_error' for a node); leave "
-        "whichever of the two is already correct unchanged. Change nothing else.",
-    ),
-    (
-        r"guided_delta_reviewed_failure_route_required",
-        "A reviewed source's on_validation_failure or a reviewed output's on_write_failure names a destination that "
-        "matches no reviewed output. The planner cannot rewrite that reviewed policy, and this check runs before your "
-        "delta is read, so no re-emitted topology can clear it. The rejection's 'connectivity' facts carry 'routes': the "
-        "sorted set of those unresolved on_validation_failure / on_write_failure destinations (an unset route or "
-        "'discard' never appears there).",
-        "Do not re-emit: no delta can clear this check, and you have no tool that edits a reviewed failure policy — a "
-        "repeat notice on this code is expected and does not mean try again. Tell the user that each destination in "
-        "'routes' is a reviewed on_validation_failure or on_write_failure setting naming no reviewed output, and that "
-        "they must return to the reviewed source/output settings form to edit that reviewed source or output — pointing "
-        "the route at an existing reviewed output or 'discard', or adding a reviewed output with that name — before "
-        "topology planning can continue.",
-    ),
-    (
-        r"guided_route_target_unknown",
-        "A routing destination (source/node on_success, node on_error, or edge to_node) names neither a declared "
-        "output, a node id, a connection another node consumes, nor 'discard'. The reviewed-output binder cannot "
-        "prove what you meant — it will not guess a sink for you. The rejection's 'connectivity' facts name the "
-        "exact mismatch in YOUR rejected candidate: 'dangling_references' are the values that matched nothing; "
-        "'declared_sinks' and 'consumable_connections' are the only valid destinations.",
-        "Re-emit with every dangling reference replaced by one of the connectivity facts' declared_sinks or "
-        "consumable_connections, copied exactly — a route meant for the sink must byte-for-byte match your own "
-        "outputs[].sink_name so the binder can rename it with the output. Change nothing else.",
-    ),
-    (
-        r"guided_output_alias_collision",
-        "Output aliasing is ambiguous: two outputs[] entries share one sink_name, an entry reuses another reviewed "
-        "output's name, or an alias is also a node id or connection name in the same candidate. References to such "
-        "a name cannot be attributed to one sink, so the reviewed-output binder rejects instead of rewriting "
-        "routes onto the wrong destination. The rejection's 'connectivity' facts list the offending names as "
-        "'colliding_aliases'.",
-        "Re-emit with a unique sink_name per outputs[] entry, distinct from every node id and connection name, "
-        "and wire each route to the matching alias. Do not reuse a name from 'colliding_aliases' for more than "
-        "one purpose.",
-    ),
-    (
-        r"guided_reviewed_name_shadowed",
-        "A node id, consumed connection, or branch value in your candidate equals a reviewed sink name you were "
-        "never shown. After the server restores that reviewed name, the engine resolves routing targets against "
-        "sink names FIRST, so every reference meant for your node would silently deliver rows to the sink and "
-        "skip the node. The rejection's 'connectivity' facts list the reserved names as 'shadowed_reviewed_names'.",
-        "Re-emit with every name in 'shadowed_reviewed_names' renamed throughout your topology — the node id, its "
-        "consumers' input, and every route referencing it — to a fresh name of your own. Do not reuse any "
-        "shadowed name for a node, connection, or branch value. Change nothing else.",
-    ),
-    (
-        r"reviewed_output_projection_conflict",
-        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output "
-        "contract. For field_mapper, retained output names are the VALUES in options.mapping. The rejection's "
-        "'connectivity' facts carry the reviewed names absent from those values as 'missing_fields'.",
-        "Add every name in 'missing_fields' as an options.mapping value while preserving the intended projection, or "
-        "return to the reviewed output form and change its required-field contract. Do not silently drop a reviewed "
-        "field.",
-    ),
-    (
         r"gate_on_error_unknown_sink",
         "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
         "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
@@ -1265,40 +1103,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "(drop fork_to; a fork delivers to every branch). "
         "If the constant fan-out was genuinely intended — every row to every destination — re-emit the same pipeline "
         "unchanged and it will be accepted.",
-    ),
-    (
-        r"passthrough_cannot_produce_declared_fields",
-        "The candidate has no transform or aggregation nodes, so every row it writes is exactly the row the source "
-        "read — but the reviewed outputs declare fields that no reviewed source declares or observes. Nothing in this "
-        "pipeline can put those fields on a row. The rejection's 'detail' names them; they are also visible as "
-        "outputs[].required_fields in the reviewed planner context, minus every source's observed_columns and "
-        "declared_fields.",
-        "Add the transform node(s) that produce the named fields — for a straight rename or copy from an existing "
-        "column a field_mapper with the appropriate mapping is enough; for derived or generated values use the "
-        "transform that computes them — and wire the source through them to the sink. Re-emitting the same "
-        "zero-transform pipeline will be rejected again with this same code.",
-    ),
-    (
-        r"proposal_missing_requested_transforms",
-        "The revision candidate contains no transform or aggregation nodes, but the operator's revision instruction asked for processing — a bare source-to-sink pass-through would ship a pipeline that silently performs none of the requested work behind a confident name. "
-        "This code only fires when a pass-through COULD satisfy the reviewed output fields; when it could not, the satisfiability rejection 'passthrough_cannot_produce_declared_fields' fires instead and re-emitting unchanged is NOT accepted there.",
-        "Re-emit with the transform nodes the revision instruction requests, as a minimal delta: keep the reviewed source and sink wiring unchanged and add only the processing nodes. "
-        "If a pass-through with no transforms is genuinely what the instruction calls for, re-emit the same pipeline unchanged to confirm the deliberate no-transform intent — the confirmation will be accepted.",
-    ),
-    (
-        r"guided_correction_unchanged",
-        "The candidate left the exact node or route selected by the operator unchanged. Changing a different component does not satisfy a selected-component correction.",
-        "Apply the operator's correction to the selected target identified by the correction_target object in the reviewed context, preserve unrelated components, and re-emit the complete pipeline.",
-    ),
-    (
-        r"guided_amend_contract_violation",
-        "The candidate was submitted as a conservative amendment but removed, duplicated, retyped, replugged, or changed protected behavior on an existing node. The accepted proposal named by revision_authority is the predecessor; omitted fields do not grant replacement authority.",
-        "Keep every existing node id, node_type, plugin, options, and control behavior unchanged. Add the requested new nodes and change only input/on_success connections needed to insert them, then re-emit the complete pipeline. If replacement or removal is genuinely intended, the operator must choose explicit replace mode instead of amend.",
-    ),
-    (
-        r"guided_revision_unchanged",
-        "The revision candidate is semantically identical to the accepted predecessor proposal, so it does not satisfy the operator's revision request. Explicit replace mode permits replacement or removal; it does not permit a no-op.",
-        "Apply the requested change under revision_authority: preserve existing nodes and use only insertion rewiring in amend mode, or perform the explicitly requested replacement in replace mode, then re-emit the complete pipeline.",
     ),
     (
         r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
@@ -1625,10 +1429,6 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "collector_scope_policy_invalid",
     "scope_opener_unknown",
     "scope_opener_not_multi_row",
-    # Guided-binder referential-integrity twin of scope_opener_unknown (WS6
-    # lift fix round): the binder rejects a dangling opener with connectivity
-    # facts before the candidate ever reaches validation or projection.
-    "guided_collector_opener_unresolved",
     "collector_has_trigger_invalid",
     "collector_has_on_error_invalid",
     "collector_missing_plugin",
@@ -1680,30 +1480,6 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
-    "proposal_missing_requested_transforms",
-    # ── Guided selected-correction convergence (elspeth-43208ece4c) ───────
-    # The candidate is otherwise valid but did not change the exact public
-    # semantics the operator selected. Keep it inside bounded repair/hatch.
-    "guided_correction_unchanged",
-    # ── Guided unscoped amendment convergence (elspeth-1d97fc4b80) ───────
-    # Prose revisions default to additive custody of the accepted proposal;
-    # protected-change attempts and no-op candidates stay inside repair/hatch.
-    "guided_amend_contract_violation",
-    "guided_revision_unchanged",
-    # ── Request-derived guided topology authority ──────────────────────────
-    "guided_delta_unknown_stable_id",
-    "guided_delta_duplicate_stable_id",
-    "guided_delta_authority_violation",
-    "guided_delta_nonincident_route",
-    "guided_delta_unknown_reference",
-    "guided_delta_reviewed_failure_route_required",
-    # ── Reviewed output versus exact field projection ──────────────────────
-    "reviewed_output_projection_conflict",
-    # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
-    # Planner-loop only: pairs the reviewed guided facts (what the sources
-    # carry vs what the outputs declare) with the candidate's node count.
-    # No structural validator sees both.
-    "passthrough_cannot_produce_declared_fields",
     # ── Stated-threshold fidelity guard (R2-F17, 2026-08-01) ───────────────
     # Planner-loop only: the instruction is the evidence, so no structural
     # validator can raise this. The shape it rejects is legal everywhere else.
@@ -1835,9 +1611,6 @@ _VALIDATION_GUIDANCE_BY_CODE: Final = _build_validation_guidance_index(
     (
         *_LEGACY_VALIDATION_ERROR_CODES,
         "on_error_closer_out_of_region",
-        "guided_output_alias_collision",
-        "guided_reviewed_name_shadowed",
-        "guided_route_target_unknown",
         "diff_baseline_unavailable",
         "coalesce_policy_quorum_unsupported",
         "coalesce_best_effort_requires_timeout",
@@ -1957,8 +1730,7 @@ def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance
     code. The mapping is also keyed BY code, so one entry serves every error
     sharing it; splicing a per-entry message span into a per-code entry would
     make N colliding entries whose text depended on which one was visited
-    last. Static text keeps the freeform and guided surfaces reading
-    identical catalogue bytes.
+    last. Static text keeps all callers reading identical catalogue bytes.
 
     Custody: this rides ``ToolResult.validation_guidance``, declared
     ``_SafeResponseEnvelope`` in the redaction manifest, so the audit
@@ -2018,8 +1790,7 @@ def explain_withheld_validation_code(code: str) -> tuple[str, str] | None:
 
     The planner's repair feedback withholds a rejection entry's component id
     and validator detail when the entry is about a finalizer-owned component
-    (guided reviewed sources/outputs, correction-restored nodes, auto-wired
-    controls — elspeth-5904b1683a). The ordinary catalogue guidance is
+    (such as auto-wired controls). The ordinary catalogue guidance is
     dishonest in that mode: ``plugin_options_invalid``'s fix opens with
     "Apply exactly what 'detail' names" when no detail is present, which
     sent live planners chasing a field that does not exist and burned the
@@ -3525,10 +3296,8 @@ def _compute_proof_diagnostics_for_source(
         return [
             _blocking_diagnostic(
                 code="source_inspection_failed",
-                message=(
-                    "A guided reviewed source claims blob custody, but the live blob is not an exact ready, session-owned path match."
-                ),
-                suggested_repair="Re-select or re-upload the source blob, then confirm the guided wiring again.",
+                message=("This source claims blob custody, but the live blob is not an exact ready, session-owned path match."),
+                suggested_repair="Re-select or re-upload the source blob, then validate the pipeline again.",
                 evidence_locator={"source": "blob", "blob_id": str(blob_id)},
             )
         ]

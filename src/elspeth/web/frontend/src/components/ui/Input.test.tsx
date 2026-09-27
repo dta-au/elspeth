@@ -166,11 +166,11 @@ describe("Input", () => {
       "type=%s with bare carries only the caller's className",
       (type) => {
         const { container } = render(
-          <Input bare type={type} className="guided-schema-input" />,
+          <Input bare type={type} className="schema-input" />,
         );
         const input = container.querySelector("input");
         expect(input).toHaveAttribute("type", type);
-        expect(input!.getAttribute("class")).toBe("guided-schema-input");
+        expect(input!.getAttribute("class")).toBe("schema-input");
       },
     );
 

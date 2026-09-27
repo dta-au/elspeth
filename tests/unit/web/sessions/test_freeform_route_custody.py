@@ -12,20 +12,17 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep, TerminalKind, TerminalReason, TerminalState
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes._helpers import _join_freeform_owned_task
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
-from tests.unit.web.sessions.test_routes import _llm_call, _make_app, _ProgressAwareComposer, _save_test_composition_state
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+from tests.unit.web.sessions.test_routes import _llm_call, _make_app, _ProgressAwareComposer
 
 
 class _AuditedComposer(_ProgressAwareComposer):
@@ -46,7 +43,7 @@ def _file_app(tmp_path):
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    service = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     app.state.session_service = service
     app.state.session_engine = engine
     composer = _AuditedComposer()
@@ -512,97 +509,6 @@ async def test_freeform_join_preserves_first_party_child_error_over_caller_cance
     release.set()
     with pytest.raises(RuntimeError, match="first-party settlement fault"):
         await request
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("route", ("messages", "recompose"))
-async def test_transition_atomic_commit_remains_owned_after_caller_cancel(tmp_path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
-    app, service, engine, _composer = _file_app(tmp_path)
-    guided = GuidedSession(
-        step=GuidedStep.STEP_1_SOURCE,
-        history=(),
-        terminal=TerminalState(
-            kind=TerminalKind.EXITED_TO_FREEFORM,
-            reason=TerminalReason.USER_PRESSED_EXIT,
-            pipeline_yaml=None,
-        ),
-        transition_consumed=False,
-    )
-
-    class _TransitionComposer(_AuditedComposer):
-        async def compose(self, *args, **kwargs) -> ComposerResult:
-            result = await super().compose(*args, **kwargs)
-            return replace(result, state=replace(result.state, guided_session=guided))
-
-    composer = _TransitionComposer()
-    app.state.composer_service = composer
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    real = service.commit_transition_response
-
-    async def pause(*args, **kwargs):
-        result = await real(*args, **kwargs)
-        entered.set()
-        await release.wait()
-        return result
-
-    monkeypatch.setattr(service, "commit_transition_response", pause)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        session_id = (await client.post("/api/sessions", json={"title": "transition"})).json()["id"]
-        initial_state = CompositionState(
-            source=None,
-            nodes=(),
-            edges=(),
-            outputs=(),
-            metadata=PipelineMetadata(),
-            version=1,
-            guided_session=guided,
-        )
-        state_dict = initial_state.to_dict()
-        await _save_test_composition_state(
-            service,
-            UUID(session_id),
-            CompositionStateData(
-                sources=state_dict["sources"],
-                nodes=state_dict["nodes"],
-                edges=state_dict["edges"],
-                outputs=state_dict["outputs"],
-                metadata_=state_dict["metadata"],
-                is_valid=False,
-                validation_errors=None,
-                composer_meta={"guided_session": guided.to_dict()},
-            ),
-            provenance="session_seed",
-        )
-        if route == "messages":
-            url = f"/api/sessions/{session_id}/messages"
-            body = {"content": "continue", "client_request_id": str(uuid4())}
-        else:
-            row = await service.add_message(UUID(session_id), "user", "continue", writer_principal="route_user_message")
-            url = f"/api/sessions/{session_id}/recompose"
-            body = {"expected_user_message_id": str(row.id)}
-        pending = asyncio.create_task(client.post(url, json=body))
-        await asyncio.wait_for(entered.wait(), 10)
-        pending.cancel("transition interruption")
-        await asyncio.sleep(0)
-        assert not pending.done()
-        assert not await _fence_released(engine, session_id)
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
-        records = await service.get_messages(UUID(session_id), limit=None)
-        roles = [message.role for message in records]
-        assert roles.count("user") == 1
-        assert roles.count("assistant") == 1
-        assert roles.count("audit") == 1
-        assert composer.calls == 1
-        states = await service.get_state_versions(UUID(session_id))
-        assert len(states) == 2
-        assert states[-1].composer_meta is not None
-        assert states[-1].composer_meta["guided_session"]["transition_consumed"] is True
-        progress = await app.state.composer_progress_registry.get_latest(session_id)
-        assert progress is not None and progress.phase == "complete"
-    engine.dispose()
 
 
 @pytest.mark.asyncio

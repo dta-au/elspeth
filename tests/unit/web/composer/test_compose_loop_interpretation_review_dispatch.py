@@ -57,8 +57,8 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
-from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
@@ -98,7 +98,7 @@ from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError,
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.helpers.session_fences import acquire_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # The backend-authored handoff suffix, byte-identical to the one composed in
 # ``elspeth.web.composer.service`` (and mirrored in
@@ -267,7 +267,7 @@ def engine():
 
 @pytest.fixture
 def sessions_service(engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions"),
@@ -4191,7 +4191,7 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
 
     # The route's shape: a BLOB_READ admission over a service whose authority records every call.
     authority = RecordingSessionOperationAuthority()
-    reading_service = DualFencedSessionServiceHarness(
+    reading_service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions.reading"),

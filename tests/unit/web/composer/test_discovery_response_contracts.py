@@ -13,9 +13,7 @@ from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer.guided.planning import guided_redacted_current_state_context
 from elspeth.web.composer.pipeline_planner import _ParsedToolCall, _serialize_provider_discovery_result
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolContext, ToolResult
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
@@ -156,17 +154,16 @@ def test_failed_absent_data_preserves_absent_envelope(tool_name: str) -> None:
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)
-def test_admitted_ordinary_bytes_match_immutable_baseline(tool_name: str) -> None:
+def test_admitted_bytes_match_freeform_baseline(tool_name: str) -> None:
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 
     golden = json.loads(GOLDEN.read_text())
     admitted = admit_discovery_result(tool_name, _produce(tool_name))
-    assert serialize_admitted_discovery_result(admitted) == golden["responses"][tool_name]["ordinary"]
+    assert serialize_admitted_discovery_result(admitted) == golden["responses"][tool_name]["freeform"]
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)
-@pytest.mark.parametrize("surface", list(PlannerSurface))
-def test_provider_bytes_match_immutable_baseline(tool_name: str, surface: PlannerSurface) -> None:
+def test_provider_bytes_match_immutable_baseline(tool_name: str) -> None:
     from elspeth.web.composer.discovery_response import admit_discovery_result
 
     golden = json.loads(GOLDEN.read_text())
@@ -175,10 +172,8 @@ def test_provider_bytes_match_immutable_baseline(tool_name: str, surface: Planne
     actual = _serialize_provider_discovery_result(
         call=call,
         result=admitted,
-        surface=surface,
-        provider_current_state=guided_redacted_current_state_context(admitted.result.updated_state),
     )
-    assert actual == golden["responses"][tool_name][surface.value]
+    assert actual == golden["responses"][tool_name]["freeform"]
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)
@@ -196,14 +191,8 @@ def test_original_data_is_not_serialization_authority_after_admission(tool_name:
     assert serialize_tool_result(persisted) == expected
     golden = json.loads(GOLDEN.read_text())
     call = _ParsedToolCall(call_id="response-golden", name=tool_name, raw_arguments="{}", arguments={})
-    for surface in PlannerSurface:
-        actual = _serialize_provider_discovery_result(
-            call=call,
-            result=persisted,
-            surface=surface,
-            provider_current_state=guided_redacted_current_state_context(persisted.updated_state),
-        )
-        assert actual == golden["responses"][tool_name][surface.value]
+    actual = _serialize_provider_discovery_result(call=call, result=persisted)
+    assert actual == golden["responses"][tool_name]["freeform"]
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)

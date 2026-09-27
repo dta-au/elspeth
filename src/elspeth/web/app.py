@@ -1653,7 +1653,7 @@ def _create_app(
     sessions_telemetry = build_sessions_telemetry(meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__))
     app.state.sessions_telemetry = sessions_telemetry
 
-    app.state.session_engine = session_engine  # available to guided step handlers
+    app.state.session_engine = session_engine
     # --- Identity authority ---
     # The ONE writer of identities / identity_roles / identity_relationships
     # (and the quota row an admission grants). Built before the auth provider
@@ -2223,16 +2223,11 @@ def _create_app(
 
     # --- request_id on every structured error envelope (all routes) ---
     # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
-    # the named-exception handlers above put the same id in their bodies —
-    # but the guided routes consume their terminal exception in-route
-    # (settling the operation first) and re-raise a CLOSED ``HTTPException``
-    # via ``raise_guided_operation_failure``. Those envelopes reached the
-    # client through FastAPI's default renderer, which knows nothing about
-    # the correlation id, so the header a user could quote back correlated
-    # to nothing (R2-F16b).
+    # the named-exception handlers above put the same id in their bodies.
+    # Route-raised structured ``HTTPException`` envelopes also need that id;
+    # FastAPI's default renderer does not add it.
     #
-    # Fixing that at the ~40 dict-detail raise sites would regress the first
-    # time a new one is added, so the injection lives at the ONE boundary
+    # The injection lives at the ONE boundary
     # every ``HTTPException`` already passes through. It is registered
     # against ``starlette.exceptions.HTTPException`` — the same key FastAPI's
     # ``setup()`` uses — so this REPLACES the default renderer rather than

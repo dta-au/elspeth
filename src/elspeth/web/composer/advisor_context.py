@@ -18,7 +18,7 @@ from jinja2 import TemplateSyntaxError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import extract_jinja2_fields
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.state import CompositionState, NodeSpec, _well_formed_query_entries
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.validation import _redact_sensitive_content

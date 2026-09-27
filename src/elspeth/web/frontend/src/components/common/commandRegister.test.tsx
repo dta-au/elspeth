@@ -30,7 +30,6 @@ import {
   READY_VALIDATION_READINESS,
 } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
-import type { GuidedSession } from "@/types/guided";
 import type { Session, ValidationResult } from "@/types/index";
 
 function makeSession(id: string, title: string): Session {
@@ -54,10 +53,6 @@ vi.mock("@/api/client", () => ({
   revertToVersion: vi.fn(),
   fetchStateVersions: vi.fn(),
   archiveSession: vi.fn(),
-  getGuided: vi.fn(),
-  respondGuided: vi.fn(),
-  reenterGuided: vi.fn(),
-  chatGuided: vi.fn(),
   fetchYaml: vi.fn(),
 }));
 
@@ -73,19 +68,6 @@ vi.mock("@/stores/executionStore", () => ({
     selector(executionStoreState),
 }));
 
-const exitedGuidedSession: GuidedSession = {
-  step: "step_1_source",
-  history: [],
-  terminal: {
-    kind: "exited_to_freeform",
-    reason: "user_pressed_exit",
-    pipeline_yaml: null,
-  },
-  chat_history: [],
-  chat_turn_seq: 0,
-  reviewed_components: { sources: [], outputs: [] },
-  profile: null,
-};
 
 /**
  * The shortcuts sheet spells the platform-agnostic chord "Ctrl/Cmd+…" where
@@ -168,7 +150,6 @@ function renderFullyStockedPalette() {
       makeSession("session-2", "Some User Session Title"),
     ],
     compositionState: makeComposition(1),
-    guidedSession: exitedGuidedSession,
   });
   executionStoreState.validationResult = makeValidationResult({
     readiness: READY_VALIDATION_READINESS,

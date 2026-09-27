@@ -13,7 +13,6 @@ describe("ImportYamlButton", () => {
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
-      guidedSession: null,
     } as never);
   });
 

@@ -1722,31 +1722,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
-        path="tests/unit/web/sessions/test_guided_custody_gate.py",
-        enclosing_symbol="TestWriteBoundaryGate.test_guided_revert_refuses_to_copy_a_legacy_unbindable_active_row",
-        table="composition_states",
-        operation="sqlalchemy_insert_call",
-        purpose=(
-            "Seeds a composition_states row that predates the pre-persist guided "
-            "custody gate (elspeth-4c442aaaa8) so the fenced guided revert's refusal "
-            "to re-tip onto it can be pinned; the gate itself blocks the service path. "
-            "Renamed with its test when the unfenced set_active_state setter this "
-            "originally pinned was removed (fc84028df); same row, same purpose, and "
-            "revert_state_for_guided_operation reaches the same custody gate."
-        ),
-    ),
-    ReviewedWriter(
-        path="tests/unit/web/sessions/test_routes.py",
-        enclosing_symbol="_insert_legacy_composition_state._sync",
-        table="composition_states",
-        operation="sqlalchemy_insert_call",
-        purpose=(
-            "Seeds pre-gate rows carrying deliberately invalid reviewed snapshots so "
-            "the YAML export route's read-side rejection stays pinned now that "
-            "save_composition_state refuses them (elspeth-4c442aaaa8)."
-        ),
-    ),
-    ReviewedWriter(
         path="tests/unit/web/sessions/test_service.py",
         enclosing_symbol="TestRunEvents.test_append_and_list_run_events_preserves_order_and_payload",
         table="composition_states",
@@ -1887,11 +1862,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "(elspeth-90231248dc). Not an executed query"
         ),
     ),
-    # NOTE: two ``...flaky_add_message`` canary entries (guided respond and
-    # guided chat turn) were removed 2026-09-04: no ``flaky_add_message``
-    # exists anywhere in the tree any more. The live OperationalError canaries
-    # in test_routes.py all sit in ``...flaky_insert`` symbols, allowlisted
-    # above, so the guided-mode coverage is intact under its current name.
     ReviewedWriter(
         path="tests/unit/web/sessions/test_routes.py",
         enclosing_symbol="TestRecomposeConvergencePartialState.test_recompose_convergence_save_operational_error_preserves_422_body._raise_operational",
@@ -2093,18 +2063,6 @@ _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
             "PostgreSQL quota authority fixture inserts the exact cancellation audit event requested by the "
             "low-level callback so the transaction, timestamp, replay, and conflict checks run on the production dialect."
         ),
-    ),
-    ReviewedWriter(
-        path="tests/integration/web/composer/guided/test_respond.py",
-        enclosing_symbol="TestStep2IntraStep.test_component_back_edit_rejects_proposal_base_bound_to_older_head_atomically",
-        table="composition_states",
-        operation="sqlalchemy_table_insert",
-        purpose=(
-            "Historical missing-rebase fixture: copy one state to a newer version while retaining the proposal's older base. "
-            "Ordinary saves now rebase that anchor atomically, so the direct insert is required to prove back-edit rejects "
-            "the stale base without changing states, messages, proposal events, or operation settlement."
-        ),
-        count=1,
     ),
     # Identity workflow tests seed versioned composition states directly so
     # approvals, reviews, permits, and scoped reads exercise real FK parents.

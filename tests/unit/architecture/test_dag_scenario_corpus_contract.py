@@ -94,7 +94,6 @@ EXPECTED_DIMENSION_VALUES = (
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 )
@@ -121,7 +120,7 @@ EXPECTED_SCENARIO_VALUES = (
 )
 
 EXPECTED_STATUS_MATRIX = {
-    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial", "partial"),
+    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial"),
     "multiple-independent-sources": (
         "pass",
         "pass",
@@ -131,7 +130,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -144,7 +142,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -157,7 +154,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -170,7 +166,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -183,7 +178,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -196,7 +190,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -209,7 +202,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -222,7 +214,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -235,7 +226,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "partial",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -247,7 +237,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "unknown",
-        "pass",
         "pass",
         "partial",
         "unknown",
@@ -261,7 +250,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -275,7 +263,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "partial",
-        "partial",
         "unknown",
     ),
     "checkpoint-deterministic-resume": (
@@ -288,7 +275,6 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
         "not_applicable",
         "not_applicable",
-        "not_applicable",
         "unknown",
     ),
     "multi-worker-lease-reclaim-late-completion": (
@@ -299,7 +285,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "partial",
-        "not_applicable",
         "not_applicable",
         "not_applicable",
         "unknown",
@@ -431,7 +416,7 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics",
     ),
     "composer-row-union-authoring-parity": (
-        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph",
+        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_freeform_derives_isomorphic_committed_graph",
     ),
 }
 
@@ -466,7 +451,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # manifest verified against this commit's harness run (real observed
 # projection_sha256/counts captured via the corpus harness, never hand-computed).
 # Current scheduler authority test names; scenario and runtime oracle bytes are unchanged.
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33bdc51e5e2823d80fe8da2"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "264ee98747bd359cecaa31546b8b31e1b4b92989d11f15750f9f85c06e8c968c"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -5942,8 +5927,6 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-f321e3ff21"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":
                 expected_owner = "elspeth-245b21351b"
-            elif dimension == "guided":
-                expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
@@ -6262,7 +6245,7 @@ def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_e
         load_manifest(write_manifest(tmp_path, raw))
 
 
-@pytest.mark.parametrize("dimension", ["concurrency", "guided", "scale"])
+@pytest.mark.parametrize("dimension", ["concurrency", "freeform", "scale"])
 def test_manifest_rejects_run_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
     raw = valid_manifest_dict()
     independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")

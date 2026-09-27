@@ -81,7 +81,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token, member_token_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -158,7 +158,7 @@ def _make_session_service() -> tuple[SessionServiceImpl, Any]:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),

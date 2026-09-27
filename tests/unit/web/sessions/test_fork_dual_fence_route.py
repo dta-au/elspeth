@@ -21,19 +21,16 @@ from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.sessions.routes import sessions
 
 
-def test_fork_route_acquires_parent_before_guided_and_uses_composite_everywhere() -> None:
+def test_fork_route_acquires_parent_with_receipt_and_uses_composite_everywhere() -> None:
     source = inspect.getsource(sessions.register_session_routes)
-    reserve = source.index("reserved = await reserve_or_replay_guided_operation")
+    reserve = source.index("reserved = await reserve_or_replay_operation_receipt")
     adopt = source.index("parent_lease = reserved.session_lease")
     assert reserve < adopt
     assert "session_operation_context=parent_operation_lease.context" in source
     assert "staged.authority," in source
-    assert "fail_guided_fork_operation" in source
-    # Merged custody shape: blob copy/cleanup run through HEAD's blob layer
-    # under an exact BlobForkWriteFence derived from the guided fence, while
-    # settlement and failure still consume the lane's composite authority
-    # (open decision 1 on elspeth-4d6c0dd0f5 tracks re-deriving the lane's
-    # authority-routed blob ledger).
+    assert "fail_fork_operation_receipt" in source
+    # Blob copy/cleanup carry an exact fork write fence while settlement and
+    # failure consume the parent/child composite authority.
     assert "cleanup_blobs_for_fork(" in source
     assert "BlobForkWriteFence(" in source
 

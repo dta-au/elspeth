@@ -39,7 +39,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _prepared(
@@ -193,7 +193,7 @@ async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(t
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Ambiguous inline commit", "local")
     message = await sessions.add_message(
         session.id,
@@ -244,7 +244,7 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Blocked inline custody", "local")
     message = await sessions.add_message(
         session.id,
@@ -349,7 +349,7 @@ async def test_failed_commit_reconciliation_removes_stage_when_committed_row_was
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Deleted inline commit", "local")
     message = await sessions.add_message(
         session.id,

@@ -72,12 +72,6 @@ def test_turn_audit_uses_tool_error_payload_owner() -> None:
     assert "_INVALID_TOOL_ARGUMENTS_REDACTION_STATUS" not in service_imports
 
 
-def test_guided_discovery_uses_result_serializer_owner() -> None:
-    service_imports = _imports_from_service("src/elspeth/web/composer/guided/_discovery.py")
-
-    assert "_serialize_tool_result" not in service_imports
-
-
 def test_no_tool_finalize_uses_no_tool_policy_owner() -> None:
     service_imports = _imports_from_service("src/elspeth/web/composer/no_tool_finalize.py")
 

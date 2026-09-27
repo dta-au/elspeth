@@ -62,7 +62,7 @@ from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 from ._helpers import (
     _mock_catalog,
@@ -344,7 +344,7 @@ def engine():
 
 @pytest.fixture
 def sessions_service(engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions"),

@@ -10,14 +10,14 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.routing import APIRoute
 from starlette.requests import Request
 
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerRequestLease
 from elspeth.web.sessions.routes import _helpers
-from elspeth.web.sessions.routes.composer import guided
+from elspeth.web.sessions.routes.messages import register_message_routes
 
 
 @dataclass
@@ -92,12 +92,7 @@ async def _settle_dependency(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "surface"),
-    (
-        ("/api/sessions/1/messages", "freeform"),
-        ("/api/sessions/1/guided/plan", "guided"),
-        ("/api/sessions/1/guided/respond", "guided"),
-        ("/api/sessions/1/guided/chat", "guided"),
-    ),
+    (("/api/sessions/1/messages", "freeform"),),
 )
 async def test_request_dependency_projects_closed_surface_and_success(
     path: str,
@@ -113,8 +108,14 @@ async def test_request_dependency_projects_closed_surface_and_success(
     assert [event for event, _session_id in registry.events] == ["begin", "end"]
 
 
-def test_guided_respond_route_mounts_request_lifecycle_dependency_exactly_once() -> None:
-    routes = [route for route in guided.router.routes if isinstance(route, APIRoute) and route.path == "/{session_id}/guided/respond"]
+def test_message_route_mounts_request_lifecycle_dependency_exactly_once() -> None:
+    router = APIRouter()
+    register_message_routes(router)
+    routes = [
+        route
+        for route in router.routes
+        if isinstance(route, APIRoute) and route.path == "/{session_id}/messages" and "POST" in route.methods
+    ]
 
     assert len(routes) == 1
     dependencies = [dependency.call for dependency in routes[0].dependant.dependencies]
@@ -138,13 +139,13 @@ async def test_request_dependency_projects_closed_failure_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, registry = await _settle_dependency(
-        path="/api/sessions/1/guided/respond",
+        path="/api/sessions/1/messages",
         monkeypatch=monkeypatch,
         failure=failure,
     )
 
     assert len(lifecycle) == 2
-    assert lifecycle[0] == ("begin", "guided")
+    assert lifecycle[0] == ("begin", "freeform")
     assert lifecycle[1][0] == "finish"
     assert lifecycle[1][2] == status
     assert [event for event, _session_id in registry.events] == ["begin", "end"]

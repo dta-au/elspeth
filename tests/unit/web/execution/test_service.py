@@ -692,35 +692,6 @@ def _proof_gate_state(
     )
 
 
-def _guided_sentinel_proof_gate_state(*, source_path: Path, blob_id: UUID) -> Any:
-    """Observed CSV numeric gate retaining the verified materializer's blob identity."""
-    from dataclasses import replace
-
-    from elspeth.web.composer.guided.resolved import SourceResolved
-    from elspeth.web.composer.guided.state_machine import GuidedSession
-
-    live_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
-    stable_id = str(uuid4())
-    guided = replace(
-        GuidedSession.initial(),
-        source_order=(stable_id,),
-        reviewed_sources={
-            stable_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options={
-                    "path": f"blob:{blob_id}",
-                    "schema": {"mode": "observed"},
-                },
-                observed_columns=("amount",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-    )
-    return replace(live_state, guided_session=guided)
-
-
 def _install_ready_proof_blob(
     service: ExecutionServiceImpl,
     *,
@@ -2022,22 +1993,28 @@ class TestExecutionFlow:
 
 class TestAuthoritativeProofDiagnostics:
     @pytest.mark.asyncio
-    async def test_guided_sentinel_with_valid_custody_reads_once_and_rejects_numeric_gate(
+    async def test_freeform_claimed_blob_with_wrong_session_fails_closed_without_reading(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
     ) -> None:
         session_id = uuid4()
         blob_id = uuid4()
-        source_path = tmp_path / "guided-sentinel-amounts.csv"
+        source_path = tmp_path / "freeform-claimed-amounts.csv"
         source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = _blob_record_stub(
             blob_id=blob_id,
-            source_path=source_path,
+            session_id=uuid4(),
+            filename=source_path.name,
+            mime_type="text/csv",
+            size_bytes=source_path.stat().st_size,
+            content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            storage_path=str(source_path),
+            status="ready",
         )
+        service._blob_service = blob_service
 
         with patch(
             "elspeth.web.execution.validation.validate_pipeline",
@@ -2049,135 +2026,52 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
-            blob_id,
-            prefix_bytes=8 * 1024,
-            session_operation_context=context,
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("terminal_kind", ["live", "completed", "exited_to_freeform"])
-    async def test_guided_terminal_kind_never_removes_the_authoritative_source_proof(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-        terminal_kind: str,
-    ) -> None:
-        """elspeth-3b45cdb41e: the three-terminal table must reject identically.
-
-        Varying ONLY the guided terminal on an otherwise identical state, the
-        admission proof must resolve custody and reject the numeric gate the
-        same way. EXITED_TO_FREEFORM previously hit the export-family identity
-        return, ran zero resolver calls, and recorded a fabricated passing
-        proof check.
-        """
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / f"terminal-{terminal_kind}-amounts.csv"
-        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        if terminal_kind == "completed":
-            terminal = TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}")
-        elif terminal_kind == "exited_to_freeform":
-            terminal = TerminalState(
-                kind=TerminalKind.EXITED_TO_FREEFORM,
-                reason=TerminalReason.USER_PRESSED_EXIT,
-                pipeline_yaml=None,
-            )
-        else:
-            terminal = None
-        if terminal is not None:
-            assert state.guided_session is not None
-            state = replace(state, guided_session=replace(state.guided_session, terminal=terminal))
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
-            blob_id,
-            prefix_bytes=8 * 1024,
-            session_operation_context=context,
-        )
-
-    @pytest.mark.asyncio
-    async def test_exited_history_that_cannot_bind_fails_closed_without_reading(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        """A diverged exited session blocks with a FAILED proof check, never a pass."""
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / "exited-renamed-amounts.csv"
-        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        base = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        assert base.guided_session is not None
-        state = replace(
-            base,
-            sources={"renamed": base.sources["source"]},
-            guided_session=replace(
-                base.guided_session,
-                terminal=TerminalState(
-                    kind=TerminalKind.EXITED_TO_FREEFORM,
-                    reason=TerminalReason.USER_PRESSED_EXIT,
-                    pipeline_yaml=None,
-                ),
-            ),
-        )
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is False
-        assert "unavailable" in result.checks[23].detail
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
-        assert result.readiness.execution_ready is False
-        blob_service.get_blob.assert_not_awaited()
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_freeform_blob_with_valid_custody_reads_once_and_rejects_numeric_gate(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "freeform-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "custody_failure",
         ["wrong_session", "wrong_path", "not_ready", "not_found"],
     )
-    async def test_guided_sentinel_with_failed_custody_is_invalid_without_reading(
+    async def test_freeform_blob_with_failed_custody_is_invalid_without_reading(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2185,9 +2079,9 @@ class TestAuthoritativeProofDiagnostics:
     ) -> None:
         session_id = uuid4()
         blob_id = uuid4()
-        source_path = tmp_path / f"guided-sentinel-{custody_failure}.csv"
+        source_path = tmp_path / f"freeform-{custody_failure}.csv"
         source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
         blob_service = create_autospec(BlobServiceProtocol, instance=True)
         if custody_failure == "not_found":
             blob_service.get_blob.side_effect = BlobNotFoundError(str(blob_id))
@@ -2587,61 +2481,6 @@ class TestAuthoritativeProofDiagnostics:
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_guided_reviewed_source_binding_is_inspected_without_live_blob_ref(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.resolved import SourceResolved
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / "guided-amounts.csv"
-        source_path.write_text("amount\n250.00\n", encoding="utf-8")
-        live_state = _proof_gate_state(source_path=source_path, blob_id=None)
-        stable_id = str(uuid4())
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={
-                        "path": str(source_path),
-                        "blob_ref": str(blob_id),
-                        "schema": {"mode": "observed"},
-                    },
-                    observed_columns=("amount",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        state = replace(live_state, guided_session=guided)
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("schema_mode", ["fixed", "flexible"])
     async def test_explicit_numeric_source_schema_passes_proof(
         self,
@@ -2711,7 +2550,7 @@ class TestAuthoritativeProofDiagnostics:
         assert result.checks[23].passed is True
 
     @pytest.mark.asyncio
-    async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
+    async def test_uninspectable_claimed_blob_source_fails_closed(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2721,61 +2560,6 @@ class TestAuthoritativeProofDiagnostics:
         state = _proof_gate_state(
             source_path=source_path,
             blob_id=blob_id,
-        )
-        service._blob_service = None
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            session_id = uuid4()
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is True
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is True
-        assert result.errors == []
-
-    @pytest.mark.asyncio
-    async def test_uninspectable_blob_source_with_exited_guided_claim_fails_closed(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        """elspeth-3b45cdb41e: exited review custody that cannot resolve must block.
-
-        Before the fix the exited sentinel claim was excluded from the
-        resolver's custody census (39c7fc635's parity with the export-family
-        skip), so an unresolvable claimed source abstained into a passing
-        proof check. Admission now keeps exited claims in the census and the
-        unresolvable claim surfaces as the blocking custody diagnostic.
-        """
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        blob_id = uuid4()
-        source_path = tmp_path / "not-authoritatively-resolved.csv"
-        state = _proof_gate_state(
-            source_path=source_path,
-            blob_id=blob_id,
-        )
-        historical_guided = _guided_sentinel_proof_gate_state(
-            source_path=source_path,
-            blob_id=blob_id,
-        ).guided_session
-        assert historical_guided is not None
-        state = replace(
-            state,
-            guided_session=replace(
-                historical_guided,
-                terminal=TerminalState(
-                    kind=TerminalKind.EXITED_TO_FREEFORM,
-                    reason=TerminalReason.USER_PRESSED_EXIT,
-                    pipeline_yaml=None,
-                ),
-            ),
         )
         service._blob_service = None
 
@@ -2793,7 +2577,7 @@ class TestAuthoritativeProofDiagnostics:
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
-    async def test_ambiguous_blob_path_binding_abstains_without_reading_bytes(
+    async def test_ambiguous_blob_path_binding_fails_without_reading_bytes(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2832,9 +2616,10 @@ class TestAuthoritativeProofDiagnostics:
             context = make_blob_read_context(session_id)
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
-        assert result.is_valid is True
+        assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is True
+        assert result.checks[23].passed is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 

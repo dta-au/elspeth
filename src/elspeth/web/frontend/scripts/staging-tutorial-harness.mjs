@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { chromium } from "@playwright/test";
 import {
   driveFreeformTutorial,
+  finishTutorialAndVerifyGraduation,
   isAuditRequest,
   isComposeRequest,
   isRunRequest,
@@ -509,22 +510,16 @@ async function runOne(browser, token, index) {
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await page.getByText(/This is the audit story/i).waitFor({ timeout: 60_000 });
     await page.getByRole("button", { name: "Continue", exact: true }).click();
-    await page
-      .getByRole("heading", { name: "You're ready to use the composer." })
-      .waitFor({ timeout: 60_000 });
+    const completion = await Promise.race([
+      finishTutorialAndVerifyGraduation(
+        page,
+        sessionId,
+        () => apiFetch(token, "/api/composer-preferences"),
+      ),
+      blockingFailurePromise,
+    ]);
     graduated = true;
-    await page
-      .getByRole("button", { name: "Take me to the composer" })
-      .click({ timeout: 30_000 })
-      .catch(() => undefined);
-
-    const bodyText = await page.locator("body").innerText();
-    const landed = graduated;
-    if (!landed) {
-      await mkdir(artifactsDir, { recursive: true });
-      screenshot = resolve(artifactsDir, `run-${index}-failure.png`);
-      await page.screenshot({ path: screenshot, fullPage: true });
-    }
+    const landed = completion.landed_session_id === sessionId;
 
     const evidence = sessionId === null ? null : await fetchSessionEvidence(token, sessionId);
     const ok =
@@ -549,13 +544,13 @@ async function runOne(browser, token, index) {
       session_id: sessionId,
       landed,
       graduated,
+      completion,
       steps,
       api_failures: apiFailures,
       console_errors: consoleErrors,
       screenshot,
       evidence,
       diagnostic,
-      body_excerpt: landed ? null : bodyText.replace(/\s+/g, " ").slice(0, 800),
     };
   } catch (error) {
     await mkdir(artifactsDir, { recursive: true });

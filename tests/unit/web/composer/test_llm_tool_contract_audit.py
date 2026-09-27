@@ -37,7 +37,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.tools.wire_projection import stamp_planner_terminal, wire_tool_definitions
-from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 
 _NEW_FIELDS = ("tool_contract_dialect", "strict_tool_count")
 
@@ -237,22 +236,3 @@ class TestSurvivesToThePersistedProjection:
         call_payload = _envelope_call(_llm_call(tool_contract_dialect=ToolContractDialect.OPENAI_STRICT, strict_tool_count=3))
 
         assert field_name not in call_payload
-
-    def test_guided_failure_row_preserves_both(self) -> None:
-        rows = prepare_guided_audit_rows(
-            invocations=(),
-            llm_calls=(
-                _llm_call(
-                    tool_contract_dialect=ToolContractDialect.OPENAI_STRICT,
-                    strict_tool_count=19,
-                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
-                    error_class="MalformedResponse",
-                    error_message="truncated mid tool call",
-                ),
-            ),
-            chat_turns=(),
-        )
-
-        (row,) = rows
-        assert row.envelope["call"]["tool_contract_dialect"] == "openai_strict"
-        assert row.envelope["call"]["strict_tool_count"] == 19

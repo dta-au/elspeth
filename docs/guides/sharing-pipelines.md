@@ -70,7 +70,7 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.1, shareable-review state is part of the broader web session database
-contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=70` and
+contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=71` and
 `SQLITE_SCHEMA_EPOCH=46`; confirm both against the deployed service's live
 schema constants before recreating a store. Landscape epoch 30 adds durable
 row_union barrier

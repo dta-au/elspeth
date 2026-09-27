@@ -239,7 +239,6 @@ describe("ImportYamlModal", () => {
       // the common path stays a two-arg importCompositionYaml call. setState
       // merges, so reset it here or a prior test's binding leaks forward.
       exportedYamlBlobBinding: null,
-      guidedSession: null,
       // Stubbed rather than exercised: selectSession's own refetch fan-out
       // (messages/proposals/preferences/blobs/interpretation-events) is
       // sessionStore's concern, already covered by sessionStore's own tests.
@@ -255,7 +254,6 @@ describe("ImportYamlModal", () => {
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
-      guidedSession: null,
     } as never);
   });
 
@@ -946,7 +944,6 @@ describe("ImportYamlModal", () => {
   it("shows a confirm step before submitting when the current pipeline is non-trivial", () => {
     useSessionStore.setState({
       compositionState: nonEmptyState(),
-      guidedSession: null,
     } as never);
 
     render(<ImportYamlModal onClose={onClose} />);
@@ -955,53 +952,12 @@ describe("ImportYamlModal", () => {
 
     expect(screen.getByRole("alertdialog")).toBeInTheDocument();
     expect(
-      screen.getByText(buildImportConfirmMessage(false)),
+      screen.getByText(buildImportConfirmMessage()),
     ).toBeInTheDocument();
     expect(api.importCompositionYaml).not.toHaveBeenCalled();
   });
 
-  it("mentions the guided-mode reset in the confirm copy while guided is genuinely active", () => {
-    useSessionStore.setState({
-      compositionState: nonEmptyState(),
-      // terminal: null is load-bearing here -- this must match
-      // isGuidedBuildActive's own non-terminal check, not just non-null.
-      guidedSession: { id: "g1", step: 1, terminal: null } as never,
-    } as never);
 
-    render(<ImportYamlModal onClose={onClose} />);
-    typeYaml();
-    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
-
-    expect(
-      screen.getByText(buildImportConfirmMessage(true)),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/switch it to freeform/i)).toBeInTheDocument();
-  });
-
-  it("does NOT claim a guided switch when the guided session is already terminal", () => {
-    // A terminal guided_session (completed / exited_to_freeform) means the
-    // user has already left guided -- SideRail (and this modal) is only
-    // reachable in that state or the null state, never mid-active-guided
-    // (isGuidedBuildActive suppresses the rail then). Saying "will switch
-    // it to freeform" here would be affirmatively wrong: it already has.
-    useSessionStore.setState({
-      compositionState: nonEmptyState(),
-      guidedSession: {
-        id: "g1",
-        step: 1,
-        terminal: { kind: "exited_to_freeform" },
-      } as never,
-    } as never);
-
-    render(<ImportYamlModal onClose={onClose} />);
-    typeYaml();
-    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
-
-    expect(
-      screen.getByText(buildImportConfirmMessage(false)),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/switch it to freeform/i)).toBeNull();
-  });
 
   it("submits after the confirm step is accepted", async () => {
     useSessionStore.setState({ compositionState: nonEmptyState() } as never);

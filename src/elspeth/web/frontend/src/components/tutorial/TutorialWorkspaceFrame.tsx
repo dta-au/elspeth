@@ -1,9 +1,8 @@
 import type { JSX, ReactNode } from "react";
-import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
+import { PipelineValidationSummary } from "@/components/chat/PipelineValidationSummary";
 import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
 import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
 import { WorkspaceActionBar } from "@/components/workspace/WorkspaceActionBar";
-import { WorkspaceInspector } from "@/components/workspace/WorkspaceInspector";
 
 interface TutorialWorkspaceFrameProps {
   /** Accessible name of the frame's landmark (`section`). */
@@ -36,7 +35,6 @@ export function TutorialWorkspaceFrame({
             checksValidationContent={<PipelineValidationSummary isTutorial />}
           />
         }
-        inspector={<WorkspaceInspector />}
         actionBar={
           <WorkspaceActionBar
             capabilities={{

@@ -20,7 +20,6 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
@@ -40,7 +39,6 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     composer_completion_events_table,
     composition_states_table,
-    guided_operation_events_table,
     message_ingress_receipts_table,
     run_events_table,
     runs_table,
@@ -54,7 +52,6 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
     CompositionValidationError,
-    GuidedOperationClaimed,
     MessageIngressAccepted,
     MessageIngressConflict,
     MessageIngressFresh,
@@ -70,7 +67,7 @@ from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_session_operation_fence
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -95,7 +92,7 @@ def engine():
 @pytest.fixture
 def service(engine):
     """Create a SessionServiceImpl backed by the in-memory engine."""
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -234,7 +231,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = DualFencedSessionServiceHarness(
+        service_with_dir = FencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -276,7 +273,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = DualFencedSessionServiceHarness(
+        service_with_dir = FencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -2152,12 +2149,12 @@ class TestAddMessageWithTranscript:
         initialize_session_schema(engine)
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
-        first = DualFencedSessionServiceHarness(
+        first = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.ingress-race.first"),
         )
-        second = DualFencedSessionServiceHarness(
+        second = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.ingress-race.second"),
@@ -2297,7 +2294,7 @@ class TestAddMessageWithTranscript:
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
         try:
-            service = DualFencedSessionServiceHarness(
+            service = FencedSessionServiceHarness(
                 engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.stale-reader"),
@@ -2357,7 +2354,7 @@ class TestAddMessageWithTranscript:
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
         try:
-            service = DualFencedSessionServiceHarness(
+            service = FencedSessionServiceHarness(
                 engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.one-conn"),
@@ -2425,87 +2422,6 @@ class TestAddMessageWithTranscript:
             engine.dispose()
 
 
-class TestGuidedFailureCohortPoisonPill:
-    """T5: a mismatched failure cohort fails closed with a DISTINCT message."""
-
-    @pytest.mark.asyncio
-    async def test_mismatched_cohort_rejects_reads_with_message_distinct_from_snapshot_guard(self, engine, service) -> None:
-        session = await service.create_session("alice", "Poison", "local")
-        claim = await service.reserve_guided_operation(
-            session_id=session.id,
-            operation_id="poison-op",
-            kind="guided_start",
-            request_hash="a" * 64,
-            actor="worker",
-            lease_seconds=30,
-        )
-        assert isinstance(claim, GuidedOperationClaimed)
-        # One structurally valid failed event whose cohort commits a
-        # fabricated evidence row that has no durable counterpart. The
-        # events table is UPDATE/DELETE-protected by trigger, so the
-        # poison pill is injected as the operation's single terminal
-        # event directly.
-        fabricated_row = {
-            "message_id": str(uuid.uuid4()),
-            "sequence_no": 1,
-            "content_hash": stable_hash("fabricated-evidence"),
-            "tool_calls_hash": stable_hash([]),
-        }
-        authority: dict[str, object] = {
-            "schema": "guided_failure_audit_cohort.v1",
-            "count": 1,
-            "rows": [fabricated_row],
-        }
-        poisoned_cohort = {**authority, "aggregate_digest": stable_hash(authority)}
-        with engine.begin() as conn:
-            conn.execute(
-                insert(guided_operation_events_table).values(
-                    session_id=str(session.id),
-                    operation_id="poison-op",
-                    sequence=2,
-                    event_kind="failed",
-                    actor="tamper",
-                    attempt=claim.fence.attempt,
-                    prior_attempt=None,
-                    lease_expires_at=None,
-                    request_hash="a" * 64,
-                    failure_audit_cohort=poisoned_cohort,
-                    occurred_at=datetime.now(UTC),
-                )
-            )
-
-        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows") as excinfo:
-            await service.get_messages(session.id, limit=None)
-        # The http_audit_integrity_error handler logs message=str(exc);
-        # this phrasing must stay distinguishable from the send_message
-        # transcript snapshot guard's copy.
-        assert "does not end at inserted user" not in str(excinfo.value)
-
-        # The combined write+read path applies the same fail-closed
-        # verification over the same rows.
-        request_id = uuid.uuid4()
-        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows"):
-            await service.add_message_with_transcript(
-                session.id,
-                "user",
-                "hello",
-                client_request_id=request_id,
-                requested_state_id=None,
-                writer_principal="route_user_message",
-            )
-        # Verification rejects the read AFTER commit; the durable receipt
-        # prevents a transport retry from inserting a duplicate user row.
-        accepted = await service.add_message_with_transcript(
-            session.id,
-            "user",
-            "hello",
-            client_request_id=request_id,
-            requested_state_id=None,
-            writer_principal="route_user_message",
-        )
-        assert isinstance(accepted, MessageIngressAccepted)
-
-
 class TestCreateRunSessionLockDomain:
     """Run admission must share the same-session custody lock domain.
 
@@ -2523,7 +2439,7 @@ class TestCreateRunSessionLockDomain:
         initialize_session_schema(engine)
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
-        service = DualFencedSessionServiceHarness(
+        service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),

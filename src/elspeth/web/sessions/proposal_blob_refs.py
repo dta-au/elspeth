@@ -9,8 +9,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 
@@ -43,7 +43,7 @@ def _collect_option_blob_references(value: Any, *, position: str, into: list[str
 
     Recognizes the three authoritative reference vocabularies that composer
     tooling can author into options: top-level or nested ``blob_ref`` marker
-    values, and ``path``/``file`` values carrying the guided ``blob:<uuid>``
+    values, and ``path``/``file`` values carrying the ``blob:<uuid>``
     sentinel.  A present-but-malformed reference raises ``ValueError`` — a
     proposal whose custody positions cannot be read must never silently shed
     its retention edges.
@@ -94,10 +94,8 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
     schema positions can create a custody/retention edge.  Within
     ``set_pipeline`` those positions are the source/node/output ``options``
     mappings, whose blob vocabulary (``blob_ref`` markers and ``blob:<uuid>``
-    path/file sentinels) is walked recursively — guided proposals bind their
-    reviewed blobs through exactly these positions, and missing them let a
-    reviewed blob be deleted while a proposal depending on it was pending
-    (elspeth-b3feba9a7c).
+    path/file sentinels) is walked recursively. Missing these positions could
+    let a blob be deleted while a proposal depending on it is pending.
     """
     if tool_name not in _BLOB_REFERENCE_TOOLS:
         return ()

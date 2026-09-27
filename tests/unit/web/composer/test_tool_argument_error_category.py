@@ -267,7 +267,7 @@ def _pydantic_wraps_without_category(source: str) -> list[int]:
 
 
 def _scanned_files() -> list[Path]:
-    return [path for root in _SCANNED_ROOTS for path in iter_gate_files(root) if "guided" not in path.relative_to(root).parts]
+    return [path for root in _SCANNED_ROOTS for path in iter_gate_files(root)]
 
 
 class TestPydanticWrapCensus:

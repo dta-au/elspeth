@@ -273,9 +273,9 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
     <div style="display:grid;grid-template-columns:2fr 3fr;flex:1;min-height:0">
       <div style="border-right:1px solid var(--color-border);padding:12px;display:flex;flex-direction:column">
         <div class="chip" style="align-self:flex-start;margin-bottom:8px">Authoring pane</div>
-        <div style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary)">Describe the result you want. Review each proposed change.</div>
+        <div style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary)">Describe the result you want. Inspect each applied change or pending proposal.</div>
         <div class="ribbon">Looked up: list_sources</div>
-        <div class="pcard"><div class="hd"><span>Proposed: set_source</span><span class="chip">audit 3f9a1c2e</span></div><div style="font-size:13px">Use the uploaded transactions CSV as the source.</div></div>
+        <div class="pcard commit"><div class="hd"><span>Applied: set_source</span><span class="chip">audit 3f9a1c2e</span></div><div style="font-size:13px">Use the uploaded transactions CSV as the source.</div></div>
         <div style="margin-top:auto;border:1px solid var(--color-border-strong);border-radius:var(--radius-md);padding:8px 10px;color:var(--color-text-muted);font-size:13px">Message input …</div>
       </div>
       <div style="display:flex;flex-direction:column;background:var(--color-surface-inspector)">
@@ -293,22 +293,22 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
   <h2>One conversation, one planner</h2>
   <div class="cols" style="flex:0 0 auto">
     <div class="card"><h3>Describe</h3><p>Describe the whole pipeline or begin with a smaller request.</p></div>
-    <div class="card"><h3>Refine</h3><p>Review each proposal, then ask for changes in the same conversation.</p></div>
+    <div class="card"><h3>Refine</h3><p>Inspect applied changes or pending proposals, then ask for changes in the same conversation.</p></div>
   </div>
-  <div class="quote" style="margin-top:22px">The model proposes the structure; ELSPETH validates it; you choose what to accept.<span class="cite">docs/guides/user-manual.md</span></div>
+  <div class="quote" style="margin-top:22px">The model proposes the structure; ELSPETH validates and records applied changes. Check the authority chip for the current approval rule.<span class="cite">docs/guides/user-manual.md</span></div>
   <aside class="notes"><p>Show that a later request can revise the current pipeline without starting over.</p></aside>
 </section>
 
 <section class="slide" data-seg="2">
   <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Trainer demo</span></div>
-  <h2>The three kinds of thing the planner shows you</h2>
+  <h2>Three signals in the authoring conversation</h2>
   <div class="cols w3">
     <div><h3>A ribbon</h3><div class="ribbon">Looked up: list_transforms</div><p class="mini">It read something. Nothing changed.</p></div>
-    <div><h3>A proposal card</h3><div class="pcard"><div class="hd"><span>Proposed: set_pipeline</span><span class="chip">audit 8c1d…</span></div><div style="font-size:13px"><b>Why:</b> route by amount<br><b>Affects:</b> source, gate, 2 sinks</div><div style="margin-top:8px"><span class="btn primary">Accept</span> <span class="btn">Reject</span></div></div></div>
-    <div><h3>A decision card</h3><div class="pcard pending"><div class="hd"><span>Transforms step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:8px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span> <span class="btn">Change…</span></div></div></div>
+    <div><h3>Applied or pending change</h3><div class="pcard commit"><div class="hd"><span>Applied: set_pipeline</span><span class="chip">audit 8c1d…</span></div><div style="font-size:13px"><b>Why:</b> route by amount<br><b>Affects:</b> source, gate, 2 sinks</div></div><p class="mini">With Approval required, a proposal instead waits for Accept or Reject.</p></div>
+    <div><h3>A decision card</h3><div class="pcard pending"><div class="hd"><span>Classify step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:8px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span> <span class="btn">Change…</span></div></div></div>
   </div>
-  <div class="alert info" style="margin-top:6px">Nothing executes, and nothing is committed to the pipeline, without you clicking one of these.</div>
-  <aside class="notes"><p>This slide is the interaction model for the entire product. Say it now; they will see all three in the next ten minutes. Note the left-edge colour: amber pending, teal committed, red rejected, dashed for a decision awaiting you.</p></aside>
+  <div class="alert info" style="margin-top:6px">Auto-apply on can commit eligible changes without Accept. Run pipeline is always a separate action; pending review cards still need your decision.</div>
+  <aside class="notes"><p>Point out the authority chip: Auto-apply on is the default; Approval required holds mutations for explicit review. Full-pipeline auto-commit also needs a green runtime preflight. A dashed decision card may still need a human response after a change is applied.</p></aside>
 </section>
 
 <section class="slide" data-seg="2">
@@ -341,8 +341,8 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
       <li>Session switcher → <code>+ New session</code> (or <kbd>Ctrl+N</kbd>).</li>
       <li>In the chat input: <code>Upload file</code> → choose <code>input.csv</code>.</li>
       <li>Paste the prompt →</li>
-      <li>Read each proposal. If asked for field types: <code>id: int</code>, <code>name: str</code>, <code>amount: int</code>, <code>category: str</code>.</li>
-      <li>Resolve any pending review cards before accepting the proposed pipeline.</li>
+      <li>Inspect the graph and versioned change. If asked for field types: <code>id: int</code>, <code>name: str</code>, <code>amount: int</code>, <code>category: str</code>.</li>
+      <li>Resolve pending review cards; accept or reject a pipeline proposal if one remains pending.</li>
       <li>When <code>Validation: Passed</code> → <code>Run pipeline</code> → confirm the dialog.</li>
     </ul></div>
     <div><pre>Use the uploaded transactions CSV as the source.
@@ -356,7 +356,7 @@ Validate it before running.</pre><p class="mini">Prompt from <code>docs/guides/y
 
 <section class="slide" data-seg="3">
   <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on</span></div>
-  <h2>Reading a proposal card</h2>
+  <h2>Reading a proposal card when one is pending</h2>
   <div class="cols">
     <div class="pcard" style="align-self:start"><div class="hd"><span>Proposed: set_pipeline</span><span class="chip">audit 8c1d4b7e</span></div>
       <div style="font-size:14px;margin-bottom:6px">Route transactions by amount into two CSV outputs.</div>
@@ -372,7 +372,7 @@ Validate it before running.</pre><p class="mini">Prompt from <code>docs/guides/y
       <li><code>Reject</code> discards; you can ask for a revision</li>
     </ul></div>
   </div>
-  <aside class="notes"><p>Every accept is a version — point at the header's version selector ticking over. Reject confirm text: "The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."</p></aside>
+  <aside class="notes"><p>Under default Auto-apply on, a valid change may already be committed; inspect the graph and version selector instead of waiting for a proposal card. Approval required always asks for an explicit decision. Reject confirm text: "The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."</p></aside>
 </section>
 
 <section class="slide" data-seg="3">
@@ -443,8 +443,8 @@ sinks:
   <div class="kicker"><span class="seg">Segment 4 · What just happened</span><span class="mode">Talk</span></div>
   <h2>The four things ELSPETH did that you did not</h2>
   <div class="grid2" style="margin-top:8px">
-    <div class="card"><b>Validated</b>the proposal before it became your pipeline — wiring, route targets, schema compatibility</div>
-    <div class="card"><b>Recorded</b>a new version (<code>v2 ▾</code> in the header) — every accept is a version</div>
+    <div class="card"><b>Validated</b>the resulting pipeline — wiring, route targets, schema compatibility</div>
+    <div class="card"><b>Recorded</b>a new version (<code>v2 ▾</code> in the header) — every committed change is versioned</div>
     <div class="card"><b>Gated</b>the run — <code>Run pipeline</code> was disabled until <code>Validation: Passed</code></div>
     <div class="card"><b>Wrote the audit trail</b>run configuration, every row's path, the gate result per row, output file hashes</div>
   </div>
@@ -496,7 +496,7 @@ sinks:
 category as retail, wholesale or corporate from its name
 and amount, and write the label to a new field llm_category.
 Keep the same routing.</pre>
-  <p style="font-size:18px">Accept the proposal. Then <strong>do not run yet</strong> — look at the cards.</p>
+  <p style="font-size:18px">Inspect the committed change, or accept a pending proposal. Then <strong>do not run yet</strong> — look at the cards.</p>
   <aside class="notes"><p>This is a revision of the current pipeline. Expect a longer planner turn — narrate the "Working on..." indicator and its "Show details" while they wait.</p></aside>
 </section>
 
@@ -505,9 +505,9 @@ Keep the same routing.</pre>
   <h2>"3 decisions the LLM made — acknowledge each"</h2>
   <div class="cols">
     <div class="stack">
-      <div class="pcard pending"><div class="hd"><span>Transforms step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:6px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span></div></div>
-      <div class="pcard pending"><div class="hd"><span>Transforms step · model</span></div><div style="font-size:13px">The LLM picked <code>&lt;model&gt;</code>.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
-      <div class="pcard pending"><div class="hd"><span>Transforms step · decision</span></div><div style="font-size:13px">How "classify" was operationalised — the category boundaries it chose.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
+      <div class="pcard pending"><div class="hd"><span>Classify step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:6px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span></div></div>
+      <div class="pcard pending"><div class="hd"><span>Classify step · model</span></div><div style="font-size:13px">The LLM picked <code>&lt;model&gt;</code>.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
+      <div class="pcard pending"><div class="hd"><span>Classify step · decision</span></div><div style="font-size:13px">How "classify" was operationalised — the category boundaries it chose.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
     </div>
     <div class="col"><ul>
       <li><strong>· prompt</strong> — <code>Approve</code> is locked until you have opened <code>View prompt</code> once</li>
@@ -767,7 +767,7 @@ Keep the same routing.</pre>
   <div class="kicker"><span class="seg">Segment 9 · Recap</span><span class="mode">Talk</span></div>
   <h2>What you can now do</h2>
   <ul>
-    <li>Describe a pipeline → review proposals → acknowledge the LLM's decisions → validate → run → read the evidence</li>
+    <li>Describe a pipeline → inspect the committed change or decide on a pending proposal → acknowledge the LLM's decisions → validate → run → read the evidence</li>
     <li>Four advanced words: <strong>fork + coalesce</strong>, <strong>row union</strong>, <strong>scope + collector</strong>, <strong>aggregation</strong></li>
     <li>Six audit rows; <code>Blocks run</code> vs <code>Advisory</code>; three trust tiers</li>
     <li>Out: YAML, review link, versions, message fork, detail level</li>

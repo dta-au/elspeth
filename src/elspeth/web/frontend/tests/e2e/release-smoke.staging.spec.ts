@@ -1,6 +1,5 @@
-// Non-mocked built-bundle smoke: a real plural-sources composition state must
-// hydrate into the ordinary freeform Composer without crashing its authoring
-// pane. YAML import gives this test a committed graph without provider spend.
+// Non-mocked built-bundle smoke: an uploaded CSV source and sink must hydrate
+// into the ordinary freeform Composer after YAML import and reload.
 import { expect, test } from "@playwright/test";
 
 import {
@@ -29,6 +28,14 @@ sinks:
     on_write_failure: discard
 `;
 
+async function assertHydratedSourceGraph(composer: ComposerPage): Promise<void> {
+  await composer.artifactTab("Spec").click();
+  await expect(composer.page.getByRole("article", { name: "Source source" })).toBeVisible();
+  await expect(composer.page.getByRole("article", { name: "Output result" })).toBeVisible();
+  await composer.artifactTab("Workflow").click();
+  await expect(composer.page.locator(".react-flow__node")).toHaveCount(2);
+}
+
 test("built freeform Composer hydrates a committed source graph after reload", async ({ page }) => {
   const token = tokenFromStorageState(await page.context().storageState());
   const ctx = await authedContext(token);
@@ -40,16 +47,30 @@ test("built freeform Composer hydrates a committed source graph after reload", a
     const imported = await ctx.post(`/api/sessions/${sessionId}/state/yaml`, {
       data: { yaml: YAML, source_blob_ids: { source: blob.id } },
     });
-    expect(imported.ok(), `state import failed: ${imported.status()} ${(await imported.text()).slice(0, 500)}`).toBe(true);
+    const importedState = await imported.json() as { version: number };
+    expect(imported.ok(), `state import failed: ${imported.status()} ${JSON.stringify(importedState).slice(0, 500)}`).toBe(true);
+
+    const assertPersistedBinding = async (): Promise<void> => {
+      const stateResponse = await ctx.get(`/api/sessions/${sessionId}/state`);
+      expect(stateResponse.ok()).toBe(true);
+      const state = await stateResponse.json() as {
+        version: number;
+        sources: Record<string, { options: Record<string, unknown> }>;
+      };
+      expect(state.version).toBe(importedState.version);
+      expect(state.sources.source?.options.blob_ref).toBe(blob.id);
+    };
 
     const composer = new ComposerPage(page);
     await composer.goto(sessionId);
     await composer.waitForChatReady();
-    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
+    await assertHydratedSourceGraph(composer);
+    await assertPersistedBinding();
     await expect(page.getByText(/Chat panel encountered an error/i)).toHaveCount(0);
     await page.reload();
     await composer.waitForChatReady();
-    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
+    await assertHydratedSourceGraph(composer);
+    await assertPersistedBinding();
     await expect(page.getByText(/Chat panel encountered an error/i)).toHaveCount(0);
   } finally {
     if (sessionId !== undefined) await deleteSession(ctx, sessionId);

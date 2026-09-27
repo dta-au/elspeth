@@ -40,7 +40,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
@@ -180,12 +180,8 @@ def _plan(candidate_state: CompositionState | None) -> PipelinePlanResult:
     proposal = PipelineProposal.create(
         pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,
