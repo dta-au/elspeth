@@ -4,9 +4,7 @@ Follows LLM plugin pattern: retryable errors are re-raised for engine
 RetryManager, non-retryable errors return TransformResult.error().
 """
 
-from elspeth.contracts.errors import PluginRetryableError
-from elspeth.core.security.web import NetworkError as SSRFNetworkError
-from elspeth.core.security.web import SSRFBlockedError as PolicySSRFBlockedError
+from elspeth.contracts.errors import PluginRetryableError, TransformErrorReason
 
 
 class WebScrapeError(PluginRetryableError):
@@ -98,17 +96,18 @@ class BodyTooLargeError(WebScrapeError):
         self.max_body_bytes = max_body_bytes
 
 
-def row_url_rejection_message(exc: KeyError | PolicySSRFBlockedError | SSRFNetworkError | TypeError) -> str:
-    """Value-free audit text for a row URL refused before any fetch.
+# Value-free audit text for a row URL refused before any fetch. The refusing
+# exceptions' own text names the URL, its host or the address it resolved to —
+# row data, which stays in the row carrier and never enters the reason. Each
+# except clause picks its sentence; error_type beside it keeps the class.
+URL_REFUSED_BY_SSRF_POLICY = (
+    "the row's URL is refused by the SSRF policy (malformed, forbidden scheme or credentials, or a blocked address)"
+)
+URL_HOST_UNRESOLVED = "the row's URL host could not be resolved"
+URL_NOT_A_STRING = "the row's URL value is not a string"
+URL_FIELD_MISSING = "the row has no URL field"
 
-    The exceptions' own text names the URL, its host or the address it
-    resolved to — row data, which stays in the row carrier and never enters
-    the reason. ``error_type`` beside this message keeps the class.
-    """
-    if isinstance(exc, PolicySSRFBlockedError):
-        return "the row's URL is refused by the SSRF policy (malformed, forbidden scheme or credentials, or a blocked address)"
-    if isinstance(exc, SSRFNetworkError):
-        return "the row's URL host could not be resolved"
-    if isinstance(exc, TypeError):
-        return "the row's URL value is not a string"
-    return "the row has no URL field"
+
+def row_url_refusal(message: str, exc: Exception) -> TransformErrorReason:
+    """The validation_failed reason for a refused row URL: fixed message, exception class."""
+    return {"reason": "validation_failed", "error": message, "error_type": type(exc).__name__}

@@ -51,6 +51,10 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.transforms.web_scrape_errors import (
+    URL_FIELD_MISSING,
+    URL_HOST_UNRESOLVED,
+    URL_NOT_A_STRING,
+    URL_REFUSED_BY_SSRF_POLICY,
     BodyTooLargeError,
     ClientError,
     ForbiddenError,
@@ -61,7 +65,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
     UnauthorizedError,
     WebScrapeError,
-    row_url_rejection_message,
+    row_url_refusal,
 )
 from elspeth.plugins.transforms.web_scrape_extraction import extract_content
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
@@ -492,7 +496,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:677e446d9571bd23"
+    source_file_hash: str | None = "sha256:b7051b6fc092d707"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -834,16 +838,16 @@ class WebScrapeTransform(BaseTransform):
                 safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
             else:
                 safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
-        except (KeyError, SSRFBlockedError, SSRFNetworkError, TypeError) as e:
-            # Missing row fields, security violations, DNS failures, and invalid
-            # URL value types are row-level validation failures, not retries.
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "error": row_url_rejection_message(e),
-                    "error_type": type(e).__name__,
-                }
-            )
+        # Missing row fields, security violations, DNS failures, and invalid
+        # URL value types are row-level validation failures, not retries.
+        except SSRFBlockedError as e:
+            return TransformResult.error(row_url_refusal(URL_REFUSED_BY_SSRF_POLICY, e))
+        except SSRFNetworkError as e:
+            return TransformResult.error(row_url_refusal(URL_HOST_UNRESOLVED, e))
+        except TypeError as e:
+            return TransformResult.error(row_url_refusal(URL_NOT_A_STRING, e))
+        except KeyError as e:
+            return TransformResult.error(row_url_refusal(URL_FIELD_MISSING, e))
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:
