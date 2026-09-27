@@ -31,6 +31,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     guided_operations_table,
+    message_ingress_receipts_table,
     proposal_events_table,
     session_operation_fences_table,
     sessions_table,
@@ -42,6 +43,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     InvalidForkTargetError,
+    MessageIngressFresh,
     SessionForkParentAuthority,
 )
 from elspeth.web.sessions.routes import create_session_router
@@ -962,6 +964,41 @@ class TestForkSession:
 
         copied_ids = {m.id for m in messages}
         assert original_msg.id not in copied_ids
+
+    @pytest.mark.asyncio
+    async def test_forked_history_does_not_copy_ingress_request_identity(self, engine, service) -> None:
+        session = await service.create_session("alice", "Request identity", "local")
+        request_id = uuid.uuid4()
+        first = await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "first",
+            client_request_id=request_id,
+            requested_state_id=None,
+            writer_principal="route_user_message",
+        )
+        assert isinstance(first, MessageIngressFresh)
+        fork_point = await service.add_message(session.id, "user", "second", writer_principal="route_user_message")
+        child, _, _ = await _fork_session(
+            service,
+            source_session_id=session.id,
+            fork_message_id=fork_point.id,
+            new_message_content="edited",
+            user_id="alice",
+            auth_provider_type="local",
+        )
+        child_messages = await service.get_messages(child.id, limit=None)
+        assert any(message.content == "first" for message in child_messages)
+        assert all(message.client_request_id is None for message in child_messages)
+        with engine.connect() as conn:
+            assert (
+                conn.scalar(
+                    select(func.count())
+                    .select_from(message_ingress_receipts_table)
+                    .where(message_ingress_receipts_table.c.session_id == str(child.id))
+                )
+                == 0
+            )
 
     @pytest.mark.asyncio
     async def test_fork_preserves_assistant_raw_content_for_copied_history(self, service) -> None:

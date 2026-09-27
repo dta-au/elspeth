@@ -153,11 +153,18 @@ class SendMessageRequest(_RequestModel):
     # _InlineBlobModel.content 256 KiB cap (web/composer/redaction.py).
     content: str = pydantic.Field(min_length=1, max_length=65536)
     state_id: UUID | None = None
+    client_request_id: UUID
 
     @field_validator("content")
     @classmethod
     def _validate_content(cls, value: str) -> str:
         return _require_visible_content(value, field_label="Message content")
+
+
+class RecomposeRequest(_RequestModel):
+    """Only retry the conversational user row the client actually selected."""
+
+    expected_user_message_id: UUID
 
 
 type ToolCallObject = dict[str, JsonValue]
@@ -208,6 +215,7 @@ class ChatMessageResponse(_StrictResponse):
     """
 
     id: str
+    client_request_id: str | None = None
     session_id: str
     role: str
     content: str
@@ -576,7 +584,9 @@ class ChatTurnResponse(_StrictResponse):
     step: str
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None
+    synthetic_failure_reason: (
+        Literal["quality_guard", "unavailable", "not_applied", "model_defect", "provider_auth", "provider_bad_request"] | None
+    )
     turn_token: str | None
 
 

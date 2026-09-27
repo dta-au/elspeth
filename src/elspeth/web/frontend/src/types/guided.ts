@@ -103,7 +103,7 @@ export interface ChatTurn {
   /** Closed persisted reason. "model_defect": the provider answered but the
    *  reply violated a tool contract — retry is the designed remedy, unlike
    *  the deterministic "not_applied" causes (Retry is suppressed there). */
-  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | null;
+  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | "provider_auth" | "provider_bad_request" | null;
   /** Occurrence the user message was submitted under (elspeth-ea80e34fdc).
    *  Retry must resend THIS token verbatim — never the current one — so a
    *  stale retry draws the server's ordinary 409 instead of applying old

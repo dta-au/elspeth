@@ -686,6 +686,7 @@ def _message_response(
     return ChatMessageResponse(
         id=str(msg.id),
         session_id=str(msg.session_id),
+        client_request_id=str(msg.client_request_id) if msg.client_request_id is not None else None,
         role=msg.role,
         content=msg.content,
         raw_content=msg.raw_content if include_raw_content else None,
@@ -1482,6 +1483,70 @@ _COMPOSER_AUTHORING_VALIDATION_COUNTER = metrics.get_meter(__name__).create_coun
 # explosion) — per-session attribution lives on the progress snapshot.
 _ComposerRequestEndpoint = Literal["send_message", "recompose"]
 _ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "cancelled"]
+
+
+@dataclass(frozen=True)
+class _FreeformContinuationReceipt:
+    """A fully projected freeform turn whose terminal progress was published."""
+
+    response: MessageWithStateResponse
+    terminal_status: Literal["completed"] = "completed"
+
+
+@dataclass(frozen=True)
+class _FreeformChildFailure:
+    """An observed child error retained for one route-level propagation."""
+
+    error: Exception | asyncio.CancelledError
+
+
+async def _capture_freeform_child[T](awaitable: Awaitable[T]) -> T | _FreeformChildFailure:
+    """Keep lease-owned children successful while the route inspects faults.
+
+    Lease close otherwise rethrows a child error already translated by the
+    route and groups it with that HTTP response. The route joins immediately,
+    inspects this envelope, and propagates the original error exactly once.
+    """
+    try:
+        return await awaitable
+    except (Exception, asyncio.CancelledError) as exc:
+        return _FreeformChildFailure(exc)
+
+
+def _freeform_child_result[T](outcome: T | _FreeformChildFailure) -> T:
+    """Propagate one inspected child fault without replaying it at lease close."""
+    if isinstance(outcome, _FreeformChildFailure):
+        if isinstance(outcome.error, asyncio.CancelledError):
+            raise AuditIntegrityError("Freeform continuation cancelled before settlement") from outcome.error
+        raise outcome.error
+    return outcome
+
+
+async def _join_freeform_owned_task[T](task: asyncio.Task[T]) -> tuple[T, asyncio.CancelledError | None]:
+    """Join one required continuation through repeated caller cancellation.
+
+    The caller retains its operation lease and compose lock while joining.
+    A child that cancels itself has not proved settlement, even if the HTTP
+    caller happened to cancel in the same event-loop turn.
+    """
+    first_cancellation: asyncio.CancelledError | None = None
+    owner = asyncio.current_task()
+    if owner is None:
+        raise RuntimeError("Freeform settlement requires an owning request task")
+    while True:
+        try:
+            return await asyncio.shield(task), first_cancellation
+        except asyncio.CancelledError as exc:
+            if owner.cancelling():
+                owner.uncancel()
+                if first_cancellation is None:
+                    first_cancellation = exc
+            if task.done():
+                if task.cancelled():
+                    raise AuditIntegrityError("Freeform continuation cancelled before settlement") from exc
+                return task.result(), first_cancellation
+
+
 _COMPOSER_REQUESTS_INFLIGHT = metrics.get_meter(__name__).create_up_down_counter(
     "composer.requests.inflight",
     unit="1",
@@ -2382,8 +2447,9 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
       but a CancelledError escaping the app is logged as "Exception in
       ASGI application").
     * If the disconnect races the guarded block's completion, the
-      pending cancellation is flushed and absorbed here so it cannot
-      detonate mid-way through the route's post-compose persist tail.
+      pending watcher cancellation is flushed here. Freeform routes keep
+      their owned post-provider continuation inside this guard and join it
+      before watcher teardown.
     * Both test transports (Starlette TestClient, httpx ASGITransport)
       block their ``receive()`` until the response completes, so the
       watcher stays dormant under tests unless a disconnect is
@@ -2444,10 +2510,9 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
                 exc.args = ()
         raise
     else:
-        # Normal exit: resolve completion races BEFORE the route resumes
-        # its persist tail, so a disconnect-cancel that landed in the
-        # same tick the guarded block completed cannot detonate mid-way
-        # through the post-compose persists.
+        # Normal exit: resolve completion races before the route resumes
+        # after its guarded operation. Freeform routes have already joined
+        # their post-provider continuation at this point.
         if not watcher.done():
             watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -2636,6 +2701,7 @@ async def _track_compose_inflight(
     lease_started_at = timer.now()
     lease = await registry.start_request(sid, user.user_id)
     request.state.composer_request_lease = lease
+    request.state.composer_durable_completed = False
     metrics_token = begin_composer_request_metrics(surface=surface)
     terminal_status: _ComposerRequestTerminalStatus = "completed"
 
@@ -2736,7 +2802,7 @@ async def _track_compose_inflight(
     except asyncio.CancelledError as exc:
         heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
         if heartbeat_cancel is None:
-            terminal_status = "cancelled"
+            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
             raise
         # The heartbeat re-raised in the same step that cancelled this task,
         # so it is done and holds the renewal failure; retrieving it here is
@@ -2746,9 +2812,9 @@ async def _track_compose_inflight(
         # request (the disconnect watcher's rule): an external cancel (server
         # shutdown) racing it keeps unwinding as genuinely cancelled.
         if owner_task.uncancel() > 0:
-            terminal_status = "cancelled"
+            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
             raise
-        terminal_status = "failed"
+        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
         if renewal_failure is None:
             raise RuntimeError("Composer heartbeat cancelled its request without a renewal failure") from exc
         if heartbeat_cancel is _COMPOSER_HEARTBEAT_RENEWAL_DEFECT:
@@ -2757,10 +2823,12 @@ async def _track_compose_inflight(
             raise renewal_failure from renewal_failure.__cause__
         raise _composer_heartbeat_http_error(heartbeat_cancel) from exc
     except TimeoutError:
-        terminal_status = "timed_out"
+        terminal_status = "completed" if request.state.composer_durable_completed else "timed_out"
         raise
     except HTTPException as exc:
-        if exc.status_code in {408, 504}:
+        if request.state.composer_durable_completed:
+            terminal_status = "completed"
+        elif exc.status_code in {408, 504}:
             terminal_status = "timed_out"
         elif exc.status_code == 499:
             terminal_status = "cancelled"
@@ -2768,7 +2836,7 @@ async def _track_compose_inflight(
             terminal_status = "failed"
         raise
     except Exception:
-        terminal_status = "failed"
+        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
         raise
     finally:
         primary_error = sys.exception()

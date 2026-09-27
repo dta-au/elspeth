@@ -672,6 +672,16 @@ let inflightMessagesPollSessionId: string | null = null;
 // session has claimed the poller since — not whether the timer still runs.
 const inflightMessagesLatestClaimBySession = new Map<string, number>();
 
+// A session can become active again while its earlier POST is unresolved.
+// The poller's per-session claim also owns POST metadata and error publication;
+// stopping its timer on navigation does not invalidate an unsuperseded turn.
+function freeformComposeClaimIsCurrent(sessionId: string, generation: number): boolean {
+  return (
+    useSessionStore.getState().activeSessionId === sessionId &&
+    inflightMessagesLatestClaimBySession.get(sessionId) === generation
+  );
+}
+
 function clearInflightMessagesPollTimer(): void {
   if (inflightMessagesPollTimer !== null) {
     clearInterval(inflightMessagesPollTimer);
@@ -944,6 +954,7 @@ async function resyncAfterAmbiguousComposeFailure(
   baselineMessageIds: ReadonlySet<string>,
   messageId: string,
   messageContent: string,
+  clientRequestId?: string,
 ): Promise<void> {
   const superseded = () =>
     useSessionStore.getState().activeSessionId !== sessionId ||
@@ -955,6 +966,18 @@ async function resyncAfterAmbiguousComposeFailure(
     .getState()
     .loadInflightMessages(sessionId, inflightOwnerGeneration);
   if (superseded()) return;
+  if (clientRequestId !== undefined) {
+    const accepted = freshMessages?.find((message) =>
+      message.role === "user" && message.client_request_id === clientRequestId
+    );
+    if (accepted) {
+      await reconcileAcceptedSend(
+        sessionId, messageId, clientRequestId, accepted.id,
+        inflightOwnerGeneration, ownerGeneration,
+      );
+      return;
+    }
+  }
 
   let state: CompositionState | null | undefined;
   let proposals: CompositionProposal[] | null | undefined;
@@ -971,18 +994,19 @@ async function resyncAfterAmbiguousComposeFailure(
       (message) =>
         !baselineMessageIds.has(message.id) &&
         message.role === "user" &&
-        message.content === messageContent,
+        (clientRequestId !== undefined
+          ? message.client_request_id === clientRequestId
+          : message.content === messageContent),
     ) ?? false;
-  const newAssistant =
-    freshMessages?.some(
-      (message) =>
-        !baselineMessageIds.has(message.id) && message.role === "assistant",
-    ) ?? false;
-  const stateAdvanced =
-    state?.version !== undefined &&
-    state.version !== null &&
-    state.version > (baselineVersion ?? 0);
-  const durableEvidence = newDurableUser || newAssistant || stateAdvanced;
+  const newAssistant = freshMessages?.some((message) =>
+    !baselineMessageIds.has(message.id) && message.role === "assistant"
+  ) ?? false;
+  const stateAdvanced = state?.version != null && state.version > (baselineVersion ?? 0);
+  // State advances and assistant rows can belong to another turn. The
+  // acceptance identity is the only proof that a new POST was saved.
+  const durableEvidence = clientRequestId !== undefined
+    ? newDurableUser
+    : newDurableUser || newAssistant || stateAdvanced;
 
   useSessionStore.setState((s) => {
     const previousVersion = s.compositionState?.version ?? null;
@@ -1022,6 +1046,108 @@ async function resyncAfterAmbiguousComposeFailure(
   useBlobStore.getState().loadBlobs(sessionId);
   void useSessionStore.getState().loadSessions();
   void refreshInterpretationEventsForSession(sessionId);
+}
+
+/** Reconcile an ingress receipt without ever starting a second model call. */
+async function reconcileAcceptedSend(
+  sessionId: string,
+  localMessageId: string,
+  clientRequestId: string,
+  canonicalUserMessageId: string,
+  inflightGeneration: number,
+  progressGeneration: number,
+): Promise<void> {
+  const current = () =>
+    freeformComposeClaimIsCurrent(sessionId, inflightGeneration) &&
+    composerProgressPollGeneration === progressGeneration;
+  // Stop both periodic readers first. A progress tick that starts while a
+  // slow state/proposal read is pending would otherwise claim a later ticket
+  // and make the receipt's complete four-surface snapshot look stale.
+  useSessionStore.getState().stopInflightMessagesPolling(sessionId, inflightGeneration);
+  useSessionStore.getState().stopComposerProgressPolling(sessionId, progressGeneration);
+  const messageTicket = ++inflightMessagesReadTicket;
+  const progressTicket = ++composerProgressReadTicket;
+  try {
+    const [messages, state, proposals, progress] = await Promise.all([
+      api.fetchMessages(sessionId),
+      api.fetchCompositionState(sessionId),
+      api.fetchCompositionProposals(sessionId),
+      api.fetchComposerProgress(sessionId),
+    ]);
+    if (!current()) return;
+    if (!messages.some((message) =>
+      message.id === canonicalUserMessageId &&
+      message.role === "user" &&
+      message.client_request_id === clientRequestId
+    )) {
+      throw new Error("Accepted message is not yet visible in the transcript");
+    }
+    if (messageTicket <= inflightMessagesAppliedTicket || progressTicket <= composerProgressAppliedTicket) {
+      throw new Error("A newer session snapshot owns the display");
+    }
+    inflightMessagesAppliedTicket = messageTicket;
+    composerProgressAppliedTicket = progressTicket;
+    useSessionStore.setState((s) => {
+      if (!current()) return s;
+      const localIntent = s.messages.find((message) =>
+        message.id === localMessageId ||
+        (message.role === "user" && message.client_request_id === clientRequestId)
+      );
+      const acceptedIndex = messages.findIndex((message) => message.id === canonicalUserMessageId);
+      const isLastUser = !messages.slice(acceptedIndex + 1).some((message) => message.role === "user");
+      const hasReply = messages.slice(acceptedIndex + 1).some((message) => message.role === "assistant");
+      const canDeliberatelyRetry = isLastUser && !hasReply &&
+        (progress.inflight_requests ?? 0) === 0 &&
+        (progress.phase === "idle" || TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase));
+      const reconciledMessages = canDeliberatelyRetry
+        ? messages.map((message) => message.id === canonicalUserMessageId
+          ? {
+              ...message,
+              local_status: "failed" as const,
+              local_error: "Your message was saved, but no reply is available. Retry to request a response.",
+              local_failure_code: localIntent?.local_failure_code,
+            }
+          : message)
+        : messages;
+      const previousVersion = s.compositionState?.version ?? null;
+      if (state?.version != null && state.version !== previousVersion) {
+        getExecutionStore().clearValidation();
+      }
+      const nextState = state ?? s.compositionState;
+      const nodeStillExists = !s.selectedNodeId ||
+        nextState?.nodes.some((node) => node.id === s.selectedNodeId);
+      return {
+        messages: reconciledMessages,
+        compositionState: nextState,
+        compositionProposals: proposals,
+        composerProgress: progress.phase === "idle" ? null : progress,
+        isComposing: false,
+        error: canDeliberatelyRetry
+          ? "Your message was saved without a reply. Retry the saved message to request a response."
+          : "Your message was saved. The latest session state is shown.",
+        ...(nodeStillExists ? {} : { selectedNodeId: null }),
+      };
+    });
+    useBlobStore.getState().loadBlobs(sessionId);
+    void useSessionStore.getState().loadSessions();
+    void refreshInterpretationEventsForSession(sessionId);
+  } catch {
+    if (!current()) return;
+    useSessionStore.setState((s) => ({
+      isComposing: false,
+      error: "Your message was saved, but the latest session state could not be confirmed. Retry to refresh it; this will not resend the message.",
+      messages: s.messages.map((message) =>
+        message.id === localMessageId ||
+        (message.role === "user" && message.client_request_id === clientRequestId)
+        ? {
+            ...message,
+            local_status: "failed",
+            local_error: "Message saved; retry to refresh the session without resending.",
+            local_accepted_user_message_id: canonicalUserMessageId,
+          }
+        : message),
+    }));
+  }
 }
 
 /**
@@ -1499,7 +1625,7 @@ interface SessionState {
   unbindMissingSession: (sessionId: string) => void;
   renameSession: (id: string, title: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
-  sendMessage: (content: string, signal?: AbortSignal) => Promise<void>;
+  sendMessage: (content: string, signal?: AbortSignal, retryLocalMessageId?: string) => Promise<void>;
   loadCompositionProposals: (sessionId?: string) => Promise<void>;
   acceptProposal: (proposalId: string) => Promise<void>;
   rejectProposal: (proposalId: string) => Promise<void>;
@@ -2171,7 +2297,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     });
   },
 
-  async sendMessage(content: string, signal?: AbortSignal) {
+  async sendMessage(content: string, signal?: AbortSignal, retryLocalMessageId?: string) {
     const { activeSessionId, isComposing } = get();
     if (!activeSessionId) return;
     // Synchronous admission gate (elspeth-3f38ebb1b5): exactly one freeform
@@ -2186,11 +2312,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().compositionState?.version ?? null;
     const baselineMessageIds = new Set(get().messages.map((message) => message.id));
 
-    const optimisticMessage: ChatMessage = {
-      id: `local-${crypto.randomUUID()}`,
+    const retriedIntent = retryLocalMessageId
+      ? get().messages.find((message) => message.id === retryLocalMessageId && message.id.startsWith("local-"))
+      : undefined;
+    if (retryLocalMessageId && (!retriedIntent || !retriedIntent.client_request_id)) return;
+    const stateId = retriedIntent
+      ? retriedIntent.local_requested_state_id ?? null
+      : get().compositionState?.id ?? null;
+    const clientRequestId = retriedIntent?.client_request_id ?? crypto.randomUUID();
+    const optimisticMessage: ChatMessage = retriedIntent ?? {
+      id: `local-${clientRequestId}`,
       session_id: activeSessionId,
       role: "user",
       content,
+      client_request_id: clientRequestId,
+      local_requested_state_id: stateId,
       tool_calls: null,
       created_at: new Date().toISOString(),
       local_status: "pending",
@@ -2203,7 +2339,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // In flight the mutation verdict is unknown — a stale verdict from the
       // previous turn must not label this turn's completion badge.
       lastComposeChangedPipeline: null,
-      messages: [...state.messages, optimisticMessage],
+      messages: retriedIntent
+        ? state.messages.map((message) => message.id === optimisticMessage.id
+          ? { ...message, local_status: "pending", local_error: undefined }
+          : message)
+        : [...state.messages, optimisticMessage],
     }));
     const progressPollGeneration =
       get().startComposerProgressPolling(activeSessionId);
@@ -2211,9 +2351,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().startInflightMessagesPolling(activeSessionId);
 
     try {
-      const stateId = get().compositionState?.id;
-      const result = await api.sendMessage(activeSessionId, content, stateId, signal);
-      if (get().activeSessionId !== activeSessionId) {
+      const result = await api.sendMessage(activeSessionId, optimisticMessage.content, clientRequestId, stateId, signal);
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Sync the chat panel against the durable DB state before applying the
@@ -2224,9 +2363,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // isComposing) without re-appending the final assistant message that
       // the poll has already pulled in.
       await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      // Navigation can also happen during the post-completion message sync.
-      // Keep the compose response scoped to the session that initiated it.
-      if (get().activeSessionId !== activeSessionId) {
+      // Navigation or a newer turn can happen during this sync. The older
+      // response must not publish metadata over the newer turn's state.
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       const { message, state } = result;
@@ -2301,6 +2440,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // fire-and-forget (`void`); only guided respondGuided awaits the refresh.
       void refreshInterpretationEventsForSession(activeSessionId);
     } catch (err) {
+      const acceptedError = err as ApiError;
+      if (
+        acceptedError.status === 409 &&
+        acceptedError.error_type === "message_already_accepted" &&
+        acceptedError.client_request_id === clientRequestId &&
+        typeof acceptedError.user_message_id === "string"
+      ) {
+        if (freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
+          set((state) => ({
+            isComposing: false,
+            messages: state.messages.map((message) =>
+              message.id === optimisticMessage.id ||
+              (message.role === "user" && message.client_request_id === clientRequestId)
+              ? { ...message, local_accepted_user_message_id: acceptedError.user_message_id }
+              : message),
+          }));
+          await reconcileAcceptedSend(
+            activeSessionId,
+            optimisticMessage.id,
+            clientRequestId,
+            acceptedError.user_message_id,
+            inflightPollGeneration,
+            progressPollGeneration,
+          );
+        }
+        return;
+      }
       let errorMessage: string;
       // Client-side abort (the useComposer COMPOSE_TIMEOUT_MS guard or any
       // user-supplied signal) rejects with the raw abort-reason string, or a
@@ -2344,16 +2510,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // deployment policy refused the pipeline; retrying cannot succeed).
       // Only set when the structured error actually carried one.
       const localFailureCode =
-        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-          ? apiErr.failure_code
-          : undefined;
+        !isComposeAbort(err) && apiErr.error_type === "message_idempotency_conflict"
+          ? "message_idempotency_conflict"
+          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+            ? apiErr.failure_code
+            : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
             recoveryStartedCompositionVersion,
           }
         : {};
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Applied AFTER recoveryPatch below so a salvaged draft rebaselines the
@@ -2365,7 +2533,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         isComposing: false,
         error: errorMessage,
         messages: state.messages.map((existing) =>
-          existing.id === optimisticMessage.id
+          existing.id === optimisticMessage.id ||
+          (existing.role === "user" && existing.client_request_id === clientRequestId)
             ? auditIntegrityRefusal
               ? {
                   ...existing,
@@ -2402,6 +2571,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           baselineMessageIds,
           optimisticMessage.id,
           content,
+          clientRequestId,
         );
       }
     } finally {
@@ -2773,10 +2943,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const survivors = localOptimistic.filter(
           (local) =>
             !fresh.some(
-              (f) => f.role === local.role && f.content === local.content,
+              (f) => f.role === "user" &&
+                local.client_request_id != null &&
+                f.client_request_id === local.client_request_id,
             ),
         );
-        return { messages: [...fresh, ...survivors] };
+        const reconciled = fresh.map((message, index) => {
+          if (message.role !== "user" || !message.client_request_id) return message;
+          const prior = s.messages.find((existing) =>
+            existing.role === "user" &&
+            existing.client_request_id === message.client_request_id
+          );
+          if (!prior) return message;
+          const hasReply = fresh.slice(index + 1).some((later) => later.role === "assistant");
+          return {
+            ...message,
+            local_requested_state_id: prior.local_requested_state_id,
+            local_accepted_user_message_id: prior.local_accepted_user_message_id,
+            ...(!hasReply && prior.local_status === "failed"
+              ? {
+                  local_status: "failed" as const,
+                  local_error: prior.local_error,
+                  local_failure_code: prior.local_failure_code,
+                }
+              : {}),
+          };
+        });
+        return { messages: [...reconciled, ...survivors] };
       });
       return fresh;
     } catch {
@@ -2827,6 +3020,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
     const message = messages.find((entry) => entry.id === messageId);
     if (!message || message.role !== "user") return;
+    if (message.client_request_id && message.local_accepted_user_message_id) {
+      set({ error: null });
+      const progressGeneration = get().startComposerProgressPolling(activeSessionId);
+      const inflightGeneration = get().startInflightMessagesPolling(activeSessionId);
+      try {
+        await reconcileAcceptedSend(
+          activeSessionId, message.id, message.client_request_id,
+          message.local_accepted_user_message_id, inflightGeneration, progressGeneration,
+        );
+      } finally {
+        get().stopInflightMessagesPolling(activeSessionId, inflightGeneration);
+        get().stopComposerProgressPolling(activeSessionId, progressGeneration);
+      }
+      return;
+    }
+    if (message.id.startsWith("local-")) {
+      if (!message.client_request_id) return;
+      await get().sendMessage(message.content, signal, message.id);
+      return;
+    }
     const baselineMessageIds = new Set(messages.map((entry) => entry.id));
 
     set((state) => ({
@@ -2850,14 +3063,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // Use recompose (not sendMessage) — the user message is already
       // persisted from the original send. Calling sendMessage again
       // would insert a duplicate user message.
-      const result = await api.recompose(activeSessionId, signal);
-      if (get().activeSessionId !== activeSessionId) {
+      const result = await api.recompose(activeSessionId, messageId, signal);
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Sync the chat panel against the DB state (see sendMessage for
       // rationale).
       await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       const { message: assistantMessage, state } = result;
@@ -2937,9 +3150,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // with a permanent code ("policy_blocked") must not re-render the
       // Retry invitation it just disproved.
       const localFailureCode =
-        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-          ? apiErr.failure_code
-          : undefined;
+        !isComposeAbort(err) && apiErr.error_type === "recompose_user_message_mismatch"
+          ? "recompose_user_message_mismatch"
+          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+            ? apiErr.failure_code
+            : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -2947,7 +3162,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           }
         : {};
 
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Mirror of the sendMessage catch: the shared 422 handler already

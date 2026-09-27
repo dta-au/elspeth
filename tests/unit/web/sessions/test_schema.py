@@ -366,7 +366,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 67 binds coalesce branch order and sources order in the composer
     # authority hashes; stored epoch-66 preimages cannot be re-verified.
     # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
-    assert SESSION_SCHEMA_EPOCH == 68
+    # Epoch 69 adds immutable freeform message ingress receipts.
+    assert SESSION_SCHEMA_EPOCH == 69
     expected_tables = frozenset(
         {
             "web_instances",
@@ -404,6 +405,24 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
 
     run_indexes = {index["name"] for index in inspector.get_indexes("runs")}
     assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
+
+
+def test_message_ingress_receipt_schema_has_exact_same_session_bindings() -> None:
+    engine = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(engine)
+    inspector = inspect(engine)
+    assert "message_ingress_receipts" in inspector.get_table_names()
+    assert inspector.get_pk_constraint("message_ingress_receipts")["constrained_columns"] == ["session_id", "client_request_id"]
+    assert {tuple(item["column_names"]) for item in inspector.get_unique_constraints("message_ingress_receipts")} == {("user_message_id",)}
+    bindings = {
+        (tuple(item["constrained_columns"]), item["referred_table"], tuple(item["referred_columns"]))
+        for item in inspector.get_foreign_keys("message_ingress_receipts")
+    }
+    assert bindings == {
+        (("session_id",), "sessions", ("id",)),
+        (("user_message_id", "session_id"), "chat_messages", ("id", "session_id")),
+        (("requested_state_id", "session_id"), "composition_states", ("id", "session_id")),
+    }
 
 
 def test_coordination_hard_cut_check_constraints_are_exact() -> None:
@@ -598,6 +617,8 @@ def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
         "trg_guided_operations_terminal_immutable",
         "trg_guided_operation_events_no_update",
         "trg_guided_operation_events_no_delete",

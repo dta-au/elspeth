@@ -768,6 +768,54 @@ async def test_shielded_cleanup_join_keeps_successful_child_result_under_repeate
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_failure", "expected_error"),
+    [
+        (None, None),
+        (AuditIntegrityError("failed terminal write"), AuditIntegrityError),
+        (asyncio.CancelledError("child cancelled itself"), AuditIntegrityError),
+    ],
+    ids=["joined_success", "integrity_primary", "self_cancel_fails_closed"],
+)
+async def test_guided_terminal_write_joins_repeated_cancellation_and_fails_closed(
+    child_failure: BaseException | None,
+    expected_error: type[BaseException] | None,
+) -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def durable_write() -> str:
+        started.set()
+        try:
+            await finish.wait()
+            if child_failure is not None:
+                raise child_failure
+            return "terminal write completed"
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(guided_operations_module._await_guided_terminal_write(durable_write()))
+    await started.wait()
+    task.cancel("first caller cancellation")
+    task.cancel("second caller cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish.set()
+    if expected_error is None:
+        assert await task == "terminal write completed"
+    else:
+        with pytest.raises(expected_error) as caught:
+            await task
+        if isinstance(child_failure, AuditIntegrityError):
+            assert caught.value is child_failure
+        else:
+            assert type(caught.value) is AuditIntegrityError
+            assert "child cancelled itself" not in str(caught.value)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_guided_guard_cancellation_during_normal_exit_drains_and_propagates() -> None:
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="cancel-close", lease_token="secret", attempt=1)

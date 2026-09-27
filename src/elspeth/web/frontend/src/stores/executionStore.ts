@@ -163,7 +163,11 @@ interface ExecutionState {
    *  reads the same field and clears with it. */
   dismissError: () => void;
   cancel: (runId: string) => Promise<void>;
-  loadRuns: (sessionId: string) => Promise<RunHistoryLoadOutcome>;
+  loadRuns: (
+    sessionId: string,
+    reconciliationRunId?: string,
+    signal?: AbortSignal,
+  ) => Promise<RunHistoryLoadOutcome>;
   rehydrateActiveRun: (sessionId: string) => Promise<void>;
   loadRunDiagnostics: (runId: string) => Promise<void>;
   evaluateRunDiagnostics: (runId: string) => Promise<void>;
@@ -182,6 +186,27 @@ interface ValidateOptions {
 let wsConnection: WebSocketConnection | null = null;
 let validationRequestSeq = 0;
 let executionRequestSeq = 0;
+let runListReadSeq = 0;
+let runListAppliedSeq = 0;
+let runTerminalRevision = 0;
+let runActivationSeq = 0;
+let wsConnectionSeq = 0;
+interface TerminalReconciliationClaim {
+  activationSeq: number;
+  readSeqAtConflict: number;
+  confirmed: boolean;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  wake: (() => void) | null;
+  endAttempt: (() => void) | null;
+}
+const terminalConflictReconciliationClaims = new Map<string, TerminalReconciliationClaim>();
+const TERMINAL_RECONCILIATION_MAX_ATTEMPTS = 5;
+const TERMINAL_RECONCILIATION_INITIAL_DELAY_MS = 1000;
+const TERMINAL_RECONCILIATION_READ_TIMEOUT_MS = 5000;
+const TERMINAL_RECONCILIATION_ERROR =
+  "Could not confirm this run's final status. Refresh run history and try again.";
+let terminalReconciliationWarningRunId: string | null = null;
+let terminalReconciliationWarningReadSeq = 0;
 
 /**
  * Store-owned REST recovery for a run whose progress stream ended for good
@@ -217,8 +242,7 @@ let runRecoveryPollTimer: ReturnType<typeof setInterval> | null = null;
 // Bounded by age because authFetch sets no timeout: a read that never
 // settles would otherwise stop recovery for good, which is worse than the
 // overlap it prevents. Past the bound a tick starts a fresh read anyway; the
-// late reply is then harmless, because loadRuns' reconciliation only ever
-// moves progress from live to terminal.
+// late reply is fenced by the newest applied read and by terminal precedence.
 const RUN_RECOVERY_READ_STALE_MS = 30_000;
 let runRecoveryPollInFlight: { read: Promise<unknown>; startedAt: number } | null = null;
 
@@ -256,8 +280,11 @@ function shouldApplyExecutionResult(
   );
 }
 
-function shouldApplyRunListResult(sessionId: string): boolean {
-  return useSessionStore.getState().activeSessionId === sessionId;
+function shouldApplyRunListResult(sessionId: string, requestSeq: number): boolean {
+  return (
+    requestSeq > runListAppliedSeq &&
+    useSessionStore.getState().activeSessionId === sessionId
+  );
 }
 
 function assertNever(value: never): never {
@@ -442,11 +469,12 @@ function applyRunEvent(
             status: newProgress.status,
             cancel_requested: false,
             accounting: completedAccounting ?? r.accounting,
+            accounting_corruption: completedAccounting ? null : r.accounting_corruption,
             error:
               event.event_type === "failed"
                 ? (data as RunEventFailed).detail
                 : r.error,
-            finished_at: event.timestamp,
+            finished_at: r.finished_at ?? event.timestamp,
           }
         : r,
     );
@@ -475,6 +503,201 @@ function applyRunEvent(
     wsDisconnected: false,
     wsStreamEnded: false,
   };
+}
+
+function mergeRunListRows(
+  state: ExecutionState,
+  incoming: Run[],
+  terminalRevisionAtRead: number,
+  reconciliationRunId: string | undefined,
+  conflicts: Set<string>,
+): Run[] {
+  const currentById = new Map(state.runs.map((run) => [run.id, run]));
+  return incoming.map((run) => {
+    const current = currentById.get(run.id);
+    const activeTerminalStatus =
+      state.activeRunId === run.id && state.progress && isTerminalRunStatus(state.progress.status)
+        ? state.progress.status
+        : null;
+    if (!isTerminalRunStatus(run.status)) {
+      if (current && isTerminalRunStatus(current.status)) return current;
+      if (activeTerminalStatus) {
+        return { ...run, status: activeTerminalStatus, cancel_requested: false };
+      }
+      return run;
+    }
+    const knownTerminalStatus = activeTerminalStatus ??
+      (current && isTerminalRunStatus(current.status) ? current.status : null);
+    if (knownTerminalStatus !== null && knownTerminalStatus !== run.status) {
+      // One conflicting response is evidence of disagreement, not proof of
+      // which terminal result is current. A fresh read started after that
+      // conflict may adjudicate it, provided no terminal event arrived later.
+      if (reconciliationRunId !== run.id || terminalRevisionAtRead !== runTerminalRevision) {
+        conflicts.add(run.id);
+        return current ?? { ...run, status: knownTerminalStatus };
+      }
+    }
+    if (!current || !isTerminalRunStatus(current.status)) return run;
+    return {
+      ...current,
+      ...run,
+      accounting: run.accounting ??
+        (run.accounting_corruption ? null : current.accounting),
+      accounting_corruption: run.accounting_corruption ??
+        (run.accounting ? null : current.accounting_corruption),
+      discard_summary: run.discard_summary ?? current.discard_summary,
+      error: run.error ?? current.error,
+      finished_at: run.finished_at ?? current.finished_at,
+    };
+  });
+}
+
+function projectRunList(
+  state: ExecutionState,
+  incoming: Run[],
+  terminalRevisionAtRead: number,
+  reconciliationRunId: string | undefined,
+  conflicts: Set<string>,
+): Partial<ExecutionState> {
+  const runs = mergeRunListRows(
+    state, incoming, terminalRevisionAtRead, reconciliationRunId, conflicts,
+  );
+  const activeRow = state.activeRunId !== null
+    ? runs.find((run) => run.id === state.activeRunId)
+    : undefined;
+  if (!activeRow || !isTerminalRunStatus(activeRow.status) || state.progress === null) {
+    return { runs };
+  }
+  const wasTerminal = isTerminalRunStatus(state.progress.status);
+  if (!wasTerminal || state.progress.status !== activeRow.status) {
+    runTerminalRevision += 1;
+  }
+  return {
+    runs,
+    progress: {
+      ...state.progress,
+      status: activeRow.status,
+      cancel_requested: false,
+      accounting: activeRow.accounting_corruption
+        ? null
+        : activeRow.accounting ?? state.progress.accounting,
+    },
+    lastRunOutcome: !wasTerminal
+      ? {
+          runId: activeRow.id,
+          status: activeRow.status,
+          sessionId: state.activeRunSessionId,
+        }
+      : state.lastRunOutcome?.runId === activeRow.id
+        ? { ...state.lastRunOutcome, status: activeRow.status }
+        : state.lastRunOutcome,
+  };
+}
+
+function requestTerminalReconciliation(runId: string): void {
+  if (terminalConflictReconciliationClaims.has(runId)) return;
+  const state = useExecutionStore.getState();
+  const sessionId = state.activeRunId === runId
+    ? state.activeRunSessionId
+    : state.runs.find((run) => run.id === runId)?.session_id;
+  if (!sessionId || useSessionStore.getState().activeSessionId !== sessionId) return;
+  const claim: TerminalReconciliationClaim = {
+    activationSeq: runActivationSeq,
+    readSeqAtConflict: runListReadSeq,
+    confirmed: false,
+    retryTimer: null,
+    wake: null,
+    endAttempt: null,
+  };
+  terminalConflictReconciliationClaims.set(runId, claim);
+  void (async () => {
+    try {
+      for (let attempt = 0; attempt < TERMINAL_RECONCILIATION_MAX_ATTEMPTS; attempt += 1) {
+        if (terminalConflictReconciliationClaims.get(runId) !== claim || claim.confirmed) return;
+        await readTerminalWithDeadline(sessionId, runId, claim);
+        if (terminalConflictReconciliationClaims.get(runId) !== claim || claim.confirmed) return;
+        if (attempt + 1 < TERMINAL_RECONCILIATION_MAX_ATTEMPTS) {
+          const delay = TERMINAL_RECONCILIATION_INITIAL_DELAY_MS * 2 ** attempt;
+          await new Promise<void>((resolve) => {
+            claim.wake = resolve;
+            claim.retryTimer = setTimeout(() => {
+              claim.retryTimer = null;
+              claim.wake = null;
+              resolve();
+            }, delay);
+          });
+        }
+      }
+      if (
+        terminalConflictReconciliationClaims.get(runId) === claim &&
+        useSessionStore.getState().activeSessionId === sessionId &&
+        runActivationSeq === claim.activationSeq
+      ) {
+        terminalReconciliationWarningRunId = runId;
+        terminalReconciliationWarningReadSeq = runListReadSeq;
+        useExecutionStore.setState({ error: TERMINAL_RECONCILIATION_ERROR });
+      }
+    } finally {
+      if (terminalConflictReconciliationClaims.get(runId) === claim) {
+        terminalConflictReconciliationClaims.delete(runId);
+      }
+    }
+  })();
+}
+
+async function readTerminalWithDeadline(
+  sessionId: string,
+  runId: string,
+  claim: TerminalReconciliationClaim,
+): Promise<void> {
+  const controller = new AbortController();
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<void>((resolve) => {
+    claim.endAttempt = () => {
+      controller.abort();
+      resolve();
+    };
+    deadlineTimer = setTimeout(claim.endAttempt, TERMINAL_RECONCILIATION_READ_TIMEOUT_MS);
+  });
+  try {
+    // Abort the transport when possible. The race still bounds this attempt
+    // if a mock, browser transport, or response parser ignores that abort.
+    await Promise.race([
+      useExecutionStore.getState().loadRuns(sessionId, runId, controller.signal),
+      deadline,
+    ]);
+  } finally {
+    if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+    claim.endAttempt = null;
+  }
+}
+
+function confirmTerminalReconciliation(
+  rows: Run[], conflicts: Set<string>, requestSeq: number,
+): void {
+  for (const row of rows) {
+    if (isTerminalRunStatus(row.status) && !conflicts.has(row.id)) {
+      const claim = terminalConflictReconciliationClaims.get(row.id);
+      if (claim && requestSeq > claim.readSeqAtConflict) {
+        claim.confirmed = true;
+        claim.endAttempt?.();
+        if (claim.retryTimer !== null) clearTimeout(claim.retryTimer);
+        claim.retryTimer = null;
+        claim.wake?.();
+        claim.wake = null;
+      }
+      if (
+        terminalReconciliationWarningRunId === row.id &&
+        requestSeq > terminalReconciliationWarningReadSeq
+      ) {
+        terminalReconciliationWarningRunId = null;
+        terminalReconciliationWarningReadSeq = 0;
+        if (useExecutionStore.getState().error === TERMINAL_RECONCILIATION_ERROR) {
+          useExecutionStore.setState({ error: null });
+        }
+      }
+    }
+  }
 }
 
 const initialExecutionState = {
@@ -802,6 +1025,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   connectWebSocket(runId: string) {
+    const connectionSeq = ++wsConnectionSeq;
     // Close any existing WebSocket connection
     wsConnection?.close();
     // A live stream supersedes the previous stream's REST recovery.
@@ -812,15 +1036,36 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       const response = await api.createRunWebSocketTicket(runId);
       return response.ticket;
     };
+    const ownsConnection = (): boolean =>
+      connectionSeq === wsConnectionSeq && get().activeRunId === runId;
     function applyActiveRunEvent(event: RunEvent): boolean {
       let applied = false;
+      let terminalConflict = false;
       set((state) => {
-        if (event.run_id !== runId || state.activeRunId !== runId) {
+        if (event.run_id !== runId || !ownsConnection()) {
           return {};
         }
+        const currentTerminalStatus =
+          state.progress && isTerminalRunStatus(state.progress.status)
+            ? state.progress.status
+            : state.runs.find((run) => run.id === runId)?.status;
+        if (currentTerminalStatus && isTerminalRunStatus(currentTerminalStatus)) {
+          const incomingStatus = deriveStatus(event);
+          if (!isTerminalRunStatus(incomingStatus)) return {};
+          if (incomingStatus !== currentTerminalStatus) {
+            terminalConflict = true;
+            return {};
+          }
+          // A duplicate terminal event can enrich accounting, but must not
+          // recreate a terminal notice the user already acknowledged.
+          applied = true;
+          return { ...applyRunEvent(state, event), lastRunOutcome: state.lastRunOutcome };
+        }
+        if (isTerminalRunStatus(deriveStatus(event))) runTerminalRevision += 1;
         applied = true;
         return applyRunEvent(state, event);
       });
+      if (terminalConflict) requestTerminalReconciliation(runId);
       return applied;
     }
 
@@ -835,6 +1080,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     function runStillLive(): boolean {
       const { activeRunId, progress } = get();
       return (
+        ownsConnection() &&
         activeRunId === runId &&
         progress !== null &&
         !isTerminalRunStatus(progress.status)
@@ -843,10 +1089,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
 
     wsConnection = connectToRun(runId, getTicket, {
       onConnected() {
+        if (!ownsConnection() || !runStillLive()) return;
         stopRunRecoveryPoll();
         set({ wsDisconnected: false, wsStreamEnded: false });
       },
       onDisconnected() {
+        if (!ownsConnection() || !runStillLive()) return;
         set({ wsDisconnected: true, wsStreamEnded: false });
       },
       onStreamEnded() {
@@ -914,10 +1162,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         }
       },
       onAuthFailure() {
+        if (!ownsConnection()) return;
         // Close code 4001 -- do not reconnect, trigger logout
         useAuthStore.getState().logout();
       },
       onRunUnavailable() {
+        if (!ownsConnection()) return;
         // Close code 4004 -- run not found or not owned. A definitive
         // refusal: polling REST could only repeat it.
         stopRunRecoveryPoll();
@@ -931,8 +1181,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   async cancel(runId: string) {
+    const activationSeq = runActivationSeq;
+    const sessionIdAtStart = useSessionStore.getState().activeSessionId;
     try {
       const result = await api.cancelRun(runId);
+      if (activationSeq !== runActivationSeq) return;
+      let terminalConflict = false;
       set((state) => {
         // Cancelling a run that had not started yet takes the backend's
         // non-Event branch: ExecutionService.cancel writes status="cancelled"
@@ -948,6 +1202,19 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         // than the only source. Stamped with the LAUNCH session for the same
         // routing-key reason as every other outcome write.
         const ownsRun = state.activeRunId === runId;
+        const currentRun = state.runs.find((run) => run.id === runId);
+        const currentTerminalStatus =
+          ownsRun && state.progress && isTerminalRunStatus(state.progress.status)
+            ? state.progress.status
+            : currentRun && isTerminalRunStatus(currentRun.status)
+              ? currentRun.status
+              : null;
+        if (currentTerminalStatus !== null) {
+          terminalConflict =
+            isTerminalRunStatus(result.status) && result.status !== currentTerminalStatus;
+          return {};
+        }
+        if (isTerminalRunStatus(result.status)) runTerminalRevision += 1;
         return {
           runs: state.runs.map((run) =>
             run.id === runId
@@ -977,55 +1244,38 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           error: null,
         };
       });
+      if (terminalConflict) requestTerminalReconciliation(runId);
     } catch (err) {
+      if (
+        activationSeq !== runActivationSeq ||
+        useSessionStore.getState().activeSessionId !== sessionIdAtStart
+      ) return;
       const apiErr = err as ApiError;
       set({ error: apiErr.detail ?? "Failed to cancel run." });
     }
   },
 
-  async loadRuns(sessionId: string) {
+  async loadRuns(sessionId: string, reconciliationRunId?: string, signal?: AbortSignal) {
+    const requestSeq = ++runListReadSeq;
+    const terminalRevisionAtRead = runTerminalRevision;
+    const conflicts = new Set<string>();
     try {
-      const runs = await api.fetchRuns(sessionId);
-      if (!shouldApplyRunListResult(sessionId)) return "stale";
-      set((state) => {
-        // Degraded-path reconciliation (WS drop): when the poll observes the
-        // active run terminal while progress still claims in-flight, the WS
-        // terminal event was lost — record the outcome (stamped with the
-        // LAUNCH session) and reconcile progress.status so the always-mounted
-        // surfaces (toast, badge) and ProgressView retire instead of showing
-        // a live run forever. Two callers drive it: InlineRunResults' 3s loop
-        // while the Run tab body is mounted, and the store-owned recovery
-        // poll (see RUN_RECOVERY_POLL_INTERVAL_MS) armed when the stream ends
-        // for good on 1000/1011, which covers the Run tab being closed. A
-        // drop that reconnects (1006/4503) is recovered by the socket itself.
-        const activeRow =
-          state.activeRunId !== null
-            ? runs.find((run) => run.id === state.activeRunId)
-            : undefined;
-        if (
-          activeRow !== undefined &&
-          isTerminalRunStatus(activeRow.status) &&
-          state.progress !== null &&
-          !isTerminalRunStatus(state.progress.status)
-        ) {
-          return {
-            runs,
-            progress: {
-              ...state.progress,
-              status: activeRow.status,
-              cancel_requested: false,
-              accounting: activeRow.accounting ?? state.progress.accounting,
-            },
-            lastRunOutcome: {
-              runId: activeRow.id,
-              status: activeRow.status,
-              sessionId: state.activeRunSessionId,
-            },
-          };
-        }
-        return { runs };
-      });
-      get().attachLiveRunIfUnattached(sessionId, runs);
+      const runs = signal
+        ? await api.fetchRuns(sessionId, signal)
+        : await api.fetchRuns(sessionId);
+      if (signal?.aborted) return "stale";
+      if (!shouldApplyRunListResult(sessionId, requestSeq)) return "stale";
+      runListAppliedSeq = requestSeq;
+      // This projection also performs degraded-path reconciliation when REST
+      // finds a terminal run whose WebSocket terminal event was lost.
+      set((state) => projectRunList(
+        state, runs, terminalRevisionAtRead, reconciliationRunId, conflicts,
+      ));
+      confirmTerminalReconciliation(runs, conflicts, requestSeq);
+      get().attachLiveRunIfUnattached(sessionId, get().runs);
+      if (reconciliationRunId === undefined) {
+        for (const runId of conflicts) requestTerminalReconciliation(runId);
+      }
       return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
@@ -1043,6 +1293,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
    * snapshot, and re-open the WebSocket so ProgressView reattaches.
    */
   async rehydrateActiveRun(sessionId: string) {
+    const requestSeq = ++runListReadSeq;
+    const terminalRevisionAtRead = runTerminalRevision;
+    const conflicts = new Set<string>();
     let runs: Run[];
     try {
       runs = await api.fetchRuns(sessionId);
@@ -1051,9 +1304,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       // and the next session activation retry.
       return;
     }
-    if (!shouldApplyRunListResult(sessionId)) return;
-    set({ runs });
-    get().attachLiveRunIfUnattached(sessionId, runs);
+    if (!shouldApplyRunListResult(sessionId, requestSeq)) return;
+    runListAppliedSeq = requestSeq;
+    set((state) => projectRunList(state, runs, terminalRevisionAtRead, undefined, conflicts));
+    confirmTerminalReconciliation(runs, conflicts, requestSeq);
+    get().attachLiveRunIfUnattached(sessionId, get().runs);
+    for (const runId of conflicts) requestTerminalReconciliation(runId);
   },
 
   /**
@@ -1190,6 +1446,19 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   reset() {
     validationRequestSeq += 1;
     executionRequestSeq += 1;
+    runListReadSeq += 1;
+    runListAppliedSeq = runListReadSeq;
+    runTerminalRevision += 1;
+    runActivationSeq += 1;
+    wsConnectionSeq += 1;
+    for (const claim of terminalConflictReconciliationClaims.values()) {
+      claim.endAttempt?.();
+      if (claim.retryTimer !== null) clearTimeout(claim.retryTimer);
+      claim.wake?.();
+    }
+    terminalConflictReconciliationClaims.clear();
+    terminalReconciliationWarningRunId = null;
+    terminalReconciliationWarningReadSeq = 0;
     wsConnection?.close();
     wsConnection = null;
     stopRunRecoveryPoll();

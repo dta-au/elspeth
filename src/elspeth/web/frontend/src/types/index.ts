@@ -122,8 +122,14 @@ export interface ChatMessage {
   segments?: ChatMessageSegment[];
   tool_calls: ToolCall[] | null;
   created_at: string;
+  /** Server receipt identity for an accepted user send; absent on older rows. */
+  client_request_id?: string | null;
   local_status?: "pending" | "failed";
   local_error?: string;
+  /** Original nullable state supplied with an optimistic send. */
+  local_requested_state_id?: string | null;
+  /** Accepted ingress receipt awaiting an authoritative transcript refresh. */
+  local_accepted_user_message_id?: string;
   /** Closed failure code from the ApiError that failed this local send
    *  (e.g. "policy_blocked", which is permanent by construction — retry
    *  affordances must not invite a retry for it). Set only when the error
@@ -1177,6 +1183,9 @@ export interface ApiError {
   /** Server correlation id (RequestIdMiddleware). Present on fail-closed
    *  audit-integrity 500s so the banner can name a support reference. */
   request_id?: string;
+  /** Exact accepted send receipt, distinct from the server request correlation id. */
+  client_request_id?: string;
+  user_message_id?: string;
   /** Closed guided-operation failure code (guided_operation_terminal_failure
    *  envelopes). "policy_blocked" is permanent by construction — retry
    *  affordances must not invite a retry for it. */

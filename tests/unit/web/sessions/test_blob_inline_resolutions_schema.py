@@ -68,9 +68,9 @@ def test_blob_inline_resolutions_schema_epoch_is_68(engine) -> None:
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
     # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
-    assert SESSION_SCHEMA_EPOCH == 68
+    assert SESSION_SCHEMA_EPOCH == 69
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 68
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 69
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

@@ -1,4 +1,4 @@
-"""Transient-LLM-failure wrapper for ``solve_step_chat`` (Phase A slice 3).
+"""Guided LLM failure wrappers for the four step-chat palettes.
 
 Contract: see :func:`solve_step_chat_with_auto_drop`.
 
@@ -13,7 +13,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import structlog
 
@@ -30,6 +30,7 @@ from elspeth.web.composer.guided.chat_solver import (
     GuidedChatDeferredManagementOutcome,
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
+    GuidedProviderTransportError,
     GuidedToolArgumentShapeError,
     GuidedUploadedSourceConfigError,
     Step1ExistingUploadContext,
@@ -39,6 +40,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1UploadedSourceChatResolution,
     Step2SinkResolvedOutcome,
     StepChatContextInput,
+    classify_guided_provider_failure,
     maybe_manage_deferred_intent_chat,
     maybe_resolve_step_1_source_chat,
     maybe_resolve_step_2_sink_chat,
@@ -64,8 +66,8 @@ if TYPE_CHECKING:
 slog = structlog.get_logger()
 
 
-def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
-    """Canonical provider/transport failures shared by every chat palette."""
+def _provider_fallback_exception_types() -> tuple[type[BaseException], ...]:
+    """Provider and response failures handled as guided chat fallbacks."""
 
     from litellm.exceptions import APIError as LiteLLMAPIError
     from litellm.exceptions import AuthenticationError as LiteLLMAuthError
@@ -83,6 +85,7 @@ def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
         LiteLLMAuthError,
         LiteLLMBadRequestError,
         OpenAIProviderError,
+        GuidedProviderTransportError,
         BudgetExceededError,
         BlockedPiiEntityError,
         GuardrailRaisedException,
@@ -94,10 +97,10 @@ def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
     )
 
 
-def _guided_tool_transient_exception_types() -> tuple[type[BaseException], ...]:
+def _guided_tool_fallback_exception_types() -> tuple[type[BaseException], ...]:
     """Provider failures plus malformed terminal/discovery response shapes."""
 
-    return (*_provider_transient_exception_types(), ValueError, GuidedSolverResponseShapeError)
+    return (*_provider_fallback_exception_types(), ValueError, GuidedSolverResponseShapeError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +118,7 @@ class StepChatResult:
     status: ComposerChatTurnStatus
     latency_ms: int
     error_class: str | None
+    provider_failure_kind: Literal["auth", "bad_request", "unavailable", "timeout"] | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -282,12 +286,32 @@ def is_guided_step_chat_empty_result(outcome: Step1SourceChatResult | Step2SinkC
     return type(outcome) is GuidedStepChatEmptyResult
 
 
-# Synthetic message returned to the user when the LLM is transiently
-# unavailable. Phrase chosen to match the Phase-A.5 opener-drop wording
+# Synthetic message returned to the user when the LLM is unavailable.
+# Phrase chosen to match the Phase-A.5 opener-drop wording
 # (plan line 147) so the frontend renders a consistent "LLM is offline"
 # experience whether the failure was on a user message or a step-entry
 # opener. The wizard widgets remain functional; chat is best-effort.
 _SYNTHETIC_UNAVAILABLE_MESSAGE = "I'm unavailable right now; you can still use the wizard controls."
+_PROVIDER_AUTH_MESSAGE = (
+    "I couldn't use the configured LLM credentials. Ask an administrator to update the provider credentials; "
+    "you can still use the wizard controls."
+)
+_PROVIDER_BAD_REQUEST_MESSAGE = (
+    "The LLM request was rejected. Ask an administrator to correct the model or provider configuration; "
+    "you can still use the wizard controls."
+)
+
+
+def _provider_failure_copy(exc: BaseException) -> tuple[str, Literal["auth", "bad_request", "unavailable", "timeout"] | None]:
+    failure = classify_guided_provider_failure(exc)
+    if failure is None:
+        return _SYNTHETIC_UNAVAILABLE_MESSAGE, None
+    if failure.kind == "auth":
+        return _PROVIDER_AUTH_MESSAGE, failure.kind
+    if failure.kind == "bad_request":
+        return _PROVIDER_BAD_REQUEST_MESSAGE, failure.kind
+    return _SYNTHETIC_UNAVAILABLE_MESSAGE, failure.kind
+
 
 _MODEL_SHAPE_REJECTED_MESSAGE = (
     "I put that step result together incorrectly just now — the connection is fine "
@@ -310,7 +334,7 @@ _COMMIT_REJECTED_MESSAGE = (
 # retryable: the Send is safe to try again, and the wizard controls remain a
 # fallback. ``status`` stays ``SYNTHETIC_UNAVAILABLE`` (no dedicated audit
 # enum member for this cause); ``error_class`` carries the distinction
-# (``AssistantScaffoldLeakError`` vs a transient exception class) for anyone
+# (``AssistantScaffoldLeakError`` vs a provider exception class) for anyone
 # reading the audit trail.
 _SCAFFOLD_LEAK_MESSAGE = (
     "That reply didn't pass a quality check, so it wasn't shown — nothing is "
@@ -388,7 +412,7 @@ async def resolve_deferred_intent_management_chat_with_auto_drop(
     request: DeferredIntentManagementChatRequest,
     recorder: BufferingRecorder | None,
 ) -> DeferredIntentManagementChatResult:
-    """Map malformed/transient management calls to an unchanged guided turn."""
+    """Map recoverable management-call failures to an unchanged guided turn."""
 
     started = time.perf_counter()
     try:
@@ -456,10 +480,11 @@ async def resolve_deferred_intent_management_chat_with_auto_drop(
                 error_class=type(exc).__name__,
             ),
         )
-    except _guided_tool_transient_exception_types() as exc:
+    except _guided_tool_fallback_exception_types() as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
+        assistant_message, provider_failure_kind = _provider_failure_copy(exc)
         slog.error(
-            "guided.deferred_intent_management_transient_failure",
+            "guided.deferred_intent_management_fallback_failure",
             session_id=session_id,
             user_id=user_id,
             site=site,
@@ -470,10 +495,11 @@ async def resolve_deferred_intent_management_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_SYNTHETIC_UNAVAILABLE_MESSAGE,
+                assistant_message=assistant_message,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
+                provider_failure_kind=provider_failure_kind,
             ),
         )
 
@@ -647,7 +673,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
             ),
         )
     except AssistantScaffoldLeakError as exc:
-        # Distinct branch from the transient set below: the model can leak
+        # Distinct branch from the provider fallback set below: the model can leak
         # scaffolding INTO resolve_source's own assistant_message argument
         # (observed live, tutorial resolve_source path), not only in the
         # tool-less advisory call. Same honest-copy outcome as
@@ -675,7 +701,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
             ),
         )
     except GuidedToolArgumentShapeError as exc:
-        # A ValueError subclass, so this branch MUST precede the transient
+        # A ValueError subclass, so this branch MUST precede the fallback
         # set: the LLM call succeeded and the model replied — the reply just
         # violates resolve_source's argument contract. Calling that
         # "unavailable" mislabels a model-output defect as provider weather
@@ -711,10 +737,11 @@ async def resolve_step_1_source_chat_with_auto_drop(
                 error_class=type(exc).__name__,
             ),
         )
-    except _guided_tool_transient_exception_types() as exc:
+    except _guided_tool_fallback_exception_types() as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
+        assistant_message, provider_failure_kind = _provider_failure_copy(exc)
         slog.error(
-            "guided.step_1_source_chat_transient_failure",
+            "guided.step_1_source_chat_fallback_failure",
             session_id=session_id,
             user_id=user_id,
             site=site,
@@ -725,10 +752,11 @@ async def resolve_step_1_source_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_SYNTHETIC_UNAVAILABLE_MESSAGE,
+                assistant_message=assistant_message,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
+                provider_failure_kind=provider_failure_kind,
             ),
         )
 
@@ -906,7 +934,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             ),
         )
     except AssistantScaffoldLeakError as exc:
-        # Distinct branch from the transient set below: the model can leak
+        # Distinct branch from the provider fallback set below: the model can leak
         # scaffolding INTO resolve_sink's own assistant_message argument, not
         # only in the tool-less advisory call. Same honest-copy outcome as
         # ``solve_step_chat_with_auto_drop``'s dedicated branch — a scaffold
@@ -937,7 +965,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     except GuidedToolArgumentShapeError as exc:
         # Mirror of the step-1 branch; see the comment there (both steps now
         # self-repair in-Send, so this too fires only at repair exhaustion).
-        # Must precede the transient set (GuidedToolArgumentShapeError is a
+        # Must precede the fallback set (GuidedToolArgumentShapeError is a
         # ValueError).
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
@@ -959,10 +987,11 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                 error_class=type(exc).__name__,
             ),
         )
-    except _guided_tool_transient_exception_types() as exc:
+    except _guided_tool_fallback_exception_types() as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
+        assistant_message, provider_failure_kind = _provider_failure_copy(exc)
         slog.error(
-            "guided.step_2_sink_chat_transient_failure",
+            "guided.step_2_sink_chat_fallback_failure",
             session_id=session_id,
             user_id=user_id,
             site=site,
@@ -973,10 +1002,11 @@ async def resolve_step_2_sink_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_SYNTHETIC_UNAVAILABLE_MESSAGE,
+                assistant_message=assistant_message,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
+                provider_failure_kind=provider_failure_kind,
             ),
         )
 
@@ -999,12 +1029,12 @@ async def solve_step_chat_with_auto_drop(
     api_key: str | None = None,
     reasoning_effort: str | None = None,
 ) -> StepChatResult:
-    """Wrap ``solve_step_chat`` with the synthetic-message-on-transient contract.
+    """Wrap ``solve_step_chat`` with a safe, reason-aware fallback contract.
 
-    On success, returns the LLM's assistant reply verbatim. On transient
-    LLM failure (LiteLLM API/auth/bad-request, timeouts, malformed-response
-    shape from ``response.choices[0].message``), returns the synthetic
-    unavailable message and emits a slog event with safe frame strings.
+    On success, returns the LLM's assistant reply verbatim. On provider or
+    malformed-response failure, returns a safe synthetic message and emits
+    a slog event with safe frame strings. Authentication and bad-request
+    failures carry corrective guidance instead of transient retry guidance.
     **The session is not modified**: advisory chat failure does not terminate
     guided mode.
 
@@ -1020,7 +1050,7 @@ async def solve_step_chat_with_auto_drop(
     instead of 500ing (observed live 2026-07-03, guided step_1 advisory
     reply).
 
-    The transient exception set mirrors the project canonical in
+    The provider fallback exception set mirrors the project canonical in
     ``composer/service.py``:
     ``LiteLLMAPIError``, ``LiteLLMAuthError``, ``LiteLLMBadRequestError``,
     plus the non-``APIError`` operational classes ``BudgetExceededError``,
@@ -1062,7 +1092,7 @@ async def solve_step_chat_with_auto_drop(
         fallback message — slice 3 left this gap on the wire by design;
         slice 5 closes it in the audit path. ``error_class`` distinguishes
         the two fallback causes (``AssistantScaffoldLeakError`` vs a
-        transient exception class) since ``status`` alone does not.
+        provider exception class) since ``status`` alone does not.
     """
     started = time.perf_counter()
     try:
@@ -1088,7 +1118,7 @@ async def solve_step_chat_with_auto_drop(
             error_class=None,
         )
     except AssistantScaffoldLeakError as exc:
-        # Distinct slog event from the transient set: a scaffold leak is a
+        # Distinct slog event from the provider fallback set: a scaffold leak is a
         # model register violation worth counting separately in triage, not
         # provider weather. Honest outcome — the guard rejected THIS reply,
         # the service is not down — not the unavailability copy; Send stays
@@ -1110,10 +1140,11 @@ async def solve_step_chat_with_auto_drop(
             latency_ms=latency_ms,
             error_class=type(exc).__name__,
         )
-    except _provider_transient_exception_types() as exc:
+    except _provider_fallback_exception_types() as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
+        assistant_message, provider_failure_kind = _provider_failure_copy(exc)
         slog.error(
-            "guided.step_chat_transient_failure",
+            "guided.step_chat_fallback_failure",
             session_id=session_id,
             user_id=user_id,
             site=site,
@@ -1123,8 +1154,9 @@ async def solve_step_chat_with_auto_drop(
             frames=_safe_frame_strings(exc),
         )
         return StepChatResult(
-            assistant_message=_SYNTHETIC_UNAVAILABLE_MESSAGE,
+            assistant_message=assistant_message,
             status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
             latency_ms=latency_ms,
             error_class=type(exc).__name__,
+            provider_failure_kind=provider_failure_kind,
         )

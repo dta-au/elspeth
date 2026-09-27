@@ -250,6 +250,29 @@ async def _join_shielded_task_after_cancellation[T](
         return None
 
 
+async def _await_guided_terminal_write[T](awaitable: Awaitable[T], *, child_cancel_is_integrity: bool = True) -> T:
+    """Join a guided terminal write before its route releases the operation lease.
+
+    A caller may be cancelled repeatedly while a database or progress write is
+    in flight. The child owns that write until it finishes. A child that
+    cancels itself has not proved completion and is an integrity failure for
+    required writes. A caller that is already preserving a stronger durable
+    primary may instead treat a progress-only sink cancellation as secondary.
+    """
+    write_task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(write_task)
+    except asyncio.CancelledError as exc:
+        if write_task.cancelled() and child_cancel_is_integrity:
+            raise AuditIntegrityError("Guided terminal write was cancelled before completion") from exc
+        try:
+            return await _join_shielded_task_after_cancellation(write_task)
+        except asyncio.CancelledError as child_cancel:
+            if child_cancel_is_integrity:
+                raise AuditIntegrityError("Guided terminal write was cancelled before completion") from child_cancel
+            raise
+
+
 def _record_guided_cleanup_failure(error: BaseException, *, site: str, session_lease: SessionOperationLease) -> None:
     """Record secondary failures even when HTTP/cancellation hides notes."""
     _log_last_resort_diagnostic(

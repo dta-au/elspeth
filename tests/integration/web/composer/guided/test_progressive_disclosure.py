@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -269,7 +269,7 @@ def _get_current_guided_session(client: TestClient, session_id: str) -> dict:
 def _send_message(client: TestClient, session_id: str, content: str) -> dict:
     resp = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": content},
+        json={"content": content, "client_request_id": str(uuid4())},
     )
     assert resp.status_code == 200, f"send_message failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -293,8 +293,17 @@ def _seed_user_message(client: TestClient, session_id: str, content: str = "retr
     )
 
 
+def _last_user_message_id(client: TestClient, session_id: str) -> str:
+    service: SessionServiceImpl = client.app.state.session_service
+    messages = asyncio.run(service.get_messages(UUID(session_id)))
+    return str(next(message.id for message in reversed(messages) if message.role == "user"))
+
+
 def _recompose(client: TestClient, session_id: str) -> dict:
-    resp = client.post(f"/api/sessions/{session_id}/recompose")
+    resp = client.post(
+        f"/api/sessions/{session_id}/recompose",
+        json={"expected_user_message_id": _last_user_message_id(client, session_id)},
+    )
     assert resp.status_code == 200, f"recompose failed: {resp.status_code} {resp.text}"
     return resp.json()
 
@@ -437,7 +446,7 @@ class TestSecondFreeformTurnAfterTransition:
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
                 composer_freeform_client.post(
                     f"/api/sessions/{session_id}/messages",
-                    json={"content": "leave guided mode"},
+                    json={"content": "leave guided mode", "client_request_id": str(uuid4())},
                 )
 
             assert _get_current_guided_session(composer_freeform_client, session_id).get("transition_consumed") is False
@@ -605,7 +614,10 @@ class TestRecomposeTransitionPrompt:
         _inject_one_assistant_insert_failure(composer_freeform_client, monkeypatch)
         with patch("elspeth.web.composer.service._litellm_acompletion", side_effect=_fake_acompletion):
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
-                composer_freeform_client.post(f"/api/sessions/{session_id}/recompose")
+                composer_freeform_client.post(
+                    f"/api/sessions/{session_id}/recompose",
+                    json={"expected_user_message_id": _last_user_message_id(composer_freeform_client, session_id)},
+                )
 
             assert _get_current_guided_session(composer_freeform_client, session_id).get("transition_consumed") is False
             body = _recompose(composer_freeform_client, session_id)

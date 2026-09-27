@@ -181,6 +181,19 @@ class TestChatTurn:
         )
         assert turn.synthetic_failure_reason == "not_applied"
 
+    @pytest.mark.parametrize("reason", ["provider_auth", "provider_bad_request"])
+    def test_chat_turn_accepts_corrective_provider_failure_reason(self, reason: str) -> None:
+        turn = ChatTurn(
+            role=ChatRole.ASSISTANT,
+            content="Ask an administrator to correct the provider configuration.",
+            seq=1,
+            step=GuidedStep.STEP_1_SOURCE,
+            ts_iso="2026-09-27T00:00:00+00:00",
+            assistant_message_kind="synthetic_failure",
+            synthetic_failure_reason=reason,
+        )
+        assert turn.synthetic_failure_reason == reason
+
     def test_rejects_synthetic_failure_without_reason(self) -> None:
         with pytest.raises(ValueError, match="synthetic_failure_reason is required"):
             ChatTurn(

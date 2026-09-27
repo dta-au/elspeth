@@ -265,6 +265,8 @@ export async function parseResponse<T>(
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
+    let clientRequestId: string | undefined;
+    let userMessageId: string | undefined;
     let failureCode: string | undefined;
     let guidance: string | undefined;
     let componentId: string | undefined;
@@ -312,6 +314,8 @@ export async function parseResponse<T>(
         : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      clientRequestId = firstStringField([body, nestedDetail], ["client_request_id"]);
+      userMessageId = firstStringField([body, nestedDetail], ["user_message_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
       guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
@@ -464,6 +468,8 @@ export async function parseResponse<T>(
       storage_quota: storageQuota,
       sources,
       request_id: requestId,
+      client_request_id: clientRequestId,
+      user_message_id: userMessageId,
       failure_code: failureCode,
       guidance,
       component_id: componentId,
@@ -899,11 +905,15 @@ export async function rejectCompositionProposal(
 export async function sendMessage(
   sessionId: string,
   content: string,
-  stateId?: string,
+  clientRequestId: string,
+  stateId?: string | null,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const body: { content: string; state_id?: string } = { content };
-  if (stateId) {
+  const body: { content: string; client_request_id: string; state_id?: string | null } = {
+    content,
+    client_request_id: clientRequestId,
+  };
+  if (stateId !== undefined) {
     body.state_id = stateId;
   }
   const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
@@ -919,11 +929,13 @@ export async function sendMessage(
  *  Used by the retry flow when the user message is already persisted. */
 export async function recompose(
   sessionId: string,
+  expectedUserMessageId: string,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
   const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
     method: "POST",
     headers: authHeaders("application/json"),
+    body: JSON.stringify({ expected_user_message_id: expectedUserMessageId }),
     signal,
   });
   return parseResponse<MessageWithStateResponse>(response);
@@ -1472,9 +1484,10 @@ export async function getRunResults(
 }
 
 /** List runs for a session. */
-export async function fetchRuns(sessionId: string): Promise<Run[]> {
+export async function fetchRuns(sessionId: string, signal?: AbortSignal): Promise<Run[]> {
   const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
     headers: authHeaders(),
+    signal,
   });
   return parseResponse<Run[]>(response);
 }

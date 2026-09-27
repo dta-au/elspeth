@@ -42,6 +42,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -109,6 +110,131 @@ def _convert_outcome(client: TestClient, session_id: str, operation_id: str) -> 
     )
     assert isinstance(outcome, GuidedOperationCompleted)
     return outcome
+
+
+def test_convert_postcommit_cancellation_joins_success_writer_and_replays(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    operation_id = str(uuid4())
+    body = {"operation_id": operation_id, "intent": _CONVERT_INTENT}
+    service = client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_save = service.save_state_for_guided_operation
+
+    async def save_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        result = await real_save(*args, **kwargs)
+        committed.set()
+        try:
+            await release_result.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "save_state_for_guided_operation", save_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/convert", json=body))
+            await asyncio.wait_for(committed.wait(), 5)
+            request_task.cancel("first cancellation after convert commit")
+            request_task.cancel("second cancellation after convert commit")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    _convert_outcome(client, session_id, operation_id)
+    replay = client.post(f"/api/sessions/{session_id}/guided/convert", json=body)
+    assert replay.status_code == 200, replay.json()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("integrity", "integrity_error"),
+        ("conflict", "stale_conflict"),
+        ("child_cancel", "integrity_error"),
+        ("child_cancel_no_caller", "integrity_error"),
+    ],
+)
+def test_convert_cancelled_settlement_surfaces_child_failure(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    body = {"operation_id": str(uuid4()), "intent": _CONVERT_INTENT}
+    service = client.app.state.session_service
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_settlement(*args: object, **kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        if failure_kind == "conflict":
+            raise GuidedOperationSettlementConflictError()
+        if failure_kind in {"child_cancel", "child_cancel_no_caller"}:
+            raise asyncio.CancelledError("conversion child cancelled itself")
+        raise AuditIntegrityError("injected conversion settlement integrity failure")
+
+    monkeypatch.setattr(service, "save_state_for_guided_operation", fail_settlement)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/convert", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            if failure_kind != "child_cancel_no_caller":
+                request_task.cancel("cancel while conversion settlement child is pending")
+                try:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+                finally:
+                    release.set()
+            else:
+                release.set()
+            if failure_kind == "conflict":
+                response = await asyncio.wait_for(request_task, 5)
+                assert response.status_code == 409, response.json()
+                assert response.json()["detail"]["failure_code"] == expected_code
+            else:
+                with pytest.raises(AuditIntegrityError):
+                    await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == expected_code
+    replayed = client.post(f"/api/sessions/{session_id}/guided/convert", json=body)
+    assert replayed.status_code == (409 if failure_kind == "conflict" else 500)
+    assert replayed.json()["detail"]["failure_code"] == expected_code
 
 
 def _guided_turn_emitted_args(client: TestClient, session_id: str) -> list[dict]:

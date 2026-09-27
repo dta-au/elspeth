@@ -7,7 +7,7 @@ import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
@@ -523,6 +523,163 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
         operation_id=operation_id,
         phase="failed",
         reason="provider_unavailable",
+    )
+
+
+def test_guided_plan_cancellation_during_ordinary_audit_write_keeps_original_failure(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AuditedFailurePlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            _record_failed_llm_call(kwargs["recorder"], status=ComposerLLMCallStatus.API_ERROR, secret="safe-test-marker")
+            raise PipelinePlannerError("safe provider failure", code="PROVIDER_ERROR")
+
+    composer_test_client.app.state.composer_service = _AuditedFailurePlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided plan writer custody"}).json()
+    operation_id = str(uuid4())
+    service = composer_test_client.app.state.session_service
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    real_writer = service.fail_guided_operation_with_audit
+
+    async def delayed_failure(command, *, session_operation_context):
+        writer_started.set()
+        await release_writer.wait()
+        return await real_writer(command, session_operation_context=session_operation_context)
+
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", delayed_failure)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Record this guided failure."},
+                )
+            )
+            await asyncio.wait_for(writer_started.wait(), 5)
+            request_task.cancel("cancel during audited planner failure")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_writer.set()
+            response = await asyncio.wait_for(request_task, 5)
+            assert response.status_code == 503
+
+    asyncio.run(drive())
+    with composer_test_client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id))
+            .mappings()
+            .one()
+        )
+        audit_rows = (
+            connection.execute(
+                select(chat_messages_table).where(
+                    chat_messages_table.c.session_id == session["id"],
+                    chat_messages_table.c.role == "audit",
+                )
+            )
+            .mappings()
+            .all()
+        )
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.operation_id == operation_id,
+                    guided_operation_events_table.c.event_kind == "failed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "provider_unavailable"
+    assert len(audit_rows) == 1
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["actor"] == "composer_route"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
+
+
+def test_guided_plan_cancellation_during_tier1_audit_write_preserves_typed_abort(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_failure = AuditIntegrityError("injected Tier-1 planner failure")
+
+    class _IntegrityFailurePlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            _record_failed_llm_call(kwargs["recorder"], status=ComposerLLMCallStatus.API_ERROR, secret="safe-tier1-marker")
+            raise original_failure
+
+    composer_test_client.app.state.composer_service = _IntegrityFailurePlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided plan Tier-1 custody"}).json()
+    operation_id = str(uuid4())
+    service = composer_test_client.app.state.session_service
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    real_writer = service.fail_guided_operation_with_audit
+
+    async def delayed_failure(command, *, session_operation_context):
+        writer_started.set()
+        await release_writer.wait()
+        return await real_writer(command, session_operation_context=session_operation_context)
+
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", delayed_failure)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Record this integrity failure."},
+                )
+            )
+            await asyncio.wait_for(writer_started.wait(), 5)
+            request_task.cancel("cancel during Tier-1 audit write")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_writer.set()
+            with pytest.raises(AuditIntegrityError) as caught:
+                await asyncio.wait_for(request_task, 5)
+            assert caught.value is original_failure
+
+    asyncio.run(drive())
+    with composer_test_client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id))
+            .mappings()
+            .one()
+        )
+        audit_rows = (
+            connection.execute(
+                select(chat_messages_table).where(
+                    chat_messages_table.c.session_id == session["id"],
+                    chat_messages_table.c.role == "audit",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    assert len(audit_rows) == 1
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
     )
 
 

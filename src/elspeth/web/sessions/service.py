@@ -185,6 +185,7 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     interpretation_events_table,
+    message_ingress_receipts_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     run_events_table,
@@ -289,6 +290,9 @@ from elspeth.web.sessions.protocol import (
     InterpretationPlaceholderConsumedError,
     InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
+    MessageIngressAccepted,
+    MessageIngressConflict,
+    MessageIngressFresh,
     PipelineDispatchRecovery,
     PipelineProposalPublicMetadata,
     PipelineProposalRejectionReason,
@@ -8405,14 +8409,12 @@ class SessionServiceImpl:
         actor: str,
         session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
-        """Reject a pending proposal by appending an event, then updating status.
+        """Reject a pending proposal, or return an exact prior rejection.
 
         Raise contract, in order: ``KeyError`` when no proposal row exists for
         ``proposal_id`` in this session, and ``ProposalStateConflictError``
-        only when the row exists but its status is no longer ``"pending"``
-        (another writer already made it terminal). Nothing else in this
-        method raises ``ProposalStateConflictError``; the route-level
-        auto-reject on a validation failure relies on that distinction.
+        when another decision or actor made it terminal. The exact prior
+        rejection must still have one well-formed, bound terminal event.
         """
         sid = str(session_id)
         pid = str(proposal_id)
@@ -8436,6 +8438,23 @@ class SessionServiceImpl:
                 ).one_or_none()
                 if row is None:
                     raise KeyError(pid)
+                if row.status == "rejected":
+                    terminal_rows = conn.execute(
+                        select(proposal_events_table)
+                        .where(proposal_events_table.c.session_id == sid)
+                        .where(proposal_events_table.c.proposal_id == pid)
+                        .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
+                    ).fetchall()
+                    if (
+                        len(terminal_rows) != 1
+                        or terminal_rows[0].event_type != "proposal.rejected"
+                        or row.audit_event_id != terminal_rows[0].id
+                        or row.committed_state_id is not None
+                        or terminal_rows[0].payload != {"status": "rejected"}
+                    ):
+                        raise AuditIntegrityError("rejected proposal terminal binding mismatch")
+                    if terminal_rows[0].actor == actor:
+                        return _proposal_record_from_row(row)
                 if row.status != "pending":
                     raise ProposalStateConflictError(f"Proposal {pid} must be pending to reject; got {row.status!r}")
 
@@ -9548,12 +9567,83 @@ class SessionServiceImpl:
             ),
         )
 
+    @staticmethod
+    def _existing_message_ingress_result(
+        conn: Connection,
+        *,
+        session_id: str,
+        client_request_id: UUID,
+        content: str,
+        requested_state_id: str | None,
+    ) -> MessageIngressAccepted | MessageIngressConflict | None:
+        receipt = conn.execute(
+            select(message_ingress_receipts_table).where(
+                message_ingress_receipts_table.c.session_id == session_id,
+                message_ingress_receipts_table.c.client_request_id == str(client_request_id),
+            )
+        ).one_or_none()
+        if receipt is None:
+            return None
+        accepted_message = conn.execute(
+            select(chat_messages_table).where(
+                chat_messages_table.c.session_id == session_id,
+                chat_messages_table.c.id == receipt.user_message_id,
+            )
+        ).one_or_none()
+        if accepted_message is None or accepted_message.role != "user" or accepted_message.writer_principal != "route_user_message":
+            raise AuditIntegrityError("Tier 1: message ingress receipt does not reference a route-owned user row")
+        result_type = (
+            MessageIngressAccepted
+            if accepted_message.content == content and receipt.requested_state_id == requested_state_id
+            else MessageIngressConflict
+        )
+        return result_type(client_request_id=client_request_id, user_message_id=UUID(receipt.user_message_id))
+
+    async def lookup_message_ingress(
+        self,
+        session_id: UUID,
+        *,
+        client_request_id: UUID,
+        content: str,
+        requested_state_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> MessageIngressAccepted | MessageIngressConflict | None:
+        """Read prior acceptance under the compose fence before state preflight.
+
+        A missing receipt remains provisional; the atomic insert checks again.
+        """
+        sid = str(session_id)
+        original_state_id = str(requested_state_id) if requested_state_id is not None else None
+
+        def _sync() -> MessageIngressAccepted | MessageIngressConflict | None:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
+                return self._existing_message_ingress_result(
+                    conn,
+                    session_id=sid,
+                    client_request_id=client_request_id,
+                    content=content,
+                    requested_state_id=original_state_id,
+                )
+
+        return cast(MessageIngressAccepted | MessageIngressConflict | None, await self._run_sync(_sync))
+
     async def add_message_with_transcript(
         self,
         session_id: UUID,
         role: ChatMessageRole,
         content: str,
         *,
+        client_request_id: UUID,
+        requested_state_id: UUID | None,
         writer_principal: ChatMessageWriterPrincipal,
         tool_calls: Sequence[Mapping[str, Any]] | None = None,
         composition_state_id: UUID | None = None,
@@ -9561,8 +9651,8 @@ class SessionServiceImpl:
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
-    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
-        """Insert a chat message and read the full transcript in ONE transaction.
+    ) -> MessageIngressFresh | MessageIngressAccepted | MessageIngressConflict:
+        """Accept one freeform user message and read its transcript in one transaction.
 
         Write-then-read split across two pooled connections is how the
         freeform send path produced false Tier-1 ``AuditIntegrityError``
@@ -9585,18 +9675,23 @@ class SessionServiceImpl:
         insert stays durable even when verification fails, so "your
         message was saved" remains true for the caller).
 
-        Returns ``(record, transcript)`` where ``record`` is the
-        DB-authoritative row for the inserted message and ``transcript``
-        is the full session transcript ordered by ``sequence_no``,
-        ending at ``record``.
+        A same-session receipt binds the client key to the original content
+        and nullable requested state before sequence allocation. An exact
+        duplicate is an acceptance receipt, never a composition replay.
         """
+        if role != "user" or writer_principal != "route_user_message":
+            raise ValueError("message ingress requires a route-owned user message")
+        if raw_content is not None or tool_calls is not None or tool_call_id is not None or parent_assistant_id is not None:
+            raise ValueError("message ingress user row cannot carry provider or tool metadata")
         now = self._now()
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
+        requested_sid = str(requested_state_id) if requested_state_id else None
+        request_id = str(client_request_id)
         pid = str(parent_assistant_id) if parent_assistant_id else None
         msg_id_holder: dict[str, str] = {}
 
-        def _sync() -> tuple[Sequence[Any], Sequence[Any]]:
+        def _sync() -> tuple[Sequence[Any], Sequence[Any]] | MessageIngressAccepted | MessageIngressConflict:
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -9607,6 +9702,22 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ),
             ):
+                existing = self._existing_message_ingress_result(
+                    conn,
+                    session_id=sid,
+                    client_request_id=client_request_id,
+                    content=content,
+                    requested_state_id=requested_sid,
+                )
+                if existing is not None:
+                    return existing
+                if requested_sid is not None:
+                    _assert_state_in_session(
+                        conn,
+                        state_id=requested_sid,
+                        expected_session_id=sid,
+                        caller="add_message_with_transcript",
+                    )
                 if csid is not None:
                     _assert_state_in_session(
                         conn,
@@ -9633,6 +9744,15 @@ class SessionServiceImpl:
                     created_at=now,
                     session_operation_context=session_operation_context,
                 )
+                conn.execute(
+                    insert(message_ingress_receipts_table).values(
+                        session_id=sid,
+                        client_request_id=request_id,
+                        user_message_id=msg_id_holder["id"],
+                        requested_state_id=requested_sid,
+                        created_at=now,
+                    )
+                )
                 with self._session_mutations(
                     conn, session_id=sid, session_operation_context=session_operation_context
                 ) as session_mutations:
@@ -9656,7 +9776,10 @@ class SessionServiceImpl:
                 ).fetchall()
                 return message_rows, failed_event_rows
 
-        message_rows, failed_event_rows = await self._run_sync(_sync)
+        sync_result = await self._run_sync(_sync)
+        if isinstance(sync_result, (MessageIngressAccepted, MessageIngressConflict)):
+            return sync_result
+        message_rows, failed_event_rows = sync_result
         # Pure verifier over the same rows the transcript is built from —
         # parity with get_messages' fail-closed posture. Runs after commit,
         # so a poisoned cohort rejects the READ, not the durable write.
@@ -9673,7 +9796,9 @@ class SessionServiceImpl:
                 f"transaction snapshot for session {sid} does not end at "
                 f"inserted message {msg_id_holder['id']}."
             )
-        return transcript[-1], transcript
+        message = replace(transcript[-1], client_request_id=client_request_id)
+        transcript[-1] = message
+        return MessageIngressFresh(client_request_id=client_request_id, message=message, transcript=transcript)
 
     def _verify_guided_failure_audit_cohort(
         self,
@@ -9749,7 +9874,9 @@ class SessionServiceImpl:
             if actual != commitments[0]:
                 raise AuditIntegrityError("guided failure audit cohort does not match the exact durable evidence rows")
 
-    def _row_to_chat_message_record(self, row: Any) -> ChatMessageRecord:
+    def _row_to_chat_message_record(self, row: Any, *, client_request_id: str | None = None) -> ChatMessageRecord:
+        if client_request_id is not None and (row.role != "user" or row.writer_principal != "route_user_message"):
+            raise AuditIntegrityError("Tier 1: message ingress receipt is attached to a non-user message")
         return ChatMessageRecord(
             id=UUID(row.id),
             session_id=UUID(row.session_id),
@@ -9763,6 +9890,7 @@ class SessionServiceImpl:
             writer_principal=row.writer_principal,
             tool_call_id=row.tool_call_id,
             parent_assistant_id=UUID(row.parent_assistant_id) if row.parent_assistant_id else None,
+            client_request_id=UUID(client_request_id) if client_request_id is not None else None,
         )
 
     async def get_messages(
@@ -9785,7 +9913,14 @@ class SessionServiceImpl:
         def _sync() -> tuple[Sequence[Any], Sequence[Any], Sequence[Any]]:
             with self._engine.connect() as conn:
                 message_rows = conn.execute(
-                    select(chat_messages_table)
+                    select(chat_messages_table, message_ingress_receipts_table.c.client_request_id)
+                    .select_from(
+                        chat_messages_table.outerjoin(
+                            message_ingress_receipts_table,
+                            (message_ingress_receipts_table.c.user_message_id == chat_messages_table.c.id)
+                            & (message_ingress_receipts_table.c.session_id == chat_messages_table.c.session_id),
+                        )
+                    )
                     .where(chat_messages_table.c.session_id == str(session_id))
                     .order_by(chat_messages_table.c.sequence_no)
                     .limit(limit)
@@ -9812,7 +9947,7 @@ class SessionServiceImpl:
         rows, verification_message_rows, failed_event_rows = await self._run_sync(_sync)
         self._verify_guided_failure_audit_cohort(verification_message_rows, failed_event_rows)
 
-        return [self._row_to_chat_message_record(row) for row in rows]
+        return [self._row_to_chat_message_record(row, client_request_id=row.client_request_id) for row in rows]
 
     async def get_verified_guided_root_intent(
         self,
@@ -10641,36 +10776,73 @@ class SessionServiceImpl:
         self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None
     ) -> ProviderAttempt:
         """Admit a provider dispatch and retain pending evidence before sending it."""
+        try:
+            return cast(
+                "ProviderAttempt",
+                await self._run_sync(
+                    self._begin_provider_attempt_sync,
+                    session_operation_context=session_operation_context,
+                    source=source,
+                    run_id=run_id,
+                ),
+            )
+        except ChargeableAdmissionRefused as exc:
+            await self._run_sync(self._record_provider_attempt_quota_refusal_sync, session_operation_context, source, exc)
+            raise
+
+    def begin_run_provider_attempt_sync(self, *, session_operation_context: SessionOperationContext, run_id: UUID) -> ProviderAttempt:
+        """Return the committed EXECUTE attempt identity to the pipeline worker."""
+        try:
+            return self._begin_provider_attempt_sync(session_operation_context=session_operation_context, source="run", run_id=run_id)
+        except ChargeableAdmissionRefused as exc:
+            self._record_provider_attempt_quota_refusal_sync(session_operation_context, "run", exc)
+            raise
+
+    def _begin_provider_attempt_sync(
+        self, *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None
+    ) -> ProviderAttempt:
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
         expected_kind = SessionOperationKind.EXECUTE if source == "run" else SessionOperationKind.COMPOSE
         if session_operation_context.operation_kind is not expected_kind:
             raise ValueError(f"source={source!r} provider attempts require {expected_kind.value} authority")
         sid = session_operation_context.fence.session_id
-
-        def _sync() -> ProviderAttempt:
+        attempt: ProviderAttempt | None = None
+        try:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 self._require_session_operation_context_on_connection(
                     conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn)
                 )
-                return begin_provider_attempt_on_connection(
+                attempt = begin_provider_attempt_on_connection(
                     conn,
                     session_operation_context=session_operation_context,
                     source=source,
                     policy=self._chargeable_admission_policy,
                     run_id=None if run_id is None else str(run_id),
                 )
-
-        try:
-            return cast("ProviderAttempt", await self._run_sync(_sync))
-        except ChargeableAdmissionRefused as exc:
-            if exc.decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED:
-                session = await self.get_session(UUID(sid))
-                await self._run_sync(
-                    self._quota_exceeded_recorder,
-                    self._quota_exceeded_outcome(session, exc.decision, operation=ChargeableOperation(source)),
-                )
+        except Exception as exc:
+            if source == "run" and attempt is not None:
+                # The body wrote an attempt, but the transaction exit failed.
+                # A commit may have landed even if its receipt did not. Never
+                # dispatch or manufacture a zero-use outcome from this state.
+                raise AuditIntegrityError("run provider admission commit outcome is uncertain; reconcile the pending attempt") from exc
             raise
+        if attempt is None:
+            raise AuditIntegrityError("Provider admission returned without an attempt")
+        return attempt
+
+    def _record_provider_attempt_quota_refusal_sync(
+        self, session_operation_context: SessionOperationContext, source: TokenUsageSource, exc: ChargeableAdmissionRefused
+    ) -> None:
+        if exc.decision.refusal_reason is not AdmissionRefusalReason.QUOTA_EXCEEDED:
+            return
+        sid = session_operation_context.fence.session_id
+        with self._engine.connect() as conn:
+            row = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).fetchone()
+        if row is None:
+            raise SessionNotFoundError(UUID(sid))
+        session = self._row_to_session_record(row)
+        self._quota_exceeded_recorder(self._quota_exceeded_outcome(session, exc.decision, operation=ChargeableOperation(source)))
 
     async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
         """Persist actual terminal call evidence and settle its ledger atomically."""
@@ -10742,21 +10914,46 @@ class SessionServiceImpl:
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
     ) -> None:
         """Settle non-Composer provider evidence under its original session lease."""
+        await self._run_sync(
+            self._settle_provider_attempt_sync,
+            session_operation_context=session_operation_context,
+            attempt_id=attempt_id,
+            entry=entry,
+        )
+
+    def settle_run_provider_attempt_sync(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        """Commit exact Landscape usage before returning to the pipeline worker."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.EXECUTE:
+            raise ValueError("Run provider settlement requires EXECUTE authority")
+        self._settle_provider_attempt_sync(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
+
+    def _settle_provider_attempt_sync(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
         expected_kind = session_operation_context.operation_kind
         if expected_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.EXECUTE}:
             raise ValueError("Provider settlement requires COMPOSE or EXECUTE authority")
         sid = session_operation_context.fence.session_id
-
-        def _sync() -> None:
+        body_completed = False
+        try:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 self._require_session_operation_context_on_connection(
                     conn, session_operation_context, session_id=sid, expected_kind=expected_kind, now=database_now(conn)
                 )
                 settle_provider_attempt_on_connection(conn, session_id=sid, attempt_id=attempt_id, entry=entry)
-
-        await self._run_sync(_sync)
+                body_completed = True
+        except Exception as exc:
+            if expected_kind is SessionOperationKind.EXECUTE and body_completed:
+                # The exact call evidence is in Landscape. Keep it and the
+                # attempt row for an authoritative replay of this settlement.
+                raise AuditIntegrityError("run provider settlement commit outcome is uncertain; replay exact Landscape evidence") from exc
+            raise
 
     async def request_run_cancellation(
         self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType

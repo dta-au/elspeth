@@ -60,7 +60,8 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
     # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
-    assert SESSION_SCHEMA_EPOCH == 68
+    # Epoch 69 adds immutable freeform message ingress receipts.
+    assert SESSION_SCHEMA_EPOCH == 69
     # Epoch 41 renames the approved prompt artifact anchor.
     # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
     # Epoch 43 gives every Landscape digest column a shape CHECK; pairs with session 63.

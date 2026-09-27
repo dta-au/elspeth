@@ -9,7 +9,10 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
 from elspeth.web.composer.guided.resolved import SourceResolved
@@ -24,6 +27,7 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
+from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
@@ -321,6 +325,79 @@ def test_reenter_replays_exact_located_response_without_a_second_state(composer_
     assert [state.version for state in versions] == [1, 2]
 
 
+def test_reenter_postcommit_cancellation_joins_success_writer_and_replays(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    _seed_exited_guided_state(composer_test_client, session_id)
+    body = {"operation_id": str(uuid4())}
+    service = composer_test_client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_settle = service.settle_guided_state_operation
+
+    async def settle_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        result = await real_settle(*args, **kwargs)
+        committed.set()
+        try:
+            await release_result.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", settle_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/guided/reenter", json=body))
+            await asyncio.wait_for(committed.wait(), 5)
+            request_task.cancel("cancel after durable reentry commit")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    with composer_test_client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "completed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "completed"
+    assert len(terminal_events) == 1
+    replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/reenter", json=body)
+    assert replayed.status_code == 200, replayed.json()
+
+
 def test_reenter_audit_insert_failure_rolls_back_new_occurrence(composer_test_client: TestClient) -> None:
     session_id = _create_session(composer_test_client)
     _seed_exited_guided_state(composer_test_client, session_id)
@@ -361,6 +438,161 @@ def test_reenter_settlement_head_conflict_is_terminal_and_exactly_replayed(compo
     assert first.status_code == replay.status_code == 409
     assert first.json() == replay.json()
     assert first.json()["detail"]["failure_code"] == "stale_conflict"
+
+
+def test_reenter_conflict_failure_write_retains_custody_after_cancellation(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    _seed_exited_guided_state(composer_test_client, session_id)
+    body = {"operation_id": str(uuid4())}
+    service = composer_test_client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_fail = service.fail_guided_operation
+
+    async def fail_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        result = await real_fail(*args, **kwargs)
+        committed.set()
+        try:
+            await release_result.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "fail_guided_operation", fail_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/guided/reenter", json=body))
+            await asyncio.wait_for(committed.wait(), 5)
+            request_task.cancel("cancel after durable conflict settlement")
+            request_task.cancel("cancel again after durable conflict settlement")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            response = await asyncio.wait_for(request_task, 5)
+            assert response.status_code == 409, response.json()
+
+    with patch.object(service, "settle_guided_state_operation", side_effect=GuidedOperationSettlementConflictError()):
+        asyncio.run(drive())
+
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    with composer_test_client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        terminal_events = connection.execute(
+            select(guided_operation_events_table).where(
+                guided_operation_events_table.c.session_id == session_id,
+                guided_operation_events_table.c.operation_id == body["operation_id"],
+                guided_operation_events_table.c.event_kind == "failed",
+            )
+        ).all()
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "stale_conflict"
+    assert len(terminal_events) == 1
+    replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/reenter", json=body)
+    assert replayed.status_code == 409, replayed.json()
+    assert replayed.json()["detail"]["failure_code"] == "stale_conflict"
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("integrity", "integrity_error"),
+        ("conflict", "stale_conflict"),
+        ("child_cancel", "integrity_error"),
+        ("child_cancel_no_caller", "integrity_error"),
+        ("child_cancel_simultaneous", "integrity_error"),
+    ],
+)
+def test_reenter_cancelled_settlement_surfaces_child_failure(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    _seed_exited_guided_state(composer_test_client, session_id)
+    body = {"operation_id": str(uuid4())}
+    service = composer_test_client.app.state.session_service
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    child_task: asyncio.Task[object] | None = None
+
+    async def fail_settlement(*args: object, **kwargs: object) -> object:
+        nonlocal child_task
+        child_task = asyncio.current_task()
+        entered.set()
+        await release.wait()
+        if failure_kind == "conflict":
+            raise GuidedOperationSettlementConflictError()
+        if failure_kind in {"child_cancel", "child_cancel_no_caller"}:
+            raise asyncio.CancelledError("settlement child cancelled itself")
+        raise AuditIntegrityError("injected reentry settlement integrity failure")
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", fail_settlement)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/guided/reenter", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            if failure_kind == "child_cancel_simultaneous":
+                assert child_task is not None
+                child_task.cancel("settlement child cancelled before caller resumes")
+                request_task.cancel("cancel caller in same scheduling turn")
+            elif failure_kind != "child_cancel_no_caller":
+                request_task.cancel("cancel while reentry settlement child is pending")
+                try:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+                finally:
+                    release.set()
+            else:
+                release.set()
+            if failure_kind == "conflict":
+                response = await asyncio.wait_for(request_task, 5)
+                assert response.status_code == 409, response.json()
+                assert response.json()["detail"]["failure_code"] == expected_code
+            else:
+                with pytest.raises(AuditIntegrityError):
+                    await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    with composer_test_client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == expected_code
+    replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/reenter", json=body)
+    assert replayed.status_code == (409 if failure_kind == "conflict" else 500)
+    assert replayed.json()["detail"]["failure_code"] == expected_code
 
 
 @pytest.mark.parametrize(

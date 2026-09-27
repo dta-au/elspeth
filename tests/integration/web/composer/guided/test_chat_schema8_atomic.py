@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -1215,6 +1215,322 @@ def test_task_cancellation_records_request_cancelled_not_operation_failed(
     operation = _guided_operation_row(client, session_id, body["operation_id"])
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "request_cancelled"
+
+
+def test_repeated_cancellation_joins_chat_audit_writer_before_lease_guard(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    body = _chat_body(client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+    service = client.app.state.session_service
+    provider_started = asyncio.Event()
+    audit_started = asyncio.Event()
+    release_audit = asyncio.Event()
+    real_audit = service.fail_guided_operation_with_audit
+
+    async def provider(**kwargs: Any) -> None:
+        _record_test_llm_call(kwargs["recorder"], marker="repeated-cancel", status=ComposerLLMCallStatus.API_ERROR)
+        provider_started.set()
+        await asyncio.Event().wait()
+
+    async def delayed_audit(command: GuidedOperationFailureCommand, *, session_operation_context: object) -> object:
+        audit_started.set()
+        await release_audit.wait()
+        return await real_audit(command, session_operation_context=session_operation_context)
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", delayed_audit)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(provider_started.wait(), 5)
+            request_task.cancel("first cancellation")
+            await asyncio.wait_for(audit_started.wait(), 5)
+            request_task.cancel("second cancellation")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_audit.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "request_cancelled"
+    with client.app.state.session_engine.connect() as connection:
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "failed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["actor"] == "composer_route"
+    assert len(_llm_audit_calls(client, session_id)) == 1
+    progress = asyncio.run(client.app.state.composer_progress_registry.get_latest(session_id))
+    assert progress.phase == "cancelled"
+    assert progress.reason == "client_cancelled"
+
+
+def test_cancellation_during_chat_ordinary_failure_keeps_original_audit(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    body = _chat_body(client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+    service = client.app.state.session_service
+    audit_started = asyncio.Event()
+    release_audit = asyncio.Event()
+    real_audit = service.fail_guided_operation_with_audit
+
+    async def provider(**kwargs: Any) -> None:
+        _record_test_llm_call(kwargs["recorder"], marker="ordinary-error", status=ComposerLLMCallStatus.API_ERROR)
+        raise RuntimeError("injected first-party fault")
+
+    async def delayed_audit(command: GuidedOperationFailureCommand, *, session_operation_context: object) -> object:
+        audit_started.set()
+        await release_audit.wait()
+        return await real_audit(command, session_operation_context=session_operation_context)
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", delayed_audit)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(audit_started.wait(), 5)
+            request_task.cancel("cancel while recording original failure")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_audit.set()
+            response = await asyncio.wait_for(request_task, 5)
+            assert response.status_code == 500
+
+    asyncio.run(drive())
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "operation_failed"
+    with client.app.state.session_engine.connect() as connection:
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "failed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["actor"] == "composer_route"
+    assert len(_llm_audit_calls(client, session_id)) == 1
+    progress = asyncio.run(client.app.state.composer_progress_registry.get_latest(session_id))
+    assert progress.phase == "failed"
+
+
+def test_cancellation_after_chat_commit_preserves_completed_progress(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    body = _chat_body(client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+    service = client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    real_settle = service.settle_guided_state_operation
+
+    async def provider(**kwargs: Any) -> object:
+        _record_test_llm_call(kwargs["recorder"], marker="post-commit-cancel")
+        return await _advisory_provider()
+
+    async def settle_then_pause(*args: Any, **kwargs: Any) -> object:
+        result = await real_settle(*args, **kwargs)
+        committed.set()
+        await release_result.wait()
+        return result
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    monkeypatch.setattr(service, "settle_guided_state_operation", settle_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(committed.wait(), 5)
+            request_task.cancel("cancel after durable commit")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "completed"
+    assert len(_llm_audit_calls(client, session_id)) == 1
+    progress = asyncio.run(client.app.state.composer_progress_registry.get_latest(session_id))
+    assert progress.phase == "complete"
+    assert progress.reason == "composer_complete"
+
+
+def test_chat_simultaneous_child_and_caller_cancellation_is_integrity_failure(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    body = _chat_body(client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+    service = client.app.state.session_service
+    entered = asyncio.Event()
+    child_task: asyncio.Task[object] | None = None
+
+    async def provider(**kwargs: Any) -> object:
+        _record_test_llm_call(kwargs["recorder"], marker="simultaneous-child-cancel")
+        return await _advisory_provider()
+
+    async def self_cancelled_settlement(*_args: object, **_kwargs: object) -> object:
+        nonlocal child_task
+        child_task = asyncio.current_task()
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable after child cancellation")
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    monkeypatch.setattr(service, "settle_guided_state_operation", self_cancelled_settlement)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            assert child_task is not None
+            child_task.cancel("chat settlement child stopped")
+            request_task.cancel("chat caller cancelled in the same scheduling turn")
+            with pytest.raises(AuditIntegrityError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    assert len(_llm_audit_calls(client, session_id)) == 1
+    replay = client.post(f"/api/sessions/{session_id}/guided/chat", json=body)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
+    progress = asyncio.run(client.app.state.composer_progress_registry.get_latest(session_id))
+    assert progress.phase == "failed"
+
+
+def test_repeated_cancellation_joins_chat_terminal_progress_publication(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    body = _chat_body(client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+    provider_started = asyncio.Event()
+    progress_started = asyncio.Event()
+    release_progress = asyncio.Event()
+    real_publish = guided_chat_atomic._publish_progress
+
+    async def provider(**kwargs: Any) -> None:
+        _record_test_llm_call(kwargs["recorder"], marker="progress-cancel", status=ComposerLLMCallStatus.API_ERROR)
+        provider_started.set()
+        await asyncio.Event().wait()
+
+    async def delayed_publish(sink: ComposerProgressSink, *, event: ComposerProgressEvent) -> None:
+        if event.phase == "cancelled":
+            progress_started.set()
+            await release_progress.wait()
+        await real_publish(sink, event=event)
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    monkeypatch.setattr(guided_chat_atomic, "_publish_progress", delayed_publish)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(provider_started.wait(), 5)
+            request_task.cancel("first cancellation")
+            await asyncio.wait_for(progress_started.wait(), 5)
+            request_task.cancel("second cancellation during progress")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_progress.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "request_cancelled"
+    assert len(_llm_audit_calls(client, session_id)) == 1
+    progress = asyncio.run(client.app.state.composer_progress_registry.get_latest(session_id))
+    assert progress.phase == "cancelled"
+    assert progress.reason == "client_cancelled"
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "expected_reason"),
+    [
+        ("auth", "provider_auth"),
+        ("bad_request", "provider_bad_request"),
+        ("unavailable", "unavailable"),
+        ("timeout", "unavailable"),
+    ],
+)
+def test_guided_chat_provider_failure_kind_is_durable_and_replayed(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: Literal["auth", "bad_request", "unavailable", "timeout"],
+    expected_reason: str,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    body = _chat_body(composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"])
+
+    async def provider(**_kwargs: Any) -> GuidedChatProviderOutcome:
+        return GuidedStepChatOnlyResult(
+            chat=StepChatResult(
+                assistant_message="The provider could not complete this guided turn.",
+                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                latency_ms=1,
+                error_class="untrusted-provider-class-name",
+                provider_failure_kind=provider_kind,
+            )
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider)
+    first = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=body)
+    assert first.status_code == 200, first.json()
+    assert first.json()["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == expected_reason
+    hydrated = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+    assert hydrated.status_code == 200, hydrated.json()
+    assert hydrated.json()["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == expected_reason
+
+    async def provider_must_not_run(**_kwargs: Any) -> GuidedChatProviderOutcome:
+        raise AssertionError("exact replay called the provider")
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", provider_must_not_run)
+    replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=body)
+    assert replayed.status_code == 200, replayed.json()
+    assert replayed.json() == first.json()
 
 
 def test_cancelled_progress_publish_defect_surfaces_instead_of_riding_the_cancellation(

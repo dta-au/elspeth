@@ -193,15 +193,12 @@ export function GuidedChatHistory({
     // handled by the parent transcript's aria-live="polite" log; the sr-only
     // "Error:" prefix still conveys the kind on read. (fp-review a11y follow-up.)
     if (turn.role === "assistant" && turn.assistant_message_kind === "synthetic_failure") {
-      // Reason-aware Retry (inv-f1 D4): "not_applied" is the deterministic
-      // set — the user's input was processed and its application rejected
-      // (config invalid, upload/type mismatch, transition rejected), so
-      // resending the SAME message is a guaranteed dead end and the turn's
-      // own copy already directs the real next step. The other reasons are
-      // retry-able by nature: provider weather ("unavailable"), a scaffold
-      // leak ("quality_guard"), or a malformed model reply ("model_defect" —
-      // whose copy explicitly invites Retry).
-      const retryInvited = turn.synthetic_failure_reason !== "not_applied";
+      // Retry only when the same request could succeed on a later attempt.
+      // Application rejection and provider configuration errors need the
+      // corrective action in the persisted turn's own message first.
+      const retryInvited = turn.synthetic_failure_reason !== "not_applied"
+        && turn.synthetic_failure_reason !== "provider_auth"
+        && turn.synthetic_failure_reason !== "provider_bad_request";
       rows.push(
         <div
           key={`turn-${turn.seq}`}

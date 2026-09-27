@@ -95,7 +95,7 @@ def _snapshot_event(snapshot: Any) -> ComposerProgressEvent:
 @pytest.mark.asyncio
 async def test_recompose_heartbeat_cancel_records_failed_and_answers_503(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     app, service = _make_progress_route_app(tmp_path)
-    await service.add_message(service.session.id, "user", "Recompose me", writer_principal="route_user_message")
+    user_message = await service.add_message(service.session.id, "user", "Recompose me", writer_principal="route_user_message")
     composer = _HangingComposer()
     app.state.composer_service = composer
     registry = app.state.composer_progress_registry
@@ -103,7 +103,9 @@ async def test_recompose_heartbeat_cancel_records_failed_and_answers_503(tmp_pat
     terminal = _capture_recompose_terminal(monkeypatch)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(f"/api/sessions/{service.session.id}/recompose")
+        response = await client.post(
+            f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_message.id)}
+        )
 
     assert composer.cancelled is True
     assert response.status_code == 503
@@ -123,14 +125,16 @@ async def test_recompose_heartbeat_cancel_records_failed_and_answers_503(tmp_pat
 async def test_recompose_plain_task_cancel_is_still_a_client_cancel(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Control: a cancel that carries no heartbeat marker keeps the Stop labelling."""
     app, service = _make_progress_route_app(tmp_path)
-    await service.add_message(service.session.id, "user", "Recompose me", writer_principal="route_user_message")
+    user_message = await service.add_message(service.session.id, "user", "Recompose me", writer_principal="route_user_message")
     composer = _HangingComposer()
     app.state.composer_service = composer
     registry = app.state.composer_progress_registry
     terminal = _capture_recompose_terminal(monkeypatch)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        request_task = asyncio.create_task(client.post(f"/api/sessions/{service.session.id}/recompose"))
+        request_task = asyncio.create_task(
+            client.post(f"/api/sessions/{service.session.id}/recompose", json={"expected_user_message_id": str(user_message.id)})
+        )
         await asyncio.wait_for(composer.started.wait(), timeout=5)
         request_task.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -367,7 +367,10 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #     ordinary_proposal_checkpoint reason codes so pending proposals retain
 #     their authoritative head across compose checkpoints. Earlier readers
 #     reject these reasons. Pre-1.0 delete/recreate, no legacy path.
-SESSION_SCHEMA_EPOCH = 68
+# 69: message ingress receipts bind each accepted freeform send UUID to one
+#     immutable user row and its originally requested nullable state.
+#     Pre-1.0 delete/recreate, no legacy path.
+SESSION_SCHEMA_EPOCH = 69
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -770,6 +773,32 @@ chat_messages_table = Table(
         "session_id",
         "tool_call_id",
     ),
+)
+
+message_ingress_receipts_table = Table(
+    "message_ingress_receipts",
+    metadata,
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("client_request_id", String, primary_key=True),
+    Column("user_message_id", String, nullable=False),
+    Column("requested_state_id", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["user_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_message_ingress_receipts_user_message_session",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["requested_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_message_ingress_receipts_requested_state_session",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("user_message_id", name="uq_message_ingress_receipts_user_message"),
+    *_non_blank_text_constraints("session_id", name="ck_message_ingress_receipts_session_id_nonblank"),
+    *_non_blank_text_constraints("client_request_id", name="ck_message_ingress_receipts_client_request_id_nonblank"),
+    *_non_blank_text_constraints("user_message_id", name="ck_message_ingress_receipts_user_message_id_nonblank"),
 )
 
 # Partial unique index: tool_call_id must be unique within
@@ -2005,6 +2034,47 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         ),
     ),
     PostgresqlAuditDDL(
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_update",
+        function_name="elspeth_message_ingress_receipts_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_update()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'message_ingress_receipts is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_update "
+            "BEFORE UPDATE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_delete",
+        function_name="elspeth_message_ingress_receipts_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
+            RAISE EXCEPTION 'message_ingress_receipts is append-only; DELETE is forbidden'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_delete "
+            "BEFORE DELETE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_delete()"
+        ),
+    ),
+    PostgresqlAuditDDL(
         table=guided_operations_table,
         trigger_name="trg_guided_operations_terminal_immutable",
         function_name="elspeth_guided_operations_terminal_immutable",
@@ -2327,6 +2397,32 @@ event.listen(
         "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
         "BEGIN "
         "  SELECT RAISE(ABORT, 'chat_messages rows are append-only'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    message_ingress_receipts_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_update "
+        "BEFORE UPDATE ON message_ingress_receipts "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    message_ingress_receipts_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_delete "
+        "BEFORE DELETE ON message_ingress_receipts "
+        "FOR EACH ROW "
+        "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; DELETE is forbidden'); "
         "END;"
     ).execute_if(dialect="sqlite"),
 )

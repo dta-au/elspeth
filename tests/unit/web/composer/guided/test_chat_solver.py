@@ -494,6 +494,121 @@ async def test_guided_palettes_absorb_gateway_status_errors(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("palette", ["management", "source", "sink", "advisory"])
+@pytest.mark.parametrize("failure_kind", ["transport", "authentication", "bad_request", "unavailable"])
+async def test_guided_palettes_preserve_physical_provider_failure_kind(
+    monkeypatch: pytest.MonkeyPatch, palette: str, failure_kind: str
+) -> None:
+    import httpx
+    from litellm.exceptions import AuthenticationError, BadRequestError
+
+    errors = {
+        "transport": httpx.ConnectError("private upstream response"),
+        "authentication": AuthenticationError(message="private upstream response", llm_provider="test", model="test/model"),
+        "bad_request": BadRequestError(message="private upstream response", llm_provider="test", model="test/model"),
+        "unavailable": ServiceUnavailableError(message="private upstream response", llm_provider="test", model="test/model"),
+    }
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise errors[failure_kind]
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    shared = {
+        "site": "test",
+        "session_id": "session",
+        "user_id": "user",
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+        "recorder": recorder,
+    }
+    if palette == "management":
+        result = await resolve_deferred_intent_management_chat_with_auto_drop(
+            site="test",
+            session_id="session",
+            user_id="user",
+            request=DeferredIntentManagementChatRequest(
+                model="test/model",
+                step=GuidedStep.STEP_3_TRANSFORMS,
+                user_message="cancel one saved instruction",
+                temperature=None,
+                seed=None,
+                timeout_seconds=5,
+                context_block="safe context",
+            ),
+            recorder=recorder,
+        )
+        chat = result.chat
+    elif palette == "source":
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            **shared, plugin_hint=None, current_source=None, available_source_plugins=("csv",)
+        )
+        chat = result.chat
+    elif palette == "sink":
+        result = await resolve_step_2_sink_chat_with_auto_drop(**shared, current_sink=None)
+        chat = result.chat
+    else:
+        chat = await guided_step_chat_module.solve_step_chat_with_auto_drop(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+
+    assert chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert (
+        chat.provider_failure_kind
+        == {
+            "transport": "unavailable",
+            "authentication": "auth",
+            "bad_request": "bad_request",
+            "unavailable": "unavailable",
+        }[failure_kind]
+    )
+    assert "private upstream response" not in chat.assistant_message
+    if failure_kind == "authentication":
+        assert "credential" in chat.assistant_message.lower()
+    elif failure_kind == "bad_request":
+        assert "configuration" in chat.assistant_message.lower()
+    assert len(recorder.llm_calls) == 1
+    assert (
+        recorder.llm_calls[0].status
+        is {
+            "transport": ComposerLLMCallStatus.API_ERROR,
+            "authentication": ComposerLLMCallStatus.AUTH_ERROR,
+            "bad_request": ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+            "unavailable": ComposerLLMCallStatus.API_ERROR,
+        }[failure_kind]
+    )
+
+
+@pytest.mark.asyncio
+async def test_guided_first_party_error_is_not_a_provider_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    assert chat_solver.classify_guided_provider_failure(httpx.ConnectError("tool transport")) is None
+
+    async def programmer_failure(**_kwargs: object) -> object:
+        raise TypeError("local call contract broke")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", programmer_failure)
+    recorder = BufferingRecorder()
+    with pytest.raises(TypeError, match="local call contract broke"):
+        await guided_step_chat_module.solve_step_chat_with_auto_drop(
+            site="test",
+            session_id="session",
+            user_id="user",
+            model="test/model",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="help me",
+            temperature=None,
+            seed=None,
+            timeout_seconds=5,
+            recorder=recorder,
+        )
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].error_class == "TypeError"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("solver", ["source", "sink", "advisory"])
 @pytest.mark.parametrize(
     ("error_type", "expected_status"),

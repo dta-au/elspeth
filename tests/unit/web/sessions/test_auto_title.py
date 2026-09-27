@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 from litellm import ModelResponse
 from litellm.exceptions import BadGatewayError, ServiceUnavailableError
@@ -525,9 +526,10 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
 
     monkeypatch.setattr(_auto_title, "_litellm_acompletion", _raise_programmer_error)
 
+    service = _TitleService()
     with pytest.raises(TypeError, match="signature drift"):
         await _auto_title.maybe_auto_title_session(
-            service=_TitleService(),
+            service=service,
             session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
@@ -537,6 +539,95 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
         )
 
     assert counter.calls == []
+    assert service.updates == []
+    assert len(service.usage) == 1
+    entry = service.usage[0][2][0]
+    assert entry.call_id == "title-attempt"
+    assert entry.prompt_tokens is None
+    assert entry.completion_tokens is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadError])
+async def test_auto_title_raw_transport_failure_settles_without_replacing_default_title(monkeypatch, error_type) -> None:
+    async def failing_provider(**_kwargs: object) -> object:
+        raise error_type("private upstream response")
+
+    counter = _FakeCounter()
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    service = _TitleService()
+    await _auto_title.maybe_auto_title_session(
+        service=service,
+        session_id=_TEST_SESSION_ID,
+        user_message="Build a CSV pipeline",
+        model="openai/test",
+        temperature=None,
+        seed=None,
+        session_operation_context=_TEST_CONTEXT,
+    )
+
+    assert service.updates == []
+    assert counter.calls == [(1, {"exception_class": "TransportError"}, None)]
+    assert len(service.usage) == 1
+    entry = service.usage[0][2][0]
+    assert entry.call_id == "title-attempt"
+    assert entry.prompt_tokens is None
+    assert entry.completion_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_auto_title_first_party_http_error_after_response_is_not_provider_weather(monkeypatch) -> None:
+    class _BrokenResponse:
+        @property
+        def choices(self) -> object:
+            raise httpx.ConnectError("local adapter bug")
+
+    async def response_from_provider(**_kwargs: object) -> object:
+        return _BrokenResponse()
+
+    counter = _FakeCounter()
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", response_from_provider)
+    service = _TitleService()
+    with pytest.raises(httpx.ConnectError, match="local adapter bug"):
+        await _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    assert counter.calls == []
+    assert len(service.usage) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_title_provider_failure_does_not_hide_failed_terminal_settlement(monkeypatch) -> None:
+    async def failing_provider(**_kwargs: object) -> object:
+        raise httpx.ConnectError("private upstream response")
+
+    class _FailingSettlementService(_TitleService):
+        async def settle_provider_attempt(
+            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+        ) -> None:
+            raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", failing_provider)
+    service = _FailingSettlementService()
+    with pytest.raises(AuditIntegrityError, match="could not be settled"):
+        await _auto_title.maybe_auto_title_session(
+            service=service,
+            session_id=_TEST_SESSION_ID,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    assert service.usage == []
 
 
 @pytest.mark.asyncio
@@ -676,15 +767,13 @@ async def test_auto_title_provider_cancellation_preserves_failure_priority_durin
     await asyncio.wait_for(settlement_started.wait(), timeout=1)
     task.cancel("second cancellation")
     release_settlement.set()
-    expected_type = AuditIntegrityError if isinstance(settlement_failure, AuditIntegrityError) else asyncio.CancelledError
-    with pytest.raises(expected_type) as caught:
+    with pytest.raises(AuditIntegrityError) as caught:
         await asyncio.wait_for(task, timeout=1)
     if isinstance(settlement_failure, AuditIntegrityError):
         assert caught.value is settlement_failure
         assert caught.value.__cause__ is original
     else:
-        assert caught.value is original
-        assert caught.value.__cause__ is settlement_failure
+        assert caught.value.__cause__ is original
     assert service.usage == []
 
 

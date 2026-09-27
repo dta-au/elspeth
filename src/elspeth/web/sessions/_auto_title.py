@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+import httpx
 from openai import OpenAIError
 from opentelemetry import metrics
 
@@ -106,6 +107,10 @@ class _MalformedAutoTitleResponseError(Exception):
     """Owned classification for an unusable external completion shape."""
 
 
+class _AutoTitleProviderTransportError(Exception):
+    """The physical auto-title LLM call failed in its HTTP transport."""
+
+
 @dataclass(frozen=True, slots=True)
 class _AdmittedAutoTitleCompletion:
     """Owned values admitted from one external LiteLLM response.
@@ -134,6 +139,8 @@ def _auto_title_exception_class(exc: BaseException) -> str:
         return "TimeoutError"
     if isinstance(exc, asyncio.CancelledError):
         return "CancelledError"
+    if isinstance(exc, _AutoTitleProviderTransportError):
+        return "TransportError"
     if classify_provider_failure(exc) is not None:
         return type(exc).__name__
     if isinstance(exc, _MalformedAutoTitleResponseError):
@@ -285,21 +292,29 @@ async def _charge_auto_title_response(
     """
     usage = token_usage_from_response(response)
     returned_model = safe_response_model(response)
-    settlement = asyncio.create_task(
-        service.settle_provider_attempt(
-            session_operation_context=session_operation_context,
-            attempt_id=attempt_id,
-            entry=TokenUsageEntry(
-                model=model if returned_model is None else returned_model,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                cached_prompt_tokens=usage.cached_prompt_tokens,
-                reasoning_tokens=usage.reasoning_tokens,
-                recorded_at=recorded_at,
-                call_id=attempt_id,
-            ),
-        )
+    entry = TokenUsageEntry(
+        model=model if returned_model is None else returned_model,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cached_prompt_tokens=usage.cached_prompt_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        recorded_at=recorded_at,
+        call_id=attempt_id,
     )
+
+    async def settle_required_attempt() -> None:
+        try:
+            await service.settle_provider_attempt(
+                session_operation_context=session_operation_context,
+                attempt_id=attempt_id,
+                entry=entry,
+            )
+        except AuditIntegrityError:
+            raise
+        except Exception as exc:
+            raise AuditIntegrityError("Auto-title provider attempt could not be settled") from exc
+
+    settlement = asyncio.create_task(settle_required_attempt())
     _, interrupted = await _join_auto_title_custody_task(
         settlement,
         primary_cancellation=primary_cancellation,
@@ -411,7 +426,10 @@ async def maybe_auto_title_session(
         raise interrupted
     response: object | None = None
     try:
-        response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        try:
+            response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        except httpx.TransportError as exc:
+            raise _AutoTitleProviderTransportError("Auto-title provider transport failed") from exc
         admitted = _admit_auto_title_completion(response)
     except asyncio.CancelledError as exc:
         await _charge_auto_title_response(
@@ -425,7 +443,7 @@ async def maybe_auto_title_session(
         )
         _record_auto_title_failure(exc)
         raise
-    except (OpenAIError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
+    except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature
@@ -440,6 +458,19 @@ async def maybe_auto_title_session(
         )
         _record_auto_title_failure(exc)
         return
+    except Exception as exc:
+        # A dispatched call remains chargeable even if our own parsing or
+        # provider adapter fails unexpectedly. Keep the original first-party
+        # failure visible after accounting, without calling it provider weather.
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc if response is None else response,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+        )
+        raise
     await _charge_auto_title_response(
         service, session_operation_context, model=model, response=response, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
     )

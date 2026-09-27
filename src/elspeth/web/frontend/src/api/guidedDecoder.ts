@@ -1934,7 +1934,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
   if (role === "user" && (kind !== null || reason !== null)) invalid(path, "user chat turn carries assistant discriminator");
   if (role === "assistant" && kind !== "assistant" && kind !== "synthetic_failure") invalid(path, "assistant chat turn lacks closed discriminator");
   if ((kind === "synthetic_failure") !== (reason !== null)) invalid(path, "synthetic failure discriminator is inconsistent");
-  if (reason !== null && !["quality_guard", "unavailable", "not_applied", "model_defect"].includes(reason)) invalid(`${path}.synthetic_failure_reason`, "unknown reason");
+  if (reason !== null && !["quality_guard", "unavailable", "not_applied", "model_defect", "provider_auth", "provider_bad_request"].includes(reason)) invalid(`${path}.synthetic_failure_reason`, "unknown reason");
   if (role === "user") {
     return {
       role,
@@ -1960,7 +1960,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
     };
   }
   if (kind !== "synthetic_failure") return invalid(path, "assistant chat turn lacks closed discriminator");
-  if (reason !== "quality_guard" && reason !== "unavailable" && reason !== "not_applied" && reason !== "model_defect") {
+  if (reason !== "quality_guard" && reason !== "unavailable" && reason !== "not_applied" && reason !== "model_defect" && reason !== "provider_auth" && reason !== "provider_bad_request") {
     return invalid(`${path}.synthetic_failure_reason`, "unknown reason");
   }
   return {

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -509,7 +509,7 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
 
     response = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": message},
+        json={"content": message, "client_request_id": str(uuid4())},
     )
 
     assert response.status_code == 200, response.text
@@ -535,7 +535,7 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
     )
     monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message, "client_request_id": str(uuid4())})
 
     assert response.status_code == 504, response.text
     ordinary_loop.assert_not_awaited()
@@ -584,7 +584,7 @@ def test_send_message_freeform_planner_failure_is_translated(
     client, engine, sessions = _build_app(tmp_path, monkeypatch, completion_factory())
     session_id = client.post("/api/sessions", json={"title": "freeform planner failure"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     # (a) deliberate safe response, not an unhandled 500.
     assert response.status_code == expected_status, response.text
@@ -651,7 +651,7 @@ def test_recompose_freeform_planner_failure_is_translated(
     # Recompose requires the transcript to end at a user turn; seed one directly.
     from uuid import UUID
 
-    asyncio.run(
+    user_message = asyncio.run(
         sessions.add_message(
             UUID(session_id),
             "user",
@@ -660,7 +660,7 @@ def test_recompose_freeform_planner_failure_is_translated(
         )
     )
 
-    response = client.post(f"/api/sessions/{session_id}/recompose")
+    response = client.post(f"/api/sessions/{session_id}/recompose", json={"expected_user_message_id": str(user_message.id)})
 
     assert response.status_code == 502, response.text
     body = response.json()
@@ -889,7 +889,7 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _decline_after_exhaustion_completion())
     session_id = client.post("/api/sessions", json={"title": "freeform planner decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert _DECLINE_TEXT in response.text
@@ -934,7 +934,7 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _marker_decline_completion())
     session_id = client.post("/api/sessions", json={"title": "ordinary turn decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert _DECLINE_TEXT in response.text
@@ -1026,7 +1026,7 @@ def test_later_explicit_imperative_reaches_planner_and_auto_commits(
 
     response = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": "How does this work? Now build it."},
+        json={"content": "How does this work? Now build it.", "client_request_id": str(uuid4())},
     )
 
     assert response.status_code == 200, response.text
@@ -1065,7 +1065,7 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
 
     session_id = client.post("/api/sessions", json={"title": "auto-commit surfacer"}).json()["id"]
     session_id_holder["id"] = session_id
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert "prepared and validated" in response.text

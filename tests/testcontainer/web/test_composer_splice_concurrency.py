@@ -226,7 +226,7 @@ async def test_concurrent_http_splices_serialize_reload_and_apply_once(tmp_path:
         async def send(content: str):
             return await client.post(
                 f"/api/sessions/{session_id}/messages",
-                json={"content": content},
+                json={"content": content, "client_request_id": str(uuid.uuid4())},
             )
 
         first_task = asyncio.create_task(send("Insert the transform"))
