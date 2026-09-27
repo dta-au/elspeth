@@ -25,6 +25,7 @@ from sqlalchemy import insert, select
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.payload_store import PayloadStore
+from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -796,3 +797,60 @@ def assert_stamped_between(
     lower = (start if start.tzinfo is not None else start.replace(tzinfo=UTC)) + offset - tolerance
     upper = (end if end.tzinfo is not None else end.replace(tzinfo=UTC)) + offset + tolerance
     assert lower <= actual_utc <= upper, f"stamp {actual_utc.isoformat()} is outside [{lower.isoformat()}, {upper.isoformat()}]"
+
+
+def ingest_quarantine_row_for_test(
+    factory: RecorderFactory,
+    *,
+    run_id: str,
+    source_node_id: str,
+    row: object,
+    error: str,
+    validation_error_id: str | None = None,
+    sink_name: str = "quarantine_sink",
+    quarantine_edge_id: str | None = None,
+    row_index: int = 0,
+    source_row_index: int = 0,
+    ingest_sequence: int = 0,
+) -> RowResult:
+    """Drive the production fenced source-quarantine ingest against a real Landscape.
+
+    Calls the ONE composition the processor uses (``engine.tokens.
+    ingest_source_quarantine``). Without ``quarantine_edge_id`` it registers a
+    sink node named ``sink_name`` and the source's ``__quarantine__`` DIVERT
+    edge first — the graph the DAG builder records for ``on_validation_failure``.
+    """
+    from elspeth.contracts import RoutingMode
+    from elspeth.contracts.types import NodeID
+    from elspeth.engine.tokens import ingest_source_quarantine
+
+    leader = leader_coordination_token(factory, run_id)
+    if quarantine_edge_id is None:
+        sink = factory.data_flow.register_node(
+            plugin_name=sink_name,
+            node_type=NodeType.SINK,
+            plugin_version="1.0",
+            config={},
+            node_id=f"sink_{sink_name}",
+            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader,
+        )
+        quarantine_edge_id = factory.data_flow.register_edge(
+            source_node_id, sink.node_id, "__quarantine__", RoutingMode.DIVERT, coordination_token=leader
+        ).edge_id
+    return ingest_source_quarantine(
+        scheduler=factory.scheduler,
+        data_flow=factory.data_flow,
+        execution=factory.execution,
+        coordination_token=leader,
+        source_node_id=NodeID(source_node_id),
+        row_index=row_index,
+        source_row_index=source_row_index,
+        ingest_sequence=ingest_sequence,
+        row=row,
+        validation_error_id=validation_error_id,
+        quarantine_sink=sink_name,
+        quarantine_error=error,
+        quarantine_edge_id=quarantine_edge_id,
+        terminal_step_index=1,
+    )

@@ -48,10 +48,21 @@ class RunIdentityPort(Protocol):
 
 
 class TokenCreationPort(RunIdentityPort, Protocol):
-    """Processor surface needed when source quarantine creates a token."""
+    """Processor surface needed when source quarantine records a rejected row."""
 
-    @property
-    def token_manager(self) -> Any:
+    def ingest_quarantined_row(
+        self,
+        *,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        row: object,
+        validation_error_id: str | None,
+        quarantine_sink: str,
+        quarantine_error: str,
+        quarantine_edge_id: str,
+    ) -> RowResult:
         raise NotImplementedError
 
     @property

@@ -593,6 +593,81 @@ class TestAccumulateTerminalPairsTerminal:
         assert counters.rows_failed == 0
 
 
+class TestAccumulateSharedQuarantinePair:
+    """(FAILURE, QUARANTINED_AT_SOURCE) is SHARED: a sinkless discard and a sink-bound source quarantine.
+
+    The counter table keeps ``routes_to_sink=False`` for the pair (the discard
+    member is never routed); the accumulator's own source-quarantine arm routes
+    the sink-carrying member with the error hash recorded at ingest. Mutations
+    that flip the table flag or drop the arm turn these red (QR, C2).
+    """
+
+    def test_discard_member_is_counted_and_never_routed(self) -> None:
+        counters = _make_counters()
+        pending = _make_pending()
+        discard = RowResult(
+            token=make_token_info(),
+            final_data=make_row({"x": 1}),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.QUARANTINED_AT_SOURCE,
+        )
+
+        accumulate_row_outcomes([discard], counters, pending)
+
+        assert (counters.rows_failed, counters.rows_quarantined) == (1, 1)
+        assert pending == {"output": [], "error_sink": []}
+
+    def test_source_quarantine_member_routes_to_its_sink_with_the_ingest_hash(self) -> None:
+        counters = _make_counters()
+        pending = {"output": [], "bad": []}
+        quarantined = RowResult(
+            token=make_token_info(),
+            final_data=make_row({"_raw": "x"}),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.QUARANTINED_AT_SOURCE,
+            sink_name="bad",
+            scheduler_pending_sink=True,
+            authoritative_error_hash="0123456789abcdef",
+        )
+
+        accumulate_row_outcomes([quarantined], counters, pending)
+
+        assert (counters.rows_failed, counters.rows_quarantined) == (1, 1)
+        ((token, outcome),) = pending["bad"]
+        assert token is quarantined.token
+        assert outcome == PendingOutcome(
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.QUARANTINED_AT_SOURCE,
+            error_hash="0123456789abcdef",
+            scheduler_pending_sink=True,
+        )
+        assert pending["output"] == []
+
+    @pytest.mark.parametrize(
+        ("sink_name", "scheduler_pending_sink", "authoritative_error_hash"),
+        [
+            ("bad", False, "0123456789abcdef"),
+            ("bad", True, None),
+            (None, True, None),
+            (None, False, "0123456789abcdef"),
+        ],
+        ids=["sink_without_handoff", "sink_without_hash", "discard_with_handoff", "discard_with_hash"],
+    )
+    def test_the_shared_pair_refuses_a_mixed_shape(
+        self, sink_name: str | None, scheduler_pending_sink: bool, authoritative_error_hash: str | None
+    ) -> None:
+        with pytest.raises(OrchestrationInvariantError):
+            RowResult(
+                token=make_token_info(),
+                final_data=make_row({"x": 1}),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                sink_name=sink_name,
+                scheduler_pending_sink=scheduler_pending_sink,
+                authoritative_error_hash=authoritative_error_hash,
+            )
+
+
 class TestAccumulateTerminalPairsCoalesced:
     """Tests for COALESCED outcome handling."""
 

@@ -1013,8 +1013,14 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
     ``PENDING_SINK`` is not merely a status: the dedicated redrive path must
     be able to rebuild a legal sink-bound ``RowResult`` without replaying its
     producer.  The opaque row payload and sink identity must therefore be
-    present, the persisted outcome/path pair must be one of the four
+    present, the persisted outcome/path pair must be one of the five
     sink-bound terminal pairs, and pair-specific evidence must be complete.
+    Source quarantine is the fifth: a row the source rejected is handed to its
+    quarantine sink through the same durable bundle as every other sink-bound
+    token, carrying the audited quarantine error hash and bounded message.
+    ``(FAILURE, QUARANTINED_AT_SOURCE)`` is also the sinkless discard pair;
+    a discarded token records its outcome directly and never parks, so a
+    parked item on this pair is always a source-quarantine handoff.
 
     Keep this predicate at the schema boundary so claim selection and its CAS
     UPDATE use the exact same SQL on SQLite and PostgreSQL.  Payload *shape*
@@ -1053,6 +1059,14 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
                 token_work_items_table.c.join_group_id.is_not(None),
                 token_work_items_table.c.join_group_id != "",
                 no_error_evidence,
+            ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.FAILURE.value,
+                token_work_items_table.c.pending_path == TerminalPath.QUARANTINED_AT_SOURCE.value,
+                token_work_items_table.c.pending_error_hash.is_not(None),
+                token_work_items_table.c.pending_error_hash != "",
+                token_work_items_table.c.pending_error_message.is_not(None),
+                token_work_items_table.c.join_group_id.is_(None),
             ),
         ),
     )

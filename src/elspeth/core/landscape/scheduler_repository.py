@@ -65,7 +65,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from datetime import datetime
 
-    from elspeth.contracts.audit import Row, Token
+    from elspeth.contracts.audit import RoutingEvent, Row, Token
+    from elspeth.contracts.errors import ExecutionError
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.core.landscape.data_flow_repository import DataFlowRepository
     from elspeth.core.landscape.execution_repository import ExecutionRepository
@@ -245,6 +246,32 @@ class TokenSchedulerRepository:
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
             collector_name=collector_name,
+        )
+
+    def ingest_quarantine_row_with_pending_sink(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        source: SourceIngestSpec,
+        data_flow: DataFlowRepository,
+        execution: ExecutionRepository,
+        validation_error_id: str | None,
+        source_state_id: str,
+        failure: ExecutionError,
+        divert_event: RoutingEvent,
+        pending_sink: BarrierEmission,
+    ) -> tuple[Row, Token, TokenWorkItem]:
+        """Fenced leader QUARANTINE INGEST (see :meth:`SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink`)."""
+        return self.queue.ingest_quarantine_row_with_pending_sink(
+            coordination_token=coordination_token,
+            source=source,
+            data_flow=data_flow,
+            execution=execution,
+            validation_error_id=validation_error_id,
+            source_state_id=source_state_id,
+            failure=failure,
+            divert_event=divert_event,
+            pending_sink=pending_sink,
         )
 
     def _ready_work_item_values(

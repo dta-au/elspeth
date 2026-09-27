@@ -154,7 +154,7 @@ files:
     Mapping[str, object]: 6
     dict[str, object]: 2
   src/elspeth/core/landscape/data_flow_repository.py:
-    Mapping[str, object]: 13
+    Mapping[str, object]: 12
     dict[str, object]: 1
   src/elspeth/core/landscape/database.py:
     dict[str, Any]: 1
@@ -167,7 +167,7 @@ files:
   src/elspeth/core/landscape/execution/calls.py:
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/node_states.py:
-    Mapping[str, object]: 14
+    Mapping[str, object]: 15
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/operations.py:
     Mapping[str, object]: 2
@@ -214,15 +214,15 @@ files:
     Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/core/landscape/scheduler/barrier.py:
-    Mapping[str, object]: 6
-    dict[str, object]: 5
+    Mapping[str, object]: 5
+    dict[str, object]: 3
   src/elspeth/core/landscape/scheduler/dispositions.py:
     dict[str, object]: 1
   src/elspeth/core/landscape/scheduler/events.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/scheduler/work_items.py:
-    Mapping[str, object]: 1
-    dict[str, object]: 7
+    Mapping[str, object]: 2
+    dict[str, object]: 9
   src/elspeth/core/landscape/scheduler_repository.py:
     Mapping[str, object]: 2
     dict[str, object]: 1

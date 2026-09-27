@@ -37,7 +37,7 @@ from elspeth.contracts import (
     ValidationErrorRecord,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.engine import CoalesceParentCompletion, CommittedCollect
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import LineageFrame
@@ -65,7 +65,6 @@ from elspeth.core.landscape.model_loaders import (
     ValidationErrorLoader,
 )
 from elspeth.core.landscape.ports import LandscapeConnectionProvider
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import ContractViolation
@@ -225,43 +224,6 @@ class DataFlowRepository:
             source_contract_json=source_contract_json,
             coordination_token=coordination_token,
         )
-
-    def create_quarantine_row_with_token(
-        self,
-        source_node_id: str,
-        row_index: int,
-        data: Mapping[str, object],
-        *,
-        source_row_index: int,
-        ingest_sequence: int,
-        validation_error_id: str | None = None,
-        coordination_token: CoordinationToken,
-    ) -> tuple[Row, Token]:
-        """Create a quarantine row/token and optional error link atomically."""
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="create_row_with_token",
-        ) as conn:
-            row, token = self.tokens.insert_row_with_token_on(
-                conn,
-                coordination_token=coordination_token,
-                source_node_id=source_node_id,
-                row_index=row_index,
-                data=data,
-                source_row_index=source_row_index,
-                ingest_sequence=ingest_sequence,
-                quarantined=True,
-            )
-            if validation_error_id is not None:
-                self.errors.link_validation_error_to_row_on(
-                    conn,
-                    run_id=coordination_token.run_id,
-                    error_id=validation_error_id,
-                    row_id=row.row_id,
-                )
-            return row, token
 
     def insert_row_with_token_on(
         self,

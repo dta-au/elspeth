@@ -556,6 +556,29 @@ def make_row_result(
     )
 
 
+def make_source_quarantine_result(
+    *,
+    sink_name: str = "quarantine",
+    error_hash: str = "0123456789abcdef",
+) -> RowResult:
+    """Build the sink-bound (FAILURE, QUARANTINED_AT_SOURCE) result the fenced quarantine ingest returns.
+
+    It carries the durable PENDING_SINK handoff flag and the audited error
+    hash, as ``RowProcessor.ingest_quarantined_row`` sets them.
+    """
+    from elspeth.contracts.results import RowResult
+
+    return RowResult(
+        token=make_token_info(),
+        final_data=make_pipeline_row({"_raw": "bad"}),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        sink_name=sink_name,
+        scheduler_pending_sink=True,
+        authoritative_error_hash=error_hash,
+    )
+
+
 def make_failure_info(
     exception_type: str = "ValueError",
     message: str = "test failure",

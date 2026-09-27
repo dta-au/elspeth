@@ -18,7 +18,6 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.identity import lineage_path_to_json
 from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
@@ -42,11 +41,9 @@ from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_
 from elspeth.core.landscape.scheduler.work_items import (
     insert_work_items,
     item_from_mapping,
+    prepare_fresh_pending_sink_item,
     ready_work_item_values,
     validate_work_item_references,
-)
-from elspeth.core.landscape.scheduler.work_items import (
-    work_item_id as make_work_item_id,
 )
 from elspeth.core.landscape.schema import (
     blocked_barrier_hold_clause,
@@ -458,14 +455,14 @@ class BarrierJournalRepository:
                 parked_lease_owner=pending_sink_lease_owner,
             )
             pending = [
-                self._prepare_fresh_pending_sink_emission(
+                prepare_fresh_pending_sink_item(
                     conn,
                     run_id=coordination_token.run_id,
-                    barrier_key=barrier_key,
                     emission=emission,
-                    emission_context=emission_context,
+                    context=emission_context,
                     database_now=database_now,
                     parked_lease_owner=pending_sink_lease_owner,
+                    refusal_prefix=f"Scheduler barrier completion for run_id={coordination_token.run_id!r} barrier_key={barrier_key!r}",
                 )
                 for emission in fresh_emissions
             ]
@@ -665,92 +662,6 @@ class BarrierJournalRepository:
                 f"Scheduler barrier pending-sink handoff mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: "
                 f"requested {len(emission_by_token)} token(s), transitioned {transitioned}."
             )
-
-    def _prepare_fresh_pending_sink_emission(
-        self,
-        conn: Connection,
-        *,
-        run_id: str,
-        barrier_key: str,
-        emission: BarrierEmission,
-        emission_context: Mapping[str, object],
-        database_now: datetime,
-        parked_lease_owner: str | None = None,
-    ) -> tuple[dict[str, object], SchedulerEventRecord]:
-        """INSERT a fresh PENDING_SINK row on the node_id-NULL terminal lane.
-
-        ``parked_lease_owner``: attributed-park stamp (ADR-030); see
-        :meth:`_transition_passthrough_pending_sink`.
-        """
-        if emission.node_id is not None:
-            raise AuditIntegrityError(
-                f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
-                f"received fresh pending-sink emission token_id={emission.token_id!r} with "
-                f"node_id={emission.node_id!r}; fresh sink-bound emissions live on the node_id-NULL terminal lane."
-            )
-        if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
-            raise AuditIntegrityError(
-                f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
-                f"fresh pending-sink emission token_id={emission.token_id!r} requires row_id, step_index "
-                "and ingest_sequence; the inserted journal row must be a complete resume cursor."
-            )
-        validate_work_item_references(
-            conn,
-            run_id=run_id,
-            token_id=emission.token_id,
-            row_id=emission.row_id,
-            ingest_sequence=emission.ingest_sequence,
-            node_id=None,
-            coalesce_node_id=emission.coalesce_node_id,
-        )
-        work_item_id = make_work_item_id(run_id, emission.token_id, None, emission.attempt)
-        values: dict[str, object] = {
-            "work_item_id": work_item_id,
-            "run_id": run_id,
-            "token_id": emission.token_id,
-            "row_id": emission.row_id,
-            "node_id": None,
-            "step_index": emission.step_index,
-            "ingest_sequence": emission.ingest_sequence,
-            "row_payload_json": emission.row_payload_json,
-            "status": TokenWorkStatus.PENDING_SINK.value,
-            "queue_key": emission.queue_key,
-            "barrier_key": emission.barrier_key,
-            "on_success_sink": emission.on_success_sink,
-            "pending_sink_name": emission.sink_name,
-            "pending_outcome": emission.outcome,
-            "pending_path": emission.path,
-            "pending_error_hash": emission.error_hash,
-            "pending_error_message": emission.error_message,
-            "join_group_id": emission.join_group_id,
-            "lineage_path_json": lineage_path_to_json(emission.lineage_path),
-            "coalesce_node_id": emission.coalesce_node_id,
-            "coalesce_name": emission.coalesce_name,
-            "row_union_name": emission.row_union_name,
-            "collector_name": emission.collector_name,
-            "attempt": emission.attempt,
-            "lease_owner": parked_lease_owner,
-            "lease_expires_at": None,
-            "available_at": database_now,
-            "created_at": database_now,
-            "updated_at": database_now,
-        }
-        event = SchedulerEventRecord(
-            event_type=SchedulerEventType.MARK_PENDING_SINK,
-            run_id=run_id,
-            token_id=emission.token_id,
-            work_item_id=work_item_id,
-            node_id=None,
-            from_status=None,
-            to_status=TokenWorkStatus.PENDING_SINK,
-            from_lease_owner=None,
-            to_lease_owner=parked_lease_owner,
-            from_attempt=None,
-            to_attempt=emission.attempt,
-            recorded_at=database_now,
-            context=emission_context,
-        )
-        return values, event
 
     def _prepare_ready_emission(
         self,

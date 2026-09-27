@@ -339,6 +339,14 @@ def accumulate_row_outcomes(
             )
         elif pair == (TerminalOutcome.SUCCESS, TerminalPath.COALESCED) and result.join_group_id is None:
             raise OrchestrationInvariantError(f"(SUCCESS, COALESCED) result missing join_group_id. Token: {result.token}")
+        # (FAILURE, QUARANTINED_AT_SOURCE) is a shared pair: the table entry is
+        # the sinkless discard (outcome already recorded, never routed). A
+        # result carrying a sink is a source-quarantined row that the fenced
+        # quarantine ingest parked durably; it routes to its quarantine sink
+        # with the error hash recorded at ingest — never recomputed.
+        source_quarantine_to_sink = pair == (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE) and result.sink_name is not None
+        if source_quarantine_to_sink:
+            error_hash = result.authoritative_error_hash
 
         # Counter movement comes from the shared table (elspeth-feeb4482fc);
         # the audit derive and the sink-diversion reconciler consume the SAME
@@ -356,7 +364,7 @@ def accumulate_row_outcomes(
             counters.rows_coalesce_failed += 1
         if effect.counts_routed_destination:
             counters.routed_destinations[_require_sink_name(result)] += 1
-        if effect.routes_to_sink:
+        if effect.routes_to_sink or source_quarantine_to_sink:
             _route_to_sink(
                 _require_sink_name(result),
                 pending_tokens,

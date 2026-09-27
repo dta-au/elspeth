@@ -10,20 +10,128 @@ __all__ = ["TokenInfo", "TokenManager"]
 
 import copy
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, SourceRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
-from elspeth.contracts.enums import FrameKind, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import ExecutionError, OrchestrationInvariantError, SourceQuarantineReason
 from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
-from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.results import RowResult
+from elspeth.contracts.scheduler import BarrierEmission, SourceIngestSpec, TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.ids import generate_id
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.engine._error_hash import compute_error_hash
+
+if TYPE_CHECKING:
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+
+
+def quarantine_pipeline_row(row: object) -> PipelineRow:
+    """The audit row of a quarantined source row: the rejected data under an empty OBSERVED contract.
+
+    A quarantined row failed source validation, so it carries no contract and
+    may not even be a mapping. A mapping is normalised to a plain ``dict``
+    (``PipelineRow`` requires exactly ``dict``); anything else is wrapped as
+    ``{"_raw": row}``. The data is never validated or transformed. This exact
+    object is what the quarantine sink writes live AND what the durable
+    PENDING_SINK handoff serialises, so a resumed write rebuilds the same
+    member row (``payload_hash``) and reuses a reserved sink effect.
+    """
+    row_data: dict[str, Any]
+    if isinstance(row, dict):
+        row_data = dict(row) if type(row) is not dict else row
+    else:
+        row_data = {"_raw": row}
+    return PipelineRow(row_data, SchemaContract(mode="OBSERVED", fields=(), locked=False))
+
+
+def ingest_source_quarantine(
+    *,
+    scheduler: TokenSchedulerRepository,
+    data_flow: DataFlowRepository,
+    execution: ExecutionRepository,
+    coordination_token: CoordinationToken,
+    source_node_id: NodeID,
+    row_index: int,
+    source_row_index: int,
+    ingest_sequence: int,
+    row: object,
+    validation_error_id: str | None,
+    quarantine_sink: str,
+    quarantine_error: str,
+    quarantine_edge_id: str,
+    terminal_step_index: int,
+) -> RowResult:
+    """Record a source-quarantined row and park its quarantine-sink handoff, in ONE fenced transaction.
+
+    The single composition of the source-quarantine ingest (``RowProcessor.
+    ingest_quarantined_row`` supplies its repositories and the terminal-lane
+    step). ``row`` is the already-sanitised rejected data; ``quarantine_error``
+    the bounded, non-empty plugin error text — the ONE text behind the FAILED
+    state's error, the DIVERT reason, the pending-sink message and the error
+    hash. The returned result is the token's sink-bound ``(FAILURE,
+    QUARANTINED_AT_SOURCE)`` result, carrying the audited hash for the shared
+    accumulator; the outcome itself is recorded after sink durability.
+    """
+    pipeline_row = quarantine_pipeline_row(row)
+    token = TokenInfo(row_id=generate_id(), token_id=generate_id(), row_data=pipeline_row)
+    error_hash = compute_error_hash(quarantine_error)
+    source_state_id = generate_id()
+    divert_event = execution.node_states.prepare_routing_event_for_new_state(
+        source_state_id,
+        quarantine_edge_id,
+        RoutingMode.DIVERT,
+        SourceQuarantineReason(quarantine_error=quarantine_error),
+        run_id=coordination_token.run_id,
+        owner="ingest_source_quarantine",
+    )
+    scheduler.ingest_quarantine_row_with_pending_sink(
+        coordination_token=coordination_token,
+        source=SourceIngestSpec(
+            source_node_id=str(source_node_id),
+            row_index=row_index,
+            data=pipeline_row.to_dict(),
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=token.row_id,
+            token_id=token.token_id,
+        ),
+        data_flow=data_flow,
+        execution=execution,
+        validation_error_id=validation_error_id,
+        source_state_id=source_state_id,
+        failure=ExecutionError(exception=quarantine_error, exception_type="ValidationError"),
+        divert_event=divert_event,
+        pending_sink=BarrierEmission(
+            token_id=token.token_id,
+            row_payload_json=scheduler.serialize_row_payload(pipeline_row),
+            sink_name=quarantine_sink,
+            outcome=TerminalOutcome.FAILURE.value,
+            path=TerminalPath.QUARANTINED_AT_SOURCE.value,
+            error_hash=error_hash,
+            error_message=quarantine_error,
+            row_id=token.row_id,
+            node_id=None,
+            step_index=terminal_step_index,
+            ingest_sequence=ingest_sequence,
+        ),
+    )
+    return RowResult(
+        token=token,
+        final_data=pipeline_row,
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        sink_name=quarantine_sink,
+        scheduler_pending_sink=True,
+        authoritative_error_hash=error_hash,
+    )
 
 
 class TokenManager:
@@ -182,84 +290,6 @@ class TokenManager:
             source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
             row_id=row_id,
             token_id=token_id,
-            coordination_token=coordination_token,
-        )
-
-        return TokenInfo(
-            row_id=row.row_id,
-            token_id=token.token_id,
-            row_data=pipeline_row,
-        )
-
-    def create_quarantine_token(
-        self,
-        source_node_id: str,
-        row_index: int,
-        source_row: SourceRow,
-        *,
-        source_row_index: int,
-        ingest_sequence: int,
-        validation_error_id: str | None = None,
-        coordination_token: CoordinationToken,
-    ) -> TokenInfo:
-        """Create a token for a quarantined row.
-
-        Quarantined rows are invalid data that failed source validation.
-        They don't have contracts (SourceRow.quarantined sets contract=None).
-        They are routed directly to a quarantine sink for investigation.
-
-        Creates a minimal PipelineRow with an empty OBSERVED contract for audit
-        trail consistency, but the data is not validated or transformed.
-
-        Args:
-            source_node_id: Source node that loaded the row
-            row_index: Position in source (0-indexed)
-            source_row: Quarantined SourceRow (contract=None is expected)
-
-        Returns:
-            TokenInfo with row and token IDs
-
-        Raises:
-            OrchestrationInvariantError: If source_row is not quarantined
-        """
-        if not source_row.is_quarantined:
-            raise OrchestrationInvariantError("create_quarantine_token requires a quarantined SourceRow")
-
-        # For quarantine rows, row may not be a dict (could be malformed external data).
-        # PipelineRow requires exactly builtin dict (type(data) is dict), so normalize
-        # dict subclasses (OrderedDict, etc.) to plain dict for the audit trail.
-        if isinstance(source_row.row, dict):
-            row_data: dict[str, Any] = dict(source_row.row) if type(source_row.row) is not dict else source_row.row
-        else:
-            row_data = {"_raw": source_row.row}
-
-        # Create minimal OBSERVED contract for audit consistency
-        # Quarantine rows don't go through transforms, but audit trail needs a contract
-        from elspeth.contracts.schema_contract import SchemaContract
-
-        quarantine_contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(),  # Empty - no declared fields
-            locked=False,  # Not locked - quarantine doesn't validate types
-        )
-
-        # Create PipelineRow with minimal contract
-        pipeline_row = PipelineRow(row_data, quarantine_contract)
-
-        # Create the row record, initial token, and optional validation-error
-        # association in ONE transaction —
-        # epoch-fenced when a coordination token is threaded (ADR-030 §C.4
-        # row 9: the quarantine arm is an ingest-adjacent durable rows write
-        # at sequence N; historically this was TWO separate transactions).
-        # quarantined=True enables safe hashing for Tier-3 external data that
-        # may contain non-canonical values (NaN, Infinity).
-        row, token = self._data_flow.create_quarantine_row_with_token(
-            source_node_id=source_node_id,
-            row_index=row_index,
-            source_row_index=source_row_index,
-            ingest_sequence=ingest_sequence,
-            data=pipeline_row.to_dict(),
-            validation_error_id=validation_error_id,
             coordination_token=coordination_token,
         )
 

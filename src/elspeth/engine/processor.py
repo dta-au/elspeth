@@ -184,7 +184,7 @@ from elspeth.engine.executors.state_guard import NodeStateGuard, stamped_node_st
 from elspeth.engine.executors.transform import record_transform_error_with_routing
 from elspeth.engine.retry import RetryManager
 from elspeth.engine.spans import SpanFactory
-from elspeth.engine.tokens import TokenManager
+from elspeth.engine.tokens import TokenManager, ingest_source_quarantine
 
 logger = logging.getLogger(__name__)
 
@@ -982,11 +982,6 @@ class RowProcessor:
                 collector_executor=self._collector_executor,
                 collector_node_ids=self._collector_node_ids,
             ).restore_from_journal(barrier_restore)
-
-    @property
-    def token_manager(self) -> TokenManager:
-        """Expose token manager for orchestrator to create tokens for quarantined rows."""
-        return self._token_manager
 
     @property
     def row_union_executor(self) -> RowUnionExecutor | None:
@@ -2940,6 +2935,49 @@ class RowProcessor:
             row_union_name=fields.row_union_name,
         )
         return scheduled
+
+    def ingest_quarantined_row(
+        self,
+        *,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        row: object,
+        validation_error_id: str | None,
+        quarantine_sink: str,
+        quarantine_error: str,
+        quarantine_edge_id: str,
+    ) -> RowResult:
+        """Record a source-quarantined row and hand it to its quarantine sink durably, in ONE fenced transaction.
+
+        ``row`` is the already-sanitised rejected data; ``quarantine_error`` is
+        the bounded, non-empty plugin error text. The fenced quarantine ingest
+        writes the row, its token, the FAILED step-0 source state, the DIVERT
+        routing event and a PENDING_SINK handoff whose payload is the exact
+        audit row the quarantine sink writes. The returned result is the
+        token's sink-bound ``(FAILURE, QUARANTINED_AT_SOURCE)`` result — the
+        same accumulator every other sink-bound token goes through routes it,
+        carrying the audited error hash (never recomputed downstream). Resume
+        re-drives the parked item through the pending-sink drain; the rejected
+        row is never re-validated.
+        """
+        return ingest_source_quarantine(
+            scheduler=self._scheduler,
+            data_flow=self._data_flow,
+            execution=self._execution,
+            coordination_token=self._require_coordination_token(),
+            source_node_id=source_node_id,
+            row_index=row_index,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row=row,
+            validation_error_id=validation_error_id,
+            quarantine_sink=quarantine_sink,
+            quarantine_error=quarantine_error,
+            quarantine_edge_id=quarantine_edge_id,
+            terminal_step_index=self._scheduler_step_index(None),
+        )
 
     def process_row(
         self,

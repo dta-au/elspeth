@@ -980,11 +980,12 @@ class TestTokenManagerBoundaryPaths:
     """Coverage for error guards and quarantine/resume token paths."""
 
     def test_source_identity_parameters_are_required_by_signature(self) -> None:
+        from elspeth.engine.processor import RowProcessor
         from elspeth.engine.tokens import TokenManager
 
         # Iterate the method objects themselves: a renamed or deleted method is a
         # NameError at collection instead of a silently skipped signature check.
-        for method in (TokenManager.create_initial_token, TokenManager.create_quarantine_token):
+        for method in (TokenManager.create_initial_token, RowProcessor.ingest_quarantined_row):
             signature = inspect.signature(method)
             type_hints = get_type_hints(method)
             for parameter_name in ("source_row_index", "ingest_sequence"):
@@ -998,50 +999,33 @@ class TestTokenManagerBoundaryPaths:
         with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
             SourceRow(row={"value": 42}, is_quarantined=False, contract=None, source_row_index=0)
 
-    def test_create_quarantine_token_rejects_non_quarantined_source_row(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+    def test_quarantine_pipeline_row_preserves_dict_payload(self) -> None:
+        from elspeth.engine.tokens import quarantine_pipeline_row
 
-        with pytest.raises(OrchestrationInvariantError, match="requires a quarantined"):
-            manager.create_quarantine_token(
-                source_node_id=source_node_id,
-                row_index=0,
-                source_row=_make_source_row({"value": 42}),
-                source_row_index=0,
-                ingest_sequence=0,
-                coordination_token=token_manager_leader(manager, run_id),
-            )
+        row = quarantine_pipeline_row({"raw": "invalid"})
 
-    def test_create_quarantine_token_preserves_dict_payload(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+        assert row.to_dict() == {"raw": "invalid"}
+        assert row.contract.mode == "OBSERVED"
+        assert row.contract.fields == ()
+        assert row.contract.locked is False
 
-        token = manager.create_quarantine_token(
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(row={"raw": "invalid"}, error="bad data", destination="quarantine", source_row_index=0),
-            source_row_index=0,
-            ingest_sequence=0,
-            coordination_token=token_manager_leader(manager, run_id),
-        )
+    def test_quarantine_pipeline_row_normalises_a_dict_subclass(self) -> None:
+        from collections import OrderedDict
 
-        assert token.row_data.to_dict() == {"raw": "invalid"}
-        assert token.row_data.contract.mode == "OBSERVED"
-        assert token.row_data.contract.fields == ()
-        assert token.row_data.contract.locked is False
+        from elspeth.engine.tokens import quarantine_pipeline_row
 
-    def test_create_quarantine_token_wraps_non_dict_payload(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+        row = quarantine_pipeline_row(OrderedDict([("a", 1)]))
 
-        token = manager.create_quarantine_token(
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(row=["not", "a", "dict"], error="bad row type", destination="quarantine", source_row_index=0),
-            source_row_index=0,
-            ingest_sequence=0,
-            coordination_token=token_manager_leader(manager, run_id),
-        )
+        assert type(row.to_dict()) is dict
+        assert row.to_dict() == {"a": 1}
 
-        assert token.row_data.to_dict() == {"_raw": ["not", "a", "dict"]}
-        assert token.row_data.contract.mode == "OBSERVED"
+    def test_quarantine_pipeline_row_wraps_non_dict_payload(self) -> None:
+        from elspeth.engine.tokens import quarantine_pipeline_row
+
+        row = quarantine_pipeline_row(["not", "a", "dict"])
+
+        assert row.to_dict() == {"_raw": ["not", "a", "dict"]}
+        assert row.contract.mode == "OBSERVED"
 
     def test_create_token_for_existing_row_creates_new_token(self) -> None:
         manager, factory, run_id, source_node_id = _make_manager_context()
@@ -1228,54 +1212,3 @@ class TestExpandTokenStrictZip:
                 node_id=NodeID("expand_node"),
                 member_token=token_manager_leader(manager, setup.run_id).membership,
             )
-
-
-class TestCreateQuarantineTokenFlag:
-    """Kill mutant: ``quarantined=True`` → ``quarantined=False``.
-
-    Quarantined rows must be recorded with quarantined=True so the
-    audit trail distinguishes quarantined data from normal rows.
-    Without this flag, quarantined rows with NaN/Infinity would
-    fail canonical hashing instead of being safely stored.
-    """
-
-    def test_quarantine_token_passes_quarantined_flag_to_data_flow(self) -> None:
-        """create_quarantine_token must pass quarantined=True to data_flow.create_row.
-
-        Kill mutant: quarantined=True → quarantined=False.
-
-        When quarantined=True, the data_flow uses repr_hash fallback for
-        data containing NaN/Infinity. If the mutant flips it to False,
-        canonical hashing crashes on NaN data.
-        """
-        manager, factory, run_id, source_node_id = _make_manager_context()
-
-        # Data with NaN — only works if quarantined=True (repr_hash fallback)
-        quarantine_row = SourceRow.quarantined(
-            {"bad_data": float("nan")},
-            error="NaN value",
-            destination="quarantine_sink",
-            source_row_index=0,
-        )
-
-        # This must NOT raise — quarantined=True enables repr_hash fallback
-        token_info = manager.create_quarantine_token(
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=quarantine_row,
-            source_row_index=0,
-            ingest_sequence=0,
-            coordination_token=token_manager_leader(manager, run_id),
-        )
-
-        assert token_info.row_id is not None
-        assert token_info.token_id is not None
-
-        # Verify the row was actually stored (proof quarantined=True worked)
-        row_record = factory.query.get_row(token_info.row_id)
-        assert row_record is not None
-        assert row_record.source_data_hash is not None, (
-            "Quarantined row must have a hash (via repr_hash fallback). "
-            "If quarantined=False mutant was active, create_row would have "
-            "crashed on NaN during canonical hashing."
-        )

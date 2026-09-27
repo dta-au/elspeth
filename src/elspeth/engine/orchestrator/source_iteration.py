@@ -725,8 +725,7 @@ class SourceIterationDriver:
 
                         # Quarantine path — route directly to sink, skip normal processing
                         if source_item.is_quarantined:
-                            self._quarantine_router.route(
-                                factory,
+                            quarantine_result = self._quarantine_router.route(
                                 run_id,
                                 source_id,
                                 source_item,
@@ -737,6 +736,7 @@ class SourceIterationDriver:
                                 loop_ctx,
                                 active_source=active_source,
                             )
+                            accumulate_row_outcomes((quarantine_result,), counters, pending_tokens)
                             # elspeth-c6d083d150 / elspeth-321f335ff2: a
                             # continuously ready stream of quarantined rows
                             # never reaches the per-row sweeps below and keeps

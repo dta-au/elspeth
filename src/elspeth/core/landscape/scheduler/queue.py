@@ -14,9 +14,10 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.scheduler import SchedulerEventType, SourceIngestSpec, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, SourceIngestSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
@@ -24,17 +25,20 @@ from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler.work_items import (
     insert_work_item_idempotent,
+    insert_work_items,
     item_from_mapping,
+    prepare_fresh_pending_sink_item,
     ready_work_item_values,
     validate_work_item_references,
 )
 from elspeth.core.landscape.scheduler.work_items import (
     work_item_id as make_work_item_id,
 )
-from elspeth.core.landscape.schema import active_worker_fence_clause, token_work_items_table
+from elspeth.core.landscape.schema import active_worker_fence_clause, pending_sink_bundle_clause, token_work_items_table
 
 if TYPE_CHECKING:
-    from elspeth.contracts.audit import Row, Token
+    from elspeth.contracts.audit import RoutingEvent, Row, Token
+    from elspeth.contracts.errors import ExecutionError
     from elspeth.core.landscape.data_flow_repository import DataFlowRepository
     from elspeth.core.landscape.execution_repository import ExecutionRepository
 
@@ -459,3 +463,153 @@ class SchedulerQueueRepository:
                 collector_name=collector_name,
             )
         return row_record, token_record, item_from_mapping(scheduled)
+
+    def ingest_quarantine_row_with_pending_sink(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        source: SourceIngestSpec,
+        data_flow: DataFlowRepository,
+        execution: ExecutionRepository,
+        validation_error_id: str | None,
+        source_state_id: str,
+        failure: ExecutionError,
+        divert_event: RoutingEvent,
+        pending_sink: BarrierEmission,
+    ) -> tuple[Row, Token, TokenWorkItem]:
+        """Fenced leader QUARANTINE INGEST: a rejected source row's whole audit record in ONE transaction.
+
+        The source-quarantine analogue of :meth:`ingest_row_with_initial_claim`.
+        One IMMEDIATE, leader-epoch-fenced transaction composes (1) the
+        ``rows`` + ``tokens`` inserts and the validation-error link, (2) the
+        step-0 FAILED source node_state carrying the bounded quarantine error,
+        (3) the DIVERT routing event on the ``__quarantine__`` edge, and (4) the
+        durable PENDING_SINK handoff to the quarantine sink — born parked on the
+        node_id-NULL terminal lane, owner-attributed to the ingesting leader,
+        exactly as an atomic barrier completion parks a generated sink-bound
+        output. A crash therefore leaves either none of it or all of it: no
+        sink-bound token exists only in memory (QR-1), and resume re-drives the
+        parked item through the ordinary pending-sink drain, never through the
+        source schema.
+
+        ``divert_event`` is prepared before the transaction (its reason bytes
+        are durable first) by ``prepare_routing_event_for_new_state`` for the
+        pre-minted ``source_state_id``.
+        """
+        from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+        from elspeth.core.landscape.execution_repository import ExecutionRepository
+
+        if type(source) is not SourceIngestSpec:
+            raise TypeError("quarantine ingest requires a SourceIngestSpec")
+        if type(data_flow) is not DataFlowRepository:
+            raise TypeError("quarantine ingest requires an exact DataFlowRepository")
+        if type(execution) is not ExecutionRepository:
+            raise TypeError("quarantine ingest requires an exact ExecutionRepository")
+        if not isinstance(coordination_token, CoordinationToken):
+            raise TypeError("quarantine ingest requires a CoordinationToken")
+        if type(pending_sink) is not BarrierEmission:
+            raise TypeError("quarantine ingest requires a BarrierEmission pending-sink image")
+        if (
+            pending_sink.token_id != source.token_id
+            or pending_sink.row_id != source.row_id
+            or pending_sink.ingest_sequence != source.ingest_sequence
+            or pending_sink.outcome != TerminalOutcome.FAILURE.value
+            or pending_sink.path != TerminalPath.QUARANTINED_AT_SOURCE.value
+        ):
+            raise AuditIntegrityError(
+                "Quarantine ingest pending-sink image does not describe this source row's (FAILURE, QUARANTINED_AT_SOURCE) handoff"
+            )
+        if divert_event.state_id != source_state_id:
+            raise AuditIntegrityError("Quarantine ingest DIVERT event does not belong to the source state it records")
+        run_id = coordination_token.run_id
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="ingest_quarantine_row_with_pending_sink",
+        ) as conn:
+            # quarantined=True: the rejected data is Tier-3 and may not be
+            # canonically hashable (the row hash takes the repr fallback).
+            row_record, token_record = data_flow.insert_row_with_token_on(
+                conn,
+                coordination_token=coordination_token,
+                source_node_id=source.source_node_id,
+                row_index=source.row_index,
+                data=source.data,
+                source_row_index=source.source_row_index,
+                ingest_sequence=source.ingest_sequence,
+                row_id=source.row_id,
+                token_id=source.token_id,
+                quarantined=True,
+            )
+            if row_record.row_id != source.row_id or token_record.token_id != source.token_id:
+                raise AuditIntegrityError(
+                    f"Quarantine ingest for run_id={run_id!r} returned row/token identities that differ from its SourceIngestSpec"
+                )
+            if validation_error_id is not None:
+                data_flow.errors.link_validation_error_to_row_on(
+                    conn,
+                    run_id=coordination_token.run_id,
+                    error_id=validation_error_id,
+                    row_id=row_record.row_id,
+                )
+            execution.node_states.record_failed_source_quarantine_state_on(
+                conn,
+                token_id=source.token_id,
+                source_node_id=source.source_node_id,
+                input_data=source.data,
+                error=failure,
+                coordination_token=coordination_token,
+                state_id=source_state_id,
+            )
+            execution.node_states.record_routing_event_on(
+                divert_event,
+                conn=conn,
+                run_id=run_id,
+                owner="ingest_quarantine_row_with_pending_sink",
+            )
+            parked = self._park_source_quarantine_on(
+                conn,
+                run_id=run_id,
+                emission=pending_sink,
+                parked_lease_owner=coordination_token.worker_id,
+            )
+        return row_record, token_record, item_from_mapping(parked)
+
+    def _park_source_quarantine_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        emission: BarrierEmission,
+        parked_lease_owner: str,
+    ) -> RowMapping:
+        """Insert the born-parked PENDING_SINK handoff of a source-quarantined row, and its event, on ``conn``.
+
+        The same terminal-lane image an atomic barrier completion parks for a
+        generated sink-bound output (:func:`prepare_fresh_pending_sink_item`),
+        attributed to the ingesting leader. The bundle predicate is checked on
+        the written row: a parked item the resume drain could never claim is
+        refused inside the ingest transaction.
+        """
+        values, event = prepare_fresh_pending_sink_item(
+            conn,
+            run_id=run_id,
+            emission=emission,
+            context={"reason": "source_quarantine_ingest"},
+            database_now=read_landscape_transaction_time(conn),
+            parked_lease_owner=parked_lease_owner,
+            refusal_prefix=f"Source-quarantine ingest for run_id={run_id!r}",
+        )
+        insert_work_items(conn, values=[values], operation="source-quarantine pending-sink handoff")
+        self._events.record_many(conn, records=[event])
+        work_item_id = values["work_item_id"]
+        bundle_complete = conn.execute(
+            select(pending_sink_bundle_clause()).where(token_work_items_table.c.work_item_id == work_item_id)
+        ).scalar_one()
+        if not bundle_complete:
+            raise AuditIntegrityError(
+                f"Source-quarantine ingest for run_id={run_id!r} token_id={emission.token_id!r} parked an incomplete "
+                "durable sink bundle; the resume drain could never claim it."
+            )
+        return conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()

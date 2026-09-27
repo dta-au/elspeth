@@ -311,6 +311,76 @@ class NodeStateRepository:
             raise LandscapePostCommitError(f"NodeState {state_id} should be COMPLETED after atomic insert but has status {loaded.status}")
         return loaded
 
+    def record_failed_source_quarantine_state_on(
+        self,
+        conn: Connection,
+        *,
+        token_id: str,
+        source_node_id: str,
+        input_data: Mapping[str, object],
+        error: ExecutionError,
+        coordination_token: CoordinationToken,
+        state_id: str,
+    ) -> NodeStateFailed:
+        """Insert the step-0 FAILED source state of a quarantined row on a caller-owned transaction.
+
+        The source-quarantine analogue of :meth:`record_completed_node_state_on`:
+        the fenced quarantine ingest records the row, its token, this state, its
+        DIVERT routing event and its PENDING_SINK handoff in ONE transaction.
+        ``input_data`` is Tier-3 external data (it failed source validation), so
+        it takes the quarantined hashing fallback.
+        """
+        verify_and_extend_leader_fence(
+            conn,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_failed_source_quarantine_state_on",
+        )
+        try:
+            input_hash = stable_hash(input_data)
+        except (ValueError, TypeError):
+            input_hash = repr_hash(input_data)
+        timestamp = now()
+        try:
+            result = conn.execute(
+                node_states_table.insert().values(
+                    state_id=state_id,
+                    token_id=token_id,
+                    node_id=source_node_id,
+                    run_id=coordination_token.run_id,
+                    step_index=0,
+                    attempt=0,
+                    status=NodeStateStatus.FAILED.value,
+                    input_hash=input_hash,
+                    output_hash=None,
+                    duration_ms=0,
+                    error_json=canonical_json(error.to_dict()),
+                    success_reason_json=None,
+                    context_after_json=None,
+                    started_at=timestamp,
+                    completed_at=timestamp,
+                )
+            )
+            if result.rowcount == 0:
+                raise LandscapeRecordError(
+                    f"record_failed_source_quarantine_state: zero rows affected for state_id={state_id} — audit write failed"
+                )
+            row = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                f"record_failed_source_quarantine_state failed for state_id={state_id} — database rejected audit write: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if row is None:
+            raise LandscapeRecordError(f"NodeState {state_id} not found after insert — database corruption or transaction failure")
+        try:
+            loaded = self._node_state_loader.load(row)
+        except AuditIntegrityError as exc:
+            raise LandscapePostCommitError(f"NodeState {state_id} became unreadable immediately after insert: {exc}") from exc
+        if loaded.status is not NodeStateStatus.FAILED:
+            raise LandscapePostCommitError(f"NodeState {state_id} should be FAILED after atomic insert but has status {loaded.status}")
+        return loaded
+
     def validate_existing_source_completed_node_state_on(
         self,
         conn: Connection,
@@ -975,11 +1045,60 @@ class NodeStateRepository:
         the event (so a crash can never leave an event whose ``reason_ref``
         points at nothing). :meth:`record_routing_event_on` inserts it.
         """
+        if reason is not None and self._payload_store is not None:
+            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner=owner)
+        return self._build_routing_event(
+            state_id,
+            edge_id,
+            mode,
+            reason,
+            event_id=event_id,
+            routing_group_id=routing_group_id,
+            ordinal=ordinal,
+            reason_ref=reason_ref,
+        )
+
+    def prepare_routing_event_for_new_state(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason,
+        *,
+        run_id: str,
+        owner: str,
+    ) -> RoutingEvent:
+        """Build the one-route decision of a state its caller will insert in the SAME transaction.
+
+        :meth:`prepare_routing_event`'s pre-transaction check reads the state,
+        which a caller composing the state insert and its routing decision
+        into one transaction (the fenced source-quarantine ingest) has not
+        committed yet. The same doomed-decision guard is kept on what does
+        exist before that transaction: the edge must belong to ``run_id``.
+        The reason bytes are materialized before the insert, as always.
+        """
+        if self._payload_store is not None:
+            edge_row = self._ops.execute_fetchone(select(edges_table.c.run_id).where(edges_table.c.edge_id == edge_id))
+            if edge_row is None or edge_row.run_id != run_id:
+                raise LandscapeRecordError(f"{owner} requires edge_id={edge_id!r} to exist in run {run_id!r}")
+        return self._build_routing_event(state_id, edge_id, mode, reason)
+
+    def _build_routing_event(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason | None,
+        *,
+        event_id: str | None = None,
+        routing_group_id: str | None = None,
+        ordinal: int = 0,
+        reason_ref: str | None = None,
+    ) -> RoutingEvent:
+        """Assemble one route with its stable identities and durable reason bytes."""
         routing_group_id = routing_group_id or self._default_routing_group_id(state_id)
         event_id = event_id or self._default_routing_event_id(routing_group_id, ordinal)
         reason_hash = stable_hash(reason) if reason is not None else None
-        if reason is not None and self._payload_store is not None:
-            self._assert_routing_targets_recordable(state_id=state_id, edge_ids=(edge_id,), owner=owner)
         materialized_reason_ref = self._materialize_routing_reason_before_insert(
             reason=reason,
             reason_hash=reason_hash,
