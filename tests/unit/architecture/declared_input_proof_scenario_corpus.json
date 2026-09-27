@@ -1,0 +1,177 @@
+{
+  "aggregation-immutable-batch/eof-immutable-membership": {
+    "aggregation:eof_sum": []
+  },
+  "aggregation-immutable-batch/resume-after-eof-flush-fault": {
+    "aggregation:eof_sum": []
+  },
+  "checkpoint-deterministic-resume/reopen-resume": {
+    "aggregation:eof_sum": []
+  },
+  "conditional-routing/error-route-and-discard": {
+    "transform:fail_selected": []
+  },
+  "conditional-routing/route-reopen-resume": {},
+  "conditional-routing/route-reopen-resume-second-sink": {},
+  "conditional-routing/two-way-gate": {},
+  "fork-coalesce-policies/best-effort-all-lost": {
+    "transform:lose_a": [],
+    "transform:lose_b": [],
+    "transform:lose_c": []
+  },
+  "fork-coalesce-policies/best-effort-nested-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/best-effort-select-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/best-effort-union-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/first-all-lost": {
+    "transform:lose_a": [],
+    "transform:lose_b": [],
+    "transform:lose_c": []
+  },
+  "fork-coalesce-policies/first-nested": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/first-select": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/first-union": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/quorum-impossible-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/quorum-nested-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/quorum-select-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/quorum-union-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/require-all-lost-c": {
+    "transform:lose_c": [],
+    "transform:mark_a": [],
+    "transform:mark_b": []
+  },
+  "fork-coalesce-policies/require-all-nested": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/require-all-nested-reopen-after-coalesce": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/require-all-select": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/require-all-union": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/union-collision-fail": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/union-collision-first-wins": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-coalesce-policies/union-collision-last-wins": {
+    "transform:mark_a": [],
+    "transform:mark_b": [],
+    "transform:mark_c": []
+  },
+  "fork-multiple-terminals-partial-failure/one-terminal-fails": {},
+  "fork-multiple-terminals-partial-failure/reopen-after-partial-terminal": {},
+  "linear/happy-path": {
+    "transform:pass_rows": []
+  },
+  "linear/reopen-after-source": {
+    "transform:pass_rows": []
+  },
+  "multi-source-queue-fan-in/queued-fan-in": {
+    "transform:normalize_rows": []
+  },
+  "multi-source-queue-fan-in/queued-fan-in-reopen-resume": {
+    "transform:normalize_rows": []
+  },
+  "multiple-independent-sources/independent-roots": {},
+  "multiple-independent-sources/independent-roots-reopen-resume": {},
+  "multiple-independent-sources/two-source-parallel-regions": {},
+  "parallel-coalesces/resume-after-left-finalize": {},
+  "parallel-coalesces/two-parallel-require-all": {},
+  "retry-quarantine-discard-routed-errors/retry-success-reopen-resume": {
+    "transform:retry_once": []
+  },
+  "retry-quarantine-discard-routed-errors/retry-then-success": {
+    "transform:retry_once": []
+  },
+  "retry-quarantine-discard-routed-errors/source-quarantine-routed": {},
+  "retry-quarantine-discard-routed-errors/transform-discard": {
+    "transform:discard_error": []
+  },
+  "retry-quarantine-discard-routed-errors/transform-error-route": {
+    "transform:routed_error": []
+  },
+  "row-expansion-parent-child-recovery/json-explode-parent-child": {
+    "transform:explode_items": [
+      "items"
+    ]
+  },
+  "row-expansion-parent-child-recovery/resume-after-child-enqueue": {
+    "transform:explode_items": []
+  },
+  "row-union-interleave/two-variant-ab": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "row-union-interleave/two-variant-ab-reopen-resume": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "sequential-nested-fork-coalesce/reopen-terminal-publication": {},
+  "sequential-nested-fork-coalesce/two-sequential-require-all": {},
+  "sink-write-pending-redrive/pending-redrive-reopen": {},
+  "sink-write-pending-redrive/write-once": {}
+}
