@@ -1984,7 +1984,7 @@ _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
     "spelling the declaration does not carry works at best by accident of the producer's original header, so "
     "'correcting' the declaration to match a template typo moves the failure rather than clearing it. Add a name to "
     "options.required_input_fields ONLY if the upstream producer guarantees that exact name: declaring one it does "
-    "not guarantee is accepted here and then fails every row at run time with a declared-required-fields violation. "
+    "not guarantee is refused when the pipeline is validated. "
     'Where the rejection shows a parenthesised form, declare THAT — a bracket literal such as row["Original Header"] '
     "is not a legal declaration entry and is rejected on application. Send the full list when you patch: "
     "patch_node_options replaces the option's value, it does not append. Do not answer this by emptying "

@@ -1211,7 +1211,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a6ff8d1e5faa13bf"
+    source_file_hash: str | None = "sha256:89957ad11642742e"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1670,6 +1670,20 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         passed to ``__init__``) — distinct meanings, distinct names.
         """
         return self._config
+
+    @property
+    def consumed_input_fields(self) -> frozenset[str]:
+        """The base set plus every ``image_inputs`` column, the optional ones included.
+
+        An image marked ``required: false`` is not a declared input
+        (``LLMConfig.declared_input_fields``) because its absence is a valid
+        row, but the transform reads it whenever it is present. The base
+        class's column-option limb cannot see it (``image_inputs`` is not a
+        ``*_field`` option), so the plugin surfaces it here, as the base
+        contract asks of a plugin that reads a column it does not declare:
+        demotion must never treat a read column as created-only.
+        """
+        return super().consumed_input_fields | self._config.image_input_fields
 
     def output_semantics(self) -> OutputSemanticDeclaration:
         """Declare that raw LLM response fields are unconstrained strings.
