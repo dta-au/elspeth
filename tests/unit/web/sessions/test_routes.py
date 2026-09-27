@@ -694,7 +694,7 @@ class _ProgressRouteSessionService:
         )
         record = replace(record, client_request_id=client_request_id)
         self.messages[-1] = record
-        return MessageIngressFresh(client_request_id=client_request_id, message=record, transcript=list(self.messages))
+        return MessageIngressFresh(client_request_id=client_request_id, message=record, transcript=tuple(self.messages))
 
     async def get_messages(
         self,

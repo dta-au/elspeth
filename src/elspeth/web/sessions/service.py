@@ -9798,7 +9798,7 @@ class SessionServiceImpl:
             )
         message = replace(transcript[-1], client_request_id=client_request_id)
         transcript[-1] = message
-        return MessageIngressFresh(client_request_id=client_request_id, message=message, transcript=transcript)
+        return MessageIngressFresh(client_request_id=client_request_id, message=message, transcript=tuple(transcript))
 
     def _verify_guided_failure_audit_cohort(
         self,

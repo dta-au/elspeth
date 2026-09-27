@@ -1096,7 +1096,7 @@ class MessageIngressFresh:
 
     client_request_id: UUID
     message: ChatMessageRecord
-    transcript: list[ChatMessageRecord]
+    transcript: tuple[ChatMessageRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)

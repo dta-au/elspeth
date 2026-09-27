@@ -3471,6 +3471,126 @@ describe("sessionStore", () => {
   });
 
   describe("composer proposals", () => {
+    it.each(["none", "tool", "reply"] as const)(
+      "keeps accepted-message retry only when %s assistant evidence has no genuine reply",
+      async (evidence) => {
+        const api = await import("@/api/client");
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => {
+          const rows: ChatMessage[] = [{
+            id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+            client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+            tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+          }];
+          if (evidence !== "none") rows.push({
+            id: "assistant", session_id: "session-1", role: "assistant",
+            content: evidence === "tool" ? "Inspecting your source" : "Done",
+            tool_calls: evidence === "tool"
+              ? [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }]
+              : null,
+            created_at: "2026-09-27T00:00:01Z",
+          });
+          return rows;
+        });
+        vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+        vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        useSessionStore.setState({ activeSessionId: "session-1" });
+
+        await useSessionStore.getState().sendMessage("hello");
+
+        expect(api.recompose).not.toHaveBeenCalled();
+        expect(useSessionStore.getState().messages[0].local_status).toBe(
+          evidence === "reply" ? undefined : "failed",
+        );
+      },
+    );
+
+    it("keeps saved-message retry metadata when a poll sees only tool-call narration", async () => {
+      const api = await import("@/api/client");
+      const user: ChatMessage = {
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: "request-1", tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      };
+      vi.mocked(api.fetchMessages).mockResolvedValueOnce([
+        user,
+        {
+          id: "tool-narration", session_id: "session-1", role: "assistant",
+          content: "Inspecting your source",
+          tool_calls: [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }],
+          created_at: "2026-09-27T00:00:01Z",
+        },
+      ]);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [{ ...user, local_status: "failed", local_error: "Retry saved message" }],
+      });
+      useSessionStore.getState().startInflightMessagesPolling("session-1");
+
+      await useSessionStore.getState().loadInflightMessages("session-1");
+
+      expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
+      useSessionStore.getState().stopInflightMessagesPolling("session-1");
+    });
+
+    it.each(["reject", "accept"] as const)(
+      "keeps a newer %s receipt and state over a delayed accepted-message snapshot",
+      async (decision) => {
+        const api = await import("@/api/client");
+        const slowState = deferred<CompositionState | null>();
+        const pending = makeCompositionProposal();
+        const receipt = makeCompositionProposal({ status: decision === "accept" ? "committed" : "rejected" });
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+          id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+          client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+          tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+        }]);
+        vi.mocked(api.fetchCompositionState)
+          .mockReturnValueOnce(slowState.promise)
+          .mockResolvedValue(makeCompositionState(2));
+        vi.mocked(api.fetchCompositionProposals)
+          .mockResolvedValueOnce([pending])
+          .mockResolvedValue([receipt]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        vi.mocked(decision === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
+          .mockResolvedValue(receipt);
+        useSessionStore.setState({
+          activeSessionId: "session-1", compositionState: makeCompositionState(1),
+          compositionStateLoaded: true, compositionProposals: [pending],
+        });
+
+        const send = useSessionStore.getState().sendMessage("hello");
+        await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+        await useSessionStore.getState()[decision === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+
+        slowState.resolve(makeCompositionState(1));
+        await send;
+
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+      },
+    );
+
     it.each([409, 500])("retains confirmed staleness when rejection fails (%s)", async (status) => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();

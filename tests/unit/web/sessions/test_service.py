@@ -1879,6 +1879,7 @@ class TestAddMessageWithTranscript:
         )
         assert isinstance(result, MessageIngressFresh)
         record, transcript = result.message, result.transcript
+        assert isinstance(transcript, tuple)
 
         assert record.role == "user"
         assert record.content == "Third"
@@ -1888,7 +1889,7 @@ class TestAddMessageWithTranscript:
         sequence_numbers = [message.sequence_no for message in transcript]
         assert sequence_numbers == sorted(sequence_numbers)
         # The transcript is exactly what a fresh get_messages would return.
-        assert await service.get_messages(session.id, limit=None) == transcript
+        assert tuple(await service.get_messages(session.id, limit=None)) == transcript
 
     @pytest.mark.asyncio
     async def test_exact_retry_after_head_advance_preserves_original_null_state_and_sequence(self, engine, service) -> None:

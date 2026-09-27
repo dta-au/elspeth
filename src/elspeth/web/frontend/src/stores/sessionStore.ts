@@ -49,6 +49,7 @@ import {
 // Pure leaf (imports only types/guided): the ONE derivation of the token a
 // completed session chats under. The view binds to the same function.
 import { completedGuidedChatToken } from "@/components/chat/guided/completedChatToken";
+import { isGenuineReply } from "@/components/chat/turns";
 import { usePreferencesStore } from "./preferencesStore";
 import {
   acquireGuidedRetry,
@@ -1067,6 +1068,10 @@ async function reconcileAcceptedSend(
   useSessionStore.getState().stopComposerProgressPolling(sessionId, progressGeneration);
   const messageTicket = ++inflightMessagesReadTicket;
   const progressTicket = ++composerProgressReadTicket;
+  const proposalSnapshot = beginProposalSnapshot();
+  const stateAtDispatch = useSessionStore.getState().compositionState;
+  const stateLoadedAtDispatch = useSessionStore.getState().compositionStateLoaded;
+  const acceptedDecisionAtDispatch = acceptedProposalDecisionSequence;
   try {
     const [messages, state, proposals, progress] = await Promise.all([
       api.fetchMessages(sessionId),
@@ -1095,7 +1100,7 @@ async function reconcileAcceptedSend(
       );
       const acceptedIndex = messages.findIndex((message) => message.id === canonicalUserMessageId);
       const isLastUser = !messages.slice(acceptedIndex + 1).some((message) => message.role === "user");
-      const hasReply = messages.slice(acceptedIndex + 1).some((message) => message.role === "assistant");
+      const hasReply = hasGenuineReplyForUser(messages, acceptedIndex);
       const canDeliberatelyRetry = isLastUser && !hasReply &&
         (progress.inflight_requests ?? 0) === 0 &&
         (progress.phase === "idle" || TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase));
@@ -1109,17 +1114,22 @@ async function reconcileAcceptedSend(
             }
           : message)
         : messages;
+      // A proposal acceptance can replace the pipeline while these four
+      // reads are pending. Its receipt and hydration own that newer state.
+      const stateSuperseded = acceptedProposalDecisionSequence !== acceptedDecisionAtDispatch ||
+        s.compositionState !== stateAtDispatch ||
+        s.compositionStateLoaded !== stateLoadedAtDispatch;
+      const nextState = stateSuperseded ? s.compositionState : state ?? s.compositionState;
       const previousVersion = s.compositionState?.version ?? null;
-      if (state?.version != null && state.version !== previousVersion) {
+      if (!stateSuperseded && nextState?.version != null && nextState.version !== previousVersion) {
         getExecutionStore().clearValidation();
       }
-      const nextState = state ?? s.compositionState;
       const nodeStillExists = !s.selectedNodeId ||
         nextState?.nodes.some((node) => node.id === s.selectedNodeId);
       return {
         messages: reconciledMessages,
         compositionState: nextState,
-        compositionProposals: proposals,
+        compositionProposals: proposalSnapshot.reconcile(s.compositionProposals, proposals),
         composerProgress: progress.phase === "idle" ? null : progress,
         isComposing: false,
         error: canDeliberatelyRetry
@@ -1224,6 +1234,19 @@ function mergeCompositionProposals(
 }
 
 let proposalSnapshotSequence = 0;
+let acceptedProposalDecisionSequence = 0;
+
+/** A tool-call row is narration; only the final answer closes this user turn. */
+function hasGenuineReplyForUser(messages: ChatMessage[], userIndex: number): boolean {
+  for (let index = userIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "user") break;
+    if (message.role === "assistant" && message.content.length > 0 && isGenuineReply(message)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /** A list read may retire only proposals it knew about when dispatched. */
 function beginProposalSnapshot(): {
@@ -2632,6 +2655,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           ?.pipeline_metadata?.draft_hash ?? null,
       );
       if (!isCurrent()) return;
+      acceptedProposalDecisionSequence += 1;
       getExecutionStore().clearValidation();
       // The write receipt remains authoritative even if read-model hydration fails.
       // Do not expose the pre-accept pipeline as the accepted composition.
@@ -2955,7 +2979,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             existing.client_request_id === message.client_request_id
           );
           if (!prior) return message;
-          const hasReply = fresh.slice(index + 1).some((later) => later.role === "assistant");
+          const hasReply = hasGenuineReplyForUser(fresh, index);
           return {
             ...message,
             local_requested_state_id: prior.local_requested_state_id,
