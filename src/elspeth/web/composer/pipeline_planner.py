@@ -125,7 +125,7 @@ from elspeth.web.composer.provider_discovery_response import (
     surface_projection_failure,
 )
 from elspeth.web.composer.provider_errors import classify_provider_failure
-from elspeth.web.composer.provider_quota import quota_provider_calls
+from elspeth.web.composer.provider_quota import provider_attempt_needs_terminal_audit, quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
@@ -4105,6 +4105,8 @@ async def _plan_pipeline_inner(
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)
             except asyncio.CancelledError as exc:
+                if not provider_attempt_needs_terminal_audit():
+                    raise
                 cancelled_call = build_llm_call_record(
                     model_requested=effective_model,
                     pricing_model=effective_pricing_model,
@@ -4125,6 +4127,8 @@ async def _plan_pipeline_inner(
                 recorder.record_llm_call(cancelled_call)
                 raise
             except TimeoutError as exc:
+                if not provider_attempt_needs_terminal_audit():
+                    raise
                 timed_out_call = build_llm_call_record(
                     model_requested=effective_model,
                     pricing_model=effective_pricing_model,
@@ -4145,6 +4149,8 @@ async def _plan_pipeline_inner(
                 recorder.record_llm_call(timed_out_call)
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
             except Exception as exc:
+                if not provider_attempt_needs_terminal_audit():
+                    raise
                 provider_failure = classify_provider_failure(exc)
                 record_provider_failure(
                     exc,
