@@ -81,7 +81,6 @@
           <li><i data-lucide="check"></i> Blob-backed sources and wired <code>{secret_ref: NAME}</code> references</li>
           <li><i data-lucide="check"></i> Background runs streamed over WebSocket, safely cancellable</li>
         </ul>
-        <p><strong>Current guided-staged limits:</strong> it cannot author cross-sink write-failure fallback or require-all coalesce shapes. Use freeform and guided-full for those pipelines.</p>
       </div>
     </div>
   </div>
@@ -170,7 +169,7 @@
       <div class="fork-arrow">→</div>
       <div class="fork-node"><span class="fn-k">Sink</span><span class="fn-v">output</span></div>
     </div>
-    <p class="fork-caption">This diagram is illustrative; the <code>require_all</code> shape must be authored through freeform or guided-full rather than guided-staged. Each branch token carries the same <code>fork_group_id</code>, so the trail knows the two are siblings of one row. When the coalesce node merges them, its lineage names <em>both</em> parent branch token ids, preserving which branch produced each part of the joined result.</p>
+    <p class="fork-caption">This diagram is illustrative; Composer can author the <code>require_all</code> shape in freeform conversation. Each branch token carries the same <code>fork_group_id</code>, so the trail knows the two are siblings of one row. When the coalesce node merges them, its lineage names <em>both</em> parent branch token ids, preserving which branch produced each part of the joined result.</p>
   </div>
 </section>
 

@@ -10,8 +10,8 @@ BANNED_STAGING_TOKEN_DIGESTS = {
 RUNNABLE_STAGING_CREDENTIAL_SURFACES = (
     Path("src/elspeth/web/frontend/playwright.staging.config.ts"),
     Path("src/elspeth/web/frontend/tests/e2e/harness/README.md"),
-    Path("src/elspeth/web/frontend/tests/e2e/composer-guided-ab-live.staging.spec.ts"),
-    Path("src/elspeth/web/frontend/tests/e2e/tutorial-probe.staging.spec.ts"),
+    Path("src/elspeth/web/frontend/tests/e2e/composer-freeform-live.staging.spec.ts"),
+    Path("src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts"),
 )
 
 
