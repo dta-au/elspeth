@@ -628,8 +628,8 @@ class RunLifecycleCoordinator:
             # and sweep_deferred_invariants_or_crash committed, so every
             # outcome is visible to the derive. The live loop counters are
             # demoted to a parity cross-check (loud on unexplained mismatch;
-            # the one documented rows_coalesce_failed divergence is
-            # tolerated — see assert_terminal_counter_parity).
+            # the one documented rows_coalesce_failed corner, audit exceeding
+            # live, is tolerated — see assert_terminal_counter_parity).
             _check_combined_coordination_latch()
             # Durable post-condition beside the deferred-invariant sweep: no
             # bound group converged unsettled (elspeth-76e936568e). Same

@@ -264,8 +264,9 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 # ExecutionCounters is the authoritative field list. Every field is strict by
 # default; add an entry here only when the exception is documented and handled
 # below.
-# rows_coalesce_failed is EXCLUDED — tolerated and logged, never raised — for
-# ONE documented corner (ADR-030 §D, bug elspeth-ff6d48c180). The live counter
+# rows_coalesce_failed is ONE-SIDED, not strict: live exceeding audit raises
+# with the strict fields; audit exceeding live is tolerated and logged for ONE
+# documented corner (ADR-030 §D, bug elspeth-ff6d48c180). The live counter
 # otherwise uses the audit derive's own evidence: a failed barrier group is
 # counted where its FIRST FAILED node_state at the barrier is written — on the
 # first consumed token's result when the group failure consumed arrived
@@ -290,7 +291,11 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 # wholesale. A second corner — the derive keyed on (barrier node, row_id),
 # collapsing the failed fork groups of one exploded row that live counted
 # separately — is closed: the derive keys on the executors' own (barrier node,
-# fork group).
+# fork group). Nothing lets live exceed audit: every live count rides a result
+# whose FAILED barrier state the derive sees, and each group carries at most one
+# marker (``failed_barrier_group_results`` marks the first consumed token; a
+# straggler's ``first_failure_evidence`` is discarded from the set as it is
+# read). So live > audit is a broken bookkeeper and raises.
 # The audit value is the terminal record either way.
 #
 # collector_groups_failed is audit-only: live row accumulation has no
@@ -322,7 +327,9 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
     crash loudly rather than record an unexplained terminal status.
 
     Raises:
-        OrchestrationInvariantError: on any strict-field mismatch.
+        OrchestrationInvariantError: on any strict-field mismatch, or when the
+            live ``rows_coalesce_failed`` exceeds the audit's (the reverse is
+            the one tolerated corner — see ``_PARITY_EXCLUDED_FIELDS``).
     """
     strict_fields = (
         ("rows_processed", live.rows_processed, audit.rows_processed),
@@ -347,17 +354,19 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
             "live": dict(live.routed_destinations),
             "audit": dict(audit.routed_destinations),
         }
+    if live.rows_coalesce_failed > audit.rows_coalesce_failed:
+        mismatches["rows_coalesce_failed"] = {"live": live.rows_coalesce_failed, "audit": audit.rows_coalesce_failed}
     if mismatches:
         raise OrchestrationInvariantError(
             f"Live-vs-audit terminal counter mismatch for run {run_id!r}: {mismatches!r}. "
             "The audit derive is the terminal record (ADR-030 §D); an unexplained divergence "
             "from the live loop counters means one of the two bookkeepers is broken."
         )
-    if live.rows_coalesce_failed != audit.rows_coalesce_failed:
+    if audit.rows_coalesce_failed > live.rows_coalesce_failed:
         import structlog
 
         structlog.get_logger(__name__).warning(
-            "rows_coalesce_failed live/audit divergence (documented, tolerated)",
+            "rows_coalesce_failed live/audit divergence: audit exceeds live (documented corner, tolerated)",
             run_id=run_id,
             live=live.rows_coalesce_failed,
             audit=audit.rows_coalesce_failed,

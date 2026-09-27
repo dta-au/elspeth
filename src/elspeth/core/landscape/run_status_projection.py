@@ -157,8 +157,8 @@ class AuditRunStatusProjection:
         timeout before any arrival) leaves no state when it fails; it becomes
         visible here only through a later straggler's late-arrival FAILED
         state. The live accumulator counts the same evidence (the
-        ``counts_failed_barrier`` result marker); the remaining tolerated
-        corners are documented at ``_PARITY_EXCLUDED_FIELDS``
+        ``counts_failed_barrier`` result marker); the one tolerated corner
+        (audit exceeds live) is documented at ``_PARITY_EXCLUDED_FIELDS``
         (elspeth-ff6d48c180).
 
         Cumulativity: resume re-drives record under the SAME ``run_id``

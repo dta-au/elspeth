@@ -11,8 +11,9 @@ never counted in the live ``rows_coalesce_failed`` at all.
 
 Each case runs the real CLI (``elspeth run --execute``) and records the live and
 audit counters handed to ``assert_terminal_counter_parity``: the strict fields
-must agree (else the run exits 4) and ``rows_coalesce_failed`` — tolerated and
-only logged on mismatch — must agree too.
+must agree (else the run exits 4) and ``rows_coalesce_failed`` — whose live count
+exceeding the audit's also exits 4, and whose audit exceeding live (one documented
+corner) is only logged — must agree too.
 """
 
 from __future__ import annotations
@@ -333,8 +334,9 @@ def test_two_failed_fork_groups_of_one_exploded_row_count_as_two(
     row fail at the barrier. The executors hold each group under its own
     (barrier, fork_group_id) key and the live counter counts both; the audit
     derive keyed on (barrier node, row_id) collapsed them to one — live 2,
-    audit 1, a tolerated divergence (corner 2). Keyed on the fork group, the
-    audit derive agrees: live == audit == 2, with no divergence warning."""
+    audit 1, then a tolerated divergence (corner 2) and now a live > audit
+    parity refusal (exit 4). Keyed on the fork group, the audit derive
+    agrees: live == audit == 2, with no divergence warning."""
     path = tmp_path / "in.jsonl"
     path.write_text('{"id": 1, "items": [{"p": 20}, {"p": 20}, {"p": 5}]}\n{"id": 2, "items": [{"p": 7}]}\n')
     source = {
@@ -371,8 +373,9 @@ def test_two_failed_fork_groups_of_one_exploded_row_count_as_two(
 
     # two quarantined path_a members + one failed path_b member per lost group
     _assert_counted_once_per_token(run, exit_code=1, rows_failed=4, coalesce_failed=2)
-    # The CLI routes structlog through stdlib logging, so the tolerated-divergence
-    # warning lands in caplog (the row_id-keyed derive logs it here, measured).
+    # The CLI routes structlog through stdlib logging, so the tolerated
+    # audit-exceeds-live warning would land in caplog (measured under the
+    # row_id-keyed derive before live > audit became a refusal).
     assert not [record for record in caplog.records if "divergence" in record.getMessage()]
     with sqlite3.connect(run.db_path) as conn:
         (failed_rows,) = conn.execute(
