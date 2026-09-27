@@ -323,19 +323,20 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
 
         values: dict[str, Any] = {}
         for field_name, parser in compiled.items():
-            # ExpressionEvaluationError carries two different facts. Chained from
-            # KeyError/IndexError it means the PATH does not fit THIS entry — a
-            # sparse table is legitimate — so that becomes _UNRESOLVED and is
-            # governed by on_miss. Chained from anything else (ZeroDivisionError,
-            # ValueError, a TypeError out of a call or comparison) the expression is
-            # BROKEN for this entry, and swallowing it would hide an author error
-            # behind a miss that on_miss cannot tell apart from sparseness.
+            # ExpressionEvaluationError carries two different facts, told apart by
+            # its value-free ``kind``. ``missing_key`` / ``index_out_of_range``
+            # mean the PATH does not fit THIS entry — a sparse table is
+            # legitimate — so that becomes _UNRESOLVED and is governed by
+            # on_miss. Any other kind (division by zero, an invalid value, a type
+            # error out of a call or comparison) means the expression is BROKEN
+            # for this entry, and swallowing it would hide an author error behind
+            # a miss that on_miss cannot tell apart from sparseness.
             # KeyError/TypeError are deliberately NOT caught: expression_parser
             # re-raises those as evaluator bugs that must crash through.
             try:
                 values[field_name] = parser.evaluate({REFERENCE_ENTRY_NAME: entry})
             except ExpressionEvaluationError as exc:
-                if not isinstance(exc.__cause__, KeyError | IndexError):
+                if exc.kind not in ("missing_key", "index_out_of_range"):
                     raise ReferenceTableError(
                         f"output field {field_name!r} failed to evaluate against reference entry "
                         f"{key!r} (position {position}): {exc}. That is a broken expression rather "
@@ -549,7 +550,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:46245d6f287224d6"
+    source_file_hash: str | None = "sha256:6aa4025393448c89"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

@@ -886,6 +886,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # pins this parity test passed and only the provenance-pin test failed, so the
 # move is the pin literal alone. No union-collision-fail row hits an
 # evaluation error; no resume digest and no oracle_freeze snapshot moved.
+# The same round moved reference_join 46245d6f287224d6 -> 6aa4025393448c89 (it
+# tells a sparse miss from a broken expression by the evaluator's ``kind``, the
+# chained cause being gone) with no manifest pin; no digest moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "1908eb05ace692750621092999fefa7693ecc58f7af6a22d1218fa1ea1ad7855"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

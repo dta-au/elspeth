@@ -96,6 +96,6 @@ def non_canonical_source_row_violation(
     """
     return PluginContractViolation(
         f"{producer} emitted a valid row with non-canonical data at {_locate_in_rows([row], declared_fields)} "
-        f"({type(exc).__name__}). A source must quarantine a value outside canonical JSON (an integer beyond the "
-        "JSON safe integer range, a non-finite float) at its boundary."
+        f"({type(exc).__name__}). A source must quarantine a value outside canonical JSON (such as an integer "
+        "beyond the JSON safe integer range) at its boundary."
     )
