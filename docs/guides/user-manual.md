@@ -15,7 +15,7 @@ building and running auditable pipelines.
 8. [Resuming Failed Runs](#resuming-failed-runs)
 9. [Health Checks](#health-checks)
 10. [Examples](#examples-walkthrough)
-11. [Web Composer workspace and guided mode](#web-composer-guided-mode)
+11. [Web Composer](#web-composer)
 
 ---
 
@@ -614,7 +614,7 @@ See [Configuration Reference](../reference/configuration.md) for the complete se
 
 ---
 
-## Web Composer: Guided Mode
+## Web Composer
 
 The Web Composer is a browser-based authoring surface for building ELSPETH
 pipelines without hand-editing YAML. Start it with:
@@ -628,9 +628,9 @@ Then open the URL printed on the console (typically <http://localhost:8451>).
 ### Using the desktop workspace
 
 On desktop, the Composer keeps authoring and the current pipeline together in
-one workspace. The authoring pane contains freeform chat or the current guided
-step. The pipeline workspace stays beside it so you can inspect the artifact
-without leaving the conversation.
+one workspace. The authoring pane contains the conversation. The pipeline
+workspace stays beside it so you can inspect the artifact without leaving
+the conversation.
 
 - Drag the divider to resize the authoring pane. You can also focus the divider
   and use Left/Right Arrow, Shift+Left/Right Arrow for larger steps, or Home/End
@@ -645,8 +645,6 @@ without leaving the conversation.
   components and configuration, YAML provides the current export controls,
   Checks carries a status badge and renders validation and audit content
   inline, and Run shows current or recent execution results.
-- Guided sessions show a **History** tab in the Inspector when completed
-  decisions are available.
 - Use **Focus Graph** for an optional full-screen graph. The persistent Graph
   tab remains the normal working view.
 
@@ -674,84 +672,19 @@ These shortcuts select the workspace tab; they do not open Focus Graph. Press
 The saved pane width and collapsed state are local interface preferences. They
 do not change the pipeline, session, validation, audit, or execution semantics.
 
-When you create a new session, the composer starts in **Guided Mode** unless
-your Composer preference says otherwise. Guided mode is LLM-primary: each stage
-sends the operator's instruction to the shared pipeline planner, which returns a
-validated proposal. Guided records the reviewed facts as it goes and
-materializes the pipeline when you confirm the wiring.
+New sessions use freeform conversation. Describe the pipeline you want in the
+chat input, including the source, output, transformations, and any routing
+constraints. The LLM proposes the structure; ELSPETH validates it and shows
+the proposal's graph impact before you accept it. Follow-up messages can refine
+the draft without starting over. A proposal does not execute the pipeline.
 
-Guided sessions are created through `POST /guided/start`, and start with your
-goal: the request requires a one-sentence `intent` ("what should come out the
-other end"), which becomes the session's durable root and opens its transcript.
-That goal is what the planner builds from at the end of the output stage, and it
-stays the planner's root through later revisions. A guided session that has no
-goal and no retained instruction cannot plan at all — finishing outputs answers
-`guided_planner_intent_required` rather than asking the planner to build from
-nothing. Switching a worked freeform session across with `POST /guided/convert`
-takes a goal the same way.
-
-The response carries a closed-enum `WorkflowProfile` so ELSPETH can distinguish
-a normal guided session from the passive first-run tutorial. Tutorial profile
-state is stripped on fork so it cannot leak into an ordinary session.
-
-### Guided and freeform differ in interaction, not in capability
-
-Guided and freeform are two ways of talking to the **same** pipeline planner.
-Freeform takes an end-to-end request and lets you refine the result
-incrementally; guided decomposes that same request into source, output,
-transformation/topology, and wire-review conversations. Both call the one shared
-planner, produce the same canonical pipeline draft, and are checked by the same
-runtime validators, the same graph contracts, and the same audit trail.
-
-The choice of mode changes the conversation, not the pipeline language: the same
-canonical structures are available on both surfaces.
-
-### Switching between guided and freeform
-
-What a mode switch carries is **not symmetric**, and the asymmetry is a property
-of the wizard, not a capability boundary:
-
-- **Guided → freeform** carries the graph exactly. Dropping to freeform hands
-  the completed or in-progress pipeline to the freeform surface unchanged.
-- **Freeform → guided, re-entering after a guided exit** resumes the wizard you
-  left, with its reviewed stages intact.
-- **Freeform → guided for the first time**, or after a YAML import, starts a
-  **fresh wizard as a new version**. The existing draft is not adopted into the
-  wizard's stages: it stays in the session's version history and remains
-  reachable there, but the guided conversation begins from the source stage
-  rather than from your draft.
-
-So the safe reading is: guided → freeform loses nothing, and going back the way
-you came loses nothing. Turning guided on over freeform work for the first time
-is a new start — park anything you still want to edit in freeform before you do
-it.
-
-### What guided mode is for
-
-Guided mode builds the pipeline through ordered stages:
-
-1. **Source** — describe where the data comes from. The source driver can revise
-   a committed source in place. A URL-row source that needs page content is
-   bridged by the ordinary `web_scrape` transform, which the planner proposes
-   like any other node.
-2. **Sink** — describe where results should land and which output fields matter.
-   The sink driver supports free-text intent and commits the resulting sink
-   configuration only after validation.
-3. **Transforms** — describe how to bridge the source to the sink. The transform
-   stage produces a model-proposed transform chain — there is no server-derived
-   alternative path — but the committed pipeline still passes the same
-   runtime-oriented validators as YAML.
-4. **Wiring** — review the final graph shape. `STEP_4_WIRE` rebuilds edges from
-   model connection labels, renders the contract overlay, and accepts only a
-   valid `CONFIRM_WIRING` payload.
-
-Each stage can be revised against its current state. Revision context is passed
-back to the model so it amends the committed stage rather than starting from a
-blank proposal.
+The first-run tutorial uses this same authoring path and a fixed example. It
+continues through **Run**, **Audit**, and **Graduation** so the user sees a real
+execution and its evidence before starting an ordinary session.
 
 ### Supported pipeline structures
 
-Both guided and freeform author the full canonical set of pipeline structures:
+Composer can author the full canonical set of pipeline structures:
 
 - **Linear transform chains** (`linear_transform`) — a source through one or
   more transforms to a
@@ -777,46 +710,10 @@ Both guided and freeform author the full canonical set of pipeline structures:
 - **Structured LLM output consumed downstream** (`structured_llm`) — a typed
   multi-field LLM result that later stages read by field.
 
-These are the canonical classes the live parity corpus verifies across every
-authoring surface; none of them is freeform-only.
-
-### Choosing between guided and freeform
-
-Because capability is identical, pick the interaction that fits how you think:
-
-- **Guided** suits a structured, one-decision-at-a-time conversation that builds
-  and reviews the pipeline stage by stage.
-- **Freeform** suits describing the whole pipeline at once, or refining a draft
-  when you already know which plugins you want to wire together.
-
-Neither choice limits what you can build. Switching guided → freeform is
-lossless, and re-entering guided from that exit resumes the same wizard. Turning
-guided *on* for the first time — or after a YAML import — starts a fresh wizard
-instead of adopting the current draft, so finish or park freeform work you want
-to keep editing before you switch that direction. See
-[Switching between guided and freeform](#switching-between-guided-and-freeform)
-for the exact contract.
-
-### Wrong-stage mentions are retained, not rejected
-
-Guided asks about the source, then the output, then transforms, then wiring, but
-you do not have to hold a thought until its stage. If you mention a plugin that
-belongs to a later stage — an LLM transform while you are still choosing the
-source — guided does not discard the request or claim it cannot express it. It
-records the intent, replies with an explicit deferral (for example, "That LLM
-belongs in the transformation stage; finish the source choice first"), and
-carries the intent forward so the responsible stage consumes it. If the stage
-that owns the request has already been reviewed, guided opens the stable
-back/edit flow for that stage instead. Early-stage work is stored as interaction
-facts rather than a frozen partial pipeline, so a later requirement triggers a
-typed rewind to the affected stage and a replan — never an "unsupported
-topology" dead-end. A message that mixes a current-stage answer with a
-future-stage instruction applies both: the current stage is configured and the
-instruction is saved in the same turn. If guided cannot immediately verify the
-structure of a future-stage instruction, it still keeps it — as a pending
-instruction awaiting clarification — and asks you for the missing detail
-rather than dropping the request. (An unavailable plugin, by contrast, remains
-a distinct catalog/availability error.)
+Describe the entire requested shape at once, or start with a small pipeline and
+ask for revisions in later turns. For example, you can add an LLM transform
+after the source and sinks already exist; the model proposes the change against
+the current composition and ELSPETH validates the result.
 
 ### Validation, interpretation, and sign-off
 
@@ -824,43 +721,29 @@ The LLM proposes changes, but it is not the authority. ELSPETH validates and
 persists the resulting pipeline state, then shows a plain-language gloss,
 validation summary, and graph impact for review.
 
-If a stage depends on a subjective interpretation, guided mode surfaces a
-pending interpretation card and blocks advancement until the card is reviewed.
-Advisor sign-off is a completion gate rather than a wiring-stage outcome: an
-`advisor_signoff` fact bound to the reviewed graph's fingerprint withholds
-completion until a compose turn obtains a current review, and the advisor
-checkpoint that feeds it records a `clean`, `flagged`, `unavailable`, or
-`malformed` verdict.
+If a proposal depends on a subjective interpretation, Composer surfaces a
+review card and blocks the affected action until it is resolved. An advisory
+review may also withhold completion until the current graph has been reviewed.
 
 ### Completion and execution
 
-When the wizard runs out of guided steps, you see a **completion summary**
-showing the final pipeline shape. From the summary you can:
-
-- **Save and exit** — keep the pipeline as it is; the session is saved.
-- **Drop to freeform to keep editing** — switch to freeform mode with the
-  completed pipeline pre-loaded, and continue authoring there.
-
-Once the pipeline is saved you can validate it, preview the YAML, and execute
-it directly from the composer. The composer's `/validate` and `/execute`
+When the proposal is accepted, you can validate the pipeline, preview the
+YAML, and execute it directly from Composer. The composer's `/validate` and
+`/execute`
 endpoints use the same runtime assembly and graph validation contracts as
 `elspeth validate` and `elspeth run` — there is no separate UI-only validator.
 
-### The first-run tutorial is a guided profile
+### The first-run tutorial
 
-The passive first-run tutorial is not a separate or reduced-capability mode. It
-is a **guided workflow profile**: it drives the same staged planner and the same
-proposal schema as ordinary guided mode, with fixed sample data and teaching
-copy. It may preselect or explain the next relevant decision, but it does not
-substitute a tutorial-only planner, remove capabilities from the planner schema,
-or rewrite the guided rules. Whatever you author in the tutorial transfers
-directly to a real guided session.
+The first-run tutorial supplies fixed sample data and a fixed task to the
+ordinary freeform Composer. Its Build step uses the same planner, proposal
+review, and validation as any other session. Continue through Run and Audit to
+see the pipeline execute and inspect its evidence; Graduation then hands you
+to ordinary authoring. The tutorial has no separate planner or reduced schema.
 
 ### See also
 
-- Historical guided-mode technical design material is preserved in git history
-  or maintainer-local archives.
-- For freeform composer authoring, plugin discovery, and tool contracts, see
+- For Composer authoring, plugin discovery, and tool contracts, see
   the composer skill at `src/elspeth/web/composer/skills/pipeline_composer.md`.
 
 ---

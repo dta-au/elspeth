@@ -72,6 +72,7 @@ def test_reference_distinguishes_queue_row_union_and_coalesce() -> None:
 
 def test_set_pipeline_reference_includes_current_node_inventory() -> None:
     reference = _reference()
+    assert "guided" not in reference.lower()
     set_pipeline = reference.split("### `set_pipeline`", maxsplit=1)[1].split("### `clear_source`", maxsplit=1)[0]
 
     for node_type in _tool_schema("upsert_node")["properties"]["node_type"]["enum"]:

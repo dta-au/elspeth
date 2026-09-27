@@ -323,8 +323,7 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
 ### Step 5: Create a Browser-Authored Version
 
 1. Use the session switcher and choose **+ New session**.
-2. Keep the default guided mode, or choose **Switch to guided** if your
-   account default is freeform.
+2. Open the Composer chat.
 3. Upload `examples/threshold_gate/input.csv` through the **Files** panel with
    **Upload**.
 4. Tell the composer:
@@ -764,7 +763,7 @@ condition: "row['amount'] > 1000"
 Now that you've built your first pipeline:
 
 1. **Add an LLM transform** - See `examples/openrouter_sentiment/` for LLM classification
-2. **Try guided browser authoring** - See [User Manual: Web Composer](user-manual.md#web-composer-guided-mode)
+2. **Try browser authoring** - See [User Manual: Web Composer](user-manual.md#web-composer)
 3. **Share a browser-authored pipeline for review** - See [Sharing Pipelines](sharing-pipelines.md)
 4. **Export the audit trail** - Add `landscape.export` to create signed exports
 5. **Build a custom plugin** - See [PLUGIN.md](../../PLUGIN.md) for plugin development

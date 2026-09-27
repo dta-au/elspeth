@@ -1620,8 +1620,8 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "schema_facts": {
     "candidate": {"session_epoch": 70, "landscape_epoch": 46, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_70_landscape_epoch_29_to_46_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
-    "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
+    "structural_changes": "session_epoch_35_to_70_landscape_epoch_29_to_46_blob_cleanup_row_union_barrier_and_coordination_schema",
+    "semantics_only_changes": "coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
   },

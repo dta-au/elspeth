@@ -48,10 +48,10 @@ def _assert_sanitized_bug_report_guidance(section: str) -> None:
         assert re.search(sensitive_term, section, re.IGNORECASE)
 
 
-def test_guided_mode_bug_reports_do_not_request_raw_chat_history() -> None:
+def test_composer_bug_reports_do_not_request_raw_chat_history() -> None:
     troubleshooting = _markdown_section(
         _doc_text("docs/guides/troubleshooting.md"),
-        "### Guided chat did not advance the stage",
+        "### A Composer proposal was not accepted",
     )
 
     assert "chat history attached" not in troubleshooting

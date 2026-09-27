@@ -20,6 +20,7 @@ def test_public_release_docs_do_not_route_readers_to_internal_tracker() -> None:
 
     for path in PUBLIC_RELEASE_DOCS:
         text = path.read_text(encoding="utf-8")
+        assert "guided" not in text.lower(), f"{path} still advertises a retired Composer mode"
         rel_path = path.relative_to(REPO_ROOT).as_posix()
         for match in INTERNAL_TRACKER_REFERENCE.finditer(text):
             offenders.append(f"{rel_path}: {match.group()}")

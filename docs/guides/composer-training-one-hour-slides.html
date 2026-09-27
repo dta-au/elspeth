@@ -148,10 +148,6 @@ pre{font-family:var(--font-mono);font-size:15px;line-height:1.6;background:var(-
 .alert.warn{background:var(--color-warning-bg);border-color:var(--color-warning-border)}
 .alert.info{background:var(--color-info-bg);border-color:var(--color-info-border)}
 .alert.ok{background:var(--color-success-bg);border-color:var(--color-success-border)}
-.stepper{display:flex;gap:6px;align-items:center;font-family:var(--font-mono);font-size:13px;margin:6px 0 16px}
-.stepper span{padding:5px 12px;border:1px solid var(--color-border-strong);border-radius:9999px;color:var(--color-text-secondary)}
-.stepper span.on{background:var(--color-accent);border-color:transparent;color:#fff}
-.stepper i{color:var(--color-text-muted);font-style:normal}
 table.tbl{border-collapse:collapse;width:100%;font-size:16px}
 .tbl th,.tbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--color-border);vertical-align:top}
 .tbl th{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--color-text-muted);font-weight:600}
@@ -277,7 +273,7 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
     <div style="display:grid;grid-template-columns:2fr 3fr;flex:1;min-height:0">
       <div style="border-right:1px solid var(--color-border);padding:12px;display:flex;flex-direction:column">
         <div class="chip" style="align-self:flex-start;margin-bottom:8px">Authoring pane</div>
-        <div class="stepper" style="margin:0 0 10px"><span class="on">Source</span><i>→</i><span>Output</span><i>→</i><span>Transforms</span><i>→</i><span>Wire</span><i>→</i><span>Ready</span></div>
+        <div style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary)">Describe the result you want. Review each proposed change.</div>
         <div class="ribbon">Looked up: list_sources</div>
         <div class="pcard"><div class="hd"><span>Proposed: set_source</span><span class="chip">audit 3f9a1c2e</span></div><div style="font-size:13px">Use the uploaded transactions CSV as the source.</div></div>
         <div style="margin-top:auto;border:1px solid var(--color-border-strong);border-radius:var(--radius-md);padding:8px 10px;color:var(--color-text-muted);font-size:13px">Message input …</div>
@@ -289,19 +285,18 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
     </div>
     <div class="bar" style="border-top:1px solid var(--color-border);border-bottom:0"><span>Validation: <b style="color:var(--color-success)">Passed</b></span><span>Audit: <b style="color:var(--color-success)">Ready</b></span><span style="margin-left:auto" class="btn">Save for review</span><span class="btn">Import YAML</span><span class="btn danger">Run pipeline</span></div>
   </div>
-  <aside class="notes"><p>Point, name, move on. Header: wordmark, session switcher, version selector, Account. Left: the authoring pane — conversation or the guided stepper. Right: the pipeline artifact with four tabs (empty pipeline shows only Graph and Run). Bottom: the action bar. Clicking a status opens the Inspector (Validation / Audit / History). The divider drags; "Collapse authoring pane" gives the graph the whole width.</p><p>Demo, 2 min: Account → Composer preferences (Default mode, Theme, Detail level — leave defaults). Press ? for the shortcuts dialog: Ctrl+K palette, Ctrl+E Run pipeline, Ctrl+/ focus chat. Plugin catalog (Ctrl+Shift+P): Sources / Transforms / Sinks — "you never have to remember their names".</p></aside>
+  <aside class="notes"><p>Point, name, move on. Header: wordmark, session switcher, version selector, Account. Left: the authoring conversation. Right: the pipeline artifact with four tabs (empty pipeline shows only Graph and Run). Bottom: the action bar. Clicking a status opens the Inspector (Validation / Audit). The divider drags; "Collapse authoring pane" gives the graph the whole width.</p><p>Demo, 2 min: Account → Composer preferences (Theme, Detail level — leave defaults). Press ? for the shortcuts dialog: Ctrl+K palette, Ctrl+E Run pipeline, Ctrl+/ focus chat. Plugin catalog (Ctrl+Shift+P): Sources / Transforms / Sinks — "you never have to remember their names".</p></aside>
 </section>
 
 <section class="slide" data-seg="2">
   <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Trainer demo</span></div>
-  <h2>Guided and freeform: two conversations, one planner</h2>
+  <h2>One conversation, one planner</h2>
   <div class="cols" style="flex:0 0 auto">
-    <div class="card"><h3>Guided</h3><div class="stepper" style="margin:4px 0 10px"><span>Source</span><i>→</i><span>Output</span><i>→</i><span>Transforms</span><i>→</i><span>Wire</span></div><p>One decision at a time. Each stage is reviewed before the next.</p></div>
-    <div class="card"><h3>Freeform</h3><p>Describe the whole pipeline at once; refine in conversation.</p><p class="mini">Switch any time: <code>Switch to guided</code> / <code>Exit to freeform</code></p></div>
+    <div class="card"><h3>Describe</h3><p>Describe the whole pipeline or begin with a smaller request.</p></div>
+    <div class="card"><h3>Refine</h3><p>Review each proposal, then ask for changes in the same conversation.</p></div>
   </div>
-  <div class="quote" style="margin-top:22px">Guided and freeform differ in interaction, not in capability.<span class="cite">docs/guides/user-manual.md</span></div>
-  <ul class="mini"><li>Guided → freeform carries the graph exactly.</li><li>Turning guided <em>on</em> over freeform work for the first time starts a fresh wizard as a new version — the old draft stays in version history.</li></ul>
-  <aside class="notes"><p>Both talk to the same planner and both can author every pipeline structure. State the one asymmetry plainly so nobody is surprised later.</p></aside>
+  <div class="quote" style="margin-top:22px">The model proposes the structure; ELSPETH validates it; you choose what to accept.<span class="cite">docs/guides/user-manual.md</span></div>
+  <aside class="notes"><p>Show that a later request can revise the current pipeline without starting over.</p></aside>
 </section>
 
 <section class="slide" data-seg="2">
@@ -320,12 +315,12 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
   <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Variant</span></div>
   <h2>Variant: the first-run tutorial</h2>
   <ul>
-    <li>Every new account starts on it. Five steps: welcome → guided build → run → audit story → graduation.</li>
+    <li>Every new account starts on it. Five steps: welcome → freeform build → run → audit story → graduation.</li>
     <li>It is the <em>same</em> machinery as every real session — its only privilege is a frozen prompt (ADR-031).</li>
     <li><code>Composer preferences → Reset tutorial</code> brings it back any time.</li>
   </ul>
   <div class="quote" style="font-size:19px">Scrape these three synthetic project-brief pages and, for each page, have an LLM write a short summary of the page. Remove the raw HTML and write the rows to a JSON file named project_brief_summaries.json.<span class="cite">the frozen tutorial prompt</span></div>
-  <aside class="notes"><p>Two ways to use it. (A) Pre-work: ask participants to complete it before the session (~10 min, needs the live LLM and network); then Segment 2 can be shorter and you can reference "the assumption callout you saw". (B) Live opener: run it yourself on a reset account instead of the shell demo — it hits web scrape, LLM, auto-wired controls, run, and the audit story in one pass. Do not do both; do not promise participants a re-run — a completed tutorial wizard is not re-enterable within the same tutorial session.</p></aside>
+  <aside class="notes"><p>Two ways to use it. (A) Pre-work: ask participants to complete it before the session (~10 min, needs the live LLM and network); then Segment 2 can be shorter and you can reference "the assumption callout you saw". (B) Live opener: run it yourself on a reset account instead of the shell demo — it hits web scrape, LLM, auto-wired controls, run, and the audit story in one pass. Do not do both; do not promise participants a re-run — a completed tutorial flow is not re-enterable within the same tutorial session.</p></aside>
 </section>
 
 <!-- ═══════════════════════════ SEGMENT 3 — First pipeline (11–24) ══════ -->
@@ -343,12 +338,11 @@ table.tbl{border-collapse:collapse;width:100%;font-size:16px}
   <h2>Steps</h2>
   <div class="cols">
     <div class="col"><ul>
-      <li>Session switcher → <code>+ New session</code> (or <kbd>Ctrl+N</kbd>). Stay in guided.</li>
+      <li>Session switcher → <code>+ New session</code> (or <kbd>Ctrl+N</kbd>).</li>
       <li>In the chat input: <code>Upload file</code> → choose <code>input.csv</code>.</li>
       <li>Paste the prompt →</li>
-      <li>Watch the stepper: Source → Output → Transforms → Wire.</li>
       <li>Read each proposal. If asked for field types: <code>id: int</code>, <code>name: str</code>, <code>amount: int</code>, <code>category: str</code>.</li>
-      <li>At <code>Review wiring</code>, clear any pending acknowledgements, then confirm wiring.</li>
+      <li>Resolve any pending review cards before accepting the proposed pipeline.</li>
       <li>When <code>Validation: Passed</code> → <code>Run pipeline</code> → confirm the dialog.</li>
     </ul></div>
     <div><pre>Use the uploaded transactions CSV as the source.
@@ -357,7 +351,7 @@ amount &gt; 1000 to a high_values CSV output
 and all other rows to a normal CSV output.
 Validate it before running.</pre><p class="mini">Prompt from <code>docs/guides/your-first-pipeline.md</code>, Option B.</p></div>
   </div>
-  <aside class="notes"><p>Circulate. Common stumbles: (1) someone types before uploading — fine, guided retains the intent; (2) a "Source data" / "Data contract" card appears — that is Segment 4's topic, tell them to read it and Acknowledge; (3) the disclosure dialog on Run — read it out: "This run leaves the composer and uses your stored credentials".</p></aside>
+  <aside class="notes"><p>Circulate. Common stumbles: (1) someone types before uploading — ask them to attach the file and clarify the request; (2) a "Source data" / "Data contract" card appears — that is Segment 4's topic, tell them to read it and Acknowledge; (3) the disclosure dialog on Run — read it out: "This run leaves the composer and uses your stored credentials".</p></aside>
 </section>
 
 <section class="slide" data-seg="3">
@@ -485,7 +479,7 @@ sinks:
   <h2>Two vocabularies you now own</h2>
   <p style="font-size:20px"><span class="tb tb-source">source</span> &nbsp;<span class="tb tb-transform">transform</span> &nbsp;<span class="tb tb-gate">gate</span> &nbsp;<span class="tb tb-sink">sink</span> &nbsp;<span class="tb tb-aggregation">aggregation</span> &nbsp;<span class="tb tb-coalesce">coalesce</span></p>
   <ul>
-    <li>Structure: <strong>source</strong>, <strong>transform</strong>, <strong>gate</strong>, <strong>sink</strong> (the guided stepper says <strong>Output</strong>), <strong>edge</strong> / connection, <strong>node</strong></li>
+    <li>Structure: <strong>source</strong>, <strong>transform</strong>, <strong>gate</strong>, <strong>sink</strong> (the user's output), <strong>edge</strong> / connection, <strong>node</strong></li>
     <li><strong>Discard</strong> vs <strong>quarantine</strong>: <code>discard</code> drops the row but records it; a production pipeline routes failures to a quarantine sink for review instead</li>
     <li>The word <strong>fork</strong> will mean two things later — a pipeline branch, and forking a chat message. Always say which.</li>
   </ul>
@@ -503,7 +497,7 @@ category as retail, wholesale or corporate from its name
 and amount, and write the label to a new field llm_category.
 Keep the same routing.</pre>
   <p style="font-size:18px">Accept the proposal. Then <strong>do not run yet</strong> — look at the cards.</p>
-  <aside class="notes"><p>Freeform or guided both work; in guided this is a revision of the Transforms stage. Expect a longer planner turn — narrate the "Working on..." indicator and its "Show details" while they wait.</p></aside>
+  <aside class="notes"><p>This is a revision of the current pipeline. Expect a longer planner turn — narrate the "Working on..." indicator and its "Show details" while they wait.</p></aside>
 </section>
 
 <section class="slide" data-seg="5">
@@ -725,7 +719,7 @@ Keep the same routing.</pre>
   <h2>YAML out, YAML in</h2>
   <div class="cols">
     <div class="col"><h3>Out</h3><ul><li><code>YAML</code> tab → <code>Copy</code> / <code>Download</code> (<code>pipeline-v&lt;n&gt;.yaml</code>)</li><li>Every export writes an audit event</li><li>Palette <code>Export YAML</code> / <kbd>Ctrl+Shift+Y</kbd> open the tab</li></ul></div>
-    <div class="col"><h3>In</h3><ul><li><code>Import YAML</code> (action bar): paste or choose a file</li><li>Live <code>Parsed preview</code> + <code>Validation summary</code> before anything is sent</li><li>Bind uploaded files for session-bound sources</li><li>Import <strong>replaces</strong> the pipeline — the old one stays in version history; in guided it switches you to freeform</li></ul></div>
+    <div class="col"><h3>In</h3><ul><li><code>Import YAML</code> (action bar): paste or choose a file</li><li>Live <code>Parsed preview</code> + <code>Validation summary</code> before anything is sent</li><li>Bind uploaded files for session-bound sources</li><li>Import <strong>replaces</strong> the pipeline — the old one stays in version history</li></ul></div>
   </div>
   <aside class="notes"><p>Fast demo; invite participants to try any one thing on their own session. Import's confirm text: "Importing will replace the current pipeline with the one in this YAML. The version you have now stays in your version history, and you can revert to it afterwards."</p></aside>
 </section>
@@ -787,7 +781,7 @@ Keep the same routing.</pre>
   <ul class="mini" style="font-size:18px">
     <li style="font-size:18px"><code>Help &amp; documentation</code> (Account menu)</li>
     <li style="font-size:18px"><code>docs/guides/your-first-pipeline.md</code> — the walkthrough you just did, CLI and browser</li>
-    <li style="font-size:18px"><code>docs/guides/user-manual.md</code> — Web Composer section · <code>docs/guides/troubleshooting.md</code> — "Web Composer — Guided Mode"</li>
+    <li style="font-size:18px"><code>docs/guides/user-manual.md</code> — Web Composer section · <code>docs/guides/troubleshooting.md</code> — "Web Composer"</li>
     <li style="font-size:18px"><code>examples/README.md</code> — "If You Want to See…" lookup table; every advanced shape has a runnable example</li>
   </ul>
   <div class="spacer"></div>

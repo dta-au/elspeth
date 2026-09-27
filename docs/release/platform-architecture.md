@@ -1,7 +1,7 @@
 # ELSPETH Platform Architecture
 
-**Document date:** 8 September 2026
-**Release covered:** 0.8.0
+**Document date:** 28 September 2026
+**Release covered:** 0.8.1
 **Audience:** Evaluators, technical leaders, architects, and assurance reviewers
 **Register:** Public-facing / technical
 **Status:** Current architecture overview
@@ -22,7 +22,7 @@ output exists.
 |---|---|
 | CLI | Runs, validates, resumes, and inspects pipelines from the command line. |
 | Web app | Provides authentication, sessions, Composer, execution controls, run progress, and review surfaces. |
-| Composer | Builds pipeline configuration through guided or freeform authoring over one reviewed proposal contract. |
+| Composer | Builds pipeline configuration through freeform conversation and reviewed proposals. |
 | Engine | Executes the directed pipeline graph, coordinates durable external effects, and records terminal outcomes. |
 | Plugin system | Provides sources, transforms, sinks, document-ingestion plugins, and integrations. |
 | Landscape audit store | Persists run, row, node, call, payload, secret-resolution, and lineage evidence. |
@@ -132,11 +132,11 @@ Composer also has an authoring recovery surface. If a composition fails or is
 interrupted, the web UI can show the transcript, redacted tool rows, and state
 diffs so the user can decide what to retain.
 
-In 0.7.1, guided planning and confirmation are durable operations. The session
-store fences concurrent mutations, preserves exact failure evidence, and keeps
-the reviewed candidate separate from committed state until wire confirmation.
-Forks, stale responses, cancellation, and retries therefore converge on one
-stored result instead of silently applying a proposal twice.
+The session store fences concurrent authoring mutations, preserves exact
+failure evidence, and keeps reviewed candidates separate from committed state
+until the operator accepts them. Forks, stale responses, cancellation, and
+retries converge on one stored result instead of silently applying a proposal
+twice.
 
 ## Security-Relevant Design Choices
 
