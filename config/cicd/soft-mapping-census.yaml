@@ -1016,6 +1016,9 @@ files:
     dict[str, object]: 2
   src/elspeth/web/sessions/audit_checkpoint.py:
     Mapping[str, Any]: 2
+  src/elspeth/web/sessions/fork_custody.py:
+    Mapping[str, Any]: 4
+    dict[str, Any]: 2
   src/elspeth/web/sessions/guided_audit.py:
     dict[str, Any]: 3
   src/elspeth/web/sessions/guided_operations.py:
@@ -1024,10 +1027,15 @@ files:
     Mapping[str, object]: 3
   src/elspeth/web/sessions/guided_replay.py:
     Mapping[str, Any]: 2
+  src/elspeth/web/sessions/mutation_capabilities.py:
+    Mapping[str, Any]: 4
   src/elspeth/web/sessions/pending_interpretation.py:
     Mapping[str, Any]: 24
     boundary: 1
     dict[str, Any]: 6
+    dict[str, object]: 1
+  src/elspeth/web/sessions/proposal_authority.py:
+    Mapping[str, Any]: 8
     dict[str, object]: 1
   src/elspeth/web/sessions/proposal_blob_refs.py:
     Mapping[str, Any]: 2
@@ -1068,9 +1076,9 @@ files:
   src/elspeth/web/sessions/schemas.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/service.py:
-    Mapping[str, Any]: 34
-    dict[str, Any]: 3
-    dict[str, object]: 2
+    Mapping[str, Any]: 18
+    dict[str, Any]: 1
+    dict[str, object]: 1
 totals:
   Mapping[str, Any]: 930
   Mapping[str, object]: 311

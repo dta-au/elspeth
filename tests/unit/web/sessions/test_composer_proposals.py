@@ -31,9 +31,10 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _pipeline_private_arguments_hash
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -966,9 +967,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
             )
 
         if winner == "proposal":
-            from elspeth.web.sessions import service as service_module
+            from elspeth.web.sessions import mutation_capabilities
 
-            original_validate = service_module.validate_proposal_blob_references
+            original_validate = mutation_capabilities.validate_proposal_blob_references
 
             def blocked_validate(*args, **kwargs):
                 entered.set()
@@ -976,7 +977,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                     raise AssertionError("proposal race barrier timed out")
                 return original_validate(*args, **kwargs)
 
-            monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
+            monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", blocked_validate)
             proposal_task = asyncio.create_task(create_proposal())
             assert await asyncio.to_thread(entered.wait, 5)
             delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))

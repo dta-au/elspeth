@@ -34,7 +34,7 @@ from elspeth.web.composer.pipeline_proposal import (
 )
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
-from elspeth.web.sessions.service import _pipeline_private_arguments_hash
+from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
 
 _SOURCES_TAG = "composer.ordered-sources.v1"

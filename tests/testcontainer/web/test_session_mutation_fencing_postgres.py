@@ -38,6 +38,7 @@ from elspeth.web.coordination.contracts import (
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.sessions import archive_quarantine as archive_quarantine_module
+from elspeth.web.sessions import mutation_capabilities
 from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.archive_quarantine import (
     ArchiveQuarantineIdentity,
@@ -190,7 +191,7 @@ async def test_postgres_composer_proposal_stale_predecessor_writes_nothing_befor
     )
     entered = threading.Event()
     release = threading.Event()
-    original_validate = session_service_module.validate_proposal_blob_references
+    original_validate = mutation_capabilities.validate_proposal_blob_references
 
     def block_after_initial_authority(*args: Any, **kwargs: Any) -> None:
         entered.set()
@@ -198,7 +199,7 @@ async def test_postgres_composer_proposal_stale_predecessor_writes_nothing_befor
             raise AssertionError("proposal predecessor barrier timed out")
         original_validate(*args, **kwargs)
 
-    monkeypatch.setattr(session_service_module, "validate_proposal_blob_references", block_after_initial_authority)
+    monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", block_after_initial_authority)
     predecessor_task = asyncio.create_task(
         first.create_composition_proposal(
             session_id=session_id,
@@ -333,7 +334,7 @@ async def test_postgres_composer_proposal_reject_stale_predecessor_writes_nothin
     )
     entered = threading.Event()
     release = threading.Event()
-    original_reject = session_service_module._SessionComposerMutations.reject_pending_proposal
+    original_reject = mutation_capabilities._SessionComposerMutations.reject_pending_proposal
     blocked = False
 
     def block_first_reject(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -345,7 +346,7 @@ async def test_postgres_composer_proposal_reject_stale_predecessor_writes_nothin
                 raise AssertionError("proposal reject predecessor barrier timed out")
         original_reject(self, *args, **kwargs)
 
-    monkeypatch.setattr(session_service_module._SessionComposerMutations, "reject_pending_proposal", block_first_reject)
+    monkeypatch.setattr(mutation_capabilities._SessionComposerMutations, "reject_pending_proposal", block_first_reject)
     predecessor_task = asyncio.create_task(
         first.reject_composition_proposal(
             session_id=session_id,
@@ -462,7 +463,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
     )
     entered = threading.Event()
     release = threading.Event()
-    original_accept = session_service_module._SessionComposerMutations.accept_pending_ordinary_proposal
+    original_accept = mutation_capabilities._SessionComposerMutations.accept_pending_ordinary_proposal
     blocked = False
     successor_reached_advisory_lock = threading.Event()
 
@@ -480,7 +481,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
             successor_reached_advisory_lock.set()
 
     monkeypatch.setattr(
-        session_service_module._SessionComposerMutations,
+        mutation_capabilities._SessionComposerMutations,
         "accept_pending_ordinary_proposal",
         block_first_accept,
     )

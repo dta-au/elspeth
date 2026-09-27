@@ -35,6 +35,7 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
+from elspeth.web.sessions.proposal_authority import _composition_state_data_content_hash
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedOperationCompleted,
@@ -54,7 +55,6 @@ from elspeth.web.sessions.routes.guided_operations import (
     reserve_or_replay_guided_operation,
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
-from elspeth.web.sessions.service import _composition_state_data_content_hash
 from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.integration.web.composer.guided.test_respond import _assert_compose_context_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority

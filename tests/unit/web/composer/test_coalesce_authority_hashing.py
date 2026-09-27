@@ -42,12 +42,12 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
-from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.proposal_authority import (
     _composition_state_data_content_hash,
     _pipeline_audit_payload_hash,
     _pipeline_private_arguments_hash,
 )
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
 
 _COALESCE_TAG = "composer.coalesce-ordered-branches.v1"

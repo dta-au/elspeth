@@ -29,11 +29,12 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.blobs.protocol import BlobForkWriteFence
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.fork_custody import _value_references_parent_blob
 from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError, GuidedForkSettlementCommand
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _value_references_parent_blob
+from elspeth.web.sessions.service import SessionServiceImpl
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient

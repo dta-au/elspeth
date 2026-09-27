@@ -31,6 +31,7 @@ from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.fork_custody import _fork_blob_plan_from_content, _value_references_parent_blob
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
@@ -39,6 +40,7 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.mutation_capabilities import _GuidedSessionMutations
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
@@ -56,12 +58,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import (
-    SessionServiceImpl,
-    _fork_blob_plan_from_content,
-    _GuidedSessionMutations,
-    _value_references_parent_blob,
-)
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
@@ -3007,9 +3004,9 @@ def test_fork_backstop_shares_the_settlement_verifiers_reference_predicate() -> 
     blob" in the route module fails this test.
     """
     import elspeth.web.sessions.routes.sessions as fork_routes
-    from elspeth.web.sessions import service as sessions_service
+    from elspeth.web.sessions import fork_custody
 
-    assert fork_routes._value_references_parent_blob is sessions_service._value_references_parent_blob
+    assert fork_routes._value_references_parent_blob is fork_custody._value_references_parent_blob
     assert "_contains_exact_string" not in dir(fork_routes)
 
 
@@ -3028,7 +3025,7 @@ async def test_fork_rewriter_changes_exactly_the_composer_meta_keys_declared_as_
     from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
     from elspeth.web.composer.guided.resolved import SourceResolved
     from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
-    from elspeth.web.sessions.service import FORK_REWRITTEN_COMPOSER_META_KEYS
+    from elspeth.web.sessions.fork_custody import FORK_REWRITTEN_COMPOSER_META_KEYS
 
     parent_blob, child_blob, child_session_id = uuid4(), uuid4(), uuid4()
     parent_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob}.csv"

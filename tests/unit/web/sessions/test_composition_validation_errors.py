@@ -5,8 +5,8 @@ from pydantic import ValidationError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions import protocol
+from elspeth.web.sessions.fork_custody import _refuse_unrewritable_fork_custody
 from elspeth.web.sessions.schemas import CompositionValidationErrorResponse
-from elspeth.web.sessions.service import _refuse_unrewritable_fork_custody
 
 
 def test_composition_error_contract_exists_and_round_trips():

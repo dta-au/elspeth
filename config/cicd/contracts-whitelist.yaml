@@ -1143,7 +1143,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/yaml_generator.py:_has_bind_source_mode:options"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._evaluate_terminal_no_tool_advisor_gate:llm_messages (list)"
   - "src/elspeth/web/composer/discovery_cache.py:make_cache_key:arguments"
-  - "src/elspeth/web/sessions/service.py:_strip_guided_profile_in_meta:return"
+  - "src/elspeth/web/sessions/fork_custody.py:_strip_guided_profile_in_meta:return"
   - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._secret_requirements:schema"
   - "src/elspeth/web/catalog/schema_parse.py:required_secret_fields_from_json_schema:schema"
   - "src/elspeth/web/catalog/schema_parse.py:common_required_secret_fields_from_discriminated:schema"

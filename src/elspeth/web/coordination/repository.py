@@ -4390,7 +4390,7 @@ class _ForkCreationTransaction:
         set: a ``pending`` or ``failed`` parent blob is outside every plan, so
         a reference to it in the source state can never be rebased onto a child
         copy — precisely the custody
-        ``sessions/service.py::_refuse_unrewritable_fork_custody`` refuses
+        ``sessions/fork_custody.py::_refuse_unrewritable_fork_custody`` refuses
         before the child is staged. Scoping this to ``ready`` would make the
         refusal blind to exactly the rows it exists to catch.
         """
