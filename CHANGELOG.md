@@ -573,8 +573,10 @@ These ran and delivered rows before:
   configuration. A downstream node that declares `int` for a `number` field
   routes every row `contract_violation`. Before, both delivered while the
   provider answered with integral numbers. A fractional answer failed its
-  row under the schema type, and under the downstream type ended the run
-  with `ContractMergeError`, leaving tokens without an outcome.
+  row under the schema type. Without it, a mix of integral and fractional
+  answers ended the run with `ContractMergeError`, leaving tokens without an
+  outcome, whether or not a downstream node declared `int`; that mix now
+  delivers unless one does.
 - **A declared type on a created field that the value does not have**
   (ADR-050 bullet above). A `json_explode` declaring `page: int` routes a
   row whose element is a string; before, the string was delivered under an

@@ -293,9 +293,10 @@ Declare every field the template reads or tests. Reading or testing any other
 field fails every row, including `'x' in row`, a row carried through a `set`
 or loop variable, and a multi-query `row.source_row` column. `[]` shows the
 whole row but proves nothing to a field-scoped prompt-injection control, so
-declare the fields. A template that never reads `row` declares none: the query
-field reaches a retrieval template as `query` without a declaration, and a
-declaration the template cannot use is refused. `row` holds fields only:
+declare the fields. A single-query prompt or retrieval template that never
+reads `row` declares none: the query field reaches a retrieval template as
+`query` without a declaration, and a declaration the template cannot use is
+refused. `row` holds fields only:
 `row.to_dict()`, `row.contract`, `row.items()`, `row.keys()` and
 `row.values()` read fields of those names.
 Besides the names it binds itself, a template reads `row`, `lookup` in a model
