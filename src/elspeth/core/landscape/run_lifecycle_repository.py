@@ -84,10 +84,10 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
     secret_resolutions_table,
+    token_decided_clause,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
-    undecided_failed_work_clause,
 )
 
 if TYPE_CHECKING:
@@ -758,9 +758,10 @@ class RunLifecycleRepository:
            in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
            PENDING_SINK token_work_items)`` so a run can never be stamped
            successful over residual scheduler work, and a second arm
-           ``NOT EXISTS (FAILED token_work_items whose token has no completed
-           token_outcomes row)`` so it is never stamped successful over a row
-           whose claim died mid-row; FAILED/INTERRUPTED check only fence +
+           ``NOT EXISTS (token of the run with no completed token_outcomes
+           row)`` so it is never stamped successful over a row that has not
+           reached a recorded outcome — a claim that died mid-row, or a token
+           no scheduler work covers; FAILED/INTERRUPTED check only fence +
            immutability (the journal is left intact for resume);
         4. ADR-038 abandonment of undecided tokens when the run is
            non-resumable, plus fail-open of effect-linked operations;
@@ -784,8 +785,8 @@ class RunLifecycleRepository:
             AuditIntegrityError: If status is not a terminal run status
             AuditIntegrityError: If the run is not found or already terminal
             OrchestrationInvariantError: If a SUCCESS finalize found residual
-                scheduler work, or a FAILED work item whose token has no
-                terminal outcome (quiescence violation)
+                scheduler work, or a token with no completed terminal outcome
+                (quiescence violation)
             RunLeadershipLostError: If ``coordination_token`` is stale
         """
         if status not in _TERMINAL_RUN_STATUSES:
@@ -903,16 +904,16 @@ class RunLifecycleRepository:
             .scalars()
             .all()
         )
-        # A FAILED item whose token has no completed outcome is a claim that
-        # died mid-row (see undecided_failed_work_clause): the row never
-        # reached an outcome, and FAILED is absent from the active-status arm.
-        # Resume returns such items to READY before it drains.
-        outcomeless_failed_tokens = (
-            select(token_work_items_table.c.token_id).where(token_work_items_table.c.run_id == run_id).where(undecided_failed_work_clause())
-        )
+        # Every token of a successful run has exactly one completed outcome
+        # (the partial unique index caps it at one, so NOT EXISTS of a decided
+        # outcome is the whole check). An undecided token is a row that never
+        # reached a recorded outcome, whatever left it so: a claim that died
+        # mid-row (a FAILED item, which resume returns to READY), or a token
+        # with no scheduler work at all, which quiescence alone cannot see.
+        undecided_tokens = select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id).where(~token_decided_clause())
         # The SUCCESS quiescence arms ride in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
-        quiescence_clauses = [~residual_work_exists, ~outcomeless_failed_tokens.exists()] if is_success_status else []
+        quiescence_clauses = [~residual_work_exists, ~undecided_tokens.exists()] if is_success_status else []
         state_llm_calls = (
             select(func.count())
             .select_from(calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id))
@@ -946,14 +947,14 @@ class RunLifecycleRepository:
                     "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
                     "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
                 )
-            outcomeless_tokens = (
-                conn.execute(outcomeless_failed_tokens.order_by(token_work_items_table.c.token_id).limit(10)).scalars().all()
-            )
+            undecided_count = conn.execute(select(func.count()).select_from(undecided_tokens.subquery())).scalar_one()
+            first_undecided = conn.execute(undecided_tokens.order_by(tokens_table.c.token_id).limit(10)).scalars().all()
             raise OrchestrationInvariantError(
-                f"Cannot complete run {run_id} as {status.value!r}: FAILED scheduler work whose token has no "
-                f"terminal outcome exists (tokens {list(outcomeless_tokens)!r}, first 10). A claim died mid-row; "
-                "a run cannot be stamped successful while a row has not reached a recorded outcome. "
-                "`elspeth resume` returns such items to READY and re-drives them."
+                f"Cannot complete run {run_id} as {status.value!r}: {undecided_count} token(s) have no completed "
+                f"terminal outcome (first 10: {list(first_undecided)!r}). A run cannot be stamped successful while "
+                "a row has not reached a recorded outcome. A token whose claim died mid-row (a FAILED work item) is "
+                "returned to READY and re-driven by `elspeth resume`; a token with no scheduler work at all cannot "
+                "be re-driven and resume refuses it."
             )
 
         # ADR-038 fate decision: the terminal stamp above succeeded, so the

@@ -42,6 +42,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam, SinkEffectInjectedFault
+from elspeth.engine.orchestrator import resume as resume_module
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 
 _ROWS = ('{"id": 1, "line": "a"}', '{"id": 2, "line": "b"}', '{"id": "x", "line": "bad"}', '{"id": 3, "line": "c"}')
@@ -304,6 +305,34 @@ def scenario_uncorrupted_crash_resumes_to_every_token_terminal(tmp_path: Path, m
         db.close()
 
 
+def scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, db_url: str
+) -> None:
+    """QR-4 is its own backstop: with the coverage check bypassed, the success stamp still refuses.
+
+    The same real crash, one token's handoff lost, and ``refuse_unaccounted_resume``
+    replaced by a no-op (a hole in the coverage check, or a future sink-bound
+    path that skips the fenced handoff). The other three tokens re-drive and
+    publish, quiescence holds, and the completion statement's undecided-token
+    arm must still refuse to stamp the run successful over the outcomeless one.
+    """
+    settings, db, run_id = _crashed_run(tmp_path, monkeypatch, db_url)
+    try:
+        victim = _first_pending_token(db, run_id)
+        with db.engine.begin() as conn:
+            conn.execute(delete(token_work_items_table).where(token_work_items_table.c.token_id == victim))
+        monkeypatch.setattr(resume_module, "refuse_unaccounted_resume", lambda factory, coordination_token: None)
+
+        result = _resume(settings, run_id)
+        assert result.exit_code != 0, result.output
+        assert "1 token(s) have no completed terminal outcome" in result.output
+        assert victim in result.output
+        assert _run_status(db, run_id) == RunStatus.FAILED.value
+        assert victim not in {token for token, _outcome, _path, completed in _outcome_rows(db, run_id) if completed == 1}
+    finally:
+        db.close()
+
+
 # SQLite runs of the scenarios; tests/testcontainer/core/test_resume_coverage_refusal_postgres.py
 # runs the same scenarios against PostgreSQL.
 
@@ -327,3 +356,7 @@ def test_abandoned_token_is_refused_before_any_redrive(tmp_path: Path, monkeypat
 
 def test_run_with_no_work_left_is_refused_not_finalized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scenario_run_with_no_work_left_is_refused_not_finalized(tmp_path, monkeypatch, db_url=_sqlite_url(tmp_path))
+
+
+def test_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path, monkeypatch, db_url=_sqlite_url(tmp_path))

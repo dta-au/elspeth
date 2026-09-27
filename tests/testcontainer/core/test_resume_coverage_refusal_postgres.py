@@ -7,7 +7,9 @@ quarantined row PENDING_SINK beside the valid rows, and resume's coverage check
 (a correlated ``NOT EXISTS`` census under the leader fence) must refuse and
 record a corrupted store, leave ABANDONED tokens to the ADR-038 belt, evaluate
 under the won seat, and let the uncorrupted crash resume to every token
-terminal. The ``resume_refused`` event must pass the ``event_type`` CHECK.
+terminal. The ``resume_refused`` event must pass the ``event_type`` CHECK, and
+the completion statement's undecided-token arm (QR-4) must refuse a success
+stamp over an outcomeless token even with the coverage check bypassed.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from tests.integration.pipeline.test_resume_coverage_refusal import (
     scenario_abandoned_token_is_refused_before_any_redrive,
     scenario_coverage_is_evaluated_under_the_won_seat,
     scenario_run_with_no_work_left_is_refused_not_finalized,
+    scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check,
     scenario_token_without_work_item_or_outcome_is_refused_and_recorded,
     scenario_uncorrupted_crash_resumes_to_every_token_terminal,
 )
@@ -65,3 +68,9 @@ def test_run_with_no_work_left_is_refused_not_finalized_on_postgres(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_url: str
 ) -> None:
     scenario_run_with_no_work_left_is_refused_not_finalized(tmp_path, monkeypatch, db_url=postgres_url)
+
+
+def test_success_stamp_refuses_an_undecided_token_past_the_coverage_check_on_postgres(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_url: str
+) -> None:
+    scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path, monkeypatch, db_url=postgres_url)

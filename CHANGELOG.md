@@ -476,6 +476,24 @@ drained and repair this release forward.
   resume of a leader that died mid-retry). A run can no longer be finalised
   successful while a row whose claim died mid-row has no outcome: it now ends
   `FAILED` instead of `COMPLETED`.
+- **A quarantined source row survives a crash, and resume never re-validates
+  it.** A row that fails source validation and is routed to a quarantine sink
+  is now recorded, with its validation error, its failed source state, its
+  routing event and a durable work item for the quarantine sink, in one
+  transaction. Before, it existed only in memory until the sink write, so a
+  crash before that write lost it. Resuming a fixed-schema run then stopped
+  with a schema validation error and left every valid row without an outcome.
+  Resuming an observed-schema run re-read the row, accepted it and published
+  it to the success sink as a successful row, and the run finished
+  `completed` with exit 0. Resume now only re-drives recorded work items and
+  never reads a source row again: after the same crash the quarantined row
+  reaches its quarantine sink, the valid rows reach theirs, nothing is
+  published twice, and the run ends `completed_with_failures`. Resume refuses
+  a run in which a row has neither an outcome nor a work item and records the
+  refusal in the audit trail as a `resume_refused` event naming the token ids
+  (never row values). A run can no longer be stamped successful while any row
+  lacks a recorded outcome. `elspeth resume`'s preview reports "Scheduler work
+  items (to re-drive)" instead of "Unprocessed rows".
 - **`elspeth resume` finishes a row whose work died on an unexpected error.**
   When a transform raises something that is neither a row error nor
   retryable (a plugin bug or an ELSPETH failure), the row's work item is left

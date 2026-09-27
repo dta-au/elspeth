@@ -1096,16 +1096,33 @@ def work_item_token_decided_clause() -> ColumnElement[bool]:
     )
 
 
+def token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the token carries a completed terminal outcome in its run.
+
+    Correlated to ``tokens``. The partial unique index
+    ``ix_token_outcomes_terminal_unique`` caps completed outcomes at one per
+    token, so NOT EXISTS of this clause is exactly "the token has no recorded
+    terminal outcome" — the fact a success stamp must never coexist with.
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == tokens_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
 def undecided_failed_work_clause() -> ColumnElement[bool]:
     """Predicate selecting FAILED work items whose token has no completed outcome.
 
     FAILED is a disposition, not a fate. A routed failure records the token's
     outcome before ``mark_failed``; a FAILED item whose token has none is a
     claim that died on an exception mid-row (the drain's exception arm marks
-    it FAILED and the worker exits), so the row is undecided. One predicate
-    for the two readers that must agree: ``complete_run`` refuses a success
-    stamp while such an item exists, and resume returns exactly these items
-    to READY for re-drive (``requeue_undecided_failed_work``).
+    it FAILED and the worker exits), so the row is undecided. Resume returns
+    exactly these items to READY for re-drive
+    (``requeue_undecided_failed_work``); ``complete_run``'s undecided-token
+    arm (``token_decided_clause``) refuses a success stamp over their tokens.
     """
     return and_(
         token_work_items_table.c.status == TokenWorkStatus.FAILED.value,
@@ -1120,11 +1137,10 @@ def blocked_barrier_hold_clause() -> ColumnElement[bool]:
     ``barrier_key`` (coalesce_name for coalesce, str(node_id) for
     aggregation), while ADR-028 queue-holds carry only a ``queue_key``. The
     ``barrier_key IS NOT NULL`` filter is what keeps queue-holds out of
-    barrier sweeps (restore, resume work-set exclusion, quiescence counting).
+    barrier sweeps (restore, quiescence counting).
 
     Single source of truth for the dual-use predicate — shared by
     ``TokenSchedulerRepository.list_blocked_barrier_items`` and
-    ``RecoveryManager._get_buffered_journal_token_ids`` /
     ``count_blocked_barrier_items``. The literal ``'blocked'`` MUST match
     ``TokenWorkStatus.BLOCKED.value`` (a lowercase ``StrEnum``), consistent
     with the status literals in this module's CHECK constraints.
