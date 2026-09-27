@@ -2530,7 +2530,7 @@ class TestGateExecutor:
         token = _make_token(contract=contract)
         ctx = make_context()
 
-        with pytest.raises(ValueError, match="unknown_label"):
+        with pytest.raises(ValueError, match=r"unconfigured route label \(type=str, length=13\).*Expression: 'unknown_label'"):
             executor.execute_config_gate(
                 config,
                 "cg_1",
@@ -2557,7 +2557,7 @@ class TestGateExecutor:
 
         with (
             spans.trace_scope("run_1", datetime.now(UTC)),
-            pytest.raises(ValueError, match="unknown_label"),
+            pytest.raises(ValueError, match=r"unconfigured route label \(type=str, length=13\).*Expression: 'unknown_label'"),
         ):
             executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"), attempt_offset=0)
 
@@ -2593,11 +2593,18 @@ class TestGateExecutor:
         assert events[0].status is EngineSpanStatus.ERROR
         assert events[0].exception_type == "ExpressionEvaluationError"
 
-    def test_config_gate_unknown_route_label_error_redacts_row_derived_value(self) -> None:
-        """Unknown row-derived route labels must not leak raw values to audit text."""
+    @pytest.mark.parametrize(
+        "secret_label",
+        [
+            # short: the retired 80-char bounded preview printed it whole (C3 fix round 1)
+            "CUSTOMER_PRIVATE_739",
+            "sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + ("x" * 100),
+        ],
+    )
+    def test_config_gate_unknown_route_label_error_redacts_row_derived_value(self, secret_label: str) -> None:
+        """Unknown row-derived route labels must not leak raw values (nor a digest of them) to audit text."""
         from elspeth.contracts.errors import ExecutionError
 
-        secret_label = "sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + ("x" * 100)
         factory = _make_factory()
         executor = GateExecutor(factory.execution, _make_span_factory(), _make_step_resolver())
         config = GateSettings(
@@ -2612,9 +2619,10 @@ class TestGateExecutor:
         with pytest.raises(ValueError) as exc_info:
             executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
-        assert secret_label not in str(exc_info.value)
-        assert "type=str" in str(exc_info.value)
-        assert "sha256=" in str(exc_info.value)
+        assert str(exc_info.value) == (
+            f"Gate 'my_gate' condition returned unconfigured route label (type=str, length={len(secret_label)}); "
+            "configured routes: ['known']. Expression: row['route_label']"
+        )
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         error_obj = failed_kwargs.get("error")
@@ -3021,8 +3029,11 @@ class TestGateExecutor:
 
         message = str(exc_info.value)
         assert secret_value not in message
-        assert "type=mappingproxy" in message
-        assert "sha256=" in message
+        assert "secret" not in message  # the row-derived KEY is not printed either
+        assert message == (
+            "Gate 'my_gate' expression returned unsupported route value (type=mappingproxy), "
+            "expected bool or str. Expression: row['route_payload']"
+        )
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         error_obj = failed_kwargs.get("error")
@@ -6234,7 +6245,7 @@ class TestGateExecutorExecutionErrorFieldRename:
         ctx = make_context()
 
         # "unknown_route" is not in routes, so this raises ValueError
-        with pytest.raises(ValueError, match="unknown_route"):
+        with pytest.raises(ValueError, match=r"unconfigured route label \(type=str, length=13\).*Expression: 'unknown_route'"):
             executor.execute_config_gate(config, "cg_1", token, ctx, attempt_offset=0)
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)

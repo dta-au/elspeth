@@ -577,7 +577,10 @@ drained and repair this release forward.
   prints `<a key the expression does not spell out>`, while a key written in
   the expression is still named, and no Python operand error text is kept.
   `value_transform` adds the arm as `error_type` (`missing_key`,
-  `index_out_of_range`, `incompatible_types`, …).
+  `index_out_of_range`, `incompatible_types`, …). A gate whose condition
+  returns an unconfigured route label or a value that is not a bool or string
+  no longer records a preview or a hash of that value (a short value printed
+  whole); the failure names its type, a string's length and the condition.
 
 ### Newly refused configurations
 
