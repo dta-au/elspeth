@@ -1219,8 +1219,10 @@ def test_a_buffered_row_missing_a_declared_field_routes_the_whole_batch_to_on_er
         "error": (
             f"Aggregation transform 'batch_threshold_summary' (buffered row {offending_index}) requires input field(s) ['v'] "
             "that the arriving row does not carry. Its upstream does not guarantee them (an observed or open schema promises "
-            "nothing about a column it does not declare), so the row is routed instead of processed. To refuse such a "
-            "pipeline at build instead, declare the field(s) in the upstream's schema or guaranteed_fields."
+            "nothing about a column it does not declare), so the row is routed instead of processed. The build refuses "
+            "such a pipeline only when a closed (mode: fixed) upstream omits the field(s). To reject rows lacking them "
+            "where they enter the pipeline instead, declare the field(s) as required in the source's schema fields; the "
+            "source's on_validation_failure then handles each such row."
         ),
     }
     [routing] = audit["routing"]

@@ -1980,8 +1980,10 @@ class DeclaredInputFieldAbsentViolation(PluginContractViolation):
         super().__init__(
             f"{component} requires input field(s) {list(fields)} that the arriving row does not carry. "
             "Its upstream does not guarantee them (an observed or open schema promises nothing about a column it "
-            "does not declare), so the row is routed instead of processed. To refuse such a pipeline at build "
-            "instead, declare the field(s) in the upstream's schema or guaranteed_fields."
+            "does not declare), so the row is routed instead of processed. The build refuses such a pipeline only "
+            "when a closed (mode: fixed) upstream omits the field(s). To reject rows lacking them where they enter "
+            "the pipeline instead, declare the field(s) as required in the source's schema fields; the source's "
+            "on_validation_failure then handles each such row."
         )
 
     def to_transform_error_reason(self) -> TransformErrorReason:
