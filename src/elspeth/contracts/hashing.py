@@ -51,9 +51,9 @@ def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:
             raise ValueError(f"Cannot canonicalize Infinity. Use None for missing values, not Infinity. Got: {obj!r}")
         return obj
     if isinstance(obj, frozenset):
-        raise TypeError(
-            f"frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections. Got: {obj!r}"
-        )
+        # Type only, never the set's repr: its members can be row values, and
+        # this text reaches audit records through every hashing seam.
+        raise TypeError("frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections.")
     # Mapping ABC covers both dict and MappingProxyType. The dict
     # comprehension normalizes MappingProxyType → dict for rfc8785.
     if isinstance(obj, Mapping):

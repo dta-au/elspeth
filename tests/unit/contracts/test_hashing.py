@@ -299,6 +299,14 @@ class TestFrozenTypeHandling:
         with pytest.raises(TypeError, match="frozenset"):
             canonical_json({"s": frozenset({1, 2})})
 
+    def test_frozenset_rejection_names_the_type_not_the_members(self) -> None:
+        """The message reaches audit records through every hashing seam, so it never carries the set's members (H4)."""
+        with pytest.raises(TypeError) as exc_info:
+            stable_hash({"tags": frozenset({"SNTL_FROZENSET_MEMBER_7"})})
+        assert str(exc_info.value) == (
+            "frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections."
+        )
+
 
 class TestFrozenRoundTripContracts:
     """Hashing thawed output must equal hashing the frozen equivalent.
