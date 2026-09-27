@@ -23,7 +23,8 @@ from structlog.testing import capture_logs
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.boot_probe import build_composer_probe_requests
-from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.strict_transport import (
     StrictTransport,
     StrictTransportDiagnostic,

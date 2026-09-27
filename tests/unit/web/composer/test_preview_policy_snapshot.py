@@ -19,7 +19,8 @@ from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _Disp
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache
-from elspeth.web.composer.service import ComposerServiceImpl, _admit_composer_llm_completion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationReadinessBlocker, ValidationResult

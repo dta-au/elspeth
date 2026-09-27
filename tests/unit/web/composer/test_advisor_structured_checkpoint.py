@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import structlog
 
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.audit import BufferingRecorder, ComposerLLMCallStatus
 from tests.unit.web.composer import test_advisor_checkpoint as checkpoint_fixtures
@@ -53,7 +54,7 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=recorder, **_fenced_session(service))
 
@@ -231,7 +232,7 @@ async def test_empty_text_is_distinct_from_absent_text_at_real_call_boundary(
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     fenced = _fenced_session(service)
     verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
     assert verdict.ok and not verdict.blocking
@@ -378,7 +379,7 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(m
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "admit_provider_attempt", admission)
+    monkeypatch.setattr(provider_gateway, "admit_provider_attempt", admission)
     monkeypatch.setattr(litellm, "acompletion", complete)
     with structlog.testing.capture_logs() as events:
         verdict = await service._run_advisor_checkpoint(

@@ -23,7 +23,8 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError
-from elspeth.web.composer.service import ComposerServiceImpl, _admit_composer_llm_completion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.dependencies import create_catalog_service

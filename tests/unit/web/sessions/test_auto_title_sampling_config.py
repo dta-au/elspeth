@@ -18,6 +18,7 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer import provider_gateway
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 
 _TEST_SESSION_ID = uuid4()
@@ -102,7 +103,7 @@ async def test_auto_title_omits_sampling_when_none(monkeypatch: pytest.MonkeyPat
         captured.update(kwargs)
         return _completion("My Title")
 
-    monkeypatch.setattr(at, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     service = _TitleService()
 
     await at.maybe_auto_title_session(
@@ -128,7 +129,7 @@ async def test_auto_title_sends_configured_sampling(monkeypatch: pytest.MonkeyPa
         captured.update(kwargs)
         return _completion("My Title")
 
-    monkeypatch.setattr(at, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await at.maybe_auto_title_session(
         service=_TitleService(),

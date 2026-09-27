@@ -9,9 +9,10 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
 from elspeth.web.config import WebSettings
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings, _mock_catalog
@@ -71,7 +72,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     async def clean_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
         return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     service, session_id = _composer_service_with_session(_mock_catalog(), _bedrock_settings())
     monkeypatch.setattr(service, "_run_advisor_checkpoint", clean_checkpoint)
 

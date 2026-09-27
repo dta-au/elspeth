@@ -100,7 +100,8 @@ import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.sessions.models import sessions_table
 

@@ -42,7 +42,7 @@ async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution()
         ]
     )
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as completion,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as completion,
         patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
     ):
         completion.side_effect = [
@@ -66,7 +66,7 @@ async def test_repeated_rootless_prose_ends_after_one_neutral_retry() -> None:
         observed.append(deepcopy(args[0]))
         return _make_llm_response(content=_FALSE_COMPLETION)
 
-    with patch.object(service, "_call_llm", side_effect=respond) as completion:
+    with patch.object(service._provider_gateway, "_call_llm", side_effect=respond) as completion:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
     assert completion.call_count == 2
     assert result.repair_turns_used == 1
@@ -87,7 +87,7 @@ async def test_repeated_rootless_prose_ends_after_one_neutral_retry() -> None:
 async def test_neutral_retry_keeps_explanation_and_revocation_without_mutation(user_message: str) -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     with patch.object(
-        service, "_call_llm", return_value=_make_llm_response(content="I can explain that without changing anything.")
+        service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="I can explain that without changing anything.")
     ) as completion:
         result = await service.compose(user_message, [], _empty_state(), session_id=sid)
     assert completion.call_count == 2
@@ -105,7 +105,9 @@ async def test_neutral_retry_keeps_explanation_and_revocation_without_mutation(u
 async def test_ineligible_request_does_not_add_a_call(user_message: str, repair_budget: int, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(composer_service_module, "_MAX_REPAIR_TURNS", repair_budget)
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
-    with patch.object(service, "_call_llm", return_value=_make_llm_response(content="Here is my response.")) as completion:
+    with patch.object(
+        service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="Here is my response.")
+    ) as completion:
         result = await service.compose(user_message, [], _empty_state(), session_id=sid)
     assert completion.call_count == 1
     assert result.repair_turns_used == 0
@@ -122,7 +124,7 @@ async def test_expired_deadline_does_not_start_rootless_retry() -> None:
         return await terminate(**kwargs)
 
     with (
-        patch.object(service, "_call_llm", return_value=_make_llm_response(content=_FALSE_COMPLETION)) as completion,
+        patch.object(service._provider_gateway, "_call_llm", return_value=_make_llm_response(content=_FALSE_COMPLETION)) as completion,
         patch.object(service, "_try_terminate_no_tools", side_effect=terminate_after_deadline),
     ):
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)

@@ -21,7 +21,8 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._dispatch import (

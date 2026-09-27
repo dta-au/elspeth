@@ -623,9 +623,8 @@ class ParityEnv:
         ``bind_guided_reviewed_components`` + candidate validation → durable
         proposal) → review wiring → confirm wiring (the sole commit).
 
-        Only ``service._litellm_acompletion`` is scripted; the structured
-        ``/guided/respond`` transitions never touch
-        ``chat_solver._litellm_acompletion``. The single response is queued from
+        Only the provider gateway transport for guided planning is scripted;
+        the structured ``/guided/respond`` transitions never call it. The single response is queued from
         the start so any unexpected pre-finish provider call surfaces as a
         scripted-completion-exhausted error at finish.
         """

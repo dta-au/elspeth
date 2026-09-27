@@ -41,7 +41,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
-from elspeth.web.composer.service import _BadRequestLLMError
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease

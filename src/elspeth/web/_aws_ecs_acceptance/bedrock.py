@@ -48,7 +48,7 @@ from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog
 from elspeth.telemetry import create_telemetry_manager
 from elspeth.web.audit_readiness.service import build_plugin_policy_readiness
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.config import settings_from_env
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.service import _build_web_plugin_policy_evidence

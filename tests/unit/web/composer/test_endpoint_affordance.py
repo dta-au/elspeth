@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 import pytest
 from litellm.exceptions import APIError as LiteLLMAPIError
 
-import elspeth.web.composer.service as svc
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
@@ -63,9 +63,9 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_llm([{"role": "user", "content": "hi"}], [])
+    await _service(tmp_path)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
 
     assert "api_base" not in captured
     assert "api_key" not in captured
@@ -83,13 +83,13 @@ async def test_call_llm_sends_configured_primary_endpoint(monkeypatch: pytest.Mo
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(
         tmp_path,
         composer_endpoint_base_url="https://primary-gateway.example.test/v1",
         composer_endpoint_api_key=_SENTINEL_CREDENTIAL,
-    )._call_llm([{"role": "user", "content": "hi"}], [])
+    )._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
 
     assert captured["api_base"] == "https://primary-gateway.example.test/v1"
     assert captured["api_key"] == _SENTINEL_CREDENTIAL
@@ -104,13 +104,13 @@ async def test_call_llm_does_not_use_advisor_endpoint(monkeypatch: pytest.Monkey
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(
         tmp_path,
         composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
         composer_advisor_endpoint_api_key="advisor-only-secret",
-    )._call_llm([{"role": "user", "content": "hi"}], [])
+    )._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
 
     assert "api_base" not in captured
     assert "api_key" not in captured
@@ -127,9 +127,9 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return _response("text")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_text_llm([{"role": "user", "content": "hi"}])
+    await _service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert "api_base" not in captured
     assert "api_key" not in captured
@@ -144,13 +144,13 @@ async def test_text_llm_sends_configured_primary_endpoint(monkeypatch: pytest.Mo
         captured.update(kwargs)
         return _response("text")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(
         tmp_path,
         composer_endpoint_base_url="http://127.0.0.1:8787/v1",
         composer_endpoint_api_key=_SENTINEL_CREDENTIAL,
-    )._call_text_llm([{"role": "user", "content": "hi"}])
+    )._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert captured["api_base"] == "http://127.0.0.1:8787/v1"
     assert captured["api_key"] == _SENTINEL_CREDENTIAL
@@ -167,7 +167,7 @@ async def test_advisor_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Monk
         captured.update(kwargs)
         return _response("advice")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(tmp_path)._call_advisor_with_audit(
         {
@@ -191,7 +191,7 @@ async def test_advisor_sends_configured_advisor_endpoint(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return _response("advice")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(
         tmp_path,
@@ -220,7 +220,7 @@ async def test_advisor_does_not_use_primary_endpoint(monkeypatch: pytest.MonkeyP
         captured.update(kwargs)
         return _response("advice")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await _service(
         tmp_path,
@@ -258,7 +258,7 @@ async def test_advisor_credential_never_appears_in_audit_record_on_failure(monke
             model=kwargs["model"],
         )
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     recorder = BufferingRecorder()
     with pytest.raises(LiteLLMAPIError) as excinfo:

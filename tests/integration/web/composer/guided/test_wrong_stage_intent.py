@@ -22,7 +22,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.guided import chat_solver
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAction,
@@ -1162,7 +1162,7 @@ def test_management_non_string_provider_content_is_bounded_without_private_egres
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", guided_chat_atomic.run_guided_chat_provider_attempt)
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_reply)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", malformed_reply)
     operation_id = str(uuid4())
     with capture_logs() as logs:
         response = _post(
@@ -1415,7 +1415,7 @@ def test_management_provider_api_error_completes_unavailable_turn_without_mutati
             model="test/model",
         )
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", provider_failure)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider_failure)
     operation_id = str(uuid4())
     response = _post(
         client,
@@ -1748,7 +1748,7 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
         ]
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_completion)
     response = _post(
         client,
         session_id,
@@ -1861,7 +1861,7 @@ def test_group_of_sink_resolution_and_two_future_intents_applies_all_atomically(
         ]
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", group_completion)
     response = _post(
         client,
         session_id,
@@ -2107,7 +2107,7 @@ def test_retain_alone_exits_keep_the_not_applied_signal(
             ]
         )
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", responder)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", responder)
     response = _post(
         client,
         session_id,
@@ -2378,7 +2378,7 @@ def test_guarded_schema_form_pair_keeps_not_applied_signal_and_retains(
         ]
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_completion)
     response = _post(
         client,
         session_id,
@@ -2454,7 +2454,7 @@ def test_real_route_malformed_future_action_degrades_to_durable_clarification_re
         state_count_before = connection.execute(
             select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
         ).scalar_one()
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", malformed_completion)
     response = _post(
         client,
         session_id,

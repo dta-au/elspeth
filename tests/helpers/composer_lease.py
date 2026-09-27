@@ -10,6 +10,8 @@ arm. Register it as an autouse fixture in the conftest of any legacy suite.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 
 def install_fenced_compose_adapter(monkeypatch) -> None:
     """Test adapter: compose() calls that name a session but carry no
@@ -103,8 +105,13 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         return await _with_lease(self, session_id, kwargs, call)
 
     async def run_one_turn(self, **kwargs):
+        scripted_llm = kwargs.pop("llm", None)
+
         async def call(**kw):
-            return await real_turn(self, **kw)
+            if scripted_llm is None:
+                return await real_turn(self, **kw)
+            with patch.object(self._provider_gateway, "_call_llm", new=scripted_llm):
+                return await real_turn(self, **kw)
 
         return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
 

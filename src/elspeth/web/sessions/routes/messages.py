@@ -8,6 +8,7 @@ from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
 from elspeth.web.sessions.protocol import MessageIngressAccepted, MessageIngressConflict, MessageIngressFresh
@@ -43,7 +44,6 @@ from ._helpers import (
     SessionServiceProtocol,
     UserIdentity,
     WebRateLimiter,
-    _BadRequestLLMError,
     _cancel_on_client_disconnect,
     _capture_freeform_child,
     _chat_ingress_inputs,

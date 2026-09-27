@@ -33,6 +33,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
@@ -55,6 +56,7 @@ from elspeth.web.composer.protocol import (
     PipelineCommitIntent,
     ToolArgumentError,
 )
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerAvailability,
@@ -103,15 +105,25 @@ from tests.unit.web.composer._helpers import (
     FakeMessage,
     FakeToolCall,
     _empty_state,
-    _make_llm_response,
     _make_settings,
     _mock_catalog,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
+from tests.unit.web.composer._helpers import (
+    _make_llm_response as _make_raw_llm_response,
 )
 from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
+
+
+def _make_llm_response(
+    content: str | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> _AdmittedLLMCompletion:
+    """Model the admitted result returned by the gateway's _call_llm seam."""
+    return _admit_composer_llm_completion(_make_raw_llm_response(content=content, tool_calls=tool_calls))
 
 
 def _advisor_checkpoint_reply(*, verdict: Literal["CLEAN", "FLAGGED"], findings: str, note: str | None) -> str:
@@ -1083,7 +1095,7 @@ class TestComposerTextOnlyResponse:
 
         llm_response = _make_llm_response(content="I'll help you build a pipeline!")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
             result = await service.compose("What can this composer do?", [], state, session_id=session_id)
 
@@ -1101,7 +1113,7 @@ class TestComposerTextOnlyResponse:
         model_prose = "I set up the workflow conceptually and can continue."
         llm_response = _make_llm_response(content=model_prose)
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
             result = await service.compose("Set this up to actually run from leads_q3.csv.", [], state, session_id=session_id)
 
@@ -1144,7 +1156,7 @@ class TestComposerTextOnlyResponse:
         final_prose = "I tried to build it, but the workflow is still conceptual."
         text_response = _make_llm_response(content=final_prose)
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [failed_set_pipeline, text_response]
             result = await service.compose("Build the CSV workflow now.", [], state, session_id=session_id)
 
@@ -1206,7 +1218,7 @@ class TestComposerSingleToolCall:
 
         with (
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fake_execute_tool),
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [turn, done]
             await service.compose("Update metadata", [], state, session_id=session_id)
@@ -1260,7 +1272,7 @@ class TestComposerSingleToolCall:
 
         with (
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fake_execute_tool),
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [turn, done]
             await service.compose(
@@ -1694,7 +1706,7 @@ class TestComposerSingleToolCall:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [tool_response, text_response]
@@ -1733,7 +1745,7 @@ class TestComposerSingleToolCall:
             return func(*args, **kwargs)
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch("elspeth.web.composer.service.asyncio.to_thread", side_effect=inline_to_thread),
         ):
             mock_llm.side_effect = [tool_response, text_response]
@@ -1839,7 +1851,7 @@ class TestComposerSingleToolCall:
             ],
             "metadata": {"name": "Append literal text"},
         }
-        build_turn = _make_llm_response(
+        build_turn = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_build",
@@ -1848,8 +1860,8 @@ class TestComposerSingleToolCall:
                 }
             ],
         )
-        preview_turn = _make_llm_response(tool_calls=[{"id": "call_preview", "name": "preview_pipeline", "arguments": {}}])
-        final_turn = _make_llm_response(content="Pipeline configured.")
+        preview_turn = _make_raw_llm_response(tool_calls=[{"id": "call_preview", "name": "preview_pipeline", "arguments": {}}])
+        final_turn = _make_raw_llm_response(content="Pipeline configured.")
 
         with (
             patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm,
@@ -1924,7 +1936,7 @@ class TestComposerMultiTurnToolCalls:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
@@ -1988,7 +2000,7 @@ class TestComposerMultiTurnToolCalls:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
@@ -2084,7 +2096,7 @@ class TestComposerMultiTurnToolCalls:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service,
@@ -2167,7 +2179,7 @@ class TestComposerMultiTurnToolCalls:
         service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service,
@@ -2212,7 +2224,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(
-                service,
+                service._provider_gateway,
                 "_call_llm",
                 new_callable=AsyncMock,
                 side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
@@ -2267,7 +2279,7 @@ class TestComposerMultiTurnToolCalls:
             return replies[len(provider_contexts) - 1]
 
         with (
-            patch.object(service, "_call_llm", side_effect=scripted_call_llm),
+            patch.object(service._provider_gateway, "_call_llm", side_effect=scripted_call_llm),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service,
@@ -2299,7 +2311,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(
-                service,
+                service._provider_gateway,
                 "_call_llm",
                 new_callable=AsyncMock,
                 side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
@@ -2338,7 +2350,9 @@ class TestComposerMultiTurnToolCalls:
         outage = AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor unavailable", failure_class="unavailable")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]),
+            patch.object(
+                service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
+            ),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(service, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
         ):
@@ -2373,7 +2387,7 @@ class TestComposerMultiTurnToolCalls:
         ]
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service,
@@ -2461,7 +2475,7 @@ class TestComposerMultiTurnToolCalls:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
@@ -2524,7 +2538,7 @@ class TestComposerMultiTurnToolCalls:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
@@ -2636,7 +2650,7 @@ class TestComposerConvergence:
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Loop forever", [], state, session_id=session_id)
@@ -2670,7 +2684,7 @@ class TestComposerConvergence:
             ],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Keep mutating", [], state, session_id=session_id)
@@ -2697,7 +2711,7 @@ class TestComposerConvergence:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [mut, text]
@@ -2740,7 +2754,7 @@ class TestComposerConvergence:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [disc, mut, text]
@@ -2789,7 +2803,7 @@ class TestFailedMutationBudgetClassification:
             ],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_mutation, bad_mutation2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Setup source", [], state, session_id=session_id)
@@ -2816,7 +2830,7 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg = FakeMessage(content=None, tool_calls=[call])
-        response = FakeLLMResponse(choices=[FakeChoice(message=msg)])
+        response = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg)]))
 
         # Bonus call also fails
         call2 = FakeToolCall(
@@ -2827,9 +2841,9 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg2 = FakeMessage(content=None, tool_calls=[call2])
-        response2 = FakeLLMResponse(choices=[FakeChoice(message=msg2)])
+        response2 = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg2)]))
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [response, response2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Setup source", [], state, session_id=session_id)
@@ -2856,14 +2870,14 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg = FakeMessage(content=None, tool_calls=[call])
-        response = FakeLLMResponse(choices=[FakeChoice(message=msg)])
+        response = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg)]))
 
         # Turn 2: another discovery call
         disc2 = _make_llm_response(
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [response, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Explore", [], state, session_id=session_id)
@@ -2892,7 +2906,7 @@ class TestComposerErrorHandling:
         # Turn 2: text response (self-corrected)
         text = _make_llm_response(content="Sorry, let me try again.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Do something", [], state, session_id=session_id)
 
@@ -2921,7 +2935,7 @@ class TestComposerErrorHandling:
         # Turn 2: text
         text = _make_llm_response(content="Fixed.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -2973,7 +2987,7 @@ class TestComposerErrorHandling:
                     actual_type="int",
                 ),
             ),
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
@@ -3039,7 +3053,7 @@ class TestComposerErrorHandling:
         )
         text = _make_llm_response(content="Recovered.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3120,7 +3134,7 @@ class TestComposerErrorHandling:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [good_call, text]
@@ -3199,7 +3213,7 @@ class TestComposerErrorHandling:
         )
         text = _make_llm_response(content="Adjusted.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [partial_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
@@ -3246,7 +3260,7 @@ class TestComposerErrorHandling:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=KeyError("internal_state_key"),
@@ -3282,7 +3296,7 @@ class TestComposerErrorHandling:
         )
         text = _make_llm_response(content="Ok.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             await service.compose("Setup", [], state, session_id=session_id)
 
@@ -3317,7 +3331,7 @@ class TestComposerErrorHandling:
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_execute_tool,
             ) as mock_execute_tool,
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
@@ -3357,7 +3371,7 @@ class TestComposerErrorHandling:
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_execute_tool,
             ) as mock_execute_tool,
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Explore", [], state, session_id=session_id)
@@ -3413,7 +3427,7 @@ class TestProviderCacheTokenAudit:
             model: str = "openrouter/openai/gpt-5.5"
             id: str = "chatcmpl-test"
 
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
         return FakeResponseWithUsage(choices=text.choices, usage=usage)  # type: ignore[return-value]
 
     @pytest.mark.asyncio
@@ -3694,7 +3708,7 @@ class TestComposerMultipleToolCallsPerTurn:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [multi_call, text]
@@ -3751,7 +3765,7 @@ class TestDiscoveryCache:
         discovery = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
         final = _make_llm_response(content="Done.")
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=[discovery, final]),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[discovery, final]),
             patch.object(service_module, "build_messages", side_effect=capture_prompt),
             patch.object(tool_batch_module, "execute_tool", side_effect=capture_tool),
         ):
@@ -3785,7 +3799,7 @@ class TestDiscoveryCache:
         text = _make_llm_response(content="Found sources.")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
             mock_llm.side_effect = [disc1, disc2, text]
@@ -3839,7 +3853,7 @@ class TestDiscoveryCache:
             )
         responses.append(_make_llm_response(content="That plugin is unavailable."))
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload", wraps=cached_discovery_payload) as cache_payload,
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
@@ -3912,7 +3926,7 @@ class TestDiscoveryCache:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
@@ -3958,7 +3972,7 @@ class TestDiscoveryCache:
             _make_llm_response(content="This must never see malformed output."),
         ]
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", return_value=malformed),
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
             patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4000,7 +4014,7 @@ class TestDiscoveryCache:
         ]
         responses.append(_make_llm_response(content="The arguments were invalid."))
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
@@ -4039,7 +4053,7 @@ class TestDiscoveryCache:
         ]
         responses.append(_make_llm_response(content="This must never see corrupt cached output."))
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload", side_effect=corrupt_cache) as cache_payload,
             patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4069,7 +4083,7 @@ class TestDiscoveryCache:
         ]
         responses.append(_make_llm_response(content="Discovery was unavailable."))
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", side_effect=fail_discovery) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
@@ -4106,7 +4120,7 @@ class TestDiscoveryCache:
                 return admitted
 
             with (
-                patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+                patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
                 patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
                 patch.object(tool_batch_module, "admitted_result_from_cached_discovery_payload", side_effect=fail_hit_encoder),
                 patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4148,7 +4162,7 @@ class TestDiscoveryCache:
         )
         text = _make_llm_response(content="Got schemas.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [schema1, schema2, text]
             await service.compose("Get schemas", [], state, session_id=session_id)
 
@@ -4183,7 +4197,7 @@ class TestDiscoveryCache:
         )
         text = _make_llm_response(content="Done.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut1, mut2, text]
             result = await service.compose("Update metadata", [], state, session_id=session_id)
 
@@ -4280,7 +4294,7 @@ class TestComposeTimeout:
             await asyncio.sleep(1.0)
             return _make_llm_response(content="Too late.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = slow_llm
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Slow pipeline", [], state, session_id=session_id)
@@ -4557,7 +4571,7 @@ class TestComposeTimeout:
             raise TimeoutError
 
         with (
-            patch.object(service, "_call_llm", new=first_tool_then_timeout_llm),
+            patch.object(service._provider_gateway, "_call_llm", new=first_tool_then_timeout_llm),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_slow_mutation_tool,
@@ -4622,7 +4636,7 @@ class TestConvergenceProgressDispatch:
             ],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut1, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("loop forever", [], state, progress=record_progress, session_id=session_id)
@@ -4651,7 +4665,7 @@ class TestConvergenceProgressDispatch:
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("discover forever", [], state, progress=record_progress, session_id=session_id)
@@ -4679,7 +4693,7 @@ class TestConvergenceProgressDispatch:
             await asyncio.sleep(1.0)
             return _make_llm_response(content="Too late.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = slow_llm
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("slow pipeline", [], state, progress=record_progress, session_id=session_id)
@@ -4709,7 +4723,7 @@ class TestConvergenceProgressDispatch:
             async def record(event: ComposerProgressEvent) -> None:
                 events.append(event)
 
-            with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+            with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
                 mock_llm.side_effect = llm_side_effect
                 with contextlib.suppress(ComposerConvergenceError):
                     await service.compose("x", [], state, progress=record, session_id=session_id)
@@ -4788,7 +4802,7 @@ class TestPartialStatePreservation:
             ],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [mut, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Build pipeline", [], state, session_id=session_id)
@@ -4813,7 +4827,7 @@ class TestPartialStatePreservation:
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [disc1, disc2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Just looking", [], state, session_id=session_id)
@@ -4837,7 +4851,7 @@ class TestComposerSamplingConfig:
         state = _empty_state()
 
         # Single text-only response converges the loop immediately.
-        completion = _make_llm_response(content="acknowledged")
+        completion = _make_raw_llm_response(content="acknowledged")
 
         # Service may reject because no pipeline was built; we only
         # care about what reached LiteLLM on the first (and possibly only) call.
@@ -4861,14 +4875,14 @@ class TestComposerSamplingConfig:
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022")
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        completion = _make_llm_response(content="acknowledged")
+        completion = _make_raw_llm_response(content="acknowledged")
 
         with patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
-            await service._call_llm([{"role": "user", "content": "Hello"}], [])
+            await service._provider_gateway._call_llm([{"role": "user", "content": "Hello"}], [])
 
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
@@ -4880,14 +4894,14 @@ class TestComposerSamplingConfig:
         settings = _make_settings(composer_temperature=0.0, composer_seed=42)
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
 
-        completion = _make_llm_response(content="diagnostic text")
+        completion = _make_raw_llm_response(content="diagnostic text")
 
         with patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
-            await service._call_text_llm([{"role": "user", "content": "explain"}])
+            await service._provider_gateway._call_text_llm([{"role": "user", "content": "explain"}])
 
         assert mock_acomp.call_count == 1
         kwargs = mock_acomp.call_args_list[0].kwargs
@@ -4899,14 +4913,14 @@ class TestComposerSamplingConfig:
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022")
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        completion = _make_llm_response(content="diagnostic text")
+        completion = _make_raw_llm_response(content="diagnostic text")
 
         with patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=completion,
         ) as mock_acomp:
-            await service._call_text_llm([{"role": "user", "content": "explain"}])
+            await service._provider_gateway._call_text_llm([{"role": "user", "content": "explain"}])
 
         kwargs = mock_acomp.call_args_list[0].kwargs
         assert "temperature" not in kwargs
@@ -4929,12 +4943,11 @@ class TestEmptyChoicesValidation:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        # Patch the lazy LiteLLM wrapper (not _call_llm) so the validation
-        # inside _call_llm is exercised through the production code path.
+        # Patch the gateway transport so admission runs on the malformed raw response.
         empty_response = FakeLLMResponse(choices=[])
         with (
             patch(
-                "litellm.acompletion",
+                "elspeth.web.composer.provider_gateway._litellm_acompletion",
                 new_callable=AsyncMock,
                 return_value=empty_response,
             ),
@@ -4957,7 +4970,7 @@ class TestEmptyChoicesValidation:
         state = _empty_state()
 
         # First call: valid response with a mutation tool call
-        mutation_call = _make_llm_response(
+        mutation_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -4976,7 +4989,7 @@ class TestEmptyChoicesValidation:
 
         with (
             patch(
-                "litellm.acompletion",
+                "elspeth.web.composer.provider_gateway._litellm_acompletion",
                 new_callable=AsyncMock,
                 side_effect=[mutation_call, empty_response],
             ) as mock_acomp,
@@ -5005,7 +5018,7 @@ class TestComposerAvailabilityAndBadRequest:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             pytest.raises(ComposerServiceError, match="bad-model is unavailable"),
         ):
             mock_llm.return_value = _make_llm_response(content="unexpected")
@@ -5046,7 +5059,7 @@ class TestComposerAvailabilityAndBadRequest:
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
         from structlog.testing import capture_logs
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
@@ -5113,7 +5126,7 @@ class TestComposerAvailabilityAndBadRequest:
         """
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         catalog = _mock_catalog()
         settings = _make_settings()
@@ -5149,7 +5162,7 @@ class TestComposerAvailabilityAndBadRequest:
         """
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         catalog = _mock_catalog()
         settings = _make_settings()
@@ -5193,7 +5206,7 @@ class TestComposerAvailabilityAndBadRequest:
             model="openrouter/openai/gpt-5.5",
             llm_provider="openrouter",
         )
-        success = _make_llm_response(content="Recovered.")
+        success = _make_raw_llm_response(content="Recovered.")
 
         with (
             patch(
@@ -5217,7 +5230,7 @@ class TestComposerAvailabilityAndBadRequest:
         failure = ServiceUnavailableError(message="private upstream response", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
         with (
             patch(
-                "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_llm_response(content="Recovered.")]
+                "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_raw_llm_response(content="Recovered.")]
             ) as mock_llm,
             patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
@@ -5259,10 +5272,10 @@ class TestComposerAvailabilityAndBadRequest:
             raise failure
 
         if call_path == "ordinary":
-            monkeypatch.setattr(service, "_call_llm", fail_completion)
-            call = service._call_llm_with_audit([{"role": "user", "content": "Hello"}], [], timeout=5, recorder=recorder)
+            monkeypatch.setattr(service._provider_gateway, "_call_llm", fail_completion)
+            call = service._provider_gateway._call_llm_with_audit([{"role": "user", "content": "Hello"}], [], timeout=5, recorder=recorder)
         else:
-            monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", fail_completion)
+            monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", fail_completion)
             if call_path == "advisor":
                 call = service._call_advisor_with_audit(
                     {
@@ -5274,7 +5287,9 @@ class TestComposerAvailabilityAndBadRequest:
                     recorder=recorder,
                 )
             else:
-                call = service._call_text_llm_with_audit([{"role": "user", "content": "Explain this run"}], timeout=5, recorder=recorder)
+                call = service._provider_gateway._call_text_llm_with_audit(
+                    [{"role": "user", "content": "Explain this run"}], timeout=5, recorder=recorder
+                )
 
         with pytest.raises(LiteLLMTimeout):
             await call
@@ -5320,7 +5335,7 @@ class TestComposerAvailabilityAndBadRequest:
         """
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         catalog = _mock_catalog()
         settings = _make_settings()
@@ -5386,7 +5401,7 @@ class TestPluginBugCrashesFromToolExecution:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("invalid expression syntax — plugin bug"),
@@ -5424,7 +5439,7 @@ class TestPluginBugCrashesFromToolExecution:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=TypeError("NoneType + int — plugin bug"),
@@ -5461,7 +5476,7 @@ class TestPluginBugCrashesFromToolExecution:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "plugin bug"),
@@ -5541,7 +5556,7 @@ class TestPluginBugCrashesFromToolExecution:
             raise ValueError("plugin bug: crash AFTER first mutation")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_fake_execute_tool,
@@ -5584,7 +5599,7 @@ class TestPluginBugCrashesFromToolExecution:
         text = _make_llm_response(content="Got it, trying again.")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ToolArgumentError(
@@ -5676,7 +5691,7 @@ class TestPluginBugCrashesFromToolExecution:
         BaseException.__setattr__(leaky, "_tool_argument_error_sealed", False)
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
             mock_llm.side_effect = [tool_call, text]
@@ -5773,7 +5788,7 @@ class TestPluginCrashSessionPersistence:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug: /etc/secrets/bootstrap.key is bad"),
@@ -5867,7 +5882,7 @@ class TestPluginCrashSessionPersistence:
             raise ValueError("original plugin bug")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=fail_tool,
@@ -5955,7 +5970,7 @@ class TestPluginCrashSessionPersistence:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
@@ -6028,7 +6043,7 @@ class TestPluginCrashSessionPersistence:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("original plugin bug"),
@@ -6113,7 +6128,7 @@ class TestPluginCrashSessionPersistence:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
@@ -6185,7 +6200,7 @@ class TestPluginCrashSessionPersistence:
         )
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
@@ -6264,7 +6279,7 @@ class TestPluginCrashSessionPersistence:
             raise ValueError("plugin bug")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fail_tool),
             patch.object(authority, "mutate", wraps=authority.mutate) as mutation,
             capture_logs() as cap_logs,
@@ -6296,8 +6311,8 @@ class TestToolExecutionThreadOffloading:
 
     @staticmethod
     async def _assert_tool_runs_off_event_loop(
-        tool_call_response: FakeLLMResponse,
-        text_response: FakeLLMResponse,
+        tool_call_response: _AdmittedLLMCompletion,
+        text_response: _AdmittedLLMCompletion,
         user_message: str,
     ) -> None:
         """Shared helper: verify a tool call executes in a worker thread."""
@@ -6323,7 +6338,7 @@ class TestToolExecutionThreadOffloading:
             return _strict_execute_tool(_tool_name, _arguments, current_state, _catalog, **kwargs)
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_capture_thread,
@@ -6438,7 +6453,7 @@ class TestToolExecutionThreadOffloading:
         text = _make_llm_response(content="Done.")
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_blocking_tool,
@@ -6986,7 +7001,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         )
         text = _make_llm_response(content="Fixed.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
@@ -7065,7 +7080,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         )
         text = _make_llm_response(content="Fixed.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
@@ -7558,7 +7573,7 @@ class TestComposerRuntimePreflightFinalGate:
             ],
         )
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
             with patch.object(service, "_runtime_preflight", return_value=failed_preflight) as mock_preflight:
                 result = await service._finalize_no_tool_response(
@@ -9461,7 +9476,7 @@ class TestComposeLoopForcedRepair:
 
         empty = _empty_state()
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_stall, turn2_build, turn3_done]
@@ -9552,7 +9567,7 @@ class TestComposeLoopForcedRepair:
 
         empty = _empty_state()
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_refusal, turn2_build, turn3_done]
@@ -9632,7 +9647,7 @@ class TestComposeLoopForcedRepair:
 
         empty = _empty_state()
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2_done, turn3, turn4_done]
@@ -9710,7 +9725,7 @@ class TestComposeLoopForcedRepair:
 
         empty = _empty_state()
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
@@ -9773,7 +9788,7 @@ class TestComposeLoopForcedRepair:
 
         empty = _empty_state()
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
@@ -9864,7 +9879,7 @@ class TestComposeLoopForcedRepair:
         turn3_done = _make_llm_response(content="Repaired and ready.", tool_calls=None)
 
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done, turn2_repair, turn3_done]
@@ -9938,7 +9953,7 @@ class TestComposeLoopForcedRepair:
         turn1_done = _make_llm_response(content="All set.", tool_calls=None)
 
         with (
-            patch.object(self.service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done]

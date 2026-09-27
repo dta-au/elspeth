@@ -17,7 +17,7 @@ import asyncio
 
 import pytest
 
-from elspeth.web.composer.service import (
+from elspeth.web.composer.provider_gateway import (
     _apply_openrouter_usage_accounting,
     _litellm_acompletion,
 )

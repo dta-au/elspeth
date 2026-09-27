@@ -22,8 +22,10 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
@@ -110,26 +112,28 @@ def _make_settings() -> WebSettings:
     )
 
 
-def _make_response_with_tool(tool_id: str, tool_name: str, args: dict[str, Any]) -> _FakeLLMResponse:
-    return _FakeLLMResponse(
-        choices=[
-            _FakeChoice(
-                message=_FakeMessage(
-                    content=None,
-                    tool_calls=[
-                        _FakeToolCall(
-                            id=tool_id,
-                            function=_FakeFunction(name=tool_name, arguments=json.dumps(args)),
-                        )
-                    ],
+def _make_response_with_tool(tool_id: str, tool_name: str, args: dict[str, Any]) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=tool_id,
+                                function=_FakeFunction(name=tool_name, arguments=json.dumps(args)),
+                            )
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _make_text_only_response(content: str) -> _FakeLLMResponse:
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
+def _make_text_only_response(content: str) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))]))
 
 
 @pytest.fixture(autouse=True)
@@ -156,7 +160,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
 
     identical_args = {"patch": {"name": "Anchored Build"}}
 
-    def turn_with_failure(call_id: str) -> _FakeLLMResponse:
+    def turn_with_failure(call_id: str) -> _AdmittedLLMCompletion:
         return _make_response_with_tool(call_id, "set_metadata", identical_args)
 
     turns = [
@@ -169,7 +173,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -215,7 +219,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
     arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
     call_count = 0
 
-    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _FakeLLMResponse:
+    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _AdmittedLLMCompletion:
         nonlocal call_count
         call_count += 1
         if call_count <= 3:
@@ -255,7 +259,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         return _make_text_only_response("The durable hint changed my next action.")
 
     with (
-        patch.object(service, "_call_llm", side_effect=respond),
+        patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -330,7 +334,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
     identical_args = {"patch": {"name": canary}}
     call_count = 0
 
-    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _FakeLLMResponse:
+    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _AdmittedLLMCompletion:
         nonlocal call_count
         call_count += 1
         if call_count <= 3:
@@ -344,10 +348,10 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
             return _make_text_only_response(f"The prior value was {canary}.")
         return _make_text_only_response("The validator named patch.name; the structural mismatch is its expected shape.")
 
-    mock_llm = AsyncMock(spec=service._call_llm, side_effect=respond)
+    mock_llm = AsyncMock(spec=service._provider_gateway._call_llm, side_effect=respond)
     arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
     with (
-        patch.object(service, "_call_llm", mock_llm),
+        patch.object(service._provider_gateway, "_call_llm", mock_llm),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -384,7 +388,7 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
     arg_error = ToolArgumentError(argument="patch", expected="valid metadata patch", actual_type="dict")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -463,7 +467,7 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
     # path was already gated above; this test verifies the dispatch path
     # gate too.)
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=dispatch_with_mutation_failures) as mock_execute,
     ):
         mock_llm.side_effect = turns
@@ -532,7 +536,7 @@ async def test_mutation_success_breaks_anchor() -> None:
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, mutation_success, arg_error, arg_error],
@@ -564,7 +568,7 @@ async def test_two_identical_failures_do_not_inject_hint() -> None:
     arg_error = ToolArgumentError(argument="patch", expected="x", actual_type="dict")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error],

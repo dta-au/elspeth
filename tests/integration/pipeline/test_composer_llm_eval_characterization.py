@@ -37,7 +37,9 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
@@ -124,10 +126,10 @@ class FakeLLMResponse:
 class _ReplayLLM:
     """Callable fake LLM for CL-PP compose-loop characterization cases."""
 
-    def __init__(self, responses: tuple[FakeLLMResponse, ...]) -> None:
+    def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: Any, _tools: Any) -> FakeLLMResponse:
+    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
         if not self._responses:
             return _make_llm_response(content="Done.")
         return self._responses.pop(0)
@@ -179,7 +181,7 @@ def _trained_operator_catalog() -> PolicyCatalogView:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[FakeToolCall] | None = None
     if tool_calls is not None:
         fake_tool_calls = [
@@ -192,7 +194,8 @@ def _make_llm_response(
             )
             for tool_call in tool_calls
         ]
-    return FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    response = FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    return _admit_composer_llm_completion(response)
 
 
 def _empty_state() -> CompositionState:
@@ -1153,12 +1156,12 @@ async def _failed_progress_for_timeout(tmp_path: Path, monkeypatch: pytest.Monke
     async def record_progress(event: ComposerProgressEvent) -> None:
         events.append(event)
 
-    async def slow_llm(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+    async def slow_llm(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
         del args, kwargs
         await asyncio.sleep(1.0)
         return _make_llm_response(content="too late")
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = slow_llm
         with pytest.raises(ComposerConvergenceError) as exc_info:
             await service.compose(
@@ -1211,7 +1214,7 @@ async def _failed_progress_for_composition_budget(tmp_path: Path, monkeypatch: p
         ]
     )
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = [mutation, bonus_mutation]
         with pytest.raises(ComposerConvergenceError) as exc_info:
             await service.compose(

@@ -43,6 +43,7 @@ from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, ge
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.guided._discovery import _assistant_tool_calls_message, _execute_discovery_call
@@ -87,9 +88,9 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
 from elspeth.web.composer.provider_errors import ProviderFailure, classify_provider_failure
+from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
-from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.composer.state import CompositionState, NodeType
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
@@ -3184,7 +3185,7 @@ async def _bounded_acompletion(kwargs: dict[str, Any], timeout_seconds: float) -
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be a finite positive number")
     try:
-        return await asyncio.wait_for(_litellm_acompletion(**kwargs), timeout=timeout_seconds)
+        return await asyncio.wait_for(provider_gateway._litellm_acompletion(**kwargs), timeout=timeout_seconds)
     except httpx.TransportError as exc:
         raise GuidedProviderTransportError("Guided provider transport failed") from exc
 

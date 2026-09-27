@@ -54,11 +54,13 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerAvailability,
@@ -222,8 +224,8 @@ class _ScriptedLLM:
         self.messages.append(_messages)
         self.tools.append(_tools)
         if not self._responses:
-            return _fake_text_response("Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_text_response("Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 @dataclass(frozen=True)
@@ -4604,13 +4606,13 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Bounded review reply")
     recorded: list[BufferingRecorder] = []
-    original_audited_call = composer._call_llm_with_audit
+    original_audited_call = composer._provider_gateway._call_llm_with_audit
 
     async def capture_audit(*args: Any, **kwargs: Any) -> Any:
         recorded.append(kwargs["recorder"])
         return await original_audited_call(*args, **kwargs)
 
-    monkeypatch.setattr(composer, "_call_llm_with_audit", capture_audit)
+    monkeypatch.setattr(composer._provider_gateway, "_call_llm_with_audit", capture_audit)
     if mode == "expired":
         original_classify = composer._classify_and_budget_turn
 
@@ -4654,8 +4656,10 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
         if mode == "cancel":
             raise asyncio.CancelledError
         if mode == "tools":
-            return _fake_response_with_tool_call(tool_call_id="forbidden", tool_name="set_pipeline", arguments={})
-        return _fake_text_response("A fork preserves both answers." if mode == "text" else "  ")
+            return _admit_composer_llm_completion(
+                _fake_response_with_tool_call(tool_call_id="forbidden", tool_name="set_pipeline", arguments={})
+            )
+        return _admit_composer_llm_completion(_fake_text_response("A fork preserves both answers." if mode == "text" else "  "))
 
     if mode == "cancel":
         with pytest.raises(asyncio.CancelledError):
@@ -4695,8 +4699,6 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
 
     import litellm
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
-
-    from elspeth.web.composer import service as service_module
 
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Portable reply history")
@@ -4739,7 +4741,7 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
 
     async def installed_adapter_completion(**kwargs: Any) -> Any:
         if "tools" in kwargs:
-            return await scripted(kwargs["messages"], kwargs["tools"])
+            return scripted._responses.pop(0)
         reply_wire.extend(deepcopy(kwargs["messages"]))
         wire = adapter.transform_request(
             model=model,
@@ -4756,7 +4758,7 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
                 assert "toolResult" not in block
         return _fake_text_response("A fork keeps both persona answers.")
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", installed_adapter_completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", installed_adapter_completion)
     result = await composer._run_one_turn_for_test(session_id=str(session_id), message="Should we use a fork?")
     assert result.raw_assistant_content == "A fork keeps both persona answers."
     assert len(histories) == 2

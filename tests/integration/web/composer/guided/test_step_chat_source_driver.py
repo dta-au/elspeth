@@ -76,7 +76,7 @@ async def test_source_driver_retries_inline_json_control_advice_into_tool_call()
         return responses.pop(0)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_first_advises_missing_control_then_resolves,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -127,7 +127,7 @@ async def test_source_driver_includes_current_source_in_prompt() -> None:
         )
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_capture,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -216,7 +216,7 @@ async def test_source_driver_strips_echoed_server_owned_keys() -> None:
         )
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_echo_server_owned_keys,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -272,7 +272,7 @@ async def test_source_driver_captures_prose_reply_on_decline() -> None:
         return prose
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_decline_with_prose,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -316,7 +316,7 @@ async def test_source_driver_rejects_scaffold_leak_in_declined_prose() -> None:
 
     with (
         patch(
-            "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             new=_decline_with_scaffold_leak,
         ),
         pytest.raises(AssistantScaffoldLeakError, match="user-facing prose"),
@@ -360,7 +360,7 @@ async def test_source_driver_declines_prose_beside_hallucinated_tool_call() -> N
         return hallucinated
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_decline_with_hallucinated_tool_call,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -406,7 +406,7 @@ async def test_source_wrapper_classifies_empty_content_as_model_defect_not_unava
         return _fake_resolve_source_response(empty_content_args)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_empty_content,
     ):
         result = await resolve_step_1_source_chat_with_auto_drop(
@@ -440,7 +440,7 @@ async def test_source_driver_returns_both_none_on_empty_response() -> None:
         return empty
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_empty_response,
     ):
         outcome = await maybe_resolve_step_1_source_chat(
@@ -506,7 +506,7 @@ async def test_source_driver_repairs_omitted_plugin_on_unhinted_first_turn() -> 
         return responses.pop(0)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_omits_plugin_then_resolves,
     ):
         result = await resolve_step_1_source_chat_with_auto_drop(

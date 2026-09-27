@@ -41,6 +41,7 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationKind
@@ -66,7 +67,9 @@ _PLUGIN_SNAPSHOT = PluginAvailabilitySnapshot.for_trained_operator(_CATALOG)
 def _text_response(content: str) -> Any:
     from types import SimpleNamespace
 
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    )
 
 
 def _metadata_tool_response(call_id: str, name: str) -> Any:
@@ -76,7 +79,9 @@ def _metadata_tool_response(call_id: str, name: str) -> Any:
         id=call_id,
         function=SimpleNamespace(name="set_metadata", arguments=json.dumps({"patch": {"name": name}})),
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    )
 
 
 def _discovery_invocation(call_id: str) -> ComposerToolInvocation:

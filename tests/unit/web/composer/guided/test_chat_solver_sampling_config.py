@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided import chat_solver
 from elspeth.web.composer.guided.prompts import load_step_chat_skill
@@ -42,7 +43,7 @@ async def test_solve_step_chat_omits_sampling_when_none(monkeypatch: pytest.Monk
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     out = await chat_solver.solve_step_chat(
         model="gpt-5",
@@ -66,7 +67,7 @@ async def test_step_1_source_resolution_sends_configured_sampling(monkeypatch: p
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     result = await chat_solver.maybe_resolve_step_1_source_chat(
         model="gpt-4o",
@@ -94,7 +95,7 @@ async def test_solve_step_chat_marks_system_message_for_anthropic(monkeypatch: p
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="openrouter/anthropic/claude-sonnet-4-6",
@@ -122,7 +123,7 @@ async def test_solve_step_chat_no_marker_for_non_anthropic(monkeypatch: pytest.M
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="openrouter/openai/gpt-5.5",
@@ -149,7 +150,7 @@ async def test_step_1_source_splits_skill_head_and_marks_for_anthropic(monkeypat
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_1_source_chat(
         model="openrouter/anthropic/claude-sonnet-4-6",
@@ -190,7 +191,7 @@ async def test_step_1_source_no_marker_for_non_anthropic(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_1_source_chat(
         model="openrouter/openai/gpt-5.5",
@@ -223,7 +224,7 @@ async def test_solve_step_chat_audit_hash_matches_marked_wire_messages(monkeypat
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     recorder = BufferingRecorder()
     await chat_solver.solve_step_chat(

@@ -272,7 +272,7 @@ def test_openai_strict_set_pipeline_keeps_the_envelope_and_an_explicit_strict_fa
 
     Control: stamp every tool ``strict: true`` in ``wire_tool_definitions`` and this goes red.
     """
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     none_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_NONE)}
     strict_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_STRICT)}
@@ -288,7 +288,7 @@ def test_openai_strict_list_keeps_registry_order_and_cache_marker_placement() ->
     D8 means no production route carries both; this pins the function only.
     """
     from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
     from elspeth.web.composer.tools import get_tool_definitions
 
     tools = composer_loop_tool_definitions(_STRICT)

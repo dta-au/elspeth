@@ -10,10 +10,10 @@ import pytest
 
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerServiceImpl,
-    _admit_composer_llm_completion,
     _AdvisorCheckpointComposeDeadlineExpired,
 )
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult

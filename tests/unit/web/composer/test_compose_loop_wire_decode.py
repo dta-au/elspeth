@@ -29,7 +29,9 @@ from sqlalchemy import select
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.composer.tools import ToolResult
@@ -73,22 +75,26 @@ def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
 
 
-def _raw_response(*calls: tuple[str, str, str]) -> FakeLLMResponse:
+def _raw_response(*calls: tuple[str, str, str]) -> _AdmittedLLMCompletion:
     """One assistant turn whose tool calls carry already-encoded argument strings."""
-    return FakeLLMResponse(
-        choices=[
-            FakeChoice(
-                message=FakeMessage(
-                    content=None,
-                    tool_calls=[FakeToolCall(id=call_id, function=FakeFunction(name=name, arguments=raw)) for call_id, name, raw in calls],
+    return _admit_composer_llm_completion(
+        FakeLLMResponse(
+            choices=[
+                FakeChoice(
+                    message=FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            FakeToolCall(id=call_id, function=FakeFunction(name=name, arguments=raw)) for call_id, name, raw in calls
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _text_response(content: str = "Done.") -> FakeLLMResponse:
-    return FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=None))])
+def _text_response(content: str = "Done.") -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=None))]))
 
 
 def _persisted_assistant_entries(service: ComposerServiceImpl, session_id: str) -> dict[str, dict[str, Any]]:
@@ -122,7 +128,7 @@ class _Turn:
         assert service._planner_dialect is self.dialect
         responses = [_raw_response(*self.calls), _text_response()]
 
-        async def _llm(messages: Any, tools: Any) -> FakeLLMResponse:
+        async def _llm(messages: Any, tools: Any) -> _AdmittedLLMCompletion:
             self.sent_tool_lists.append(tools)
             return responses.pop(0) if responses else _text_response()
 
@@ -328,7 +334,7 @@ class TestPersistedP4RowCarriesTheFacts:
             affected_nodes=(),
         )
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=[

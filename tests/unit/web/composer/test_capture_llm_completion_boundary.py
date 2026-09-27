@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from elspeth.web.composer.service import (
+from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
 )

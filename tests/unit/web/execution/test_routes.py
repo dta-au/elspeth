@@ -1572,7 +1572,7 @@ class TestRunDiagnosticsEndpoint:
         from elspeth.web.composer.audit import BufferingRecorder
         from elspeth.web.composer.llm_response_parsing import build_llm_call_record
         from elspeth.web.composer.protocol import ComposerServiceError
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         session_id = uuid4()
@@ -2181,7 +2181,7 @@ class TestRunDiagnosticsEndpoint:
         """
         from fastapi import HTTPException
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         svc = _execution_service()
@@ -2271,7 +2271,7 @@ class TestRunDiagnosticsEndpoint:
         """
         from fastapi import HTTPException
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         svc = _execution_service()

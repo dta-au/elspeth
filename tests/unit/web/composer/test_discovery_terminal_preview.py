@@ -8,10 +8,9 @@ import pytest
 
 from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
-    _admit_composer_llm_completion,
-    _MalformedLLMResponseError,
     _tool_batch_ends_with_valid_current_preview,
 )
 from elspeth.web.composer.state import OutputSpec, SourceSpec, ValidationSummary
@@ -73,15 +72,17 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             if final_kind == "timeout":
                 raise TimeoutError
             if final_kind == "tools":
-                return _make_llm_response(
-                    tool_calls=[{"id": "forbidden", "name": "set_metadata", "arguments": {"patch": {"name": "must not apply"}}}]
+                return _admit_composer_llm_completion(
+                    _make_llm_response(
+                        tool_calls=[{"id": "forbidden", "name": "set_metadata", "arguments": {"patch": {"name": "must not apply"}}}]
+                    )
                 )
-        return next(replies)
+        return _admit_composer_llm_completion(next(replies))
 
     def preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
 
-    monkeypatch.setattr(service, "_call_llm", provider)
+    monkeypatch.setattr(service._provider_gateway, "_call_llm", provider)
     monkeypatch.setattr(service, "_runtime_preflight", preflight)
     monkeypatch.setattr(service, "_dispatch_tool_batch", dispatch)
 

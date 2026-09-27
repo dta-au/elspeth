@@ -25,6 +25,7 @@ from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, Charg
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination import chargeable_admission_authority
@@ -227,7 +228,7 @@ async def test_auto_title_cancellation_after_committed_admission_never_dispatche
         raise AssertionError("A cancelled admission must not dispatch the provider")
 
     monkeypatch.setattr(harness, "begin_provider_attempt", _delayed_result)
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", _provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _provider)
     task = asyncio.create_task(
         _auto_title.maybe_auto_title_session(
             service=harness,

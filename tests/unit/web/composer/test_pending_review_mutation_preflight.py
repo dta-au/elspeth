@@ -17,7 +17,8 @@ from elspeth.web.composer import service as service_module
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import ComposerServiceImpl, _admit_composer_llm_completion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot

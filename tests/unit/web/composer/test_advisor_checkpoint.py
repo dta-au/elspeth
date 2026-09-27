@@ -37,6 +37,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_context import _node_required_input_fields
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGatePassed, AdvisorSignoffGateFact
@@ -55,10 +56,10 @@ from elspeth.web.composer.no_tool_policy import (
     visible_message_segments,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerServiceImpl,
-    _MalformedLLMResponseError,
     admit_llm_provider_metadata,
 )
 from elspeth.web.composer.state import (
@@ -761,7 +762,6 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
     actionable hint. Applying that higher-priority instruction to deterministic
     checkpoints makes a correct pipeline structurally difficult to sign off.
     """
-    from elspeth.web.composer import service as composer_service
 
     captured: list[dict[str, Any]] = []
 
@@ -775,7 +775,7 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
         )
 
-    monkeypatch.setattr(composer_service, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     service = make_service()
     arguments = service._build_checkpoint_arguments(phase=phase, state=simple_state)
 
@@ -805,7 +805,6 @@ async def test_manual_advisor_hint_wire_retains_stuck_hint_contract(
     make_service,
 ) -> None:
     """Trigger-specific checkpoint wording must not weaken the manual tool."""
-    from elspeth.web.composer import service as composer_service
 
     captured: list[dict[str, Any]] = []
 
@@ -819,7 +818,7 @@ async def test_manual_advisor_hint_wire_retains_stuck_hint_contract(
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
         )
 
-    monkeypatch.setattr(composer_service, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     service = make_service()
     arguments = {
         "trigger": "proactive_security_safety",
@@ -2463,7 +2462,7 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
         finally:
             provider_cleanup_seen.set()
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", wait_until_cancelled)
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", wait_until_cancelled)
 
     verdict = await service._run_advisor_checkpoint(
         phase="end",

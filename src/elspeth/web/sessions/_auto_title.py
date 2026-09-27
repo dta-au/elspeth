@@ -40,9 +40,10 @@ from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.llm_response_parsing import safe_response_model, token_usage_from_response
 from elspeth.web.composer.provider_errors import classify_provider_failure
-from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
+from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
 
@@ -427,7 +428,7 @@ async def maybe_auto_title_session(
     response: object | None = None
     try:
         try:
-            response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
+            response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
         except httpx.TransportError as exc:
             raise _AutoTitleProviderTransportError("Auto-title provider transport failed") from exc
         admitted = _admit_auto_title_completion(response)

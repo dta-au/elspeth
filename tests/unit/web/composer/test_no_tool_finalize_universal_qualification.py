@@ -43,6 +43,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
@@ -237,8 +238,8 @@ class _ScriptedLLM:
 
     async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
         if not self._responses:
-            return _fake_text_response("Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_text_response("Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 class _RecordingAdvisor:

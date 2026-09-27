@@ -37,10 +37,10 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
-    composer_loop_tool_definitions,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
@@ -373,7 +373,7 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     advisor_response = _make_advisor_response()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -455,7 +455,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
     turns = [advisor_tool_call, _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -489,7 +489,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
         arguments["schema_excerpt"] = excerpt
     expected = build_advisor_user_message(arguments)
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
     ):
         mock_llm.side_effect = [
@@ -537,7 +537,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -654,7 +654,7 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     ]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -707,7 +707,7 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -765,7 +765,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     api_error = LiteLLMAPIError(status_code=500, message="upstream server error", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -826,7 +826,7 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
     api_error = LiteLLMAPIError(status_code=500, message="x", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -881,7 +881,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
     ]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -924,7 +924,7 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -967,7 +967,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
     initial_failures = tuple(tracker._failures)
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
@@ -1019,7 +1019,7 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     recorder = BufferingRecorder()
     with (
         patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
@@ -1081,7 +1081,7 @@ async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float
     }
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -1142,7 +1142,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1185,7 +1185,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     # BadRequest/APIError/MalformedResponse). Without a catch-all, status
     # stays None and the finally block skips record_llm_call.
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         patch(
             "litellm.acompletion",
@@ -1230,7 +1230,7 @@ async def test_transport_failure_still_degrades_into_structured_advisor_feedback
     turns = [_make_advisor_tool_call("call_transport"), _make_text_only_response("moving on")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1263,7 +1263,7 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1309,7 +1309,7 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1349,7 +1349,7 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
     api_error = LiteLLMAPIError(status_code=500, message="x", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1421,7 +1421,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
     turns = [bad_response, _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1456,7 +1456,7 @@ async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> No
         "user_message": secret_marker,
     }
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
     ):
         mock_llm.side_effect = [
@@ -1538,7 +1538,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
     turns = [huge_response, _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1609,7 +1609,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     turns = [overhead_response, _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "litellm.acompletion",
             new_callable=AsyncMock,
@@ -1642,7 +1642,7 @@ async def test_f1_skill_text_always_includes_advisor() -> None:
     state = _empty_state()
     turns = [_make_text_only_response("ok")]
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = turns
         await service.compose("hello", [], state, session_id=session_id)
 
@@ -1704,7 +1704,7 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     original = AuditIntegrityError("recorder could not seal the advisor call")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,

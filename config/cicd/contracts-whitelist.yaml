@@ -1000,19 +1000,19 @@ allowed_dict_patterns:
   # kwargs are LiteLLM's open-ended completion surface (``acompletion(**kwargs:
   # Any)``) — the same untyped external-library boundary as the entries above —
   # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
-  - "src/elspeth/web/composer/service.py:_apply_openrouter_app_identity:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_app_identity:kwargs"
   # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
   # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
   # kwargs dict as the entry above, for the same reason: it is LiteLLM's
   # untyped external-library completion surface, not a contract this
   # codebase owns the shape of.
-  - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_endpoint_kwargs:kwargs"
   # ``_apply_openrouter_usage_accounting`` pins OpenRouter's usage-accounting
   # opt-in (elspeth-190a5c4668) on the same open-ended LiteLLM ``acompletion``
   # kwargs dict as the two entries above, for the same reason: it is LiteLLM's
   # untyped external-library completion surface, not a contract this codebase
   # owns the shape of.
-  - "src/elspeth/web/composer/service.py:_apply_openrouter_usage_accounting:kwargs"
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_usage_accounting:kwargs"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
@@ -1102,19 +1102,19 @@ allowed_dict_patterns:
   # LiteLLM message shape; persisted history remains nominally typed.
   - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
-  - "src/elspeth/web/composer/service.py:composer_loop_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.
   # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
-  - "src/elspeth/web/composer/service.py:build_composer_loop_request_kwargs:return"
+  - "src/elspeth/web/composer/provider_gateway.py:build_composer_loop_request_kwargs:return"
   - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
   - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm:tools (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:tools (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:tools (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:tools (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:tools (list)"
   # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
   # payload; returns the admitted model or an owned AdvisorArgumentRejection.
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._validate_advisor_arguments:arguments"

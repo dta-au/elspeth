@@ -119,7 +119,7 @@ async def test_sink_loop_lists_sinks_then_resolves() -> None:
         captured_messages.append(kwargs["messages"])
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results as a jsonl file",
@@ -168,7 +168,7 @@ async def test_sink_loop_refuses_to_dispatch_mutation_tool() -> None:
         return responses.pop(0)
 
     with (
-        patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake),
         # ``execute_tool`` is dispatched from the shared ``_discovery`` helper
         # (``_execute_discovery_call``) after the discovery-loop primitives were
         # extracted there; spy at that seam, not at ``chat_solver``.
@@ -215,7 +215,7 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
         captured_messages.append(kwargs["messages"])
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save as jsonl",
@@ -267,7 +267,7 @@ async def test_sink_loop_schema_success_marks_the_session_tracker() -> None:
     async def _fake(**kwargs: Any) -> SimpleNamespace:
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save as jsonl",
@@ -334,7 +334,7 @@ async def test_sink_loop_schema_failure_never_marks_the_session_tracker() -> Non
     async def _fake(**kwargs: Any) -> SimpleNamespace:
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save as jsonl",
@@ -369,7 +369,7 @@ async def test_sink_loop_rejects_over_limit_batch_before_any_dispatch() -> None:
         return response
 
     with (
-        patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake),
         patch("elspeth.web.composer.guided._discovery.execute_tool", autospec=True) as execute_tool_spy,
         pytest.raises(GuidedToolArgumentShapeError, match="per-turn tool call limit"),
     ):
@@ -403,7 +403,7 @@ async def test_sink_loop_returns_none_at_iteration_cap() -> None:
         # Always ask for list_sinks again; never resolve.
         return _response(tool_calls=[_tool_call("loop", "list_sinks", {})])
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="keep looking",
@@ -446,7 +446,7 @@ async def test_sink_loop_malformed_discovery_args_classify_malformed_response() 
         return malformed
 
     with (
-        patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake),
         pytest.raises(GuidedSolverResponseShapeError),
     ):
         await maybe_resolve_step_2_sink_chat(
@@ -490,7 +490,7 @@ async def test_sink_loop_progress_events_advance_through_discovery_and_resolve()
     async def _capture_progress(event: Any) -> None:
         phases.append(event.phase)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results as a jsonl file",
@@ -527,7 +527,7 @@ async def test_sink_loop_progress_single_shot_resolve_emits_calling_model_only()
     async def _capture_progress(event: Any) -> None:
         phases.append(event.phase)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results as a jsonl file",
@@ -552,7 +552,7 @@ async def test_sink_loop_single_shot_when_no_catalog() -> None:
         captured.append(kwargs.get("tools", []))
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save as jsonl",
@@ -605,7 +605,7 @@ async def test_sink_resolve_invalid_plugin_config_feeds_back_and_repairs() -> No
         captured_messages.append(kwargs["messages"])
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results as a json file",
@@ -654,7 +654,7 @@ async def test_sink_resolve_unknown_plugin_feeds_back_and_repairs() -> None:
         captured_messages.append(kwargs["messages"])
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results",
@@ -686,7 +686,7 @@ async def test_sink_resolve_invalid_plugin_config_at_cap_returns_empty() -> None
     async def _fake(**kwargs: Any) -> SimpleNamespace:
         return responses.pop(0)
 
-    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+    with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake):
         result = await maybe_resolve_step_2_sink_chat(
             model="m",
             user_message="save the results as a json file",

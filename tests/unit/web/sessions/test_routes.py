@@ -54,6 +54,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.resolved import SourceResolved
@@ -1054,12 +1055,10 @@ def test_send_message_response_includes_empty_proposals_array(tmp_path) -> None:
 def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import httpx
 
-    from elspeth.web.sessions import _auto_title
-
     async def title_provider_failure(**_kwargs: object) -> object:
         raise httpx.ConnectError("private upstream response body")
 
-    monkeypatch.setattr(_auto_title, "_litellm_acompletion", title_provider_failure)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", title_provider_failure)
     app, _service = _make_app(tmp_path)
     # Auto-title and compose use independent workers. A single StaticPool
     # connection cannot model their overlapping SQLite transactions.
@@ -7028,7 +7027,7 @@ class TestLiteLLMErrorRedaction:
         assert usage[0].prompt_tokens is None and usage[0].completion_tokens is None
 
     def _make_bad_request_error(self) -> Exception:
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         return _BadRequestLLMError(
             "LLM request rejected (BadRequestError)",
@@ -7238,7 +7237,7 @@ class TestLiteLLMErrorRedaction:
         prefer ``exc.provider_detail`` / ``exc.provider_status_code``. Without
         this branch the attributes were dead infrastructure.
         """
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
         from elspeth.web.sessions.routes import _litellm_error_detail
 
         exc = _BadRequestLLMError(
@@ -7260,7 +7259,7 @@ class TestLiteLLMErrorRedaction:
 
     def test_bad_request_llm_error_attributes_scrubbed_for_secrets(self) -> None:
         """Provider text from _BadRequestLLMError must pass through the scrubber too."""
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
         from elspeth.web.sessions.routes import _litellm_error_detail
 
         secret = "sk-or-v1-abcdefghijklmnopqrstuvwxyz123456"  # secret-scan: allow-this-line
@@ -7292,7 +7291,7 @@ class TestLiteLLMErrorRedaction:
 
     def test_bad_request_llm_error_without_detail_yields_no_provider_fields(self) -> None:
         """When the carrier has no provider text, omit the optional fields rather than fabricating."""
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
         from elspeth.web.sessions.routes import _litellm_error_detail
 
         exc = _BadRequestLLMError("LLM request rejected (BadRequestError)")

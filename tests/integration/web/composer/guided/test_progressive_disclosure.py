@@ -355,7 +355,7 @@ class TestFirstFreeformTurnAfterExit:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _send_message(composer_freeform_client, session_id, "what can you do?")
@@ -392,7 +392,7 @@ class TestSecondFreeformTurnAfterTransition:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             # First freeform turn — should use transition prompt
@@ -403,7 +403,7 @@ class TestSecondFreeformTurnAfterTransition:
         assert gs_dict.get("transition_consumed") is True, f"transition_consumed not set to True after first turn. GuidedSession: {gs_dict}"
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             # Second freeform turn — must NOT use transition prompt
@@ -442,7 +442,7 @@ class TestSecondFreeformTurnAfterTransition:
             return _fake_chat_response("durable transition response")
 
         _inject_one_assistant_insert_failure(composer_freeform_client, monkeypatch)
-        with patch("elspeth.web.composer.service._litellm_acompletion", side_effect=_fake_acompletion):
+        with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake_acompletion):
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
                 composer_freeform_client.post(
                     f"/api/sessions/{session_id}/messages",
@@ -476,7 +476,7 @@ class TestTransitionPromptAfterCompletedTerminal:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _send_message(composer_freeform_client, session_id, "actually change the sink to CSV")
@@ -521,7 +521,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _recompose(composer_freeform_client, session_id)
@@ -552,7 +552,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             body = _recompose(composer_freeform_client, session_id)
@@ -579,7 +579,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _recompose(composer_freeform_client, session_id)
@@ -612,7 +612,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response("durable recompose transition")
 
         _inject_one_assistant_insert_failure(composer_freeform_client, monkeypatch)
-        with patch("elspeth.web.composer.service._litellm_acompletion", side_effect=_fake_acompletion):
+        with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake_acompletion):
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
                 composer_freeform_client.post(
                     f"/api/sessions/{session_id}/recompose",

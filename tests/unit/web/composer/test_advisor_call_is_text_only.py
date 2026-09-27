@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import elspeth.web.composer.service as svc
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 
@@ -40,7 +40,7 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         choice = type("Choice", (), {"message": message})()
         return type("Response", (), {"choices": [choice]})()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     return captured
 
 
