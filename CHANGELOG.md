@@ -590,7 +590,14 @@ drained and repair this release forward.
   still ends the run at ingest, but the failure (the source operation's error
   and the printed traceback) no longer is that integer: it names the row
   index, a declared field and the error type, as the transform, aggregation
-  and collector seams already did.
+  and collector seams already did. Sinks follow the same rule: `dataverse`
+  no longer prints the row's alternate-key or lookup value when it refuses a
+  duplicate, blank or non-string key or an unsafe `@odata.bind` reference
+  (it names the field, the failure and, for a duplicate, the two member
+  ordinals), and the `csv`, `json` and `azure_blob` sinks' encoding and
+  serialization diversion reasons carry the exception class instead of the
+  codec's text, which quoted the character it could not encode (`CSV
+  encoding (ascii) failed: UnicodeEncodeError`) or the non-finite float.
 
 ### Newly refused configurations
 

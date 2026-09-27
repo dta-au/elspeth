@@ -283,7 +283,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aade9b9e9425a491"
+    source_file_hash: str | None = "sha256:934b0bdb38c02efa"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -458,8 +458,10 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
                     # producing an ambiguous/injectable outbound payload.
                     bind_value = str(value)
                     if not _SAFE_LOOKUP_BIND_VALUE.match(bind_value):
+                        # Value-free: the value is the row's reference data;
+                        # the reason names the field, the target and the rule.
                         raise ValueError(
-                            f"lookup field {pipeline_field!r} value {value!r} is "
+                            f"lookup field {pipeline_field!r} (type {type(value).__name__}) is "
                             f"not a valid record reference for @odata.bind to "
                             f"entity {lookup.target_entity!r}: only alphanumerics "
                             f"and hyphens are allowed (e.g. a record GUID). Values "
@@ -489,7 +491,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
     ) -> tuple[ArtifactDescriptor, str, str, tuple[dict[str, object], ...]]:
         payloads: list[dict[str, object]] = []
         member_bindings: list[dict[str, object]] = []
-        seen_keys: set[str] = set()
+        first_ordinal_by_key: dict[str, int] = {}
         if self._alternate_key_pipeline_field is None:  # pragma: no cover - config validator establishes it
             raise FrameworkBugError("Dataverse alternate-key pipeline field was not resolved")
         for member in effect_input.members:
@@ -497,14 +499,26 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
             if not isinstance(row, dict):  # pragma: no cover - member contract guarantees a mapping
                 raise FrameworkBugError("Dataverse effect member row is not an object")
             key_value = row[self._alternate_key_pipeline_field]
-            if not isinstance(key_value, str) or not key_value.strip():
+            # Value-free reasons: the alternate key is the row's business key
+            # (an email in the plugin's own example), so each reason names the
+            # field, the failure kind and member ordinals — never the value.
+            if not isinstance(key_value, str):
                 raise ValueError(
-                    f"alternate_key field '{self._alternate_key_pipeline_field}' has empty or non-string value "
-                    f"{key_value!r} — cannot construct PATCH URL for entity '{self._entity}'"
+                    f"alternate_key field '{self._alternate_key_pipeline_field}' has a non-string value "
+                    f"(type {type(key_value).__name__}) — cannot construct PATCH URL for entity '{self._entity}'"
                 )
-            if key_value in seen_keys:
-                raise ValueError(f"Dataverse effect members require unique alternate-key values; duplicate {key_value!r}")
-            seen_keys.add(key_value)
+            if not key_value.strip():
+                raise ValueError(
+                    f"alternate_key field '{self._alternate_key_pipeline_field}' is empty or whitespace-only "
+                    f"— cannot construct PATCH URL for entity '{self._entity}'"
+                )
+            if key_value in first_ordinal_by_key:
+                raise ValueError(
+                    f"Dataverse effect members require unique alternate-key values: members "
+                    f"{first_ordinal_by_key[key_value]} and {member.ordinal} carry the same "
+                    f"'{self._alternate_key_pipeline_field}' value"
+                )
+            first_ordinal_by_key[key_value] = member.ordinal
             payload = self._map_row(row)
             payloads.append(payload)
             member_bindings.append(

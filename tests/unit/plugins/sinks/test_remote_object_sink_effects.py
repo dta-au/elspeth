@@ -705,6 +705,40 @@ def test_azure_effect_diverts_fixed_schema_extra_and_publishes_good_rows() -> No
     assert reconciled.diverted_ordinals is None
 
 
+@pytest.mark.parametrize(
+    ("factory", "expected_reason"),
+    [
+        (_azure, "CSV encoding (ascii) failed: UnicodeEncodeError"),
+        (_s3, "CSV record could not be encoded safely"),
+    ],
+    ids=["azure_blob", "aws_s3"],
+)
+def test_remote_csv_encoding_diversion_reason_is_value_free(factory: Any, expected_reason: str) -> None:
+    """The recorded diversion reason names the codec and failure kind, never a fragment of the value.
+
+    ``UnicodeEncodeError``'s own text quotes the character it could not
+    encode ("can't encode character '\\xe9' in position 9"), a piece of the
+    row's value; the reason must not carry it.
+    """
+    store = _AzureStore() if factory is _azure else _S3Store()
+    good = _member(0, {"id": 1, "name": "Ada"})
+    bad = _member(1, {"id": 2, "name": "SNTL_RMT_é_7731"})
+    options: dict[str, object] = {"format": "csv", "schema": {"mode": "fixed", "fields": ["id: int", "name: str"]}}
+    if factory is _azure:
+        options.update(blob_path="out.csv", csv_options={"encoding": "ascii"})
+    else:
+        options.update(key="out.csv", csv_options={"encoding": "ascii"})
+    sink = factory(store, **options)
+
+    plan = _prepare(sink, effect_id="5" * 64, current=(good, bad), target_snapshot=(good, bad))
+
+    assert plan.safe_evidence["diverted_ordinals"] == (1,)
+    reason = sink._get_diversions()[0].reason
+    assert reason == expected_reason
+    for fragment in ("SNTL_RMT", "é", "\\xe9", "position"):
+        assert fragment not in reason
+
+
 def test_s3_csv_effect_applies_display_headers_before_serialization() -> None:
     """Custom display headers must not reject rows keyed by pipeline names (elspeth-3718ff4c28)."""
     store = _S3Store()

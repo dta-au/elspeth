@@ -167,7 +167,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2629742182442969"
+    source_file_hash: str | None = "sha256:9ef547005076060e"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -474,18 +474,22 @@ class JSONSink(BaseSink):
                 try:
                     serialized = json.dumps(output, indent=self._indent if self._format == "json" else None, allow_nan=False)
                     serialized.encode(self._encoding)
-                except UnicodeEncodeError as exc:
-                    reason = f"JSON encoding ({self._encoding}) failed: {exc}"
+                except UnicodeEncodeError:
+                    # Value-free: the codec's own text quotes the character it
+                    # could not encode, a fragment of the row's value.
+                    reason = f"JSON encoding ({self._encoding}) failed: UnicodeEncodeError"
                     if current_member is None:
-                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from exc
+                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from None
                     self._divert_row(original, row_index=current_member.ordinal, reason=reason)
                     diverted.append(current_member.ordinal)
                     diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))
                     continue
                 except (ValueError, TypeError) as exc:
-                    reason = f"JSON serialization failed: {exc}"
+                    # Class only: json's ValueError text quotes a non-finite
+                    # float of the row ("... not JSON compliant: nan").
+                    reason = f"JSON serialization failed: {type(exc).__name__}"
                     if current_member is None:
-                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from exc
+                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from None
                     self._divert_row(original, row_index=current_member.ordinal, reason=reason)
                     diverted.append(current_member.ordinal)
                     diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))

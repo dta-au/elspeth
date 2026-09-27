@@ -889,7 +889,21 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # The same round moved reference_join 46245d6f287224d6 -> 6aa4025393448c89 (it
 # tells a sparse miss from a broken expression by the evaluator's ``kind``, the
 # chained cause being gone) with no manifest pin; no digest moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "1908eb05ace692750621092999fefa7693ecc58f7af6a22d1218fa1ea1ad7855"
+# Rotated 2026-09-28 (elspeth-5887fb7928, C3 value-free reasons, review r3 +
+# sink census): a PLUGIN PROVENANCE rotation. json_sink's encode/serialize
+# diversion reasons carry the exception class, never the codec's text (which
+# quotes the row's character), so its source_file_hash moved
+# 2629742182442969 -> 9ef547005076060e (scripts/cicd/plugin_hash). Order:
+# (1) the manifest's 15 literal pins; (2) reopen-resume's
+# resumed_full_projection_sha256 3c03ee77... -> cab4aab8..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — with ONLY the json_sink pin (code and manifest) set back to
+# 2629742182442969 the reopen/checkpoint production-path and oracle-freeze
+# cases pass 23/23, so the move is the pin literal alone; (3) this digest
+# 1908eb05... -> a3b8a299.... csv_sink cb4119567e0d1b1c, dataverse
+# 934b0bdb38c02efa and azure_blob 0719093e3ea19a79 moved in the same round
+# with no manifest pin. No oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "a3b8a299590210012d4afa4a86cb891b719c636f80af17a2ae3788193fb387d4"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

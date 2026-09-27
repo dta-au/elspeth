@@ -57,15 +57,25 @@ class TestAzureBlobSinkNonFiniteRejection:
             )
         )
 
+    # The rejection is value-free: json's own text ("... not JSON compliant: nan")
+    # quotes the row's float, so the error carries the class name only and no cause.
     @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "neg_inf"])
     def test_serialize_json_rejects_non_finite(self, sink, bad_value: float) -> None:
-        with pytest.raises(ValueError, match="Out of range float values"):
+        from elspeth.plugins.sinks.azure_blob_sink import AzureBlobRecordSerializationError
+
+        with pytest.raises(AzureBlobRecordSerializationError) as excinfo:
             sink._serialize_json([{"id": 1, "value": bad_value}])
+        assert str(excinfo.value) == "ValueError"
+        assert excinfo.value.__cause__ is None
 
     @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "neg_inf"])
     def test_serialize_jsonl_rejects_non_finite(self, sink, bad_value: float) -> None:
-        with pytest.raises(ValueError, match="Out of range float values"):
+        from elspeth.plugins.sinks.azure_blob_sink import AzureBlobRecordSerializationError
+
+        with pytest.raises(AzureBlobRecordSerializationError) as excinfo:
             sink._serialize_jsonl([{"id": 1, "value": bad_value}])
+        assert str(excinfo.value) == "ValueError"
+        assert excinfo.value.__cause__ is None
 
     def test_serialize_json_accepts_finite_floats(self, sink) -> None:
         result = sink._serialize_json([{"id": 1, "value": 3.14}])
