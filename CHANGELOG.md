@@ -256,8 +256,10 @@ drained and repair this release forward.
   composer and run start) now refuses, for an LLM prompt, a query's
   `row.source_row` and a RAG `query_template`, and under `required_input_fields:
   []` too, a call on a row field (`row.keys()`, `row.items()`,
-  `row['keys']()`, `row.note()`, `dict(row).note()`, and calling what
-  `row.get('note')` returns), `row.get` without a call, and the reserved
+  `row['keys']()`, `row.note()`, `dict(row).note()`, calling an element of
+  the row such as `(row | first)()`, and calling what `row.get('note')`
+  returns, also when its default is a row field, `row.get('note', row.id)()`),
+  `row.get` without a call, and the reserved
   names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
   through `row | attr('contract')`). Before, under `[]` these validated and
   failed every row (`row.keys()`, `row.to_dict()`, `row.contract`), or sent a
@@ -266,19 +268,22 @@ drained and repair this release forward.
   read a column named `contract` while the same text was refused under a
   list. The refusal names the replacement (`row | list`, `row | items`,
   `row | dictsort`, `dict(row)`, `row['contract']`) and never suggests `[]`.
-  A method on a value built from the whole row is that value's own and still
-  validates: `dict(row).items()`, `(row | list).count('note')`,
-  `(row | tojson).upper()`, through a `set`, `with`, loop or macro argument too.
+  A method on a value built from the whole row is that value's own, not a row
+  call: `dict(row).items()`, `(row | list).count('note')`,
+  `(row | tojson).upper()`, through a `set`, `with`, loop or macro argument too,
+  validate under `required_input_fields: []` in an LLM prompt and a RAG
+  `query_template`. Under a declared list the field check still reads the
+  method name as a field (`dict(row).items` reads `items`) and refuses it
+  unless declared, and a multi-query template refuses these under every
+  declaration.
   At render, a reserved name the check cannot follow fails the row with the
   value-free reason `Reserved row name: ...`, and a missing field's reason
   names "the row" instead of an internal class. A whole row used as a value is
   the mapping it holds: `{{ row }}` and every string filter print the declared
   fields, and `row | tojson` (also over a nested value such as
   `row.meta | tojson`), `row | last`, `row | urlencode` and `row | pprint`
-  work, where each failed every row or printed an object repr. `row | reverse`
-  now returns a lazy iterator, as it does for a dict, so print it as
-  `row | reverse | list` (printed bare it shows the iterator's repr, which it
-  did not before). With the
+  work, where each failed every row or printed an object repr;
+  `row | reverse` is still the list of field names in reverse order. With the
   declaration omitted, a single-query prompt that uses `row` as a whole
   (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
   empty row. A multi-query `input_fields` variable named `source_row` or like

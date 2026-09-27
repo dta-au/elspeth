@@ -96,7 +96,8 @@ over the projected view (`row | list`, `row | items`, `row | dictsort`,
 PipelineRow names (`RETIRED_ROW_API_NAMES`: `contract`, `to_dict`,
 `to_checkpoint_format`) are reserved in attribute form; their columns are read
 by item. Configuration refuses the row used as an object — a reserved name, a
-call on a row field (including calling what `row.get(...)` returns), `row.get`
+call on a row field (including calling an element of the row, `(row | first)()`,
+or what `row.get(...)` returns), `row.get`
 without a call — under **every** declaration,
 `[]` included, on the prompt's `row`, a query's `row` and `row.source_row`,
 and a RAG `row`, and never suggests `[]` as its remedy: no declaration makes

@@ -1223,10 +1223,11 @@ Within that:
   `row | items`, `row | tojson`, `dict(row)` and `**row` see the declared
   fields the row carries, and so does every other builtin filter applied to
   the row: it sees the same mapping `dict(row)` holds.
-- `{{ row }}` prints that mapping, e.g. `{'note': 'first', 'amount_usd': 5}`.
-  A filter that returns a lazy sequence (`row | reverse`, `row | items`,
-  `row | map(...)`) prints its iterator, as it does for any value: end it
-  with `| list` to print the elements.
+- `{{ row }}` prints that mapping, e.g. `{'note': 'first', 'amount_usd': 5}`,
+  and `row | reverse` the list of field names in reverse order. A filter that
+  returns a lazy sequence (`row | items`, `row | map(...)`) prints its
+  iterator, as it does for any value: end it with `| list` to print the
+  elements.
 
 `row` has fields and one method, `get`. Every other attribute or item lookup
 on `row` reads a field of that name: `row.keys` and `row.items` are fields,
@@ -1263,16 +1264,21 @@ opts out of these checks, and the template then sees the whole row.
 Configuration also refuses a template that uses its row as an object, under
 every declaration, `[]` included, because no declaration makes it work: a
 call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
-`row.note()`, and calling what `row.get('note')` returns, `row.get('note')()`),
+`row.note()`, calling an element of the row, `(row | first)()`, and calling
+what `row.get('note')` returns, `row.get('note')()`, also when its default is
+a row field, `row.get('note', row.id)()`),
 `row.get` without a call (`{{ row.get }}`,
 `{% set g = row.get %}`), and a reserved name in attribute form
 (`row.contract`, `row.to_dict()`, `row | attr('contract')`). A method on a
 value is not a row call: a field's value has its own methods
 (`row.note.upper()`), and so does a value a builtin or a filter builds from
 the whole row (`dict(row).items()`, `(row | list).count('note')`,
-`(row | tojson).upper()`). On a dict built from the row, a name that is not a
-dict method reads a field, so `dict(row).note()` is refused like
-`row.note()`. At render, a
+`(row | tojson).upper()`), which validates under `required_input_fields: []`.
+Under a declared list the field check reads that method name as a field
+(`dict(row).items` reads `items`) and refuses it unless it is declared, and a
+multi-query template refuses these under every declaration. On a dict built
+from the row, a name that is not a dict method reads a field, so
+`dict(row).note()` is refused like `row.note()`. At render, a
 reserved name the configuration check cannot follow fails the row with
 `template_rendering_failed` (`Reserved row name: ...`). With
 `required_input_fields` omitted, a single-query template that uses `row` as a
