@@ -279,8 +279,10 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 #      MAY EXCEED live. Four ways to get there: the key was evicted from the
 #      bounded completed-key FIFO and is rediscovered through the Landscape
 #      fallback; the coalesce end-of-input ``flush_pending`` cleared the set
-#      (with the completed keys) and the flush loop's next intake pass
-#      adopted the straggler; a row_union straggler closes the group through
+#      (with the completed keys) before the straggler arrived — the executor
+#      assumes nothing follows a flush, but leader_drain's flush loop runs
+#      intake again after one, so the loop does not enforce that; a row_union
+#      straggler closes the group through
 #      accept()'s durable ``has_group_loss`` fallback (a loss recorded by
 #      another worker and not yet replayed here); or the zero-arrival failure
 #      was recorded in another process — before a resume, or by the leader a
