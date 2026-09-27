@@ -3,9 +3,8 @@ by the capability-manifest SCHEMA-IDENTITY gate, not by graph isomorphism.
 
 Why these controls exist (the false-green trap they defend against)
 -------------------------------------------------------------------
-The generated-DAG and fixture-matrix parity tests prove that three authoring
-surfaces derive the *same committed graph* by comparing each surface's committed
-``CompositionState`` to a shared reference with ``assert_isomorphic``. That proof
+The fixture-matrix tests compare the committed freeform ``CompositionState``
+to a reference with ``assert_isomorphic``. That proof
 has an explicit blind spot: the committed graph is a function of the pipeline
 the LLM *emits*, not of the schema the planner *advertises* to
 the LLM in the ``emit_pipeline_proposal`` terminal tool. Under this suite's
@@ -76,7 +75,6 @@ from elspeth.web.composer.capability_skill import (
     load_pipeline_capability_core,
 )
 from elspeth.web.composer.pipeline_planner import planner_tool_definitions
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 
 from .conftest import PARITY_FIXTURES, ParityEnv, _empty_state
@@ -175,10 +173,8 @@ def _advertised_pipeline(tools: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _build_manifest(tools: list[dict[str, Any]]) -> Any:
-    """Run the real gate for the freeform surface against the genuine canonical schema."""
+    """Run the real gate against the genuine canonical schema."""
     return build_planner_capability_manifest(
-        surface=PlannerSurface.FREEFORM,
-        profile="ordinary",
         messages=_planner_messages(),
         tools=tools,
         canonical_schema=canonical_set_pipeline_schema(),

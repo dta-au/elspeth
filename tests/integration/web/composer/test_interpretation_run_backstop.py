@@ -97,9 +97,7 @@ def _composer(tmp_path: Path, sessions_service: SessionServiceImpl) -> ComposerS
     catalog.list_sources.return_value = []
     catalog.list_transforms.return_value = []
     catalog.list_sinks.return_value = []
-    # F22 (same class as F1): WebSettings requires these four composer
-    # fields; omitting them raises a 4-error pydantic ValidationError before
-    # the service is ever built. Values mirror the guided conftest / F1.
+    # WebSettings requires these Composer fields before the service is built.
     settings = WebSettings(
         data_dir=tmp_path,
         composer_model="anthropic/claude-opus-4-7",
