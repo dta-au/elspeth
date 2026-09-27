@@ -8482,6 +8482,39 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
         self._assert_both_accept(state, tmp_path)
 
+    def test_both_resolve_through_a_source_reaching_the_consumer_behind_an_intermediate_transform(self, tmp_path: Path) -> None:
+        """The source's rename reaches a consumer two hops down (review-C1-alias-bypass-r1 F2).
+
+        source {name: b} -> hop (value_transform, fixed b) -> field_mapper
+        declaring 'Name: int?': both surfaces walk the live reach transitively,
+        so the consumer is refused exactly as a direct consumer is. Resolving
+        through direct predecessors only would find no source behind 'hop' and
+        the composer would admit what the runtime validation refuses.
+        """
+        hop = replace(
+            self._value_transform(target="x", schema={"mode": "fixed", "fields": ["id: str", "b: str"]}, reads="b"),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        consumer = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        consumer = replace(consumer, options={**consumer.options, "select_only": True}, input="t2_in")
+        mapped = self._mapped_state(tmp_path, node=consumer)
+        state = CompositionState(
+            sources=mapped.sources,
+            nodes=(hop, consumer),
+            edges=(),
+            outputs=mapped.outputs,
+            metadata=mapped.metadata,
+            version=1,
+        )
+        self._assert_both_reject(
+            state,
+            tmp_path,
+            "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') "
+            "and the source's field_mapping renames 'name' to 'b'. Declare 'b'",
+        )
+
     # --- A headerless source renames each column AS WRITTEN (review-C1-alias-bypass-r1 F1) ---
     # resolve_field_names keys a headerless source's field_mapping by the column
     # as written: under columns [id, Name] + {Name: b} the literal 'Name' names

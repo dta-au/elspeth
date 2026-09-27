@@ -825,3 +825,54 @@ def test_a_case_variant_of_a_renamed_headerless_column_is_no_spelling_of_the_tar
 
     assert result.exit_code == 0, result.output
     assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+
+
+# The resolution follows the live reach TRANSITIVELY (review-C1-alias-bypass-r1 F2)
+# ---------------------------------------------------------------------------
+#
+# The build resolves a declaration through the renames of every source whose
+# rows reach the node over live edges, however many transforms lie between.
+# A consumer behind an intermediate transform must be refused exactly as a
+# direct consumer is; resolving through direct predecessors only would find
+# no source there and let the Codex shape past ``elspeth validate``.
+
+
+def _hop() -> dict[str, Any]:
+    """A closed intermediate transform that carries ``b`` through (source -> hop -> consumer)."""
+    return {
+        "name": "hop",
+        "plugin": "value_transform",
+        "input": "rows",
+        "on_success": "mid",
+        "on_error": "quarantine",
+        "options": {"operations": [{"target": "x", "expression": "row['b'] + '!'"}], "schema": _FIXED_ID_B},
+    }
+
+
+@pytest.mark.parametrize(
+    ("consumer", "spelling"),
+    [
+        pytest.param(
+            _transform(
+                "field_mapper",
+                {"mapping": {"Name": "given"}, "select_only": True, "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+            ),
+            "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') and "
+            "the source's field_mapping renames 'name' to 'b'. Declare 'b'",
+            id="read-field_mapper-codex-shape",
+        ),
+        pytest.param(
+            _transform("value_transform", {"operations": [{"target": "Name", "expression": "row['b'] + '!'"}], "schema": _OBSERVED}),
+            "'Name' is a header spelling of the arriving field 'b'",
+            id="create-value_transform-target",
+        ),
+    ],
+)
+def test_a_renamed_header_declaration_behind_an_intermediate_transform_is_refused_at_build(
+    tmp_path: Path, consumer: dict[str, Any], spelling: str
+) -> None:
+    source = _mapped_source(tmp_path, schema=_FIXED_ID_B)
+    output = _refused_at_build(_settings(tmp_path, source=source, transforms=[_hop(), {**consumer, "input": "mid"}]))
+
+    assert "its upstream 'transform_hop_" in output
+    assert spelling in output
