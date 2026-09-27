@@ -286,7 +286,11 @@ where the architectural fix landed:
   9-case matrix (fixed/flexible/observed against conflicting/identical/``any``/
   disjoint): Stage 1 and the runtime graph build agree on all nine. Two known
   boundaries keep that from being a claim about the whole rule, and both are
-  permissive (they miss a rejection; neither blocks a runnable pipeline):
+  permissive (they miss a rejection; neither blocks a runnable pipeline).
+  A third, observed branches, was closed separately (Shape 33: the check reads
+  only typed branch schemas, so a certain conflict between observed branches
+  never reached it; the certain-conflict predicate now covers every mode).
+  The two known boundaries:
     - ``merge=None``. CLOSED FOR NODESPEC-CONSTRUCTED STATE by ``aa963bafe``
       (``elspeth-11334b382c``); the injected-``state_dict`` route remains open
       (``elspeth-5581fcb76f``). Both union mirrors gate on ``merge != "union"``
