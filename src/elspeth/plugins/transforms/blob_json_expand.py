@@ -374,7 +374,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2b3d30aed1e467df"
+    source_file_hash: str | None = "sha256:882daa33b903b38a"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
@@ -703,7 +703,6 @@ class BlobJSONExpand(BaseTransform):
                 _json_error_reason(
                     "invalid_input",
                     field=self._blob_ref_field,
-                    blob_ref=blob_ref,
                     error_type="invalid_blob_ref",
                     error="payload-store hash must be 64 lowercase hex characters",
                 )

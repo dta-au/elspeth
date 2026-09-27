@@ -1012,7 +1012,8 @@ def test_malformed_blob_ref_is_a_value_level_error(tmp_path: Path) -> None:
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
     assert result.reason["error_type"] == "invalid_blob_ref"
-    assert result.reason["blob_ref"] == "not-a-sha256"
+    # An unvalidated ref is arbitrary row text: the reason names the field, never the value.
+    assert "not-a-sha256" not in repr(result.reason)
 
 
 def test_non_string_blob_ref_routes_as_a_row_error(tmp_path: Path) -> None:

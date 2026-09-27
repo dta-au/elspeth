@@ -550,6 +550,10 @@ drained and repair this release forward.
   error and the routing reason. The reason now names the field, the expected
   and actual type and a stable `error_type` code (`not_integer_string`,
   `fractional_float`, …); the value stays only in the row-data columns.
+  `blob_csv_expand`, `blob_json_expand`, `blob_text_expand` and
+  `pdf_rasterize` no longer echo a malformed `blob_ref` (arbitrary row text)
+  in their `invalid_blob_ref` reason; a well-formed payload-store hash is
+  still named where it identifies the stored blob.
 
 ### Newly refused configurations
 

@@ -393,6 +393,8 @@ def test_input_validation_precedes_rendering(store: FilesystemPayloadStore) -> N
     assert missing.reason["reason"] == "missing_field"
     bad_ref = transform.process(make_pipeline_row({"blob_ref": "nope"}), make_context())
     assert bad_ref.reason["reason"] == "invalid_input" and bad_ref.reason["error_type"] == "invalid_blob_ref"
+    # An unvalidated ref is arbitrary row text: the reason names the field, never the value.
+    assert "nope" not in repr(bad_ref.reason)
     absent = transform.process(make_pipeline_row({"blob_ref": "0" * 64}), make_context())
     assert absent.reason["reason"] == "blob_not_found"
     not_pdf = transform.process(make_pipeline_row({"blob_ref": store.store(PNG)}), make_context())
