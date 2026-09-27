@@ -626,6 +626,25 @@ where the architectural fix landed:
   ``_is_config_probe_exception``; measured for ``query_template`` +
   ``query_pattern`` too), so no new gap class. Pinned by
   ``TestComposerRuntimeRagQueryTemplateAgreement``.
+* Shape 33 — a union coalesce whose branches are OBSERVED but whose field
+  types are certain from config (elspeth-5887fb7928 G2; the lane's
+  ``specialist2-coalesce-contracts.md`` co2/co6/c10). A value_transform rewrite
+  (declared ``any``) or a field_mapper dotted extraction (created ``any``) on
+  one branch met a carried concrete type (a fixed source's ``price: int``,
+  directly or through a flat rename) on the other: every row failed
+  ``contract_type_conflict`` at the merge while both surfaces admitted the
+  pipeline, because Shape 18's check reads only typed branch schemas and
+  ``merge_union_fields`` returns early when every branch is observed. Closed
+  on both surfaces by ONE predicate
+  (``union_merge.certain_union_type_conflict``) over the ONE stamp table
+  (``output_field_declarations()``: published on ``NodeInfo`` by the build,
+  read from the node's probe instance by the composer), with presence from
+  each surface's guarantee walk; both emit the same text, the composer as
+  ``coalesce_union_type_incompatible``. Certain only under all-branch
+  semantics. Open, and permissive: the composer does not recurse through a
+  fan-in producer or a collector on a branch, so it abstains where only the
+  build's DAG walk proves the type. Pinned by
+  ``TestComposerRuntimeCertainUnionTypeConflictAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -666,7 +685,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from unittest.mock import Mock, create_autospec, patch
 from uuid import UUID, uuid4
 
@@ -8587,3 +8606,195 @@ class TestComposerRuntimeRagQueryTemplateAgreement:
         options = self._options(template, required_input_fields)
         assert _prevalidate_transform("rag_retrieval", options) is None
         TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)
+
+
+class TestComposerRuntimeCertainUnionTypeConflictAgreement:
+    """Shape 33 — a certain union-merge type conflict over observed branches: both surfaces refuse.
+
+    One YAML document feeds both surfaces: the runtime build (settings ->
+    plugin instances -> ``ExecutionGraph``, as ``elspeth validate`` builds it)
+    and the composer (``composition_state_from_runtime_yaml`` ->
+    ``validate()``).
+
+    Bug verification protocol: replacing the stamp arm of
+    ``resolve_guaranteed_field_type`` / ``_resolved_producer_field_type``
+    (``field_name in ...output_field_declarations`` -> ``False``) makes all
+    three refusals fail on BOTH sides (the build DID NOT RAISE; the composer
+    reports is_valid) — the dotted extraction's ``any`` is a table entry too;
+    dropping the carried-rename arm does the same for ``dotted`` only;
+    dropping the policy gate turns ``control-first-policy`` red. The other
+    controls stay green under every mutation. Measured 2026-09-27 (lane logs
+    round6/G2-coalesce-build/mut).
+    """
+
+    @staticmethod
+    def _yaml(*, source: dict[str, Any], branch_a: dict[str, Any], branch_b: dict[str, Any], policy: str = "require_all") -> str:
+        import yaml
+
+        document = {
+            "sources": {"src": source},
+            "gates": [
+                {
+                    "name": "fork_gate",
+                    "input": "raw",
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "out"},
+                    "fork_to": ["path_a", "path_b"],
+                }
+            ],
+            "transforms": [
+                {"name": "t_a", "input": "path_a", "on_success": "out_a", "on_error": "discard", **branch_a},
+                {"name": "t_b", "input": "path_b", "on_success": "out_b", "on_error": "discard", **branch_b},
+            ],
+            "coalesce": [
+                {
+                    "name": "merge_results",
+                    "branches": {"path_a": "out_a", "path_b": "out_b"},
+                    "policy": policy,
+                    "merge": "union",
+                    "on_success": "out",
+                }
+            ],
+            "sinks": {
+                "out": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {"path": "/tmp/shape33-out.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+                }
+            },
+        }
+        return yaml.safe_dump(document, sort_keys=False)
+
+    _CSV: ClassVar[dict[str, Any]] = {
+        "plugin": "csv",
+        "on_success": "raw",
+        "options": {
+            "path": "/tmp/shape33-in.csv",
+            "on_validation_failure": "discard",
+            "schema": {"mode": "fixed", "fields": ["id: int", "price: int"]},
+        },
+    }
+    _JSON: ClassVar[dict[str, Any]] = {
+        "plugin": "json",
+        "on_success": "raw",
+        "options": {
+            "path": "/tmp/shape33-in.jsonl",
+            "format": "jsonl",
+            "on_validation_failure": "discard",
+            "schema": {"mode": "fixed", "fields": ["id: int", "r: int", "meta: any"]},
+        },
+    }
+    _PASSTHROUGH: ClassVar[dict[str, Any]] = {"plugin": "passthrough", "options": {"schema": {"mode": "observed"}}}
+
+    @staticmethod
+    def _rewrite(target: str, expression: str, schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "plugin": "value_transform",
+            "options": {"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": expression}]},
+        }
+
+    @staticmethod
+    def _mapper(mapping: dict[str, str]) -> dict[str, Any]:
+        return {"plugin": "field_mapper", "options": {"schema": {"mode": "observed"}, "mapping": mapping}}
+
+    def _cases(self) -> dict[str, tuple[str, str | None]]:
+        """name -> (yaml, the refused field, or None for a control both surfaces must admit)."""
+
+        def flexible_int() -> dict[str, Any]:
+            # A fresh dict per use: a shared one dumps as a YAML alias, which the importer refuses.
+            return {"mode": "flexible", "fields": ["price: int"]}
+
+        return {
+            "rewrite": (
+                self._yaml(source=self._CSV, branch_a=self._rewrite("price", "row['price'] + 1"), branch_b=self._PASSTHROUGH),
+                "price",
+            ),
+            "literal": (self._yaml(source=self._CSV, branch_a=self._rewrite("price", "'x'"), branch_b=self._PASSTHROUGH), "price"),
+            "dotted": (self._yaml(source=self._JSON, branch_a=self._mapper({"meta.p": "q"}), branch_b=self._mapper({"r": "q"})), "q"),
+            "control-both-any": (
+                self._yaml(source=self._CSV, branch_a=self._rewrite("bonus", "2"), branch_b=self._rewrite("bonus", "3")),
+                None,
+            ),
+            "control-declared-every-branch": (
+                self._yaml(
+                    source=self._CSV,
+                    branch_a=self._rewrite("price", "row['price'] + 1", flexible_int()),
+                    branch_b={"plugin": "passthrough", "options": {"schema": flexible_int()}},
+                ),
+                None,
+            ),
+            "control-first-policy": (
+                self._yaml(source=self._CSV, branch_a=self._rewrite("price", "'x'"), branch_b=self._PASSTHROUGH, policy="first"),
+                None,
+            ),
+        }
+
+    @staticmethod
+    def _runtime(pipeline_yaml: str, tmp_path: Path) -> tuple[ExecutionGraph | None, str | None, Any]:
+        """Build the runtime graph from the YAML; (graph, refusal text, plugins)."""
+        from elspeth.config_loading import load_settings
+
+        settings_path = tmp_path / "settings.yaml"
+        settings_path.write_text(pipeline_yaml)
+        config = load_settings(settings_path)
+        plugins = instantiate_plugins_from_config(config, preflight_mode=True)
+        try:
+            graph = ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(config.gates),
+                coalesce_settings=list(config.coalesce) or None,
+            )
+        except GraphValidationError as exc:
+            return None, str(exc), plugins
+        return graph, None, plugins
+
+    @pytest.mark.parametrize(
+        "case", ["rewrite", "literal", "dotted", "control-both-any", "control-declared-every-branch", "control-first-policy"]
+    )
+    def test_both_surfaces_agree(self, case: str, tmp_path: Path) -> None:
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        pipeline_yaml, refused_field = self._cases()[case]
+        _graph, runtime_refusal, _plugins = self._runtime(pipeline_yaml, tmp_path)
+        composer_result = composition_state_from_runtime_yaml(pipeline_yaml).validate()
+        composer_entries = [error for error in composer_result.errors if error.error_code == "coalesce_union_type_incompatible"]
+
+        if refused_field is None:
+            assert runtime_refusal is None
+            assert composer_entries == [], composer_result.errors
+            return
+        assert runtime_refusal is not None
+        [entry] = composer_entries
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == refused_field
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+        # One predicate, one message: the composer's text is the build's text with the node label.
+        assert entry.message == runtime_refusal.replace(runtime_refusal.split("'")[1], "merge_results")
+
+    @pytest.mark.parametrize("case", ["rewrite", "dotted", "control-declared-every-branch"])
+    def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path) -> None:
+        """T3b: the composer's probe instance, the runtime instance and NodeInfo hold the SAME stamp table and carried map."""
+        from elspeth.web.composer.state import ValidationProbeCache
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        # A nested merge builds the refused shapes too; the tables do not depend on the merge strategy.
+        pipeline_yaml = self._cases()[case][0].replace("merge: union", "merge: nested")
+        state = composition_state_from_runtime_yaml(pipeline_yaml)
+        graph, refusal, plugins = self._runtime(pipeline_yaml, tmp_path)
+        assert graph is not None, refusal
+        runtime_by_name = {wired.settings.name: wired.plugin for wired in plugins.transforms}
+        transform_ids = graph.get_transform_name_id_map()
+        with ValidationProbeCache() as probe_cache:
+            for node in state.nodes:
+                if node.node_type != "transform":
+                    continue
+                assert node.plugin is not None
+                probe = probe_cache.transform(node.plugin, node)
+                runtime = runtime_by_name[node.id]
+                node_info = graph.get_node_info(transform_ids[node.id])
+                assert probe.output_field_declarations() == runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+                assert probe.carried_output_sources() == runtime.carried_output_sources() == dict(node_info.carried_output_sources)

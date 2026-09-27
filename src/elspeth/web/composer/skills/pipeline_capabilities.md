@@ -315,6 +315,15 @@ no canonical order: build a list (`[a, b]`); a set used in place
 (`x in {...}`) is fine. A column a node declares as an input, such as a
 conversion's field, must be carried by every row that reaches the node.
 
+A field that two branches of a `merge: union` coalesce both carry must have one
+type on every branch, and `any` is a type of its own there, not a wildcard: a
+value computed without a declared type (an expression result, an extracted
+nested value) is `any`, and meeting a declared `int` on the other branch fails
+every row, so validation refuses the coalesce
+(`coalesce_union_type_incompatible`). Declare the field's type on the schema
+of every branch's last node (`mode: flexible`), or write the computed value
+under a new name.
+
 ### Utility Transforms
 
 Users often describe the effect, not the utility plugin. Plan utility transforms

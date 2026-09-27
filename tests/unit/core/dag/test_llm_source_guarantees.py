@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from elspeth.contracts.schema import SchemaConfig, get_raw_producer_guaranteed_fields
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.guarantees import get_effective_guaranteed_fields
@@ -48,6 +49,13 @@ class _UsageConsumerTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     name = "usage_consumer"
     input_schema = None

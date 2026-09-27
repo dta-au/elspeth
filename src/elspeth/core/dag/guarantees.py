@@ -11,7 +11,7 @@ signatures.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.errors import FrameworkBugError
@@ -543,13 +543,26 @@ def get_definite_emitted_fields(
     return walk_definite_emitted_fields(graph, node_id, caches.fields, caches.presence_votes)
 
 
+# The two questions ``resolve_guaranteed_field_type`` answers: ``edge`` — the
+# nearest DECLARED type a build-time edge check can hold a consumer to (``any``
+# abstains); ``union_merge`` — the contract type the field will carry at
+# runtime, for the union-coalesce refusal (``any`` is a known type).
+ResolutionMode = Literal["edge", "union_merge"]
+
+# The node kinds that execute a TransformProtocol plugin and so carry a
+# published stamp table (NodeInfo.output_field_declarations).
+_PLUGIN_BEARING_KINDS: frozenset[NodeType] = frozenset({NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR})
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedGuaranteeType:
     """Nearest ancestor declaration for a guarantee-carried field.
 
-    ``field_type`` is the SchemaConfig vocabulary (never ``"any"`` — an
-    ``any`` declaration abstains to ``None`` at the resolution site, because
-    it states no type to check). BASE TYPE ONLY, deliberately: the two
+    ``field_type`` is the SchemaConfig vocabulary. Under the default
+    ``edge`` mode it is never ``"any"`` — an ``any`` declaration abstains to
+    ``None`` at the resolution site, because it states no type to check;
+    under ``union_merge`` a declared ``any`` is the known type ``"any"``
+    (see ``resolve_guaranteed_field_type``). BASE TYPE ONLY, deliberately: the two
     pydantic materializations disagree about nullability
     (``build_coalesce_schema`` folds ``nullable or not required`` into
     ``| None``; the plugin factory's ``_get_python_type`` reads ``required``
@@ -574,6 +587,7 @@ def resolve_guaranteed_field_type(
     *,
     _visited: frozenset[str] = frozenset(),
     cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None = None,
+    mode: ResolutionMode = "edge",
 ) -> ResolvedGuaranteeType | None:
     """Resolve the nearest ancestor DECLARED type of a guarantee-carried field.
 
@@ -615,6 +629,37 @@ def resolve_guaranteed_field_type(
     error routing is terminal (see ``_live_predecessors``), and defensive on
     the public ``add_edge`` surface.
 
+    ``mode="union_merge"`` answers a different question: the contract type
+    this field WILL carry at runtime on the node's rows, for the union-
+    coalesce refusal (``union_merge.certain_union_type_conflict``), where a
+    runtime ``contract_type_conflict`` compares contract types exactly and
+    ``any`` (``object``) conflicts with every concrete type. Three arms
+    differ from ``edge``:
+
+    - **stamp arm**: a plugin-bearing node (TRANSFORM, AGGREGATION,
+      COLLECTOR) answers from its published stamp table
+      (``NodeInfo.output_field_declarations`` — the table the runtime stamp
+      rewrites emitted contracts from), and a declared ``any`` answers the
+      known type ``"any"`` instead of abstaining. A field its output config
+      declares but its table does not is not stamped at runtime, so the
+      config's type is no runtime fact and the node abstains.
+    - **carried-rename arm**: a ``NodeInfo.carried_output_sources`` target
+      (a field_mapper flat rename) carries its source field's value under
+      that field's contract, so the walk continues upstream under the SOURCE
+      name. Checked before the forwarding arms, so a renamed target never
+      borrows the type of an unrelated upstream field of the same name.
+    - **declarations elsewhere**: only a SOURCE's own declaration is read
+      (``any`` answering ``"any"``: a declared source field's contract type is
+      its declaration). A coalesce's, queue's or row_union's config is a
+      build-time MERGE of branch configs, which can differ from the branch
+      stamp tables (a flexible placeholder ``any`` the plugin types
+      concretely), so a declaring fan-in node abstains and an undeclaring
+      one recurses into its branches as ``edge`` does.
+
+    Names created dynamically at runtime (blob_csv_expand's data-derived
+    columns) are in no table and abstain as before. A cache is per mode:
+    never share one dict between an ``edge`` and a ``union_merge`` walk.
+
     ``cache`` memoizes on ``(node_id, field_name)`` — same discipline as
     ``walk_effective_guaranteed_fields``'s cache parameter, and load-bearing
     for the same reason: without it, nested fan-in re-resolves shared
@@ -629,7 +674,7 @@ def resolve_guaranteed_field_type(
         return None
     if cache is not None and (node_id, field_name) in cache:
         return cache[(node_id, field_name)]
-    result = _resolve_guaranteed_field_type_uncached(graph, node_id, field_name, _visited=_visited, cache=cache)
+    result = _resolve_guaranteed_field_type_uncached(graph, node_id, field_name, _visited=_visited, cache=cache, mode=mode)
     if cache is not None:
         cache[(node_id, field_name)] = result
     return result
@@ -642,10 +687,36 @@ def _resolve_guaranteed_field_type_uncached(
     *,
     _visited: frozenset[str],
     cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None,
+    mode: ResolutionMode,
 ) -> ResolvedGuaranteeType | None:
     """Worker for ``resolve_guaranteed_field_type`` — see its docstring."""
     node_info = graph.get_node_info(node_id)
     config = node_info.output_schema_config
+    declares_field = config is not None and config.fields is not None and any(field_def.name == field_name for field_def in config.fields)
+    if mode == "union_merge":
+        if node_info.node_type in _PLUGIN_BEARING_KINDS:
+            # Stamp arm: the table the runtime stamp rewrites the field from.
+            if field_name in node_info.output_field_declarations:
+                return ResolvedGuaranteeType(
+                    field_type=node_info.output_field_declarations[field_name].field_type,
+                    declared_by=frozenset({node_id}),
+                )
+            # Carried-rename arm: the value is the source field's value.
+            if field_name in node_info.carried_output_sources:
+                return _resolve_from_contributors(
+                    graph,
+                    node_id,
+                    node_info.carried_output_sources[field_name],
+                    _visited=_visited,
+                    cache=cache,
+                    mode=mode,
+                )
+            if declares_field:
+                return None
+        elif node_info.node_type not in (NodeType.SOURCE, NodeType.GATE) and declares_field:
+            # A fan-in node's config is a build-time merge of branch configs,
+            # not a runtime fact; a gate's is its producer's (recursed below).
+            return None
     # A gate's own config is its upstream producer's RAW config copied in by
     # the builder (``_assign_schema(gate_id, _best_schema_config(producer_id))``),
     # not a declaration the gate made. Recursing past it reaches the identical
@@ -654,7 +725,7 @@ def _resolve_guaranteed_field_type_uncached(
     if config is not None and config.fields is not None and node_info.node_type is not NodeType.GATE:
         for field_def in config.fields:
             if field_def.name == field_name:
-                if field_def.field_type == "any":
+                if field_def.field_type == "any" and mode == "edge":
                     return None
                 return ResolvedGuaranteeType(
                     field_type=field_def.field_type,
@@ -761,6 +832,25 @@ def _resolve_guaranteed_field_type_uncached(
     ):
         return None
 
+    return _resolve_from_contributors(graph, node_id, field_name, _visited=_visited, cache=cache, mode=mode)
+
+
+def _resolve_from_contributors(
+    graph: ExecutionGraph,
+    node_id: str,
+    field_name: str,
+    *,
+    _visited: frozenset[str],
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None,
+    mode: ResolutionMode,
+) -> ResolvedGuaranteeType | None:
+    """Resolve ``field_name`` unanimously over ``node_id``'s predecessors (the recursion step).
+
+    Shared by the structural recursion and the union-merge carried-rename arm,
+    which asks for the SOURCE name over the same predecessors. Writes no cache
+    entry itself: the caller caches ``(node_id, field_name)`` and each
+    recursive call caches ``(predecessor, name)``.
+    """
     in_edges = list(graph._graph.in_edges(node_id, data=True))
     if any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
         return None
@@ -770,7 +860,8 @@ def _resolve_guaranteed_field_type_uncached(
 
     visited = _visited | {node_id}
     resolutions = [
-        resolve_guaranteed_field_type(graph, contributor, field_name, _visited=visited, cache=cache) for contributor in contributors
+        resolve_guaranteed_field_type(graph, contributor, field_name, _visited=visited, cache=cache, mode=mode)
+        for contributor in contributors
     ]
     if any(resolution is None for resolution in resolutions):
         return None

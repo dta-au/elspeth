@@ -18,6 +18,7 @@ from elspeth.contracts.types import NODE_ID_MAX_LENGTH, CoalesceName, NodeID
 
 if TYPE_CHECKING:
     from elspeth.contracts import PluginSchema
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration
 
 
 class GraphValidationError(ValueError):
@@ -324,6 +325,30 @@ class NodeInfo:
     # type only for fields in the source's own guaranteed set.
     observed_value_type: str | None = None
 
+    # The plugin's ADR-050 stamp table (TransformProtocol.output_field_declarations):
+    # every field the runtime stamp rewrites on an emitted row, with its
+    # declared contract and declarer (operator > plugin > any). Populated for
+    # the plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the
+    # builder, published VERBATIM from the constructed instance, so a
+    # build-time reader of "the type this node's rows carry" reads the table
+    # the runtime stamps from rather than re-deriving it. Its reader is
+    # resolve_guaranteed_field_type's union-merge mode (the union-coalesce
+    # refusal). NOT derivable from output_schema_config: an observed config
+    # carries no fields while the table types every created field, and a
+    # flexible config's name-only placeholders are ``any`` where the plugin
+    # types them. Any later build-time completion of the table (a bind of
+    # upstream-derived types) must republish it here through the builder's
+    # one publishing helper — a reader never sees a table captured earlier.
+    output_field_declarations: Mapping[str, OutputFieldDeclaration] = field(default_factory=dict)
+
+    # The plugin's carried output name -> copied input field map
+    # (TransformProtocol.carried_output_sources): a carried name's value IS the
+    # named input field's value under that field's contract (a field_mapper
+    # flat rename). Same scope and publishing rule as
+    # output_field_declarations; read by resolve_guaranteed_field_type's
+    # carried-rename arm, which follows the type upstream under the source name.
+    carried_output_sources: Mapping[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
@@ -508,6 +533,21 @@ class NodeInfo:
                 component_id=self.node_id,
                 component_type=component_type,
             )
+        # Offensive programming: the stamp table and the carried map describe a
+        # TransformProtocol plugin's emissions, so they sit only on the kinds
+        # that execute one (passes_through_input's scope and rationale).
+        if (self.output_field_declarations or self.carried_output_sources) and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.output_field_declarations/carried_output_sources are only meaningful for "
+                f"TRANSFORM, AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        freeze_fields(self, "output_field_declarations", "carried_output_sources")
         # NOTE: config is NOT frozen here because graph construction replaces
         # NodeInfo payloads during schema propagation and final config freezing.
         # Deep freeze is applied by build_execution_graph() after construction.

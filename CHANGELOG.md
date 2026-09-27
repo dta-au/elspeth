@@ -382,6 +382,19 @@ drained and repair this release forward.
   ends PARTIAL (exit 1), or FAILED (exit 2) when no row succeeded. The failed-group count (`rows_coalesce_failed`) now also counts
   failures completed by an arrival or a branch loss, including a group that
   failed before any branch arrived.
+- **A union coalesce whose branches certainly disagree on a field's type is
+  refused at build.** When every branch merges on every row (`require_all`)
+  and two branches each carry a field whose type is fixed before the first
+  row but differs — an untyped `value_transform` rewrite or `field_mapper`
+  dotted extraction (`any`) beside a source's declared `price: int`, carried
+  through a passthrough or a rename — every row failed the merge with
+  `contract_type_conflict`, yet `elspeth validate` and the composer admitted
+  the pipeline whenever the branches were observed. `elspeth validate`, the
+  build and the composer now refuse it (`coalesce_union_type_incompatible`),
+  naming both declaring nodes; declare the type on every branch's output
+  schema (`mode: flexible`) or write the computed value under a new name.
+  A type known only from the rows (an observed upstream) still fails each row
+  at the merge, and that reason now names `any` rather than `object`.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
@@ -626,6 +639,13 @@ These ran and delivered rows before:
   values and hashes from one run to the next; `value_transform` ended the
   run with a `TypeError`. Use a list. A set consumed in place (`x in {...}`,
   `len({...})`) is unaffected.
+- **A union coalesce whose branches certainly disagree on a field's type**
+  (the coalesce bullet above): refused at validate and build with
+  `coalesce_union_type_incompatible`. Before, an untyped rewrite of the
+  field on one branch delivered every row (the per-row value types happened
+  to agree), and a field_mapper dotted extraction merged with a carried rename
+  of a declared `int` delivered too; on this branch before the fix both failed
+  every row. Declare the type on every branch.
 
 These already failed and are now refused earlier or routed, with no loss:
 `output_mode: passthrough` over a flush that did not return one row per

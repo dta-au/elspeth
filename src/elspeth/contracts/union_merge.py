@@ -11,6 +11,13 @@ semantics. Two thin wrappers consume the core algorithm:
 Both derive required/nullable flags from merge_union_field_flags so build-time
 and runtime merges cannot diverge.
 
+The certain-conflict predicate (``certain_union_type_conflict``) lives here
+too: the build (``core/dag/builder.py``) and the composer
+(``web/composer/state.py``) both call it to refuse, before row 1, a union
+coalesce whose every row would fail ``merge_union_contracts`` — the same
+exact-type comparison, over types both surfaces resolve from the plugins'
+published stamp tables.
+
 A THIRD, separate operation lives here too: ``join_batch_contracts``, the
 DESCRIPTION join (J1) used only where several PRODUCERS' rows meet — the sink
 batch merge and display headers (ADR-050). It never raises on a type
@@ -45,7 +52,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Hashable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 from elspeth.contracts.errors import ContractMergeError
@@ -184,6 +191,105 @@ def merge_union_field_flags(
     return seen_types
 
 
+@dataclass(frozen=True, slots=True)
+class KnownBranchFieldType:
+    """A field's runtime contract type on one union-coalesce branch, known before row 1.
+
+    ``field_type`` is the schema-DSL token (``"any"`` included: a declared
+    ``any`` is the contract type ``object``, which conflicts with every
+    concrete type at the runtime merge). ``declared_by`` names the
+    declaring node(s) for the refusal message, already rendered by the
+    surface that resolved the type (the DAG build or the composer).
+    """
+
+    field_type: str
+    declared_by: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnionFieldTypeConflict:
+    """Two union-coalesce branches that each certainly carry ``field`` under different contract types."""
+
+    field: str
+    branch_a: str
+    type_a: KnownBranchFieldType
+    branch_b: str
+    type_b: KnownBranchFieldType
+
+
+def certain_union_type_conflict(
+    branch_fields: Mapping[str, Mapping[str, KnownBranchFieldType]],
+    *,
+    all_branches_merge: bool,
+    branch_order: Sequence[str],
+) -> UnionFieldTypeConflict | None:
+    """The first union-merge type conflict that is certain from config, or None.
+
+    The ONE predicate behind the build-time refusal
+    (``coalesce_union_type_incompatible``) of a union coalesce whose every
+    row would fail the runtime merge with ``contract_type_conflict``. Both
+    the DAG build (``builder.py``, every schema mode including all-observed)
+    and the composer (``web/composer/state.py``) call it; each surface
+    resolves the per-branch inputs from the same stamp tables
+    (``BaseTransform.output_field_declarations``) and presence walks.
+
+    ``branch_fields`` maps each branch to the fields it BOTH guarantees
+    present on every row AND knows the runtime contract type of; a field
+    whose type or presence is not provable is simply absent (abstention).
+    A conflict is two such branches typing one field differently, compared
+    exactly as the runtime merge compares contract types
+    (``merge_union_field_flags``: ``int`` vs ``float`` conflicts too).
+
+    Certain only when every branch merges on every row:
+    ``all_branches_merge`` is ``CoalesceSettings.has_all_branch_semantics``
+    (``require_all``, or ``quorum`` equal to the branch count). Under
+    ``first`` the runtime merges one arrival, and under ``best_effort`` or a
+    smaller quorum a row whose conflicting sibling was diverted or late
+    merges without it, so those policies abstain and the per-row
+    ``contract_type_conflict`` remains the residual.
+
+    Deterministic: fields in sorted order, branches in ``branch_order``.
+    """
+    if not all_branches_merge:
+        return None
+    ordered = [branch for branch in branch_order if branch in branch_fields]
+    field_names = sorted({name for branch in ordered for name in branch_fields[branch]})
+    for field_name in field_names:
+        first: tuple[str, KnownBranchFieldType] | None = None
+        for branch in ordered:
+            if field_name not in branch_fields[branch]:
+                continue
+            known = branch_fields[branch][field_name]
+            if first is None:
+                first = (branch, known)
+            elif known.field_type != first[1].field_type:
+                return UnionFieldTypeConflict(
+                    field=field_name,
+                    branch_a=first[0],
+                    type_a=first[1],
+                    branch_b=branch,
+                    type_b=known,
+                )
+    return None
+
+
+def union_type_conflict_message(coalesce_label: str, conflict: UnionFieldTypeConflict) -> str:
+    """The actionable refusal text for a certain union-merge type conflict (build and composer share it)."""
+    concrete = sorted({conflict.type_a.field_type, conflict.type_b.field_type} - {"any"})
+    declaration = f"'{conflict.field}: {concrete[0]}'" if len(concrete) == 1 else f"'{conflict.field}' with one type"
+    return (
+        f"Coalesce {coalesce_label} receives incompatible types for field '{conflict.field}' in union merge: "
+        f"branch '{conflict.branch_a}' carries {conflict.type_a.field_type!r} "
+        f"(declared by {', '.join(conflict.type_a.declared_by)}), "
+        f"branch '{conflict.branch_b}' carries {conflict.type_b.field_type!r} "
+        f"(declared by {', '.join(conflict.type_b.declared_by)}). "
+        "Every row would fail this merge at runtime (contract_type_conflict); 'any' is a type of its own here, "
+        "not a wildcard. A union coalesce needs one type per field: declare "
+        f"{declaration} on the output schema of every branch's last node (mode: flexible), "
+        "or write a rewritten value under a new name."
+    )
+
+
 def resolve_original_name_collisions(fields: Sequence[FieldContract]) -> tuple[FieldContract, ...]:
     """Break cross-branch original_name collisions deterministically.
 
@@ -281,11 +387,15 @@ def merge_union_contracts(
             branch_order=ordered_names,
         )
     except UnionTypeConflictError as e:
-        # Type keys here are always Python types (built from fc.python_type)
+        # Type keys here are always Python types (built from fc.python_type).
+        # ``object`` is rendered ``any``: it is the contract type of a declared
+        # ``any``, and the build-time refusal of the same conflict
+        # (``coalesce_union_type_incompatible``) names it ``any``, so the
+        # residual per-row reason uses the operator's vocabulary too.
         raise ContractMergeError(
             field=e.field,
-            type_a=cast(type, e.type_a).__name__,
-            type_b=cast(type, e.type_b).__name__,
+            type_a=_union_type_label(cast(type, e.type_a)),
+            type_b=_union_type_label(cast(type, e.type_b)),
         ) from e
 
     # Mode precedence: FIXED > FLEXIBLE > OBSERVED (most restrictive wins)
@@ -317,6 +427,11 @@ def merge_union_contracts(
         fields=resolve_original_name_collisions(merged_fields),
         locked=merged_locked,
     )
+
+
+def _union_type_label(python_type: type) -> str:
+    """A conflicting contract type's name in the schema vocabulary (``object`` is ``any``)."""
+    return "any" if python_type is object else python_type.__name__
 
 
 _MODE_ORDER: dict[str, int] = {"FIXED": 0, "FLEXIBLE": 1, "OBSERVED": 2}

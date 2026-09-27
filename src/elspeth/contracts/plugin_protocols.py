@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
-    from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration, PipelineRow, SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.contracts.sink_effects import (
         ResolvedSinkEffectMode,
@@ -481,6 +481,22 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
         """
         ...
 
+    def output_field_declarations(self) -> dict[str, "OutputFieldDeclaration"]:
+        """The ADR-050 stamp table: every stamped field's declared contract and its declarer.
+
+        See ``BaseTransform.output_field_declarations``. The DAG build
+        publishes it on ``NodeInfo.output_field_declarations``.
+        """
+        ...
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Each carried output name mapped to the input field whose value it copies.
+
+        See ``BaseTransform.carried_output_sources``. The DAG build publishes
+        it on ``NodeInfo.carried_output_sources``.
+        """
+        ...
+
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
     # instead of probing for optional methods, preserving a closed lifecycle
     # surface.
@@ -733,6 +749,14 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
         (``engine.executors.batch_contract_validation``) checks every buffered
         row against it.
         """
+        ...
+
+    def output_field_declarations(self) -> dict[str, "OutputFieldDeclaration"]:
+        """The ADR-050 stamp table; see :meth:`TransformProtocol.output_field_declarations`."""
+        ...
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Carried output name -> copied input field; see :meth:`TransformProtocol.carried_output_sources`."""
         ...
 
     def schema_required_input_fields(self) -> frozenset[str]:

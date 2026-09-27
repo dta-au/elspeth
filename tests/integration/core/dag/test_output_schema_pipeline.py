@@ -21,6 +21,7 @@ import pytest
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
@@ -72,6 +73,13 @@ class MockFieldAddingTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None

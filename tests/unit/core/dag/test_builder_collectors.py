@@ -8,6 +8,7 @@ import pytest
 
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig, get_raw_node_required_fields
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import CollectorName, NodeID
 from elspeth.core.config import CoalesceSettings, CollectorSettings, GateSettings, ScopeSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
@@ -55,6 +56,13 @@ class _MultiRowTransform:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
 
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     creates_tokens = True
@@ -91,6 +99,13 @@ class _BatchTransform:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
 
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     creates_tokens = False
@@ -123,6 +138,13 @@ class _PlainTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None

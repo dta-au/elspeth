@@ -8,6 +8,7 @@ import pytest
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import GateName, NodeID, SinkName
 from elspeth.core.config import (
     AggregationSettings,
@@ -81,6 +82,13 @@ class _BoundRegionTransform:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
 
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
@@ -111,6 +119,13 @@ class _BoundRegionMultiRowTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
@@ -145,6 +160,13 @@ class _BoundRegionCollectorPlugin:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
 
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -177,6 +199,13 @@ class _BoundRegionAggregationTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None

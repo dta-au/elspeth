@@ -314,7 +314,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:45320b13b23f6e0b"
+    source_file_hash: str | None = "sha256:b96c5b5e88bcd1eb"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -491,8 +491,12 @@ class FieldMapper(BaseTransform):
             if "." in source
         )
 
-    def carried_output_fields(self) -> frozenset[str]:
+    def carried_output_sources(self) -> dict[str, str]:
         """A flat rename target carries the source field's contract; the stamp leaves it alone.
+
+        Mapped to the rename source (the key ``carried_output_fields()``
+        derives from, and the name the build follows the carried value's type
+        upstream under).
 
         Except a target the author declared by its EMITTED name while leaving
         the source undeclared (``_declaration_is_authored_on_target``): its
@@ -512,11 +516,11 @@ class FieldMapper(BaseTransform):
         a target is not in ``declared_output_fields``, the collision surface,
         which excludes every identity mapping.
         """
-        return frozenset(
-            target
+        return {
+            target: source
             for source, target in self._mapping.items()
             if "." not in source and self._writes_target_key(source, target) and target not in self._flat_renames_declared_on_target
-        )
+        }
 
     @classmethod
     def _declaration_is_authored_on_target(cls, source: str, target: str, authored_names: frozenset[str]) -> bool:

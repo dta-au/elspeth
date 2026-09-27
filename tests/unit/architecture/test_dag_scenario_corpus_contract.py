@@ -862,6 +862,14 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # rotation above dropped on a false premise), so its source_file_hash moved
 # b39aa95f4046c12c -> 45320b13b23f6e0b (scripts/cicd/plugin_hash); no manifest
 # literal, resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928 G2, certain union-merge type
+# conflicts): a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper
+# declares its carried renames as a target -> source map
+# (carried_output_sources, the authority carried_output_fields now derives
+# from) so the build can follow a carried value's type upstream; its
+# source_file_hash moved 45320b13b23f6e0b -> b96c5b5e88bcd1eb
+# (scripts/cicd/plugin_hash); no manifest literal, resume digest, registry
+# digest or oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",

@@ -55,7 +55,7 @@ from elspeth.contracts.plugin_capabilities import (
     PluginCapability,
     WebConfigAuthority,
 )
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, OutputFieldDeclaration, PipelineRow, SchemaContract
 from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
@@ -977,18 +977,32 @@ class BaseTransform(ABC):
         admitted the value. Not to be confused with ``authorship: carried`` on
         a ``DeclaredOutputTypeViolation``, which marks an input field the
         transform REWROTE under the same name.
+
+        Derived from ``carried_output_sources()``, the one declaration of
+        which input field each carried name copies; override that, not this.
         """
-        return frozenset()
+        return frozenset(self.carried_output_sources())
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Each carried output name mapped to the input field whose value it copies.
+
+        The authority behind ``carried_output_fields()`` (its keys). The value
+        is the rename SOURCE as the operator wrote it, so the build can follow
+        a carried value's type upstream under the name it arrived with
+        (``core/dag/guarantees.resolve_guaranteed_field_type``'s carried-rename
+        arm, the union-coalesce refusal). The default carries nothing.
+        """
+        return {}
 
     def _stamped_output_field_contracts(self) -> dict[str, FieldContract]:
         """The declared contract of every field this transform stamps on emission.
 
         One table, built from three declaration sources in precedence order
-        (ADR-050: operator > plugin > ``any``) by ``_output_field_declarations``;
+        (ADR-050: operator > plugin > ``any``) by ``output_field_declarations``;
         see there for the precedence and for who is recorded as each field's
         declarer.
         """
-        return {name: contract for name, (contract, _declared_by) in self._output_field_declarations().items()}
+        return {name: declaration.contract for name, declaration in self.output_field_declarations().items()}
 
     def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]:
         """Who declared the type of each field in the stamp table: ``operator`` or ``plugin`` (ADR-050).
@@ -1001,10 +1015,16 @@ class BaseTransform(ABC):
         the operator's declaration) at fault. Keyed by the same names as
         ``_stamped_output_field_contracts``.
         """
-        return {name: declared_by for name, (_contract, declared_by) in self._output_field_declarations().items()}
+        return {name: declaration.declared_by for name, declaration in self.output_field_declarations().items()}
 
-    def _output_field_declarations(self) -> dict[str, tuple[FieldContract, OutputFieldDeclarer]]:
-        """Every stamped field's declared contract and the declarer of its type.
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        """Every stamped field's declared contract and the declarer of its type: THE stamp table (ADR-050).
+
+        Public because the DAG build publishes it verbatim on
+        ``NodeInfo.output_field_declarations`` (and the composer reads it from
+        its validation probe instance): build-time reasoning about the types a
+        node's rows carry reads the table the runtime stamps from, never a
+        re-derivation of it.
 
         Three declaration sources in precedence order (ADR-050: operator >
         plugin > ``any``):
@@ -1055,7 +1075,7 @@ class BaseTransform(ABC):
             else {}
         )
         carried = self.carried_output_fields()
-        declarations: dict[str, tuple[FieldContract, OutputFieldDeclarer]] = {}
+        declarations: dict[str, OutputFieldDeclaration] = {}
         if output_schema_config.fields is not None:
             config_definitions = {field.name: field for field in output_schema_config.fields}
             for contract in create_contract_from_config(output_schema_config).fields:
@@ -1063,11 +1083,11 @@ class BaseTransform(ABC):
                 operator_declared = name in carried or (
                     name in authored_definitions and authored_definitions[name] == config_definitions[name]
                 )
-                declarations[name] = (contract, "operator" if operator_declared else "plugin")
+                declarations[name] = OutputFieldDeclaration(contract, "operator" if operator_declared else "plugin")
         for definition in self.created_output_fields():
             if definition.name in declarations and definition.name in authored_definitions:
                 continue
-            declarations[definition.name] = (
+            declarations[definition.name] = OutputFieldDeclaration(
                 FieldContract(
                     normalized_name=definition.name,
                     original_name=definition.name,
@@ -1082,7 +1102,7 @@ class BaseTransform(ABC):
         for name in self.declared_output_fields:
             if name in declarations or name in carried:
                 continue
-            declarations[name] = (
+            declarations[name] = OutputFieldDeclaration(
                 FieldContract(
                     normalized_name=name,
                     original_name=name,
@@ -1094,8 +1114,12 @@ class BaseTransform(ABC):
                 "plugin",
             )
         return {
-            name: (replace(contract, nullable=True) if contract.python_type is object and not contract.nullable else contract, declared_by)
-            for name, (contract, declared_by) in declarations.items()
+            name: (
+                replace(declaration, contract=replace(declaration.contract, nullable=True))
+                if declaration.contract.python_type is object and not declaration.contract.nullable
+                else declaration
+            )
+            for name, declaration in declarations.items()
         }
 
     def _apply_declared_output_field_contracts(

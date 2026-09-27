@@ -57,6 +57,7 @@ from elspeth.core.dag.schema_factory import (
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
@@ -167,6 +168,8 @@ class ExecutionGraph:
         removed_input_fields: frozenset[str] = frozenset(),
         preserves_input_values: bool = False,
         observed_value_type: str | None = None,
+        output_field_declarations: Mapping[str, OutputFieldDeclaration] | None = None,
+        carried_output_sources: Mapping[str, str] | None = None,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -250,6 +253,13 @@ class ExecutionGraph:
                 fact holds. Consumed by resolve_guaranteed_field_type's
                 structural source arm (elspeth-e6e552ce34). NodeInfo guards
                 against misuse.
+            output_field_declarations: For the plugin-bearing kinds only —
+                the plugin's ADR-050 stamp table
+                (``output_field_declarations()``), published verbatim. None
+                publishes nothing (a node with no plugin, or a direct caller).
+            carried_output_sources: For the plugin-bearing kinds only — the
+                plugin's carried output name -> copied input field map
+                (``carried_output_sources()``). None publishes nothing.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -290,6 +300,8 @@ class ExecutionGraph:
             declared_created_fields=declared_created_fields,
             preserves_input_values=preserves_input_values,
             observed_value_type=observed_value_type,
+            output_field_declarations=output_field_declarations if output_field_declarations is not None else {},
+            carried_output_sources=carried_output_sources if carried_output_sources is not None else {},
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,

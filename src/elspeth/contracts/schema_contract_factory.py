@@ -37,6 +37,22 @@ def field_definition_python_type(definition: FieldDefinition) -> type:
     return _FIELD_TYPE_MAP[definition.field_type]
 
 
+_FIELD_TYPE_NAMES: dict[type, str] = {python_type: name for name, python_type in _FIELD_TYPE_MAP.items()}
+
+
+def field_type_name(python_type: type) -> str:
+    """The schema-DSL type token for a DECLARED contract's ``python_type`` (``object`` is ``any``).
+
+    The inverse of ``field_definition_python_type``. Total over every declared
+    contract, because a declared contract's type is only ever built through
+    that one mapping (``create_contract_from_config``, the transform
+    declaration stamp); a type outside it (an INFERRED ``datetime`` or
+    ``NoneType``) is not a declaration, and asking is a caller bug, so it
+    raises ``KeyError``.
+    """
+    return _FIELD_TYPE_NAMES[python_type]
+
+
 def map_schema_mode(
     mode: Literal["fixed", "flexible", "observed"],
 ) -> Literal["FIXED", "FLEXIBLE", "OBSERVED"]:

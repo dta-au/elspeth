@@ -440,8 +440,8 @@ def _declaration_cases() -> list[tuple[str, dict[str, Any], str]]:
         for config in configs:
             transform = transform_cls(config)
             created = transform.declared_output_fields | {definition.name for definition in transform.created_output_fields()}
-            for name, (contract, declared_by) in sorted(transform._output_field_declarations().items()):
-                if declared_by == "plugin" and contract.python_type is not object and name in created:
+            for name, declaration in sorted(transform.output_field_declarations().items()):
+                if declaration.declared_by == "plugin" and declaration.contract.python_type is not object and name in created:
                     cases.append((transform_cls.name, config, name))
     return cases
 

@@ -52,7 +52,13 @@ from elspeth.contracts.sink import (
     LOCAL_RECOVERY_SINK_PLUGINS,
 )
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
-from elspeth.contracts.union_merge import UnionTypeConflictError, merge_union_field_flags
+from elspeth.contracts.union_merge import (
+    KnownBranchFieldType,
+    UnionTypeConflictError,
+    certain_union_type_conflict,
+    merge_union_field_flags,
+    union_type_conflict_message,
+)
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.config import (
     _MAX_NODE_NAME_LENGTH,
@@ -68,6 +74,7 @@ from elspeth.core.config import (
 )
 from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
+from elspeth.core.dag.guarantees import ResolutionMode
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -5315,6 +5322,8 @@ def _check_schema_contracts(
     # for sources, gates, queues, transforms, and aggregations. Unresolved
     # branches are omitted: one known mode plus unknowns abstains, while an
     # observed/explicit conflict already proven by known branches still rejects.
+    # (coalesce id, require_all, ordered (branch name, branch connection) pairs)
+    certain_conflict_candidates: list[tuple[str, bool, tuple[tuple[str, str], ...]]] = []
     for coalesce_node in nodes:
         if coalesce_node.node_type != "coalesce" or coalesce_node.merge != "union" or not coalesce_node.branches:
             continue
@@ -5374,8 +5383,6 @@ def _check_schema_contracts(
             branch_typed_fields[branch_name] = [
                 (field.name, field.field_type, field.required, field.nullable) for field in schema_config.fields
             ]
-        if len(branch_typed_fields) < 2:
-            continue
         # ``require_all`` is derived from the policy alone, where the runtime
         # uses ``CoalesceSettings.has_all_branch_semantics`` — which is ALSO
         # true for a quorum whose count equals the branch count. The two cannot
@@ -5387,11 +5394,12 @@ def _check_schema_contracts(
         # Both hold today; the first is the one that would still hold if a
         # future caller consumed the returned flags.
         try:
-            merge_union_field_flags(
-                branch_typed_fields,
-                require_all=coalesce_node.policy == "require_all",
-                branch_order=_coalesce_branch_names(coalesce_node.branches),
-            )
+            if len(branch_typed_fields) >= 2:
+                merge_union_field_flags(
+                    branch_typed_fields,
+                    require_all=coalesce_node.policy == "require_all",
+                    branch_order=_coalesce_branch_names(coalesce_node.branches),
+                )
         except UnionTypeConflictError as conflict:
             errors.append(
                 _err(
@@ -5410,6 +5418,26 @@ def _check_schema_contracts(
                     ),
                 )
             )
+            # The runtime's typed-schema merge raises before the certain-
+            # conflict check below runs; report this coalesce's type defect once.
+            continue
+
+        # Every schema mode, the all-observed case included: the certain-
+        # conflict check runs further down, once the union-merge type walk it
+        # needs (``_resolved_producer_field_type``) is defined.
+        certain_conflict_candidates.append(
+            (
+                coalesce_node.id,
+                coalesce_node.policy == "require_all",
+                tuple(
+                    zip(
+                        _coalesce_branch_names(coalesce_node.branches),
+                        _coalesce_branch_connections(coalesce_node.branches),
+                        strict=True,
+                    )
+                ),
+            )
+        )
 
     # row_union publishes every branch row unchanged into one long-format
     # stream. Exact fixed/fixed schemas need full mutual compatibility.
@@ -6375,9 +6403,22 @@ def _check_schema_contracts(
         field_name: str,
         *,
         source_map: Mapping[str, SourceSpec],
+        mode: ResolutionMode = "edge",
         visited: frozenset[str] = frozenset(),
-    ) -> str | None:
+    ) -> KnownBranchFieldType | None:
         """Resolve a declared type through truthful value-preserving forwarders.
+
+        The composer mirror of ``core/dag/guarantees.resolve_guaranteed_field_type``
+        over the producer graph, in both of its modes. ``edge`` (the edge type
+        check): the nearest declared type, a declared ``any`` abstaining.
+        ``union_merge`` (the certain union-coalesce conflict): the contract type
+        the field will carry at runtime — a plugin node answers from its stamp
+        table (``output_field_declarations()`` on the node's ONE probe instance,
+        the table the runtime stamps from) with ``any`` a known type, a carried
+        rename (``carried_output_sources()``) continues upstream under its
+        source name, and a field the output config declares but the table does
+        not abstains. The result names the declaring node(s) for a refusal
+        message, in the label shape the DAG build uses.
 
         ``source_map`` is threaded in as a parameter rather than read from the
         enclosing closure so the Tier-3 boundary declaration above can name it:
@@ -6386,20 +6427,27 @@ def _check_schema_contracts(
         """
         if producer.producer_id in visited:
             return None
-        owner = _producer_owner(producer)
-        raw_schema = get_raw_schema_config(producer.options, owner=owner)
         if is_source_producer_id(producer.producer_id):
+            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+            source_label = (f"source '{source_name}' ({producer.plugin_name})",)
+            try:
+                raw_schema = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+            except ValueError:
+                # A malformed declaration owns its rejection through the
+                # ``contract_config_invalid`` parsers; the walk abstains.
+                return None
             if raw_schema is None:
                 return None
             if raw_schema.fields is not None:
                 for field in raw_schema.fields:
                     if field.name == field_name:
-                        return None if field.field_type == "any" else field.field_type
+                        if field.field_type == "any" and mode == "edge":
+                            return None
+                        return KnownBranchFieldType(field_type=field.field_type, declared_by=source_label)
                 return None
             if not raw_schema.is_observed or field_name not in (raw_schema.guaranteed_fields or ()):
                 return None
 
-            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
             source_spec = source_map.get(source_name)
             if source_spec is None or producer.plugin_name is None:
                 return None
@@ -6410,7 +6458,9 @@ def _check_schema_contracts(
                 probe_options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
                 probe_options["on_validation_failure"] = source_spec.on_validation_failure
                 source = get_shared_plugin_manager().create_source(producer.plugin_name, probe_options)
-                return source.observed_value_type
+                if source.observed_value_type is None:
+                    return None
+                return KnownBranchFieldType(field_type=source.observed_value_type, declared_by=source_label)
             except Exception as exc:
                 if _is_source_config_probe_exception(exc):
                     return None
@@ -6423,19 +6473,36 @@ def _check_schema_contracts(
         if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
             return None
 
-        transform: TransformProtocol | None = None
+        upstream_field_name = field_name
         try:
-            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
-            transform = get_shared_plugin_manager().create_transform(
-                producer_node.plugin,
-                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
-            )
-            output_config = transform._output_schema_config
+            transform = probe_cache.transform(producer_node.plugin, producer_node)
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                return None
+            raise
+        output_config = transform._output_schema_config
+        config_declares_field = (
+            output_config is not None
+            and output_config.fields is not None
+            and any(field.name == field_name for field in output_config.fields)
+        )
+        node_label = (f"{producer_node.node_type} '{producer_node.id}' ({producer_node.plugin})",)
+        if mode == "union_merge":
+            declarations = transform.output_field_declarations()
+            carried_sources = transform.carried_output_sources()
+            if field_name in declarations:
+                return KnownBranchFieldType(field_type=declarations[field_name].field_type, declared_by=node_label)
+            if field_name in carried_sources:
+                upstream_field_name = carried_sources[field_name]
+            elif config_declares_field:
+                return None
+        if upstream_field_name == field_name:
             if output_config is not None and output_config.fields is not None:
                 for field in output_config.fields:
                     if field.name == field_name:
-                        return None if field.field_type == "any" else field.field_type
+                        if field.field_type == "any":
+                            return None
+                        return KnownBranchFieldType(field_type=field.field_type, declared_by=node_label)
 
             forwards_field_unchanged = (
                 transform.forwards_input_fields
@@ -6445,34 +6512,62 @@ def _check_schema_contracts(
             )
             if not ((transform.passes_through_input and transform.preserves_input_values) or forwards_field_unchanged):
                 return None
-        except Exception as exc:
-            if _is_config_probe_exception(exc):
-                return None
-            raise
-        finally:
-            if transform is not None:
-                transform.close()
 
-        upstream = resolver.find_producer_for(producer_node.input)
-        if upstream is None:
-            return None
-        upstream = _walk_producer_entry_to_real_producer(
-            upstream,
-            connection_name=producer_node.input,
-            warnings=[],
-        )
+        if mode == "union_merge":
+            upstream = _value_producer_through_gates(producer_node.input)
+        else:
+            upstream = resolver.find_producer_for(producer_node.input)
+            if upstream is None:
+                return None
+            upstream = _walk_producer_entry_to_real_producer(
+                upstream,
+                connection_name=producer_node.input,
+                warnings=[],
+            )
         if upstream is None:
             return None
         # Annotated because the recursive reference resolves to the DECORATED
         # name, whose type mypy cannot infer from inside the function it is
         # still defining; the annotation restores the declared return type.
-        upstream_type: str | None = _resolved_producer_field_type(
+        upstream_type: KnownBranchFieldType | None = _resolved_producer_field_type(
             upstream,
-            field_name,
+            upstream_field_name,
             source_map=source_map,
+            mode=mode,
             visited=visited | {producer.producer_id},
         )
         return upstream_type
+
+    def _value_producer_through_gates(connection_name: str) -> ProducerEntry | None:
+        """The source or plugin node whose row VALUES arrive on ``connection_name``, walking back through gates.
+
+        For the union-merge type walk only. A gate — a fork included — routes
+        the row it received unchanged (a fork copies it to every branch), so a
+        field's runtime contract type on a gate's output is its type on the
+        gate's input; the DAG walk recurses through gates for the same reason.
+        ``_walk_producer_entry_to_real_producer`` stops at a fork because
+        branch-aware GUARANTEE checks are out of its scope, which is not a
+        question about value types. A fan-in node (coalesce, queue,
+        row_union) abstains here: the composer does not mirror the DAG walk's
+        recursion into branches, so it under-refuses there and the runtime
+        residual stays.
+        """
+        visited_connections: set[str] = set()
+        current_connection = connection_name
+        while current_connection not in visited_connections:
+            visited_connections.add(current_connection)
+            producer = resolver.find_producer_for(current_connection)
+            if producer is None:
+                return None
+            if is_source_producer_id(producer.producer_id):
+                return producer
+            producer_node = resolver.get_node(producer.producer_id)
+            if producer_node is None:
+                return None
+            if producer_node.node_type != "gate":
+                return producer if producer_node.node_type in {"transform", "aggregation"} else None
+            current_connection = producer_node.input
+        return None
 
     def _consumer_typed_declarations(consumer: NodeSpec | OutputSpec, *, owner: str) -> tuple[FieldDefinition, ...]:
         """Return the consumer's declared fields whose type an edge can conflict with.
@@ -6577,8 +6672,8 @@ def _check_schema_contracts(
         mismatches: list[tuple[str, str, str]] = []
         for field_def in _consumer_typed_declarations(consumer, owner=consumer_component):
             producer_type = _resolved_producer_field_type(producer, field_def.name, source_map=source_map)
-            if producer_type is not None and not declared_type_name_admits(field_def.field_type, producer_type):
-                mismatches.append((field_def.name, field_def.field_type, producer_type))
+            if producer_type is not None and not declared_type_name_admits(field_def.field_type, producer_type.field_type):
+                mismatches.append((field_def.name, field_def.field_type, producer_type.field_type))
         if not mismatches:
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
@@ -6588,6 +6683,56 @@ def _check_schema_contracts(
             "high",
             "edge_field_type_incompatible",
         )
+
+    # A union coalesce whose every row would fail the runtime merge (two
+    # branches each guaranteeing a field and certainly typing it differently —
+    # a declared ``any`` rewrite against a carried concrete type is the common
+    # shape) is refused in EVERY schema mode, the all-observed case included,
+    # like the DAG build refuses it (``builder._refuse_certain_union_type_conflict``),
+    # through the same predicate over the same stamp tables. A coalesce whose
+    # mode-mix or typed-schema conflict is already reported is not a candidate:
+    # the runtime raises those before this check runs.
+    for coalesce_id, all_branches_merge, coalesce_branches in certain_conflict_candidates:
+        known_branch_fields: dict[str, dict[str, KnownBranchFieldType]] = {}
+        for branch_name, branch_connection in coalesce_branches:
+            try:
+                participated, present_fields = _connection_propagation_vote(branch_connection)
+            except ValueError:
+                # A branch whose schema block does not parse is reported by the
+                # ``contract_config_invalid`` parsers; its presence is unprovable.
+                continue
+            if not participated:
+                continue
+            branch_producer = _value_producer_through_gates(branch_connection)
+            if branch_producer is None:
+                continue
+            known: dict[str, KnownBranchFieldType] = {}
+            for field_name in sorted(present_fields):
+                resolved = _resolved_producer_field_type(branch_producer, field_name, source_map=source_map, mode="union_merge")
+                if resolved is not None:
+                    known[field_name] = resolved
+            known_branch_fields[branch_name] = known
+        certain_conflict = certain_union_type_conflict(
+            known_branch_fields,
+            all_branches_merge=all_branches_merge,
+            branch_order=tuple(branch_name for branch_name, _connection in coalesce_branches),
+        )
+        if certain_conflict is not None:
+            errors.append(
+                _err(
+                    f"node:{coalesce_id}",
+                    union_type_conflict_message(f"'{coalesce_id}'", certain_conflict),
+                    "high",
+                    "coalesce_union_type_incompatible",
+                    coalesce_union_type=CoalesceUnionTypeDetail(
+                        field=certain_conflict.field,
+                        branch_a=certain_conflict.branch_a,
+                        type_a=certain_conflict.type_a.field_type,
+                        branch_b=certain_conflict.branch_b,
+                        type_b=certain_conflict.type_b.field_type,
+                    ),
+                )
+            )
 
     for node in nodes:
         consumer_required, consumer_required_error = _parse_node_required_fields(node)

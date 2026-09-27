@@ -12,7 +12,7 @@ import hashlib
 import types
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -28,6 +28,9 @@ from elspeth.contracts.type_normalization import (
     classify_runtime_type,
     infer_field_type,
 )
+
+if TYPE_CHECKING:
+    from elspeth.contracts.schema import OutputFieldDeclarer
 
 
 def declared_type_admits(declared: type, actual: type) -> bool:
@@ -116,6 +119,31 @@ class FieldContract:
             source="inferred",
             nullable=nullable,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputFieldDeclaration:
+    """One row of a transform's output-declaration table (ADR-050): a field's declared contract and who declared it.
+
+    The table (``BaseTransform.output_field_declarations()``) is the ONE
+    authority the runtime stamp rewrites emitted contracts from
+    (``_apply_declared_output_field_contracts``), the engine's value check
+    reads the authorship bit from, and the DAG build publishes on
+    ``NodeInfo.output_field_declarations`` for build-time reasoning about
+    the types a node's rows will carry (the union-coalesce refusal,
+    ``core/dag/guarantees.resolve_guaranteed_field_type``). A reader never
+    re-derives it.
+    """
+
+    contract: FieldContract
+    declared_by: OutputFieldDeclarer
+
+    @property
+    def field_type(self) -> str:
+        """The schema-DSL type token of ``contract.python_type`` (``object`` is ``any``)."""
+        from elspeth.contracts.schema_contract_factory import field_type_name
+
+        return field_type_name(self.contract.python_type)
 
 
 @dataclass(frozen=True, slots=True)

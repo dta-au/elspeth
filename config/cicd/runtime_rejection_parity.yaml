@@ -2305,6 +2305,21 @@ sites:
   note: Stage 1's eager schema-syntax sweep (state.py:4788-4805) calls the same get_raw_schema_config
     over EVERY source, node and output, which covers all four runtime call sites of this helper (builder.py:293
     source, 318 sink, 382 transform, 442 aggregation).
+- key: 9f3e3714b369276a
+  path: src/elspeth/core/dag/builder.py
+  qualname: _refuse_certain_union_type_conflict
+  exception: GraphValidationError
+  message: <call:union_type_conflict_message>
+  ordinal: 0
+  disposition: abstains
+  counterpart:
+  - coalesce_union_type_incompatible
+  note: 'The certain union-merge type conflict (ADR-050 D8; lane 5887 G2). Stage 1 calls the SAME predicate
+    (union_merge.certain_union_type_conflict) over the same stamp tables (the probe instance''s output_field_declarations)
+    and emits coalesce_union_type_incompatible with the shared message text; agreement pinned by TestComposerRuntimeCertainUnionTypeConflictAgreement.
+    Abstains where the runtime walk reaches further: the composer does not recurse through fan-in (coalesce/queue/row_union)
+    producers or collectors, so a branch whose type is only provable through one is not refused at Stage
+    1 (under-refusal; the build still refuses).'
 - key: 562c0a28d56a6581
   path: src/elspeth/core/dag/builder.py
   qualname: _validate_output_schema_contract
@@ -3366,6 +3381,17 @@ sites:
   note: observed_value_type is written only at builder.py's SOURCE add_node site (from SourceProtocol.observed_value_type);
     any other node type carrying it is misrouted attribute threading — a framework wiring bug, unreachable
     from authored config. Sibling of the passes_through_input and declared_required_fields guards (elspeth-e6e552ce34).
+- key: e2538b5300ed1003
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.output_field_declarations/carried_output_sources are only meaningful for TRANSFORM,
+    AGGREGATION, or COLLECTOR nodes; node {} has type {}.
+  ordinal: 0
+  disposition: structural
+  note: output_field_declarations / carried_output_sources are written only by the builder's _published_output_declarations
+    helper at the transform, aggregation and collector add_node sites — all three admitted types; add_node
+    defaults both to empty.
 - key: ed073ec097a17c2a
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__

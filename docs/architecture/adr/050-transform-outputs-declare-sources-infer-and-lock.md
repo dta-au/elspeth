@@ -247,6 +247,18 @@ rows meet.**
    against `int`. A union coalesce promises one type to its consumers and
    `any` promises nothing; the operator's lever is to declare the type on
    the transform's schema. Pinned in `tests/unit/contracts/test_union_merge.py`.
+   A conflict that is known before row 1 is refused at build time in every
+   schema mode, the all-observed case included: when every branch merges on
+   every row (`require_all`, or a quorum of every branch) and two branches
+   each guarantee a field and resolve its runtime type — from the stamp table
+   the build publishes on `NodeInfo.output_field_declarations`, a carried
+   rename's source, or a source declaration, with `any` a type of its own —
+   and the types differ, the build and the composer refuse it through one
+   predicate (`union_merge.certain_union_type_conflict`), naming both
+   declarers and the remedy (declare the type on every branch). Only the
+   residual whose type depends on per-row inference (an observed upstream)
+   routes as `contract_type_conflict`, now rendering `object` as `any`.
+   Pinned in `tests/integration/pipeline/test_certain_union_type_conflict.py`.
 9. **`ContractMergeError` is seam-neutral.** It carries a field and two type
    names; the caller assigns the tier (a coalesce routes the row, the node
    writer re-raises Tier 1, the description join never raises it).

@@ -34,6 +34,7 @@ import pytest
 from elspeth.contracts import PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
 from elspeth.core.dag.models import GraphValidationError
@@ -526,6 +527,13 @@ class _ThreadingFakeBatchTransform:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
 
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     creates_tokens = False
@@ -558,6 +566,13 @@ class _ThreadingFakeOpenerTransform:
     def declared_created_fields(self) -> frozenset[str]:
         # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
         return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
