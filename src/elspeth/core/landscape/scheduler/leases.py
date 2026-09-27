@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import ColumnElement, and_, case, or_, select, update
+from sqlalchemy import ColumnElement, and_, case, func, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import (
@@ -19,14 +19,22 @@ from elspeth.contracts.coordination import (
     CoordinationToken,
     WorkerMembershipToken,
 )
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import (
+    RESUME_REFUSAL_TOKEN_ID_LIMIT,
+    ResumeCoverageRefusal,
+    SchedulerEventType,
+    TokenWorkItem,
+    TokenWorkStatus,
+)
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
 from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     fenced_member_transaction,
+    record_coordination_event,
     record_coordination_events,
 )
 from elspeth.core.landscape.scheduler.events import SchedulerEventRecord, SchedulerEventStore
@@ -42,7 +50,9 @@ from elspeth.core.landscape.schema import (
     group_losses_table,
     pending_sink_bundle_clause,
     run_workers_table,
+    token_outcomes_table,
     token_work_items_table,
+    tokens_table,
     undecided_failed_work_clause,
 )
 
@@ -925,6 +935,79 @@ class SchedulerLeaseRepository:
                 ],
             )
         return len(undecided)
+
+    def verify_resume_coverage(self, *, coordination_token: CoordinationToken) -> ResumeCoverageRefusal | None:
+        """Resume's one coverage check: every token is decided or covered by scheduler work (resume only).
+
+        Resume re-drives only durable scheduler work and never re-derives a
+        row, so a resumable run must account for every token: a completed
+        outcome, or a READY / LEASED / BLOCKED / PENDING_SINK work item. Run
+        under the resuming leader's seat after ``requeue_undecided_failed_work``
+        (a FAILED item left after it belongs to a decided token) and after the
+        barrier-journal restore (which mints the work of committed barrier
+        residuals), before anything is re-driven or written to a sink.
+
+        ABANDONED tokens are not counted here: ADR-038 declares them
+        non-resumable, and the status derive's ABANDONED belt refuses them on
+        every resume branch before any re-drive.
+
+        Returns ``None`` when every token is accounted for. Otherwise records
+        ONE value-free ``resume_refused`` coordination event (the count and the
+        sorted head of the token ids — ELSPETH identifiers, never row values)
+        in the same leader-fenced transaction, commits it, and returns the
+        refusal for the caller to raise. The run stays resumable-but-refusing
+        (lane ruling M2): nothing is swept or abandoned here.
+        """
+        require_coordination_token(coordination_token, verb="verify_resume_coverage")
+        run_id = coordination_token.run_id
+        tokens = tokens_table
+        outcomes = token_outcomes_table
+        decided_or_abandoned = (
+            select(outcomes.c.outcome_id)
+            .where(outcomes.c.run_id == tokens.c.run_id)
+            .where(outcomes.c.token_id == tokens.c.token_id)
+            .where(or_(outcomes.c.completed == 1, outcomes.c.path == TerminalPath.ABANDONED.value))
+            .exists()
+        )
+        covered = (
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == tokens.c.run_id)
+            .where(token_work_items_table.c.token_id == tokens.c.token_id)
+            .where(
+                token_work_items_table.c.status.in_(
+                    (
+                        TokenWorkStatus.READY.value,
+                        TokenWorkStatus.LEASED.value,
+                        TokenWorkStatus.BLOCKED.value,
+                        TokenWorkStatus.PENDING_SINK.value,
+                    )
+                )
+            )
+            .exists()
+        )
+        uncovered = select(tokens.c.token_id).where(tokens.c.run_id == run_id).where(~decided_or_abandoned).where(~covered)
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="verify_resume_coverage") as conn:
+            token_count = conn.execute(select(func.count()).select_from(uncovered.subquery())).scalar_one()
+            if token_count == 0:
+                return None
+            first_token_ids = tuple(
+                conn.execute(uncovered.order_by(tokens.c.token_id).limit(RESUME_REFUSAL_TOKEN_ID_LIMIT)).scalars().all()
+            )
+            refusal = ResumeCoverageRefusal(token_count=token_count, first_token_ids=first_token_ids)
+            record_coordination_event(
+                conn,
+                run_id=coordination_token.run_id,
+                event_type="resume_refused",
+                worker_id=coordination_token.worker_id,
+                leader_epoch=coordination_token.leader_epoch,
+                recorded_at=read_landscape_decision_time(conn),
+                context={
+                    "cause": "uncovered_undecided_tokens",
+                    "token_count": refusal.token_count,
+                    "first_token_ids": list(refusal.first_token_ids),
+                },
+            )
+        return refusal
 
     def heartbeat_lease(
         self,

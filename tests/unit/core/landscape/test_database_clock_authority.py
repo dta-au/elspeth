@@ -180,7 +180,9 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # ONE fenced_leader_transaction recording a rejected row's whole audit record) and
 # NodeStateRepository.record_failed_source_quarantine_state_on (its step-0 FAILED state,
 # fence-extended on the caller's connection) arrive. Re-derived by RUNNING the gate.
-_CLOCK_BOUNDARY_DIGEST = "c864f58dfb3ab367601d8cec170af23a58bf90e9095c84b97572df9c38311347"
+# QR H2 (resume coverage check): c864f58d… → the value below, +1 identity:
+# SchedulerLeaseRepository.verify_resume_coverage. Re-derived by RUNNING the gate.
+_CLOCK_BOUNDARY_DIGEST = "aecd851337f99f935215c8d914b386ab2e8cb782b9163571f0026984eb5c8e11"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -368,6 +370,9 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         # outcome to READY (lane ruling 2026-09-26, option A2): it clears the
         # lease columns under the epoch fence and stamps Landscape decision time.
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.requeue_undecided_failed_work"),
+        # Resume's coverage check (QR H2): stamps its value-free resume_refused
+        # coordination event with Landscape decision time under the epoch fence.
+        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.verify_resume_coverage"),
         ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_row_with_initial_claim"),
         ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),

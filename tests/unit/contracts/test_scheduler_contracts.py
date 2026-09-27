@@ -5,12 +5,15 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 
 from elspeth.contracts.scheduler import (
+    RESUME_REFUSAL_TOKEN_ID_LIMIT,
     BufferedOutcomeSpec,
     GroupLossSpec,
+    ResumeCoverageRefusal,
     SchedulerEvent,
     SchedulerEventType,
     TokenWorkStatus,
@@ -99,3 +102,31 @@ class TestGroupLossSpec:
         spec = GroupLossSpec(closer_name="c", group_id="g", member_key="m", token_id="t", reason="r")
         with pytest.raises(FrozenInstanceError):
             spec.reason = "other"  # type: ignore[misc]
+
+
+class TestResumeCoverageRefusal:
+    """The resume coverage refusal carries a count and the sorted, bounded head of ELSPETH token ids."""
+
+    def test_names_every_token_up_to_the_limit(self) -> None:
+        refusal = ResumeCoverageRefusal(token_count=2, first_token_ids=("tok-a", "tok-b"))
+        assert refusal.first_token_ids == ("tok-a", "tok-b")
+
+    def test_names_only_the_bounded_head_of_a_large_set(self) -> None:
+        head = tuple(f"tok-{index:02d}" for index in range(RESUME_REFUSAL_TOKEN_ID_LIMIT))
+        assert ResumeCoverageRefusal(token_count=500, first_token_ids=head).token_count == 500
+
+    @pytest.mark.parametrize(
+        ("token_count", "first_token_ids", "error"),
+        [
+            (0, (), ValueError),
+            (2, ("tok-a",), ValueError),
+            (1, ["tok-a"], TypeError),
+            (1, ("",), ValueError),
+            (2, ("tok-b", "tok-a"), ValueError),
+            (2, ("tok-a", "tok-a"), ValueError),
+        ],
+        ids=["zero", "short-head", "list", "empty-id", "unsorted", "duplicate"],
+    )
+    def test_rejects_malformed_refusals(self, token_count: int, first_token_ids: Any, error: type[Exception]) -> None:
+        with pytest.raises(error):
+            ResumeCoverageRefusal(token_count=token_count, first_token_ids=first_token_ids)

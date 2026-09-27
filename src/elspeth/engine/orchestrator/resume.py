@@ -269,6 +269,29 @@ def run_resume_processing_loop(
     return interrupted_by_shutdown
 
 
+def refuse_unaccounted_resume(factory: RecorderFactory, coordination_token: CoordinationToken) -> None:
+    """Refuse a resume with an undecided token no scheduler work covers (the one resume coverage check).
+
+    ``verify_resume_coverage`` records the refusal as a value-free
+    ``resume_refused`` coordination event under this leader's seat before this
+    raises; the resume failure ceremony then stamps the run FAILED. Nothing is
+    re-driven, so the run stays resumable-but-refusing (lane ruling M2).
+
+    Raises:
+        AuditIntegrityError: A token is neither decided nor covered by
+            scheduler work.
+    """
+    refusal = factory.scheduler.leases.verify_resume_coverage(coordination_token=coordination_token)
+    if refusal is None:
+        return
+    raise AuditIntegrityError(
+        f"Resume of run {coordination_token.run_id!r} refused: {refusal.token_count} token(s) have no completed "
+        "outcome and no durable scheduler work item; resume re-drives only scheduler work and never re-derives a "
+        f"row, so it cannot account for them. First token id(s): {', '.join(refusal.first_token_ids)}. "
+        "Recorded as a resume_refused coordination event; nothing was re-driven."
+    )
+
+
 def _resume_failure_result_from_baseline(
     run_id: str,
     *,
@@ -942,6 +965,9 @@ class ResumeCoordinator:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
             if not state.has_restored_barrier_work and not has_active_scheduler_work and not pending_empty_collector_groups:
                 check_combined_coordination_latch()
+                # No work and no restored barrier holds: nothing remains for a
+                # journal restore to mint, so the coverage check is complete here.
+                refuse_unaccounted_resume(factory, coordination_token)
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
                 # No scheduler work remains - complete the run.
@@ -1164,6 +1190,11 @@ class ResumeCoordinator:
 
             preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
             try:
+                # The processor is built and the barrier journal restored (which
+                # mints the work of committed coalesce/aggregation residuals):
+                # every token must now be decided or covered before anything is
+                # re-driven or written to a sink.
+                refuse_unaccounted_resume(factory, coordination_token)
                 run_transform_runtime_preflights(
                     factory,
                     run_id,

@@ -1646,7 +1646,7 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 68, Landscape epoch 46 and `run_web_plugin_policy` presence,
+session epoch 68, Landscape epoch 47 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and

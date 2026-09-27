@@ -45,7 +45,7 @@ Session epoch 68 adds `compose_checkpoint` and `ordinary_proposal_checkpoint`
 to the persisted proposal rebase reasons. These events keep pending proposals
 bound to the current composition head across checkpoints. Earlier readers
 reject the new reasons, so epoch-67 session databases must also be recreated.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 46 for immutable web
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 47 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
@@ -70,16 +70,23 @@ of sparse source streams. Its scheduler event vocabulary also includes
 `resume_requeue_failed`; a Landscape store created from an earlier 0.8.1
 pre-release build at epoch 46 has the narrower `event_type` CHECK and is
 refused at startup; recreate it.
+Epoch 47 hands a source-quarantined row to its sink through a durable
+PENDING_SINK work item written in the same transaction that records it, and
+resume re-drives only scheduler work: it never re-derives a source row, and it
+refuses (recording a value-free `resume_refused` coordination event) a run with
+an undecided token that no scheduler work covers. A store written before epoch
+47 can hold a quarantined token with no work item, which resume would now
+refuse as corruption, so it is refused at startup; recreate it.
 These changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 68 (including epoch 67) and Landscape databases below epoch 46 must be
+epoch 68 (including epoch 67) and Landscape databases below epoch 47 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 68, Landscape 46); these are not minimum versions.
+current schema epoch (session 68, Landscape 47); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

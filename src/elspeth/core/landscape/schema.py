@@ -466,7 +466,17 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        2026-09-26, no bump; a store created before the fold carries the
 #        narrower CHECK and startup shape validation refuses it). Populated
 #        epoch-45 stores require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 46
+#  47 → A source-quarantined row is handed to its sink through a durable
+#        PENDING_SINK work item written in its ingest transaction (the fifth
+#        pending_sink_bundle_clause arm), resume re-drives only scheduler work
+#        and never re-derives a row, and the run_coordination_events
+#        event_type CHECK admits ``resume_refused`` (resume refuses a run whose
+#        tokens are neither decided nor covered by scheduler work). A store
+#        written before this epoch can hold a quarantined token with no work
+#        item that the new resume refuses as corruption, so only a bump — not
+#        a fold — keeps such a store from opening. Populated epoch-46 stores
+#        require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 47
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -1269,11 +1279,13 @@ run_coordination_events_table = Table(
     Column("context_json", Text, nullable=False, server_default=text("'{}'")),
     # All 10 event types from the design DDL (§A.2), including the slice-4
     # producers worker_stalled and heartbeat_degraded — pinned into the
-    # epoch-21 CHECK now so slice 4 needs no schema change.
+    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 47's
+    # resume_refused: the resuming leader's value-free record of a run whose
+    # tokens resume cannot account for (SchedulerLeaseRepository.verify_resume_coverage).
     CheckConstraint(
         "event_type IN ('worker_register', 'worker_depart', 'worker_evict', 'worker_stalled', "
         "'leader_acquire', 'leader_release', 'leadership_lost', "
-        "'fence_refusal', 'heartbeat_degraded', 'finalize')",
+        "'fence_refusal', 'heartbeat_degraded', 'finalize', 'resume_refused')",
         name="ck_run_coordination_events_event_type",
     ),
     # Mandatory: without the table kwarg, SQLAlchemy emits a bare INTEGER

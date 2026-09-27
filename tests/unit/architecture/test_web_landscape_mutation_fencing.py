@@ -919,8 +919,12 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "a00408f8bf0645a4a7cecd06626d460c28b01fe72d
 # and its own _park_source_quarantine_on; _park_source_quarantine_on -> insert_work_items
 # and SchedulerEventStore.record_many; record_failed_source_quarantine_state_on ->
 # verify_and_extend_leader_fence. Measured by scripts/fencing_inventory.py.
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 153
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "8bddd1d26d54870da55e1382df5b140fcdddb22605a412e5a6a4be0b17c2978f"
+# QR H2 (resume coverage check): 153 -> 154, 8bddd1d2… -> the value below. Arrived:
+# SchedulerLeaseRepository.verify_resume_coverage -> record_coordination_event (the
+# value-free resume_refused event, on the verb's one leader-fenced connection, run
+# subject coordination_token.run_id). Measured by scripts/fencing_inventory.py.
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 154
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "932a286b18763e20e8f1ebfcc883d704947960894a636f6e147ce1e422b9277a"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
