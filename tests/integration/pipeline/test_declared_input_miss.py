@@ -239,6 +239,64 @@ def test_on_error_discard_records_the_routed_miss_as_a_failure(tmp_path: Path) -
     assert sum(count for key, count in outcomes.items() if key.startswith("failure/")) == 2, outcomes
 
 
+def test_a_field_only_a_lost_branch_created_routes_after_a_best_effort_union(tmp_path: Path) -> None:
+    """Review-R2 r1 F1: a best-effort union's lost branch is a row fact, never a proven miss.
+
+    fork → (pa: passthrough | pb: value_transform creating y) → best_effort
+    union → type_coerce on y. The row whose pb branch fails (a=3) merges as the
+    pa branch alone, without y. The build does not prove y (the pa branch
+    abstains), so that row routes as missing_field; before the fix the
+    coalesce published y as guaranteed and the run ended (exit 4).
+    """
+    (tmp_path / "in.jsonl").write_text('{"a": 1, "b": "2"}\n{"a": 3, "b": "4"}\n')
+    settings: dict[str, Any] = {
+        "sources": {
+            "src": {
+                "plugin": "json",
+                "on_success": "rows",
+                "options": {"path": str(tmp_path / "in.jsonl"), "format": "jsonl", "on_validation_failure": "discard", "schema": _OBSERVED},
+            }
+        },
+        "concurrency": {"max_workers": 1},
+        "gates": [{"name": "g", "input": "rows", "condition": "True", "routes": {"true": "fork", "false": "out"}, "fork_to": ["pa", "pb"]}],
+        "transforms": [
+            {"name": "ta", "plugin": "passthrough", "input": "pa", "on_success": "da", "on_error": "q", "options": {"schema": _OBSERVED}},
+            {
+                "name": "tb",
+                "plugin": "value_transform",
+                "input": "pb",
+                "on_success": "db",
+                "on_error": "q",
+                "options": {"schema": _OBSERVED, "operations": [{"target": "y", "expression": "1 // (row['a'] - 3)"}]},
+            },
+            {
+                "name": "tail",
+                "plugin": "type_coerce",
+                "input": "m",
+                "on_success": "out",
+                "on_error": "q",
+                "options": {"schema": _OBSERVED, "conversions": [{"field": "y", "to": "str"}]},
+            },
+        ],
+        "coalesce": [{"name": "m", "branches": {"pa": "da", "pb": "db"}, "policy": "best_effort", "timeout_seconds": 5, "merge": "union"}],
+        "sinks": {"out": _json_sink(tmp_path / "out.jsonl"), "q": _json_sink(tmp_path / "q.jsonl")},
+        "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
+    }
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+
+    result = _cli("run", "-s", str(path), "--execute")
+
+    assert "Traceback" not in result.output
+    assert result.exit_code == 1, result.output
+    outcomes = _terminal_outcomes(tmp_path)
+    assert "NONTERMINAL" not in outcomes, outcomes
+    assert outcomes.get("failure/on_error_routed") == 2, outcomes
+    reasons = [(reason["reason"], tuple(reason.get("fields", ()))) for reason in _routed_reasons(tmp_path)]
+    assert ("missing_field", ("y",)) in reasons, reasons
+
+
 def _inject_before_transform(monkeypatch: pytest.MonkeyPatch, rewrite: Callable[[PipelineRow], PipelineRow]) -> None:
     """Stand in for an engine defect that hands the transform a row other than the one upstream produced."""
     original = TransformExecutor.execute_transform

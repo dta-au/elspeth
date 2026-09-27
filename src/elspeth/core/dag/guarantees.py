@@ -158,7 +158,9 @@ def get_effective_guaranteed_fields(graph: ExecutionGraph, node_id: str) -> froz
 
     For coalesce nodes, builder.py pre-computes strategy-aware guarantees:
     - **union** with require_all: union of branch guarantees (all branches arrive)
-    - **union** with other policies: intersection (only fields in ALL branches)
+    - **union** with other policies: intersection (only fields in ALL branches);
+      one abstaining branch makes the coalesce abstain (a merged row can be
+      that branch alone)
     - **nested**: the node's own guarantees (branch names, not inner fields)
     - **select**: the node's own guarantees (selected branch's schema)
 

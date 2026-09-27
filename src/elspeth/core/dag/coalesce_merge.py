@@ -122,7 +122,8 @@ def merge_coalesce_schema(
     schemas used SOLELY for the ``guaranteed_fields`` merge, decoupled from the
     ``branch_schemas`` used for the typed-field / mode / audit merge. The DAG
     builder passes each branch producer's PROPAGATION-WALKED effective
-    guarantee here (skipping non-participating branches), so fields a
+    guarantee here (an abstaining branch as a schema without guarantees, so
+    ``merge_guaranteed_fields`` can apply its policy rule to it), so fields a
     pass-through branch inherits from upstream survive the union — the raw
     per-branch ``guaranteed_fields`` omits them, which under-computed the
     coalesce guarantee and made ``validate_edge_compatibility`` reject runnable
@@ -185,32 +186,58 @@ def merge_guaranteed_fields(
     Computes the merged guaranteed_fields tuple for a coalesce node based on
     the effective guarantees from each branch and the coalesce policy.
 
+    Every branch of the coalesce must be passed, an abstaining one included
+    (a schema without effective guarantees: the branch's producer vouches for
+    nothing, e.g. an observed pass-through). The two policies treat it
+    differently, because they differ in which branches a merged row is made of:
+
+    - ``require_all``: every branch arrives, so the merged row carries the
+      union of every branch's guarantees. An abstainer adds nothing to that
+      union and is skipped; the others' guarantees still hold.
+    - other policies: any branch may be lost, so a merged row can be made of
+      the abstaining branch alone and carries only what EVERY branch
+      guarantees. An abstainer vouches for nothing, so the coalesce can
+      vouch for nothing either and abstains — the same rule the queue and
+      row_union fan-ins apply (``walk_effective_guarantee_vote``: one
+      abstaining arm collapses the vote to abstention, which keeps a
+      downstream sink deferred to per-row enforcement). Skipping the
+      abstainer here published a field only one branch creates as
+      guaranteed, so a legitimate branch loss (a row fact) became a proven
+      declared-input miss and ended the run (ADR-013 Amendment 2026-09-27,
+      R2 fix round 1).
+
     Args:
-        branch_schemas: Map of branch name to SchemaConfig
+        branch_schemas: Map of branch name to SchemaConfig, one per branch
         require_all: If True, use union semantics (all branches always arrive,
             so any branch's guarantee survives). If False, use intersection
             semantics (some branches may be lost, so only shared guarantees
             survive).
 
     Returns:
-        Merged guaranteed fields tuple, or None if no branch has effective
-        guarantees (abstention semantics — the coalesce makes no claim).
+        Merged guaranteed fields tuple, or None to abstain (the coalesce makes
+        no claim): no branch has effective guarantees, or — under a policy
+        other than ``require_all`` — any branch has none.
 
     Note:
         The None-vs-empty-tuple distinction is semantic:
-        - None = no branch has effective guarantees (abstain from vote)
+        - None = the coalesce abstains from the vote
         - () = branches have guarantees but merge is empty set (explicit zero)
     """
     guaranteed_sets: list[set[str]] = []
+    any_branch_abstains = False
     for schema_cfg in branch_schemas.values():
         if schema_cfg.has_effective_guarantees:
             guaranteed_sets.append(set(schema_cfg.get_effective_guaranteed_fields()))
+        else:
+            any_branch_abstains = True
 
     if not guaranteed_sets:
         return None
 
     if require_all:
         merged = set.union(*guaranteed_sets)
+    elif any_branch_abstains:
+        return None
     else:
         merged = set.intersection(*guaranteed_sets)
 

@@ -344,7 +344,14 @@ drained and repair this release forward.
   `azure_ai_search` `query_field`, `blob_fetch` and `web_scrape` `url_field`,
   `llm` `image_inputs` columns, and `json_explode` `array_field`. A field the build did prove present (every upstream
   guarantees it), or one the row carries while its contract lost it, is still
-  our defect and ends the run. Aggregations and collectors classify a buffered
+  our defect and ends the run. After a `merge: union` coalesce whose policy
+  can lose a branch (`best_effort`, `quorum`, `first`), a field counts as
+  proved only when every branch guarantees it: a branch that declares no
+  guarantees can be the whole merged row, so a field only another branch
+  creates is a fact about the row and a row without it routes. For the same
+  reason a `mode: fixed` consumer after such a coalesce is no longer refused
+  at build for a field only one branch guarantees; it checks each row.
+  Aggregations and collectors classify a buffered
   row's missing `schema.required_fields` column with the same rule: an
   unproven absence fails the batch through `on_error`, and a proven one ends
   the run with every buffered aggregation row recorded `failed` first. An

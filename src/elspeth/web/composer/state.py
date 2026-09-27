@@ -5635,8 +5635,9 @@ def _check_schema_contracts(
                 # of the declared branch names and ``require_all`` and never
                 # reads a branch's guarantees at all. That is why this dispatches
                 # BEFORE the per-branch vote below — the walk is dead work here,
-                # and the vote's participation filter (which drops abstaining
-                # branches) would under-report the branch-name set.
+                # and the union merge's abstention rule (an abstaining branch
+                # under a non-require_all policy abstains the whole vote) would
+                # under-report the branch-name set.
                 #
                 # Running the union arm on a nested merge claimed the branches'
                 # inner fields, so Stage 1 validated GREEN a pipeline the DAG
@@ -5663,46 +5664,31 @@ def _check_schema_contracts(
                     branch_connection,
                     visited_fan_in_ids=visited_fan_in_ids | {producer_node.id},
                 )
-                if not branch_participates:
-                    continue
+                # EVERY branch enters, an abstainer as a schema without
+                # guarantees, exactly as the DAG builder builds its
+                # ``guarantee_branch_schemas``: ``merge_guaranteed_fields``
+                # skips it under require_all and abstains on it under every
+                # other policy (a merged row can be that branch alone), so
+                # this vote and the runtime's read one rule (R2 fix round 1).
                 branch_schemas[branch_name] = SchemaConfig(
                     mode="observed",
                     fields=None,
-                    guaranteed_fields=tuple(sorted(branch_guarantees)),
+                    guaranteed_fields=tuple(sorted(branch_guarantees)) if branch_participates else None,
                 )
-
-            if not branch_schemas:
-                return False, frozenset()
 
             merged = merge_guaranteed_fields(
                 branch_schemas,
                 require_all=require_all,
             )
-            # ``merge_guaranteed_fields`` documents None and () as SEMANTICALLY
-            # distinct — None is "no branch has effective guarantees, abstain",
-            # () is "branches have guarantees and the merge is empty". The
-            # ``or ()`` therefore looks like it flattens an abstention into an
-            # assertion. It cannot, and the reason is three lines up, not here:
-            #
-            #   * the loop ``continue``s on every non-participating branch, so
-            #     an abstainer never enters ``branch_schemas``;
-            #   * ``if not branch_schemas`` returns participated=False above,
-            #     so the all-abstained case never reaches this call;
-            #   * every surviving entry is built with an explicit
-            #     ``guaranteed_fields=tuple(...)``, never None, so
-            #     ``has_effective_guarantees`` is True for all of them.
-            #
-            # With at least one participating set present, the None limb is
-            # unreachable, and participated=True is the correct answer. The
-            # ``or ()`` stays as a fail-safe rather than an assert: if a future
-            # edit let None through, it would reach
-            # ``_mirrored_coalesce_merged_guarantees``, whose three consumers
-            # all test ``is not None``, and an abstention arriving as
-            # ``frozenset()`` would make them adjudicate the coalesce as a
-            # zero-guarantee producer and false-reject a downstream sink. Any
-            # edit that removes the ``continue`` or the empty-case return owes
-            # this line a real abstention channel.
-            return True, frozenset(merged or ())
+            # None is the abstention channel ``merge_guaranteed_fields``
+            # documents (no branch vouches, or a non-require_all policy with an
+            # abstaining branch); () is a participating empty merge. Flattening
+            # None into frozenset() would make the three consumers of
+            # ``_mirrored_coalesce_merged_guarantees`` adjudicate the coalesce
+            # as a zero-guarantee producer and false-reject a downstream sink.
+            if merged is None:
+                return False, frozenset()
+            return True, frozenset(merged)
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 

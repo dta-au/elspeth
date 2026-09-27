@@ -268,6 +268,100 @@ assert "row_unions" not in _COALESCE_YAML
 assert "input: variant_union" in _COALESCE_YAML
 
 
+# The red-team case (review-R2 r1 F1): an observed source forks into a
+# pass-through branch (abstains: it vouches for nothing) and a branch that
+# CREATES y; a union coalesce merges them and type_coerce declares y.
+_LOST_BRANCH_YAML = """
+sources:
+  src:
+    plugin: json
+    on_success: rows
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema: {{mode: observed}}
+gates:
+  - name: g
+    input: rows
+    condition: "True"
+    routes: {{'true': fork, 'false': out}}
+    fork_to: [pa, pb]
+transforms:
+  - name: ta
+    plugin: passthrough
+    input: pa
+    on_success: da
+    on_error: q
+    options: {{schema: {{mode: observed}}}}
+  - name: tb
+    plugin: value_transform
+    input: pb
+    on_success: db
+    on_error: q
+    options:
+      schema: {{mode: observed}}
+      operations: [{{target: y, expression: "1 // (row['a'] - 3)"}}]
+  - name: tail
+    plugin: type_coerce
+    input: m
+    on_success: out
+    on_error: q
+    options: {{schema: {{mode: observed}}, conversions: [{{field: y, to: str}}]}}
+coalesce:
+  - name: m
+    branches: {{pa: da, pb: db}}
+    policy: {policy}
+    merge: union
+    {timeout}
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options: {{path: {output_path}, format: jsonl, schema: {{mode: observed}}}}
+  q:
+    plugin: json
+    on_write_failure: discard
+    options: {{path: {quarantine_path}, format: jsonl, schema: {{mode: observed}}}}
+"""
+
+
+class TestLostBranchIsARowFact:
+    """A field only one branch creates is proven only when every branch arrives (R2 fix round 1).
+
+    Under a policy that can lose a branch, a merged row can be the abstaining
+    pass-through branch alone, so y is a row fact: its absence routes
+    (missing_field) instead of ending the run as a proven miss. Under
+    require_all every branch arrives, so y is on every merged row and a miss
+    there is our bug (Tier 1).
+    """
+
+    @pytest.mark.parametrize(
+        ("policy", "timeout", "expected"),
+        [
+            pytest.param("require_all", "", frozenset({"y"}), id="require_all"),
+            pytest.param("best_effort", "timeout_seconds: 5", frozenset(), id="best_effort"),
+            pytest.param("first", "", frozenset(), id="first"),
+        ],
+    )
+    def test_the_tail_proof_of_a_field_one_branch_creates(
+        self, tmp_path: Path, policy: str, timeout: str, expected: frozenset[str]
+    ) -> None:
+        input_path = tmp_path / "in.jsonl"
+        input_path.write_text('{"a": 1, "b": "2"}\n')
+        graph = _build(
+            _LOST_BRANCH_YAML.format(
+                input_path=input_path,
+                output_path=tmp_path / "out.jsonl",
+                quarantine_path=tmp_path / "q.jsonl",
+                policy=policy,
+                timeout=timeout,
+            )
+        )
+        tail = graph.get_transform_name_id_map()["tail"]
+        assert graph.get_declared_input_proof()[tail] == expected
+
+
 class TestPublishedOnTheFinalGraph:
     """The builder publishes the proof after the rule-9 DIVERT edges (architect A3/T6)."""
 
@@ -298,9 +392,11 @@ class TestPublishedOnTheFinalGraph:
         the failing token terminalizes at the transform exactly as a branch
         loss and never reaches the closer (engine/token_traversal.py). The
         coalesce guarantee the builder computes (union for require_all,
-        intersection otherwise) already accounts for lost branches, so the
+        intersection otherwise) accounts for lost branches, so the
         successor's proof is the same with and without the error edge, under
-        both policies. The row_union vote above instead abstains on any DIVERT
+        both policies. Here `b` is a field EVERY branch guarantees; a field
+        only one branch creates is the lost-branch case pinned in
+        TestLostBranchIsARowFact. The row_union vote above instead abstains on any DIVERT
         in-edge — conservative (it under-proves; recorded as a vote-precision
         residual for the lane), and pinned so a change to it is judged.
         """

@@ -6936,6 +6936,127 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
         assert entries[0].contract.extra_fields == ("id", "product")
 
 
+class TestComposerRuntimeAbstainingCoalesceBranchAgreement:
+    """A union coalesce with an ABSTAINING branch: both surfaces, both policies (R2 fix round 1).
+
+    arm_a is an observed pass-through behind an observed source, so it vouches
+    for nothing; arm_b guarantees ``product`` and ``description``. Under
+    require_all every branch arrives, so the merged row carries arm_b's
+    guarantees and ``product`` is a definite extra for the locked sink — both
+    surfaces reject it. Under best_effort a merged row can be arm_a alone, so
+    the coalesce abstains (``merge_guaranteed_fields``) and neither surface
+    rejects: the sink enforces per row. Skipping the abstainer (the rule before
+    this fix) published arm_b's set under best_effort too, which made a lost
+    branch a proven declared-input miss downstream (Tier 1, run abort).
+
+    The composer reaches the merge through ``_producer_entry_propagation_vote``
+    and the runtime through the builder's ``guarantee_branch_schemas``; both
+    must hand ``merge_guaranteed_fields`` every branch, the abstainer included.
+    """
+
+    def _doc(self, tmp_path: Path, policy: str) -> dict[str, Any]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("id,product,description\n1,widget,a short blurb\n", encoding="utf-8")
+        coalesce: dict[str, Any] = {
+            "name": "merge_results",
+            "branches": {"branch_a": "done_a", "branch_b": "done_b"},
+            "policy": policy,
+            "merge": "union",
+            "on_success": "main",
+        }
+        if policy == "best_effort":
+            coalesce["timeout_seconds"] = 5
+        return {
+            "sources": {
+                "primary": {
+                    "plugin": "csv",
+                    "on_success": "gate_in",
+                    "options": {"path": str(csv_path), "schema": {"mode": "observed"}, "on_validation_failure": "discard"},
+                }
+            },
+            "gates": [
+                {
+                    "name": "fork_gate",
+                    "input": "gate_in",
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "fork"},
+                    "fork_to": ["branch_a", "branch_b"],
+                }
+            ],
+            "transforms": [
+                {
+                    "name": "arm_a",
+                    "plugin": "passthrough",
+                    "input": "branch_a",
+                    "on_success": "done_a",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+                {
+                    "name": "arm_b",
+                    "plugin": "passthrough",
+                    "input": "branch_b",
+                    "on_success": "done_b",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed", "guaranteed_fields": ["product", "description"]}},
+                },
+            ],
+            "coalesce": [coalesce],
+            "sinks": {
+                "main": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": str(tmp_path / "out.jsonl"),
+                        "format": "jsonl",
+                        "schema": {"mode": "fixed", "fields": ["description: str"]},
+                    },
+                }
+            },
+        }
+
+    @pytest.mark.parametrize(
+        ("policy", "expected_extras"),
+        [pytest.param("require_all", ("product",), id="require_all"), pytest.param("best_effort", None, id="best_effort")],
+    )
+    def test_both_surfaces_read_one_merge_rule(self, tmp_path: Path, policy: str, expected_extras: tuple[str, ...] | None) -> None:
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        text = yaml.safe_dump(self._doc(tmp_path, policy), sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(text).validate()
+        composer_extras = [error for error in composer_result.errors if error.error_code == "sink_locked_extras"]
+
+        config = load_settings_from_yaml_string(text)
+        plugins = instantiate_plugins_from_config(config)
+        runtime_extras: tuple[str, ...] | None = None
+        try:
+            graph = ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(config.gates),
+                coalesce_settings=list(config.coalesce),
+            )
+            graph.validate_edge_compatibility()
+        except EdgeContractError as exc:
+            runtime_extras = exc.compatibility_result.extra_fields
+
+        assert runtime_extras == expected_extras
+        if expected_extras is None:
+            assert composer_extras == [], composer_result.errors
+            assert composer_result.is_valid, composer_result.errors
+        else:
+            assert len(composer_extras) == 1, composer_result.errors
+            assert composer_extras[0].contract is not None
+            assert composer_extras[0].contract.extra_fields == runtime_extras
+
+
 class TestComposerRuntimeCensusAgreement:
     """Shapes 21-25 — the 2026-08-17 census closures (elspeth-2ed41f0a4a).
 

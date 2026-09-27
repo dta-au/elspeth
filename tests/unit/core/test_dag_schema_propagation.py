@@ -1213,19 +1213,29 @@ class TestCoalesceMaterializedSchemaFromBuilder:
             coalesce_settings=[coalesce],
         )
 
-    def test_mixed_none_and_explicit_materializes_abstain(self) -> None:
-        """Branch with None guaranteed_fields abstains — doesn't kill materialized intersection."""
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            # Every branch arrives: branch_a's guarantees hold on every merged row.
+            pytest.param("require_all", ("x", "y"), id="require_all"),
+            # A merged row can be branch_b alone, which vouches for nothing, so
+            # the coalesce materializes an abstention (None), not branch_a's
+            # set (R2 fix round 1).
+            pytest.param("best_effort", None, id="best_effort"),
+        ],
+    )
+    def test_mixed_none_and_explicit_materializes(self, policy: str, expected: tuple[str, ...] | None) -> None:
+        """A branch with None guaranteed_fields is skipped only under require_all."""
         graph = self._build_fork_coalesce_with_branch_transforms(
             transform_a_guaranteed=("x", "y"),
             transform_b_guaranteed=None,
+            policy=policy,
         )
         coalesce_nodes = [n for n in graph.get_nodes() if n.node_type == NodeType.COALESCE]
         assert len(coalesce_nodes) == 1
         coal_schema = coalesce_nodes[0].output_schema_config
         assert coal_schema is not None
-        # branch_b abstains, branch_a's guarantees survive
-        assert coal_schema.guaranteed_fields is not None
-        assert set(coal_schema.guaranteed_fields) == {"x", "y"}
+        assert coal_schema.guaranteed_fields == expected
 
     def test_empty_intersection_materializes_empty_tuple_not_none(self) -> None:
         """Branches with disjoint fields → guaranteed_fields is (), not None.
