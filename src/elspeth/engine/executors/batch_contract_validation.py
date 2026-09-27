@@ -39,17 +39,21 @@ required (``schema_required_input_fields``: ``schema.required_fields`` plus the
 columns each batch transform folds in from its own options). An observed input
 model has no fields, so pydantic never saw that declaration, and a buffered row
 omitting ``value_field`` reached the plugin as a raw ``KeyError`` that ended the
-run (elspeth-5887fb7928 R1). The build-time edge check does not cover it
-either: it reads the AUTHORED config, not the fields a plugin folds in, and an
-observed upstream guarantees nothing. So an absent field is a fact about that
-row, like a wrong type, and it is routed the same way. The per-row
-``DeclaredRequiredInputFieldsViolation`` (ADR-013) is not the model here: its
-fields are guaranteed upstream at build time, so a miss there is a framework
-fault and Tier 1, and ADR-013 scopes it to single-row transforms.
+run (elspeth-5887fb7928 R1). A miss is classified by the SAME rule the per-row
+transform preflight applies (ADR-013 Amendment 2026-09-27,
+``engine.executors.declared_input_miss``), against the node's entry in the
+build's declared-input proof: a field the build never proved present and the
+row does not carry is a fact about that row, like a wrong type, and is routed
+the same way (``DeclaredInputFieldAbsentViolation``, B2); a field the build
+PROVED present, or one the row's payload carries while its contract lost it, is
+our bug and aborts (``BatchDeclaredInputFieldsViolation``, Tier 1). One fact,
+one disposition, whichever seam sees it.
 
 The message names the row index, field and error type, never the row VALUE
 (``contracts.safe_validation_errors``): it becomes the routed reason. An absent
-field is named from the transform's CONFIG, never from the row's own keys.
+field is named from the transform's CONFIG, never from the row's own keys; the
+buffered row's INDEX locates the member (as the spelling residual's does), which
+is a position in the batch, not row content.
 
 Before presence, the input check applies the field-name spelling rule's runtime
 residual (operator ruling 2026-09-25): a declared read spelled by the header of
@@ -62,15 +66,42 @@ it; this settles an abstaining or open one.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from pydantic import ValidationError
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TransformResult
-from elspeth.contracts.errors import HeaderSpelledDeclarationViolation, PluginContractViolation
+from elspeth.contracts.declaration_contracts import derive_effective_input_fields
+from elspeth.contracts.errors import (
+    BatchDeclaredInputFieldsViolation,
+    DeclaredInputFieldAbsentViolation,
+    HeaderSpelledDeclarationViolation,
+    PluginContractViolation,
+)
 from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.types import NodeID
+from elspeth.engine.executors.declared_input_miss import classify_declared_input_miss, declared_input_proof_entry
 from elspeth.engine.executors.declared_output_types import verify_created_output_types
+
+
+def batch_declared_input_proof(
+    proof: Mapping[NodeID, frozenset[str]],
+    *,
+    node_id: NodeID,
+    transform: BatchTransformProtocol,
+    node_kind: str,
+) -> frozenset[str]:
+    """The batch node's entry in the build's declared-input proof, for ``validate_batch_inputs``.
+
+    A node whose plugin requires no field has nothing to classify. One that
+    does must have an entry (``declared_input_proof_entry`` refuses a missing
+    one rather than reading it as "proves nothing").
+    """
+    required = transform.schema_required_input_fields()
+    if not required:
+        return frozenset()
+    return declared_input_proof_entry(proof, node_id=node_id, declared=required, component=f"{node_kind} transform '{transform.name}'")
 
 
 def validate_batch_inputs(
@@ -78,6 +109,7 @@ def validate_batch_inputs(
     rows: Sequence[PipelineRow],
     *,
     node_kind: str,
+    proven: frozenset[str],
 ) -> None:
     """Validate reconstructed batch input rows before plugin execution.
 
@@ -86,14 +118,20 @@ def validate_batch_inputs(
         rows: The buffered rows about to be handed to ``process``.
         node_kind: Operator-facing name for the node kind ("Aggregation",
             "Collector") — message text only, never control flow.
+        proven: The node's entry in the build's declared-input proof — the
+            required fields every arriving row provably carries.
 
     Presence is checked before the model, for the reason the per-row preflight
     runs its declaration check first: an absent field is reported as absent,
     not diluted into a schema failure.
 
     Raises:
-        PluginContractViolation: If any buffered row lacks a field the transform
-            declares required, or fails the declared input schema.
+        DeclaredInputFieldAbsentViolation: A buffered row lacks required fields
+            the build never proved present (routed, like any
+            ``PluginContractViolation`` here).
+        BatchDeclaredInputFieldsViolation: A buffered row lacks a PROVEN field,
+            or its payload carries a required field its contract lost (Tier 1).
+        PluginContractViolation: A buffered row fails the declared input schema.
     """
     required = transform.schema_required_input_fields()
     declared_spellings = DeclaredSpellings.of(reads=transform.declared_read_fields, creates=())
@@ -111,15 +149,30 @@ def validate_batch_inputs(
                 component=f"{node_kind} transform '{transform.name}' (buffered row {idx})",
                 spellings=spellings,
             )
-        # ``in`` on a PipelineRow resolves original and normalized names exactly
-        # as ``row[field]`` does, so a field reported present here cannot raise
-        # KeyError inside the plugin.
-        absent = sorted(field for field in required if field not in row)
-        if absent:
-            raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' input validation failed for buffered row {idx}: "
-                f"required input field(s) {absent} absent from the row. "
-                "The transform's schema declares them required."
+        # The row's effective fields (contract names ∩ payload keys) — the set
+        # the per-row seam checks. After the spelling check above, every
+        # required name is canonical, so a field present here is present under
+        # the name the plugin reads and cannot raise KeyError inside it.
+        missing = required - derive_effective_input_fields(row)
+        if missing:
+            miss_kind = classify_declared_input_miss(missing=missing, proven=proven, payload_keys=frozenset(row.keys()))
+            if miss_kind == "absent":
+                raise DeclaredInputFieldAbsentViolation(
+                    component=f"{node_kind} transform '{transform.name}' (buffered row {idx})",
+                    fields=tuple(sorted(missing)),
+                )
+            raise BatchDeclaredInputFieldsViolation(
+                f"{node_kind} transform '{transform.name}': buffered row {idx} lacks required input field(s) {sorted(missing)} "
+                + (
+                    "that the build proved present on every arriving row. "
+                    if miss_kind == "proven"
+                    else "that its payload carries but its contract does not. "
+                )
+                + "This is an engine defect (contract propagation, merge or restore), not a fact about the row.",
+                failure_kind="proven_field_absent" if miss_kind == "proven" else "contract_payload_divergence",
+                plugin=transform.name,
+                node_kind=node_kind,
+                missing=frozenset(missing),
             )
         try:
             transform.input_schema.model_validate(row.to_dict(), strict=True)

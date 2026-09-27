@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import structlog
@@ -47,7 +48,11 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
-from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
+from elspeth.engine.executors.batch_contract_validation import (
+    batch_declared_input_proof,
+    validate_batch_inputs,
+    validate_success_outputs,
+)
 from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
@@ -140,6 +145,7 @@ class CollectorExecutor:
         clock: Clock | None = None,
         max_completed_keys: int = 10000,
         barrier_restore_reads: BarrierRestoreReadModel | None = None,
+        declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({}),
     ) -> None:
         if max_completed_keys <= 0:
             raise OrchestrationInvariantError(f"max_completed_keys must be > 0, got {max_completed_keys}")
@@ -147,6 +153,9 @@ class CollectorExecutor:
             raise OrchestrationInvariantError("barrier_restore_reads is required for collector roster/restore reads")
         self._execution = execution
         self._barrier_restore_reads = barrier_restore_reads
+        # The build's declared-input proof (ADR-013 Amendment 2026-09-27): the
+        # flush's input check classifies a required-field miss by this node's entry.
+        self._declared_input_proof = declared_input_proof
         self._data_flow = data_flow
         self._spans = span_factory
         self._token_manager = token_manager
@@ -1121,7 +1130,14 @@ class CollectorExecutor:
             # run. Nothing is minted before these checks; the Tier-1 subclasses
             # still abort.
             try:
-                validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
+                validate_batch_inputs(
+                    transform,
+                    pipeline_rows,
+                    node_kind="Collector",
+                    proven=batch_declared_input_proof(
+                        self._declared_input_proof, node_id=node_id, transform=transform, node_kind="Collector"
+                    ),
+                )
                 result = transform.process(pipeline_rows, ctx)
                 if result.status == "success":
                     if result.row is None and result.rows is None:

@@ -262,6 +262,8 @@ class _CollectorEnv:
             step_resolver=lambda _node_id: 1,
             data_flow=self.factory.data_flow,
             barrier_restore_reads=self.factory.barrier_restore,
+            # The collector sits behind an abstaining upstream here: the build proves none of its required fields.
+            declared_input_proof={self.node_id: frozenset()},
         )
         settings = CollectorSettings(name="stitch", plugin="recording_stitch", input="pages_in", on_success="assembled_out")
         scope = ScopeSettings(name="scope1", opener="expand_node", closer="stitch", policy=policy)
@@ -375,6 +377,8 @@ class _CollectorEnv:
             step_resolver=lambda _node_id: 1,
             data_flow=self.factory.data_flow,
             barrier_restore_reads=self.factory.barrier_restore,
+            # The collector sits behind an abstaining upstream here: the build proves none of its required fields.
+            declared_input_proof={self.node_id: frozenset()},
         )
         settings = CollectorSettings(name="stitch", plugin="recording_stitch", input="pages_in", on_success="assembled_out")
         scope = ScopeSettings(name="scope1", opener="expand_node", closer="stitch", policy=self.policy)
@@ -1195,9 +1199,8 @@ class TestFlushContractPreflight:
         assert env.transform.call_count == 0
         [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids={members[0].token_id})
         assert flush_error["phase"] == "collector_flush"
-        assert flush_error["exception"] == (
-            "Collector transform 'recording_stitch' input validation failed for buffered row 0: "
-            "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+        assert flush_error["exception"].startswith(
+            "Collector transform 'recording_stitch' (buffered row 0) requires input field(s) ['score'] that the arriving row does not carry."
         )
 
 

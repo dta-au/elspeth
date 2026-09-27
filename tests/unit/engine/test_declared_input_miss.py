@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import DeclaredInputFieldAbsentViolation, OrchestrationInvariantError, PluginContractViolation
+from elspeth.contracts.types import NodeID
 from elspeth.engine.executors.declared_input_miss import classify_declared_input_miss, declared_input_proof_entry
 
 
@@ -75,3 +76,39 @@ class TestRoutedViolation:
     def test_it_needs_a_field(self) -> None:
         with pytest.raises(ValueError, match="at least one field"):
             DeclaredInputFieldAbsentViolation(component="Transform 'x'", fields=())
+
+
+class TestBatchProofEntry:
+    """The batch seams resolve their node's entry the same way (``batch_declared_input_proof``)."""
+
+    class _Batch:
+        name = "fake_batch"
+
+        def __init__(self, required: frozenset[str]) -> None:
+            self._required = required
+
+        def schema_required_input_fields(self) -> frozenset[str]:
+            return self._required
+
+    def test_a_plugin_requiring_nothing_needs_no_entry(self) -> None:
+        from elspeth.engine.executors.batch_contract_validation import batch_declared_input_proof
+
+        assert (
+            batch_declared_input_proof({}, node_id=NodeID("agg"), transform=self._Batch(frozenset()), node_kind="Aggregation")
+            == frozenset()
+        )
+
+    def test_a_requiring_plugin_without_an_entry_is_refused(self) -> None:
+        from elspeth.engine.executors.batch_contract_validation import batch_declared_input_proof
+
+        with pytest.raises(OrchestrationInvariantError, match="has no entry"):
+            batch_declared_input_proof({}, node_id=NodeID("agg"), transform=self._Batch(frozenset({"v"})), node_kind="Aggregation")
+
+    def test_the_entry_is_returned(self) -> None:
+        from elspeth.engine.executors.batch_contract_validation import batch_declared_input_proof
+
+        proof = {NodeID("agg"): frozenset({"v"})}
+
+        assert batch_declared_input_proof(
+            proof, node_id=NodeID("agg"), transform=self._Batch(frozenset({"v", "w"})), node_kind="Collector"
+        ) == frozenset({"v"})

@@ -362,6 +362,7 @@ def build_row_processor(
             clock=clock,
             max_completed_keys=coalesce_completed_keys_limit,
             barrier_restore_reads=factory.barrier_restore,
+            declared_input_proof=traversal.declared_input_proof,
         )
         for collector_settings_entry in settings.collectors:
             collector_name = CollectorName(collector_settings_entry.name)

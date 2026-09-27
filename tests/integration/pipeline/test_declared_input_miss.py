@@ -310,3 +310,95 @@ def test_a_payload_the_contract_lost_is_tier_one_even_unproven(tmp_path: Path, m
     settings = _settings(tmp_path, [{"a": "1", "b": "2"}], plugin="type_coerce", options=_CENSUS[0][2])
 
     _assert_tier_one(tmp_path, _cli("run", "-s", str(settings), "--execute"))
+
+
+def _aggregation_settings(tmp_path: Path, *, source_schema: dict[str, Any]) -> Path:
+    (tmp_path / "in.jsonl").write_text("".join(json.dumps(row) + "\n" for row in ({"id": 1, "v": 1}, {"id": 2, "v": 2})))
+    settings: dict[str, Any] = {
+        "sources": {
+            "src": {
+                "plugin": "json",
+                "on_success": "batch_in",
+                "options": {
+                    "path": str(tmp_path / "in.jsonl"),
+                    "format": "jsonl",
+                    "on_validation_failure": "discard",
+                    "schema": source_schema,
+                },
+            }
+        },
+        "aggregations": [
+            {
+                "name": "thresholds",
+                "plugin": "batch_threshold_summary",
+                "input": "batch_in",
+                "on_success": "out",
+                "on_error": "quarantine",
+                "trigger": {"count": 2},
+                "output_mode": "transform",
+                "options": {"value_field": "v", "thresholds": [{"name": "hi", "operator": ">=", "value": 1}], "schema": _OBSERVED},
+            }
+        ],
+        "sinks": {"out": _json_sink(tmp_path / "out.jsonl"), "quarantine": _json_sink(tmp_path / "q.jsonl")},
+        "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
+        "concurrency": {"max_workers": 1},
+    }
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
+
+
+def _inject_before_batch_preflight(monkeypatch: pytest.MonkeyPatch, rewrite: Callable[[PipelineRow], PipelineRow]) -> None:
+    """Stand in for an engine defect that hands the aggregation's input check rows other than the buffered ones."""
+    from elspeth.engine.executors.aggregation import AggregationExecutor
+
+    original = AggregationExecutor._validate_batch_inputs
+
+    def validate(self: AggregationExecutor, node_id: Any, transform: Any, rows: Any) -> None:
+        original(self, node_id, transform, [rewrite(row) for row in rows])
+
+    monkeypatch.setattr(AggregationExecutor, "_validate_batch_inputs", validate)
+
+
+class TestBatchSeamParity:
+    """The aggregation input seam classifies a miss with the transform seam's rule (architect A5, T4)."""
+
+    def test_a_proven_batch_field_missing_is_tier_one_with_every_buffered_token_failed_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _inject_before_batch_preflight(monkeypatch, _drop("v", from_payload=True))
+        settings = _aggregation_settings(tmp_path, source_schema={"mode": "observed", "guaranteed_fields": ["v"]})
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code == 4, result.output
+        assert "BatchDeclaredInputFieldsViolation" in result.output
+        assert _routed_reasons(tmp_path) == []
+        # Never outcomeless: both buffered tokens are FAILED before the abort.
+        assert _terminal_outcomes(tmp_path) == {"failure/unrouted": 2}
+        contexts = [json.loads(text) for (text,) in _query(tmp_path, "select context_json from token_outcomes where completed = 1")]
+        assert {(context["exception_type"], context["failure_kind"], tuple(context["missing"])) for context in contexts} == {
+            ("BatchDeclaredInputFieldsViolation", "proven_field_absent", ("v",))
+        }
+
+    def test_a_batch_payload_the_contract_lost_is_tier_one(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _inject_before_batch_preflight(monkeypatch, _drop("v", from_payload=False))
+        settings = _aggregation_settings(tmp_path, source_schema=_OBSERVED)
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code == 4, result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/unrouted": 2}
+
+    def test_the_same_unproven_absence_routes_the_batch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control (B2 kept): behind an abstaining upstream the identical rows fail the batch through on_error."""
+        _inject_before_batch_preflight(monkeypatch, _drop("v", from_payload=True))
+        settings = _aggregation_settings(tmp_path, source_schema=_OBSERVED)
+
+        result = _cli("run", "-s", str(settings), "--execute")
+
+        assert result.exit_code != 4, result.output
+        assert "Traceback" not in result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
+        assert {(reason["reason"], tuple(reason["fields"])) for reason in _routed_reasons(tmp_path)} == {("missing_field", ("v",))}

@@ -132,6 +132,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
     BatchPassthroughShapeError,
     BatchPassthroughShapeKind,
     BatchQuarantineContradictionError,
@@ -738,6 +739,7 @@ class RowProcessor:
             run_id,
             aggregation_settings=aggregation_settings,
             error_edge_ids=error_edge_ids,
+            declared_input_proof=traversal.declared_input_proof,
             clock=self._clock,
         )
         self._telemetry_manager = telemetry_manager
@@ -1702,7 +1704,8 @@ class RowProcessor:
         | PluginContractViolation
         | AggregateDeclarationContractViolation
         | BatchQuarantineContradictionError
-        | BatchPassthroughShapeError,
+        | BatchPassthroughShapeError
+        | BatchDeclaredInputFieldsViolation,
     ) -> None:
         """Record FAILED audit entries for every buffered token on flush failure.
 
@@ -2199,12 +2202,18 @@ class RowProcessor:
             quarantined_indices = self._cross_check_flush_output(fctx, result)
             validated_context.append((fctx, quarantined_indices))
 
+        def record_input_violation(
+            violation: BatchDeclaredInputFieldsViolation, buffered_tokens: Sequence[TokenInfo], batch_id: str
+        ) -> None:
+            self._record_flush_violation(build_flush_context(buffered_tokens, batch_id), violation)
+
         result, buffered_tokens, batch_id = self._aggregation_executor.execute_flush(
             node_id=node_id,
             transform=cast(BatchTransformProtocol, transform),
             ctx=ctx,
             trigger_type=trigger_type,
             validate_success=validate_success,
+            record_input_violation=record_input_violation,
         )
 
         # Test doubles and compatibility adapters may return without invoking

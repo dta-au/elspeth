@@ -1212,11 +1212,15 @@ def test_a_buffered_row_missing_a_declared_field_routes_the_whole_batch_to_on_er
 
     [failed_state] = audit["failed_states"]
     reason = json.loads(failed_state.error_json)
+    # ADR-013 Amendment 2026-09-27: the unproven absence routes as missing_field, config field names only.
     assert reason == {
-        "reason": "contract_violation",
+        "reason": "missing_field",
+        "fields": ["v"],
         "error": (
-            f"Aggregation transform 'batch_threshold_summary' input validation failed for buffered row {offending_index}: "
-            "required input field(s) ['v'] absent from the row. The transform's schema declares them required."
+            f"Aggregation transform 'batch_threshold_summary' (buffered row {offending_index}) requires input field(s) ['v'] "
+            "that the arriving row does not carry. Its upstream does not guarantee them (an observed or open schema promises "
+            "nothing about a column it does not declare), so the row is routed instead of processed. To refuse such a "
+            "pipeline at build instead, declare the field(s) in the upstream's schema or guaranteed_fields."
         ),
     }
     [routing] = audit["routing"]
@@ -1327,11 +1331,11 @@ def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_t
 
     assert not [state for state in states if state.status == "open"], "no member hold may be left OPEN"
     failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
-    [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
+    [flush_error] = [error for error in failed if error["type"] == "DeclaredInputFieldAbsentViolation"]
     assert flush_error["phase"] == "collector_flush"
-    assert flush_error["exception"] == (
-        "Collector transform 'batch_threshold_summary' input validation failed for buffered row 0: "
-        "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+    assert flush_error["exception"].startswith(
+        "Collector transform 'batch_threshold_summary' (buffered row 0) requires input field(s) ['score'] "
+        "that the arriving row does not carry."
     )
     member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
     assert len(member_errors) == 2
@@ -1341,7 +1345,7 @@ def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_t
     assert len(failed_pages) == 2
 
     # Positive control for the scan: it finds the reason it must find.
-    assert ("node_states", "error_json") in _audit_cells_containing(db, "required input field(s) ['score']")
+    assert ("node_states", "error_json") in _audit_cells_containing(db, "requires input field(s) ['score']")
     assert _audit_cells_containing(db, _MISSING_FIELD_SENTINEL) == []
 
 
