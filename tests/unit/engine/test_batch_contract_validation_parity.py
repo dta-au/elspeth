@@ -30,7 +30,7 @@ from pydantic import ConfigDict
 
 from elspeth.contracts import PluginSchema, TransformResult
 from elspeth.contracts.enums import NodeType
-from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.errors import DeclaredInputFieldAbsentViolation, PluginContractViolation
 from elspeth.contracts.schema import NESTED_CONTRACT_OPTIONS_NODE_TYPES
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.engine.executors import aggregation as aggregation_module
@@ -133,11 +133,13 @@ class TestSharedValidators:
     """Direct coverage of both halves for both operator-facing labels."""
 
     def test_conforming_input_rows_pass(self, node_kind: str) -> None:
-        validate_batch_inputs(_FakeBatchTransform(), [_row({"item": 1}), _row({"item": 2})], node_kind=node_kind)
+        validate_batch_inputs(_FakeBatchTransform(), [_row({"item": 1}), _row({"item": 2})], node_kind=node_kind, proven=frozenset())
 
     def test_an_extra_field_on_a_buffered_row_is_rejected(self, node_kind: str) -> None:
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(_FakeBatchTransform(), [_row({"item": 1}), _row({"item": 2, "id": 9})], node_kind=node_kind)
+            validate_batch_inputs(
+                _FakeBatchTransform(), [_row({"item": 1}), _row({"item": 2, "id": 9})], node_kind=node_kind, proven=frozenset()
+            )
 
         message = str(excinfo.value)
         assert message.startswith(f"{node_kind} transform 'fake_batch' input validation failed for buffered row 1")
@@ -176,7 +178,9 @@ class TestSharedValidators:
         in it.
         """
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(_FakeBatchTransform(), [_row({"item": 1}), _row({"item": _SENTINEL})], node_kind=node_kind)
+            validate_batch_inputs(
+                _FakeBatchTransform(), [_row({"item": 1}), _row({"item": _SENTINEL})], node_kind=node_kind, proven=frozenset()
+            )
 
         message = str(excinfo.value)
         assert message.startswith(f"{node_kind} transform 'fake_batch' input validation failed for buffered row 1: ")
@@ -208,18 +212,20 @@ class TestSharedValidators:
         """
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score", "variant"}))
 
-        with pytest.raises(PluginContractViolation) as excinfo:
+        with pytest.raises(DeclaredInputFieldAbsentViolation) as excinfo:
             validate_batch_inputs(
                 transform,
                 [_row({"score": 1, "variant": "a"}), _row({"variant": "b", "sentinel_column": _SENTINEL})],
                 node_kind=node_kind,
+                proven=frozenset(),
             )
 
-        assert str(excinfo.value) == (
-            f"{node_kind} transform 'fake_batch' input validation failed for buffered row 1: "
-            "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
-        )
+        # The routed absent-field reason names config fields and the member's position only (ADR-013 Amendment 2026-09-27).
+        assert excinfo.value.to_transform_error_reason()["reason"] == "missing_field"
+        assert excinfo.value.to_transform_error_reason()["fields"] == ["score"]
+        assert str(excinfo.value).startswith(f"{node_kind} transform 'fake_batch' (buffered row 1) requires input field(s) ['score']")
         assert _SENTINEL not in str(excinfo.value)
+        assert "sentinel_column" not in str(excinfo.value)
         assert "sentinel_column" not in str(excinfo.value)
 
     def test_presence_is_reported_before_the_model(self, node_kind: str) -> None:
@@ -232,16 +238,16 @@ class TestSharedValidators:
         transform = _FakeBatchTransform(required=frozenset({"item"}))
 
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind)
+            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind, proven=frozenset())
 
-        assert "required input field(s) ['item'] absent" in str(excinfo.value)
+        assert "requires input field(s) ['item'] that the arriving row does not carry" in str(excinfo.value)
         assert "validation error" not in str(excinfo.value)
 
     def test_a_declared_field_present_as_none_is_not_absent(self, node_kind: str) -> None:
         """Presence, not value: a present ``None`` is the plugin's to count as missing."""
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score"}))
 
-        validate_batch_inputs(transform, [_row({"score": None})], node_kind=node_kind)
+        validate_batch_inputs(transform, [_row({"score": None})], node_kind=node_kind, proven=frozenset())
 
     def test_a_field_required_by_its_header_spelling_is_refused_by_the_spelling_rule(self, node_kind: str) -> None:
         """A header-spelled declaration fails the batch, routed, naming only config literals (ruling 2026-09-25).
@@ -270,7 +276,7 @@ class TestSharedValidators:
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Amount USD"}))
 
         with pytest.raises(HeaderSpelledDeclarationViolation) as excinfo:
-            validate_batch_inputs(transform, [row], node_kind=node_kind)
+            validate_batch_inputs(transform, [row], node_kind=node_kind, proven=frozenset())
         # Routed like every flush preflight violation (a PluginContractViolation),
         # with a stable reason carrying the literal and its canonical name only.
         assert isinstance(excinfo.value, PluginContractViolation)
@@ -290,7 +296,9 @@ class TestSharedValidators:
         named the field differently (Codex final review, finding 1; this test
         pinned the admission before). The predicate now resolves the literal
         through the row's own contract, as the lookup does, and refuses it
-        with the canonical name and the leg that named it.
+        with the canonical name and the leg that named it — before the
+        ADR-013 presence check (Amendment 2026-09-27) is ever reached, so the
+        declaration never becomes a routed absence.
         """
         from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
         from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -308,7 +316,7 @@ class TestSharedValidators:
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Weird Header"}))
 
         with pytest.raises(HeaderSpelledDeclarationViolation) as excinfo:
-            validate_batch_inputs(transform, [row], node_kind=node_kind)
+            validate_batch_inputs(transform, [row], node_kind=node_kind, proven=frozenset())
         reason = excinfo.value.to_transform_error_reason()
         assert reason["reason"] == "declared_field_is_header_spelling"
         assert reason["fields"] == ["Weird Header"]
@@ -322,6 +330,53 @@ class TestSharedValidators:
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=required)
 
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind)
+            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind, proven=frozenset())
 
-        assert "required input field(s) ['alpha', 'pair_id', 'score', 'variant', 'zeta'] absent" in str(excinfo.value)
+        assert "requires input field(s) ['alpha', 'pair_id', 'score', 'variant', 'zeta'] that the arriving row" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("node_kind", ["Aggregation", "Collector"])
+class TestDeclaredInputMissParity:
+    """Both batch seams classify a required-field miss with the transform seam's rule (ADR-013 Amendment 2026-09-27)."""
+
+    def test_an_unproven_absence_routes(self, node_kind: str) -> None:
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score"}))
+
+        with pytest.raises(DeclaredInputFieldAbsentViolation):
+            validate_batch_inputs(transform, [_row({"other": 1})], node_kind=node_kind, proven=frozenset())
+
+    def test_a_proven_field_missing_is_tier_one(self, node_kind: str) -> None:
+        from elspeth.contracts.errors import TIER_1_ERRORS, BatchDeclaredInputFieldsViolation
+
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score", "variant"}))
+
+        with pytest.raises(BatchDeclaredInputFieldsViolation) as excinfo:
+            validate_batch_inputs(transform, [_row({"variant": "a", "other": _SENTINEL})], node_kind=node_kind, proven=frozenset({"score"}))
+
+        assert isinstance(excinfo.value, TIER_1_ERRORS)
+        assert excinfo.value.to_audit_dict() == {
+            "exception_type": "BatchDeclaredInputFieldsViolation",
+            "failure_kind": "proven_field_absent",
+            "plugin": "fake_batch",
+            "node_kind": node_kind,
+            "missing": ["score"],
+        }
+        assert _SENTINEL not in str(excinfo.value)
+
+    def test_a_payload_the_contract_lost_is_tier_one(self, node_kind: str) -> None:
+        import dataclasses
+
+        from elspeth.contracts.errors import BatchDeclaredInputFieldsViolation
+
+        row = _row({"score": 1, "other": _SENTINEL})
+        lost = PipelineRow(
+            row.to_dict(),
+            dataclasses.replace(row.contract, fields=tuple(fc for fc in row.contract.fields if fc.normalized_name != "score")),
+        )
+        transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"score"}))
+
+        with pytest.raises(BatchDeclaredInputFieldsViolation) as excinfo:
+            validate_batch_inputs(transform, [lost], node_kind=node_kind, proven=frozenset())
+
+        assert excinfo.value.failure_kind == "contract_payload_divergence"
+        assert _SENTINEL not in str(excinfo.value)

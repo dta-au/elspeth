@@ -32,11 +32,13 @@ def _compute_coalesce_schema(
     Returns:
         SchemaConfig with computed guaranteed_fields for the coalesce node
     """
-    # Filter out None values before calling production function
-    valid_schemas = {k: v for k, v in branch_schemas.items() if v is not None}
+    # Every branch enters, a schema-less one as a schema without guarantees,
+    # as the builder's ``guarantee_branch_schemas`` does: the merge skips an
+    # abstainer only under require_all (R2 fix round 1).
+    every_branch = {k: v if v is not None else SchemaConfig(mode="observed", fields=None) for k, v in branch_schemas.items()}
 
     merged_guaranteed_tuple = merge_guaranteed_fields(
-        valid_schemas,
+        every_branch,
         require_all=(policy == "require_all"),
     )
 

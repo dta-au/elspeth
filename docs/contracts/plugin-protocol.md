@@ -701,7 +701,7 @@ class SummaryTransform(BaseTransform):
 - `is_batch_aware = False` (default): Transform implements `TransformProtocol`, receives single `PipelineRow`
 - `is_batch_aware = True`: Transform implements `BatchTransformProtocol`, receives `list[PipelineRow]` at aggregation nodes
 - The engine decides when to batch based on pipeline configuration
-- `declared_input_fields` is a single-row precondition surface today; batch-aware transforms must leave it empty until a batch pre-emission contract exists
+- `declared_input_fields` is a single-row precondition surface; batch-aware transforms must leave it empty. A batch transform states the columns every buffered row must carry through `schema.required_fields` (`schema_required_input_fields()`), and the flush's input check classifies a miss with the per-row rule (ADR-013 Amendment 2026-09-27): a field the build never proved present and the row does not carry fails the batch through `on_error` (`missing_field`); a proven field missing, or one the payload carries while the contract lost it, aborts (Tier 1)
 
 #### Error Routing (`on_error`)
 

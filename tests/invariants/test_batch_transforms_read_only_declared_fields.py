@@ -147,14 +147,14 @@ def test_a_batch_transform_reads_no_undeclared_field_unguarded(transform: Any) -
 @pytest.mark.parametrize("transform", [t for t in _ROSTER if t.schema_required_input_fields()], ids=lambda transform: transform.name)
 def test_every_declared_field_is_enforced_by_the_flush_preflight(transform: Any) -> None:
     rows = [make_pipeline_row({**row.to_dict(), _SENTINEL_FIELD: _SENTINEL_VALUE}) for row in _probe_batch(transform)]
-    validate_batch_inputs(transform, rows, node_kind="Aggregation")
+    validate_batch_inputs(transform, rows, node_kind="Aggregation", proven=frozenset())
 
     last = len(rows) - 1
     for field in sorted(transform.schema_required_input_fields()):
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(transform, _without(rows, field, only_index=last), node_kind="Aggregation")
+            validate_batch_inputs(transform, _without(rows, field, only_index=last), node_kind="Aggregation", proven=frozenset())
         message = str(excinfo.value)
-        assert f"buffered row {last}:" in message
+        assert f"(buffered row {last})" in message
         assert repr(field) in message
         assert _SENTINEL_VALUE not in message
         # The row's own keys are row-derived under an observed source: only the

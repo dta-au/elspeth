@@ -590,16 +590,16 @@ class TestClosedCodeCatalogueInvariants:
         # this error by withdrawing the contract for every OTHER field too.
         assert "withdraws the contract for every field" in fix
 
-        # Rewrite-the-reference must LEAD. ``verify_declared_required_fields``
-        # is a plain set difference over row keys with no dual-name limb, so
-        # declaring a read name the producer does not guarantee is accepted at
-        # config time and then raises on every row — leading with it would hand
-        # the planner a repair that clears this error and breaks the run
-        # (elspeth-a9ba80cb0b). This is the claim the catalogue must carry, not
-        # a property of whatever string happened to be written first.
+        # Rewrite-the-reference must LEAD. Declaring a read name the producer
+        # does not guarantee is refused when the pipeline is validated
+        # (schema_contract_violation, or the field-name spelling rule for a
+        # header spelling) — leading with it would hand the planner a repair
+        # that trades this error for another (elspeth-a9ba80cb0b). This is the
+        # claim the catalogue must carry, not a property of whatever string
+        # happened to be written first.
         assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in fix
-        assert "fails every row at run time" in fix
+        assert "refused when the pipeline is validated" in fix
 
     def test_prompt_role_codes_resolve_to_planner_authoring_guidance(self) -> None:
         """Both prompt-role codes are closed, distinct, and never offer a server default.

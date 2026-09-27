@@ -27,6 +27,7 @@ from elspeth.contracts import (
     RoutingMode,
 )
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
@@ -119,6 +120,9 @@ class ExecutionGraph:
         self._route_resolution_map: dict[tuple[NodeID, str], RouteDestination] = {}
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
         self._node_step_map: dict[NodeID, int] = {}  # node_id -> audit step (source=0)
+        # node_id -> declared input fields the build PROVED present on every
+        # arriving row; None until the builder publishes it on the final graph.
+        self._declared_input_proof: Mapping[NodeID, frozenset[str]] | None = None
         self._validation_warnings: tuple[GraphValidationWarning, ...] = ()
         self._group_bindings: GroupBindingRegistry = GroupBindingRegistry(bindings=())
         self._bound_regions: tuple[BoundRegion, ...] = ()
@@ -166,6 +170,7 @@ class ExecutionGraph:
         declared_required_fields: frozenset[str] = _EMPTY_DECLARED_REQUIRED_FIELDS,
         declared_output_fields: frozenset[str] = frozenset(),
         declared_input_fields: frozenset[str] = frozenset(),
+        batch_required_input_fields: frozenset[str] = frozenset(),
         declared_string_input_fields: frozenset[str] = frozenset(),
         declared_read_fields: frozenset[str] = frozenset(),
         declared_created_fields: frozenset[str] = frozenset(),
@@ -214,6 +219,10 @@ class ExecutionGraph:
                 compute this as a property over their own options and the
                 `schema:` block never carries those field names
                 (elspeth-ada5a60249). Empty frozenset otherwise.
+            batch_required_input_fields: For AGGREGATION and COLLECTOR nodes
+                only — the batch plugin's ``schema_required_input_fields()``,
+                the fields every buffered row must carry. Read only by the
+                declared-input proof. Empty frozenset otherwise.
             declared_string_input_fields: For TRANSFORM nodes only — the set of
                 fields the transform requires to be present AND string-valued
                 on every arriving row, failing the row closed otherwise.
@@ -310,6 +319,7 @@ class ExecutionGraph:
             declared_required_fields=declared_required_fields,
             declared_output_fields=declared_output_fields,
             declared_input_fields=declared_input_fields,
+            batch_required_input_fields=batch_required_input_fields,
             declared_string_input_fields=declared_string_input_fields,
             declared_read_fields=declared_read_fields,
             declared_created_fields=declared_created_fields,
@@ -945,6 +955,16 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._node_step_map = dict(mapping)
 
+    def set_declared_input_proof(self, proof: Mapping[NodeID, frozenset[str]]) -> None:
+        """Publish the build's declared-input proof (``schema_validation.compute_declared_input_proof``).
+
+        Computed on the FINAL graph — after the rule-9 DIVERT edges — and
+        frozen with the rest of the build metadata, so the runtime classifies
+        a declared-input miss by exactly what this build proved.
+        """
+        self._assert_build_metadata_mutable()
+        self._declared_input_proof = deep_freeze(dict(proof))
+
     def set_validation_warnings(self, warnings: Sequence[GraphValidationWarning]) -> None:
         """Set non-fatal graph construction warnings."""
         self._assert_build_metadata_mutable()
@@ -1042,6 +1062,21 @@ class ExecutionGraph:
     def get_node_step_map(self) -> dict[NodeID, int]:
         """Get the builder-assigned node_id -> audit step mapping."""
         return dict(self._node_step_map)
+
+    def get_declared_input_proof(self) -> Mapping[NodeID, frozenset[str]]:
+        """The builder-published declared-input proof: node_id -> fields proved present.
+
+        Raises:
+            OrchestrationInvariantError: the builder never published it. A
+                graph that runs rows without its proof would have to guess
+                every declared-input miss's tier, so there is no empty default.
+        """
+        if self._declared_input_proof is None:
+            raise OrchestrationInvariantError(
+                "ExecutionGraph has no declared-input proof: the builder publishes it on the final graph "
+                "(build_execution_graph) before the build metadata freezes."
+            )
+        return self._declared_input_proof
 
     def get_config_gate_id_map(self) -> dict[GateName, NodeID]:
         """Get explicit gate_name -> node_id mapping for config-driven gates.

@@ -937,7 +937,16 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48f
 # branch onto the lane): the two rotation chains above ran on sibling branches;
 # the manifest carries both sides' literals and this digest is re-captured from
 # the merged tree (never hand-computed).
-EXPECTED_CASE_REGISTRY_SHA256 = "dc2e8e1d8292e5feb4107f46e7e1d80e73c2c24da6bd982d6c260bb2ce9052b3"
+# Rotated 2026-09-27 (elspeth-5887fb7928, R2 declared-input miss): a PLUGIN
+# PROVENANCE rotation. json_explode now declares array_field as an input
+# (declared_input_fields), so its source_file_hash moved 26471026c209f7ef ->
+# 1919e96964500441 (the 1 manifest pin in json-explode-parent-child;
+# scripts/cicd/plugin_hash). No count, terminal, projection, resume digest or
+# oracle_freeze snapshot moved (test_oracle_freeze + production-path files green).
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the R2 branch):
+# the R2 json_explode pin above joins the lane's chain; digest re-captured from
+# the merged tree.
+EXPECTED_CASE_REGISTRY_SHA256 = "104886128377b61f4611a95b993b1cb1dcef2a65e795521b415ae7450ac3895a"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -399,7 +399,9 @@ val carries the whole of the enforcement.
 
 The failure is deliberately loud. Each registered contract's `violation_class`
 carries `@tier_1_error`, so a contradicted declaration aborts the run rather
-than letting it finish and produce evidence nobody can trust. Measured
+than letting it finish and produce evidence nobody can trust. A declaration's
+untrusted residual (see [ADR-013](013-declared-required-fields-contract.md)
+Amendment 2026-09-27) is row validation, not a val, and routes. Measured
 2026-09-10: `passes_through_input` → `PassThroughContractViolation` and
 `sink_required_fields` → `SinkRequiredFieldsViolation` are both in
 `TIER_1_ERRORS`, as is `AggregateDeclarationContractViolation`. The generic base

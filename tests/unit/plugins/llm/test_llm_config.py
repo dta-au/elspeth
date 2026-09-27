@@ -7,6 +7,7 @@ resolve_queries() normalization, and provider-specific config classes.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -2246,27 +2247,64 @@ class TestTemplateVariableBindings:
         message = str(exc_info.value)
         assert message.index("Rewrite each reference") < message.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in message
-        assert "fails every row at run time" in message
+        assert "refused when the pipeline is validated" in message
 
-    def test_declaring_an_unguaranteed_read_name_is_accepted_here_and_fails_at_run_time(self) -> None:
-        """Pins the fact the remedy ordering rests on, so it cannot drift silently."""
-        from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
-        from elspeth.engine.executors.declared_required_fields import verify_declared_required_fields
+    def test_declaring_an_unguaranteed_read_name_is_refused_when_the_pipeline_is_validated(self, tmp_path: Path) -> None:
+        """Pins the fact the remedy's warning rests on, so it cannot drift silently.
 
-        # Config time accepts the "just declare what you read" repair...
+        The plugin config accepts the "just declare what you read" repair, but
+        the pipeline's validation refuses it: an explicit required_input_fields
+        name the producer does not guarantee fails Phase 1 (it used to be
+        accepted and fail every row at run time).
+        """
+        import yaml
+        from typer.testing import CliRunner
+
+        from elspeth.cli import app
+
         self._single("Hello {{ row.Name }}", required_input_fields=["Name"])
 
-        # ...and the engine then rejects every row whose key is the normalized name.
-        with pytest.raises(DeclaredRequiredInputFieldsViolation):
-            verify_declared_required_fields(
-                declared_input_fields=frozenset({"Name"}),
-                effective_input_fields=frozenset({"name"}),
-                plugin_name="llm",
-                node_id="n1",
-                run_id="r1",
-                row_id="row1",
-                token_id="t1",
-            )
+        (tmp_path / "in.csv").write_text("Name\nAda\n")
+        sink = {
+            "plugin": "json",
+            "on_write_failure": "discard",
+            "options": {"path": str(tmp_path / "out.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+        }
+        settings = {
+            "sources": {
+                "src": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"path": str(tmp_path / "in.csv"), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+                }
+            },
+            "transforms": [
+                {
+                    "name": "greet",
+                    "plugin": "llm",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4o",
+                        "api_key": "placeholder-not-a-key",  # secret-scan: allow-this-line
+                        "prompt_template": "Hello {{ row.Name }}",
+                        "required_input_fields": ["Name"],
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            ],
+            "sinks": {"out": sink},
+            "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        }
+        (tmp_path / "settings.yaml").write_text(yaml.safe_dump(settings, sort_keys=False))
+
+        result = CliRunner().invoke(app, ["validate", "-s", str(tmp_path / "settings.yaml")])
+
+        assert result.exit_code == 1, result.output
+        assert "Traceback" not in result.output
+        assert "'Name'" in result.output
 
     def test_single_prompt_declaration_opt_out_suppresses_the_check(self) -> None:
         """``required_input_fields: []`` is the documented opt-out and must keep working."""

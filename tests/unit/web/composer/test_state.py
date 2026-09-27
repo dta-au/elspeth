@@ -4306,15 +4306,15 @@ class TestPromptTemplateUndeclaredRowFields:
         assert self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1", 5]))
 
     def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
-        """Declaring a read name the producer does not guarantee is accepted at
-        config time and then fails every row (``verify_declared_required_fields``
-        is a plain set difference with no dual-name limb), so the ordering of
-        the two remedies is load-bearing."""
+        """Declaring a read name the producer does not guarantee is refused when
+        the pipeline is validated (``schema_contract_violation``), so a repair
+        that leads with it trades this error for another: the ordering of the
+        two remedies is load-bearing."""
         from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as fix
 
         assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in fix
-        assert "fails every row at run time" in fix
+        assert "refused when the pipeline is validated" in fix
         assert "patch_node_options replaces the option's value, it does not append" in fix
 
     def test_both_authoring_surfaces_carry_the_same_substantive_advice(self) -> None:
@@ -4328,7 +4328,7 @@ class TestPromptTemplateUndeclaredRowFields:
         for text in (plugin_fix, composer_fix):
             assert text.index("Rewrite each reference") < text.index("Add a name to options.required_input_fields")
             assert "ONLY if the upstream producer guarantees that exact name" in text
-            assert "fails every row at run time" in text
+            assert "refused when the pipeline is validated" in text
             assert "withdraws the contract for every field" in text
 
 

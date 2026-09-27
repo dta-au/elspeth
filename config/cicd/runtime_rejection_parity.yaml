@@ -3049,6 +3049,17 @@ sites:
   disposition: mirrored
   counterpart:
   - contract_config_invalid
+- key: e99775374efee1d4
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.get_declared_input_proof
+  exception: OrchestrationInvariantError
+  message: 'ExecutionGraph has no declared-input proof: the builder publishes it on the final graph (build_execution_graph)
+    before the build metadata freezes.'
+  ordinal: 0
+  disposition: structural
+  note: The builder calls set_declared_input_proof unconditionally after the rule-9 pass, before _freeze_build_metadata
+    (builder.py); only a graph assembled by hand outside the builder reaches this raise. No pipeline input
+    can skip the publication.
 - key: a45d05ec3cc9e67c
   path: src/elspeth/core/dag/graph.py
   qualname: ExecutionGraph.get_next_node
@@ -3309,6 +3320,17 @@ sites:
     constructed, and composer names are capped at 38 by core/config.py:75 _MAX_NODE_NAME_LENGTH. Probed
     a 60-char node id: Stage 1 red (node_id_invalid, state.py:5142), Stage 2 red at ElspethSettings, no
     GraphValidationError at all.'
+- key: 76a0767a50a1aa72
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.batch_required_input_fields is only meaningful for AGGREGATION and COLLECTOR nodes;
+    node {} has type {} with batch_required_input_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: batch_required_input_fields is written at exactly two non-test sites, the builder's aggregation
+    and collector add_node calls, reading the batch plugin's schema_required_input_fields(); add_node
+    defaults it to frozenset() otherwise. No composer option feeds it.
 - key: 9393bc1b6aca40c5
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__

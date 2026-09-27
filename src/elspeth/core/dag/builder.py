@@ -13,7 +13,7 @@ import hashlib
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
 from elspeth.contracts.enums import NodeType, OutputMode
@@ -54,9 +54,10 @@ from elspeth.core.dag.models import (
     _GateEntry,
     _suggest_similar,
 )
+from elspeth.core.dag.schema_validation import compute_declared_input_proof
 
 if TYPE_CHECKING:
-    from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts import BatchTransformProtocol, SinkProtocol, SourceProtocol, TransformProtocol
     from elspeth.contracts.schema_contract import OutputFieldDeclaration
     from elspeth.core.config import (
         AggregationSettings,
@@ -617,6 +618,8 @@ def build_execution_graph(
             input_schema=transform.input_schema,
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
+            # The runtime factory admits only batch-aware plugins as aggregations.
+            batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
             declared_read_fields=transform.declared_read_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
@@ -910,6 +913,8 @@ def build_execution_graph(
                 input_schema=transform.input_schema,
                 output_schema=transform.output_schema,
                 output_schema_config=collector_output_schema_config,
+                # The runtime factory admits only batch-aware plugins as collectors.
+                batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
                 declared_read_fields=transform.declared_read_fields,
                 passes_through_input=transform.passes_through_input,
                 forwards_input_fields=transform.forwards_input_fields,
@@ -1815,10 +1820,13 @@ def build_execution_graph(
         # for typed-field/mode/audit merging), this carries each branch's
         # PROPAGATION-WALKED effective guarantee so fields a pass-through branch
         # inherits from upstream (e.g. source columns carried through an LLM)
-        # survive the union. Non-participating branches are skipped, mirroring
-        # the composer preview's _connection_propagation_vote
-        # (web/composer/state.py) so build-time and preview agree
-        # (elspeth-0b14977817).
+        # survive the union. EVERY branch enters, a non-participating one as a
+        # schema without guarantees: merge_guaranteed_fields skips it under
+        # require_all (every branch arrives) and abstains on it under every
+        # other policy (a merged row can be that branch alone). The composer
+        # preview's _connection_propagation_vote (web/composer/state.py)
+        # builds the same map, so build-time and preview agree
+        # (elspeth-0b14977817; R2 fix round 1).
         guarantee_branch_schemas: dict[str, SchemaConfig] = {}
         # Each branch's producer and presence vote, for the certain-conflict
         # refusal below (the vote is the walk the guarantee merge already uses).
@@ -1836,12 +1844,11 @@ def build_execution_graph(
             branch_to_schema[str(branch_plan.branch_name)] = _best_schema_config(producer_node)
             vote = walk_effective_guarantee_vote(graph, producer_node, {})
             branch_producer_votes[str(branch_plan.branch_name)] = (producer_node, vote)
-            if vote.participated:
-                guarantee_branch_schemas[str(branch_plan.branch_name)] = SchemaConfig(
-                    mode="observed",
-                    fields=None,
-                    guaranteed_fields=tuple(sorted(vote.fields)),
-                )
+            guarantee_branch_schemas[str(branch_plan.branch_name)] = SchemaConfig(
+                mode="observed",
+                fields=None,
+                guaranteed_fields=tuple(sorted(vote.fields)) if vote.participated else None,
+            )
 
         # Update branch_info with schema information for runtime tracking of
         # lost branch fields. When a branch is diverted at runtime, the coalesce
@@ -1860,7 +1867,7 @@ def build_execution_graph(
             branch_order=tuple(coal_config.branches.keys()),
             select_branch=coal_config.select_branch,
             coalesce_id=str(coalesce_id),
-            guarantee_branch_schemas=guarantee_branch_schemas or None,
+            guarantee_branch_schemas=guarantee_branch_schemas,
         )
         _assign_schema(coalesce_id, merged_schema)
         if coal_config.merge == "union":
@@ -2212,6 +2219,12 @@ def build_execution_graph(
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
+
+    # The declared-input proof reads the FINAL topology: the rule-9 DIVERT
+    # edges above change what a closer's vote (and so its successors' proofs)
+    # may claim, and the runtime classifies a declared-input miss by exactly
+    # this map (ADR-013 Amendment 2026-09-27).
+    graph.set_declared_input_proof(compute_declared_input_proof(graph))
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)

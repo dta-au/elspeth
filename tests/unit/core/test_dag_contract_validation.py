@@ -1058,17 +1058,27 @@ class TestCoalesceGuaranteedFieldsSemantics:
         result = graph.get_effective_guaranteed_fields("coalesce")
         assert result == frozenset({"common"})
 
-    def test_one_branch_none_guarantees_abstains(self) -> None:
-        """Branch with None guaranteed_fields abstains — doesn't kill intersection."""
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            # Every branch arrives, so branch_a's guarantees hold on every merged row.
+            pytest.param("require_all", frozenset({"x", "y"}), id="require_all"),
+            # A merged row can be branch_b alone, which vouches for nothing: the
+            # coalesce abstains (R2 fix round 1). Skipping the abstainer used to
+            # publish {x, y}, so a lost branch_a became a proven miss downstream.
+            pytest.param("best_effort", frozenset(), id="best_effort"),
+        ],
+    )
+    def test_one_branch_none_guarantees(self, policy: str, expected: frozenset[str]) -> None:
+        """An abstaining branch is skipped only when every branch arrives (require_all)."""
         graph = self._build_coalesce_graph(
             {
                 "branch_a": {"schema": {"mode": "observed", "guaranteed_fields": ["x", "y"]}},
                 "branch_b": {"schema": {"mode": "observed"}},  # guaranteed_fields=None
-            }
+            },
+            policy=policy,
         )
-        result = graph.get_effective_guaranteed_fields("coalesce")
-        # branch_b abstains, so branch_a's guarantees survive
-        assert result == frozenset({"x", "y"})
+        assert graph.get_effective_guaranteed_fields("coalesce") == expected
 
     def test_all_branches_none_guarantees_returns_empty(self) -> None:
         """All branches with None guaranteed_fields → no guarantees (empty set)."""
@@ -1135,8 +1145,20 @@ class TestCoalesceGuaranteedFieldsSemantics:
         result = graph.get_effective_guaranteed_fields("coalesce")
         assert result == frozenset()
 
-    def test_three_branches_mixed_none_and_explicit(self) -> None:
-        """Three branches: two explicit, one None → intersection of explicit only."""
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            pytest.param("require_all", frozenset({"x", "y", "z"}), id="require_all"),
+            pytest.param("best_effort", frozenset(), id="best_effort"),
+        ],
+    )
+    def test_three_branches_mixed_none_and_explicit(self, policy: str, expected: frozenset[str]) -> None:
+        """Three branches: two explicit, one None.
+
+        require_all: every branch arrives → union of the explicit ones.
+        best_effort: a merged row can be branch_c alone, which vouches for
+        nothing → the coalesce abstains (R2 fix round 1; was a ∩ b).
+        """
         graph = ExecutionGraph()
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
 
@@ -1159,8 +1181,7 @@ class TestCoalesceGuaranteedFieldsSemantics:
             config={"schema": {"mode": "observed"}},  # None → abstains
         )
         # Add coalesce with computed schema (simulates builder)
-        # branch_c abstains, intersection of a ∩ b = {"x", "z"}
-        _add_coalesce_with_computed_schema(graph, "coalesce", ["branch_a", "branch_b", "branch_c"], policy="best_effort")
+        _add_coalesce_with_computed_schema(graph, "coalesce", ["branch_a", "branch_b", "branch_c"], policy=policy)
 
         graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv")
 
@@ -1169,8 +1190,7 @@ class TestCoalesceGuaranteedFieldsSemantics:
             graph.add_edge(b, "coalesce", label="continue")
         graph.add_edge("coalesce", "sink", label="continue")
 
-        result = graph.get_effective_guaranteed_fields("coalesce")
-        assert result == frozenset({"x", "z"})
+        assert graph.get_effective_guaranteed_fields("coalesce") == expected
 
     def test_typed_required_fields_participate_without_explicit_guaranteed_fields(
         self,

@@ -134,6 +134,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
     BatchPassthroughShapeError,
     BatchPassthroughShapeKind,
     BatchQuarantineContradictionError,
@@ -143,7 +144,6 @@ from elspeth.contracts.errors import (
     FrameworkBugError,
     MaxRetriesExceeded,
     OrchestrationInvariantError,
-    PassThroughContractViolation,
     PluginContractViolation,
     PluginRetryableError,
     TransformErrorCategory,
@@ -181,6 +181,7 @@ from elspeth.engine.executors import (
     GateExecutor,
     TransformExecutor,
 )
+from elspeth.engine.executors.batch_violation_outcomes import BatchSeamViolation, record_batch_violation_failures
 from elspeth.engine.executors.declaration_dispatch import run_batch_flush_checks, run_boundary_checks
 from elspeth.engine.executors.non_canonical_output import non_canonical_source_row_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard, stamped_node_state_id
@@ -226,6 +227,14 @@ class DAGTraversalContext:
     # closed at resolution instead of being skipped. Barrier nodes are
     # structural by definition and always unioned in.
     structural_node_ids: frozenset[NodeID] = frozenset()
+    # The build's declared-input proof (ExecutionGraph.get_declared_input_proof):
+    # node_id -> the declared input fields every arriving row provably carries.
+    # The transform preflight and the batch seams classify a declared-input
+    # miss by it (ADR-013 Amendment 2026-09-27). The empty default serves the
+    # hand-built contexts of tests whose nodes declare no input; a node that
+    # does declare one and has no entry is refused on its first row
+    # (OrchestrationInvariantError), never read as "proves nothing".
+    declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({})
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "node_step_map", deep_freeze(self.node_step_map))
@@ -235,6 +244,7 @@ class DAGTraversalContext:
         object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
         object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
         object.__setattr__(self, "collector_node_map", deep_freeze(self.collector_node_map))
+        object.__setattr__(self, "declared_input_proof", deep_freeze(self.declared_input_proof))
         object.__setattr__(
             self,
             "structural_node_ids",
@@ -715,6 +725,7 @@ class RowProcessor:
             error_edge_ids=error_edge_ids,
             data_flow=data_flow,
             before_terminal_audit=self._heartbeat_active_claim,
+            declared_input_proof=traversal.declared_input_proof,
         )
         self._gate_executor = GateExecutor(
             execution,
@@ -731,6 +742,7 @@ class RowProcessor:
             run_id,
             aggregation_settings=aggregation_settings,
             error_edge_ids=error_edge_ids,
+            declared_input_proof=traversal.declared_input_proof,
             clock=self._clock,
         )
         self._telemetry_manager = telemetry_manager
@@ -1688,62 +1700,25 @@ class RowProcessor:
             emitted_row_count=emitted_row_count,
         )
 
-    def _record_flush_violation(
-        self,
-        fctx: _FlushContext,
-        violation: DeclarationContractViolation
-        | PluginContractViolation
-        | AggregateDeclarationContractViolation
-        | BatchQuarantineContradictionError
-        | BatchPassthroughShapeError,
-    ) -> None:
+    def _record_flush_violation(self, fctx: _FlushContext, violation: BatchSeamViolation) -> None:
         """Record FAILED audit entries for every buffered token on flush failure.
 
-        The violation is semantically batch-level but the audit trail must
-        capture per-token evidence for every buffered token. ``per_token_audit_payload``
-        is rebuilt inside the loop so ``$.context.token_id`` reflects the
-        row's own token, not the triggering token's.
-
-        If ``record_token_outcome`` raises mid-loop, the audit trail is
-        incomplete. Rather than silently swallow the failure and re-raise the
-        original violation, crash loudly with ``AuditIntegrityError`` so the
-        operator learns about the audit-write failure. The primary violation
-        is preserved via ``__context__`` (Python automatically sets it
-        because this is inside ``except``).
+        The per-token terminal writes are the batch seams' one recorder
+        (``record_batch_violation_failures``, shared with the collector's
+        flush); this adds the TokenCompleted telemetry the aggregation path
+        emits for each recorded token.
         """
-        if isinstance(violation, PassThroughContractViolation):
-            violation_summary = f"PassThroughContractViolation:{fctx.transform.name}:{sorted(violation.divergence_set)}"
-        else:
-            violation_summary = f"{type(violation).__name__}:{fctx.transform.name}"
-        error_hash = compute_error_hash(violation_summary)
-        base_audit = violation.to_audit_dict()
-
+        record_batch_violation_failures(
+            self._data_flow,
+            coordination_token=self._require_coordination_token(),
+            run_id=self._run_id,
+            tokens=fctx.buffered_tokens,
+            violation=violation,
+            transform_name=fctx.transform.name,
+            node_id=fctx.node_id,
+            triggering_token_id=fctx.triggering_token.token_id if fctx.triggering_token is not None else None,
+        )
         for token in fctx.buffered_tokens:
-            per_token_audit_payload: dict[str, object] = {
-                **base_audit,
-                "token_id": token.token_id,
-                "row_id": token.row_id,
-                "triggering_token_id": (fctx.triggering_token.token_id if fctx.triggering_token is not None else None),
-            }
-            try:
-                self._data_flow.record_token_outcome_leader(
-                    coordination_token=self._require_coordination_token(),
-                    ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
-                    outcome=TerminalOutcome.FAILURE,
-                    path=TerminalPath.UNROUTED,
-                    error_hash=error_hash,
-                    context=per_token_audit_payload,
-                )
-            except LandscapeRecordError as record_failure:
-                raise AuditIntegrityError(
-                    f"Failed to record {type(violation).__name__} FAILED outcome "
-                    f"for token {token.token_id!r} in batch flush "
-                    f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}). "
-                    f"Audit trail is INCOMPLETE — FAILED records may exist for some "
-                    f"buffered tokens but not others. "
-                    f"Recorder failure: {type(record_failure).__name__}: {record_failure}. "
-                    f"Original violation: {violation!s}"
-                ) from record_failure
             with best_effort(
                 "TokenCompleted telemetry after batch-flush violation audit",
                 run_id=self._run_id,
@@ -2192,12 +2167,18 @@ class RowProcessor:
             quarantined_indices = self._cross_check_flush_output(fctx, result)
             validated_context.append((fctx, quarantined_indices))
 
+        def record_input_violation(
+            violation: BatchDeclaredInputFieldsViolation, buffered_tokens: Sequence[TokenInfo], batch_id: str
+        ) -> None:
+            self._record_flush_violation(build_flush_context(buffered_tokens, batch_id), violation)
+
         result, buffered_tokens, batch_id = self._aggregation_executor.execute_flush(
             node_id=node_id,
             transform=cast(BatchTransformProtocol, transform),
             ctx=ctx,
             trigger_type=trigger_type,
             validate_success=validate_success,
+            record_input_violation=record_input_violation,
         )
 
         # Test doubles and compatibility adapters may return without invoking

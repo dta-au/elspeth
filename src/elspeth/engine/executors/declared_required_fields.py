@@ -111,7 +111,10 @@ class DeclaredRequiredFieldsContract(DeclarationContract):
                 f"Transform {typed_plugin.name!r} declares declared_input_fields "
                 f"{sorted(declared_input_fields)!r} but is batch-aware. No "
                 f"batch-pre-execution dispatch site exists; ADR-013 scopes this "
-                f"contract to non-batch transforms until an ADR-010 amendment lands."
+                f"contract to non-batch transforms. A batch plugin declares the "
+                f"columns every buffered row must carry through schema.required_fields, "
+                f"which the flush's input check classifies with the same rule "
+                f"(ADR-013 Amendment 2026-09-27)."
             )
         return True
 

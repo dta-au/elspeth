@@ -45,6 +45,7 @@ from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings, QueueSettings, SourceSettings
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.schema_validation import compute_declared_input_proof
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
@@ -173,6 +174,9 @@ def _build_linear_graph(config: PipelineConfig) -> ExecutionGraph:
     graph.set_transform_id_map(transform_ids)
     graph.set_route_resolution_map({})
     graph.set_config_gate_id_map({})
+    # The builder publishes the declared-input proof on every graph it returns;
+    # a hand-built graph that runs rows must too (ADR-013 Amendment 2026-09-27).
+    graph.set_declared_input_proof(compute_declared_input_proof(graph))
     graph.set_pipeline_nodes(list(transform_ids.values()))
     graph.set_node_step_map(graph.build_step_map())
 
@@ -899,6 +903,7 @@ class TestResumeIdempotence:
         graph_b.set_transform_id_map({0: NodeID("transform_0")})
         graph_b.set_route_resolution_map({})
         graph_b.set_config_gate_id_map({})
+        graph_b.set_declared_input_proof(compute_declared_input_proof(graph_b))
         graph_b.set_pipeline_nodes([NodeID("transform_0")])
         graph_b.set_node_step_map(graph_b.build_step_map())
 

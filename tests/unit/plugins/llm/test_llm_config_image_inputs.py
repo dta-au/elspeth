@@ -235,6 +235,24 @@ class TestLLMTransformDeclaredInputFields:
         transform = LLMTransform(config)
         assert "text" in transform.declared_input_fields
 
+    def test_an_optional_image_input_is_not_a_declared_required_input(self) -> None:
+        """``required: false`` means an absent image is a valid row (resolve_image_parts skips it).
+
+        Declaring it made the engine refuse that valid row before process()
+        (elspeth-5887fb7928 R2 census). The column stays a consumed input, so
+        it is never demoted.
+        """
+        config = _make_config(
+            image_inputs=[
+                {"field": "page_blob_ref", "format_field": "page_mime_type"},
+                {"field": "cover_blob_ref", "format_field": "cover_mime_type", "required": False},
+            ],
+        )
+        transform = LLMTransform(config)
+
+        assert transform.declared_input_fields == frozenset({"text", "page_blob_ref", "page_mime_type"})
+        assert {"cover_blob_ref", "cover_mime_type"} <= transform.consumed_input_fields
+
     def test_declared_input_fields_unaffected_when_no_image_inputs(self) -> None:
         transform = LLMTransform(_make_config())
         assert "page_blob_ref" not in transform.declared_input_fields

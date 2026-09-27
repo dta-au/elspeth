@@ -255,6 +255,8 @@ files:
   src/elspeth/engine/executors/aggregation.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 4
+  src/elspeth/engine/executors/batch_violation_outcomes.py:
+    dict[str, object]: 1
   src/elspeth/engine/executors/replay_sink_effect.py:
     Mapping[str, object]: 1
     dict[str, object]: 1
@@ -300,7 +302,7 @@ files:
   src/elspeth/engine/processor.py:
     Mapping[str, object]: 1
     dict[str, Any]: 1
-    dict[str, object]: 4
+    dict[str, object]: 3
   src/elspeth/engine/spans.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5

@@ -29,6 +29,7 @@ from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.canonical import canonical_json
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.schema_validation import compute_declared_input_proof
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
     checkpoints_table,
@@ -68,6 +69,7 @@ def _runtime_val_manifest_json() -> str:
 
 def _finalize_manual_graph(graph: ExecutionGraph, *, pipeline_nodes: list[NodeID] | None = None) -> None:
     """Populate traversal metadata that production graph construction derives."""
+    graph.set_declared_input_proof(compute_declared_input_proof(graph))
     graph.set_pipeline_nodes(list(pipeline_nodes or ()))
     graph.set_node_step_map(graph.build_step_map())
 

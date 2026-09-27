@@ -425,21 +425,48 @@ class TestTypeCoerceConversionField:
         assert result.exit_code == 0, result.output
         assert [row["price"] for row in map(json.loads, (tmp_path / "out.jsonl").read_text().splitlines())] == [5, 6]
 
-    def test_a_missing_conversion_field_is_now_a_declared_input_violation(self, tmp_path: Path) -> None:
-        """Behaviour change (CHANGELOG): a conversion naming a field no row carries is enforced as every declared input is.
+    def test_a_missing_conversion_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """A conversion naming a field no row carries routes ``missing_field``, as release did (R2, ADR-013 Amendment 2026-09-27).
 
-        It was routed ``missing_field`` from inside ``process()``; as a declared
-        input it meets ADR-013's pre-emission contract, which ends the run with
-        the in-flight token's terminal recorded — the disposition web_scrape's
-        ``url_field`` and every other option on this surface already had.
+        As a declared input it is settled before ``process()``: the observed
+        upstream proves nothing about ``nope``, so each row's miss is a fact
+        about that row and routes with one value-free reason. The spelling-rule
+        unit's first cut ended the run here (exit 4) — a lane regression that
+        never shipped.
         """
         result = _run(
             _settings(tmp_path, source=_csv_source(tmp_path, "ID,Price\n1,5\n2,6\n"), transforms=[self._coerce("nope", _OBSERVED)])
         )
 
-        assert result.exit_code == 4, result.output
-        assert "DeclaredRequiredInputFieldsViolation" in result.output
-        assert "NONTERMINAL" not in _terminal_outcomes(tmp_path)
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
+        reasons = _reasons(tmp_path)
+        assert {(r["reason"], tuple(r["fields"])) for r in reasons} == {("missing_field", ("nope",))}
+
+
+class TestJSONExplodeArrayField:
+    """R2: json_explode's ``array_field`` is a declared input, so the rule governs it (it was a lookup)."""
+
+    def _explode(self, field: str) -> dict[str, Any]:
+        return _transform("json_explode", {"array_field": field, "schema": _OBSERVED})
+
+    def test_a_header_spelled_array_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Behaviour change (CHANGELOG): the lookup resolved ``Name`` inside ``process()``; it now routes before it."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._explode("Name")]))
+
+        _assert_routed(tmp_path, result, reason=_READ, literal="Name", canonical="name")
+
+    def test_a_missing_array_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Before R2: ``row[array_field]`` raised a raw KeyError that ended the run (exit 4)."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._explode("nope")]))
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
+        reasons = _reasons(tmp_path)
+        assert {(r["reason"], tuple(r["fields"])) for r in reasons} == {("missing_field", ("nope",))}
+        assert all(SENTINEL not in json.dumps(r) for r in reasons)
 
 
 # ---------------------------------------------------------------------------
