@@ -8559,6 +8559,69 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         node = self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b")
         self._assert_both_accept(self._headerless_state(tmp_path, columns=["id", "name"], field_mapping={"name": "b"}, node=node), tmp_path)
 
+    # --- A field a TRANSFORM renamed (review-C1-alias-bypass-r2) ---
+    # field_mapper {b: c} carries b's recorded original name onto c, so a lookup
+    # of 'Name' reads c. Both surfaces resolved a declaration through the
+    # sources' renames and normalization only — both admitted 'Name: int?'
+    # behind the rename while the run time refused every row. Both now follow
+    # the transform's renamed_input_fields.
+
+    def _renamed_state(self, tmp_path: Path, *, mapped: bool, consumer: NodeSpec) -> CompositionState:
+        """source -> hop (closed field_mapper renaming the header field to 'c') -> consumer."""
+        old = "b" if mapped else "name"
+        hop = replace(
+            self._field_mapper({old: "c"}, schema={"mode": "fixed", "fields": ["id: str", f"{old}: str"]}),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        base = (
+            self._mapped_state(tmp_path, node=hop)
+            if mapped
+            else self._state(tmp_path, source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]}, node=hop)
+        )
+        return CompositionState(
+            sources=base.sources,
+            nodes=(hop, replace(consumer, input="t2_in")),
+            edges=(),
+            outputs=base.outputs,
+            metadata=base.metadata,
+            version=1,
+        )
+
+    @pytest.mark.parametrize("mapped", [True, False], ids=["source-field_mapping", "no-source-field_mapping"])
+    def test_both_reject_a_header_spelling_of_a_field_a_transform_renamed(self, tmp_path: Path, mapped: bool) -> None:
+        consumer = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        consumer = replace(consumer, options={**consumer.options, "select_only": True})
+        self._assert_both_reject(
+            self._renamed_state(tmp_path, mapped=mapped, consumer=consumer),
+            tmp_path,
+            "'Name' is a header spelling of 'c': a transform upstream renames the field it names to 'c', so rows carry it as 'c' "
+            "(a lookup of 'Name' reads that field). Declare 'c'",
+        )
+
+    def test_both_reject_recreating_an_unmapped_field_under_its_header_name_behind_its_rename(self, tmp_path: Path) -> None:
+        """No source rename: 'name' is the field's identity, so behind {name: c} a created 'name' is a spelling of c."""
+        composer, runtime = self._both(
+            self._renamed_state(tmp_path, mapped=False, consumer=self._value_transform(target="name", reads="c")), tmp_path
+        )
+        spelling = "'name' is a header spelling of the arriving field 'c'"
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert spelling in entry.message
+        assert not runtime.is_valid
+        assert any("Field name header spelling" in e.message and spelling in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize(
+        "consumer",
+        [
+            pytest.param({"target": "b", "reads": "c"}, id="recreate-the-name-a-source-rename-gave"),
+            pytest.param({"target": "total", "schema": {"mode": "flexible", "fields": ["c: str?"]}, "reads": "c"}, id="canonical-read"),
+        ],
+    )
+    def test_both_accept_what_no_lookup_resolves_to_the_renamed_field(self, tmp_path: Path, consumer: dict[str, Any]) -> None:
+        """Behind source {name: b} -> {b: c}, b's identity is 'Name': 'b' names nothing, 'c' is the field itself."""
+        self._assert_both_accept(self._renamed_state(tmp_path, mapped=True, consumer=self._value_transform(**consumer)), tmp_path)
+
     @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
     def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:
         state = self._state(

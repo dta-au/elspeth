@@ -21,6 +21,8 @@ exactly like a pass-through transform with no declared fields of its own.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -84,6 +86,7 @@ class _PassThroughTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, added_field: str) -> None:
         self.name = name
@@ -120,6 +123,7 @@ class _RequiringTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, required: tuple[str, ...]) -> None:
         self.name = name

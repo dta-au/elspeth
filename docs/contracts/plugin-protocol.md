@@ -553,8 +553,20 @@ passes_through_input: bool = False  # Set True only when every emitted row prese
 can_drop_rows: bool = False  # Set True only when pass-through transform may intentionally emit zero rows
 declared_input_fields: frozenset[str] = frozenset()  # Required input-field declaration (single-row only)
 declared_output_fields: frozenset[str] = frozenset()  # Guaranteed per-emitted-row output fields
+renamed_input_fields: Mapping[str, str] = MappingProxyType({})  # Identity-carrying renames (source spelling -> new name)
 _output_schema_config: SchemaConfig | None = None  # Required when output fields are declared
 ```
+
+`renamed_input_fields` names every field `process()` moves to a new key while
+its output contract carries the field's recorded original name onto that key
+(`narrow_contract_to_output(renamed_fields=...)` — field_mapper's flat
+`mapping`), so a lookup of any spelling of the old field reads the new one.
+The key is the rename's source as configured (a LOOKUP, which may be a header
+spelling). The field-name spelling rule's build-time resolution follows these
+renames between the sources and every declaring node, in the pipeline build
+and the Web Composer alike, so a transform that carries a field's identity to
+a new name must declare exactly the renames it passes to
+`narrow_contract_to_output`.
 
 #### Token Creation (Deaggregation)
 

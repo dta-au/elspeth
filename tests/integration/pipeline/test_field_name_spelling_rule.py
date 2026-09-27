@@ -876,3 +876,138 @@ def test_a_renamed_header_declaration_behind_an_intermediate_transform_is_refuse
 
     assert "its upstream 'transform_hop_" in output
     assert spelling in output
+
+
+# ---------------------------------------------------------------------------
+# A field a TRANSFORM renamed (review-C1-alias-bypass-r2)
+# ---------------------------------------------------------------------------
+#
+# field_mapper ``{b: c}`` carries b's recorded original name ('Name') onto
+# ``c``, so a lookup of 'Name' reads ``c`` and the run time refused every row of
+# a consumer declaring 'Name'. The build resolved the declaration through the
+# sources' renames and normalization only, never through the transform's, so
+# ``elspeth validate`` admitted a config whose every row failed — with and
+# without a source field_mapping. The build now follows each transform's
+# ``renamed_input_fields`` between the sources and the consumer.
+
+
+def _renaming_hop(*, mapped: bool) -> dict[str, Any]:
+    """A closed field_mapper renaming the header field to ``c`` (source -> hop -> consumer)."""
+    old = "b" if mapped else "name"
+    return {
+        "name": "hop",
+        "plugin": "field_mapper",
+        "input": "rows",
+        "on_success": "mid",
+        "on_error": "quarantine",
+        "options": {"mapping": {old: "c"}, "schema": {"mode": "fixed", "fields": ["id: str", f"{old}: str"]}},
+    }
+
+
+def _source_before_the_hop(tmp_path: Path, *, mapped: bool) -> dict[str, Any]:
+    if mapped:
+        return _mapped_source(tmp_path, schema=_FIXED_ID_B)
+    return _csv_source(tmp_path, schema=_FIXED_ID_NAME)
+
+
+_CARRIED_READ = (
+    "'Name' is a header spelling of 'c': a transform upstream renames the field it names to 'c', so rows carry it as 'c' "
+    "(a lookup of 'Name' reads that field). Declare 'c'"
+)
+
+
+@pytest.mark.parametrize("mapped", [True, False], ids=["source-field_mapping", "no-source-field_mapping"])
+@pytest.mark.parametrize(
+    ("consumer", "spelling"),
+    [
+        pytest.param(
+            _transform(
+                "field_mapper",
+                {"mapping": {"Name": "given"}, "select_only": True, "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+            ),
+            _CARRIED_READ,
+            id="read-field_mapper-codex-shape",
+        ),
+        pytest.param(
+            _transform(
+                "value_transform",
+                {"operations": [{"target": "d", "expression": "row['c']"}], "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+            ),
+            _CARRIED_READ,
+            id="read-value_transform-schema-field",
+        ),
+        pytest.param(
+            _transform("value_transform", {"operations": [{"target": "Name", "expression": "row['c'] + '!'"}], "schema": _OBSERVED}),
+            "'Name' is a header spelling of the arriving field 'c'",
+            id="create-value_transform-target",
+        ),
+    ],
+)
+def test_a_header_spelling_of_a_field_a_transform_renamed_is_refused_at_build(
+    tmp_path: Path, mapped: bool, consumer: dict[str, Any], spelling: str
+) -> None:
+    source = _source_before_the_hop(tmp_path, mapped=mapped)
+    output = _refused_at_build(_settings(tmp_path, source=source, transforms=[_renaming_hop(mapped=mapped), {**consumer, "input": "mid"}]))
+
+    assert "its upstream 'transform_hop_" in output
+    assert spelling in output
+
+
+def test_a_sink_declaration_of_a_field_a_transform_renamed_is_refused_at_build(tmp_path: Path) -> None:
+    hop = {**_renaming_hop(mapped=True), "on_success": "out"}
+    sink = _json_sink(tmp_path / "out.jsonl", schema={"mode": "flexible", "fields": ["Name: str?"]})
+    output = _refused_at_build(_settings(tmp_path, source=_mapped_source(tmp_path, schema=_FIXED_ID_B), transforms=[hop], out_sink=sink))
+
+    assert _CARRIED_READ in output
+
+
+def test_the_renamed_field_is_the_canonical_declaration_and_delivers(tmp_path: Path) -> None:
+    consumer = _transform(
+        "value_transform", {"operations": [{"target": "d", "expression": "row['c']"}], "schema": {"mode": "flexible", "fields": ["c: str"]}}
+    )
+    result = _run(
+        _settings(
+            tmp_path,
+            source=_mapped_source(tmp_path, schema=_FIXED_ID_B),
+            transforms=[_renaming_hop(mapped=True), {**consumer, "input": "mid"}],
+        )
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+    assert [json.loads(line)["d"] for line in (tmp_path / "out.jsonl").read_text().splitlines()] == [SENTINEL, "Bob"]
+
+
+def test_the_name_a_source_rename_gave_a_field_is_free_once_a_transform_renames_it(tmp_path: Path) -> None:
+    """Behind source {name: b} -> field_mapper {b: c}, creating 'b' afresh shadows nothing: b's identity is 'Name'.
+
+    A lookup of 'b' reads no field there (the contract records 'Name' as c's
+    original), so both the build and the run time admit the target.
+    """
+    consumer = _transform("value_transform", {"operations": [{"target": "b", "expression": "row['c'] + '!'"}], "schema": _OBSERVED})
+    result = _run(
+        _settings(
+            tmp_path,
+            source=_mapped_source(tmp_path, schema=_FIXED_ID_B),
+            transforms=[_renaming_hop(mapped=True), {**consumer, "input": "mid"}],
+        )
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+    rows = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert [row["b"] for row in rows] == [f"{SENTINEL}!", "Bob!"]
+
+
+def test_the_header_name_of_an_unmapped_field_follows_the_rename(tmp_path: Path) -> None:
+    """Without a source rename the field's identity is its header: behind {name: c}, a created 'name' shadows c."""
+    consumer = _transform("value_transform", {"operations": [{"target": "name", "expression": "row['c'] + '!'"}], "schema": _OBSERVED})
+    output = _refused_at_build(
+        _settings(
+            tmp_path,
+            source=_source_before_the_hop(tmp_path, mapped=False),
+            transforms=[_renaming_hop(mapped=False), {**consumer, "input": "mid"}],
+        )
+    )
+
+    assert "'name' is a header spelling of the arriving field 'c'" in output

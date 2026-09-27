@@ -21,7 +21,6 @@ from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
     DeclaredSpellings,
     FieldNameResolution,
-    SourceFieldRenames,
     describe_header_spellings,
     header_spelled_declarations,
     header_spelled_names,
@@ -224,7 +223,7 @@ def validate_single_edge(
                 f"  Producer ({from_info.plugin_name}) guarantees: "
                 f"{sorted(producer_guaranteed) if producer_guaranteed else '(none - dynamic schema)'}\n"
                 f"  Missing fields: {sorted(missing)}\n"
-                f"{header_spelling_hint(missing, producer_guaranteed, upstream_name_resolution(graph, to_node_id))}"
+                f"{header_spelling_hint(missing, producer_guaranteed, upstream_name_resolution(graph, to_node_id, {}))}"
                 f"\n"
                 f"Fix: Either:\n"
                 f"  1. Add missing fields to producer's schema or guaranteed_fields, or\n"
@@ -713,7 +712,7 @@ def _validate_locked_consumer_guaranteed_extras(
 
     if sink_missing:
         message = (
-            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing, walk_effective_guarantee_vote(graph, from_node_id, {}).fields, upstream_name_resolution(graph, to_node_id))}\n"
+            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing, walk_effective_guarantee_vote(graph, from_node_id, {}).fields, upstream_name_resolution(graph, to_node_id, {}))}\n"
             f"\n"
             f"The same edge ALSO violates the consumer's locked input contract. "
             f"BOTH must be repaired — dropping the extras alone leaves the sink "
@@ -1205,32 +1204,56 @@ def _sink_required_missing_fields(
     return sink_required - vote.fields
 
 
-def upstream_name_resolution(graph: ExecutionGraph, node_id: str) -> FieldNameResolution:
-    """The field-name spelling rule's build-time resolution for ``node_id``: the renames of every source reaching it.
+def upstream_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
+    """The field-name spelling rule's build-time resolution for the rows arriving at ``node_id``.
 
-    A declaration names what the upstream makes of its spelling, and the only
-    renames a build can know are each source's ``field_mapping``
-    (``NodeInfo.field_renames``). A source contributes when its ROWS reach the
-    node: the walk follows live edges only (``_live_predecessors``), since a
-    DIVERT edge delivers an error envelope, not the source's row — the same
-    reason the vote itself skips them. Membership in the node's upstream vote
-    still decides whether a resolved name is refused. The Web Composer's
-    Stage-1 mirror derives the same set by the same live reach
-    (``_live_sources_reaching`` in web/composer/state.py).
+    A declaration names what the upstream makes of its spelling, so the build
+    resolves it the way the rows' own contract will: through the renames of
+    every source whose rows reach the node (``NodeInfo.field_renames``, each
+    source's ``field_mapping``), followed through every transform rename on
+    the way (``NodeInfo.renamed_input_fields``, e.g. field_mapper's
+    ``mapping``), which carries the field's identity onto its new name. Where
+    predecessors meet, their resolutions unite
+    (``FieldNameResolution.union``). The walk follows live edges only
+    (``_live_predecessors``), since a DIVERT edge delivers an error envelope,
+    not the producer's row — the same reason the vote itself skips them.
+    Membership in the node's upstream vote still decides whether a resolved
+    name is refused. The Web Composer's Stage-1 mirror composes the same
+    resolution over the same live wiring (``_live_name_resolution`` in
+    web/composer/state.py).
+
+    ``cache`` holds each node's OUTPUT resolution and may be shared across
+    calls on one graph.
     """
-    seen: set[str] = set()
-    pending = [node_id]
-    renames: list[SourceFieldRenames] = []
+    return FieldNameResolution.union(
+        _output_name_resolution(graph, predecessor_id, cache) for predecessor_id in _live_predecessors(graph, node_id)
+    )
+
+
+def _output_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
+    """The name resolution of the rows ``node_id`` emits: a source's renames, else its input's past its own renames.
+
+    Iterative post-order over live predecessors, memoised in ``cache``, so a
+    deep chain does not recurse.
+    """
+    pending: list[tuple[str, bool]] = [(node_id, False)]
     while pending:
-        for predecessor_id in _live_predecessors(graph, pending.pop()):
-            if predecessor_id in seen:
-                continue
-            seen.add(predecessor_id)
-            info = graph.get_node_info(predecessor_id)
-            if info.node_type is NodeType.SOURCE:
-                renames.append(info.field_renames)
-            pending.append(predecessor_id)
-    return FieldNameResolution.of_source_renames(renames)
+        current, inputs_resolved = pending.pop()
+        if current in cache:
+            continue
+        info = graph.get_node_info(current)
+        if info.node_type is NodeType.SOURCE:
+            cache[current] = FieldNameResolution.of_source_renames((info.field_renames,))
+            continue
+        predecessors = _live_predecessors(graph, current)
+        if not inputs_resolved:
+            pending.append((current, True))
+            pending.extend((predecessor_id, False) for predecessor_id in predecessors if predecessor_id not in cache)
+            continue
+        cache[current] = FieldNameResolution.union(cache[predecessor_id] for predecessor_id in predecessors).then_renamed(
+            info.renamed_input_fields
+        )
+    return cache[node_id]
 
 
 def header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str], resolution: FieldNameResolution) -> str:
@@ -1367,7 +1390,7 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
                     predecessor_id,
                     missing,
                     walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache).fields,
-                    upstream_name_resolution(graph, node_id),
+                    upstream_name_resolution(graph, node_id, {}),
                 ),
                 component_id=str(node_id),
                 component_type="sink",
@@ -1694,8 +1717,9 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
     mirror makes, so the two surfaces cannot disagree about when a build may
     refuse. A declared name is resolved the way the upstream resolves it: its
     normalized form, renamed by the ``field_mapping`` of any source reaching the
-    node (``upstream_name_resolution``) — so under ``field_mapping: {name: b}``
-    both ``Name`` and ``name`` are spellings of ``b``. Soundness, per
+    node and by every transform rename on the way (``upstream_name_resolution``)
+    — so under ``field_mapping: {name: b}`` both ``Name`` and ``name`` are
+    spellings of ``b``, and behind a field_mapper ``{b: c}`` of ``c``. Soundness, per
     predecessor vote:
 
     - a READ is refused only against a PARTICIPATING and CLOSED vote. Absence of
@@ -1727,6 +1751,7 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
             participating predecessor carries.
     """
     effective_fields_cache: dict[str, EffectiveGuaranteeVote] = {}
+    name_resolution_cache: dict[str, FieldNameResolution] = {}
 
     for node_id, data in graph._graph.nodes(data=True):
         info = data["info"]
@@ -1746,7 +1771,7 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
         if declared.is_empty:
             continue
 
-        resolution = upstream_name_resolution(graph, node_id)
+        resolution = upstream_name_resolution(graph, node_id, name_resolution_cache)
         for predecessor_id in _live_predecessors(graph, node_id):
             vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
             spellings = header_spelled_declarations(

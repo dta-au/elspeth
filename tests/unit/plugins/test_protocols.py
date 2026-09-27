@@ -2,6 +2,7 @@
 """Tests for plugin protocols."""
 
 from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from elspeth.contracts import Determinism, PipelineRow, SourceRow
@@ -198,6 +199,7 @@ class TestTransformProtocol:
             # rewritten. Fail-closed default, mirroring BaseTransform.
             preserves_input_values = False
             removed_input_fields = frozenset()
+            renamed_input_fields: Mapping[str, str] = MappingProxyType({})
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
             declared_string_input_fields: frozenset[str] = frozenset()  # elspeth-b19dfe41fb string-scan surface

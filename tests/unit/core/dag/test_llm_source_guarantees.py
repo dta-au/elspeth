@@ -10,6 +10,8 @@ The composer's raw-level guarantee synthesis
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from elspeth.contracts.schema import SchemaConfig, get_raw_producer_guaranteed_fields
@@ -60,6 +62,7 @@ class _UsageConsumerTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {

@@ -3421,6 +3421,17 @@ sites:
   note: Both fields are read off one TransformProtocol instance at builder.py:407-408 / 458-459, so the
     pairing invariant is the plugin's own declaration, not pipeline input; the composer cannot set either
     field.
+- key: af7ed0e605e5fb89
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.renamed_input_fields is only meaningful for TRANSFORM nodes; node {} has type {}.
+  ordinal: 0
+  disposition: structural
+  note: renamed_input_fields is written only on the builder's transform path (builder.py, from TransformProtocol.renamed_input_fields);
+    add_node defaults it to an empty mapping. No composer option can place it on a non-transform node.
+    review-C1-alias-bypass-r2 (the field-name spelling rule's build resolution follows a transform's identity-carrying
+    renames).
 - key: 92eca96a9e43431a
   path: src/elspeth/core/dag/models.py
   qualname: _GateEntry.__post_init__

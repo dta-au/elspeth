@@ -26,6 +26,8 @@ exactly one arm, so
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -90,6 +92,7 @@ class _RequiringTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, required: tuple[str, ...]) -> None:
         self.name = name

@@ -441,6 +441,16 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
 
+    # Identity-carrying renames (field-name spelling rule): source spelling ->
+    # new name, for every field process() moves to a new key while its output
+    # contract carries the field's recorded original name onto that key
+    # (``narrow_contract_to_output(renamed_fields=...)``), so a lookup of any
+    # spelling of the old field reads the new one. The source is a LOOKUP
+    # (it may be a header spelling). Read by the build-time name resolution
+    # (``FieldNameResolution.then_renamed``) in the DAG validator and the Web
+    # Composer's mirror; empty for a transform that renames nothing.
+    renamed_input_fields: Mapping[str, str]
+
     # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
     # above say which fields survive; this one says the plugin never CHANGES a
     # surviving field's value (adding new fields is fine). When True, the

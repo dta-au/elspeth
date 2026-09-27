@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 import networkx as nx
@@ -76,6 +77,10 @@ if TYPE_CHECKING:
 # `frozenset()` literal default-argument anti-pattern, which would be unsafe
 # if the type were ever changed to a mutable container.
 _EMPTY_DECLARED_REQUIRED_FIELDS: frozenset[str] = frozenset()
+
+# The empty renamed_input_fields default: a read-only mapping, so the shared
+# default instance cannot be mutated through one node's NodeInfo.
+_NO_RENAMED_INPUT_FIELDS: Mapping[str, str] = MappingProxyType({})
 
 
 class ExecutionGraph:
@@ -169,6 +174,7 @@ class ExecutionGraph:
         preserves_input_values: bool = False,
         observed_value_type: str | None = None,
         field_renames: SourceFieldRenames = NO_SOURCE_RENAMES,
+        renamed_input_fields: Mapping[str, str] = _NO_RENAMED_INPUT_FIELDS,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -256,6 +262,9 @@ class ExecutionGraph:
                 the way it keys them (SourceProtocol.field_renames), read by
                 the field-name spelling rule's build-time resolution. NodeInfo
                 guards against misuse.
+            renamed_input_fields: For TRANSFORM nodes only — the transform's
+                identity-carrying renames (TransformProtocol.renamed_input_fields),
+                followed by the same resolution. NodeInfo guards against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -297,6 +306,7 @@ class ExecutionGraph:
             preserves_input_values=preserves_input_values,
             observed_value_type=observed_value_type,
             field_renames=field_renames,
+            renamed_input_fields=renamed_input_fields,
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,

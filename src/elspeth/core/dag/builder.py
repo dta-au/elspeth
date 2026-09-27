@@ -427,6 +427,7 @@ def build_execution_graph(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
+            renamed_input_fields=transform.renamed_input_fields,
             preserves_input_values=transform.preserves_input_values,
         )
 

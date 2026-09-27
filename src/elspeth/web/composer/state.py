@@ -7250,7 +7250,8 @@ def _check_schema_contracts(
     # The rule resolves a declared name the way the upstream does: through the
     # ``field_mapping`` of every source whose rows reach the consumer, read off
     # a probe instance's ``field_renames`` exactly as the builder reads the real
-    # source's (``upstream_name_resolution`` in core/dag/schema_validation.py).
+    # source's, followed through every transform's ``renamed_input_fields`` on
+    # the way (``upstream_name_resolution`` in core/dag/schema_validation.py).
     source_renames_memo: dict[str, SourceFieldRenames] = {}
 
     def _source_field_renames(producer: ProducerEntry) -> SourceFieldRenames:
@@ -7314,33 +7315,51 @@ def _check_schema_contracts(
         return (producer,) if _publishes_live(producer, connection) else ()
 
     live_reach_memo: dict[tuple[str, ...], FieldNameResolution] = {}
+    producer_resolution_memo: dict[str, FieldNameResolution] = {}
 
-    def _live_sources_reaching(connections: tuple[str, ...]) -> FieldNameResolution:
-        """The renames of every source whose rows reach ``connections`` over live wiring (the build's live walk).
+    def _transform_renamed_input_fields(node: NodeSpec) -> Mapping[str, str]:
+        """A transform node's ``renamed_input_fields``, read off its shared probe; none for any other kind.
 
-        Asked only once a producer vote participates (``_header_spelling_error``),
-        so a source is probed only when a verdict can depend on its renames.
+        Exactly what the builder threads onto a TRANSFORM ``NodeInfo``. A node
+        whose draft options do not construct is refused by its own validation
+        and the build that would follow its renames never runs, so it renames
+        nothing here (as ``_source_field_renames`` abstains).
+        """
+        if node.node_type != "transform" or node.plugin is None:
+            return {}
+        try:
+            return probe_cache.transform(node.plugin, node).renamed_input_fields
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return {}
+
+    def _producer_name_resolution(producer: ProducerEntry) -> FieldNameResolution:
+        """The name resolution of the rows ``producer`` emits (``_output_name_resolution`` in the builder's validator)."""
+        if producer.producer_id in producer_resolution_memo:
+            return producer_resolution_memo[producer.producer_id]
+        if is_source_producer_id(producer.producer_id):
+            resolution = FieldNameResolution.of_source_renames((_source_field_renames(producer),))
+        else:
+            node = node_by_id[producer.producer_id]
+            resolution = _live_name_resolution(_node_input_connections(node)).then_renamed(_transform_renamed_input_fields(node))
+        producer_resolution_memo[producer.producer_id] = resolution
+        return resolution
+
+    def _live_name_resolution(connections: tuple[str, ...]) -> FieldNameResolution:
+        """The name resolution of the rows arriving over ``connections`` (``upstream_name_resolution``'s mirror).
+
+        The renames of every source whose rows reach them over live wiring,
+        followed through every transform rename on the way. Asked only once a
+        producer vote participates (``_header_spelling_error``), so a source is
+        probed only when a verdict can depend on its renames. A node cycle never
+        reaches here: the rule abstains on one (``spelling_rule_abstains``).
         """
         if connections in live_reach_memo:
             return live_reach_memo[connections]
-        renames: list[SourceFieldRenames] = []
-        seen_connections: set[str] = set()
-        seen_producers: set[str] = set()
-        pending = list(connections)
-        while pending:
-            connection = pending.pop()
-            if connection in seen_connections:
-                continue
-            seen_connections.add(connection)
-            for producer in _live_producers_of(connection):
-                if producer.producer_id in seen_producers:
-                    continue
-                seen_producers.add(producer.producer_id)
-                if is_source_producer_id(producer.producer_id):
-                    renames.append(_source_field_renames(producer))
-                else:
-                    pending.extend(_node_input_connections(node_by_id[producer.producer_id]))
-        live_reach_memo[connections] = FieldNameResolution.of_source_renames(renames)
+        live_reach_memo[connections] = FieldNameResolution.union(
+            _producer_name_resolution(producer) for connection in connections for producer in _live_producers_of(connection)
+        )
         return live_reach_memo[connections]
 
     def _header_spelling_error(
@@ -7365,7 +7384,7 @@ def _check_schema_contracts(
             forwarded=vote_fields - removed,
             participated=participates,
             closed=producer_schema is not None and not producer_schema.allows_extra_fields,
-            resolution=_live_sources_reaching(reach),
+            resolution=_live_name_resolution(reach),
         )
         if not spellings:
             return None

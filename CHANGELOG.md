@@ -168,8 +168,14 @@ drained and repair this release forward.
   mapping delivered a str under a recorded `given: int` with exit 0, and both
   `elspeth validate` and the Composer admitted it. The build and the Composer
   resolve a declaration through the `field_mapping` of every source whose rows
-  reach the node; the run time resolves it through the row's own contract,
-  exactly as a lookup does. Behaviour changes: a
+  reach the node, followed through every transform rename on the way; the run
+  time resolves it through the row's own contract, exactly as a lookup does. A
+  `field_mapper` rename carries the field's original header onto its new name,
+  so behind `{name: c}` (or a source `{name: b}` then `{b: c}`) a declaration
+  `Name` names `c` and is refused at validation ("... a transform upstream
+  renames the field it names to 'c' ... Declare 'c'"); with or without a source
+  `field_mapping`, that shape also delivered a str under a recorded
+  `given: int` with exit 0. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
   Price}]` over header `Price` worked as a lookup and now routes every row
   with `declared_field_is_header_spelling` — write `field: price`; and a

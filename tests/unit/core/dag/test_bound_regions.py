@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar, get_args
 
 import pytest
@@ -94,6 +96,7 @@ class _BoundRegionTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -127,6 +130,7 @@ class _BoundRegionMultiRowTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -160,6 +164,7 @@ class _BoundRegionCollectorPlugin:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -192,6 +197,7 @@ class _BoundRegionAggregationTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name

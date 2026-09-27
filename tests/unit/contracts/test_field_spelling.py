@@ -136,8 +136,8 @@ class TestUpstreamResolution:
                 NO_SOURCE_RENAMES,
             ]
         )
-        assert both.renames == {"name": ("b", "c")}
-        assert both.renames_as_written == {"Name": ("d",)}
+        assert both.renames == {"name": (("b", "renamed"), ("c", "renamed"))}
+        assert both.renames_as_written == {"Name": (("d", "renamed_as_written"),)}
         assert header_spelled_names(["Name"], {"c"}, both, kind="read") == (
             HeaderSpelling(literal="Name", canonical="c", kind="read", leg="renamed"),
         )
@@ -215,6 +215,71 @@ def _gate(
         closed=closed,
         resolution=resolution,
     )
+
+
+class TestTransformRenames:
+    """The build follows a transform's identity-carrying renames (review-C1-alias-bypass-r2).
+
+    field_mapper ``{b: c}`` carries b's recorded original name onto ``c``
+    (``narrow_contract_to_output(renamed_fields=...)``), so at run time a
+    lookup of any spelling of the old field reads ``c``. The build resolution
+    must name ``c`` for the same spellings, and nothing a lookup does not.
+    """
+
+    def test_a_source_renamed_header_follows_the_transform_rename(self) -> None:
+        carried = RENAMED.then_renamed({"b": "c"})
+        assert header_spelled_names(["Name", "name"], {"id", "c"}, carried, kind="read") == (
+            HeaderSpelling(literal="Name", canonical="c", kind="read", leg="carried"),
+            HeaderSpelling(literal="name", canonical="c", kind="read", leg="carried"),
+        )
+
+    def test_the_name_a_source_rename_gave_the_field_does_not_follow_it(self) -> None:
+        # b's original name is the header 'Name', not 'b': after the rename a
+        # lookup of 'b' reads nothing, so creating 'b' afresh shadows nothing.
+        carried = RENAMED.then_renamed({"b": "c"})
+        assert header_spelled_names(["b"], {"id", "c"}, carried, kind="create") == ()
+
+    def test_an_unmapped_header_follows_the_transform_rename_by_its_own_name(self) -> None:
+        # No source rename: the field's original is the header it normalizes
+        # from, so 'name' and 'Name' both read 'c' once name -> c.
+        carried = NORMALIZATION_ONLY.then_renamed({"name": "c"})
+        assert header_spelled_names(["Name", "name"], {"id", "c"}, carried, kind="create") == (
+            HeaderSpelling(literal="Name", canonical="c", kind="create", leg="carried"),
+            HeaderSpelling(literal="name", canonical="c", kind="create", leg="carried"),
+        )
+
+    def test_a_rename_source_is_resolved_as_the_lookup_it_is(self) -> None:
+        # field_mapper {Name: c} behind source {name: b} renames the field 'Name' names: b.
+        carried = RENAMED.then_renamed({"Name": "c"})
+        assert [spelling.canonical for spelling in header_spelled_names(["Name"], {"c"}, carried, kind="read")] == ["c"]
+
+    def test_chained_renames_compose_and_intermediate_names_do_not_follow(self) -> None:
+        for base in (RENAMED, NORMALIZATION_ONLY):
+            chained = base.then_renamed({"b" if base is RENAMED else "name": "c"}).then_renamed({"c": "d"})
+            assert [spelling.canonical for spelling in header_spelled_names(["Name"], {"d"}, chained, kind="read")] == ["d"]
+            # 'c' was only the name a rename gave the field; its identity stayed 'Name'.
+            assert header_spelled_names(["c"], {"d"}, chained, kind="create") == ()
+
+    def test_a_branch_that_did_not_rename_keeps_the_field_under_its_own_name(self) -> None:
+        renamed_arm = NORMALIZATION_ONLY.then_renamed({"name": "c"})
+        merged = FieldNameResolution.union([renamed_arm, NORMALIZATION_ONLY])
+        assert [spelling.canonical for spelling in header_spelled_names(["Name"], {"name"}, merged, kind="read")] == ["name"]
+        assert [spelling.canonical for spelling in header_spelled_names(["Name"], {"c"}, merged, kind="read")] == ["c"]
+
+    def test_union_order_does_not_change_the_resolution(self) -> None:
+        renamed_arm = RENAMED.then_renamed({"b": "c"})
+        assert FieldNameResolution.union([renamed_arm, RENAMED]) == FieldNameResolution.union([RENAMED, renamed_arm])
+
+    def test_an_identity_or_empty_rename_changes_nothing(self) -> None:
+        assert RENAMED.then_renamed({}) is RENAMED
+        assert RENAMED.then_renamed({"b": "b"}) is RENAMED
+
+    def test_the_remedy_names_the_carried_field(self) -> None:
+        [spelling] = header_spelled_names(["Name"], {"c"}, RENAMED.then_renamed({"b": "c"}), kind="read")
+        assert describe_header_spelling(spelling) == (
+            "'Name' is a header spelling of 'c': a transform upstream renames the field it names to 'c', so rows carry it "
+            "as 'c' (a lookup of 'Name' reads that field). Declare 'c'"
+        )
 
 
 class TestBuildTimeGate:

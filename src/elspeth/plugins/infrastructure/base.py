@@ -38,6 +38,7 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
@@ -535,6 +536,14 @@ class BaseTransform(ABC):
     # plugins is a separate change with live-crash risk.
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+
+    # Identity-carrying renames (``TransformProtocol.renamed_input_fields``):
+    # source spelling -> new name for every field ``process`` moves to a new
+    # key while the output contract carries its recorded original name there.
+    # Per-INSTANCE (computed from config — field_mapper's flat mapping), so a
+    # declarer sets it in ``__init__`` and passes exactly these renames to
+    # ``narrow_contract_to_output``; the build's name resolution follows them.
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     # Value-preservation declaration (elspeth-e6e552ce34).
     #

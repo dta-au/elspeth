@@ -27,6 +27,8 @@ Three coordinated pieces under test here:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
@@ -540,6 +542,7 @@ class _ThreadingFakeBatchTransform:
     passes_through_input = True
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, preserves_input_values: bool) -> None:
         self.name = name
@@ -574,6 +577,7 @@ class _ThreadingFakeOpenerTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "json_explode"

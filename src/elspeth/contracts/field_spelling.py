@@ -25,7 +25,9 @@ predicate"):
 where ``resolve`` is the UPSTREAM's own name resolution (``FieldNameResolution``):
 what a lookup of ``T`` reads on the arriving row (``SchemaContract.find_name``,
 at run time), what the source's ``field_mapping`` renames ``normalize(T)`` to
-(``resolve_field_names``' rule, at build time), and ``normalize(T)`` itself.
+(``resolve_field_names``' rule, at build time), and ``normalize(T)`` itself —
+at build time followed through every transform rename between the sources and
+the node, since a rename carries the field's identity onto its new name.
 Comparing only ``normalize(T)`` missed a header the source renames: under
 ``field_mapping: {name: b}`` a lookup of ``Name`` reads ``b`` while a
 declaration ``Name: int?`` met no field, so a str was delivered under a
@@ -134,7 +136,7 @@ def normalized_field_name_or_empty(raw: str) -> str:
     return normalized
 
 
-SpellingLeg = Literal["recorded", "renamed_as_written", "renamed", "normalized"]
+SpellingLeg = Literal["recorded", "renamed_as_written", "renamed", "normalized", "carried"]
 """Which leg of the upstream's resolution named the canonical field (``FieldNameResolution.resolve``).
 
 ``recorded``: the arriving row's contract resolves the literal (it is the
@@ -144,6 +146,10 @@ literal itself, a column name the source keys as written.
 ``renamed``: a headered source's ``field_mapping`` renames the literal's
 normalized form.
 ``normalized``: the literal's normalized form is the field itself.
+``carried``: a transform upstream renamed the field one of the legs above
+names, carrying its identity onto the new name
+(``TransformProtocol.renamed_input_fields``) — so a lookup of the literal
+reads the renamed field.
 """
 
 FieldMappingKeys = Literal["normalized", "as_written"]
@@ -198,6 +204,23 @@ def _declared(names: Iterable[str]) -> tuple[DeclaredName, ...]:
     return tuple(DeclaredName.of(name) for name in sorted(set(names)))
 
 
+ResolvedName = tuple[str, SpellingLeg]
+"""A name rows carry a field as at the resolving node, with the leg that named it."""
+
+
+def _ordered(entries: Iterable[ResolvedName]) -> tuple[ResolvedName, ...]:
+    """Each name once (its first leg), a transform's carried name ahead of the name it came from, then by name.
+
+    Deterministic whatever order predecessors are merged in, so the build and
+    the Web Composer's mirror name the same field in the same words.
+    """
+    first: dict[str, SpellingLeg] = {}
+    for name, leg in entries:
+        if name not in first:
+            first[name] = leg
+    return tuple(sorted(first.items(), key=lambda entry: (entry[1] != "carried", entry[0])))
+
+
 @dataclass(frozen=True, slots=True)
 class FieldNameResolution:
     """How an upstream turns a spelling into the name its rows carry — the resolution the predicate asks.
@@ -223,59 +246,153 @@ class FieldNameResolution:
       its unmapped columns as written, so behind one this leg can only fire on
       a literal that normalizes to a field the upstream carries, which the rule
       refuses as a spelling of that field whatever the source's mode.
+    - each transform rename on the way (build time,
+      ``TransformProtocol.renamed_input_fields``, composed by
+      ``then_renamed``): a transform that renames a field carries its identity
+      (the recorded original name) onto the new name, so a lookup of any
+      spelling of the old field reads the new one. The build therefore
+      follows every rename between the sources and the node; each leg above
+      stores the names rows carry its field as HERE, not at the source.
+      ``normalized_moves`` holds the normalization leg's names that a rename
+      moved; any other normalized name is carried as itself.
 
-    The build has no row contract and the run time does not re-derive a
-    source's renames: a recorded original name that a downstream transform
-    carried onto a renamed field is not a rename any code applies to
-    ``normalize(original)``, so reading one back out of a contract would name
-    fields no lookup reaches.
+    The run time does not re-derive a source's renames: its contract already
+    records every identity the renames carried, which ``recorded`` reads.
     """
 
-    renames_as_written: Mapping[str, tuple[str, ...]]
-    renames: Mapping[str, tuple[str, ...]]
+    renames_as_written: Mapping[str, tuple[ResolvedName, ...]]
+    renames: Mapping[str, tuple[ResolvedName, ...]]
+    normalized_moves: Mapping[str, tuple[ResolvedName, ...]]
     recorded: SchemaContract | None
 
     def __post_init__(self) -> None:
-        freeze_fields(self, "renames_as_written", "renames")
+        freeze_fields(self, "renames_as_written", "renames", "normalized_moves")
 
     @classmethod
     def of_source_renames(cls, sources: Iterable[SourceFieldRenames]) -> FieldNameResolution:
-        """The build-time resolution over the ``field_renames`` of every source whose rows can reach the node."""
-        targets: dict[FieldMappingKeys, dict[str, set[str]]] = {"as_written": {}, "normalized": {}}
+        """The build-time resolution over the ``field_renames`` of the given sources, at the sources themselves."""
+        targets: dict[FieldMappingKeys, dict[str, list[ResolvedName]]] = {"as_written": {}, "normalized": {}}
+        legs: dict[FieldMappingKeys, SpellingLeg] = {"as_written": "renamed_as_written", "normalized": "renamed"}
         for source in sources:
             keyed = targets[source.keys]
             for key, target in source.mapping.items():
                 if key not in keyed:
-                    keyed[key] = set()
-                keyed[key].add(target)
+                    keyed[key] = []
+                keyed[key].append((target, legs[source.keys]))
         return cls(
-            renames_as_written={key: tuple(sorted(found)) for key, found in targets["as_written"].items()},
-            renames={key: tuple(sorted(found)) for key, found in targets["normalized"].items()},
+            renames_as_written={key: _ordered(found) for key, found in targets["as_written"].items()},
+            renames={key: _ordered(found) for key, found in targets["normalized"].items()},
+            normalized_moves={},
             recorded=None,
         )
 
     @classmethod
     def of_contract(cls, contract: SchemaContract) -> FieldNameResolution:
         """The run-time resolution: the arriving row's own contract."""
-        return cls(renames_as_written=NORMALIZATION_ONLY.renames_as_written, renames=NORMALIZATION_ONLY.renames, recorded=contract)
+        return cls(renames_as_written={}, renames={}, normalized_moves={}, recorded=contract)
 
-    def resolve(self, name: DeclaredName) -> Iterator[tuple[str, SpellingLeg]]:
+    @classmethod
+    def union(cls, resolutions: Iterable[FieldNameResolution]) -> FieldNameResolution:
+        """The build-time resolution where several predecessors' rows meet: every name any of them resolves to.
+
+        A normalized name one predecessor moved and another carries as itself
+        resolves to both, so a rename on one branch never hides the field the
+        other branch still delivers under the old name.
+        """
+        merged: tuple[dict[str, list[ResolvedName]], dict[str, list[ResolvedName]]] = ({}, {})
+        parts = tuple(resolutions)
+        for resolution in parts:
+            for into, legs in zip(merged, (resolution.renames_as_written, resolution.renames), strict=True):
+                for key, entries in legs.items():
+                    if key not in into:
+                        into[key] = []
+                    into[key].extend(entries)
+        moved_names = {name for resolution in parts for name in resolution.normalized_moves}
+        moves = {
+            name: _ordered(
+                entry
+                for resolution in parts
+                for entry in (resolution.normalized_moves[name] if name in resolution.normalized_moves else ((name, "normalized"),))
+            )
+            for name in moved_names
+        }
+        return cls(
+            renames_as_written={key: _ordered(entries) for key, entries in merged[0].items()},
+            renames={key: _ordered(entries) for key, entries in merged[1].items()},
+            normalized_moves=moves,
+            recorded=None,
+        )
+
+    def then_renamed(self, renamed: Mapping[str, str]) -> FieldNameResolution:
+        """This resolution on the far side of a transform that renames ``renamed`` (source spelling -> new name).
+
+        A rename's source is itself a LOOKUP (the transform reads it through
+        the row's contract), so the field it renames is whatever this
+        resolution resolves the source to, the literal included — the renames
+        of one transform are applied together, from the resolution the
+        transform's input carries. Every leg naming a renamed field now names
+        the new one. So does the normalization leg of the renamed name itself,
+        unless that name is a field some other leg already names (a source's
+        ``field_mapping`` target, an earlier rename's): its identity is that
+        other spelling, and the old name no longer reaches it.
+        """
+        moved_to: dict[str, set[str]] = {}
+        for source, target in renamed.items():
+            for field_name in {source, *(found for found, _ in self.resolve(DeclaredName.of(source)))}:
+                if field_name == target:
+                    continue
+                if field_name not in moved_to:
+                    moved_to[field_name] = set()
+                moved_to[field_name].add(target)
+        if not moved_to:
+            return self
+
+        def moved(entries: tuple[ResolvedName, ...]) -> tuple[ResolvedName, ...]:
+            return _ordered(
+                entry
+                for name, leg in entries
+                for entry in (((target, "carried") for target in moved_to[name]) if name in moved_to else ((name, leg),))
+            )
+
+        named_elsewhere = {
+            name
+            for legs in (self.renames_as_written, self.renames, self.normalized_moves)
+            for key, entries in legs.items()
+            for name, _ in entries
+            if legs is not self.normalized_moves or name != key
+        }
+        moves = {name: moved(entries) for name, entries in self.normalized_moves.items()}
+        for field_name in moved_to:
+            if field_name in moves or field_name in named_elsewhere:
+                continue
+            # Only a normalization fixed point is ever looked up on this leg.
+            if normalized_field_name_or_empty(field_name) == field_name:
+                moves[field_name] = moved(((field_name, "normalized"),))
+        return FieldNameResolution(
+            renames_as_written={key: moved(entries) for key, entries in self.renames_as_written.items()},
+            renames={key: moved(entries) for key, entries in self.renames.items()},
+            normalized_moves=moves,
+            recorded=None,
+        )
+
+    def resolve(self, name: DeclaredName) -> Iterator[ResolvedName]:
         """Every field ``name`` can name upstream, strongest leg first."""
         if self.recorded is not None:
             found = self.recorded.find_name(name.literal)
             if found is not None:
                 yield found, "recorded"
         if name.literal in self.renames_as_written:
-            for target in self.renames_as_written[name.literal]:
-                yield target, "renamed_as_written"
+            yield from self.renames_as_written[name.literal]
         if name.normalized:
             if name.normalized in self.renames:
-                for target in self.renames[name.normalized]:
-                    yield target, "renamed"
-            yield name.normalized, "normalized"
+                yield from self.renames[name.normalized]
+            if name.normalized in self.normalized_moves:
+                yield from self.normalized_moves[name.normalized]
+            else:
+                yield name.normalized, "normalized"
 
 
-NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, recorded=None)
+NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, normalized_moves={}, recorded=None)
 """The resolution with no upstream rename and no row contract: ``normalize(T)`` alone.
 
 For names checked against names the SAME node creates (value_transform's targets
@@ -362,8 +479,9 @@ def header_spelled_declarations(
     ``present`` is the upstream's guaranteed fields; ``forwarded`` is the part
     of it the consumer carries onto its output (``present`` minus the fields
     the consumer removes, empty when it forwards nothing), which is what a
-    created name can shadow. ``resolution`` is the renames of every source whose
-    rows reach the consumer (``FieldNameResolution.of_source_renames``).
+    created name can shadow. ``resolution`` is the upstream's name resolution
+    at the consumer: the renames of every source whose rows reach it, followed
+    through every transform rename on the way (``upstream_name_resolution``).
 
     A READ declaration (a field the node looks up on arriving rows) is refused
     only when the upstream vote is PARTICIPATING and CLOSED. The predicate's
@@ -477,6 +595,11 @@ def _read_remedy(spelling: HeaderSpelling) -> str:
         if normalized != spelling.literal:
             rename = f"headers are normalized to lowercase identifiers ('{spelling.literal}' -> '{normalized}') and {rename}"
         return f"{rename}. Declare '{spelling.canonical}'"
+    if spelling.leg == "carried":
+        return (
+            f"a transform upstream renames the field it names to '{spelling.canonical}', so rows carry it as "
+            f"'{spelling.canonical}' (a lookup of '{spelling.literal}' reads that field). Declare '{spelling.canonical}'"
+        )
     if spelling.leg == "recorded" and normalized != spelling.canonical:
         return f"rows carry the field it names as '{spelling.canonical}' (a lookup of '{spelling.literal}' reads that field). Declare '{spelling.canonical}'"
     return header_normalization_remedy(spelling.literal, spelling.canonical)
