@@ -477,8 +477,50 @@ class TestTypeCoerceBehavior:
         result = transform.process(row, ctx)
         assert result.status == "error"
         assert result.reason is not None
-        assert result.reason["reason"] == "type_mismatch"
-        assert "maybe" in result.reason.get("message", "")
+        assert result.reason == {
+            "reason": "type_mismatch",
+            "field": "active",
+            "expected": "bool",
+            "actual": "str",
+            "error_type": "not_boolean_string",
+            "message": "string is not a valid boolean string",
+        }
+
+    @pytest.mark.parametrize(
+        ("to", "value", "failure"),
+        [
+            ("int", 918273.5, "fractional_float"),
+            ("int", "SENTINEL_918273", "not_integer_string"),
+            ("int", float("inf"), "non_finite"),
+            ("int", ["SENTINEL_918273"], "unsupported_type"),
+            ("float", "SENTINEL_918273", "not_numeric_string"),
+            ("float", "1e918273", "non_finite"),
+            ("float", {"SENTINEL_918273": 1}, "unsupported_type"),
+            ("bool", 918273, "int_not_zero_or_one"),
+            ("bool", "SENTINEL_918273", "not_boolean_string"),
+            ("bool", 918273.5, "float_not_bool"),
+            ("str", {"SENTINEL_918273": "SENTINEL_918273"}, "not_scalar"),
+        ],
+    )
+    def test_failure_reason_and_exception_are_value_free(self, ctx: "PluginContext", to: str, value: object, failure: str) -> None:
+        """No failure arm may put the row value (or a key inside it) into the
+        audit reason or the exception text: the value stays in the row carrier.
+        """
+        from elspeth.plugins.transforms.type_coerce import _COERCION_FUNCS, CoercionError, TypeCoerce
+        from elspeth.testing import make_pipeline_row
+
+        with pytest.raises(CoercionError) as excinfo:
+            _COERCION_FUNCS[to](value)
+        assert excinfo.value.failure == failure
+        assert excinfo.value.__cause__ is None
+        assert "918273" not in str(excinfo.value)
+
+        transform = TypeCoerce({"schema": DYNAMIC_SCHEMA, "conversions": [{"field": "x", "to": to}]})
+        result = transform.process(make_pipeline_row({"x": value}), ctx)
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["error_type"] == failure
+        assert "918273" not in repr(result.reason)
 
     def test_atomic_failure_no_partial_mutation(self, ctx: "PluginContext") -> None:
         """If second conversion fails, first conversion should not be applied."""

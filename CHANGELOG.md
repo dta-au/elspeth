@@ -543,6 +543,13 @@ drained and repair this release forward.
   every composer authority hash and the advisor fingerprint (session epoch 67).
   A planner `set_pipeline` whose row_union branch value is not a string now
   persists as an argument error instead of failing audit persistence.
+- **Failure reasons no longer carry the row value.** `type_coerce` wrote the
+  offending value into its failure message (`'…' is not a valid integer
+  string`, `float … has fractional part`), and the engine copies that reason
+  into `transform_errors`, `node_states.error_json`, the scheduler's pending
+  error and the routing reason. The reason now names the field, the expected
+  and actual type and a stable `error_type` code (`not_integer_string`,
+  `fractional_float`, …); the value stays only in the row-data columns.
 
 ### Newly refused configurations
 

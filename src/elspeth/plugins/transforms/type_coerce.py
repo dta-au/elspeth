@@ -28,14 +28,54 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import TransformContext
 
 
-class CoercionError(Exception):
-    """Raised when type coercion fails."""
+CoercionFailure = Literal[
+    "none_value",
+    "bool_not_numeric",
+    "non_finite",
+    "fractional_float",
+    "empty_string",
+    "not_integer_string",
+    "not_numeric_string",
+    "int_not_zero_or_one",
+    "float_not_bool",
+    "not_boolean_string",
+    "not_scalar",
+    "unsupported_type",
+]
 
-    def __init__(self, value: Any, target_type: str, reason: str) -> None:
-        self.value = value
+# One fixed sentence per failure arm. The coerced value is row data (Tier 2/3):
+# it stays in the row carrier (transform_errors.row_data_json), never in the
+# reason, so no sentence here may interpolate it.
+_FAILURE_MESSAGES: dict[CoercionFailure, str] = {
+    "none_value": "None cannot be converted",
+    "bool_not_numeric": "bool cannot be converted to a number",
+    "non_finite": "non-finite values are not allowed",
+    "fractional_float": "float has fractional part",
+    "empty_string": "empty string cannot be converted",
+    "not_integer_string": "string is not a valid integer string",
+    "not_numeric_string": "string is not a valid numeric string",
+    "int_not_zero_or_one": "only 0 and 1 can be converted to bool",
+    "float_not_bool": "float cannot be converted to bool",
+    "not_boolean_string": "string is not a valid boolean string",
+    "not_scalar": "value is not a scalar type",
+    "unsupported_type": "unsupported type",
+}
+
+
+class CoercionError(Exception):
+    """Raised when type coercion fails.
+
+    Carries only the failure arm, the target type and the input's type name —
+    never the input value, so neither ``str(exc)`` nor the audit reason built
+    from it can put row content into the Landscape.
+    """
+
+    def __init__(self, *, failure: CoercionFailure, target_type: str, actual_type: str) -> None:
+        self.failure = failure
         self.target_type = target_type
-        self.reason = reason
-        super().__init__(f"Cannot coerce {type(value).__name__} to {target_type}: {reason}")
+        self.actual_type = actual_type
+        self.message = _FAILURE_MESSAGES[failure]
+        super().__init__(f"Cannot coerce {actual_type} to {target_type}: {self.message}")
 
 
 def coerce_to_int(value: Any) -> int:
@@ -56,11 +96,11 @@ def coerce_to_int(value: Any) -> int:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "int", "None cannot be converted to int")
+        raise CoercionError(failure="none_value", target_type="int", actual_type=type(value).__name__)
 
     # Reject bool explicitly (before int check, since bool is subclass of int)
     if type(value) is bool:
-        raise CoercionError(value, "int", "bool cannot be converted to int")
+        raise CoercionError(failure="bool_not_numeric", target_type="int", actual_type=type(value).__name__)
 
     # int passes through
     if type(value) is int:
@@ -69,22 +109,22 @@ def coerce_to_int(value: Any) -> int:
     # float: only if no fractional part
     if type(value) is float:
         if not math.isfinite(value):
-            raise CoercionError(value, "int", "non-finite float cannot be converted to int")
+            raise CoercionError(failure="non_finite", target_type="int", actual_type=type(value).__name__)
         if value != int(value):
-            raise CoercionError(value, "int", f"float {value} has fractional part")
+            raise CoercionError(failure="fractional_float", target_type="int", actual_type=type(value).__name__)
         return int(value)
 
     # string: parse as integer
     if type(value) is str:
         trimmed = value.strip()
         if not trimmed:
-            raise CoercionError(value, "int", "empty string cannot be converted to int")
+            raise CoercionError(failure="empty_string", target_type="int", actual_type=type(value).__name__)
         try:
             return int(trimmed)
-        except ValueError as exc:
-            raise CoercionError(value, "int", f"'{trimmed}' is not a valid integer string") from exc
+        except ValueError:
+            raise CoercionError(failure="not_integer_string", target_type="int", actual_type=type(value).__name__) from None
 
-    raise CoercionError(value, "int", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="int", actual_type=type(value).__name__)
 
 
 def coerce_to_float(value: Any) -> float:
@@ -103,16 +143,16 @@ def coerce_to_float(value: Any) -> float:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "float", "None cannot be converted to float")
+        raise CoercionError(failure="none_value", target_type="float", actual_type=type(value).__name__)
 
     # Reject bool explicitly
     if type(value) is bool:
-        raise CoercionError(value, "float", "bool cannot be converted to float")
+        raise CoercionError(failure="bool_not_numeric", target_type="float", actual_type=type(value).__name__)
 
     # float: check finite
     if type(value) is float:
         if not math.isfinite(value):
-            raise CoercionError(value, "float", "non-finite float values are not allowed")
+            raise CoercionError(failure="non_finite", target_type="float", actual_type=type(value).__name__)
         return value
 
     # int -> float
@@ -123,16 +163,16 @@ def coerce_to_float(value: Any) -> float:
     if type(value) is str:
         trimmed = value.strip()
         if not trimmed:
-            raise CoercionError(value, "float", "empty string cannot be converted to float")
+            raise CoercionError(failure="empty_string", target_type="float", actual_type=type(value).__name__)
         try:
             result = float(trimmed)
-        except ValueError as exc:
-            raise CoercionError(value, "float", f"'{trimmed}' is not a valid numeric string") from exc
+        except ValueError:
+            raise CoercionError(failure="not_numeric_string", target_type="float", actual_type=type(value).__name__) from None
         if not math.isfinite(result):
-            raise CoercionError(value, "float", f"'{trimmed}' produces non-finite value")
+            raise CoercionError(failure="non_finite", target_type="float", actual_type=type(value).__name__)
         return result
 
-    raise CoercionError(value, "float", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="float", actual_type=type(value).__name__)
 
 
 # Boolean string mappings (case-insensitive after trim)
@@ -157,7 +197,7 @@ def coerce_to_bool(value: Any) -> bool:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "bool", "None cannot be converted to bool")
+        raise CoercionError(failure="none_value", target_type="bool", actual_type=type(value).__name__)
 
     # bool passes through
     if type(value) is bool:
@@ -169,11 +209,11 @@ def coerce_to_bool(value: Any) -> bool:
             return False
         if value == 1:
             return True
-        raise CoercionError(value, "bool", f"only 0 and 1 can be converted to bool, got {value}")
+        raise CoercionError(failure="int_not_zero_or_one", target_type="bool", actual_type=type(value).__name__)
 
     # float: reject
     if type(value) is float:
-        raise CoercionError(value, "bool", "float cannot be converted to bool")
+        raise CoercionError(failure="float_not_bool", target_type="bool", actual_type=type(value).__name__)
 
     # string: check against true/false sets
     if type(value) is str:
@@ -182,9 +222,9 @@ def coerce_to_bool(value: Any) -> bool:
             return True
         if normalized in _BOOL_FALSE_STRINGS:
             return False
-        raise CoercionError(value, "bool", f"'{value}' is not a valid boolean string")
+        raise CoercionError(failure="not_boolean_string", target_type="bool", actual_type=type(value).__name__)
 
-    raise CoercionError(value, "bool", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="bool", actual_type=type(value).__name__)
 
 
 # Scalar types accepted for string conversion
@@ -204,11 +244,11 @@ def coerce_to_str(value: Any) -> str:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "str", "None cannot be converted to str")
+        raise CoercionError(failure="none_value", target_type="str", actual_type=type(value).__name__)
 
     # Only accept scalar types
     if type(value) not in _SCALAR_TYPES:
-        raise CoercionError(value, "str", f"{type(value).__name__} is not a scalar type")
+        raise CoercionError(failure="not_scalar", target_type="str", actual_type=type(value).__name__)
 
     return str(value)
 
@@ -300,7 +340,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d6cb511830dd8923"
+    source_file_hash: str | None = "sha256:3c9c3dabe268dad2"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -419,7 +459,8 @@ class TypeCoerce(BaseTransform):
                         "field": config_field,
                         "expected": target_type_name,
                         "actual": type(value).__name__,
-                        "message": e.reason,
+                        "error_type": e.failure,
+                        "message": e.message,
                     }
                 )
 
