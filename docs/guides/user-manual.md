@@ -353,7 +353,7 @@ Output:
     Sequence number: 45
     Has barrier scalars: No
     Blocked barrier rows (journal): 0
-    Unprocessed rows: 55
+    Scheduler work items (to re-drive): 55
 
   Dry run - use --execute to actually resume processing.
   Topology validation passed - checkpoint is compatible with current config.

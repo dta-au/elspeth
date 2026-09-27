@@ -38,8 +38,6 @@ import pytest
 
 from elspeth.contracts import Checkpoint, NodeID, ResumePoint, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
-from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape.factory import RecorderFactory
@@ -89,10 +87,6 @@ class _EarlyCompletionResume:
         self.resume_state = ResumeState(
             factory=self.factory,
             run_id=run_id,
-            unprocessed_rows=(),
-            incomplete_by_row={},
-            recovery_manager=MagicMock(spec=RecoveryManager),
-            schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
             source_names_by_source={NodeID("source"): "source"},
             source_lifecycle_by_source={NodeID("source"): "loaded"},
             has_restored_barrier_work=False,

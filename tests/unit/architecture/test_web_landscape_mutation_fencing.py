@@ -871,6 +871,11 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # factory.execution.begin_node_state / complete_node_state / record_routing_event and
 # TokenManager.create_quarantine_token -> self._data_flow.create_quarantine_row_with_token
 # — the four separate transactions the fenced quarantine ingest now composes into one.
+# QR commit 1 pinned an intermediate tree: the committed tree measures 286 (the arrival
+# ingest_source_quarantine -> scheduler.ingest_quarantine_row_with_pending_sink was not
+# counted). QR replay deletion: 286 -> 285. Departed: TokenManager.create_token_for_existing_row
+# -> self._data_flow.create_token (source-row replay deleted). Measured by
+# scripts/fencing_inventory.py on a git snapshot of 874fdb7c7 and on this tree.
 _EXPECTED_CALL_COUNT = 285
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
@@ -882,8 +887,9 @@ _EXPECTED_CALL_COUNT = 285
 # Re-derived for the combined K063/K056 tree after the caller exchange.
 # K063 run accounting adds CollectorExecutor.notify_empty_group's direct
 # complete_collector_failure call for a zero-arrival group.
-# QR: 7683d3e0… -> the value below (the four departures named at _EXPECTED_CALL_COUNT).
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "18571316227b99fb7aae9656af4e366420cad5f098d9f8eb492bebfb67aa45a8"
+# QR: 7683d3e0… -> 853145e4… (commit 1's committed tree) -> the value below (the
+# arrival and departures named at _EXPECTED_CALL_COUNT).
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "a00408f8bf0645a4a7cecd06626d460c28b01fe72d02bd65a98ff81a7f7d282b"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -917,11 +923,13 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 153
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "8bddd1d26d54870da55e1382df5b140fcdddb22605a412e5a6a4be0b17c2978f"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
-_EXPECTED_INTERNAL_EDGE_COUNT = 92
-# QR (lane 5887): d1af3e66… -> the value below, count unchanged: the internal
+_EXPECTED_INTERNAL_EDGE_COUNT = 93
+# QR (lane 5887): d1af3e66… -> the value below, 92 -> 93: the internal
 # insert_row_with_token_on edge moves from DataFlowRepository.create_quarantine_row_with_token
-# (deleted) to SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink.
-_EXPECTED_INTERNAL_EDGE_SHA256 = "05cc24c62c2cb15f235b60b33c5746bdb2367fbb69781544bf79dc3b7da8878b"
+# (deleted) to SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink, and the
+# facade edge TokenSchedulerRepository.ingest_quarantine_row_with_pending_sink -> self.queue
+# arrives (commit 1 pinned an intermediate tree without it; measured on 874fdb7c7).
+_EXPECTED_INTERNAL_EDGE_SHA256 = "e2535cc472ce543ad83042f4628377de3a003fc661e2233451fe83d4549fc4b8"
 
 
 def _repo_root() -> Path:

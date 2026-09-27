@@ -304,7 +304,7 @@ def accumulate_row_outcomes(
     the processor) rather than a default_sink_name parameter.
 
     Args:
-        results: Iterable of RowProcessingResult from processor.process_row/process_token
+        results: Iterable of RowProcessingResult from the processor (process_row, the scheduler drain)
         counters: Mutable ExecutionCounters to update
         pending_tokens: Dict of sink_name -> list of (token, pending_outcome) pairs
     """

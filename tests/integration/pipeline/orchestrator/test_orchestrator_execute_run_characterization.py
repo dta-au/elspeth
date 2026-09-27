@@ -18,16 +18,12 @@ from sqlalchemy import text
 from elspeth.contracts import (
     Determinism,
     PipelineRow,
-    ResumedRow,
     RunStatus,
     SourceProtocol,
     TransformProtocol,
 )
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.types import NodeID
-from elspeth.core.checkpoint.manager import CheckpointManager
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.config import AggregationSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
@@ -123,10 +119,6 @@ def _begin_test_run(db: LandscapeDB) -> tuple[RecorderFactory, str, MockPayloadS
         canonical_version="sha256-rfc8785-v1",
     )
     return factory, run.run_id, payload_store
-
-
-def _recovery_manager_for(db: LandscapeDB) -> RecoveryManager:
-    return RecoveryManager(db, CheckpointManager(db))
 
 
 # ---------------------------------------------------------------------------
@@ -409,120 +401,6 @@ class TestResumePathCharacterization:
     _process_resumed_rows() documented in the design.
     """
 
-    def test_schema_contract_set_before_transform_execution(self) -> None:
-        """Assert ctx.contract is set to the resume schema_contract BEFORE transforms execute.
-
-        The resume path sets run_ctx.ctx.contract = schema_contract between
-        initialize_run_context() and LoopContext construction. If a future
-        refactor reorders these steps, transforms would see contract=None.
-
-        Strategy: Run the original pipeline to populate DB with rows, then
-        resume with one of those rows and spy on the transform to capture
-        ctx.contract during process(). Verify it matches the passed contract.
-        """
-        db = make_landscape_db()
-        orchestrator = Orchestrator(db)
-
-        captured_contracts: list[SchemaContract | None] = []
-
-        class ContractCapturingTransform(_TestTransformBase):
-            name = "contract_capture_transform"
-            determinism = Determinism.DETERMINISTIC
-            input_schema = _TestSchema
-            output_schema = _TestSchema
-
-            def process(self, row: PipelineRow, ctx: Any) -> TransformResult:
-                captured_contracts.append(ctx.contract)
-                return TransformResult.success(
-                    make_pipeline_row(row.to_dict()),
-                    success_reason={"action": "identity"},
-                )
-
-        source = as_source(ListSource([{"value": 1}]))
-        transform = as_transform(ContractCapturingTransform())
-        output_sink = as_sink(CollectSink("output"))
-
-        config = PipelineConfig(
-            sources={"primary": source},
-            transforms=[transform],
-            sinks={"output": output_sink},
-            sink_effect_modes={"output": "write"},
-        )
-
-        graph = build_production_graph(config)
-        factory, run_id, payload_store = _begin_test_run(db)
-
-        # First: run the full pipeline to populate DB with rows, nodes, edges
-        orchestrator._execute_run(
-            factory=factory,
-            run_id=run_id,
-            config=config,
-            graph=graph,
-            payload_store=payload_store,
-            coordination_token=leader_coordination_token(factory, run_id),
-        )
-
-        # Retrieve the actual row_id and source_node_id created during the original run.
-        # ADR-025 §3 + §4: resume rows are ResumedRow instances carrying
-        # source_node_id; the per-source contract map is keyed by that identity.
-        assert db._engine is not None
-        with db._engine.connect() as conn:
-            row_record = conn.execute(
-                text("SELECT row_id, source_node_id FROM rows WHERE run_id = :run_id LIMIT 1"),
-                {"run_id": run_id},
-            ).first()
-        assert row_record is not None, "Original run should have created at least one row"
-        row_id, source_node_id_str = row_record
-        source_node_id = NodeID(source_node_id_str)
-
-        # Clear captures from original run
-        captured_contracts.clear()
-
-        # Create a distinct schema contract for resume (different from what
-        # the original run would have set, so we can verify identity)
-        resume_contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(
-                FieldContract(
-                    normalized_name="value",
-                    original_name="value",
-                    python_type=int,
-                    required=False,
-                    source="inferred",
-                ),
-            ),
-            locked=True,
-        )
-
-        # Resume with the real row_id from the original run
-        orchestrator._resume_coordinator.process_resumed_rows(
-            factory=factory,
-            run_id=run_id,
-            config=config,
-            graph=graph,
-            unprocessed_rows=[
-                ResumedRow(
-                    row_id=row_id,
-                    row_index=0,
-                    source_node_id=source_node_id,
-                    row_data={"value": 1},
-                ),
-            ],
-            barrier_restore=None,
-            payload_store=payload_store,
-            incomplete_by_row={},
-            recovery_manager=_recovery_manager_for(db),
-            resume_checkpoint_id="char-test-checkpoint",
-            schema_contracts_by_source={source_node_id: resume_contract},
-            coordination_token=leader_coordination_token(factory, run_id),
-        )
-
-        # The transform must have seen the contract during process()
-        assert len(captured_contracts) == 1, f"Expected 1 transform call, got {len(captured_contracts)}"
-        assert captured_contracts[0] is resume_contract, (
-            f"ctx.contract during resume must be the passed schema_contract, got {captured_contracts[0]!r}"
-        )
-
     def test_source_on_start_not_called_during_resume(self) -> None:
         """Assert source.on_start() is NOT called during resume.
 
@@ -531,7 +409,7 @@ class TestResumePathCharacterization:
         still fire.
 
         Strategy: First do a full _execute_run() to populate DB with nodes/edges,
-        then call _process_resumed_rows() with empty rows on the same run.
+        then call process_resumed_rows() on the same (work-free) run.
         """
         db = make_landscape_db()
         orchestrator = Orchestrator(db)
@@ -594,21 +472,6 @@ class TestResumePathCharacterization:
         on_start_calls["transform"] = 0
         on_start_calls["sink"] = 0
 
-        # Create a minimal schema contract for resume
-        schema_contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(
-                FieldContract(
-                    normalized_name="value",
-                    original_name="value",
-                    python_type=int,
-                    required=False,
-                    source="inferred",
-                ),
-            ),
-            locked=True,
-        )
-
         # Spy on sink on_start using patch.object
         original_sink_on_start = output_sink.on_start
 
@@ -616,26 +479,16 @@ class TestResumePathCharacterization:
             on_start_calls["sink"] += 1
             original_sink_on_start(ctx)
 
-        # Call _process_resumed_rows directly with empty rows.
-        # ADR-025 §3: schema_contracts_by_source is non-empty by contract;
-        # derive the source NodeID from the graph rather than fabricating one,
-        # so the test exercises the production reconstruction path identity.
-        sources_list = list(graph.get_sources())
-        assert len(sources_list) == 1, "single-source pipeline expected for this test"
-        source_node_id = sources_list[0]
+        # Call process_resumed_rows directly on the completed run: no scheduler
+        # work remains, so only the plugin lifecycle is exercised.
         with patch.object(output_sink, "on_start", side_effect=tracking_sink_on_start):
             result = orchestrator._resume_coordinator.process_resumed_rows(
                 factory=factory,
                 run_id=run_id,
                 config=config,
                 graph=graph,
-                unprocessed_rows=[],
                 barrier_restore=None,
                 payload_store=payload_store,
-                incomplete_by_row={},
-                recovery_manager=_recovery_manager_for(db),
-                resume_checkpoint_id="char-test-checkpoint",
-                schema_contracts_by_source={source_node_id: schema_contract},
                 coordination_token=leader_coordination_token(factory, run_id),
             )
 

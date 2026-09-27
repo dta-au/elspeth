@@ -3431,8 +3431,9 @@ def resume(
         # Get resume point information
         resume_point = recovery_manager.get_resume_point(run_id, validation_graph)
 
-        # Get count of unprocessed rows
-        unprocessed_row_ids = recovery_manager.get_unprocessed_rows(run_id)
+        # Resume re-drives the run's durable scheduler work; it never
+        # re-derives a source row.
+        scheduler_work_items = recovery_manager.count_active_scheduler_work(run_id)
 
         # F1: buffered barrier tokens live in the scheduler journal, not the
         # checkpoint — "what will be restored" is the journal's BLOCKED
@@ -3448,7 +3449,7 @@ def resume(
                 "has_barrier_scalars": resume_point.barrier_scalars is not None,
                 "blocked_barrier_rows": blocked_barrier_rows,
             },
-            "unprocessed_rows": len(unprocessed_row_ids),
+            "scheduler_work_items": scheduler_work_items,
         }
 
         if output_format == "json" and not execute:
@@ -3467,7 +3468,7 @@ def resume(
             else:
                 typer.echo("  Has barrier scalars: No")
             typer.echo(f"  Blocked barrier rows (journal): {blocked_barrier_rows}")
-            typer.echo(f"  Unprocessed rows: {len(unprocessed_row_ids)}")
+            typer.echo(f"  Scheduler work items (to re-drive): {scheduler_work_items}")
 
         if not execute:
             if output_format != "json":

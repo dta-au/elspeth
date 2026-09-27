@@ -311,7 +311,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
     assert items[0].token_id == "token-a1"
     assert items[0].barrier_key is not None  # queue-hold NOT swept in
     assert items[0].barrier_blocked_at is not None
-    assert repo.blocked_barrier_token_ids(run_id="run-A") == frozenset({"token-a1"})
     assert repo.count_blocked_barrier_items(run_id="run-A") == 1
     assert repo.count_blocked_barrier_items(run_id="run-B") == 1
     assert repo.count_blocked_barrier_items(run_id="missing-run") == 0

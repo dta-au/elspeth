@@ -1021,20 +1021,6 @@ class BarrierJournalRepository:
             )
         return [item_from_mapping(row) for row in rows]
 
-    def blocked_barrier_token_ids(self, *, run_id: str) -> frozenset[str]:
-        """Return token IDs currently held by journal BLOCKED barrier rows."""
-        with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    select(token_work_items_table.c.token_id)
-                    .where(token_work_items_table.c.run_id == run_id)
-                    .where(blocked_barrier_hold_clause())
-                )
-                .scalars()
-                .all()
-            )
-        return frozenset(rows)
-
     def count_blocked_barrier_items(self, *, run_id: str) -> int:
         """Count journal BLOCKED barrier holds for a run."""
         with self._engine.connect() as conn:

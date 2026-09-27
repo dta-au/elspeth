@@ -42,8 +42,6 @@ files:
     Mapping[str, Any]: 15
   src/elspeth/contracts/chat_parts.py:
     dict[str, Any]: 7
-  src/elspeth/contracts/checkpoint.py:
-    Mapping[str, Any]: 1
   src/elspeth/contracts/coalesce_metadata.py:
     dict[str, Any]: 3
   src/elspeth/contracts/composer_audit.py:
@@ -121,8 +119,6 @@ files:
     dict[str, Any]: 18
   src/elspeth/core/canonical.py:
     dict[str, Any]: 1
-  src/elspeth/core/checkpoint/recovery.py:
-    dict[str, object]: 1
   src/elspeth/core/checkpoint/serialization.py:
     dict[str, object]: 2
   src/elspeth/core/config.py:
@@ -300,7 +296,7 @@ files:
   src/elspeth/engine/processor.py:
     Mapping[str, object]: 1
     dict[str, Any]: 1
-    dict[str, object]: 4
+    dict[str, object]: 3
   src/elspeth/engine/spans.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
@@ -1072,10 +1068,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 933
+  Mapping[str, Any]: 932
   Mapping[str, object]: 311
   MutableMapping[str, Any]: 13
   boundary: 66
   dict[str, Any]: 1180
-  dict[str, object]: 410
-  soft: 2847
+  dict[str, object]: 408
+  soft: 2844

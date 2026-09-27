@@ -23,7 +23,9 @@ ADR-010.
 - Tier: 1
 - Runtime observation: `row_contract.fields ∩ row_data.keys()`
 - Call posture: run after token creation in `RowProcessor.process_row()`, never
-  on `process_existing_row()`
+  on resume (resume re-drives durable scheduler work and never re-crosses the
+  source boundary; the row-replay entry `process_existing_row()` this line
+  originally named was deleted 2026-09-28, see the ADR-025 amendment)
 - Failure recording: record a terminal `FAILED` token outcome plus a `FAILED`
   source node state before re-raising the Tier 1 exception
 

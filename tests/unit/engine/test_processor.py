@@ -80,7 +80,6 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.canonical import canonical_json
-from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape import LandscapeDB
@@ -4130,11 +4129,7 @@ class TestProcessRowGateBranching:
         )
         _persist_token_for_scheduler(factory, token)
 
-        results = processor.process_token(
-            token=token,
-            ctx=ctx,
-            current_node_id=None,  # type: ignore[arg-type]  # Intentional: tests branch routing when fork child has no starting node
-        )
+        results = processor._drain_work_queue(processor._work_items.create(token=token, current_node_id=None), ctx)
 
         assert len(results) == 1
         _assert_outcome_pair(results[0], TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
@@ -4529,63 +4524,15 @@ class TestProcessRowMultiRowOutput:
 
 
 # =============================================================================
-# process_existing_row (resume path)
+# Mid-pipeline drain entry (a continuation cursor handed to the work queue)
 # =============================================================================
 
 
-class TestProcessExistingRow:
-    """Tests for process_existing_row (resume after crash)."""
+class TestDrainContinuationEntry:
+    """A continuation cursor drained from a mid-pipeline node resolves its terminal sink."""
 
-    def test_does_not_create_new_row_record(self) -> None:
-        """process_existing_row creates token but NOT a new row."""
-        _db, factory = _make_factory()
-
-        processor = _make_processor(factory)
-
-        contract = _make_contract()
-        row_data = make_row({"value": 42}, contract=contract)
-        ctx = make_context(
-            landscape=factory.plugin_audit_writer(),
-            coordination_token=leader_coordination_token(factory, "test-run"),
-        )
-
-        # We need a pre-existing row. Create one via process_row first.
-        source_row = _make_source_row({"value": 42})
-        first_results = processor.process_row(
-            row_index=0,
-            source_row=source_row,
-            transforms=[],
-            ctx=ctx,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
-        existing_row_id = first_results[0].token.row_id
-
-        # Now process_existing_row for the same row
-        results = processor.process_existing_row(
-            row_id=existing_row_id,
-            row_data=row_data,
-            transforms=[],
-            ctx=ctx,
-        )
-
-        assert len(results) == 1
-        _assert_outcome_pair(results[0], TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
-        assert results[0].sink_name == "default"
-        # The row_id should match the existing row
-        assert results[0].token.row_id == existing_row_id
-
-
-# =============================================================================
-# process_token (mid-pipeline entry)
-# =============================================================================
-
-
-class TestProcessToken:
-    """Tests for process_token (used for coalesce merge continuations)."""
-
-    def test_process_token_from_midpoint(self) -> None:
-        """process_token starts processing from a given step."""
+    def test_drain_from_midpoint(self) -> None:
+        """A cursor at a given node drains from that node."""
         _db, factory = _make_factory()
 
         processor = _make_processor(factory)
@@ -4598,18 +4545,14 @@ class TestProcessToken:
         token = make_token_info(data={"value": 42})
         _persist_token_for_scheduler(factory, token)
 
-        results = processor.process_token(
-            token=token,
-            ctx=ctx,
-            current_node_id=NodeID("source-0"),
-        )
+        results = processor._drain_work_queue(processor._work_items.create(token=token, current_node_id=NodeID("source-0")), ctx)
 
         assert len(results) == 1
         _assert_outcome_pair(results[0], TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
         assert results[0].sink_name == "default"
 
     def test_terminal_coalesce_continuation_uses_coalesce_on_success_sink(self) -> None:
-        """Merged token resumed at terminal coalesce must route to coalesce sink, not source sink."""
+        """A merged token continued at a terminal coalesce routes to the coalesce sink, not the source sink."""
         _db, factory = _make_factory()
 
         processor = _make_processor(
@@ -4627,12 +4570,14 @@ class TestProcessToken:
         token = make_token_info(data={"value": 42})
         _persist_token_for_scheduler(factory, token)
 
-        results = processor.process_token(
-            token=token,
-            ctx=ctx,
-            current_node_id=NodeID("coalesce::merge"),
-            coalesce_node_id=NodeID("coalesce::merge"),
-            coalesce_name=CoalesceName("merge"),
+        results = processor._drain_work_queue(
+            processor._work_items.create(
+                token=token,
+                current_node_id=NodeID("coalesce::merge"),
+                coalesce_node_id=NodeID("coalesce::merge"),
+                coalesce_name=CoalesceName("merge"),
+            ),
+            ctx,
         )
 
         assert len(results) == 1
@@ -4670,12 +4615,14 @@ class TestProcessToken:
                 None,
             ),
         ):
-            results = processor.process_token(
-                token=token,
-                ctx=ctx,
-                current_node_id=NodeID("coalesce::merge"),
-                coalesce_node_id=NodeID("coalesce::merge"),
-                coalesce_name=CoalesceName("merge"),
+            results = processor._drain_work_queue(
+                processor._work_items.create(
+                    token=token,
+                    current_node_id=NodeID("coalesce::merge"),
+                    coalesce_node_id=NodeID("coalesce::merge"),
+                    coalesce_name=CoalesceName("merge"),
+                ),
+                ctx,
             )
 
         assert len(results) == 1
@@ -9208,9 +9155,8 @@ class TestCompleteCoalesceMerge:
             ctx=ctx,
         )
 
-        # The merged token was driven to its terminal coalesce sink handoff
-        # (same continuation semantics as the old process_token hop: the
-        # merged token resolves the coalesce on_success sink).
+        # The merged token was driven to its terminal coalesce sink handoff:
+        # the merged token resolves the coalesce on_success sink.
         assert len(results) == 1
         assert results[0].token.token_id == "merged-1"
         assert (results[0].outcome, results[0].path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
@@ -9232,126 +9178,6 @@ class TestCompleteCoalesceMerge:
         assert statuses == {
             "token-held-a": "terminal",
             "merged-1": "pending_sink",
-        }
-
-
-# =============================================================================
-# resume_incomplete_token
-# =============================================================================
-
-
-class TestResumeIncompleteToken:
-    """Tests for re-driving reconstructed incomplete tokens from the correct DAG node."""
-
-    def test_expanded_child_inside_coalesced_branch_resumes_after_expand_node(self) -> None:
-        """An expanded branch child must resume after expand, not at branch entry."""
-        _, factory = _make_factory()
-        ctx = make_context(
-            landscape=factory.plugin_audit_writer(),
-            coordination_token=leader_coordination_token(factory, "test-run"),
-        )
-
-        source_node = NodeID("source-0")
-        branch_first_node = NodeID("branch-first")
-        expand_node = NodeID("expand-branch")
-        after_expand_node = NodeID("after-expand")
-        coalesce_node = NodeID("coalesce::merge")
-
-        processor = _make_processor(
-            factory,
-            node_step_map={
-                source_node: 0,
-                branch_first_node: 1,
-                expand_node: 2,
-                after_expand_node: 3,
-                coalesce_node: 4,
-            },
-            node_to_next={
-                source_node: branch_first_node,
-                branch_first_node: expand_node,
-                expand_node: after_expand_node,
-                after_expand_node: coalesce_node,
-                coalesce_node: None,
-            },
-            branch_to_coalesce={BranchName("path_a"): CoalesceName("merge")},
-            coalesce_node_ids={CoalesceName("merge"): coalesce_node},
-        )
-        spec = IncompleteTokenSpec(
-            token_id="token-expanded-child",
-            row_id="row-1",
-            join_group_id=None,
-            lineage_path=(
-                LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
-                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-expanded-child"),
-            ),
-            token_data_ref="payload-1",
-            step_in_pipeline=2,
-            max_attempt=0,
-        )
-
-        with (
-            patch.object(processor._nav, "resolve_branch_first_node", return_value=branch_first_node),
-            patch.object(processor, "process_token", return_value=[]) as process_token,
-        ):
-            processor.resume_incomplete_token(
-                spec,
-                make_pipeline_row({"value": 42}),
-                ctx,
-                resume_checkpoint_id="checkpoint-1",
-            )
-
-        process_token.assert_called_once()
-        _token_arg, _ctx_arg = process_token.call_args.args
-        assert process_token.call_args.kwargs == {"current_node_id": after_expand_node}
-
-    def test_fork_child_branch_to_row_union_resumes_with_row_union_context(self) -> None:
-        """A FORK_CHILD branch bound to a row_union re-drives with row_union context.
-
-        Regression (elspeth-de1941d2bf): the FORK_CHILD arm checked
-        _branch_to_sink, _branch_to_coalesce, and _unbound_branch_first_node,
-        never _branch_to_row_union — a fork-child crashed before its
-        row_union barrier had no resume-start node resolvable and raised.
-        """
-        _, factory = _make_factory()
-        ctx = make_context(
-            landscape=factory.plugin_audit_writer(),
-            coordination_token=leader_coordination_token(factory, "test-run"),
-        )
-
-        branch_first_node = NodeID("branch-first")
-        union_node = NodeID("row_union::variants")
-
-        processor = _make_processor(
-            factory,
-            row_union_node_ids={RowUnionName("variants"): union_node},
-            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
-        )
-        spec = IncompleteTokenSpec(
-            token_id="token-fork-child",
-            row_id="row-1",
-            join_group_id=None,
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="control"),),
-            token_data_ref="payload-1",
-            step_in_pipeline=1,
-            max_attempt=0,
-        )
-
-        with (
-            patch.object(processor._nav, "resolve_branch_first_node", return_value=branch_first_node),
-            patch.object(processor, "process_token", return_value=[]) as process_token,
-        ):
-            processor.resume_incomplete_token(
-                spec,
-                make_pipeline_row({"value": 42}),
-                ctx,
-                resume_checkpoint_id="checkpoint-1",
-            )
-
-        process_token.assert_called_once()
-        _token_arg, _ctx_arg = process_token.call_args.args
-        assert process_token.call_args.kwargs == {
-            "current_node_id": branch_first_node,
-            "row_union_name": RowUnionName("variants"),
         }
 
 

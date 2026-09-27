@@ -13,7 +13,7 @@ import json
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -32,14 +32,11 @@ from elspeth.contracts import (
     RunStatus,
     SourceRow,
 )
-from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.contract_records import ContractAuditRecord
 from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
-from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -50,12 +47,8 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
-    run_coordination_events_table,
-    run_coordination_table,
     run_sources_table,
-    run_workers_table,
     runs_table,
-    token_outcomes_table,
     tokens_table,
     transform_errors_table,
 )
@@ -74,7 +67,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, leader_token_for, make_factory
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -182,25 +175,6 @@ def _build_linear_graph(config: PipelineConfig) -> ExecutionGraph:
 # ---------------------------------------------------------------------------
 # Test plugins for resume tests
 # ---------------------------------------------------------------------------
-
-
-class _DoublerTransform(BaseTransform):
-    """Transform that doubles the value field."""
-
-    name = "doubler"
-    input_schema = _RowSchema
-    output_schema = _RowSchema
-    determinism = Determinism.DETERMINISTIC
-    on_error = "discard"
-
-    def __init__(self) -> None:
-        super().__init__({"schema": {"mode": "observed"}})
-
-    def process(self, row: PipelineRow, ctx: Any) -> TransformResult:
-        return TransformResult.success(
-            make_pipeline_row({**row, "value": row["value"] * 2}),
-            success_reason={"action": "doubler"},
-        )
 
 
 class _ResumeSink(_TestSinkBase):
@@ -639,10 +613,15 @@ class TestMultiSourceCrashResume:
         ctx = _start_interrupted_multi_source_run(tmp_path)
         crashed_row_id = _append_crashed_refund_row(ctx)
 
-        assert ctx.recovery_mgr.get_unprocessed_rows(ctx.run_id) == [crashed_row_id]
+        def _persisted_row_ids() -> list[str]:
+            with ctx.db.engine.connect() as conn:
+                return list(conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == ctx.run_id)).scalars())
+
+        before = _persisted_row_ids()
+        assert crashed_row_id in before
         with pytest.raises(IncompleteSourceResumeError, match=r"source.*refunds.*interrupted"):
             _resume_multi_source_run(ctx)
-        assert ctx.recovery_mgr.get_unprocessed_rows(ctx.run_id) == [crashed_row_id]
+        assert _persisted_row_ids() == before
         ctx.db.close()
 
     def test_interrupted_source_refusal_does_not_append_replayed_rows(self, tmp_path: Path) -> None:
@@ -677,355 +656,6 @@ class TestMultiSourceCrashResume:
         with pytest.raises(IncompleteSourceResumeError, match=r"source.*refunds.*interrupted"):
             _resume_multi_source_run(ctx)
         ctx.db.close()
-
-
-class TestResumeIdempotence:
-    """Tests for resume idempotence -- same results whether interrupted or not."""
-
-    def test_resume_produces_same_result_as_uninterrupted(self, tmp_path: Path) -> None:
-        """Resume after interruption produces same final output.
-
-        This test verifies the recovery idempotence property:
-        1. Run pipeline A completely (baseline)
-        2. Run pipeline B with checkpoint, simulate crash after 3 rows processed
-        3. Resume pipeline B
-        4. Verify: pre-crash output + resumed output == baseline output
-        """
-        source_data = [{"id": i, "value": (i + 1) * 10} for i in range(5)]
-        # Expected after doubler: values = [20, 40, 60, 80, 100]
-
-        # ===== Pipeline A: Run completely (baseline) =====
-        db_a = LandscapeDB(f"sqlite:///{tmp_path}/baseline.db")
-        payload_store_a = FilesystemPayloadStore(tmp_path / "payloads_a")
-        source_a = _ResumeSource(source_data)
-        transform_a = _DoublerTransform()
-        sink_a = _ResumeSink()
-
-        config_a = PipelineConfig(
-            sources={"primary": as_source(source_a)},
-            transforms=[transform_a],  # type: ignore[list-item]
-            sinks={"default": as_sink(sink_a)},
-        )
-
-        # NOTE: Manual graph construction is required because the resume
-        # portion of this test needs deterministic node IDs that match
-        # stored checkpoint records. See _build_linear_graph docstring.
-        orchestrator_a = Orchestrator(db_a)
-        result_a = orchestrator_a.run(
-            config_a,
-            graph=_build_linear_graph(config_a),
-            payload_store=payload_store_a,
-        )
-
-        assert result_a.status == RunStatus.COMPLETED
-        assert result_a.rows_processed == 5
-        baseline_output = list(_ResumeSink.results)
-        assert len(baseline_output) == 5
-        db_a.close()
-
-        # ===== Pipeline B: Simulate crash after 3 rows, then resume =====
-        db_b = LandscapeDB(f"sqlite:///{tmp_path}/resume_test.db")
-        checkpoint_mgr = CheckpointManager(db_b)
-        checkpoint_settings = CheckpointSettings(enabled=True, frequency="every_row")
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(checkpoint_settings)
-        payload_store_b = FilesystemPayloadStore(tmp_path / "payloads_b")
-        factory = RecorderFactory(db_b, payload_store=payload_store_b)
-
-        # Create the source schema contract needed for resume
-        source_contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(
-                FieldContract(
-                    normalized_name="id",
-                    original_name="id",
-                    python_type=object,
-                    required=False,
-                    source="inferred",
-                ),
-                FieldContract(
-                    normalized_name="value",
-                    original_name="value",
-                    python_type=object,
-                    required=False,
-                    source="inferred",
-                ),
-            ),
-            locked=True,
-        )
-
-        # Phase 1: Create a "crashed" run with first 3 rows processed
-        run = factory.run_lifecycle.begin_run(
-            config={"test": "resume"},
-            canonical_version="sha256-rfc8785-v1",
-        )
-        run_id = run.run_id
-
-        # Store source schema for resume type fidelity
-        with db_b.engine.connect() as conn:
-            conn.execute(
-                runs_table.update()
-                .where(runs_table.c.run_id == run_id)
-                .values(
-                    source_schema_json=json.dumps(
-                        {
-                            "properties": {
-                                "id": {"type": "integer"},
-                                "value": {"type": "integer"},
-                            },
-                            "required": ["id", "value"],
-                        }
-                    )
-                )
-            )
-            conn.commit()
-
-        # Register the actual admitted implementation evidence. Resume must
-        # compare the fresh plugins against the versions and determinism
-        # used by the uninterrupted run, not placeholder metadata.
-        factory.data_flow.register_node(
-            plugin_name="list_source",
-            node_type=NodeType.SOURCE,
-            plugin_version=source_a.plugin_version,
-            config={},
-            node_id="source",
-            determinism=source_a.determinism,
-            source_file_hash=source_a.source_file_hash,
-            schema_config=SchemaConfig(mode="observed", fields=None),
-            coordination_token=leader_token_for(factory._db, run_id),
-        )
-        factory.data_flow.register_node(
-            plugin_name="doubler",
-            node_type=NodeType.TRANSFORM,
-            plugin_version=transform_a.plugin_version,
-            config={},
-            node_id="transform_0",
-            determinism=transform_a.determinism,
-            source_file_hash=transform_a.source_file_hash,
-            schema_config=SchemaConfig(mode="observed", fields=None),
-            coordination_token=leader_token_for(factory._db, run_id),
-        )
-        factory.data_flow.register_node(
-            plugin_name="collect_sink",
-            node_type=NodeType.SINK,
-            plugin_version=sink_a.plugin_version,
-            config={},
-            node_id="sink_default",
-            determinism=sink_a.determinism,
-            source_file_hash=sink_a.source_file_hash,
-            schema_config=SchemaConfig(mode="observed", fields=None),
-            coordination_token=leader_token_for(factory._db, run_id),
-        )
-        factory.data_flow.register_edge(
-            from_node_id="source",
-            to_node_id="transform_0",
-            label="continue",
-            mode=RoutingMode.MOVE,
-            coordination_token=leader_token_for(factory._db, run_id),
-        )
-        factory.data_flow.register_edge(
-            from_node_id="transform_0",
-            to_node_id="sink_default",
-            label="continue",
-            mode=RoutingMode.MOVE,
-            coordination_token=leader_token_for(factory._db, run_id),
-        )
-
-        # ADR-025 §3 Decision 5 (G6): schema contracts live exclusively in
-        # ``run_sources``. The legacy ``begin_run(schema_contract=...)``
-        # path was deleted; resume reconstruction now reads the contract
-        # from the per-source ``run_sources`` record. Mirror what the
-        # production orchestrator writes via ``_emit_source_loading``.
-        factory.run_lifecycle.record_run_source(
-            source_node_id="source",
-            source_name="source",
-            plugin_name="list_source",
-            config_hash=fake_sha256("crash-and-resume"),
-            lifecycle_state="loaded",
-            coordination_token=leader_coordination_token(factory, run_id),
-            source_schema_json=json.dumps(
-                {
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "value": {"type": "integer"},
-                    },
-                    "required": ["id", "value"],
-                }
-            ),
-            schema_contract=source_contract,
-        )
-        # Record the source node's output contract for resume.
-        factory.data_flow.update_node_output_contract("source", source_contract, member_token=leader_token_for(db_b, run_id).membership)
-
-        # Create all 5 rows with payloads (create_row auto-stores via payload_store_b)
-        row_ids = []
-        token_ids = []
-        for i, row_data in enumerate(source_data):
-            row, token = factory.data_flow.create_row_with_token(
-                coordination_token=leader_token_for(db_b, run_id),
-                source_node_id="source",
-                row_index=i,
-                data=row_data,
-                source_row_index=i,
-                ingest_sequence=i,
-            )
-            row_ids.append(row.row_id)
-            token_ids.append(token.token_id)
-
-        # Build graph for checkpoint -- manual construction required because
-        # checkpoint node IDs must match what we registered above.
-        graph_b = ExecutionGraph()
-        schema_config_dict: dict[str, Any] = {"schema": {"mode": "observed"}}
-        graph_b.add_node(
-            "source",
-            node_type=NodeType.SOURCE,
-            plugin_name="list_source",
-            config={**schema_config_dict, "source_name": "primary"},
-        )
-        graph_b.add_node(
-            "transform_0",
-            node_type=NodeType.TRANSFORM,
-            plugin_name="doubler",
-            config=schema_config_dict,
-        )
-        graph_b.add_node(
-            "sink_default",
-            node_type=NodeType.SINK,
-            plugin_name="collect_sink",
-            config=schema_config_dict,
-        )
-        graph_b.add_edge("source", "transform_0", label="continue", mode=RoutingMode.MOVE)
-        graph_b.add_edge("transform_0", "sink_default", label="continue", mode=RoutingMode.MOVE)
-        graph_b.set_sink_id_map({SinkName("default"): NodeID("sink_default")})
-        graph_b.set_transform_id_map({0: NodeID("transform_0")})
-        graph_b.set_route_resolution_map({})
-        graph_b.set_config_gate_id_map({})
-        graph_b.set_pipeline_nodes([NodeID("transform_0")])
-        graph_b.set_node_step_map(graph_b.build_step_map())
-
-        # Simulate that first 3 rows were processed (doubled)
-        pre_crash_output = [{"id": i, "value": (i + 1) * 10 * 2} for i in range(3)]
-
-        # Record terminal outcomes for first 3 rows
-        for i in range(3):
-            factory.data_flow.record_token_outcome_leader(
-                ref=TokenRef(token_id=token_ids[i], run_id=run_id),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.DEFAULT_FLOW,
-                sink_name="default",
-                coordination_token=leader_token_for(factory._db, run_id),
-            )
-
-        # Create checkpoint at row 2 (0-indexed, so rows 0-2 processed)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=3,
-            barrier_scalars=None,
-            graph=graph_b,
-        )
-
-        # Mark run as failed (simulating crash)
-        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
-
-        # Epoch 21 (ADR-030 §B.4): begin_run minted this run's leader seat
-        # (uniformity rule), and a hard-killed leader never releases it — the
-        # seat stays HELD until its liveness window lapses. Resume's takeover
-        # CAS requires vacant-or-expired, so craft the post-window image
-        # deterministically (the in-DB picture an operator sees ~80s after
-        # the crash) instead of sleeping out the window.
-        with db_b.engine.begin() as conn:
-            conn.execute(
-                run_coordination_table.update()
-                .where(run_coordination_table.c.run_id == run_id)
-                .values(leader_heartbeat_expires_at=datetime.now(UTC) - timedelta(seconds=1))
-            )
-
-        # Phase 2: Resume and process remaining rows
-        recovery_mgr = RecoveryManager(db_b, checkpoint_mgr)
-
-        check = recovery_mgr.can_resume(run_id, graph_b)
-        assert check.can_resume, f"Cannot resume: {check.reason}"
-
-        resume_point = recovery_mgr.get_resume_point(run_id, graph_b)
-        assert resume_point is not None
-
-        # Create fresh plugins for resume
-        _ResumeSink.results = []
-        source_b = _ResumeSource(source_data)
-        transform_b = _DoublerTransform()
-        sink_b = _ResumeSink()
-
-        config_b = PipelineConfig(
-            sources={"primary": as_source(source_b)},
-            transforms=[transform_b],  # type: ignore[list-item]
-            sinks={"default": as_sink(sink_b)},
-        )
-
-        # NOTE: Manual graph construction for resume because node IDs
-        # must match the checkpoint data from the pre-crash run.
-        resume_graph = _build_linear_graph(config_b)
-
-        orchestrator_b = Orchestrator(
-            db_b,
-            checkpoint_manager=checkpoint_mgr,
-            checkpoint_config=checkpoint_config,
-        )
-
-        result_b = orchestrator_b.resume(
-            resume_point,
-            config_b,
-            resume_graph,
-            payload_store=payload_store_b,
-        )
-
-        assert result_b.status == RunStatus.COMPLETED
-        # F2 (resume-fork-reemit): the resume RunResult now reports CUMULATIVE
-        # counters reconstructed from the audit trail (both resume branches
-        # finalize via derive_resume_terminal_status_from_audit), so a resumed
-        # run matches an uninterrupted run — this test's whole premise. All 5
-        # source rows reached a terminal outcome (3 recorded pre-crash + 2
-        # re-driven), so rows_processed is the cumulative 5, matching run A
-        # (line ~276), NOT the pre-F2 resume-only count of 2 (rows 3 and 4).
-        assert result_b.rows_processed == 5
-
-        resumed_output = list(_ResumeSink.results)
-        assert len(resumed_output) == 2
-
-        # Verify: pre-crash output + resumed output == baseline output
-        combined_output = pre_crash_output + resumed_output
-        assert len(combined_output) == 5
-        assert combined_output == baseline_output, (
-            f"Resume did not produce same result as uninterrupted run.\nExpected: {baseline_output}\nGot: {combined_output}"
-        )
-
-        # Epoch 21 (ADR-030 §B.4) — the resume-side coordination pin: the
-        # takeover CAS bumped the seat to epoch 2, identity-evicted the
-        # crashed begin_run leader, and the successful finalize released the
-        # seat (vacant, epoch retained).
-        with db_b.engine.connect() as conn:
-            seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).one()
-            workers = conn.execute(
-                select(run_workers_table).where(run_workers_table.c.run_id == run_id).order_by(run_workers_table.c.registered_at)
-            ).all()
-            event_types = (
-                conn.execute(
-                    select(run_coordination_events_table.c.event_type)
-                    .where(run_coordination_events_table.c.run_id == run_id)
-                    .order_by(run_coordination_events_table.c.seq)
-                )
-                .scalars()
-                .all()
-            )
-        assert seat.leader_epoch == 2, "resume's takeover CAS must bump the seat epoch"
-        assert seat.leader_worker_id is None, "graceful completion must release the seat"
-        statuses_by_entry = {w.entry_point: w.status for w in workers}
-        assert statuses_by_entry == {"run": "evicted", "resume": "departed"}, (
-            "the crashed begin_run leader must be identity-evicted by the takeover; the resume leader departs on release"
-        )
-        assert "worker_evict" in event_types
-        assert event_types[-1] == "leader_release"
-
-        db_b.close()
 
 
 class TestRetryBehavior:
@@ -1164,145 +794,6 @@ class TestCheckpointRecovery:
             config=schema_config,
         )
         return graph
-
-    def test_checkpoint_preserves_partial_progress(self, test_env: dict[str, Any], mock_graph: ExecutionGraph) -> None:
-        """Create run with 5 rows, checkpoint at row 2, mark as failed.
-
-        Verify get_unprocessed_rows() returns only rows 3-4.
-        """
-        db: LandscapeDB = test_env["db"]
-        checkpoint_mgr: CheckpointManager = test_env["checkpoint_manager"]
-        recovery_mgr: RecoveryManager = test_env["recovery_manager"]
-
-        run_id = "checkpoint-partial-progress-test"
-        now = datetime.now(UTC)
-        contract_json, contract_hash = _create_test_schema_contract()
-        source_schema_json = json.dumps(
-            {"properties": {"id": {"type": "integer"}, "value": {"type": "integer"}}, "required": ["id", "value"]}
-        )
-
-        with db.engine.connect() as conn:
-            conn.execute(
-                runs_table.insert().values(
-                    run_id=run_id,
-                    started_at=now,
-                    config_hash=fake_sha256("test"),
-                    settings_json="{}",
-                    canonical_version="sha256-rfc8785-v1",
-                    status=RunStatus.FAILED,
-                    source_schema_json=source_schema_json,
-                    openrouter_catalog_sha256="0" * 64,
-                    openrouter_catalog_source="bundled",
-                )
-            )
-            # A raw-SQL run has no seat; the checkpoint below is written under the
-            # lapsed seat its crashed leader left (ADR-048 §5 read-back), which is
-            # also what the resume takeover CAS requires.
-            insert_crashed_leader_seat(conn, run_id=run_id)
-
-            conn.execute(
-                nodes_table.insert().values(
-                    node_id="source",
-                    run_id=run_id,
-                    plugin_name="test_source",
-                    node_type=NodeType.SOURCE,
-                    plugin_version="1.0",
-                    determinism=Determinism.DETERMINISTIC,
-                    config_hash=fake_sha256("test"),
-                    config_json="{}",
-                    registered_at=now,
-                )
-            )
-
-            conn.execute(
-                run_sources_table.insert().values(
-                    run_id=run_id,
-                    source_node_id="source",
-                    source_name="source",
-                    plugin_name="test_source",
-                    lifecycle_state="loaded",
-                    config_hash=fake_sha256("test"),
-                    schema_json=source_schema_json,
-                    schema_contract_json=contract_json,
-                    schema_contract_hash=contract_hash,
-                    field_resolution_json=None,
-                    recorded_at=now,
-                )
-            )
-
-            conn.execute(
-                nodes_table.insert().values(
-                    node_id="transform",
-                    run_id=run_id,
-                    plugin_name="test_transform",
-                    node_type=NodeType.TRANSFORM,
-                    plugin_version="1.0",
-                    determinism=Determinism.DETERMINISTIC,
-                    config_hash=fake_sha256("test"),
-                    config_json="{}",
-                    registered_at=now,
-                )
-            )
-
-            # Create 5 rows with tokens
-            for i in range(5):
-                row_id = f"row-{i:03d}"
-                token_id = f"tok-{i:03d}"
-                conn.execute(
-                    rows_table.insert().values(
-                        row_id=row_id,
-                        run_id=run_id,
-                        source_node_id="source",
-                        row_index=i,
-                        source_row_index=i,
-                        ingest_sequence=i,
-                        source_data_hash=fake_sha256(f"hash-{i}"),
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    tokens_table.insert().values(
-                        token_id=token_id,
-                        row_id=row_id,
-                        run_id=run_id,
-                        created_at=now,
-                    )
-                )
-                # Mark rows 0, 1, 2 as COMPLETED
-                if i < 3:
-                    conn.execute(
-                        token_outcomes_table.insert().values(
-                            outcome_id=f"outcome-{i:03d}",
-                            run_id=run_id,
-                            token_id=token_id,
-                            outcome=TerminalOutcome.SUCCESS.value,
-                            path=TerminalPath.DEFAULT_FLOW.value,
-                            completed=1,
-                            recorded_at=now,
-                            sink_name="default",
-                        )
-                    )
-            conn.commit()
-
-        # Checkpoint at row 2 (token tok-002)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=2,
-            barrier_scalars=None,
-            graph=mock_graph,
-        )
-
-        checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
-        assert checkpoint is not None
-        assert checkpoint.sequence_number == 2
-
-        check = recovery_mgr.can_resume(run_id, mock_graph)
-        assert check.can_resume is True, f"Cannot resume: {check.reason}"
-
-        unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
-        assert len(unprocessed) == 2
-        assert unprocessed == ["row-003", "row-004"]
 
     def test_checkpoint_survives_process_restart(self, test_env: dict[str, Any], mock_graph: ExecutionGraph) -> None:
         """Create run + checkpoint with file-based DB, close DB, reopen.

@@ -299,34 +299,6 @@ class TokenManager:
             row_data=pipeline_row,
         )
 
-    def create_token_for_existing_row(
-        self,
-        row_id: str,
-        row_data: PipelineRow,
-        *,
-        coordination_token: CoordinationToken,
-    ) -> TokenInfo:
-        """Create a token for a row that already exists in the database.
-
-        Used during resume when rows were created in the original run
-        but tokens need to be created for reprocessing.
-
-        Args:
-            row_id: Existing row ID in the database
-            row_data: Row data as PipelineRow (reconstructed from checkpoint)
-
-        Returns:
-            TokenInfo with row and token IDs
-        """
-        # Create token for existing row
-        token = self._data_flow.create_token(row_id=row_id, coordination_token=coordination_token)
-
-        return TokenInfo(
-            row_id=row_id,
-            token_id=token.token_id,
-            row_data=row_data,
-        )
-
     def fork_token(
         self,
         parent_token: TokenInfo,

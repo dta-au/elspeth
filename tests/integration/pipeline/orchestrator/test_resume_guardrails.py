@@ -17,10 +17,9 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts import Checkpoint, PluginSchema, ResumedRow, ResumePoint, RunStatus
+from elspeth.contracts import Checkpoint, PluginSchema, ResumePoint, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -241,13 +240,7 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        with (
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data",
-                return_value=[],
-            ) as mock_get_unprocessed,
-            pytest.raises(EmptyResumeStateError) as exc_info,
-        ):
+        with pytest.raises(EmptyResumeStateError) as exc_info:
             orchestrator.resume(
                 resume_point=_persist_resume_point(resume_test_env, run_id, graph),
                 config=config,
@@ -255,7 +248,6 @@ class TestResumeGuardrails:
                 payload_store=resume_test_env["payload_store"],
             )
 
-        mock_get_unprocessed.assert_not_called()
         assert exc_info.value.run_id == run_id
         # ADR-025 §3 Decision 5 (G6): the singleton ``schema_contract_json``
         # column was deleted. The empty-resume-state precondition now keys on
@@ -275,20 +267,12 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        # ADR-025 §3 Decision 5 (G6): resume now reconstructs unprocessed
-        # rows via ``get_unprocessed_row_data_by_source``. Patching the
-        # legacy ``get_unprocessed_row_data`` would silently no-op.
+        # Active scheduler work puts the resume on the processing path, where
+        # the resume graph is rebuilt from the recorded edges.
         with (
             patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data_by_source",
-                return_value=(
-                    ResumedRow(
-                        row_id="row-1",
-                        row_index=0,
-                        source_node_id=NodeID(graph.get_sources()[0]),
-                        row_data={"id": 1, "value": "alpha"},
-                    ),
-                ),
+                "elspeth.core.landscape.scheduler_repository.TokenSchedulerRepository.count_active_work",
+                return_value=1,
             ),
             pytest.raises(AuditIntegrityError, match="has no edges registered") as exc_info,
         ):
@@ -320,10 +304,6 @@ class TestResumeGuardrails:
                     "tier_1_errors": [],
                 },
             ),
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data",
-                return_value=[],
-            ) as mock_get_unprocessed,
             pytest.raises(OrchestrationInvariantError, match="runtime VAL manifest") as exc_info,
         ):
             orchestrator.resume(
@@ -333,7 +313,6 @@ class TestResumeGuardrails:
                 payload_store=resume_test_env["payload_store"],
             )
 
-        mock_get_unprocessed.assert_not_called()
         assert run_id in str(exc_info.value)
         assert "contract registry" in str(exc_info.value).lower()
 
@@ -354,9 +333,8 @@ class TestResumeGuardrails:
         The genuine "early-exit on empty rows" success path is
         exercised in
         ``tests/unit/engine/orchestrator/test_resume_failure.py::test_resume_treats_empty_journal_as_all_rows_processed``,
-        which constructs ``ResumeState`` directly with a non-empty
-        contract map (the RC6 shape: run_sources records present,
-        unprocessed_rows empty).
+        which constructs ``ResumeState`` directly with run_sources records
+        present and no scheduler work.
         """
         run_id = _create_failed_run(resume_test_env["factory"], include_contract=False)
         orchestrator = Orchestrator(
@@ -365,13 +343,7 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        with (
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data_by_source",
-                return_value=(),
-            ),
-            pytest.raises(EmptyResumeStateError) as exc_info,
-        ):
+        with pytest.raises(EmptyResumeStateError) as exc_info:
             orchestrator.resume(
                 resume_point=_persist_resume_point(resume_test_env, run_id, graph),
                 config=config,

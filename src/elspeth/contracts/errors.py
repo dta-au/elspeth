@@ -1491,8 +1491,8 @@ class BatchPassthroughShapeError(AuditEvidenceBase, OrchestrationInvariantError)
 class EmptyResumeStateError(OrchestrationInvariantError):
     """Raised when resume is attempted for a run with no recorded work.
 
-    ADR-025 §3 declares ``ResumeState.schema_contracts_by_source``
-    non-empty by invariant. The construction-time guard in
+    ``ResumeState.source_names_by_source`` (one entry per ``run_sources``
+    record) is non-empty by invariant. The construction-time guard in
     ``ResumeState.__post_init__`` is the chokepoint that pins the
     invariant; this exception is the upstream refuse path so callers
     can distinguish "nothing to resume" from "audit corruption

@@ -1027,28 +1027,6 @@ class TestTokenManagerBoundaryPaths:
         assert row.to_dict() == {"_raw": ["not", "a", "dict"]}
         assert row.contract.mode == "OBSERVED"
 
-    def test_create_token_for_existing_row_creates_new_token(self) -> None:
-        manager, factory, run_id, source_node_id = _make_manager_context()
-
-        original = manager.create_initial_token(
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=_make_source_row({"id": 1}),
-            source_row_index=0,
-            ingest_sequence=0,
-            coordination_token=token_manager_leader(manager, run_id),
-        )
-        restored_row = _make_pipeline_row({"id": 1, "restored": True})
-
-        resumed = manager.create_token_for_existing_row(
-            row_id=original.row_id, row_data=restored_row, coordination_token=token_manager_leader(manager, run_id)
-        )
-
-        assert resumed.row_id == original.row_id
-        assert resumed.token_id != original.token_id
-        assert resumed.row_data is restored_row
-        assert factory.query.get_token(resumed.token_id) is not None
-
     def test_expand_token_requires_locked_output_contract(self) -> None:
         manager, factory, run_id, source_node_id = _make_manager_context()
 

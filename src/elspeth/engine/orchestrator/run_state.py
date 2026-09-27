@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -10,13 +10,10 @@ from elspeth.contracts.freeze import freeze_fields
 
 if TYPE_CHECKING:
     from elspeth.contracts import PendingOutcome, TokenInfo, TransformProtocol
-    from elspeth.contracts.checkpoint import ResumedRow
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.run_result import RunResult
-    from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.contracts.types import CoalesceName, GateName, NodeID, SinkName
-    from elspeth.core.checkpoint.recovery import IncompleteTokenSpec, RecoveryManager
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine.coalesce_executor import CoalesceExecutor
     from elspeth.engine.orchestrator.ports import RowProcessorHandle
@@ -159,43 +156,32 @@ class LoopResult:
 class ResumeState:
     """Return type for _reconstruct_resume_state().
 
-    Bundles the state reconstruction results needed to process resumed rows.
-    Short-lived: consumed immediately by the resume method.
+    Bundles the state reconstruction results needed to re-drive a resumed
+    run's durable scheduler work. Short-lived: consumed immediately by the
+    resume method.
 
-    Per ADR-025 Decision section 3, schema contracts are plural-by-source.
-    ``schema_contracts_by_source`` is non-optional and never empty - resume
-    reconstruction either populates one contract per source from ``run_sources``
-    or one contract keyed by the single-source NodeID derived from
-    ``rows.source_node_id``. The previous singular ``schema_contract`` field
-    has been deleted; consumers look up each row's contract via
-    ``schema_contracts_by_source[row.source_node_id]``.
+    Resume never re-derives a source row: every ingested row is already
+    durable scheduler work whose payload carries its own row and contract, so
+    no per-source schema or contract map is reconstructed here.
 
-    The empty case - a run that failed before any row was committed and before
-    any ``run_sources`` records were written - is refused upstream in
-    ``_reconstruct_resume_state`` via :class:`EmptyResumeStateError`. That
-    exception is the interpretable "nothing to resume" outcome; the
-    construction-time guard below is the chokepoint that pins the invariant
-    against future regressions where some caller bypasses the upstream check.
+    ``source_names_by_source`` is non-empty by invariant. The empty case - a
+    run that failed before any ``run_sources`` record was written - is refused
+    upstream in ``_load_resume_audit_snapshot`` via
+    :class:`EmptyResumeStateError`. That exception is the interpretable
+    "nothing to resume" outcome; the construction-time guard below is the
+    chokepoint that pins the invariant against a caller that bypasses the
+    upstream check.
     """
 
     factory: RecorderFactory
     run_id: str
-    unprocessed_rows: Sequence[ResumedRow]
-    # F1 fix: incomplete child tokens grouped by row_id - used by the resume loop
-    # to dispatch partial-fork/expand/coalesce rows via mid-DAG continuation
-    # instead of whole-row restart (which re-emits completed branches).
-    incomplete_by_row: Mapping[str, Sequence[IncompleteTokenSpec]]
-    # RecoveryManager needed by resume loop for reconstruct_token_row.
-    recovery_manager: RecoveryManager
-    schema_contracts_by_source: Mapping[NodeID, SchemaContract]
     source_names_by_source: Mapping[NodeID, str]
     source_lifecycle_by_source: Mapping[NodeID, str]
     # F1: True when the scheduler journal carries BLOCKED barrier rows for the
-    # run. Those tokens are EXCLUDED from unprocessed_rows (they are restored
-    # into executor buffers at processor construction, not re-driven), so the
-    # resume quiescence gate must consult this flag - a fully-buffered crashed
-    # run has zero unprocessed rows but must still run the processing path so
-    # the restored buffers flush.
+    # run. They are restored into executor buffers at processor construction,
+    # so the resume quiescence gate must consult this flag - a fully-buffered
+    # crashed run has no other scheduler work but must still run the
+    # processing path so the restored buffers flush.
     has_restored_barrier_work: bool = False
     # F1: old->retry batch_id mapping from handle_incomplete_batches; consumed
     # by the processor's journal restore.
@@ -211,46 +197,16 @@ class ResumeState:
         # contracts package is already an L0 dependency.
         from elspeth.contracts.errors import OrchestrationInvariantError
 
-        # incomplete_by_row is a dict[str, list[IncompleteTokenSpec]] of frozen specs;
-        # deep_freeze converts it to MappingProxyType[str, tuple[IncompleteTokenSpec, ...]].
-        # The resume loop consumes it via membership (`row_id in incomplete_by_row`) and
-        # iteration (`for s in incomplete_by_row[row_id]`), both fine on the frozen shape.
-        # recovery_manager is a live service object (not a container) - NOT frozen here.
-        # unprocessed_rows arrives as a list (recovery) or tuple (tests) of
-        # ResumedRow instances, each already deep-frozen in its own
-        # __post_init__; deep_freeze tuple-ifies the outer container and leaves
-        # the frozen rows untouched (identity-preserving idempotency).
         freeze_fields(
             self,
-            "incomplete_by_row",
-            "schema_contracts_by_source",
             "source_names_by_source",
             "source_lifecycle_by_source",
             "batch_id_remap",
-            "unprocessed_rows",
         )
-        # ADR-025 section 3: schema_contracts_by_source is non-empty by invariant.
-        # The empty case (no rows committed, no run_sources records) is
-        # handled upstream by ``_reconstruct_resume_state`` via
-        # :class:`EmptyResumeStateError` - ResumeState is never constructed in
-        # that case. This guard pins the invariant so a future caller that
-        # bypasses the upstream check fails loudly rather than silently picking
-        # an arbitrary contract.
-        if not self.schema_contracts_by_source:
+        if not self.source_names_by_source:
             raise OrchestrationInvariantError(
-                "ResumeState.schema_contracts_by_source must not be empty. "
+                "ResumeState.source_names_by_source must not be empty. "
                 "Empty-state resume should have been refused upstream via "
                 "EmptyResumeStateError before ResumeState was constructed. "
                 "If you're hitting this, the upstream check is missing."
-            )
-        # ADR-025 section 3: resume rejects rather than picks an arbitrary
-        # contract. Every row's ``source_node_id`` must have a corresponding
-        # entry in ``schema_contracts_by_source``.
-        missing = {row.source_node_id for row in self.unprocessed_rows} - set(self.schema_contracts_by_source)
-        if missing:
-            raise OrchestrationInvariantError(
-                "ResumeState.schema_contracts_by_source is missing entries for "
-                f"source_node_id(s): {sorted(missing)}. Available keys: "
-                f"{sorted(self.schema_contracts_by_source)}. Resume rejects rather "
-                "than picks an arbitrary contract (ADR-025 section 3)."
             )
