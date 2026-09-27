@@ -41,7 +41,7 @@ function chatMessage(role: "user" | "assistant", content: string): Record<string
 
 async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
   const prefs: Record<string, unknown> = {
-    default_mode: "freeform", freeform_intro_dismissed_at: null,
+    freeform_intro_dismissed_at: null,
     tutorial_completed_at: null, tutorial_stage: null, tutorial_session_id: null,
     tutorial_run_id: null, tutorial_source_data_hash: null, show_advanced: false, updated_at: null,
   };
@@ -50,6 +50,11 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
     const path = new URL(req.url()).pathname;
     const method = req.method();
     const fulfill = async (json: unknown): Promise<void> => { await route.fulfill({ json }); };
+    if (path.includes("/guided")) {
+      fixture.requests.push("forbidden-guided-request");
+      await route.fulfill({ status: 404, json: { detail: "Not found" } });
+      return;
+    }
     if (path === "/api/system/status" && method === "GET") {
       await fulfill({
         composer_available: true, composer_model: "test", composer_advisor_model: "test",
@@ -92,10 +97,6 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
       fixture.title = (req.postDataJSON() as { title: string }).title;
       fixture.requests.push(`rename:${fixture.title}`);
       await fulfill({ ...session, title: fixture.title });
-      return;
-    }
-    if (path === `/api/sessions/${sid}/guided` && method === "GET") {
-      await fulfill(null);
       return;
     }
     if (path === `/api/tutorial/${sid}/sample` && method === "GET") {
@@ -224,5 +225,5 @@ test("Welcome → freeform Build → explicit Run → Audit → Graduation keeps
   expect(fixture.requests).toContain("audit-story");
   expect(fixture.requests).toContain("rename:First-run tutorial");
   expect(fixture.requests.indexOf("readiness")).toBeLessThan(fixture.requests.indexOf("run"));
-  expect(fixture.requests.filter((item) => item.startsWith("guided-"))).toHaveLength(0);
+  expect(fixture.requests).not.toContain("forbidden-guided-request");
 });

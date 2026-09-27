@@ -77,6 +77,11 @@ psql_capture() { protected_capture psql psql_command_failed psql --no-psqlrc --q
 facade() { protected_capture probe acceptance_command_failed "$PYTHON" -m elspeth.web.azure_container_apps_acceptance "$@"; }
 
 require_file() { test -f "$1" && test -r "$1" || fail required_file_unreadable; }
+require_p1_body() {
+  require_file "${P1_BODY:?set freeform Composer message template JSON}"
+  jq -e 'type == "object" and (keys == ["content"]) and (.content | type == "string" and length > 0)' \
+    "$P1_BODY" >/dev/null || fail p1_message_template_invalid
+}
 require_parameters() {
   require_file "$1"
   # The concrete resolved files, not checked-in examples, reach what-if/create.
@@ -115,9 +120,9 @@ preflight_all() {
   require_file "${P3_YAML:?set long-running pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set source blob request JSON}"
   require_file "${P4_MESSAGE_BODY:?set normal Composer message JSON}"
-  require_file "${P1_BODY:?set guided action template JSON}"
+  require_p1_body
   require_file "${COMPATIBILITY_RECORD:?set operator compatibility record}"
-  : "${P1_INTENT:?set guided intent}" "${P3_SINK_PATH:?set physical CSV path template}"
+  : "${P3_SINK_PATH:?set physical CSV path template}"
   : "${P3_SINK_KEY_FIELD:?set stable unique CSV key}" "${ACCEPTANCE_SECRET_DIR:?set secret value directory}"
   : "${BOOTSTRAP_PRINCIPAL_ID:?set operator principal id}" "${BOOTSTRAP_PRINCIPAL_TYPE:?set User or ServicePrincipal}"
   : "${PROVISION_STORAGE_IMAGE:?set pinned provisioner digest}" "${PGSSLROOTCERT:?set readable PostgreSQL root PEM}"
@@ -467,21 +472,16 @@ prepare_session() {
   fi
   printf '%s\n' "$session"
 }
-prepare_guided_trials() {
-  local prefix="$1" trials="${PROBE_TRIALS:-20}" index session operation turn
+prepare_freeform_trials() {
+  local prefix="$1" trials="${PROBE_TRIALS:-20}" index session request_key
   positive_integer "$trials"
   test "$trials" -ge 20 || fail probe_trials_insufficient
   : >"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
   for ((index=0; index<trials; index++)); do
     session=$(prepare_session "${prefix}-${index}")
-    operation=$(cat /proc/sys/kernel/random/uuid)
-    jq -n --arg operation "$operation" --arg intent "$P1_INTENT" \
-      '{operation_id:$operation,profile:"live",intent:$intent}' >"$EVIDENCE_DIR/${prefix}-${index}-start.json"
-    api_post "/api/sessions/${session}/guided/start" "$EVIDENCE_DIR/${prefix}-${index}-start.json" "$EVIDENCE_DIR/${prefix}-${index}-turn.json"
-    turn=$(jq -er '.next_turn.turn_token | select(test("^[0-9a-f]{64}$"))' "$EVIDENCE_DIR/${prefix}-${index}-turn.json")
-    operation=$(cat /proc/sys/kernel/random/uuid)
-    jq -c --arg session "$session" --arg operation "$operation" --arg turn "$turn" \
-      '{session_id:$session,body:(. + {operation_id:$operation,turn_token:$turn})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
+    request_key=$(cat /proc/sys/kernel/random/uuid)
+    jq -c --arg session "$session" --arg request_key "$request_key" \
+      '{session_id:$session,body:(. + {client_request_id:$request_key})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
   done
   jq -s '.' "$EVIDENCE_DIR/${prefix}-trial-requests.jsonl" >"$EVIDENCE_DIR/${prefix}-trial-requests.json"
 }
@@ -491,8 +491,7 @@ stage_prepare() {
   require_file "${P3_YAML:?set long-running physical CSV sink pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
   require_file "${P4_MESSAGE_BODY:?set a normal Composer message JSON to observe}"
-  require_file "${P1_BODY:?set the guided action template JSON}"
-  : "${P1_INTENT:?set guided acceptance intent}"
+  require_p1_body
   local trials="${PROBE_TRIALS:-20}" index token
   positive_integer "$trials"
   test "$trials" -ge 20 || fail probe_trials_insufficient
@@ -506,7 +505,7 @@ stage_prepare() {
   P4_SESSION_ID=$(prepare_session p4 "$PROBE_YAML")
   api_post "/api/sessions/${P4_SESSION_ID}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-p4-message.json"
   : >"$EVIDENCE_DIR/p2-session-ids.txt"
-  prepare_guided_trials p1
+  prepare_freeform_trials p1
   for ((index=0; index<trials; index++)); do
     prepare_session "p2-${index}" "$PROBE_YAML" >>"$EVIDENCE_DIR/p2-session-ids.txt"
   done
@@ -533,7 +532,7 @@ stage_probes() {
     P2_SESSION_IDS="${P2_SESSION_IDS:-$EVIDENCE_DIR/p2-session-ids.json}"
     P1_TRIAL_REQUESTS="${P1_TRIAL_REQUESTS:-$EVIDENCE_DIR/p1-trial-requests.json}"
   fi
-  : "${P1_TRIAL_REQUESTS:?set fresh guided trial requests JSON}"
+  : "${P1_TRIAL_REQUESTS:?set fresh freeform trial requests JSON}"
   : "${P2_SESSION_IDS:?set fresh executable sessions JSON array}"
   : "${P4_SESSION_ID:?set prepared progress session}" "${P3_SESSION_ID:?set prepared long-run session}"
   : "${P3_SINK_PATH:?set shared NFS physical CSV path}" "${P3_SINK_KEY_FIELD:?set stable unique CSV key}"
@@ -590,8 +589,7 @@ single_revision_receipt() {
 }
 stage_single_revision() {
   : "${ELSPETH_ACCEPTANCE_BEARER_TOKEN:?set existing acceptance bearer token}"
-  : "${P1_INTENT:?set guided acceptance intent}"
-  require_file "${P1_BODY:?set guided action template JSON}"
+  require_p1_body
   require_file "${PROBE_YAML:?set executable P4 pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
   require_file "${P4_MESSAGE_BODY:?set normal Composer message JSON}"
@@ -599,7 +597,7 @@ stage_single_revision() {
   stage_rollout "${REVISION_SUFFIX}-single"
   az_capture containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >"$EVIDENCE_DIR/app.json"
   PREPARATION_ORIGIN="https://$(jq -er '.properties.configuration.ingress.fqdn' "$EVIDENCE_DIR/app.json")"
-  prepare_guided_trials single-p1
+  prepare_freeform_trials single-p1
   local session
   session=$(prepare_session single-p4 "$PROBE_YAML")
   api_post "/api/sessions/${session}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-single-p4-message.json"

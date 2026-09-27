@@ -112,7 +112,6 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
   await page.route("**/api/composer-preferences", async (route) => {
     await route.fulfill({
       json: {
-        default_mode: "freeform",
         freeform_intro_dismissed_at: null,
         tutorial_completed_at: "2026-05-14T00:00:00Z",
         tutorial_stage: null,
@@ -148,17 +147,6 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
       return;
     }
 
-    if (path === `/api/sessions/${sessionId}/guided` && method === "GET") {
-      await route.fulfill({
-        json: {
-          guided_session: null,
-          next_turn: null,
-          terminal: null,
-          composition_state: null,
-        },
-      });
-      return;
-    }
 
     if (path === `/api/sessions/${sessionId}/composer-progress` && method === "GET") {
       await route.fulfill({

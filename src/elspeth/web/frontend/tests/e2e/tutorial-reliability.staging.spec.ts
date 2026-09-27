@@ -27,7 +27,6 @@ import {
   JUDGE_RUBRIC,
 } from "./harness/prompt-and-rubric";
 import { classifyOutcome, type StepSignal } from "./harness/classify";
-import { ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES } from "./harness/guided-driver";
 import { renderLedgerMarkdown, type TransitionLedger } from "./harness/transition-ledger";
 import type { RunRecord } from "./harness/types";
 import { TransitionLedgerRecorder } from "./helpers/transition-ledger-recorder";
@@ -49,6 +48,11 @@ import {
 
 const BATCH_ID = process.env.HARNESS_BATCH_ID ?? "skeleton";
 const BATCH_SIZE = Number(process.env.HARNESS_BATCH_SIZE ?? "1");
+const ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES = [
+  /^View prompt$/,
+  /^Approve the LLM prompt template$/,
+  /^Acknowledge/i,
+];
 
 type EfficiencyRunRecord = RunRecord & {
   efficiency: PlannerEfficiency;
@@ -90,7 +94,6 @@ async function resolveVisibleReviews(
   const primaryButtons = ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES.map((name) =>
     page.getByRole("button", { name }),
   );
-  const legacyViewToggles = page.getByRole("button", { name: /^View$/ });
   const promptRegions = page.getByRole("region", {
     name: "Prompt template review",
   });
@@ -98,12 +101,6 @@ async function resolveVisibleReviews(
   // Bounded inner loop: each acknowledged card unmounts, shrinking the list.
   // Prompt-template cards take two iterations (View prompt -> Approve).
   for (let guard = 0; guard < 12; guard++) {
-    // Keep the retired exact-"View" path for old staging bundles while the
-    // current bundle uses the two-stage primary handled below.
-    const toggleCount = await legacyViewToggles.count().catch(() => 0);
-    for (let i = 0; i < toggleCount; i++) {
-      await clickGesture(legacyViewToggles.nth(i), "View", ledger);
-    }
     const regionCount = await promptRegions.count().catch(() => 0);
     for (let i = 0; i < regionCount; i++) {
       await promptRegions
@@ -298,7 +295,7 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
   // authoring response back from the browser until the backend's durable audit rows have
   // been re-read, which is what makes per-transition attribution exact.
   const ledgerCtx = await harnessCtx();
-  const ledger = new TransitionLedgerRecorder(page, ledgerCtx, { legacyAutoRun: false });
+  const ledger = new TransitionLedgerRecorder(page, ledgerCtx);
   await ledger.install();
   let transitions: TransitionLedger | null = null;
   let ledgerError: string | null = null;
@@ -624,244 +621,4 @@ test.describe("tutorial reliability battery", () => {
       await runOnce(page, i);
     });
   }
-});
-
-// ── Collector-authoring scenario (WS6 guard lift; ADR-031 amendment 2026-08-25) ──
-//
-// NOT the tutorial: the tutorial's frozen prompt and script are UNTOUCHED
-// (Q8-1 ruling — amending them would reset the red-attribution baseline during
-// the riskiest window). This scenario drives an ORDINARY guided session with a
-// fixed collector-authoring prompt through the same backend, so the battery
-// covers the collector variant of the guided surface that the frozen tutorial
-// cannot exercise. Same doctrine as the tutorial walk: fixed input, no
-// improvisation — a red here is a machinery investigation.
-//
-// !! PENDING CALIBRATION — DO NOT GRADE YET !! The baseline of record is
-// tool-call counts + repair rounds per scenario, and those numbers do not
-// exist until John fires a calibration round (the battery is manual-fire ONLY;
-// never overlap rounds). Until COLLECTOR_BASELINE carries calibrated values
-// this scenario records observations into its RunRecord and asserts nothing
-// beyond completion. ADR-031 reconsideration triggers (2026-08-25 amendment):
-//   T1: any battery round where the collector scenario needs a repair round on
-//       the collector/scope step or exceeds its calibrated call count =
-//       suspected machinery defect; two consecutive → escalate to a standing
-//       live canary.
-//   T2: any collector-authoring defect found by a human/staging/downstream
-//       layer that the mocked spec or battery should have caught = immediate
-//       reconsideration, no threshold.
-//   T3: guided-authoring-path changes (planner skills, projection, guided
-//       backend) accumulating without a collector-covering battery round in
-//       the same slice = the cited control is inert; fire a round before the
-//       next guided-surface merge or upgrade.
-//
-// !! UNVERIFIED (operator-env blocked) !! Like driveGuidedWalk above, this
-// driver needs a live LLM-backed staging deploy. Named residuals for the
-// calibration round: the ordinary-session entry affordance (this driver
-// assumes goto "/" lands on a fresh guided-mode session once first-run is
-// consumed), and any schema_form stages the pump cannot fill.
-
-const COLLECTOR_SCENARIO_PROMPT =
-  "Read this synthetic multi-document JSON file, split each document into one " +
-  "row per section, have an LLM write a one-sentence gist of each section, " +
-  "then gather each document's section rows back together into a single " +
-  "batch per document (every section must make it back — fail the document " +
-  "if one is lost) and write one summary row per document to a JSON file.\n" +
-  "https://dta-au.github.io/elspeth/tutorial-site/multi-doc-sections.json";
-
-const COLLECTOR_BASELINE: {
-  max_provider_calls: number | null;
-  max_repair_turns: number | null;
-} = {
-  // STAYS NULL ON THIS SURFACE (2026-08-26 ruling): collector-authoring cost
-  // is now calibrated on the FREEFORM battery, not through this browser walk
-  // — evals/composer-battery/calibration/run_collector_calibration.py, round
-  // 2026-08-26-collector-calibration-freeform (3/3 authored a require_all
-  // scoped collector; ceiling 13 provider calls). Five guided firings spent
-  // their budget answering wizard turn types that have nothing to do with the
-  // measurement, so the browser scenario keeps its ADR-031 job — proving the
-  // guided lane can author a collector at all — and records without grading.
-  // Do NOT paste the freeform numbers here: a guided walk pays for wizard
-  // turns the freeform planner never makes, so they would grade a cost this
-  // surface was never measured at.
-  max_provider_calls: null,
-  max_repair_turns: null,
-};
-
-async function driveCollectorScenarioWalk(page: Page): Promise<void> {
-  const runbookDeadline = Date.now() + 900_000;
-  const stepChat = page.getByRole("region", { name: "Describe what you want" });
-  const stepChatInput = stepChat.getByLabel("Message input");
-  const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
-  const completion = page.getByRole("region", { name: /pipeline summary/i });
-  // Source and Output only, for the same reason as the tutorial walk: since the
-  // goal-first change the transforms are planned once, on the step-2 finish,
-  // from the session's goal (the scenario prompt, set on the convert below)
-  // plus whatever this walk's sends retained as deferred intents. There is no
-  // transforms Send.
-  const drivenPhases = new Set(["Source", "Output"]);
-  const primaries = [
-    page.getByRole("button", { name: "Confirm wiring", exact: true }),
-    // No send-first guard: with the pre-Send auto-proposal gone there is no
-    // unpaid-for proposal to accept early. This scenario RECORDS its ledger
-    // without grading it (COLLECTOR_BASELINE is null), so the tutorial walk's
-    // per-transition planner assertions deliberately do not apply here.
-    page.getByRole("button", { name: "Review wiring", exact: true }),
-    page.getByRole("button", { name: "Continue", exact: true }),
-    page.getByRole("button", { name: "Looks right", exact: true }),
-    page.getByRole("button", { name: "Finish sources", exact: true }),
-    page.getByRole("button", { name: "Finish outputs", exact: true }),
-    page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
-  ];
-  async function currentPhase(): Promise<string | null> {
-    const label = page.locator(".guided-workflow-step--current .guided-workflow-label").first();
-    const text = await label.textContent().catch(() => null);
-    return text ? text.trim() : null;
-  }
-  let lastDrivenPhase: string | null = null;
-  const sendsByPhase = new Map<string, number>();
-  let sourceChipClicked = false;
-  while (Date.now() < runbookDeadline) {
-    if (await completion.isVisible().catch(() => false)) return;
-    await resolveVisibleReviews(page);
-    let advanced = false;
-    for (const primary of primaries) {
-      if (
-        (await primary.count().catch(() => 0)) > 0 &&
-        (await primary.isEnabled().catch(() => false))
-      ) {
-        await primary.click().catch(() => {});
-        advanced = true;
-        break;
-      }
-    }
-    if (advanced) {
-      await page.waitForTimeout(750);
-      continue;
-    }
-    const phase = await currentPhase();
-    // Wizard select arm: after the scenario prompt has been sent at Source
-    // (its future-stage halves are retained as deferred intents — the
-    // elspeth-3a21f09f09 flow), the step-1 single-select still owns the
-    // source choice. Answer it the way a user would: pick JSON, the
-    // scenario's stated source kind. One click, chat-first guarded.
-    if (!sourceChipClicked && phase === "Source" && (sendsByPhase.get("Source") ?? 0) > 0) {
-      const jsonChip = page.getByRole("button", { name: "JSON", exact: true });
-      if ((await jsonChip.count().catch(() => 0)) > 0 && (await jsonChip.isEnabled().catch(() => false))) {
-        await jsonChip.click().catch(() => {});
-        sourceChipClicked = true;
-        // The select answer re-arms the chat for this phase: the JSON source
-        // wizard turn that follows may need the scenario's URL restated.
-        lastDrivenPhase = null;
-        await page.waitForTimeout(1_000);
-        continue;
-      }
-    }
-    // Gate on the INPUT, not the Send button: with an empty composer Send is
-    // disabled by design (ChatInput requires non-empty text), so checking
-    // Send first spins forever in ordinary guided mode — the 2026-08-26
-    // calibration round's second finding. Tutorial mode masked this via its
-    // prelocked prompt.
-    const canType = await stepChatInput.isEnabled().catch(() => false);
-    // Two sends per phase, not one: with multi-retain intact the planner
-    // holds a real conversation (e.g. it may ask for source structure before
-    // resolving), so a single blocked send per phase deadlocks the walk.
-    if (canType && phase !== null && drivenPhases.has(phase) && (sendsByPhase.get(phase) ?? 0) < 2 && phase !== lastDrivenPhase) {
-      // Ordinary guided mode has no prelocked prompt: type the fixed scenario
-      // prompt, then Send — one drive per phase, like the tutorial walk.
-      await stepChatInput.fill(COLLECTOR_SCENARIO_PROMPT).catch(() => {});
-      const sent = await stepChatSend
-        .isEnabled()
-        .catch(() => false)
-        .then(async (enabled) => {
-          if (!enabled) return false;
-          await stepChatSend.click();
-          return true;
-        })
-        .catch(() => false);
-      if (sent) {
-        lastDrivenPhase = phase;
-        sendsByPhase.set(phase, (sendsByPhase.get(phase) ?? 0) + 1);
-        await page.waitForTimeout(2_000);
-      } else {
-        await stepChatInput.fill("").catch(() => {});
-        await page.waitForTimeout(1_000);
-      }
-      continue;
-    }
-    await page.waitForTimeout(1_000);
-  }
-  throw new Error("collector scenario walk never reached completion before the deadline");
-}
-
-test.describe("collector-authoring scenario (ordinary guided surface)", () => {
-  // Manual-fire opt-in on top of the battery's own manual-fire status, so a
-  // tutorial round never silently spends provider budget on this scenario and
-  // the two are never graded as one population.
-  test.skip(
-    process.env.HARNESS_COLLECTOR !== "1",
-    "PENDING CALIBRATION (Q8-1): John fires the calibration round manually (HARNESS_COLLECTOR=1); baselines are recorded, not guessed.",
-  );
-
-  test("collector scenario run", async ({ page }) => {
-    // Live planner walk (runbook deadline <=900s) + audit capture: the suite
-    // default timeout cannot hold it (2026-08-26 calibration round finding).
-    test.setTimeout(1_200_000);
-
-    // Entry affordance (the driver's named residual, resolved by the same
-    // calibration round): goto "/" resumes the LAST session in whatever mode
-    // it was left in — the first firing landed inside a freeform battery
-    // session and the guided region never appeared. The scenario needs a
-    // FRESH guided session: create + convert via the API (the same
-    // POST /guided/convert the "Switch to guided" affordance calls), then
-    // deep-link it by hash (#/{sessionId}).
-    //
-    // The convert carries the scenario prompt as the session's GOAL: since the
-    // goal-first change no guided session starts without a visible intent, and
-    // the "Switch to guided" card the affordance renders now collects one. The
-    // scenario prompt is this walk's fixed input, so it is also its goal — the
-    // same relationship the tutorial's frozen lesson prompt has to the tutorial
-    // session. The driver still sends it at the source and output phases, where
-    // the chat solvers extract their halves of it.
-    const entry = await harnessCtx();
-    const created = await entry.post("/api/sessions", { data: {} });
-    if (!created.ok()) throw new Error(`create session failed ${created.status()}: ${await created.text()}`);
-    const sessionId = ((await created.json()) as { id: string }).id;
-    const converted = await entry.post(`/api/sessions/${sessionId}/guided/convert`, {
-      data: { operation_id: crypto.randomUUID(), intent: COLLECTOR_SCENARIO_PROMPT },
-    });
-    if (!converted.ok()) throw new Error(`guided convert failed ${converted.status()}: ${await converted.text()}`);
-    await entry.dispose();
-
-    await page.goto(`/#/${sessionId}`);
-    await expect(page.getByLabel(/guided composer/i)).toBeVisible({ timeout: 60_000 });
-    await driveCollectorScenarioWalk(page);
-
-    const ctx = await harnessCtx();
-    const audit = await fetchPlannerAuditEvidence(ctx, sessionId).catch(() => null);
-    const efficiency = audit === null
-      ? unavailablePlannerEfficiency("planner audit evidence unavailable")
-      : classifyPlannerEfficiency(audit, true);
-    const record = {
-      scenario: "collector-authoring",
-      prompt: COLLECTOR_SCENARIO_PROMPT,
-      session_id: sessionId,
-      efficiency,
-      baseline: COLLECTOR_BASELINE,
-      calibrated: COLLECTOR_BASELINE.max_provider_calls !== null,
-    };
-    const dir = `tests/e2e/.harness-results/${BATCH_ID}`;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(`${dir}/collector-run.json`, JSON.stringify(record, null, 2));
-    await ctx.dispose();
-
-    // Grade ONLY once calibrated (T1 lives here): a repair round on the
-    // collector/scope step or a call count above baseline is a suspected
-    // machinery defect, not model variance (ADR-031 §4).
-    if (COLLECTOR_BASELINE.max_provider_calls !== null && efficiency.provider_calls !== null) {
-      expect(efficiency.provider_calls).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_provider_calls);
-    }
-    if (COLLECTOR_BASELINE.max_repair_turns !== null && efficiency.repair_turns !== null) {
-      expect(efficiency.repair_turns).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_repair_turns);
-    }
-  });
 });

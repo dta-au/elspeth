@@ -32,7 +32,6 @@ Usage::
     python scripts/acceptance_battery.py api POST /api/sessions body.json g01/session.json
     python scripts/acceptance_battery.py resolve-reviews <session-id> g01
     python scripts/acceptance_battery.py run-graph <session-id> g01
-    python scripts/acceptance_battery.py guided-rider 10
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ import os
 import secrets
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -187,63 +185,6 @@ class Battery:
         self.api("GET", f"/api/runs/{run_id}/outputs", save=f"{graph}/outputs.json")
         return 0
 
-    def guided_rider(self, attempts: int, intent: str) -> int:
-        """Sample plain-guided cold starts; report completions over attempts.
-
-        Each attempt is a fresh session and operation id. A client timeout is
-        reconciled against the server's authoritative outcome rather than
-        counted as a failure.
-        """
-        if self.ensure_account() != 0:
-            print("GUIDED RIDER: could not obtain a battery account")
-            return 2
-        results: list[dict[str, Any]] = []
-        for attempt in range(1, attempts + 1):
-            status, session = self.api("POST", "/api/sessions", json={"title": f"battery guided rider {attempt}"})
-            if status not in (200, 201):
-                print(f"GUIDED RIDER: session create failed on attempt {attempt}: {status} {str(session)[:200]}")
-                return 2
-            session_id = session["id"]
-            operation_id = str(uuid.uuid4())
-            outcome: dict[str, Any] = {"attempt": attempt, "session": session_id, "operation": operation_id}
-            try:
-                status, body = self.api(
-                    "POST",
-                    f"/api/sessions/{session_id}/guided/start",
-                    save=f"rider/attempt-{attempt:02d}.json",
-                    timeout=280,
-                    json={"operation_id": operation_id, "profile": "live", "intent": intent},
-                )
-                outcome["http"] = status
-                if status == 200:
-                    outcome["result"] = "completed"
-                    outcome["has_state"] = body.get("composition_state") is not None
-                else:
-                    detail = body.get("detail", body) if isinstance(body, dict) else {}
-                    outcome["result"] = "failed"
-                    outcome["failure_code"] = detail.get("failure_code") if isinstance(detail, dict) else None
-            except requests.RequestException:
-                outcome["result"] = "client-timeout"
-                for _ in range(20):
-                    time.sleep(15)
-                    status, reconciled = self.api(
-                        "POST",
-                        f"/api/sessions/{session_id}/guided/start/{operation_id}/reconcile",
-                        timeout=60,
-                    )
-                    if status == 200 and reconciled.get("status") in {"completed", "failed"}:
-                        outcome["result"] = f"reconciled-{reconciled['status']}"
-                        outcome["failure_code"] = reconciled.get("failure_code")
-                        break
-            results.append(outcome)
-            print(json.dumps(outcome, default=str))
-            with (self.state_dir / "rider-results.jsonl").open("a") as handle:
-                handle.write(json.dumps(outcome, default=str) + "\n")
-            time.sleep(20)
-        completed = sum(1 for result in results if "completed" in str(result.get("result")))
-        print(f"GUIDED RIDER: {completed}/{attempts} completions")
-        return 0
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -273,9 +214,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("graph")
     run.add_argument("--budget", type=int, default=900, help="seconds to poll before giving up")
 
-    rider = commands.add_parser("guided-rider")
-    rider.add_argument("attempts", type=int, nargs="?", default=10)
-    rider.add_argument("--intent", required=True, help="the canonical intent to replay each attempt")
     return parser
 
 
@@ -299,8 +237,6 @@ def main(argv: list[str] | None = None) -> int:
         return battery.resolve_reviews(args.session_id, args.graph)
     if args.command == "run-graph":
         return battery.run_graph(args.session_id, args.graph, args.budget)
-    if args.command == "guided-rider":
-        return battery.guided_rider(args.attempts, args.intent)
     raise AssertionError(f"unhandled command {args.command!r}")
 
 

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  GUIDED_STAGE_PRIMARY_ACTION_NAMES,
-  STAGED_GUIDED_PHASES,
+  FREEFORM_BUILD_ACTION_NAMES,
+  isAuditRequest,
   isComposeRequest,
   isRunRequest,
 } from "../../../scripts/staging-tutorial-driver.mjs";
@@ -10,29 +10,23 @@ import {
 describe("standalone staging tutorial driver contract", () => {
   const sessionId = "00000000-0000-4000-8000-000000000000";
 
-  it("drives the staged guided flow instead of the retired Build it turn", () => {
-    expect(STAGED_GUIDED_PHASES).toEqual(["Source", "Output", "Transforms"]);
-    expect(GUIDED_STAGE_PRIMARY_ACTION_NAMES).toEqual([
-      "Confirm wiring",
-      "Continue",
-      "Let source decide (pass all fields through)",
-    ]);
-    expect(GUIDED_STAGE_PRIMARY_ACTION_NAMES).not.toContain("Build it");
+  it("drives the ordinary freeform Build and explicit Run gestures", () => {
+    expect(FREEFORM_BUILD_ACTION_NAMES).toEqual(["Send tutorial brief", "Continue to Run", "Run"]);
   });
 
-  it("treats guided/respond, not composer messages, as the compose step", () => {
+  it("treats composer messages, not a removed guided route, as the compose step", () => {
     expect(
       isComposeRequest(
         `https://staging.example/api/sessions/${sessionId}/guided/respond`,
         "POST",
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       isComposeRequest(
         `https://staging.example/api/sessions/${sessionId}/messages`,
         "POST",
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("identifies the tutorial run request independently", () => {
@@ -42,5 +36,10 @@ describe("standalone staging tutorial driver contract", () => {
     expect(
       isRunRequest("https://staging.example/api/tutorial/run", "GET"),
     ).toBe(false);
+  });
+
+  it("identifies the evidence-backed audit story read", () => {
+    expect(isAuditRequest(`https://staging.example/api/sessions/${sessionId}/runs/run-1/audit-story`, "GET")).toBe(true);
+    expect(isAuditRequest(`https://staging.example/api/sessions/${sessionId}/runs/run-1/audit-story`, "POST")).toBe(false);
   });
 });

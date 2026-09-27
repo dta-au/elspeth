@@ -11,7 +11,7 @@ export async function harnessCtx(): Promise<APIRequestContext> {
 
 export async function resetToFirstRun(ctx: APIRequestContext): Promise<void> {
   const r = await ctx.patch("/api/composer-preferences", {
-    data: { tutorial_completed_at: null, default_mode: "guided" },
+    data: { tutorial_completed_at: null },
   });
   if (!r.ok()) throw new Error(`reset prefs failed ${r.status()}: ${await r.text()}`);
 }
