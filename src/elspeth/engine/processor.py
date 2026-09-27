@@ -4485,30 +4485,23 @@ class RowProcessor:
     ) -> int:
         """Mark durable scheduler work consumed by a barrier as terminal.
 
+        The scheduler repository is the one authority for the consumed set:
+        inside its write transaction it refuses an empty, duplicated,
+        not-BLOCKED or short-terminalized set with ``AuditIntegrityError``
+        before anything commits, so the returned count is always the number
+        of distinct ``token_ids`` and callers do not re-check it.
+
         ``group_losses`` (Ruling 39): passed straight through to
         `complete_barrier`'s existing durable write — the out-of-claim sweep
         caller's own drained-and-not-otherwise-committed stage. See
         `take_pending_group_losses`.
         """
-        expected_count = len(frozenset(token_ids))
-        if not token_ids:
-            raise AuditIntegrityError(f"Scheduler barrier terminalization for barrier_key={barrier_key!r} requires live token_ids.")
-        if expected_count != len(token_ids):
-            raise AuditIntegrityError(
-                f"Scheduler barrier terminalization received duplicate live token_ids for barrier_key={barrier_key!r}: {token_ids!r}"
-            )
-        terminalized_count = self._scheduler.mark_blocked_barrier_terminal(
+        return self._scheduler.mark_blocked_barrier_terminal(
             barrier_key=barrier_key,
             token_ids=token_ids,
             coordination_token=self._require_coordination_token(),
             group_losses=group_losses,
         )
-        if expected_count and terminalized_count != expected_count:
-            raise AuditIntegrityError(
-                f"Scheduler barrier terminalization mismatch for run_id={self._run_id!r} barrier_key={barrier_key!r}: "
-                f"live consumed {expected_count} token(s), but durable scheduler terminalized {terminalized_count}."
-            )
-        return terminalized_count
 
     def _mark_coalesce_consumed_scheduler_work_terminal(
         self,

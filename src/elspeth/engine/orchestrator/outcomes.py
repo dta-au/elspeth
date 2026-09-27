@@ -34,7 +34,6 @@ from elspeth.engine.orchestrator.types import ExecutionCounters
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.results import RowResult
-    from elspeth.contracts.scheduler import GroupLossSpec
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
     from elspeth.engine.work_items import WorkItem
@@ -98,39 +97,6 @@ def _route_to_sink(
             ),
         )
     )
-
-
-def _mark_barrier_tokens_terminal(
-    processor: CoalesceCompletionPort,
-    *,
-    barrier_key: str,
-    consumed_tokens: tuple[TokenInfo, ...],
-    group_losses: tuple[GroupLossSpec, ...] = (),
-) -> None:
-    """Reconcile a FAILED coalesce outcome with durable scheduler terminalization.
-
-    Failure arms only (merge failed at timeout/EOF): consumption without an
-    emission, on the legacy partial-release wrapper. Successful merges go
-    through ``processor.complete_coalesce_merge`` — ONE atomic journal
-    transition that consumes the branches and emits the merged child (F1/D6).
-
-    ``group_losses`` (Ruling 39): an escalation loss staged by the SAME
-    sweep call, drained and passed through so it commits durably in this
-    SAME transaction — see `_terminalize_swept_coalesce_failure`.
-    """
-    token_ids = tuple(token.token_id for token in consumed_tokens)
-    if not token_ids:
-        raise AuditIntegrityError(f"Coalesce barrier {barrier_key!r} cannot terminalize scheduler work without live consumed token_ids.")
-    expected_count = len(frozenset(token_ids))
-    if expected_count != len(token_ids):
-        raise AuditIntegrityError(f"Coalesce barrier {barrier_key!r} consumed duplicate token_ids: {token_ids!r}")
-
-    terminalized_count = processor.mark_blocked_barrier_terminal(barrier_key, token_ids, group_losses=group_losses)
-    if expected_count and terminalized_count != expected_count:
-        raise AuditIntegrityError(
-            f"Coalesce barrier {barrier_key!r} live consumed {expected_count} token(s), "
-            f"but durable scheduler terminalized {terminalized_count}."
-        )
 
 
 def _terminalize_swept_coalesce_failure(
@@ -521,10 +487,9 @@ def _handle_failed_row_union_outcome(
         raise AuditIntegrityError(
             "Failed RowUnionOutcome has consumed tokens but no row_union_name; cannot reconcile durable scheduler barrier rows."
         )
-    _mark_barrier_tokens_terminal(
-        processor,
-        barrier_key=str(outcome.row_union_name),
-        consumed_tokens=tuple(outcome.consumed_tokens),
+    processor.mark_blocked_barrier_terminal(
+        str(outcome.row_union_name),
+        tuple(token.token_id for token in outcome.consumed_tokens),
     )
     counters.rows_failed += len(outcome.consumed_tokens)
     counters.rows_coalesce_failed += 1

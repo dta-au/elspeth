@@ -858,7 +858,13 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
 # Source replay restores discarded source decisions through the existing fenced
 # PluginContext.record_validation_error API (one new caller, none removed).
-_EXPECTED_CALL_COUNT = 290
+# G1 (elspeth-5887fb7928): 290 -> 289. Departed:
+# BarrierIntakeCoordinator._adopt_row_union_row -> self._scheduler.mark_blocked_barrier_terminal#2
+# (the row_union intake group-failure arm, deleted as unreachable: accept() returns only
+# held / late-arrival / release). G1b moved, not added: the row_union sweep's
+# processor.mark_blocked_barrier_terminal#1 now sits in _handle_failed_row_union_outcome
+# (the deleted _mark_barrier_tokens_terminal re-checked what the repository enforces).
+_EXPECTED_CALL_COUNT = 289
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -869,7 +875,8 @@ _EXPECTED_CALL_COUNT = 290
 # Re-derived for the combined K063/K056 tree after the caller exchange.
 # K063 run accounting adds CollectorExecutor.notify_empty_group's direct
 # complete_collector_failure call for a zero-arrival group.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "7683d3e0cfefa635a465005c75805f5aa666f027bc98346f483f647378011cc3"
+# G1 + G1b: 7683d3e0… -> e74265fd…, the departure and the move above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "e74265fd4839681642a89d26a1fc41a6860b59ae53a785d5804a22766d21868c"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
