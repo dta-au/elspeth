@@ -175,15 +175,20 @@ def build_canonicalization_sentinel(
 
     - ``_canonicalization_error`` — exception class name (status quo).
     - ``_canonicalization_detail`` — exception ``str(exc)`` only when
-      ``exc`` is an :class:`rfc8785.CanonicalizationError`. By spec
-      (verified empirically on rfc8785) those messages are
-      type-name or JCS-rule strings such as ``"unsupported type:
-      <class 'X'>"`` or ``"inf is not representable in JCS"`` — they
-      never echo payload values. Other ``ValueError`` / ``TypeError``
-      paths can echo Tier-3 data (e.g. ``core/canonical.py``'s Decimal
-      check interpolates the offending value into its message); for
-      those the detail field is omitted to prevent a Tier-3 leak into
-      the Tier-1 audit row.
+      ``exc`` is exactly the base :class:`rfc8785.CanonicalizationError`,
+      whose three messages are type-name or JCS-rule strings
+      (``"unsupported type: <class 'X'>"``, ``"object keys must be
+      strings"``, ``"input contains non-UTF-8 codepoints"``). Its two
+      subclasses echo the offending value, measured on rfc8785:
+      ``IntegerDomainError`` is ``"<the integer> exceeds safe integer
+      domain for JSON floats"`` and ``FloatDomainError`` is ``"<the
+      float> is not representable in JCS"`` — so for them, as for every
+      other ``ValueError`` / ``TypeError`` (``core/canonical.py``'s
+      Decimal check interpolates the value too), the detail is omitted
+      and the class name in ``_canonicalization_error`` says which rule
+      failed. The payload is the planner's tool arguments or a tool
+      result, which can carry values the planner copied from a user's
+      data, and the sentinel is persisted in the Tier-1 audit row.
     - ``_payload_keys`` — sorted top-level keys of the failed payload
       when it is a Mapping. Keys are schema metadata (names like
       "data", "validation", "version"); values are NOT captured. This
@@ -196,10 +201,11 @@ def build_canonicalization_sentinel(
     structures.
     """
     sentinel: dict[str, object] = {"_canonicalization_error": type(exc).__name__}
-    if isinstance(exc, rfc8785.CanonicalizationError):
-        # Bounded by spec: rfc8785 messages are short and value-free.
-        # The 512-char cap is belt-and-braces against future rfc8785
-        # changes that might inline a longer schema fragment.
+    if type(exc) is rfc8785.CanonicalizationError:
+        # Exactly the base class: its messages are type/rule strings. The
+        # domain subclasses carry the value (see above). The 512-char cap
+        # is belt-and-braces against a future rfc8785 inlining a longer
+        # schema fragment.
         sentinel["_canonicalization_detail"] = str(exc)[:512]
     if isinstance(payload, Mapping):
         sentinel["_payload_keys"] = sorted(str(k) for k in payload)
