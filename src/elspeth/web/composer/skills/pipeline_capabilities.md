@@ -301,8 +301,9 @@ reads `row` declares none: the query field reaches a retrieval template as
 `query` without a declaration, and a declaration the template cannot use is
 refused. `row` has fields and one method, `get`: `row.items` and `row.keys`
 read columns of those names, so a call on a row field (`row.keys()`,
-`row.items()`, `row['keys']()`), `row.get` without a call and the reserved
-names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` are refused
+`row.items()`, `row['keys']()`, `row.get('note')()`), `row.get` without a call
+and the reserved names `row.contract`, `row.to_dict` and
+`row.to_checkpoint_format` are refused
 under every declaration, `[]` included. For the field names use `row | list`,
 for name and value pairs `row | items` or `row | dictsort`, for a mapping
 `dict(row)` or `row | tojson`; read a column named like a method or a reserved

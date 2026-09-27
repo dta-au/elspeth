@@ -96,11 +96,19 @@ over the projected view (`row | list`, `row | items`, `row | dictsort`,
 PipelineRow names (`RETIRED_ROW_API_NAMES`: `contract`, `to_dict`,
 `to_checkpoint_format`) are reserved in attribute form; their columns are read
 by item. Configuration refuses the row used as an object — a reserved name, a
-call on a row field, `row.get` without a call — under **every** declaration,
+call on a row field (including calling what `row.get(...)` returns), `row.get`
+without a call — under **every** declaration,
 `[]` included, on the prompt's `row`, a query's `row` and `row.source_row`,
 and a RAG `row`, and never suggests `[]` as its remedy: no declaration makes
 these forms work, and the method-versus-column alternative corrupts silently
-(a `keys` column once rendered as `<bound method ...>`). The runtime reads the
+(a `keys` column once rendered as `<bound method ...>`). A method on a value
+is that value's own and not a row call: a field's value (`row.note.upper()`)
+and a value a builtin or filter builds from the whole row
+(`dict(row).items()`, `(row | list).count('x')`); on a dict built from the
+row a name that is not a dict method reads a field, so `dict(row).note()` is
+a row call. The analysis tells the row object from a value built from it
+through the same aliases, loops and macro arguments it follows for field
+reads. The runtime reads the
 same constants for what the analysis cannot follow: `TemplateRow` refuses a
 reserved name in attribute form on every projection with a fixed,
 value-free reason, and its `repr` names fields only, never a value or an

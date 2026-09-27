@@ -256,7 +256,8 @@ drained and repair this release forward.
   composer and run start) now refuses, for an LLM prompt, a query's
   `row.source_row` and a RAG `query_template`, and under `required_input_fields:
   []` too, a call on a row field (`row.keys()`, `row.items()`,
-  `row['keys']()`, `row.note()`), `row.get` without a call, and the reserved
+  `row['keys']()`, `row.note()`, `dict(row).note()`, and calling what
+  `row.get('note')` returns), `row.get` without a call, and the reserved
   names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
   through `row | attr('contract')`). Before, under `[]` these validated and
   failed every row (`row.keys()`, `row.to_dict()`, `row.contract`), or sent a
@@ -265,6 +266,9 @@ drained and repair this release forward.
   read a column named `contract` while the same text was refused under a
   list. The refusal names the replacement (`row | list`, `row | items`,
   `row | dictsort`, `dict(row)`, `row['contract']`) and never suggests `[]`.
+  A method on a value built from the whole row is that value's own and still
+  validates: `dict(row).items()`, `(row | list).count('note')`,
+  `(row | tojson).upper()`, through a `set`, `with`, loop or macro argument too.
   At render, a reserved name the check cannot follow fails the row with the
   value-free reason `Reserved row name: ...`, and a missing field's reason
   names "the row" instead of an internal class. A whole row used as a value is

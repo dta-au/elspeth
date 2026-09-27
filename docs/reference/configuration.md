@@ -1263,10 +1263,16 @@ opts out of these checks, and the template then sees the whole row.
 Configuration also refuses a template that uses its row as an object, under
 every declaration, `[]` included, because no declaration makes it work: a
 call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
-`row.note()`), `row.get` without a call (`{{ row.get }}`,
+`row.note()`, and calling what `row.get('note')` returns, `row.get('note')()`),
+`row.get` without a call (`{{ row.get }}`,
 `{% set g = row.get %}`), and a reserved name in attribute form
 (`row.contract`, `row.to_dict()`, `row | attr('contract')`). A method on a
-field's value is not a row call: `row.note.upper()` is fine. At render, a
+value is not a row call: a field's value has its own methods
+(`row.note.upper()`), and so does a value a builtin or a filter builds from
+the whole row (`dict(row).items()`, `(row | list).count('note')`,
+`(row | tojson).upper()`). On a dict built from the row, a name that is not a
+dict method reads a field, so `dict(row).note()` is refused like
+`row.note()`. At render, a
 reserved name the configuration check cannot follow fails the row with
 `template_rendering_failed` (`Reserved row name: ...`). With
 `required_input_fields` omitted, a single-query template that uses `row` as a
