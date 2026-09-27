@@ -604,11 +604,12 @@ drained and repair this release forward.
   returns an unconfigured route label or a value that is not a bool or string
   no longer records a preview or a hash of that value (a short value printed
   whole); the failure names its type, a string's length and the condition.
-  A source that passes an integer beyond the JSON safe range as a valid row
-  still ends the run at ingest, but the failure (the source operation's error
-  and the printed traceback) no longer is that integer: it names the row
-  index, a declared field and the error type, as the transform, aggregation
-  and collector seams already did. Sinks follow the same rule: `dataverse`
+  A source row carrying an integer beyond the JSON safe range is quarantined
+  (see the bullet above); a source that bypasses its schema and passes one as
+  a valid row still ends the run at ingest, but the failure (the source
+  operation's error and the printed traceback) no longer is that integer: it
+  names the source row index, a declared field and the error type, as the
+  transform, aggregation and collector seams already did. Sinks follow the same rule: `dataverse`
   no longer prints the row's alternate-key or lookup value when it refuses a
   duplicate, blank or non-string key or an unsafe `@odata.bind` reference
   (it names the field, the failure and, for a duplicate, the two member
