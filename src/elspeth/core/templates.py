@@ -69,8 +69,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DYNAMIC_ROW_FIELD",
+    "RETIRED_ROW_API_NAMES",
+    "ROW_API_MISUSE_KINDS",
+    "TEMPLATE_ROW_METHODS",
     "Jinja2FieldExtraction",
     "describe_dynamic_row_access",
+    "describe_row_api_misuse",
     "extract_jinja2_field_usage",
     "extract_jinja2_fields",
     "extract_jinja2_fields_with_details",
@@ -82,7 +86,27 @@ DYNAMIC_ROW_FIELD = "<dynamic-row-field>"
 ATTR_FILTER_DYNAMIC_ACCESS = "attr"
 MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS = "map(attribute)"
 ROW_API_DYNAMIC_ACCESS = "row-api"
+ROW_FIELD_CALL_ACCESS = "row-call"
+UNCALLED_GET_ACCESS = "get-uncalled"
 CARRIER_LIMIT_DYNAMIC_ACCESS = "carrier-limit"
+
+# The one template row API (ADR-051): attribute and item syntax on a template's
+# ``row`` always read a field, and ``get`` is the row's only method. Whole-row
+# operations are filters and builtins over the projected view (``row | list``,
+# ``row | items``, ``row | dictsort``, ``dict(row)``). The retired PipelineRow
+# API names stay reserved in attribute form, so text written against the old
+# row object is refused rather than silently reading a column of that name; a
+# column so named is read as ``row['contract']``. The sandbox
+# (``plugins.infrastructure.templates``) reads these same constants.
+TEMPLATE_ROW_METHODS: frozenset[str] = frozenset({"get"})
+RETIRED_ROW_API_NAMES: frozenset[str] = frozenset({"contract", "to_dict", "to_checkpoint_format"})
+
+# The access kinds that misuse the row as an object. Configuration refuses them
+# under every declaration, ``[]`` included: none names a field a declaration
+# could cover, and each fails or garbles every row whatever the row holds. The
+# other kinds are computed keys, which the ``[]`` opt-out admits because the
+# whole row can answer them.
+ROW_API_MISUSE_KINDS: frozenset[str] = frozenset({ROW_API_DYNAMIC_ACCESS, ROW_FIELD_CALL_ACCESS, UNCALLED_GET_ACCESS})
 
 # The alias analysis is a fixpoint over what each template name may hold. Every
 # write only ever joins (an API alias bound to two kinds is ROW_API_DYNAMIC_ACCESS,
@@ -103,14 +127,38 @@ _DYNAMIC_ACCESS_EXAMPLES: dict[str, str] = {
     "get": "row.get(expr)",
     "item": "row[expr]",
     MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS: "map(attribute=expr)",
-    ROW_API_DYNAMIC_ACCESS: "row API",
+}
+
+# How a configuration refusal names each row-API misuse. The spelling is the
+# kind's shape, never the template's own text, so a message stays one line.
+_ROW_API_MISUSE_EXAMPLES: dict[str, str] = {
+    ROW_API_DYNAMIC_ACCESS: "row.contract, row.to_dict, row.to_checkpoint_format or a name starting with '_'",
+    ROW_FIELD_CALL_ACCESS: "a call on a row field, such as row.keys(), row.items(), row['keys']() or row.name()",
+    UNCALLED_GET_ACCESS: "row.get without a call",
 }
 
 
 def describe_dynamic_row_access(dynamic_accesses: Iterable[str]) -> str:
-    """``"<kinds> via <examples>"`` for a template's dynamic row accesses, sorted and deduplicated."""
+    """``"<kinds> via <examples>"`` for a template's computed-key row accesses, sorted and deduplicated."""
     kinds = sorted(set(dynamic_accesses))
     return f"{', '.join(kinds)} via {', '.join(_DYNAMIC_ACCESS_EXAMPLES[kind] for kind in kinds)}"
+
+
+def describe_row_api_misuse(misuses: Iterable[str]) -> str:
+    """The refusal text for a template that uses its ``row`` as an object (every template surface shares it).
+
+    It names the replacement for each whole-row operation and never suggests
+    ``required_input_fields: []``: no declaration makes these forms work.
+    """
+    kinds = sorted(set(misuses))
+    return (
+        f"uses its row as an object ({'; '.join(_ROW_API_MISUSE_EXAMPLES[kind] for kind in kinds)}). A template's "
+        "row holds fields and one method, get: row.name, row['name'] and row.get('name', default) read a field, "
+        "so row.keys() calls the value of a field named 'keys', and row.contract, row.to_dict and "
+        "row.to_checkpoint_format are reserved names, not fields. For the field names use 'row | list', for "
+        "name and value pairs 'row | items' or 'row | dictsort', for a mapping 'dict(row)'; read a column whose "
+        "name is reserved or matches a method as row['contract'] or row['keys']."
+    )
 
 
 def template_loads_name(template_string: str, name: str) -> bool:
@@ -173,6 +221,16 @@ class Jinja2FieldExtraction:
         """Return whether the template has row[expr] or row.get(expr)."""
         return bool(self.dynamic_accesses)
 
+    @property
+    def row_api_misuses(self) -> tuple[str, ...]:
+        """The kinds that use the row as an object (``ROW_API_MISUSE_KINDS``), refused under every declaration."""
+        return tuple(kind for kind in self.dynamic_accesses if kind in ROW_API_MISUSE_KINDS)
+
+    @property
+    def computed_key_accesses(self) -> tuple[str, ...]:
+        """The computed-key kinds (``row[k]``, ``row.get(k)``, ``carrier-limit`` ...), which ``[]`` admits."""
+        return tuple(kind for kind in self.dynamic_accesses if kind not in ROW_API_MISUSE_KINDS)
+
 
 def _create_field_extraction_environment() -> Environment:
     return Environment(autoescape=True)
@@ -233,6 +291,7 @@ def extract_jinja2_field_usage(
         row_container_aliases,
         fields,
         dynamic_accesses,
+        _called_nodes(ast),
     )
     for kind in _shifted_varargs_splat_kinds(
         ast, namespaces, api_aliases, row_api_container_aliases, row_collection_aliases, row_container_aliases
@@ -321,30 +380,21 @@ def extract_jinja2_fields(
         row_container_aliases,
         fields,
         dynamic_accesses,
+        _called_nodes(ast),
     )
     return frozenset(fields)
 
 
-# Row names excluded from field extraction:
-# - "get" is the template row's one method, handled as a Call pattern
-#   (row.get("field")).
-# - "contract", "to_dict" and "to_checkpoint_format" are the retired PipelineRow
-#   API. A template's row is now a field-only TemplateRow, so at render time
-#   each reads a field of that name. They stay reserved here: a dot or attr
-#   read of one is classified as dynamic row access, so a template still
-#   spelling the old API fails configuration validation. A column with one of
-#   these names is read as row['contract'].
-# Note: "keys", "items", "values" are NOT excluded because they are
-# column names in user data (e.g., row.items in a for loop), which is also
-# how the template row resolves them.
-_PIPELINE_ROW_API_NAMES: frozenset[str] = frozenset(
-    {
-        "get",
-        "contract",
-        "to_dict",
-        "to_checkpoint_format",
-    }
-)
+# Row names excluded from field extraction: the one method (TEMPLATE_ROW_METHODS,
+# read as a Call pattern, row.get("field")) and the retired PipelineRow API
+# (RETIRED_ROW_API_NAMES). At render a TemplateRow refuses a retired name in
+# attribute form (``row.contract``, ``row | attr('contract')``) whatever the
+# declaration, and configuration refuses the same text first, so a template
+# still spelling the old API never reads a column of that name; the column is
+# read as row['contract']. "keys", "items" and "values" are NOT excluded: they
+# are column names in user data (e.g. row.items in a for loop), and attribute
+# syntax on a template row reads a field.
+_PIPELINE_ROW_API_NAMES: frozenset[str] = TEMPLATE_ROW_METHODS | RETIRED_ROW_API_NAMES
 
 
 def _walk_ast(
@@ -357,6 +407,7 @@ def _walk_ast(
     row_container_aliases: dict[str, frozenset[_CarrierPath]],
     fields: set[str],
     dynamic_accesses: list[str],
+    called: frozenset[int],
 ) -> None:
     """Recursively walk AST to find namespace attribute/item accesses.
 
@@ -365,11 +416,24 @@ def _walk_ast(
         namespaces: Variable names to search for, including direct aliases
         fields: Set to accumulate found field names (mutated)
         dynamic_accesses: List to accumulate dynamic access kinds (mutated)
+        called: ``id`` of every node the template calls (``_called_nodes``)
     """
     if isinstance(node, Call):
         alias_kind = _row_api_alias_expression_kind(node.node, api_aliases, row_api_container_aliases)
         if alias_kind is not None:
             _append_dynamic_access(dynamic_accesses, alias_kind)
+        if _is_row_field_call(node.node, namespaces, row_collection_aliases, row_container_aliases):
+            _append_dynamic_access(dynamic_accesses, ROW_FIELD_CALL_ACCESS)
+
+    if (
+        isinstance(node, Getattr)
+        and node.attr in TEMPLATE_ROW_METHODS
+        and id(node) not in called
+        and _node_is_row_object_expression(node.node, namespaces, row_collection_aliases, row_container_aliases)
+    ):
+        # ``{{ row.get }}`` renders a bound method, and ``{% set g = row.get %}``
+        # hands the method on: the one method is called where it is named.
+        _append_dynamic_access(dynamic_accesses, UNCALLED_GET_ACCESS)
 
     if (
         isinstance(node, Call)
@@ -440,7 +504,63 @@ def _walk_ast(
             row_container_aliases,
             fields,
             dynamic_accesses,
+            called,
         )
+
+
+def _called_nodes(ast: Node) -> frozenset[int]:
+    """The ``id`` of every expression a template calls (the callee of each ``Call``)."""
+    return frozenset(id(call.node) for call in ast.find_all(Call))
+
+
+@trust_boundary(
+    tier=3,
+    source="the callee expression of one Call node in a parsed operator-authored Jinja template",
+    source_param="callee",
+    suppresses=("R5",),
+    invariant=(
+        "classifies the callee by AST node type only: True for an attribute (other than the row's one method "
+        "or a reserved name), item or attr-filter lookup whose receiver can be the row object itself; every "
+        "other shape returns False, the explicit no-match result; nothing is evaluated or coerced"
+    ),
+    non_raising=True,
+)
+def _is_row_field_call(
+    callee: Node,
+    namespaces: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether a call's callee is a field of a row: ``row.keys()``, ``row['keys']()``, ``(row | attr('x'))()``.
+
+    Attribute and item syntax on a template row read a field, and a field
+    value is plain data (a string, number, boolean, None, list or mapping),
+    so calling it fails every row. ``row.get(...)`` is the row's one method;
+    a retired name (``row.to_dict()``) is reported as the row API instead. A
+    method on a field VALUE (``row.note.upper()``, ``(row.a ~ row.b).upper()``,
+    ``(row.a | default('')).strip()``) has the value, not the row, as its
+    receiver and is not a row call: the receiver must be an expression that
+    can yield the row object itself (``_node_is_row_object_expression``), not
+    merely one that mentions it.
+    """
+    if isinstance(callee, Getattr):
+        return (
+            _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+            and callee.attr not in TEMPLATE_ROW_METHODS
+            and not _is_blocked_row_attribute_name(callee.attr)
+        )
+    if isinstance(callee, Filter) and callee.name == "attr":
+        name = _filter_positional_or_keyword_value(callee, 0, "name")
+        if isinstance(name, Const) and isinstance(name.value, str) and name.value in _PIPELINE_ROW_API_NAMES:
+            # ``attr('get')`` / ``attr('to_dict')`` are reported as the uncalled method / the row API.
+            return False
+        # A filter's operand is None only inside a {% filter %} block, where no call can take it.
+        return callee.node is not None and _node_is_row_object_expression(
+            callee.node, namespaces, row_collection_aliases, row_container_aliases
+        )
+    if isinstance(callee, Getitem):
+        return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+    return False
 
 
 @trust_boundary(
@@ -473,8 +593,11 @@ def _record_dynamic_attribute_filter_access(
             return
         attr_arg = _filter_positional_or_keyword_value(node, 0, "name")
         if attr_arg is not None and isinstance(attr_arg, Const) and isinstance(attr_arg.value, str):
+            if attr_arg.value in TEMPLATE_ROW_METHODS:
+                _append_dynamic_access(dynamic_accesses, UNCALLED_GET_ACCESS)
+                return
             if _is_blocked_attr_filter_name(attr_arg.value):
-                _append_dynamic_access(dynamic_accesses, ATTR_FILTER_DYNAMIC_ACCESS)
+                _append_dynamic_access(dynamic_accesses, ROW_API_DYNAMIC_ACCESS)
                 return
             if _node_may_be_row_receiver(node.node, namespaces, row_collection_aliases, row_container_aliases):
                 fields.add(attr_arg.value)
@@ -2094,7 +2217,7 @@ def _is_blocked_attr_filter_name(value: str) -> bool:
 
 
 def _is_blocked_row_attribute_name(value: str) -> bool:
-    return value.startswith("_") or (value in _PIPELINE_ROW_API_NAMES and value != "get")
+    return value.startswith("_") or value in RETIRED_ROW_API_NAMES
 
 
 def extract_jinja2_fields_with_details(

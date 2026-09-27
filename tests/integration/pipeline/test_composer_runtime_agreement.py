@@ -8612,6 +8612,99 @@ class TestComposerRuntimeRagQueryTemplateAgreement:
         TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)
 
 
+class TestComposerRuntimeTemplateRowApiAgreement:
+    """Shape 34 — the one template row API (ADR-051 (c), elspeth-5887fb7928 G3): both surfaces refuse the row as an object.
+
+    A retired row-API name, a call on a row field and an uncalled ``row.get``
+    are refused under every declaration, ``[]`` included, for ``llm`` (its
+    ``row`` and a query's ``row.source_row``) and ``rag_retrieval``; a field
+    read and every whole-row filter are admitted by both. The composer side is
+    its mutation gate (``_prevalidate_transform``); the runtime side is plugin
+    instantiation from settings, as ``elspeth validate`` does.
+
+    Bug verification protocol: restoring the declaration-dependent early
+    return ahead of the row-API check (``LLMConfig._validate_template_row_access``
+    returning on ``[]`` first; ``RetrievalOutputConfig`` returning on
+    ``AllFields`` first) turns every ``[]`` refusal case red on BOTH sides.
+    """
+
+    _REFUSED = (
+        pytest.param("{{ row.to_dict() }}", "row.contract, row.to_dict", id="retired-name"),
+        pytest.param("{{ row.keys() | list }}", "a call on a row field", id="keys-call"),
+        pytest.param("{{ row['keys']() }}", "a call on a row field", id="item-call"),
+        pytest.param("{{ row.get }}", "row.get without a call", id="uncalled-get"),
+    )
+
+    @staticmethod
+    def _options(plugin: str, template: str, required_input_fields: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        if plugin == "llm":
+            common: dict[str, Any] = {
+                "provider": "openrouter",
+                "model": "openai/gpt-4.1-nano",
+                "prompt_template": template,
+                "required_input_fields": required_input_fields,
+                "schema": {"mode": "observed"},
+            }
+            return {**common, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**common, "api_key": "sk-test-key"}
+        if plugin == "llm-multi-query":
+            multi: dict[str, Any] = {
+                "provider": "openrouter",
+                "model": "openai/gpt-4.1-nano",
+                "prompt_template": "x",
+                "queries": {"q1": {"input_fields": {"text": "q"}, "template": template.replace("row", "row.source_row")}},
+                "required_input_fields": required_input_fields,
+                "schema": {"mode": "observed"},
+            }
+            return {**multi, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**multi, "api_key": "sk-test-key"}
+        rag = {
+            "query_field": "q",
+            "query_template": "{{ query }} " + template,
+            "required_input_fields": required_input_fields,
+            "output_prefix": "sci",
+            "provider": "chroma",
+            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
+            "schema": {"mode": "observed"},
+        }
+        return rag, rag
+
+    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "rag_retrieval"])
+    @pytest.mark.parametrize("required_input_fields", [pytest.param(["q", "n"], id="list"), pytest.param([], id="opt-out")])
+    @pytest.mark.parametrize(("template", "message"), _REFUSED)
+    def test_both_refuse_the_row_used_as_an_object(
+        self, tmp_path: Path, plugin: str, required_input_fields: list[str], template: str, message: str
+    ) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(plugin, template, required_input_fields)
+        registered = "llm" if plugin == "llm-multi-query" else plugin
+        composer = _prevalidate_transform(registered, composer_options)
+        assert composer is not None
+        assert "uses its row as an object" in composer, composer
+        assert message in composer, composer
+        assert "required_input_fields: []" not in composer
+        with pytest.raises(PluginConfigError, match=re.escape(message)):
+            TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, registered, runtime_options)
+
+    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "rag_retrieval"])
+    @pytest.mark.parametrize("required_input_fields", [pytest.param(["q", "n"], id="list"), pytest.param([], id="opt-out")])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{{ row.get('n', 'none') }} {{ row.q.upper() }}", id="get-and-a-value-method"),
+            pytest.param("{{ row | tojson }} {{ row | dictsort }} {{ row | list }} {{ dict(row) }} {{ row }}", id="whole-row-forms"),
+        ],
+    )
+    def test_both_admit_a_field_read_and_the_whole_row_forms(
+        self, tmp_path: Path, plugin: str, required_input_fields: list[str], template: str
+    ) -> None:
+        from elspeth.web.composer.tools._common import _prevalidate_transform
+
+        composer_options, runtime_options = self._options(plugin, template, required_input_fields)
+        registered = "llm" if plugin == "llm-multi-query" else plugin
+        assert _prevalidate_transform(registered, composer_options) is None
+        TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, registered, runtime_options)
+
+
 class TestComposerRuntimeCertainUnionTypeConflictAgreement:
     """Shape 33 — a certain union-merge type conflict over observed branches: both surfaces refuse.
 

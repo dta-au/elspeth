@@ -408,9 +408,7 @@ def test_a_declared_field_the_row_does_not_carry_is_an_ordinary_absent_key() -> 
         "{{ row.optional_x is defined }}|{{ row.optional_x | default('d') }}"
     )
     assert _outcome(source, row=row) == "False|False|D|True|False|d"
-    assert _outcome("{{ row.optional_x }}", row=row) == (
-        "TemplateError: Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute 'optional_x'"
-    )
+    assert _outcome("{{ row.optional_x }}", row=row) == ("TemplateError: Undefined variable: the row has no field 'optional_x'")
 
 
 @pytest.mark.parametrize(

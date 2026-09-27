@@ -853,10 +853,7 @@ class TestTemplateTierPolicy:
         assert result.status == "error"
         assert result.reason == {
             "reason": "template_rendering_failed",
-            "error": (
-                "Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute "
-                "<a key the template does not spell out>"
-            ),
+            "error": ("Undefined variable: the row has no field <a key the template does not spell out>"),
             "template_hash": transform._template.template_hash,
         }
         mock_provider.execute_query.assert_not_called()

@@ -453,9 +453,7 @@ def test_a_pipeline_row_lookup_is_rendered_value_free() -> None:
     from elspeth.testing import make_pipeline_row
 
     row = _whole(make_pipeline_row({"q": "x", "k": _SENTINEL}))
-    assert _render_error("{{ row[row.k] }}", row=row) == (
-        f"Undefined variable: 'elspeth.plugins.infrastructure.templates.TemplateRow object' has no attribute {_UNSPELLED}"
-    )
+    assert _render_error("{{ row[row.k] }}", row=row) == (f"Undefined variable: the row has no field {_UNSPELLED}")
 
 
 def test_withheld_error_detail_keeps_only_the_class() -> None:
@@ -802,7 +800,12 @@ def test_a_template_whose_failure_depends_on_the_row_is_built(source: str) -> No
 # / ``row.contract`` rendered framework objects into the prompt.
 # ---------------------------------------------------------------------------
 
-_ROW_TYPE = "elspeth.plugins.infrastructure.templates.TemplateRow object"
+# A template row is named "the row" in every reason, never by its internal class; a retired
+# row-API name in attribute form has one fixed reason that names the reserved set only.
+_RESERVED = (
+    "Reserved row name: the template reads a reserved row name (contract, to_checkpoint_format, to_dict) as an "
+    "attribute; a template row holds fields and one method, get; read a column of that name as row['<name>']"
+)
 
 
 def _owned_api_row() -> object:
@@ -820,40 +823,38 @@ def _owned_api_row() -> object:
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        pytest.param("{{ row.contract }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'", id="contract"),
+        pytest.param("{{ row.contract }}", _RESERVED, id="contract"),
         pytest.param(
             "{{ row.contract.from_checkpoint(row.blob) }}",
-            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'",
+            _RESERVED,
             id="contract-from-checkpoint-tier1",
         ),
         pytest.param(
             "{{ row.from_checkpoint(row.blob, row.contract) }}",
-            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'from_checkpoint'",
+            _RESERVED,
             id="row-from-checkpoint",
         ),
-        pytest.param("{{ row.to_dict() }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'to_dict'", id="to-dict"),
+        pytest.param("{{ row.to_dict() }}", _RESERVED, id="to-dict"),
         pytest.param(
             "{{ row.to_checkpoint_format() }}",
-            f"Undefined variable: '{_ROW_TYPE}' has no attribute 'to_checkpoint_format'",
+            _RESERVED,
             id="to-checkpoint-format",
         ),
-        pytest.param("{{ row.name_index() }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'name_index'", id="name-index"),
-        pytest.param("{{ row.keys() | list }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'keys'", id="keys-method"),
-        pytest.param("{{ row.items() | list }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'items'", id="items-method"),
-        pytest.param("{{ row['values'] }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'values'", id="item-no-method-fallback"),
-        pytest.param("{{ row | attr('contract') }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'", id="attr-filter"),
-        pytest.param("{{ row | attr('keys') }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute 'keys'", id="attr-filter-method"),
-        pytest.param("{{ row['__class__'] }}", f"Undefined variable: '{_ROW_TYPE}' has no attribute '__class__'", id="item-dunder"),
-        pytest.param(
-            "{{ row.__class__ }}", f"Sandbox violation: access to attribute '__class__' of {_ROW_TYPE} is unsafe", id="dunder-class"
-        ),
+        pytest.param("{{ row.name_index() }}", "Undefined variable: the row has no field 'name_index'", id="name-index"),
+        pytest.param("{{ row.keys() | list }}", "Undefined variable: the row has no field 'keys'", id="keys-method"),
+        pytest.param("{{ row.items() | list }}", "Undefined variable: the row has no field 'items'", id="items-method"),
+        pytest.param("{{ row['values'] }}", "Undefined variable: the row has no field 'values'", id="item-no-method-fallback"),
+        pytest.param("{{ row | attr('contract') }}", _RESERVED, id="attr-filter"),
+        pytest.param("{{ row | attr('keys') }}", "Undefined variable: the row has no field 'keys'", id="attr-filter-method"),
+        pytest.param("{{ row['__class__'] }}", "Undefined variable: the row has no field '__class__'", id="item-dunder"),
+        pytest.param("{{ row.__class__ }}", "Sandbox violation: access to attribute '__class__' of the row is unsafe", id="dunder-class"),
         pytest.param(
             "{{ row.__class__.__mro__ }}",
-            f"Sandbox violation: access to attribute '__class__' of {_ROW_TYPE} is unsafe",
+            "Sandbox violation: access to attribute '__class__' of the row is unsafe",
             id="dunder-mro",
         ),
-        pytest.param("{{ row._values }}", f"Sandbox violation: access to attribute '_values' of {_ROW_TYPE} is unsafe", id="private-slot"),
-        pytest.param("{{ row._data }}", f"Sandbox violation: access to attribute '_data' of {_ROW_TYPE} is unsafe", id="private-name"),
+        pytest.param("{{ row._values }}", "Sandbox violation: access to attribute '_values' of the row is unsafe", id="private-slot"),
+        pytest.param("{{ row._data }}", "Sandbox violation: access to attribute '_data' of the row is unsafe", id="private-name"),
     ],
 )
 def test_a_template_reaches_no_framework_api_on_the_row(source: str, expected: str) -> None:
@@ -868,19 +869,23 @@ def test_a_template_reaches_no_framework_api_on_the_row(source: str, expected: s
 def test_a_multi_query_source_row_reaches_no_framework_api() -> None:
     """A row nested in the context (multi-query ``row.source_row``) crosses as the same projection."""
     context_row = {"text": "hello", "source_row": _whole(_owned_api_row())}
-    assert _render_error("{{ row.source_row.contract.from_checkpoint(row.source_row.blob) }}", row=context_row) == (
-        f"Undefined variable: '{_ROW_TYPE}' has no attribute 'contract'"
-    )
+    assert _render_error("{{ row.source_row.contract.from_checkpoint(row.source_row.blob) }}", row=context_row) == (_RESERVED)
     assert create_sandboxed_environment().from_string("{{ row.source_row.q }}").render(row=context_row) == "hello"
 
 
 def test_a_field_named_like_a_method_reads_the_field() -> None:
-    """Dot, item and ``attr`` lookups resolve to fields: a column named ``keys`` is no longer shadowed by a method."""
+    """Dot, item and ``attr`` lookups resolve to fields: a column named ``keys`` is no longer shadowed by a method.
+
+    A retired row-API name is the exception in attribute form (``row.contract``
+    is refused, whatever the row carries); its column is read by item.
+    """
     row = _whole(make_pipeline_row({"keys": "K", "contract": "C", "items": "I", "to_dict": "D", "values": "V"}))
     template = create_sandboxed_environment().from_string(
-        "{{ row.keys }}|{{ row.contract }}|{{ row['items'] }}|{{ row.to_dict }}|{{ row | attr('values') }}"
+        "{{ row.keys }}|{{ row['contract'] }}|{{ row['items'] }}|{{ row['to_dict'] }}|{{ row | attr('values') }}|{{ row.items }}"
     )
-    assert template.render(row=row) == "K|C|I|D|V"
+    assert template.render(row=row) == "K|C|I|D|V|I"
+    for source in ("{{ row.contract }}", "{{ row.to_dict }}", "{{ row | attr('contract') }}"):
+        assert _render_error(source, row=row) == _RESERVED
 
 
 def test_the_template_row_keeps_every_documented_row_form() -> None:
@@ -912,9 +917,9 @@ def test_an_opted_out_whole_row_value_renders_field_values_never_framework_objec
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        pytest.param("{{ row[[1]] }}", f"Undefined variable: {_ROW_TYPE} has no element {_UNSPELLED}", id="unhashable-key"),
-        pytest.param("{{ row[{}] }}", f"Undefined variable: {_ROW_TYPE} has no element {_UNSPELLED}", id="unhashable-dict-key"),
-        pytest.param("{{ row[0] }}", f"Undefined variable: {_ROW_TYPE} has no element 0", id="int-key"),
+        pytest.param("{{ row[[1]] }}", f"Undefined variable: the row has no field {_UNSPELLED}", id="unhashable-key"),
+        pytest.param("{{ row[{}] }}", f"Undefined variable: the row has no field {_UNSPELLED}", id="unhashable-dict-key"),
+        pytest.param("{{ row[0] }}", "Undefined variable: the row has no field 0", id="int-key"),
     ],
 )
 def test_a_non_string_key_is_the_ordinary_undefined_field(source: str, expected: str) -> None:

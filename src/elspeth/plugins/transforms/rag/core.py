@@ -189,10 +189,14 @@ class RetrievalOutputConfig(TransformDataConfig):
 
         - a top-level name other than ``query``, ``row`` or a sandbox global
           is undefined on every row;
+        - under every declaration, ``[]`` included, the row used as an object
+          (a retired name such as ``row.to_dict``, a call on a row field such
+          as ``row.keys()``, an uncalled ``row.get``): a template row holds
+          fields and one method, ``get``, so these fail or garble every row;
         - under a declaration (a list, or omitted), a computed row key
-          (``row[k]``, ``row.get(k)``, ``row|attr(k)``), a reserved row-API
-          name or ``carrier-limit`` names no field the declaration could
-          cover; ``[]`` opts out of these checks;
+          (``row[k]``, ``row.get(k)``, ``row|attr(k)``) or ``carrier-limit``
+          names no field the declaration could cover; ``[]`` opts out of this
+          check;
         - a literal ``row.<field>`` read outside the declaration fails every
           row as an undeclared read; omitted, only ``query_field`` is declared;
         - the dual: fields declared beyond ``query_field`` while the template
@@ -200,7 +204,12 @@ class RetrievalOutputConfig(TransformDataConfig):
         """
         if self.query_template is None:
             return self
-        from elspeth.core.templates import describe_dynamic_row_access, extract_jinja2_field_usage, template_loads_name
+        from elspeth.core.templates import (
+            describe_dynamic_row_access,
+            describe_row_api_misuse,
+            extract_jinja2_field_usage,
+            template_loads_name,
+        )
         from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
 
         template = self.query_template
@@ -215,16 +224,19 @@ class RetrievalOutputConfig(TransformDataConfig):
                 "variable' on every row. Rewrite each name as '{{ query }}' or '{{ row.<field> }}', or remove it."
             )
 
+        usage = extract_jinja2_field_usage(template)
+        if usage.row_api_misuses:
+            raise ValueError(f"query_template {describe_row_api_misuse(usage.row_api_misuses)}")
+
         match self.query_template_row_projection():
             case AllFields():
                 return self
             case DeclaredFields(names=declared):
                 pass
 
-        usage = extract_jinja2_field_usage(template)
-        if usage.dynamic_accesses:
+        if usage.computed_key_accesses:
             raise ValueError(
-                f"query_template uses dynamic row field access ({describe_dynamic_row_access(usage.dynamic_accesses)}). "
+                f"query_template uses dynamic row field access ({describe_dynamic_row_access(usage.computed_key_accesses)}). "
                 "The template's row holds only the fields this node declares (options.required_input_fields and "
                 "query_field), and a computed key names no field a declaration could cover. Use static row.field or "
                 "row['field'] references, or set options.required_input_fields: [] to opt out: the template then "

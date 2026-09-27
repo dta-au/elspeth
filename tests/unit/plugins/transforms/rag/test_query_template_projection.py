@@ -157,8 +157,9 @@ def test_the_query_template_projection_is_the_declaration(required_input_fields:
         pytest.param(
             "{{ query }} {{ row.items() | list }}",
             ["question"],
-            "query_template reads 'items' under 'row'",
-            id="probe-rag-items-is-a-field-read",
+            "query_template uses its row as an object (a call on a row field, such as row.keys(), row.items(), "
+            "row['keys']() or row.name()). A template's row holds fields and one method, get",
+            id="probe-rag-items-is-a-field-call",
         ),
         pytest.param(
             "{{ query }} {{ row['Secret Header'] }}",
@@ -181,7 +182,7 @@ def test_the_query_template_projection_is_the_declaration(required_input_fields:
         pytest.param(
             "{{ query }} {{ row.to_dict() }}",
             ["question"],
-            "query_template uses dynamic row field access (row-api via row API).",
+            "query_template uses its row as an object (row.contract, row.to_dict, row.to_checkpoint_format or a name starting with '_').",
             id="reserved-row-api",
         ),
         pytest.param(

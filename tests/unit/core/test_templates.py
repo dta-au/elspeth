@@ -204,7 +204,8 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{{ (row | attr('get'))(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("attr",)
+        # attr('get') names the row's one method without calling it in place.
+        assert result.dynamic_accesses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_row_alias_derived_map_attribute_filter_reported_by_usage(self) -> None:
@@ -224,7 +225,8 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set r = row %}{{ (r | attr('get'))(r.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("attr",)
+        # attr('get') names the row's one method without calling it in place.
+        assert result.dynamic_accesses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_with_row_alias_derived_map_attribute_filter_reported_by_usage(self) -> None:
@@ -244,7 +246,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set g = row.get %}{{ g(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -262,7 +267,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset()
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_container_carried_row_get_alias_dynamic_key_reported_by_usage(self) -> None:
@@ -272,7 +280,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set ns = namespace(g=row.get) %}{{ ns.g(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -289,7 +300,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset()
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_namespace_assigned_row_alias_dynamic_get_reported_by_usage(self) -> None:
@@ -319,7 +333,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set xs = [row.get] %}{{ xs[0](row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_loop_target_from_row_get_alias_collection_reported_by_usage(self) -> None:
@@ -329,7 +346,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set xs = [row.get] %}{% for g in xs %}{{ g(row.selector) }}{% endfor %}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -356,7 +376,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -377,7 +400,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -401,7 +427,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields <= frozenset({"selector", "idx"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -1097,8 +1126,12 @@ class TestImplicitMacroArguments:
             ("{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0].secret }}{% endcall %}", {"secret"}, ()),
             # A tuple holding a row is a row collection, so every item may be the row: the key is computed.
             ("{% macro m() %}{{ varargs[0][varargs[1]] }}{% endmacro %}{{ m(row, row.note) }}", {"note"}, ("item",)),
-            ("{% macro m() %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(row.get) }}", set(), ("get",)),
-            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(*c) }}", set(), ("get",)),
+            ("{% macro m() %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(row.get) }}", set(), ("get", "get-uncalled")),
+            (
+                "{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(*c) }}",
+                set(),
+                ("get-uncalled", "get"),
+            ),
             ("{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}", set(), ()),
             ("{% macro m() %}{{ varargs[0] | upper }}{% endmacro %}{{ m(row.note) }}", {"note"}, ()),
         ],
@@ -1126,8 +1159,8 @@ class TestImplicitMacroArguments:
     @pytest.mark.parametrize(
         ("template", "expected"),
         [
-            ("{% set c = [row.get] %}{% macro m() %}{{ varargs[1]('x') }}{% endmacro %}{{ m(1, *c) }}", ("get",)),
-            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('x') }}{% endmacro %}{{ m(*c) }}", ("get",)),
+            ("{% set c = [row.get] %}{% macro m() %}{{ varargs[1]('x') }}{% endmacro %}{{ m(1, *c) }}", ("get-uncalled", "get")),
+            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('x') }}{% endmacro %}{{ m(*c) }}", ("get-uncalled", "get")),
             (
                 "{% set c = [row.contract] %}{% macro m() %}{{ caller(1, *c) }}{% endmacro %}{% call m() %}{{ varargs[1] }}{% endcall %}",
                 ("row-api",),
@@ -1176,14 +1209,14 @@ class TestAliasAnalysisTerminates:
         ("template", "expected"),
         [
             # A name bound to two different API carriers or kinds used to be rewritten back and forth forever.
-            ("{% set a = [row.get] %}{% set a = {'k': row.get} %}{{ a }}", ()),
-            ("{% macro m(a) %}{{ a }}{% endmacro %}{{ m([row.get]) }}{{ m({'k': row.get}) }}", ()),
-            ("{% macro m(a) %}{{ a[0]('x') }}{% endmacro %}{{ m([1, row.get]) }}{{ m([row.get]) }}", ("get",)),
+            ("{% set a = [row.get] %}{% set a = {'k': row.get} %}{{ a }}", ("get-uncalled",)),
+            ("{% macro m(a) %}{{ a }}{% endmacro %}{{ m([row.get]) }}{{ m({'k': row.get}) }}", ("get-uncalled",)),
+            ("{% macro m(a) %}{{ a[0]('x') }}{% endmacro %}{{ m([1, row.get]) }}{{ m([row.get]) }}", ("get", "get-uncalled")),
             ("{% macro m() %}{% endmacro %}{% set a = [m] %}{% set a = {'k': m} %}{{ a }}", ()),
             ("{% macro m() %}{% endmacro %}{% macro n() %}{% endmacro %}{% set a = [m] %}{% set a = [n] %}{{ a }}", ()),
-            ("{% set g = row.get %}{% set g = row.contract %}{{ g }}", ("row-api",)),
-            ("{% set ns = namespace() %}{% set ns.a = row.get %}{% set ns.a = row.contract %}{{ ns }}", ("row-api",)),
-            ("{% for g in [row.get] %}{% endfor %}{% for g in [row.contract] %}{% endfor %}{{ g }}", ("row-api",)),
+            ("{% set g = row.get %}{% set g = row.contract %}{{ g }}", ("get-uncalled", "row-api")),
+            ("{% set ns = namespace() %}{% set ns.a = row.get %}{% set ns.a = row.contract %}{{ ns }}", ("get-uncalled", "row-api")),
+            ("{% for g in [row.get] %}{% endfor %}{% for g in [row.contract] %}{% endfor %}{{ g }}", ("get-uncalled", "row-api")),
         ],
     )
     def test_a_name_bound_to_conflicting_values_joins_them(self, template: str, expected: tuple[str, ...]) -> None:
@@ -1205,7 +1238,8 @@ class TestAliasAnalysisTerminates:
     def test_a_carrier_that_holds_itself_reports_the_carrier_limit(self, template: str) -> None:
         result = _extract_within(template)
 
-        assert result.dynamic_accesses == ("carrier-limit",)
+        # The row.get case is also refused as a named, uncalled method.
+        assert result.computed_key_accesses == ("carrier-limit",)
 
     def test_the_field_only_helpers_terminate_on_a_self_holding_carrier(self) -> None:
         import threading

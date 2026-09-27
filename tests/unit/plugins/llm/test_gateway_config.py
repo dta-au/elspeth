@@ -45,7 +45,7 @@ def _make_gateway_config(**overrides: Any) -> GatewayConfig:
         "model": "gpt-5-mini",
         "endpoint": "https://gateway.example.com/v1",
         "api_key": "test-bearer-token",
-        "prompt_template": "{{ row }}",
+        "prompt_template": "Classify the input.",
         "schema": _OBSERVED_SCHEMA,
     }
     base.update(overrides)

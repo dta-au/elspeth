@@ -16,6 +16,7 @@ waits for one; a worker lost to a signal the row did not cause is retried.
 
 from __future__ import annotations
 
+import json
 import math
 import multiprocessing
 import os
@@ -26,8 +27,9 @@ import signal
 import sys
 import threading
 from atexit import register as register_exit
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from multiprocessing import resource_tracker
 from pathlib import Path
 from types import MappingProxyType
@@ -43,9 +45,10 @@ from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import PluginRetryableError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.templates import validate_jinja_source
+from elspeth.core.templates import RETIRED_ROW_API_NAMES, TEMPLATE_ROW_METHODS, validate_jinja_source
 
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow
@@ -208,6 +211,23 @@ class _UndeclaredFieldError(Exception):
         self.key = key
 
 
+class _RetiredRowNameError(Exception):
+    """A template read a retired row-API name (``row.to_dict``) in attribute form (raised in the render worker only).
+
+    It carries nothing: the name is one of ``RETIRED_ROW_API_NAMES``, but a
+    computed ``row | attr(k)`` could spell it from row data, so the reason
+    names the reserved set, never the name that was read.
+    """
+
+
+# The value-free text of a ``_RetiredRowNameError``.
+_RETIRED_ROW_NAME_TEXT = (
+    "the template reads a reserved row name ("
+    + ", ".join(sorted(RETIRED_ROW_API_NAMES))
+    + ") as an attribute; a template row holds fields and one method, get; read a column of that name as row['<name>']"
+)
+
+
 class TemplateRow(Mapping[str, Any]):
     """The ``row`` a template sees: the field values its node declares it reads, and nothing else.
 
@@ -222,9 +242,19 @@ class TemplateRow(Mapping[str, Any]):
     ``row.name``, ``row['name']`` and ``row['Original Name']`` read a declared
     field by either spelling (the resolution is ``PipelineRow.name_index``
     filtered to the declared fields). The sandbox resolves every attribute
-    and item lookup on this type to a field; the one callable it admits is
-    ``row.get(name)``. Iteration, ``in`` and ``length`` see the declared field
-    names the row carries.
+    and item lookup on this type to a field; the one method it admits is
+    ``row.get(name)`` (``TEMPLATE_ROW_METHODS``). A retired row-API name
+    (``RETIRED_ROW_API_NAMES``) in attribute form raises
+    ``_RetiredRowNameError`` whatever the declaration, so ``row.contract``
+    never reads a column (``row['contract']`` does). Iteration, ``in`` and
+    ``length`` see the declared field names the row carries.
+
+    Used as a value, the row is the mapping it holds: ``{{ row }}`` and every
+    string conversion render its field values as a plain mapping (a nested
+    value as its data, not ELSPETH's frozen carrier), ``tojson`` serializes it, and
+    ``last`` / ``reverse`` see the field names in order (``__reversed__``).
+    ``repr`` names the fields and never a value, because a repr can reach an
+    exception message.
 
     A lookup, ``in`` test or ``get`` of a name the node does not declare
     raises ``_UndeclaredFieldError``: a template can learn nothing about an
@@ -299,16 +329,47 @@ class TemplateRow(Mapping[str, Any]):
     def __len__(self) -> int:
         return len(self._values)
 
+    def __reversed__(self) -> Iterator[str]:
+        return reversed(list(self._values))
+
+    def __str__(self) -> str:
+        return str(_shown_value(self))
+
+    def __repr__(self) -> str:
+        return f"<TemplateRow: {', '.join(self._values)}>"
+
     def __getattr__(self, key: str) -> Any:
-        # jinja2's ``attr`` filter asks ``hasattr`` before it defers to the
-        # sandbox's getattr, so a field must answer here as ``row.name`` does.
-        # An undeclared name raises through ``hasattr`` on purpose.
+        # jinja2's ``attr`` filter asks ``hasattr`` for a name the class does
+        # not define before it defers to the sandbox's getattr, so a field
+        # must answer here as ``row.name`` does, and a retired row-API name
+        # must be refused here as ``row.contract`` is. An undeclared name
+        # raises through ``hasattr`` on purpose.
         if key.startswith("_"):
             raise AttributeError(key)
+        _refuse_retired_row_name(key)
         try:
             return self[key]
         except KeyError:
             raise AttributeError(key) from None
+
+
+def _refuse_retired_row_name(name: str) -> None:
+    """The one runtime guard for a retired row-API name in attribute form, under every projection (ADR-051)."""
+    if name in RETIRED_ROW_API_NAMES:
+        raise _RetiredRowNameError
+
+
+def _shown_value(value: object) -> object:
+    """What a template shows for a value it uses whole: a template row as the plain mapping of its field values.
+
+    ``{{ row }}``, ``pprint`` and ``urlencode`` render this. Row values are
+    held frozen (a nested object as a ``mappingproxy``, a list as a tuple),
+    and that carrier is ELSPETH's, not the row's: the prompt shows the data,
+    thawed. Any other value is shown as itself.
+    """
+    if type(value) is TemplateRow:
+        return deep_thaw(value._values)
+    return value
 
 
 def template_row_values(row: TemplateRow) -> Mapping[str, Any]:
@@ -319,12 +380,23 @@ def template_row_values(row: TemplateRow) -> Mapping[str, Any]:
 class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
     code_generator_class = _NoFoldCodeGenerator
 
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # A whole row used as a value is the mapping it holds (ADR-051):
+        # tojson serializes it (and a frozen nested value) as JSON, and the
+        # builtins that inspect their argument's type see the mapping.
+        self.policies["json.dumps_function"] = _template_json_dumps
+        for name in _MAPPING_TYPED_FILTERS:
+            self.filters[name] = _row_as_mapping(self.filters[name])
+
     def getattr(self, obj: Any, attribute: str) -> Any:
         if type(obj) is TemplateRow:
-            if attribute == "get":
+            if attribute in TEMPLATE_ROW_METHODS:
+                # TEMPLATE_ROW_METHODS is {"get"}: the row's one method.
                 return obj.get
             if attribute.startswith("_"):
                 return self.unsafe_undefined(obj, attribute)
+            _refuse_retired_row_name(attribute)
             return self._row_field(obj, attribute)
         return super().getattr(obj, attribute)
 
@@ -341,6 +413,34 @@ class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
         if key in row:
             return row[key]
         return self.undefined(obj=row, name=key)
+
+
+# Builtin filters that decide what to do by their argument's type rather than
+# by the Mapping protocol: ``urlencode`` encodes pairs only for an
+# ``isinstance(value, dict)``, and ``pprint`` formats a repr. Each sees a
+# template row as the mapping it holds (``_shown_value``), as every
+# other whole-row filter already does through iteration and lookup.
+_MAPPING_TYPED_FILTERS: tuple[str, ...] = ("pprint", "urlencode")
+
+
+def _row_as_mapping(filter_function: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(filter_function)
+    def row_as_mapping(value: Any, *args: Any, **kwargs: Any) -> Any:
+        return filter_function(_shown_value(value), *args, **kwargs)
+
+    return row_as_mapping
+
+
+def _template_json_default(value: object) -> object:
+    if type(value) is TemplateRow or type(value) is MappingProxyType:
+        return dict(value)
+    # json's own message for this names only the type: nothing of the value.
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _template_json_dumps(value: Any, **kwargs: Any) -> str:
+    """``tojson``'s dumps: a template row and a frozen mapping value serialize as the JSON objects they hold."""
+    return json.dumps(value, default=_template_json_default, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -368,7 +468,7 @@ def _pack_context_value(
     projection left out. An unprojected ``PipelineRow`` or a contract object
     anywhere in a template context is a caller bug.
     """
-    from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw
+    from elspeth.contracts.freeze import FrozenJsonArray
     from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 
     if depth > 64:
@@ -603,6 +703,8 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
         return "undefined_contract", str(exc)[:1024]
     except _UndeclaredFieldError as exc:
         return "undeclared_field", _undeclared_field_text(exc.key, source)
+    except _RetiredRowNameError:
+        return "retired_row_name", _RETIRED_ROW_NAME_TEXT
     except contract_errors.TIER_1_ERRORS as exc:
         return "render_tier1", type(exc).__name__
     except (
@@ -780,6 +882,9 @@ def _run_template_worker(source: str, payload: bytes, *, value_free: bool = Fals
         if status == "undeclared_field":
             # The worker built this text from the template's own literals.
             raise TemplateError(f"Undeclared field: {value}")
+        if status == "retired_row_name":
+            # A fixed text: it names the reserved set, never the name read.
+            raise TemplateError(f"Reserved row name: {value}")
         if value_free:
             if status == "safe_undefined":
                 raise TemplateError(f"Undefined variable: {value}")
@@ -1211,10 +1316,14 @@ def _value_free_undefined(literals: frozenset[str | int]) -> type[StrictUndefine
                 key = repr(name)
             else:
                 key = _UNSPELLED_KEY
+            # A template row is named as "the row", never by its internal class.
             if self._undefined_exception is _ValueFreeUnsafeAccessError:
-                return f"access to attribute {key} of {object_type_repr(self._undefined_obj)} is unsafe"
+                owner = "the row" if type(self._undefined_obj) is TemplateRow else object_type_repr(self._undefined_obj)
+                return f"access to attribute {key} of {owner} is unsafe"
             if self._undefined_obj is missing:
                 return "a value is undefined" if name is None else f"{key} is undefined"
+            if type(self._undefined_obj) is TemplateRow:
+                return f"the row has no field {key}"
             if type(name) is str:
                 return f"{object_type_repr(self._undefined_obj)!r} has no attribute {key}"
             return f"{object_type_repr(self._undefined_obj)} has no element {key}"

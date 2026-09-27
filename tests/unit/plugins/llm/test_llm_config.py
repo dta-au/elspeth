@@ -306,8 +306,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row|attr(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_row_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A local alias for row cannot hide map(attribute=alias.field)."""
@@ -336,8 +336,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row|attr(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_with_row_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A with-block alias for row cannot hide map(attribute=alias.field)."""
@@ -366,8 +366,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -388,8 +388,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_container_carried_row_get_alias_dynamic_key_rejected_even_with_declared_selector(self) -> None:
         """Carrier-held row.get with row-derived keys remains dynamic."""
@@ -403,8 +403,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -424,8 +424,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_namespace_assigned_row_alias_dynamic_get_rejected_even_with_declared_selector(self) -> None:
         """Namespace attribute assignment can carry row itself."""
@@ -443,13 +443,14 @@ class TestLLMConfigBase:
         assert "row.get(expr)" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{% set d = {'inner': {'r': row}} %}{{ d['inner']['r'].get(row.selector) }}",
-            "{% set xs = [row.get] %}{{ xs[0](row.selector) }}",
+            ("{% set d = {'inner': {'r': row}} %}{{ d['inner']['r'].get(row.selector) }}", "dynamic row field access"),
+            # Naming row.get without a call is refused under every declaration.
+            ("{% set xs = [row.get] %}{{ xs[0](row.selector) }}", "uses its row as an object"),
         ),
     )
-    def test_nested_or_list_carried_row_access_rejected_even_with_declared_selector(self, template: str) -> None:
+    def test_nested_or_list_carried_row_access_rejected_even_with_declared_selector(self, template: str, refusal: str) -> None:
         """Nested row-object and list API carriers cannot hide row.get."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -461,8 +462,7 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert refusal in message
 
     def test_loop_target_from_row_get_alias_collection_rejected_even_with_declared_selector(self) -> None:
         """Loop targets over row.get collections inherit API alias guards."""
@@ -476,8 +476,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -508,8 +508,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -534,8 +534,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -575,8 +575,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -612,8 +612,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -634,8 +634,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_scalar_row_value_collection_alias_allowed_when_declared(self) -> None:
         """A list of declared row values is not a list of row objects."""
@@ -672,8 +672,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize("template", ("{{ row._data }}", "{{ row.__class__ }}", "{{ row.contract }}"))
     def test_pipeline_row_private_or_api_attr_rejected(self, template: str) -> None:
@@ -687,8 +687,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_scalar_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A row-derived scalar alias cannot choose map(attribute=...)."""
@@ -716,8 +716,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_row_arg_to_dict_rejected(self) -> None:
         """A macro parameter called with row cannot expose the full row."""
@@ -730,8 +730,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_row_arg_map_attribute_rejected_even_with_declared_selector(self) -> None:
         """A macro parameter called with row cannot hide map(attribute=alias.field)."""
@@ -760,8 +760,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_expression_dynamic_get_rejected_even_with_declared_selector(self) -> None:
         """A row-valued expression cannot hide row.get(expr)."""
@@ -798,8 +798,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_for_loop_row_collection_alias_rejected(self) -> None:
         """A collection alias containing row cannot hide a row loop target."""
@@ -812,8 +812,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_default_row_arg_rejected(self) -> None:
         """A macro default bound to row cannot hide full-row access."""
@@ -826,8 +826,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_alias_row_arg_rejected(self) -> None:
         """Calling a macro through an alias cannot hide full-row access."""
@@ -840,8 +840,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_callblock_caller_row_arg_rejected(self) -> None:
         """A caller parameter passed row by a macro cannot hide full-row access."""
@@ -854,8 +854,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -887,8 +887,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_carried_callblock_macro_alias_rejected(self) -> None:
         """Callblock macros invoked through carriers cannot hide full-row access."""
@@ -904,8 +904,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_to_checkpoint_format_rejected_without_required_input_fields(self) -> None:
         """row.to_checkpoint_format() exposes serialized row data and must fail closed."""
@@ -918,18 +918,18 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{% set xs = [row] %}{{ xs[0].get(row.selector) }}",
-            "{{ [row][0].to_dict() }}",
-            "{{ [row][0]._data }}",
+            ("{% set xs = [row] %}{{ xs[0].get(row.selector) }}", "dynamic row field access"),
+            ("{{ [row][0].to_dict() }}", "uses its row as an object"),
+            ("{{ [row][0]._data }}", "uses its row as an object"),
         ),
     )
-    def test_indexed_row_collection_receiver_rejected(self, template: str) -> None:
+    def test_indexed_row_collection_receiver_rejected(self, template: str, refusal: str) -> None:
         """Indexing a known row collection cannot hide row API or dynamic access."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -940,7 +940,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert refusal in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",
@@ -1011,8 +1011,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -1033,18 +1033,18 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{{ (row if true else row).to_dict() }}",
-            "{{ (row or {}).get(row.selector) }}",
-            "{{ (row|default({})).to_dict() }}",
+            ("{{ (row if true else row).to_dict() }}", "uses its row as an object"),
+            ("{{ (row or {}).get(row.selector) }}", "dynamic row field access"),
+            ("{{ (row|default({})).to_dict() }}", "uses its row as an object"),
         ),
     )
-    def test_generic_row_expression_receiver_rejected(self, template: str) -> None:
+    def test_generic_row_expression_receiver_rejected(self, template: str, refusal: str) -> None:
         """Generic expressions that may yield row cannot hide row API access."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -1055,7 +1055,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert refusal in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",
@@ -1119,8 +1119,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -1141,7 +1141,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert "uses its row as an object" in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",

@@ -104,6 +104,12 @@ class OutputFieldConfig(PluginConfig):
             return {"type": self.type.value}
 
 
+# Names a query's ``row`` (a plain ``dict`` of its variables plus ``source_row``)
+# never resolves to a variable: its own ``source_row`` entry, and every public
+# attribute of ``dict``, which ``row.<name>`` finds before the key.
+_QUERY_CONTEXT_RESERVED_NAMES: frozenset[str] = frozenset({"source_row"} | {name for name in dir(dict) if not name.startswith("_")})
+
+
 class QueryDefinition(BaseModel):
     """Typed authoring model for a single multi-query LLM query.
 
@@ -151,6 +157,30 @@ class QueryDefinition(BaseModel):
         default=None,
         description="Per-query Jinja2 template override (None = use the config-level prompt_template).",
     )
+
+    @field_validator("input_fields")
+    @classmethod
+    def validate_input_field_variables(cls, v: dict[str, str]) -> dict[str, str]:
+        """Refuse a variable name the query's ``row`` cannot read as that variable.
+
+        A query renders with ``row`` bound to a plain mapping of its variables
+        plus ``source_row`` (``build_template_context``). ``source_row`` is that
+        mapping's own entry, so a variable of that name is overwritten; and
+        attribute syntax on a mapping finds the mapping's method before its
+        key, so ``row.items`` for a variable named ``items`` renders the bound
+        method (with a memory address) on every row. Both are fixed by the
+        name alone, so configuration refuses them.
+        """
+        shadowed = sorted(name for name in v if name in _QUERY_CONTEXT_RESERVED_NAMES)
+        if shadowed:
+            names = ", ".join(f"'{name}'" for name in shadowed)
+            raise ValueError(
+                f"input_fields variable {names} cannot be read as that variable: a query's row is a mapping of its "
+                "input_fields variables plus 'source_row', so 'source_row' is taken and row.<name> for a mapping "
+                "method name (keys, items, values, get, ...) renders the method, not the value. Rename the variable, "
+                "e.g. 'items_text'."
+            )
+        return v
 
     @field_validator("template")
     @classmethod

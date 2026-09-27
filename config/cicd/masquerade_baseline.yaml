@@ -291,14 +291,16 @@ entries:
   kind: dunder_getattr
   occurrences: 1
   probe_shapes:
-  - 18f05cd7c3b5364768aabdbcfd3e001bc0844b6fc9903a3b0214129b790c0655
+  - a2ca33d213b691366a87579fea74274efaa02800a086de357a7f9ff2e3a3e9d0
   classification: data-container-api
-  justification: The template sandbox's field-only row (elspeth-5887fb7928 S0). Dot-access
-    over row DATA delegating to self[key] (a Subscript over its own name index, not
-    attribute forwarding to a foreign object), with a `_`-prefix guard; the same shape
-    as PipelineRow.__getattr__. It exists because jinja2's `attr` filter asks hasattr
-    before deferring to the sandbox, which resolves every lookup on this type to a
-    field.
+  justification: The template sandbox's field-only row (elspeth-5887fb7928 S0, G3).
+    Dot-access over row DATA delegating to self[key] (a Subscript over its own name
+    index, not attribute forwarding to a foreign object), with a `_`-prefix guard
+    and the one runtime guard for a retired row-API name (_refuse_retired_row_name,
+    a membership test against the owned RETIRED_ROW_API_NAMES constant); the same
+    shape as PipelineRow.__getattr__. It exists because jinja2's `attr` filter asks
+    hasattr before deferring to the sandbox, which resolves every lookup on this type
+    to a field.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr

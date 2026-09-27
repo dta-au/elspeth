@@ -604,34 +604,53 @@ class LLMConfig(TransformDataConfig):
         return tuple(templates)
 
     @model_validator(mode="after")
-    def _validate_dynamic_row_access_requires_explicit_opt_out(self) -> LLMConfig:
-        """Fail closed when row fields are accessed through parse-time dynamic keys."""
-        if self.required_input_fields == []:
-            return self
+    def _validate_template_row_access(self) -> LLMConfig:
+        """Refuse row reads configuration can prove fail, under every declaration first.
 
-        from elspeth.core.templates import describe_dynamic_row_access, extract_jinja2_field_usage
+        Two refusals, in this order (after-validators run in definition order,
+        so both keep primacy over the declaration checks below and the planner
+        never receives "declare `keys`" for ``row.keys()``):
 
-        dynamic_accesses: list[str] = []
+        - the row used as an object (``describe_row_api_misuse``): a retired
+          name (``row.contract``, ``row.to_dict``), a call on a row field
+          (``row.keys()``, ``row['keys']()``) or an uncalled ``row.get``. A
+          template row holds fields and one method, ``get``, under every
+          declaration, so these fail or garble every row whatever the row
+          holds, and ``[]`` does not admit them;
+        - a computed key (``row[k]``, ``row.get(k)``, ``row | attr(k)``) names
+          no field a declaration could cover. ``[]`` opts out of this one:
+          the template then sees the whole row, where any key can resolve.
+
+        A multi-query template is checked through both its ``row`` (the query
+        context) and ``row.source_row`` (the row).
+        """
+        from elspeth.core.templates import describe_dynamic_row_access, describe_row_api_misuse, extract_jinja2_field_usage
+
+        misuses: list[str] = []
+        computed_keys: list[str] = []
         for label, template in self._field_extraction_templates():
             try:
-                extraction = extract_jinja2_field_usage(template)
+                extractions = [extract_jinja2_field_usage(template)]
             except TemplateSyntaxError as e:
                 # An unparseable template cannot be proven free of dynamic row
                 # access, so it must fail here — as the structured TemplateError
                 # the constructor advertises, not a raw jinja2 exception.
                 raise TemplateError(f"Invalid template syntax in {label}: {e}") from e
-            dynamic_accesses.extend(extraction.dynamic_accesses)
             if self.queries is not None:
-                # A query renders with the row at row.source_row; a computed key or
-                # row API through it is refused the same way as through row.
-                dynamic_accesses.extend(extract_jinja2_field_usage(template, row_attribute="source_row").dynamic_accesses)
+                # A query renders with the row at row.source_row; the same reads
+                # through it are refused the same way as through row.
+                extractions.append(extract_jinja2_field_usage(template, row_attribute="source_row"))
+            for extraction in extractions:
+                misuses.extend(extraction.row_api_misuses)
+                computed_keys.extend(extraction.computed_key_accesses)
 
-        if not dynamic_accesses:
+        if misuses:
+            raise ValueError(f"LLM prompt_template {describe_row_api_misuse(misuses)}")
+        if not computed_keys or self.required_input_fields == []:
             return self
-
         raise ValueError(
             "LLM prompt_template uses dynamic row field access "
-            f"({describe_dynamic_row_access(dynamic_accesses)}). "
+            f"({describe_dynamic_row_access(computed_keys)}). "
             "Dynamic row keys cannot be audited against options.required_input_fields. "
             "Use static row.field or row['field'] references, or set "
             "options.required_input_fields: [] to explicitly opt out and accept runtime risk."
@@ -665,7 +684,7 @@ class LLMConfig(TransformDataConfig):
         fields_not_declared = self.required_input_fields is None
 
         if fields_not_declared:
-            from elspeth.core.templates import extract_jinja2_fields
+            from elspeth.core.templates import extract_jinja2_fields, template_loads_name
 
             if self.queries is not None:
                 # Multi-query mode: the row columns each query reads — its
@@ -680,6 +699,16 @@ class LLMConfig(TransformDataConfig):
             else:
                 # Single-query mode: detect row references in the template
                 extracted = set(extract_jinja2_fields(self.effective_template()))
+                if not extracted and template_loads_name(self.effective_template(), "row"):
+                    # A whole-row form (``row | dictsort``, ``dict(row)``,
+                    # ``{{ row }}``) names no field. Omitted declares none,
+                    # so the row it shows is empty on every row (ADR-051).
+                    raise ValueError(
+                        "LLM prompt_template uses 'row' as a whole, but options.required_input_fields is not "
+                        "declared, so the template's row holds no field and it renders empty on every row. "
+                        "Declare the fields the template shows in options.required_input_fields, or set "
+                        "options.required_input_fields: [] for the whole row."
+                    )
 
             if extracted:
                 required_fields = sorted(extracted)
