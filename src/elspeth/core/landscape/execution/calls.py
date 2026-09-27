@@ -28,6 +28,7 @@ from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -1287,7 +1288,7 @@ class CallAuditRepository:
         except (PayloadIntegrityError, OSError) as exc:
             raise AuditIntegrityError(f"Call request payload retrieval failed for call_id={call_id}") from exc
         try:
-            decoded = json.loads(payload_bytes.decode("utf-8"), parse_constant=_reject_non_finite_json_constant)
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             raise AuditIntegrityError(f"Corrupt call request payload for call_id={call_id}") from exc
         if type(decoded) is not dict:
@@ -1348,7 +1349,7 @@ class CallAuditRepository:
 
         # Everything below is Tier 1: our data, crash on anomaly
         try:
-            decoded = json.loads(payload_bytes.decode("utf-8"), parse_constant=_reject_non_finite_json_constant)
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as e:
             raise AuditIntegrityError(f"Corrupt call response payload for call_id={call_id} (ref={row.response_ref}): {e}") from e
         if type(decoded) is not dict:

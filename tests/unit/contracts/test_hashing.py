@@ -1,11 +1,12 @@
 """Tests for contracts/hashing.py — NaN/Infinity rejection and primitives."""
 
+import json
 from datetime import UTC, datetime
 
 import pytest
 
 from elspeth.contracts import hashing as contracts_hashing
-from elspeth.contracts.hashing import CANONICAL_VERSION, canonical_json, repr_hash, stable_hash
+from elspeth.contracts.hashing import CANONICAL_VERSION, canonical_json, canonical_json_loads, repr_hash, stable_hash
 from elspeth.core import canonical as core_canonical
 from elspeth.core.canonical import CANONICAL_VERSION as CORE_VERSION
 
@@ -349,3 +350,61 @@ class TestFrozenRoundTripContracts:
         original: dict[str, dict[str, object] | list[object]] = {"empty_dict": {}, "empty_list": []}
         frozen = deep_freeze(original)
         assert canonical_json(original) == canonical_json(frozen)
+
+
+class TestCanonicalJsonLoadsIsTheEncodersInverse:
+    """``canonical_json_loads`` reads canonical text back to the value encoded (review-codexfix-handoffs-r1 F1).
+
+    RFC 8785 prints an integral double in [2**53, 1e21) in integer notation, so
+    a plain ``json.loads`` reads it back as an int the encoder refuses: the
+    sink-effect round trip of a valid row carrying such a float ended the run.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            1e17,
+            -1e17,
+            1.2345678901234568e17,  # shortest form padded with zeros: 123456789012345680
+            float(2**53),
+            float(2**53 + 2),
+            float(2**60),  # printed 1152921504606847000, which as an int is NOT this double's value
+            9.99e20,
+            1e21,  # the first double RFC 8785 prints in exponent form
+            6.022e23,
+            1.5,
+        ],
+    )
+    def test_a_double_comes_back_as_the_same_double(self, value: float) -> None:
+        text = canonical_json({"x": value, "nested": [value, {"y": value}]})
+        restored = canonical_json_loads(text)
+        assert restored == {"x": value, "nested": [value, {"y": value}]}
+        assert type(restored["x"]) is float
+        assert type(restored["nested"][0]) is float
+        assert type(restored["nested"][1]["y"]) is float
+        # The restored value re-encodes to the same text: the round trip is stable.
+        assert canonical_json(restored) == text
+
+    def test_plain_json_loads_is_not_an_inverse(self) -> None:
+        # Positive control for the defect the loader exists to close.
+        text = canonical_json({"x": 1e17})
+        assert text == '{"x":100000000000000000}'
+        with pytest.raises(ValueError):
+            canonical_json(json.loads(text))
+        assert canonical_json(canonical_json_loads(text)) == text
+
+    @pytest.mark.parametrize("value", [0, 5, -7, 2**53 - 1, -(2**53 - 1)])
+    def test_an_integer_inside_the_safe_range_stays_an_int(self, value: int) -> None:
+        restored = canonical_json_loads(canonical_json({"x": value}))
+        assert restored == {"x": value}
+        assert type(restored["x"]) is int
+
+    def test_an_integral_double_inside_the_safe_range_reads_as_int(self) -> None:
+        # The encoder writes 5 and 5.0 identically; int is the established reading.
+        assert canonical_json(5.0) == canonical_json(5)
+        assert type(canonical_json_loads(canonical_json(5.0))) is int
+
+    @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_constant_is_a_decode_error(self, constant: str) -> None:
+        with pytest.raises(json.JSONDecodeError, match="non-finite JSON constant"):
+            canonical_json_loads('{"x": ' + constant + "}")

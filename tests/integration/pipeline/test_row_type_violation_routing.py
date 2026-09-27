@@ -1629,6 +1629,101 @@ payload_store:
     assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == [("validation_errors", "row_data_json")]
 
 
+@pytest.mark.parametrize(
+    ("schema", "on_validation_failure", "neighbour_big", "expected_status", "delivered_ids", "quarantined"),
+    [
+        # A valid row carrying an integral double in [2**53, 1e21) is delivered
+        # (the observed contract infers `big: float` from the first row).
+        ("mode: observed", "discard", "1.5", RunStatus.COMPLETED, [1, 2, 3], []),
+        # Under `big: int` the double becomes an int beyond ±(2**53-1): the row is
+        # quarantined, and its raw row (still the double) reaches the quarantine sink.
+        ('mode: fixed\n        fields: ["id: int", "big: int"]', "quarantine", "1", RunStatus.COMPLETED_WITH_FAILURES, [1, 3], [2]),
+    ],
+    ids=["valid-observed-double", "exponent-form-under-int-quarantined"],
+)
+def test_a_row_carrying_an_integral_double_beyond_2_53_reaches_a_terminal_outcome(
+    tmp_path: Any,
+    schema: str,
+    on_validation_failure: str,
+    neighbour_big: str,
+    expected_status: RunStatus,
+    delivered_ids: list[int],
+    quarantined: list[int],
+) -> None:
+    """review-codexfix-handoffs-r1 F1: the sink-effect round trip reads canonical text back as the double.
+
+    RFC 8785 writes an integral double below 1e21 in integer notation
+    (1e17 -> 100000000000000000). The sink boundary normalized each row with
+    ``json.loads(canonical_json(row))``, which read that literal back as an int
+    beyond ±(2**53-1); the member freeze refused it and the run ended with the
+    row's token (valid or quarantined) left without an outcome. The canonical
+    reader returns the double, so the row is written and every token is terminal.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    lines = ['{"id": 1, "big": ' + neighbour_big + "}", '{"id": 2, "big": 1e17}', '{"id": 3, "big": ' + neighbour_big + "}"]
+    (tmp_path / "input.jsonl").write_text("\n".join(lines) + "\n")
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        {schema}
+      on_validation_failure: {on_validation_failure}
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    if not quarantined:
+        # A sink no route reaches fails graph validation.
+        settings = settings.replace(settings[settings.index("  quarantine:\n") : settings.index("landscape:")], "")
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(expected_status)[1], cli.output
+    assert "Traceback" not in cli.output
+    delivered = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert [row["id"] for row in delivered] == delivered_ids
+    for row in delivered:
+        if row["id"] == 2:
+            assert row["big"] == 1e17
+            assert type(row["big"]) is float
+    if quarantined:
+        rows = [json.loads(line) for line in (tmp_path / "quarantine.jsonl").read_text().splitlines()]
+        assert rows == [{"id": 2, "big": 1e17}]
+        assert type(rows[0]["big"]) is float
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        completed = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars().all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    assert len(tokens) == 3
+    assert sorted(completed) == sorted(tokens)
+
+
 def test_a_source_that_skips_its_schema_ends_the_run_at_ingest_naming_the_source_row(tmp_path: Any) -> None:
     """The backstop: a VALID source row the ingest hash refuses is the source's contract breach.
 

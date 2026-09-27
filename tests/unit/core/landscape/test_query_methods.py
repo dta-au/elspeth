@@ -2419,6 +2419,19 @@ class TestGetRowDataErrorHandling:
             payload_store=payload_store,
         )
 
+    def test_an_integral_double_beyond_2_53_is_read_back_as_that_double(self):
+        # Row payloads are canonical JSON, where RFC 8785 writes 1e17 as
+        # 100000000000000000; source replay re-hashes this data, and an int
+        # beyond ±(2**53-1) cannot be hashed (review-codexfix-handoffs-r1 F1).
+        payload_store = _PayloadStoreStub(retrieve_result=b'{"x":100000000000000000}')
+        repo = self._make_repo_with_row(payload_store)
+
+        result = repo.get_row_data("row-1")
+
+        assert result.data == {"x": 1e17}
+        assert result.data is not None
+        assert type(result.data["x"]) is float
+
     def test_json_decode_error_raises_audit_integrity(self):
         payload_store = _PayloadStoreStub(retrieve_result=b"not-json{{")
         repo = self._make_repo_with_row(payload_store)
