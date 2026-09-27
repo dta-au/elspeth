@@ -78,6 +78,11 @@ class NonConformingTransform:
         self.declared_output_fields: frozenset[str] = frozenset()
         self.declared_input_fields: frozenset[str] = frozenset()
         self.declared_string_input_fields: frozenset[str] = frozenset()
+        # The field-name spelling rule's declaration surface (1f40c567d): the
+        # transform executor reads both on every row, so they belong to the
+        # surface this fake models. Empty: the fake declares no field names.
+        self.declared_read_fields: frozenset[str] = frozenset()
+        self.declared_created_fields: frozenset[str] = frozenset()
         self.requires_runtime_preflight = False
         self._output_schema_config = None
         self.on_error = on_error
