@@ -310,6 +310,20 @@ class TestTransformRenames:
             HeaderSpelling(literal="Name", canonical="c", kind="read", leg="carried"),
         )
 
+    def test_a_rename_keeps_the_headerless_flag_for_the_next_rename(self) -> None:
+        # hl-create-2ren (review-C1C3-residuals-r1 F1): columns [id, Name], {id: i}, then
+        # {Name: c}. The first rename must carry "this upstream does not normalize names"
+        # to the second; were it to claim normalization, the second rename would move
+        # the normalized 'name' onto c and creating 'name' would be falsely refused.
+        once = self._HEADERLESS.then_renamed({"id": "i"})
+        assert once.normalizes_names is False
+        assert self._HEADERED.then_renamed({"id": "i"}).normalizes_names is True
+        twice = once.then_renamed({"Name": "c"})
+        assert header_spelled_names(["name"], {"c"}, twice, kind="create") == ()
+        assert header_spelled_names(["Name"], {"c"}, twice, kind="read") == (
+            HeaderSpelling(literal="Name", canonical="c", kind="read", leg="carried"),
+        )
+
     def test_behind_a_headerless_source_a_renamed_fixed_point_column_still_moves(self) -> None:
         # columns [name], {name: c}: c records 'name' as its original, so re-creating
         # 'name' would sit beside c under a second key. The literal is the only thing
