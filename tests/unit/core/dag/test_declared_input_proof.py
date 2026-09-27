@@ -26,6 +26,7 @@ import pytest
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.types import CoalesceName
 from elspeth.core.dag import schema_validation
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote
@@ -245,6 +246,28 @@ sinks:
 """
 
 
+_COALESCE_YAML = _ROW_UNION_YAML.replace(
+    """row_unions:
+  - name: variant_union
+    branches:
+      ctl: ctl_out
+      trt: trt_out
+    on_success: union_out
+""",
+    """coalesce:
+  - name: variant_union
+    branches:
+      ctl: ctl_out
+      trt: trt_out
+    policy: {policy}
+    merge: union
+    {timeout}
+""",
+).replace("input: union_out", "input: variant_union")  # a coalesce with no on_success produces its own name
+assert "row_unions" not in _COALESCE_YAML
+assert "input: variant_union" in _COALESCE_YAML
+
+
 class TestPublishedOnTheFinalGraph:
     """The builder publishes the proof after the rule-9 DIVERT edges (architect A3/T6)."""
 
@@ -261,6 +284,42 @@ class TestPublishedOnTheFinalGraph:
     def test_a_rule9_error_edge_into_the_closer_unproves_what_follows_it(self, tmp_path: Path) -> None:
         """The DIVERT edge into the row_union (rule 9) exists only on the FINAL graph; the proof must see it."""
         assert self._proof_of_after_union(tmp_path, "variant_union") == frozenset()
+
+    @pytest.mark.parametrize(
+        ("policy", "timeout"),
+        [pytest.param("require_all", "", id="require_all"), pytest.param("best_effort", "timeout_seconds: 5", id="best_effort")],
+    )
+    def test_a_rule9_error_edge_into_a_coalesce_keeps_the_proof_under_either_policy(
+        self, tmp_path: Path, policy: str, timeout: str
+    ) -> None:
+        """T6 for a coalesce closer, on the FINAL graph (the rule-9 DIVERT edge is present).
+
+        Under rule 9 the DIVERT edge into a closer is a structural audit marker:
+        the failing token terminalizes at the transform exactly as a branch
+        loss and never reaches the closer (engine/token_traversal.py). The
+        coalesce guarantee the builder computes (union for require_all,
+        intersection otherwise) already accounts for lost branches, so the
+        successor's proof is the same with and without the error edge, under
+        both policies. The row_union vote above instead abstains on any DIVERT
+        in-edge — conservative (it under-proves; recorded as a vote-precision
+        residual for the lane), and pinned so a change to it is judged.
+        """
+        proofs: dict[str, frozenset[str]] = {}
+        for ctl_on_error in ("discard", "variant_union"):
+            case_dir = tmp_path / ctl_on_error
+            case_dir.mkdir()
+            input_path = case_dir / "in.csv"
+            input_path.write_text("a,b\n1,2\n")
+            yaml_text = _COALESCE_YAML.format(
+                input_path=input_path, output_path=case_dir / "out.jsonl", ctl_on_error=ctl_on_error, policy=policy, timeout=timeout
+            )
+            graph = _build(yaml_text)
+            closer = graph.get_coalesce_id_map()[CoalesceName("variant_union")]
+            divert_in = [edge for edge in graph.get_incoming_edges(closer) if edge.mode == RoutingMode.DIVERT]
+            assert len(divert_in) == (1 if ctl_on_error == "variant_union" else 0)
+            proofs[ctl_on_error] = graph.get_declared_input_proof()[graph.get_transform_name_id_map()["after_union"]]
+
+        assert proofs == {"discard": frozenset({"b"}), "variant_union": frozenset({"b"})}
 
     def test_the_published_proof_is_frozen_with_the_build_metadata(self, tmp_path: Path) -> None:
         input_path = tmp_path / "in.csv"
