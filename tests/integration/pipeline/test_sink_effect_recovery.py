@@ -227,7 +227,6 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
         pending_outcome = PendingOutcome(
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
-            scheduler_pending_sink=True,
         )
         pending_tokens = {"output": [(token, pending_outcome)]}
         lost_terminalizer = _LostSchedulerTerminalizer()

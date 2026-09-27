@@ -10,7 +10,7 @@ _execute_run() and _process_resumed_rows(). These tests verify that:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pytest
@@ -47,7 +47,8 @@ class _FakeRowResult:
     token: TokenInfo
     sink_name: str | None = None
     error: Any | None = None
-    scheduler_pending_sink: bool = False
+    # A real sink-bound result always carries its durable handoff (_route_to_sink refuses one without).
+    scheduler_pending_sink: bool = True
     authoritative_error_hash: str | None = None
     join_group_id: str | None = None
     counts_failed_barrier: bool = False
@@ -639,8 +640,26 @@ class TestAccumulateSharedQuarantinePair:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="0123456789abcdef",
-            scheduler_pending_sink=True,
         )
+        assert pending["output"] == []
+
+    @pytest.mark.parametrize(
+        ("outcome", "path"),
+        [
+            (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
+            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
+            (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
+        ],
+        ids=["default_flow", "coalesced", "gate_routed"],
+    )
+    def test_a_sink_bound_result_without_a_durable_handoff_is_refused(self, outcome: TerminalOutcome, path: TerminalPath) -> None:
+        """Every written batch terminalizes its scheduler rows, so a sink-bound token must be parked first."""
+        counters = _make_counters()
+        pending = _make_pending()
+        unparked = replace(_make_result(outcome, path, sink_name="output"), scheduler_pending_sink=False)
+
+        with pytest.raises(OrchestrationInvariantError, match="no durable PENDING_SINK scheduler handoff"):
+            accumulate_row_outcomes([unparked], counters, pending)
         assert pending["output"] == []
 
     @pytest.mark.parametrize(

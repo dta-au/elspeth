@@ -166,7 +166,8 @@ def _row_result(
         token=result_token,
         sink_name=sink_name,
         error=error,
-        scheduler_pending_sink=False,
+        # A real sink-bound result always carries its durable handoff (_route_to_sink refuses one without).
+        scheduler_pending_sink=True,
         authoritative_error_hash=None,
         join_group_id="join-1" if path is TerminalPath.COALESCED else None,
         counts_failed_barrier=False,

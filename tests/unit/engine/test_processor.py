@@ -443,6 +443,24 @@ def _synthesize_group_bindings_from_legacy_maps(
     return GroupBindingRegistry(bindings=tuple(bindings))
 
 
+def _record_error_sink_outcome(factory: RecorderFactory, *, token_id: str, run_id: str) -> None:
+    """Record the (FAILURE, ON_ERROR_ROUTED) outcome the error-sink write would record.
+
+    These harnesses route a row to an error sink they never run. The sink
+    write is what decides the token; a run is never stamped successful while
+    a token lacks a recorded outcome (QR-4), so the harness records it as that
+    write would before stamping the run for its immutable export.
+    """
+    factory.data_flow.record_token_outcome_leader(
+        TokenRef(token_id=token_id, run_id=run_id),
+        TerminalOutcome.FAILURE,
+        TerminalPath.ON_ERROR_ROUTED,
+        coordination_token=leader_coordination_token(factory, run_id),
+        sink_name="error-sink",
+        error_hash=compute_error_hash("routed to the error sink"),
+    )
+
+
 def _make_processor(
     factory: RecorderFactory,
     *,
@@ -7510,10 +7528,9 @@ class TestExecuteTransformNoRetry:
 
         # Settle the direct executor's claim before taking an immutable export.
         # The row was routed to its error sink, which this harness never
-        # runs; settle the claim TERMINAL as that sink write would (the
-        # sibling scheduler test does the same). A FAILED item is a claim
-        # that died mid-row, and complete_run refuses a success over one
-        # whose token has no outcome.
+        # runs; record its outcome and settle the claim TERMINAL as that sink
+        # write would (the sibling scheduler test does the same).
+        _record_error_sink_outcome(factory, token_id=ctx.require_work_item().token_id, run_id=setup.run_id)
         factory.scheduler.mark_terminal(
             member_token=ctx.require_member_token(),
             work_item_id=ctx.require_work_item().work_item_id,
@@ -7616,6 +7633,7 @@ class TestExecuteTransformNoRetry:
 
         from elspeth.core.landscape.schema import token_work_items_table
 
+        _record_error_sink_outcome(factory, token_id=result.token.token_id, run_id=setup.run_id)
         with setup.db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.run_id == setup.run_id).values(status="terminal"))
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
@@ -7751,10 +7769,9 @@ class TestExecuteTransformNoRetry:
 
         # Settle the direct executor's claim before taking an immutable export.
         # The row was routed to its error sink, which this harness never
-        # runs; settle the claim TERMINAL as that sink write would (the
-        # sibling scheduler test does the same). A FAILED item is a claim
-        # that died mid-row, and complete_run refuses a success over one
-        # whose token has no outcome.
+        # runs; record its outcome and settle the claim TERMINAL as that sink
+        # write would (the sibling scheduler test does the same).
+        _record_error_sink_outcome(factory, token_id=ctx.require_work_item().token_id, run_id=setup.run_id)
         factory.scheduler.mark_terminal(
             member_token=ctx.require_member_token(),
             work_item_id=ctx.require_work_item().work_item_id,

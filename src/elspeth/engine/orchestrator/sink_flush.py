@@ -254,12 +254,12 @@ class SinkFlushCoordinator:
             # Group tokens by pending_outcome for separate write() calls
             # (sink_executor.write() takes a single PendingOutcome for all tokens in a batch)
             # PendingOutcome carries error_hash for QUARANTINED tokens
-            def pending_sort_key(pair: tuple[TokenInfo, PendingOutcome | None]) -> tuple[bool, str, str, str, bool]:
+            def pending_sort_key(pair: tuple[TokenInfo, PendingOutcome | None]) -> tuple[bool, str, str, str]:
                 pending = pair[1]
                 if pending is None:
-                    return (True, "", "", "", False)  # None sorts last
+                    return (True, "", "", "")  # None sorts last
                 outcome_value = pending.outcome.value if pending.outcome is not None else ""
-                return (False, outcome_value, pending.path.value, pending.error_hash or "", pending.scheduler_pending_sink)
+                return (False, outcome_value, pending.path.value, pending.error_hash or "")
 
             sorted_pairs = sorted(token_outcome_pairs, key=pending_sort_key)
 
@@ -270,13 +270,13 @@ class SinkFlushCoordinator:
                 join_group_id_by_token = {
                     token.token_id: (pending.join_group_id if pending is not None else None) for token, pending in group_pairs
                 }
-                # Only tokens with a proven durable PENDING_SINK handoff are
-                # terminalized after sink durability. Aggregation flush
-                # outputs carry that handoff since F1/D6 (the atomic barrier
-                # completion inserts their PENDING_SINK rows); terminal
-                # coalesce merges and source-quarantine rows still need
-                # checkpoints but have no scheduler row to close.
-                terminalize_scheduler = bool(pending_outcome is not None and pending_outcome.scheduler_pending_sink)
+                # Every queued token carries a durable PENDING_SINK handoff
+                # (``_route_to_sink`` refuses one without): drain outputs,
+                # barrier completions (aggregation flushes and coalesce
+                # merges, intake or out-of-claim) and fenced source-quarantine
+                # ingests all park before they reach here. So every written
+                # batch with a pending outcome terminalizes its scheduler rows.
+                terminalize_scheduler = pending_outcome is not None
                 # Compose the two independent post-sink lifecycles here
                 # (elspeth-107a29d02e): checkpoint progress (from the factory) and,
                 # only when this grouped batch carries a durable scheduler

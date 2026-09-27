@@ -894,7 +894,6 @@ def test_ts14_scheduler_callback_loss_repairs_without_republishing_s3_effect(
     pending_outcome = PendingOutcome(
         outcome=TerminalOutcome.SUCCESS,
         path=TerminalPath.DEFAULT_FLOW,
-        scheduler_pending_sink=True,
     )
     pending_tokens = {_SINK_NAME: [(token, pending_outcome)]}
     lost_terminalizer = _LostSchedulerTerminalizer()

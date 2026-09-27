@@ -772,7 +772,6 @@ class SinkExecutor:
             "error_hash": pending_outcome.error_hash,
             "outcome": pending_outcome.outcome.value,
             "path": pending_outcome.path.value,
-            "scheduler_pending_sink": pending_outcome.scheduler_pending_sink,
         }
         canonical_rows: list[dict[str, object]] = []
         for row in rows:
