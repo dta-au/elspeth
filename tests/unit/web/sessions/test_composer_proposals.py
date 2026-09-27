@@ -18,6 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -979,7 +980,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
 
             monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", blocked_validate)
             proposal_task = asyncio.create_task(create_proposal())
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await run_sync_in_worker(entered.wait, 5)
             delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
             await asyncio.sleep(0)
             release.set()
@@ -1003,7 +1004,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
 
         monkeypatch.setattr(coordination_repository, "pending_proposal_reference_id", blocked_pending)
         delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await run_sync_in_worker(entered.wait, 5)
         proposal_task = asyncio.create_task(create_proposal())
         await asyncio.sleep(0)
         release.set()
