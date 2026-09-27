@@ -75,20 +75,6 @@ def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> s
     return _HANDLED_GATE_EVALUATION_ERRORS[exc.kind]
 
 
-def _describe_untrusted_gate_value(value: object) -> str:
-    """Value-free description of a row-derived gate result: its type, and a string's length.
-
-    The result is row data (``row['category']`` returns the row's value), so
-    neither its content, a preview, nor a digest of it is audit text: a short
-    value printed whole through the old bounded preview, and a hash of a
-    low-entropy value is reversible. The row stays attributable through the
-    token.
-    """
-    if isinstance(value, str):
-        return f"type=str, length={len(value)}"
-    return f"type={type(value).__name__}"
-
-
 @dataclass(frozen=True, slots=True)
 class _RouteDispatchOutcome:
     """Internal routing dispatch result used by gate executors."""
@@ -407,9 +393,14 @@ class GateExecutor:
             elif isinstance(eval_result, str):
                 route_label = eval_result
             else:
+                # The result is row data (``row['category']`` returns the row's
+                # value): only its type and a label's length are audit text,
+                # never its content, a preview, or a digest (a hash of a
+                # low-entropy value is reversible). The row stays attributable
+                # through the token.
                 raise TypeError(
                     f"Gate '{gate_config.name}' expression returned unsupported route value "
-                    f"({_describe_untrusted_gate_value(eval_result)}), expected bool or str. "
+                    f"(type={type(eval_result).__name__}), expected bool or str. "
                     f"Expression: {gate_config.condition}"
                 )
 
@@ -417,7 +408,7 @@ class GateExecutor:
             if route_label not in gate_config.routes:
                 raise ValueError(
                     f"Gate '{gate_config.name}' condition returned unconfigured route label "
-                    f"({_describe_untrusted_gate_value(route_label)}); configured routes: {list(gate_config.routes.keys())}. "
+                    f"(type=str, length={len(route_label)}); configured routes: {list(gate_config.routes.keys())}. "
                     f"Expression: {gate_config.condition}"
                 )
 

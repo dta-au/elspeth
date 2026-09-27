@@ -565,6 +565,24 @@ _assert_visitor_coupling(
 )
 
 
+class _AllowedNameReadFinder(ast.NodeVisitor):
+    """Whether a validated sub-expression reads an allowed name (``row``, a namespace).
+
+    Used to decide whether a subscript key is config text: a key whose
+    expression reads no allowed name is determined by what the operator wrote.
+    Walks with ``generic_visit`` (a read-only scan over an already-validated
+    tree, never an evaluation).
+    """
+
+    def __init__(self, allowed_names: frozenset[str]) -> None:
+        self._allowed_names = allowed_names
+        self.reads_allowed_name = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in self._allowed_names:
+            self.reads_allowed_name = True
+
+
 class _ExpressionEvaluator(ast.NodeVisitor):
     """AST visitor that evaluates validated expressions."""
 
@@ -625,7 +643,9 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         that reads an allowed name (``row[row['code']]``) is computed from the
         row, so its value is row data and is withheld.
         """
-        return not any(isinstance(sub, ast.Name) and sub.id in self._allowed_names for sub in ast.walk(key_node))
+        finder = _AllowedNameReadFinder(self._allowed_names)
+        finder.visit(key_node)
+        return not finder.reads_allowed_name
 
     def visit_Subscript(self, node: ast.Subscript) -> Any:
         """Evaluate subscript access."""
@@ -1182,20 +1202,20 @@ class ExpressionParser:
             raise  # Framework bugs must not be wrapped as evaluation errors
         except (TypeError, AttributeError, KeyError, NameError, AssertionError, RecursionError):
             raise  # Programming errors in the evaluator must crash through
+        # The expression is config text; the exception's own text can quote an
+        # operand (a row value), so only its type is named.
+        except OverflowError as exc:
+            raise self._unexpected_error(exc, kind="arithmetic_overflow") from None
+        except ValueError as exc:
+            raise self._unexpected_error(exc, kind="invalid_value") from None
         except Exception as exc:
-            # The expression is config text; the exception's own text can quote
-            # an operand (a row value), so only its type is named.
-            kind: ExpressionEvaluationKind
-            if isinstance(exc, OverflowError):
-                kind = "arithmetic_overflow"
-            elif isinstance(exc, ValueError):
-                kind = "invalid_value"
-            else:
-                kind = "unexpected_error"
-            raise ExpressionEvaluationError(
-                f"Unexpected error evaluating expression {self._expression!r}: {type(exc).__name__}",
-                kind=kind,
-            ) from None
+            raise self._unexpected_error(exc, kind="unexpected_error") from None
+
+    def _unexpected_error(self, exc: Exception, *, kind: ExpressionEvaluationKind) -> ExpressionEvaluationError:
+        return ExpressionEvaluationError(
+            f"Unexpected error evaluating expression {self._expression!r}: {type(exc).__name__}",
+            kind=kind,
+        )
 
     def __repr__(self) -> str:
         return f"ExpressionParser({self._expression!r})"
