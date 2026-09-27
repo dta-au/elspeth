@@ -79,11 +79,36 @@ packer is a `FrameworkBugError`.
 (c) **The static analysis is configuration's early error, not a
 confidentiality control.** It stays a hard refusal: an undeclared literal read
 (`row.secret` with `[note]`), a computed key (`row[k]`, `row.get(k)`,
-`row|attr(k)`) — through `row.source_row` too — the reserved row-API names and
-`carrier-limit` still fail at `elspeth validate`, in the composer and at run
-start, because each would otherwise fail every row. The "whole-row" kind is
-retired: a whole row used as a value holds only the declared fields, which is
-exactly what the node declared. The LLM prompt's declared-but-unread dual
+`row|attr(k)`) — through `row.source_row` too — and `carrier-limit` still fail
+at `elspeth validate`, in the composer and at run start, because each would
+otherwise fail every row. `[]` opts out of these, because under the whole row a
+computed key can resolve. The "whole-row" kind is retired: a whole row used as
+a value holds only the declared fields, which is exactly what the node
+declared.
+
+**One template row API** (amended 2026-09-27, elspeth-5887fb7928 G3). A
+template's `row` has fields and one method, `get`
+(`core.templates.TEMPLATE_ROW_METHODS`). Attribute and item syntax always read
+a field, so `row.items` is a column named `items` and `row.keys()` calls the
+value of a field named `keys`; a whole-row operation is a filter or builtin
+over the projected view (`row | list`, `row | items`, `row | dictsort`,
+`row | tojson`, `dict(row)`), and `{{ row }}` renders that mapping. The retired
+PipelineRow names (`RETIRED_ROW_API_NAMES`: `contract`, `to_dict`,
+`to_checkpoint_format`) are reserved in attribute form; their columns are read
+by item. Configuration refuses the row used as an object — a reserved name, a
+call on a row field, `row.get` without a call — under **every** declaration,
+`[]` included, on the prompt's `row`, a query's `row` and `row.source_row`,
+and a RAG `row`, and never suggests `[]` as its remedy: no declaration makes
+these forms work, and the method-versus-column alternative corrupts silently
+(a `keys` column once rendered as `<bound method ...>`). The runtime reads the
+same constants for what the analysis cannot follow: `TemplateRow` refuses a
+reserved name in attribute form on every projection with a fixed,
+value-free reason, and its `repr` names fields only, never a value or an
+address. A multi-query `input_fields` variable may not be named `source_row`
+or like a mapping method, because a query's `row` is a plain mapping on which
+`row.<name>` finds the method first. With the declaration omitted, a
+single-query template that uses `row` as a whole is refused: its row holds no
+field. The LLM prompt's declared-but-unread dual
 counts the same way: it refuses a declared list only when the template never
 reads the context `row`, so `{{ row | dictsort }}` with `[note]` builds, and
 its remedy never suggests `[]`. Relaxing the remaining dynamic-key refusal is
@@ -119,8 +144,8 @@ with the LLM prompt's rules:
 
 - a literal row read outside the declared read set (omitted plus a read of
   any field but `query_field`);
-- a computed key, a reserved row-API name or `carrier-limit` under a
-  declaration, as in (c);
+- a computed key or `carrier-limit` under a declaration, as in (c);
+- under every declaration, the row used as an object, as in (c);
 - a top-level name other than `query`, `row` or a sandbox global.
 
 The dual refuses fields declared beyond `query_field` when the template never

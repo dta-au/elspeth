@@ -236,16 +236,48 @@ drained and repair this release forward.
   run start, the reads it can prove fail or go unused, as it does for an LLM
   prompt: a literal `row.<field>` read outside the declaration (with the
   declaration omitted, any field but `query_field`); a computed key
-  (`row[k]`, `row.get(k)`, `row | attr(k)`) or a retired row-API name unless
-  `required_input_fields: []`; a top-level name other than `query` or `row`;
+  (`row[k]`, `row.get(k)`, `row | attr(k)`) unless
+  `required_input_fields: []`; the row used as an object under every
+  declaration (see the template row API entry below); a top-level name other
+  than `query` or `row`;
   and fields declared beyond `query_field` for a template that never reads
   the context `row` (a `row` it binds itself, as a `set` or loop variable or
   a macro parameter, does not count). A read configuration cannot see fails the row with
   `template_rendering_failed` and the `Undeclared field` reason. Behaviour
   changes: under every declaration `row` is the template row rather than a
-  plain dict, so `row.items()`, `row.keys()` and `row.values()` read fields
-  of those names (they were dict methods), and `{{ row }}` no longer prints
-  the row. No shipped example sets `query_template`.
+  plain dict, so `row.items()`, `row.keys()` and `row.values()` are refused at
+  configuration (they were dict methods; `row | items`, `row | list` and
+  `dict(row)` replace them), and `{{ row }}` prints the declared fields. No
+  shipped example sets `query_template`.
+- **One template row API, refused at configuration under every declaration
+  (ADR-051 (c)).** A template's `row` has fields and one method, `get`:
+  attribute and item syntax read a field, and a whole-row operation is a
+  filter over the declared view. Configuration (`elspeth validate`, the
+  composer and run start) now refuses, for an LLM prompt, a query's
+  `row.source_row` and a RAG `query_template`, and under `required_input_fields:
+  []` too, a call on a row field (`row.keys()`, `row.items()`,
+  `row['keys']()`, `row.note()`), `row.get` without a call, and the reserved
+  names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
+  through `row | attr('contract')`). Before, under `[]` these validated and
+  failed every row (`row.keys()`, `row.to_dict()`, `row.contract`), or sent a
+  bound-method or object repr with a memory address to the provider
+  (`{{ row.get }}`, `{{ row }}`, `row | pprint`); `row.contract` under `[]`
+  read a column named `contract` while the same text was refused under a
+  list. The refusal names the replacement (`row | list`, `row | items`,
+  `row | dictsort`, `dict(row)`, `row['contract']`) and never suggests `[]`.
+  At render, a reserved name the check cannot follow fails the row with the
+  value-free reason `Reserved row name: ...`, and a missing field's reason
+  names "the row" instead of an internal class. A whole row used as a value is
+  the mapping it holds: `{{ row }}` and every string filter print the declared
+  fields, and `row | tojson` (also over a nested value such as
+  `row.meta | tojson`), `row | last`, `row | urlencode` and `row | pprint`
+  work, where each failed every row or printed an object repr. With the
+  declaration omitted, a single-query prompt that uses `row` as a whole
+  (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
+  empty row. A multi-query `input_fields` variable named `source_row` or like
+  a mapping method (`items`, `keys`, `values`, `get`, `copy`, ...) is refused:
+  `row.items` rendered the dict method, not the variable. No shipped example,
+  skill or fixture template uses a refused form.
 - **A template whose own literals fail its rows is refused when the
   template is built.** Jinja refuses an unknown filter or test name when it
   compiles a template, except inside `{% if %}` or an inline `if`
@@ -604,17 +636,30 @@ These ran and delivered rows before:
 - **A template test or read of a field the node does not declare** (the
   ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
   or a `row.source_row` column read through a `set` alias fails each row
-  with `template_rendering_failed` ("Undeclared field"). So does `row.to_dict()` or `row.contract` under
-  `required_input_fields: []`: those names are now ordinary fields. In a RAG
+  with `template_rendering_failed` ("Undeclared field"). In a RAG
   `query_template`, a `row.<field>` read outside `required_input_fields`
-  and `query_field` is refused at configuration, as is `row.items()`,
-  `row.keys()` or `row.values()`. A `'x' in row` test there fails each row.
+  and `query_field` is refused at configuration. A `'x' in row` test there
+  fails each row.
   Before, all of these rendered, and the undeclared columns went to the LLM
   or search provider. A RAG `required_input_fields` that declares fields
   beyond `query_field` for a `query_template` that never reads `row` is
   refused at configuration; before, the query rendered without them. On the
   web, an LLM node with `required_input_fields: []` or none is now
   `input_fields_unprovable` for a field-scoped prompt shield.
+- **The template row used as an object, under every declaration** (the
+  template row API entry above): `row.keys()`, `row.items()`, `row.values()`,
+  `row['keys']()`, a call on any row field, `row.get` without a call, and
+  `row.contract` / `row.to_dict()` / `row.to_checkpoint_format()` (also through
+  `row | attr(...)`) are refused at configuration in an LLM prompt, a query's
+  `row.source_row` and a RAG `query_template`, `required_input_fields: []`
+  included; replace them with `row | list`, `row | items`, `row | dictsort`,
+  `dict(row)` or `row['contract']`. Before, `row.keys()` under `[]` (single-
+  and multi-query) and RAG `row.keys()` / `row.items()` / `row.values()`
+  under any declaration delivered, and the rest failed each row or sent an
+  object repr.
+  With `required_input_fields` omitted, a single-query prompt that uses `row`
+  as a whole is refused, and a multi-query `input_fields` variable named
+  `source_row` or like a mapping method is refused.
 - **A multi-query template that reads `row.source_row` by a computed key**
   (`row.source_row[k]`, `row.source_row.get(expr)`) is refused at
   configuration with "LLM prompt_template uses dynamic row field access",

@@ -299,9 +299,18 @@ whole row but proves nothing to a field-scoped prompt-injection control, so
 declare the fields. A single-query prompt or retrieval template that never
 reads `row` declares none: the query field reaches a retrieval template as
 `query` without a declaration, and a declaration the template cannot use is
-refused. `row` holds fields only:
-`row.to_dict()`, `row.contract`, `row.items()`, `row.keys()` and
-`row.values()` read fields of those names.
+refused. `row` has fields and one method, `get`: `row.items` and `row.keys`
+read columns of those names, so a call on a row field (`row.keys()`,
+`row.items()`, `row['keys']()`), `row.get` without a call and the reserved
+names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` are refused
+under every declaration, `[]` included. For the field names use `row | list`,
+for name and value pairs `row | items` or `row | dictsort`, for a mapping
+`dict(row)` or `row | tojson`; read a column named like a method or a reserved
+name as `row['contract']`. A method on a field's value (`row.note.upper()`)
+is fine. With `required_input_fields` omitted, a model prompt may not use
+`row` as a whole (`{{ row }}`, `row | dictsort`): declare the fields it shows.
+A multi-query `input_fields` variable may not be named `source_row` or like a
+mapping method (`items`, `keys`, `values`, `get`).
 Besides the names it binds itself, a template reads `row`, `lookup` in a model
 prompt and `query` (the query field's value) in a retrieval `query_template`; a
 name its render context does not define is refused. Template literals must

@@ -1219,14 +1219,22 @@ Within that:
   and `row['Original Header']` reads it by the source's original header.
 - `row.get('name')` returns a declared field, or `None` when the row does not
   carry it; `'name' in row` is `False` then.
-- `{% for name in row %}`, `row | length`, `row | dictsort`, `row | items`,
-  `dict(row)` and `**row` see the declared fields the row carries.
+- `{% for name in row %}`, `row | length`, `row | list`, `row | dictsort`,
+  `row | items`, `row | tojson`, `dict(row)` and `**row` see the declared
+  fields the row carries, and so does every other builtin filter applied to
+  the row: it sees the same mapping `dict(row)` holds.
+- `{{ row }}` prints that mapping, e.g. `{'note': 'first', 'amount_usd': 5}`.
 
-Every other attribute or item lookup on `row` reads a field of that name:
-`row.keys` and `row.items` are fields, not methods. The row object, its schema
+`row` has fields and one method, `get`. Every other attribute or item lookup
+on `row` reads a field of that name: `row.keys` and `row.items` are fields,
+not methods, so `row.keys()` calls the value of a field named `keys`. For the
+field names use `row | list`, for name and value pairs `row | items` or
+`row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
+and `row.to_checkpoint_format` are reserved names, not fields: read a column
+with one of those names as `row['contract']`. The row object, its schema
 contract and their methods are not reachable from a template. A lookup of a
 declared field the row does not carry fails that row with
-`template_rendering_failed` (`Undefined variable: ...`).
+`template_rendering_failed` (`Undefined variable: the row has no field ...`).
 
 Reading a field the node does not declare fails the row with
 `template_rendering_failed` and its own reason, `Undeclared field: the template
@@ -1246,17 +1254,30 @@ declared parameter, its default, and the extra arguments a macro body reads as
 assignment at once, not in template order, so a variable that is reassigned to
 a container holding itself (`{% set a = {'k': row} %}` then
 `{% set a = {'k': a} %}`) cannot be followed and is rejected as
-`carrier-limit`; give the second value its own name. Configuration validation
-also treats `row.contract`, `row.to_dict` and `row.to_checkpoint_format` as
-dynamic row access, so read a column with one of those names as
-`row['contract']`. `required_input_fields: []` opts out of these checks, and
-the template then sees the whole row.
+`carrier-limit`; give the second value its own name. `required_input_fields: []`
+opts out of these checks, and the template then sees the whole row.
+
+Configuration also refuses a template that uses its row as an object, under
+every declaration, `[]` included, because no declaration makes it work: a
+call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
+`row.note()`), `row.get` without a call (`{{ row.get }}`,
+`{% set g = row.get %}`), and a reserved name in attribute form
+(`row.contract`, `row.to_dict()`, `row | attr('contract')`). A method on a
+field's value is not a row call: `row.note.upper()` is fine. At render, a
+reserved name the configuration check cannot follow fails the row with
+`template_rendering_failed` (`Reserved row name: ...`). With
+`required_input_fields` omitted, a single-query template that uses `row` as a
+whole (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: its row would
+hold no field.
 
 In a multi-query template, `row` holds the query's `input_fields` variables and
 `row.source_row`, the same view of the row narrowed to `required_input_fields`.
 The same rules apply to reads through `row.source_row`, and a
 `row.source_row.<column>` read must be listed in `required_input_fields`
-itself: an `image_inputs` column is not in `row.source_row`.
+itself: an `image_inputs` column is not in `row.source_row`. A query's `row`
+is a plain mapping, so an `input_fields` variable may not be named
+`source_row` or like a mapping method (`items`, `keys`, `values`, `get`,
+`copy`, ...): `row.items` would find the method, not the variable.
 
 The `<response_field>_variables_hash` an LLM node records is the SHA-256 of
 what its template could see: the declared field values (for a query, its
@@ -1275,7 +1296,8 @@ because the node reads it by its own option.
 
 Configuration refuses a literal read outside that set, a computed key, a name
 other than `query` or `row`, and fields declared beyond `query_field` when
-the template never reads `row`. Declare only the fields the query uses: the
+the template never reads `row`; under every declaration it refuses the row
+used as an object, as above. Declare only the fields the query uses: the
 query field needs no declaration.
 
 `provider: azure` adds:
