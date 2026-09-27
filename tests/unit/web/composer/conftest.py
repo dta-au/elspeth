@@ -672,10 +672,10 @@ def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
 def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep Phase 3 compose-loop harness tests independent of local API keys."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture

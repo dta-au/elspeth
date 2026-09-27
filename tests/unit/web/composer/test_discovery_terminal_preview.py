@@ -83,7 +83,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
 
     monkeypatch.setattr(service._provider_gateway, "_call_llm", provider)
-    monkeypatch.setattr(service, "_runtime_preflight", preflight)
+    monkeypatch.setattr(service._preflight, "runtime_preflight", preflight)
     monkeypatch.setattr(service, "_dispatch_tool_batch", dispatch)
 
     async def advisor(*args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:

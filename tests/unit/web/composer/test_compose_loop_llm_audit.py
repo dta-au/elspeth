@@ -23,7 +23,7 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import llm_response_parsing as llm_response_parsing_module
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, token_usage_from_response
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerServiceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
@@ -436,10 +436,10 @@ def test_llm_call_record_redacts_raw_provider_error_detail() -> None:
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.mark.asyncio
@@ -583,7 +583,7 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
         patch("elspeth.web.composer.tool_batch.execute_tool", return_value=tool_result),
-        patch.object(service, "_cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
+        patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
         result = await service.compose("Set a name", [], state, session_id=session_id)
 

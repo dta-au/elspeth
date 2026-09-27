@@ -99,22 +99,23 @@ def test_active_source_and_openapi_expose_no_retired_chain_contract() -> None:
 
 def test_reachable_surfaces_share_one_planner_implementation_boundary() -> None:
     from elspeth.web.composer import pipeline_planner
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import planning_application as planning_module
 
     service_tree = _module_tree("src/elspeth/web/composer/service.py")
+    planning_tree = _module_tree("src/elspeth/web/composer/planning_application.py")
     guided_route_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
     guided_full_route_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided_plan.py")
     freeform = _named_scope(service_tree, "compose", owner="ComposerServiceImpl")
-    freeform_planner = _named_scope(service_tree, "_plan_and_stage_empty_pipeline", owner="ComposerServiceImpl")
-    guided = _named_scope(service_tree, "plan_guided_pipeline", owner="ComposerServiceImpl")
-    guided_full = _named_scope(service_tree, "plan_guided_full_pipeline", owner="ComposerServiceImpl")
+    freeform_planner = _named_scope(planning_tree, "_plan_and_stage_empty_pipeline", owner="PlanningApplication")
+    guided = _named_scope(planning_tree, "plan_guided_pipeline", owner="PlanningApplication")
+    guided_full = _named_scope(planning_tree, "plan_guided_full_pipeline", owner="PlanningApplication")
     guided_route = _named_scope(guided_route_tree, "post_guided_respond")
     guided_full_route = _named_scope(guided_full_route_tree, "post_guided_plan")
 
     # Freeform has one model-planner fallback. Guided-staged and tutorial use
     # the same reachable adapter for initial and revision branches; the adapter
     # itself contains exactly one call to the shared imported implementation.
-    assert service_module.plan_pipeline is pipeline_planner.plan_pipeline
+    assert planning_module.plan_pipeline is pipeline_planner.plan_pipeline
     assert _call_count(freeform, "_plan_and_stage_empty_pipeline") == 1
     assert _call_count(freeform_planner, "plan_pipeline") == 1
     assert _call_count(guided_route, "plan_guided_pipeline") == 3

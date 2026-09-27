@@ -8,7 +8,7 @@ This conftest builds ONE production stack that all parity surfaces share:
   ``profile`` LLM authoring form only on the freeform surface) mounted as
   ``app.state.composer_service`` (so both freeform ``compose`` and guided-full's
   ``plan_guided_full_pipeline`` run the real planner against the same web policy),
-  with ``_compute_availability`` forced available;
+  with the service's ``compute_availability`` import forced available;
 * a permissive-but-real web plugin policy that admits every plugin the ten
   fixtures use (``csv`` / ``json`` sources+sinks and ``llm`` are already in
   ``REQUIRED_WEB_PLUGIN_IDS``; ``passthrough`` / ``type_coerce`` / ``batch_stats``
@@ -807,11 +807,10 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
         )
 
     # Force provider availability BEFORE constructing the service (its __init__
-    # calls _compute_availability).
+    # calls compute_availability).
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     # Production wires the composer service in WEB mode — operator_profile_registry
     # plus a user-id-keyed snapshot factory (app.py create_app), NOT
@@ -842,6 +841,9 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.scoped_secret_resolver = None
     app.state.settings = settings
     app.state.composer_service = composer
+    app.state.interpretation_surfacing = composer._interpretation_surfacing
+    app.state.planning_application = composer._planning_application
+    app.state.schema_disclosure = composer._schema_disclosure
     app.state.rate_limiter = ComposerRateLimiter(limit=1000)
     app.state.catalog_service = catalog
     app.state.web_plugin_policy = web_plugin_policy

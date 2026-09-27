@@ -13,19 +13,19 @@ import pytest
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer import service as service_module
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_settings, complaint_triage_state
 
 from .conftest import _fake_llm_response
-from .test_preview_policy_snapshot import _service
+from .test_preview_policy_snapshot import _registry, _service
 
 
 @pytest.mark.anyio
@@ -42,8 +42,14 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     complaint_settings(tmp_path)
-    service = _service(tmp_path, snapshot)
-    service._sessions_service = composer_service_with_real_sessions._sessions_service
+    registry = _registry(tmp_path)
+    service = _service(
+        tmp_path,
+        snapshot,
+        catalog,
+        registry=registry,
+        sessions_service=composer_service_with_real_sessions._sessions_service,
+    )
     state = complaint_triage_state(pending=True, narrow_consumer=narrow_consumer)
     session_id = result_session_id
     source_dir = tmp_path / "blobs" / session_id
@@ -87,7 +93,7 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         review_calls.append(kwargs)
         return ToolResult(success=True, updated_state=state, validation=state.validate(), affected_nodes=())
 
-    monkeypatch.setitem(service_module._SESSION_AWARE_TOOL_HANDLERS, "request_interpretation_review", review_handler)
+    monkeypatch.setitem(_SESSION_AWARE_TOOL_HANDLERS, "request_interpretation_review", review_handler)
     if tool_name == "finalize":
 
         async def surface(*_args: Any, **kwargs: Any) -> None:
@@ -98,7 +104,7 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
 
         monkeypatch.setattr(service._interpretation_surfacing, "surface_pending_interpretation_reviews", surface)
         monkeypatch.setattr(service._interpretation_surfacing, "_missing_pending_interpretation_review_sites", missing)
-        result = await service._surface_and_finalize_no_tools(
+        result = await service._completion._surface_and_finalize_no_tools(
             assistant_message=_admit_composer_llm_completion(_fake_llm_response(content="The pipeline is ready.")).message,
             state=state,
             session_id=session_id,
@@ -164,7 +170,7 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         failed_turn=None,
         cancellation_requested=asyncio.Event(),
         plugin_snapshot=snapshot,
-        policy_catalog=PolicyCatalogView(catalog, snapshot, service._operator_profile_registry),
+        policy_catalog=PolicyCatalogView(catalog, snapshot, registry),
         session_operation_context=SessionOperationContext(
             SessionOperationFence(session_id, str(uuid4()), str(uuid4()), 1), SessionOperationKind.COMPOSE
         ),

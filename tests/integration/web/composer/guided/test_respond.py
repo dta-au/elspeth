@@ -47,6 +47,7 @@ from elspeth.web.composer.guided.protocol import (
 from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
@@ -569,6 +570,8 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
     app.state.scoped_secret_resolver = primary_app.state.scoped_secret_resolver
     app.state.settings = primary_app.state.settings
     app.state.composer_service = type(primary_app.state.composer_service)()
+    app.state.planning_application = app.state.composer_service
+    app.state.schema_disclosure = SchemaDisclosureTracker()
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = primary_app.state.catalog_service
     app.state.web_plugin_policy = primary_app.state.web_plugin_policy
@@ -948,9 +951,8 @@ class TestStep2IntraStep:
         reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
 
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -966,6 +968,9 @@ class TestStep2IntraStep:
             plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
             operator_profile_registry=app.state.operator_profile_registry,
         )
+
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
 
         planner_pipeline = {
             "source_routes": [{"stable_id": source_stable_id, "on_success": reviewed_output_name}],
@@ -1262,9 +1267,8 @@ class TestStep2IntraStep:
         )
 
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -1280,6 +1284,8 @@ class TestStep2IntraStep:
             plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
             operator_profile_registry=app.state.operator_profile_registry,
         )
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
         planner_pipeline = {
             "source_routes": [{"stable_id": source_stable_id, "on_success": reviewed_output_name}],
             "nodes": [],
@@ -1356,7 +1362,7 @@ class TestStep2IntraStep:
           exhaustion must hand the operator the missing field names rather
           than a bare "retry the request".
         """
-        import elspeth.web.composer.service as service_module
+        import elspeth.web.composer.planning_application as planning_module
 
         app = composer_test_client.app
         session_id = _create_session(composer_test_client)
@@ -1397,9 +1403,8 @@ class TestStep2IntraStep:
         ]
 
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -1416,14 +1421,17 @@ class TestStep2IntraStep:
             operator_profile_registry=app.state.operator_profile_registry,
         )
 
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
+
         planner_contexts: list[Mapping[str, Any]] = []
-        real_plan_pipeline = service_module.plan_pipeline
+        real_plan_pipeline = planning_module.plan_pipeline
 
         def recording_plan_pipeline(**kwargs: Any):
             planner_contexts.append(kwargs["reviewed_planner_context"])
             return real_plan_pipeline(**kwargs)
 
-        monkeypatch.setattr(service_module, "plan_pipeline", recording_plan_pipeline)
+        monkeypatch.setattr(planning_module, "plan_pipeline", recording_plan_pipeline)
 
         gap_closing_nodes = [
             {
@@ -1603,9 +1611,8 @@ class TestStep2IntraStep:
 
         app = composer_test_client.app
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -1621,6 +1628,8 @@ class TestStep2IntraStep:
             plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
             operator_profile_registry=app.state.operator_profile_registry,
         )
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
         requests: list[dict[str, object]] = []
         manifests: list[PlannerCapabilityManifest] = []
         real_builder = planner_module.build_planner_capability_manifest  # type: ignore[attr-defined]
@@ -1712,9 +1721,8 @@ class TestStep2IntraStep:
 
         app = composer_test_client.app
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -1730,6 +1738,9 @@ class TestStep2IntraStep:
             plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
             operator_profile_registry=app.state.operator_profile_registry,
         )
+
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
 
         async def cancelling_completion(**_kwargs: Any) -> _PlannerResponse:
             raise asyncio.CancelledError("provider cancelled matching planner request")
@@ -1757,7 +1768,18 @@ class TestStep2IntraStep:
             pause_after_audit_insert,
         )
 
+        async def wait_for_event(event: threading.Event, timeout: float) -> bool:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while not event.is_set():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(0.01, remaining))
+            return True
+
         async def invoke_cancelled_route() -> None:
+            assert not await wait_for_event(audit_inserted, 0), "unset audit event must not satisfy the barrier"
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 request_task = asyncio.create_task(
                     client.post(
@@ -1769,7 +1791,7 @@ class TestStep2IntraStep:
                         },
                     )
                 )
-                assert await asyncio.to_thread(audit_inserted.wait, 5.0), "guided cancellation audit worker did not start"
+                assert await wait_for_event(audit_inserted, 5.0), "guided cancellation audit worker did not start"
                 request_task.cancel("shutdown cancelled guided failure settlement")
                 await asyncio.sleep(0)
                 cancellation_escaped_before_settlement = request_task.done()
@@ -1856,7 +1878,7 @@ class TestStep2IntraStep:
             planner_entered.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", blocked_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", blocked_planner)
         state_before = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
 
         async def cancel_request() -> asyncio.CancelledError:
@@ -2209,7 +2231,7 @@ class TestStep2IntraStep:
             raise AssertionError("source/output proposal back-edit must not call the planner")
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             forbidden_planner,
         )
@@ -2352,7 +2374,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             forbidden_planner,
         )
@@ -2502,13 +2524,13 @@ class TestStep2IntraStep:
         assert staged["composition_state"]["sources"] == {}
 
         captured: dict[str, object] = {}
-        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+        original_planner = composer_test_client.app.state.planning_application.plan_guided_pipeline
 
         async def spy_planner(**kwargs: object) -> object:
             captured.update(kwargs)
             return await original_planner(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
 
         feedback = "Route high-value rows to the reviewed high-value output and all other rows to standard."
 
@@ -2564,7 +2586,7 @@ class TestStep2IntraStep:
     ) -> None:
         initial_prompt = "Summarise this row without changing its reviewed fields."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(initial_prompt),
         )
@@ -2582,7 +2604,7 @@ class TestStep2IntraStep:
             return await replacement(**kwargs)
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             spy_planner,
         )
@@ -2648,8 +2670,8 @@ class TestStep2IntraStep:
         and a prompt revise could not land at all."""
         initial_prompt = "Summarise this row in one short sentence."
         revised_prompt = "Summarise this row in two sentences, keeping every number."
-        composer_service = composer_test_client.app.state.composer_service
-        monkeypatch.setattr(composer_service, "plan_guided_pipeline", _llm_prompt_template_planner(initial_prompt))
+        planning_application = composer_test_client.app.state.planning_application
+        monkeypatch.setattr(planning_application, "plan_guided_pipeline", _llm_prompt_template_planner(initial_prompt))
         session_id = _create_session(composer_test_client)
         staged = self._stage_proposal(composer_test_client, session_id, filename="node-prompt-edit.jsonl")
         turn = staged["next_turn"]
@@ -2666,7 +2688,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(planning_application, "plan_guided_pipeline", spy_planner)
         feedback = "Ask for two sentences and keep every number."
 
         response = composer_test_client.post(
@@ -2785,7 +2807,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             unchanged_planner,
         )
@@ -2825,7 +2847,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         if target_kind == "node":
             monkeypatch.setattr(
-                composer_test_client.app.state.composer_service,
+                composer_test_client.app.state.planning_application,
                 "plan_guided_pipeline",
                 _llm_prompt_template_planner("Summarise this row in one short sentence."),
             )
@@ -2841,7 +2863,7 @@ class TestStep2IntraStep:
             raise AssertionError("a node/edge proposal revision without feedback must not reach the planner")
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             forbidden_planner,
         )
@@ -2875,7 +2897,7 @@ class TestStep2IntraStep:
 
         session_id = _create_session(composer_test_client)
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(
                 "Summarise this row in one short sentence.",
@@ -2947,7 +2969,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
 
         instruction = "Add a deduplication transform before the output."
         operation_id = str(uuid4())
@@ -3041,7 +3063,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
 
         instruction = "Insert a deduplication transform while preserving the reviewed gate and existing transforms."
         revised = composer_test_client.post(
@@ -3091,7 +3113,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
         response = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/respond",
             json={
@@ -3150,7 +3172,7 @@ class TestStep2IntraStep:
             start=1,
         ):
             monkeypatch.setattr(
-                composer_test_client.app.state.composer_service,
+                composer_test_client.app.state.planning_application,
                 "plan_guided_pipeline",
                 spying(_llm_prompt_template_planner(f"Revision {index} prompt.")),
             )
@@ -3229,7 +3251,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
 
         instruction = "Actually put everything in one sink; no routing."
         revised = composer_test_client.post(
@@ -3308,7 +3330,7 @@ class TestStep2IntraStep:
                 },
             )
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", unchanged_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", unchanged_planner)
         rejected = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/respond",
             json={
@@ -3339,7 +3361,7 @@ class TestStep2IntraStep:
 
         session_id = _create_session(composer_test_client)
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner("Keep this exact reviewed prompt."),
         )
@@ -3389,7 +3411,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             private_field_changing_planner,
         )
@@ -3464,7 +3486,7 @@ class TestStep2IntraStep:
         payload = turn["payload"]
         before = _full_guided_session(staged)
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner("Deduplicate each row before writing it."),
         )
@@ -3539,7 +3561,7 @@ class TestStep2IntraStep:
             return GuidedPlannerDecline(decline_text=decline_text)
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             decline_planner,
         )
@@ -3666,7 +3688,7 @@ class TestStep2IntraStep:
             return GuidedPlannerDecline(decline_text=decline_text)
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             decline_planner,
         )
@@ -3721,7 +3743,7 @@ class TestStep2IntraStep:
             return GuidedPlannerDecline(decline_text=decline_text)
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             decline_planner,
         )
@@ -3817,7 +3839,7 @@ class TestStep2IntraStep:
                 detail_codes=(),
             )
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", slow_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", slow_planner)
         monkeypatch.setattr(guided_ops_module, "GUIDED_RESPOND_ADMISSION_WAIT_SECONDS", 0.2, raising=False)
 
         def _revision_body(instruction: str) -> dict[str, object]:
@@ -3903,7 +3925,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             exhausted_planner,
         )
@@ -3962,7 +3984,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             policy_refused_planner,
         )
@@ -4018,7 +4040,7 @@ class TestStep2IntraStep:
             captured.update(kwargs)
             return await replacement(**kwargs)
 
-        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        monkeypatch.setattr(composer_test_client.app.state.planning_application, "plan_guided_pipeline", spy_planner)
 
         instruction = "Insert a deduplication transform between the source and the sink."
         revised = composer_test_client.post(
@@ -4597,7 +4619,7 @@ class TestStep2IntraStep:
             raise RuntimeError(" | ".join(failure_canaries))
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             fail_planner,
         )
@@ -4683,7 +4705,7 @@ class TestStep2IntraStep:
             return GuidedPlannerDecline(decline_text=decline_text)
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             decline_planner,
         )
@@ -4763,9 +4785,8 @@ class TestStep2IntraStep:
 
         app = composer_test_client.app
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(
                 available=True,
                 provider="test",
                 model="test/guided-planner",
@@ -4786,6 +4807,9 @@ class TestStep2IntraStep:
             plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
             operator_profile_registry=app.state.operator_profile_registry,
         )
+
+        app.state.planning_application = app.state.composer_service._planning_application
+        app.state.schema_disclosure = app.state.composer_service._schema_disclosure
 
         responses = iter(
             (
@@ -4898,7 +4922,7 @@ class TestStep2IntraStep:
             return GuidedPlannerDecline(decline_text="The prospective turn cannot be planned yet.")
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             decline_planner,
         )
@@ -4984,7 +5008,7 @@ class TestStep2IntraStep:
             raise RuntimeError("safe audit insert failure")
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             fail_planner,
         )
@@ -5106,7 +5130,7 @@ class TestStep2IntraStep:
                 )
 
             monkeypatch.setattr(
-                composer_test_client.app.state.composer_service,
+                composer_test_client.app.state.planning_application,
                 "plan_guided_pipeline",
                 forbidden_planner,
             )
@@ -5581,7 +5605,7 @@ class TestStep2IntraStep:
 
         session_id = _create_session(composer_test_client)
         app = composer_test_client.app
-        original = app.state.composer_service.plan_guided_pipeline
+        original = app.state.planning_application.plan_guided_pipeline
         seen: dict[str, Any] = {}
 
         async def capturing_planner(**kwargs: Any):
@@ -5595,7 +5619,7 @@ class TestStep2IntraStep:
                 )
             return await original(**{k: v for k, v in kwargs.items() if k != "progress"})
 
-        monkeypatch.setattr(app.state.composer_service, "plan_guided_pipeline", capturing_planner)
+        monkeypatch.setattr(app.state.planning_application, "plan_guided_pipeline", capturing_planner)
         self._stage_proposal(composer_test_client, session_id, filename="progress_sink.jsonl")
 
         assert seen.get("progress") is not None, "plan_guided_pipeline received no progress sink"
@@ -5694,7 +5718,7 @@ class TestStep2IntraStep:
                 },
             )
 
-        monkeypatch.setattr(app.state.composer_service, "plan_guided_pipeline", counting_planner)
+        monkeypatch.setattr(app.state.planning_application, "plan_guided_pipeline", counting_planner)
         request_payload = {
             "operation_id": str(uuid4()),
             "turn_token": turn["turn_token"],
@@ -5753,7 +5777,7 @@ class TestStep2IntraStep:
         prompt = "Summarise this row in one short sentence."
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -5807,7 +5831,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -5885,7 +5909,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -5944,7 +5968,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -6135,7 +6159,7 @@ class TestStep2IntraStep:
             assert accepted.json()["status"] == "committed"
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -6254,7 +6278,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -6327,7 +6351,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -6417,7 +6441,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt, extra_node_id="second_summary"),
         )
@@ -6503,7 +6527,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             _llm_prompt_template_planner(prompt),
         )
@@ -7311,7 +7335,7 @@ class TestStep2IntraStep:
             )
 
         monkeypatch.setattr(
-            composer_test_client.app.state.composer_service,
+            composer_test_client.app.state.planning_application,
             "plan_guided_pipeline",
             llm_planner,
         )

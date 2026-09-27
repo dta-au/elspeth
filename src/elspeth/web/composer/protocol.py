@@ -21,20 +21,10 @@ if TYPE_CHECKING:
     from pydantic import SecretStr
 
     from elspeth.contracts.session_operation import SessionOperationContext
-    from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
-    from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
-    from elspeth.web.composer.pipeline_planner import (
-        GuidedPlannerDecline,
-        PipelinePlanResult,
-        PlannerOriginatingMessage,
-    )
-    from elspeth.web.composer.pipeline_proposal import PresentBase
+    from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.sessions.protocol import GuidedOperationFence
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -1683,53 +1673,6 @@ class ComposerService(Protocol):
         Raises:
             ComposerConvergenceError: If the loop exceeds max_turns.
         """
-
-    async def plan_guided_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        guided: GuidedSession,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        user_id: str | None,
-        supersedes_draft_hash: str | None,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-        correction_target: GuidedCorrectionTarget | None = None,
-        revision_authority: GuidedRevisionAuthority | None = None,
-        root_goal: str | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run the shared planner once with split private/provider-safe facts.
-
-        ``root_goal`` is the outcome the author stated when the session
-        started, carried as a NAMED reviewed fact on a correction or revision
-        only — never folded into ``intent``, which always means "the request
-        being made now". A revision that narrows or withdraws part of the goal
-        would otherwise argue against the goal inside the one field the
-        planner (and the deterministic request guards that parse it) read as
-        the current request.
-        """
-        ...
-
-    async def plan_guided_full_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        policy_catalog: PolicyCatalogView,
-        plugin_snapshot: PluginAvailabilitySnapshot,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Plan one ordinary guided-full proposal through the shared planner."""
-        ...
 
     async def explain_run_diagnostics(
         self,

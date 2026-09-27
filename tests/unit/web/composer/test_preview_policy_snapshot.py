@@ -14,7 +14,8 @@ import pytest
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.protocol import BlobRecord
-from elspeth.web.composer import service as service_module
+from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
@@ -27,6 +28,7 @@ from elspeth.web.execution.schemas import ValidationReadiness, ValidationReadine
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.sessions.protocol import SessionServiceProtocol
 from tests.unit.web.execution.test_validate_blob_inline import BLOB_ID, _ready_blob_record, _state_with_reference_join
 
 from .conftest import _fake_llm_response, _make_settings
@@ -46,15 +48,28 @@ def _snapshot(*, csv_available: bool) -> PluginAvailabilitySnapshot:
     )
 
 
-def _service(tmp_path: Path, current_snapshot: PluginAvailabilitySnapshot) -> ComposerServiceImpl:
+def _registry(tmp_path: Path) -> OperatorProfileRegistry:
     settings = _make_settings(tmp_path)
     config = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=config)
+    return OperatorProfileRegistry(policy=policy, settings=config)
+
+
+def _service(
+    tmp_path: Path,
+    current_snapshot: PluginAvailabilitySnapshot,
+    catalog: CatalogService,
+    *,
+    registry: OperatorProfileRegistry | None = None,
+    sessions_service: SessionServiceProtocol | None = None,
+) -> ComposerServiceImpl:
+    settings = _make_settings(tmp_path)
     return ComposerServiceImpl(
-        catalog=create_catalog_service(),
+        catalog=catalog,
         settings=settings,
         plugin_snapshot_factory=lambda _user_id: current_snapshot,
-        operator_profile_registry=OperatorProfileRegistry(policy=policy, settings=config),
+        operator_profile_registry=registry if registry is not None else _registry(tmp_path),
+        sessions_service=sessions_service,
     )
 
 
@@ -86,11 +101,13 @@ async def _preview(
     state: CompositionState,
     admitted: PluginAvailabilitySnapshot,
     cache: RuntimePreflightCache,
+    registry: OperatorProfileRegistry,
+    catalog: CatalogService,
     operation_context: SessionOperationContext | None = None,
 ) -> _DispatchOutcome:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
 
-    policy_catalog = PolicyCatalogView(service._catalog, admitted, service._operator_profile_registry)
+    policy_catalog = PolicyCatalogView(catalog, admitted, registry)
     completion = _admit_composer_llm_completion(
         _fake_llm_response(tool_calls=({"id": "preview-call", "name": "preview_pipeline", "arguments": {}},))
     )
@@ -136,25 +153,27 @@ async def test_preview_policy_verdict_and_cache_stay_bound_to_admitted_snapshot(
     admitted = _snapshot(csv_available=False)
     subsequent = _snapshot(csv_available=True)
     assert admitted.snapshot_hash != subsequent.snapshot_hash
-    service = _service(tmp_path, subsequent)
+    registry = _registry(tmp_path)
+    catalog = create_catalog_service()
+    service = _service(tmp_path, subsequent, catalog, registry=registry)
     state = _state(tmp_path)
-    cache = service._new_runtime_preflight_cache()
+    cache = service._preflight.new_cache()
 
-    first = await _preview(service, state, admitted, cache)
+    first = await _preview(service, state, admitted, cache, registry, catalog)
     strict = first.last_runtime_preflight
     assert strict is not None
     assert "plugin_not_enabled" in {error.error_code for error in strict.errors}
-    key = service._runtime_preflight_key(state, session_scope="preview-snapshot-test", plugin_snapshot=admitted)
+    key = service._preflight.key(state, session_scope="preview-snapshot-test", plugin_snapshot=admitted)
     assert cache == {key: strict}
 
-    repeated = await _preview(service, state, admitted, cache)
+    repeated = await _preview(service, state, admitted, cache, registry, catalog)
     assert repeated.last_runtime_preflight is strict
-    later = await _preview(service, state, subsequent, cache)
+    later = await _preview(service, state, subsequent, cache, registry, catalog)
     later_strict = later.last_runtime_preflight
     assert later_strict is not None
     assert "plugin_not_enabled" not in {error.error_code for error in later_strict.errors}
     assert any(check.name == "plugin_enablement" and check.passed for check in later_strict.checks)
-    later_key = service._runtime_preflight_key(state, session_scope="preview-snapshot-test", plugin_snapshot=subsequent)
+    later_key = service._preflight.key(state, session_scope="preview-snapshot-test", plugin_snapshot=subsequent)
     assert cache == {key: strict, later_key: later_strict}
 
 
@@ -163,7 +182,9 @@ async def test_strict_and_tolerant_preview_share_the_admitted_snapshot(tmp_path:
     """Exercise both real cached-preflight branches after a pending-review result."""
     admitted = _snapshot(csv_available=True)
     subsequent = _snapshot(csv_available=False)
-    service = _service(tmp_path, subsequent)
+    registry = _registry(tmp_path)
+    catalog = create_catalog_service()
+    service = _service(tmp_path, subsequent, catalog, registry=registry)
     seen: list[tuple[bool, PluginAvailabilitySnapshot]] = []
 
     def pending_review_preflight(
@@ -196,8 +217,8 @@ async def test_strict_and_tolerant_preview_share_the_admitted_snapshot(tmp_path:
             ),
         )
 
-    monkeypatch.setattr(service_module, "validate_pipeline", pending_review_preflight)
-    await _preview(service, _state(tmp_path), admitted, service._new_runtime_preflight_cache())
+    monkeypatch.setattr(preflight_module, "validate_pipeline", pending_review_preflight)
+    await _preview(service, _state(tmp_path), admitted, service._preflight.new_cache(), registry, catalog)
     assert len(seen) == 2
     assert [tolerant for tolerant, _snapshot_used in seen] == [False, True]
     assert seen[0][1] is admitted
@@ -240,8 +261,15 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
         selected_profile_aliases=(),
         binding_generation_fingerprint="preview-blob-generation",
     )
-    service = _service(tmp_path, admitted)
-    service._sessions_service = composer_service_with_real_sessions._sessions_service
+    registry = _registry(tmp_path)
+    catalog = create_catalog_service()
+    service = _service(
+        tmp_path,
+        admitted,
+        catalog,
+        registry=registry,
+        sessions_service=composer_service_with_real_sessions._sessions_service,
+    )
     reads: list[SessionOperationContext] = []
 
     class BlobReader:
@@ -256,8 +284,8 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
             reads.append(operation_context)
             return record, encoded
 
-    monkeypatch.setattr(service, "_blob_service", BlobReader())
-    real_validate = service_module.validate_pipeline
+    monkeypatch.setattr(service._preflight, "_blob_service", BlobReader())
+    real_validate = preflight_module.validate_pipeline
     results: list[ValidationResult] = []
 
     def validate(*args: Any, allow_pending_interpretation_placeholders: bool = False, **kwargs: Any) -> ValidationResult:
@@ -286,8 +314,8 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
         results.append(result)
         return result
 
-    monkeypatch.setattr(service_module, "validate_pipeline", validate)
-    await _preview(service, state, admitted, service._new_runtime_preflight_cache(), context)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", validate)
+    await _preview(service, state, admitted, service._preflight.new_cache(), registry, catalog, context)
     assert len(results) == 1
     assert results[0].is_valid, results[0].errors
     assert reads == [context]

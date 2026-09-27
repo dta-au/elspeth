@@ -169,6 +169,9 @@ def test_persist_outcome_rejects_current_dispatch_identity_without_committed_row
             persisted_assistant_matches_current_dispatch=True,
             unwind_audit_failed=False,
             failed_turn=None,
+            redacted_assistant_tool_calls=(),
+            redacted_tool_rows=(),
+            audit_outcome=None,
         )
 
 

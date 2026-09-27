@@ -41,7 +41,7 @@ from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.schemas import PluginSummary
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -425,7 +425,7 @@ async def _run_no_tool_turn(
     if advisor is not None:
         composer._advisor_checkpoint._run_advisor_checkpoint = advisor
     session_id = await _seed_session(sessions_service)
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
     llm = _ScriptedLLM(
         [
             _fake_response_with_tool_call(

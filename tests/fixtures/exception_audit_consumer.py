@@ -18,6 +18,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedToolCall,
     _AdmittedToolFunction,
 )
+from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.turn_audit import persist_turn_audit
 from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.test_composer_exception_handlers import _AUDIT_INTEGRITY_DETAIL, _audit_request, _settings
@@ -33,7 +34,6 @@ def exercise_audit_failed_turn() -> None:
 
     async def exercise(data_dir: Path) -> None:
         app = create_app(_settings(data_dir))
-        service = app.state.composer_service
         sessions = app.state.session_service
         handler = app.exception_handlers[AuditIntegrityError]
         request = _audit_request("audit-consumer-request")
@@ -55,7 +55,8 @@ def exercise_audit_failed_turn() -> None:
                 pytest.raises(AuditIntegrityError) as caught,
             ):
                 await persist_turn_audit(
-                    service,
+                    sessions_service=sessions,
+                    redaction_telemetry=NoopRedactionTelemetry(),
                     tool_outcomes=(),
                     decoded_args_by_call_id={},
                     assistant_message=_AdmittedAssistantMessage(content=provider_canary),

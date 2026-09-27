@@ -294,10 +294,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass real availability check (no API key needed in tests)."""
     from elspeth.web.composer.service import ComposerAvailability
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -639,7 +639,7 @@ class TestNumericGateScenario:
         empty = _empty_state()
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2]
             result = await service.compose(
@@ -824,7 +824,7 @@ class TestNumericGateScenario:
         empty = _empty_state()
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -1004,7 +1004,7 @@ class TestUrlTextSmokeScenario:
         empty = _empty_state()
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -1179,7 +1179,7 @@ class TestPreflightRepairContinue:
         empty = _empty_state()
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", side_effect=_content_aware_preflight),
+            patch.object(service._preflight, "runtime_preflight", side_effect=_content_aware_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",

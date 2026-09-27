@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy import update
 
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.sessions.models import sessions_table
 from tests.unit.web.composer.test_compose_loop_persistence import _run_one_turn, _text_response, _tool_batch_response
@@ -35,9 +36,11 @@ async def test_proposal_cap_after_a_discovery_turn_reports_turns_used_and_failed
 ) -> None:
     _set_explicit_approve(composer_service_with_real_sessions, result_session_id)
     responses = [
-        _tool_batch_response(("call_discovery_before_cap", "get_pipeline_state", {})),
-        _tool_batch_response(
-            *((f"call_cap_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(11))
+        _admit_composer_llm_completion(_tool_batch_response(("call_discovery_before_cap", "get_pipeline_state", {}))),
+        _admit_composer_llm_completion(
+            _tool_batch_response(
+                *((f"call_cap_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(11))
+            )
         ),
         _text_response("Done."),
     ]

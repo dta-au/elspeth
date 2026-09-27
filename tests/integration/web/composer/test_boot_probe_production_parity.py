@@ -35,6 +35,7 @@ import structlog
 from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.pipeline_planner as planner_module
+import elspeth.web.composer.provider_gateway as gateway_module
 from elspeth.web.composer.boot_probe import ComposerProbeRequest, build_composer_probe_requests
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -172,9 +173,8 @@ async def _run_production_turn(
     session = await sessions.create_session("parity-user", "Parity", "local")
     user_message = await sessions.add_message(session.id, "user", message, writer_principal="route_user_message")
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model=_MODEL, reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model=_MODEL, reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -277,11 +277,9 @@ async def test_planner_tools_probe_sends_the_pipeline_planner_request(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_mutation_control_dropped_reasoning_makes_the_loop_comparison_red(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import elspeth.web.composer.service as service_module
-
     settings = _settings(tmp_path)
     production = _loop_request(await _capture_production_requests(tmp_path, monkeypatch, settings, message="What can you help me build?"))
-    monkeypatch.setattr(service_module, "apply_reasoning_kwargs", lambda _kwargs, **_ignored: None)
+    monkeypatch.setattr(gateway_module, "apply_reasoning_kwargs", lambda _kwargs, **_ignored: None)
     probe = (await _capture_probe_requests(monkeypatch, settings))["loop_tools"]
 
     assert "reasoning" not in probe

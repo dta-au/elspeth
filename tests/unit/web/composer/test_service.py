@@ -37,6 +37,7 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _compose_preflight_repair_message
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
@@ -45,6 +46,9 @@ from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResol
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_planner import PipelineCandidatePolicyRejection, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
+from elspeth.web.composer.planning_application import (
+    _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -58,12 +62,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.service import (
-    ComposerAvailability,
-    ComposerServiceImpl,
-    _compose_preflight_repair_message,
-    _freeform_planner_conversation_context,
-)
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -212,19 +211,19 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         captured.append(kwargs)
         return sentinel_plan
 
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
+    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
     current_state = _empty_state()
     session_id, session_context = guided_session_authority
     # F2: the guided planner threads the same per-session schema tracker the
     # freeform batch writes — seeded here so the threading is observable.
-    composer_service_with_real_sessions._mark_plugin_schema_loaded(str(session_id), "source", "csv")
+    composer_service_with_real_sessions._schema_disclosure.mark_plugin_schema_loaded(str(session_id), "source", "csv")
     custody_fence = GuidedOperationFence(
         session_id=session_id,
         operation_id=str(uuid4()),
         lease_token=uuid4().hex,
         attempt=1,
     )
-    result, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
+    result, _catalog_ids = await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
         session_operation_context=session_context,
         intent="Build the reviewed pipeline.",
         current_state=current_state,
@@ -257,7 +256,7 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
     # callback writes back into the SAME per-session tracker (no parallel one).
     assert captured[0]["schemas_loaded"] == frozenset({("source", "csv")})
     captured[0]["mark_schema_loaded"]("transform", "field_mapper")
-    assert composer_service_with_real_sessions._schemas_loaded_for_session(str(session_id)) == frozenset(
+    assert composer_service_with_real_sessions._schema_disclosure.schemas_loaded_for_session(str(session_id)) == frozenset(
         {("source", "csv"), ("transform", "field_mapper")}
     )
 
@@ -325,13 +324,13 @@ async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
+    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
     session_id, session_context = guided_session_authority
     goal = "Route rows scoring over 8 to the review sink and everything else to the archive."
     instruction = "Actually put everything in one sink; no routing."
 
     def call(**overrides: Any):
-        return composer_service_with_real_sessions.plan_guided_pipeline(
+        return composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
             intent=instruction,
             current_state=predecessor,
             guided=guided,
@@ -460,9 +459,9 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
+    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
     session_id, session_context = guided_session_authority
-    await composer_service_with_real_sessions.plan_guided_pipeline(
+    await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
         session_operation_context=session_context,
         intent="Add a normalization transform.",
         current_state=predecessor,
@@ -528,7 +527,7 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
         assert nonsemantic_rejection.value.error_code == "guided_revision_unchanged"
 
     captured.clear()
-    await composer_service_with_real_sessions.plan_guided_pipeline(
+    await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
         session_operation_context=session_context,
         intent="Replace the current transform topology.",
         current_state=predecessor,
@@ -576,7 +575,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     sessions = cast(SessionServiceImpl | None, composer_service_with_real_sessions._sessions_service)
     assert sessions is not None
     actual_service = ComposerServiceImpl.for_trained_operator(
-        composer_service_with_real_sessions._catalog,
+        _mock_catalog(),
         composer_service_with_real_sessions._settings,
         sessions_service=sessions,
         session_engine=sessions._engine,
@@ -634,7 +633,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
 
     for guided in (ordinary, replace(ordinary, profile=TUTORIAL_PROFILE)):
         with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
-            await actual_service.plan_guided_pipeline(
+            await actual_service._planning_application.plan_guided_pipeline(
                 session_operation_context=guided_session_authority[1],
                 intent="Build the reviewed pipeline.",
                 current_state=_empty_state(),
@@ -944,10 +943,10 @@ def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_pat
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep service tests focused on compose behavior, not local API keys."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -1353,9 +1352,10 @@ class TestComposerSingleToolCall:
 
         proposal_result = result.tool_outcomes[0].response
         assert isinstance(proposal_result, ToolResult)
-        snapshot = PluginAvailabilitySnapshot.for_trained_operator(composer_service_with_real_sessions._catalog)
+        catalog = _mock_catalog()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
         expected = PolicyCatalogView.for_trained_operator(
-            composer_service_with_real_sessions._catalog,
+            catalog,
             snapshot,
         ).validate_composition_state(state)
         assert proposal_result.validation == expected.validation
@@ -1707,7 +1707,7 @@ class TestComposerSingleToolCall:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [tool_response, text_response]
             result = await service.compose("Use CSV as source", [], state, session_id=session_id)
@@ -1866,8 +1866,8 @@ class TestComposerSingleToolCall:
         with (
             patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm,
             patch.object(
-                service,
-                "_cached_runtime_preflight",
+                service._preflight,
+                "cached_runtime_preflight",
                 new_callable=AsyncMock,
                 return_value=ValidationResult(is_valid=True, checks=[], errors=[]),
             ),
@@ -1937,7 +1937,7 @@ class TestComposerMultiTurnToolCalls:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
             result = await service.compose("Build a pipeline", [], state, session_id=session_id)
@@ -2001,7 +2001,7 @@ class TestComposerMultiTurnToolCalls:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
@@ -2099,7 +2099,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
@@ -2184,7 +2184,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
@@ -2235,7 +2235,7 @@ class TestComposerMultiTurnToolCalls:
                 new_callable=AsyncMock,
                 side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
             ),
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
@@ -2286,7 +2286,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(service._provider_gateway, "_call_llm", side_effect=scripted_call_llm),
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
@@ -2322,7 +2322,7 @@ class TestComposerMultiTurnToolCalls:
                 new_callable=AsyncMock,
                 side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
             ),
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
@@ -2359,7 +2359,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(
                 service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
             ),
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
         ):
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
@@ -2394,7 +2394,7 @@ class TestComposerMultiTurnToolCalls:
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
@@ -2482,7 +2482,7 @@ class TestComposerMultiTurnToolCalls:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
@@ -2545,7 +2545,7 @@ class TestComposerMultiTurnToolCalls:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
@@ -2579,7 +2579,7 @@ def test_advisor_repair_none_preflight_publishes_unverified_not_ready() -> None:
     model's contradicting prose. ``None`` is UNKNOWN readiness: the published
     wording must not assert readiness, and the repair-cohort prose stays
     withheld."""
-    from elspeth.web.composer.service import (
+    from elspeth.web.composer.composition_completion import (
         _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
         _replace_advisor_repair_public_result,
     )
@@ -2603,7 +2603,7 @@ def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() ->
     substitution must read the SAME sentinel in the SAME direction — never as
     an affirmative readiness claim. If a future unification flips either
     consumer, this fails loudly."""
-    from elspeth.web.composer.service import (
+    from elspeth.web.composer.composition_completion import (
         _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
         _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
         _replace_advisor_repair_public_result,
@@ -2718,7 +2718,7 @@ class TestComposerConvergence:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [mut, text]
             result = await service.compose("Do it", [], state, session_id=session_id)
@@ -2761,7 +2761,7 @@ class TestComposerConvergence:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [disc, mut, text]
             result = await service.compose("Build", [], state, session_id=session_id)
@@ -3141,7 +3141,7 @@ class TestComposerErrorHandling:
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [good_call, text]
             await service.compose("Setup", [], state, session_id=session_id)
@@ -3715,7 +3715,7 @@ class TestComposerMultipleToolCallsPerTurn:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [multi_call, text]
             result = await service.compose("Setup", [], state, session_id=session_id)
@@ -3862,7 +3862,7 @@ class TestDiscoveryCache:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload", wraps=cached_discovery_payload) as cache_payload,
-            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
         ):
             result = await service.compose("Describe the missing plugin", [], _empty_state(), session_id=session_id)
 
@@ -3933,7 +3933,7 @@ class TestDiscoveryCache:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
             mock_llm.side_effect = [disc1, mutate, disc2, text]
@@ -4354,7 +4354,7 @@ class TestComposeTimeout:
 
         with (
             patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=terminal_response_after_deadline),
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
@@ -7269,11 +7269,11 @@ class TestComposerRuntimePreflightCacheAndTimeout:
     async def test_runtime_preflight_cache_reuses_same_state_version_and_settings_hash(self) -> None:
         service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
-        cache = service._new_runtime_preflight_cache()
+        cache = service._preflight.new_cache()
         preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
-        with patch.object(service, "_runtime_preflight", return_value=preflight) as mock_preflight:
-            first = await service._cached_runtime_preflight(
+        with patch.object(service._preflight, "runtime_preflight", return_value=preflight) as mock_preflight:
+            first = await service._preflight.cached_runtime_preflight(
                 state,
                 session_id=None,
                 user_id="user-1",
@@ -7281,7 +7281,7 @@ class TestComposerRuntimePreflightCacheAndTimeout:
                 initial_version=state.version,
                 session_scope="session:test",
             )
-            second = await service._cached_runtime_preflight(
+            second = await service._preflight.cached_runtime_preflight(
                 state,
                 session_id=None,
                 user_id="user-1",
@@ -7321,7 +7321,7 @@ class TestComposerRuntimePreflightCacheAndTimeout:
         release_first = threading.Event()
         second_joined_coordinator = asyncio.Event()
         coordinator_calls = 0
-        coordinator = service._runtime_preflight_coordinator
+        coordinator = service._preflight._coordinator
         original_run = coordinator.run
 
         def preflight(
@@ -7346,26 +7346,26 @@ class TestComposerRuntimePreflightCacheAndTimeout:
             return await original_run(*args, **kwargs)
 
         with (
-            patch.object(service, "_runtime_preflight", side_effect=preflight) as mock_preflight,
+            patch.object(service._preflight, "runtime_preflight", side_effect=preflight) as mock_preflight,
             patch.object(coordinator, "run", side_effect=observed_run),
         ):
             first_task = asyncio.create_task(
-                service._cached_runtime_preflight(
+                service._preflight.cached_runtime_preflight(
                     first_state,
                     session_id=None,
                     user_id="user-1",
-                    cache=service._new_runtime_preflight_cache(),
+                    cache=service._preflight.new_cache(),
                     initial_version=first_state.version,
                     session_scope="session:unsaved",
                 )
             )
             assert await asyncio.to_thread(first_started.wait, 5)
             second_task = asyncio.create_task(
-                service._cached_runtime_preflight(
+                service._preflight.cached_runtime_preflight(
                     second_state,
                     session_id=None,
                     user_id="user-1",
-                    cache=service._new_runtime_preflight_cache(),
+                    cache=service._preflight.new_cache(),
                     initial_version=second_state.version,
                     session_scope="session:unsaved",
                 )
@@ -7384,7 +7384,7 @@ class TestComposerRuntimePreflightCacheAndTimeout:
         settings = _make_settings(composer_runtime_preflight_timeout_seconds=0.01)
         service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
         state = _empty_state()
-        cache = service._new_runtime_preflight_cache()
+        cache = service._preflight.new_cache()
         started = threading.Event()
         release = threading.Event()
 
@@ -7394,9 +7394,9 @@ class TestComposerRuntimePreflightCacheAndTimeout:
             return ValidationResult(is_valid=True, checks=[], errors=[])
 
         try:
-            with patch.object(service, "_runtime_preflight", side_effect=slow_preflight) as mock_preflight:
+            with patch.object(service._preflight, "runtime_preflight", side_effect=slow_preflight) as mock_preflight:
                 with pytest.raises(ComposerRuntimePreflightError) as first:
-                    await service._cached_runtime_preflight(
+                    await service._preflight.cached_runtime_preflight(
                         state,
                         session_id=None,
                         user_id="user-1",
@@ -7408,7 +7408,7 @@ class TestComposerRuntimePreflightCacheAndTimeout:
                 assert started.is_set()
 
                 with pytest.raises(ComposerRuntimePreflightError) as second:
-                    await service._cached_runtime_preflight(
+                    await service._preflight.cached_runtime_preflight(
                         state,
                         session_id=None,
                         user_id="user-1",
@@ -7446,14 +7446,14 @@ class TestComposerRuntimePreflightCacheAndTimeout:
             return expected
 
         try:
-            with patch.object(service, "_runtime_preflight", side_effect=hung_preflight) as mock_preflight:
+            with patch.object(service._preflight, "runtime_preflight", side_effect=hung_preflight) as mock_preflight:
                 for _ in range(3):
                     with pytest.raises(ComposerRuntimePreflightError) as failure:
-                        await service._cached_runtime_preflight(
+                        await service._preflight.cached_runtime_preflight(
                             state,
                             session_id=None,
                             user_id="user-1",
-                            cache=service._new_runtime_preflight_cache(),
+                            cache=service._preflight.new_cache(),
                             initial_version=state.version - 1,
                             session_scope="session:test",
                         )
@@ -7461,8 +7461,8 @@ class TestComposerRuntimePreflightCacheAndTimeout:
                 assert started.is_set()
                 # One sync worker for three timed-out compose calls.
                 mock_preflight.assert_called_once()
-                key = service._runtime_preflight_key(state, session_scope="session:test", plugin_snapshot=None)
-                assert key in service._runtime_preflight_coordinator._inflight
+                key = service._preflight.key(state, session_scope="session:test", plugin_snapshot=None)
+                assert key in service._preflight._coordinator._inflight
 
                 # A retry that arrives with budget to spare joins the running
                 # worker and receives its real result.
@@ -7470,7 +7470,7 @@ class TestComposerRuntimePreflightCacheAndTimeout:
                     raise AssertionError("retry started a second preflight instead of joining the running one")
 
                 patient = asyncio.create_task(
-                    service._runtime_preflight_coordinator.run(key, must_not_start, timeout=5.0),
+                    service._preflight._coordinator.run(key, must_not_start, timeout=5.0),
                 )
                 await asyncio.sleep(0)
                 release.set()
@@ -7595,15 +7595,15 @@ class TestComposerRuntimePreflightFinalGate:
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.return_value = llm_response
-            with patch.object(service, "_runtime_preflight", return_value=failed_preflight) as mock_preflight:
-                result = await service._finalize_no_tool_response(
+            with patch.object(service._preflight, "runtime_preflight", return_value=failed_preflight) as mock_preflight:
+                result = await service._completion._finalize_no_tool_response(
                     content="The pipeline is complete and valid.",
                     state=changed_state,
                     initial_version=state.version,
                     user_id="user-1",
                     session_id=None,
                     last_runtime_preflight=None,
-                    runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                    runtime_preflight_cache=service._preflight.new_cache(),
                     session_scope="session:test",
                 )
 
@@ -7653,15 +7653,15 @@ class TestComposerRuntimePreflightFinalGate:
         )
         model_prose = "Review is pending for cool."
 
-        with patch.object(service, "_runtime_preflight", return_value=pending_preflight) as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight", return_value=pending_preflight) as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=changed_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=True,
             )
@@ -7678,15 +7678,15 @@ class TestComposerRuntimePreflightFinalGate:
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content="I can help with that.",
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -7723,15 +7723,15 @@ class TestComposerRuntimePreflightFinalGate:
             ],
         )
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=preview_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -7755,15 +7755,15 @@ class TestComposerRuntimePreflightFinalGate:
         state = _empty_state()
         passing_preview_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=passing_preview_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -7781,15 +7781,15 @@ class TestComposerRuntimePreflightFinalGate:
         changed_state = replace(state, version=state.version + 1)
         passed_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
-        with patch.object(service, "_runtime_preflight", return_value=passed_preflight):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight", return_value=passed_preflight):
+            result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=changed_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -7806,17 +7806,17 @@ class TestComposerRuntimePreflightFinalGate:
         changed_state = replace(state, version=state.version + 1)
 
         with (
-            patch.object(service, "_runtime_preflight", side_effect=RuntimeError("boom")),
+            patch.object(service._preflight, "runtime_preflight", side_effect=RuntimeError("boom")),
             pytest.raises(ComposerRuntimePreflightError) as exc_info,
         ):
-            await service._finalize_no_tool_response(
+            await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete.",
                 state=changed_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -7907,7 +7907,7 @@ class TestEmptyStateFinalizePassthrough:
         assert _state_is_structurally_empty(state) is False
 
     def test_compose_empty_state_message_appends_system_suffix(self) -> None:
-        from elspeth.web.composer.service import _compose_empty_state_message
+        from elspeth.web.composer.no_tool_policy import compose_empty_state_message as _compose_empty_state_message
 
         content = "I tried to build the pipeline but couldn't converge."
         msg = _compose_empty_state_message(content)
@@ -7921,7 +7921,7 @@ class TestEmptyStateFinalizePassthrough:
     def test_compose_empty_state_message_handles_empty_content(self) -> None:
         """Edge case: model produced no content at all. Suffix becomes the
         whole message (better than silence)."""
-        from elspeth.web.composer.service import _compose_empty_state_message
+        from elspeth.web.composer.no_tool_policy import compose_empty_state_message as _compose_empty_state_message
 
         msg = _compose_empty_state_message("")
         assert "[ELSPETH-SYSTEM]" in msg
@@ -7933,7 +7933,7 @@ class TestEmptyStateFinalizePassthrough:
         having to consult the audit DB. This is defense-in-depth: the model's
         prose usually mentions the blocker, but not always.
         """
-        from elspeth.web.composer.service import _compose_empty_state_message
+        from elspeth.web.composer.no_tool_policy import compose_empty_state_message as _compose_empty_state_message
 
         content = "I tried to build but the source binding failed."
         blocker = "set_pipeline returned success=false: schema: Field required"
@@ -7952,7 +7952,7 @@ class TestEmptyStateFinalizePassthrough:
         The ``Cause:`` field is omitted to avoid implying a cause that
         isn't there.
         """
-        from elspeth.web.composer.service import _compose_empty_state_message
+        from elspeth.web.composer.no_tool_policy import compose_empty_state_message as _compose_empty_state_message
 
         msg = _compose_empty_state_message("I tried.", blocker=None)
         assert "[ELSPETH-SYSTEM]" in msg
@@ -7965,7 +7965,7 @@ class TestEmptyStateFinalizePassthrough:
         and the empty-state augmentation builder degenerates to suffix-only output
         for empty inputs.
         """
-        from elspeth.web.composer.service import _enforce_augmentation_prefix_invariant
+        from elspeth.web.composer.no_tool_policy import enforce_augmentation_prefix_invariant as _enforce_augmentation_prefix_invariant
 
         _enforce_augmentation_prefix_invariant(branch="test", content="model prose", augmented="model prose [ELSPETH-SYSTEM] suffix")
         _enforce_augmentation_prefix_invariant(branch="test", content="model prose", augmented="model prose")
@@ -7978,7 +7978,7 @@ class TestEmptyStateFinalizePassthrough:
         as replacement (LLM gets [INTERCEPTED] prefixed onto its own prose).
         """
         from elspeth.contracts.errors import AuditIntegrityError
-        from elspeth.web.composer.service import _enforce_augmentation_prefix_invariant
+        from elspeth.web.composer.no_tool_policy import enforce_augmentation_prefix_invariant as _enforce_augmentation_prefix_invariant
 
         with pytest.raises(AuditIntegrityError) as exc_info:
             _enforce_augmentation_prefix_invariant(
@@ -8044,13 +8044,13 @@ class TestEmptyStateFinalizePassthrough:
         )
 
     def test_last_mutation_was_pending_proposal_true_for_approval_required_payload(self) -> None:
-        from elspeth.web.composer.service import _last_mutation_was_pending_proposal
+        from elspeth.web.composer.no_tool_policy import last_mutation_was_pending_proposal as _last_mutation_was_pending_proposal
 
         invocations = (self._proposal_invocation(),)
         assert _last_mutation_was_pending_proposal(invocations) is True
 
     def test_last_mutation_was_pending_proposal_false_for_empty_invocations(self) -> None:
-        from elspeth.web.composer.service import _last_mutation_was_pending_proposal
+        from elspeth.web.composer.no_tool_policy import last_mutation_was_pending_proposal as _last_mutation_was_pending_proposal
 
         assert _last_mutation_was_pending_proposal(()) is False
 
@@ -8061,7 +8061,7 @@ class TestEmptyStateFinalizePassthrough:
         from datetime import UTC, datetime
 
         from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
-        from elspeth.web.composer.service import _last_mutation_was_pending_proposal
+        from elspeth.web.composer.no_tool_policy import last_mutation_was_pending_proposal as _last_mutation_was_pending_proposal
 
         proposal = self._proposal_invocation()
         discovery = ComposerToolInvocation(
@@ -8089,7 +8089,7 @@ class TestEmptyStateFinalizePassthrough:
         from datetime import UTC, datetime
 
         from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
-        from elspeth.web.composer.service import _last_mutation_was_pending_proposal
+        from elspeth.web.composer.no_tool_policy import last_mutation_was_pending_proposal as _last_mutation_was_pending_proposal
 
         proposal = self._proposal_invocation()
         arg_error = ComposerToolInvocation(
@@ -8118,7 +8118,7 @@ class TestEmptyStateFinalizePassthrough:
         from datetime import UTC, datetime
 
         from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
-        from elspeth.web.composer.service import _last_mutation_was_pending_proposal
+        from elspeth.web.composer.no_tool_policy import last_mutation_was_pending_proposal as _last_mutation_was_pending_proposal
 
         create_blob_inv = ComposerToolInvocation(
             tool_call_id="call_blob",
@@ -8161,15 +8161,15 @@ class TestEmptyStateFinalizePassthrough:
             "state, so it has not been applied yet."
         )
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 user_message="please build me a pipeline",
                 tool_invocations=(self._proposal_invocation(),),
@@ -8220,15 +8220,15 @@ class TestEmptyStateFinalizePassthrough:
             "needs one more valid build pass to supply the right options."
         )
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=invalid_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8270,15 +8270,15 @@ class TestEmptyStateFinalizePassthrough:
             ],
         )
 
-        with patch.object(service, "_runtime_preflight", return_value=invalid_preflight):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight", return_value=invalid_preflight):
+            result = await service._completion._finalize_no_tool_response(
                 content="Model prose explaining the gap.",
                 state=bumped_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8339,15 +8339,15 @@ class TestEmptyStateFinalizePassthrough:
         )
         model_prose = "The pipeline is complete and valid."
 
-        with patch.object(service, "_runtime_preflight", return_value=invalid_preflight):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight", return_value=invalid_preflight):
+            result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=bumped_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8417,15 +8417,15 @@ class TestEmptyStateFinalizePassthrough:
             ],
         )
 
-        with patch.object(service, "_runtime_preflight", return_value=invalid_preflight):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight", return_value=invalid_preflight):
+            result = await service._completion._finalize_no_tool_response(
                 content="",
                 state=bumped_state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8452,15 +8452,15 @@ class TestEmptyStateFinalizePassthrough:
         state = _empty_state()
         valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
-        with patch.object(service, "_runtime_preflight"):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight"):
+            result = await service._completion._finalize_no_tool_response(
                 content="All good.",
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8518,15 +8518,15 @@ class TestEmptyStateFinalizePassthrough:
         # Prose contradicts state: claims discard, but state has rejected_records.
         contradicting_prose = "I see the issue — the source still uses `on_validation_failure: discard`, so I'll fix that next."
 
-        with patch.object(service, "_runtime_preflight"):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight"):
+            result = await service._completion._finalize_no_tool_response(
                 content=contradicting_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
             )
 
@@ -8585,15 +8585,15 @@ class TestEmptyStateFinalizePassthrough:
         valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         unmotivated_prose = "I just fixed the workflow behavior. All set now."
 
-        with patch.object(service, "_runtime_preflight"):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight"):
+            result = await service._completion._finalize_no_tool_response(
                 content=unmotivated_prose,
                 state=state,
                 initial_version=state.version,  # unchanged → no mutation
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=False,
             )
@@ -8646,15 +8646,15 @@ class TestEmptyStateFinalizePassthrough:
         # Prose accurately reports state: it correctly says rejected_records.
         grounded_prose = "I configured the source with `on_validation_failure: rejected_records`. The pipeline is ready."
 
-        with patch.object(service, "_runtime_preflight"):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight"):
+            result = await service._completion._finalize_no_tool_response(
                 content=grounded_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=valid_preflight,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=True,
             )
@@ -8708,15 +8708,15 @@ class TestEmptyStateFinalizePassthrough:
         )
         agreement_prose = "You're right, I'll change that to rejected_records."
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=agreement_prose,
                 state=state,
                 initial_version=state.version,  # unchanged → no mutation
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,  # no preview was called
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=False,
             )
@@ -8778,15 +8778,15 @@ class TestEmptyStateFinalizePassthrough:
         )
         t5_prose = "I fixed the workflow behavior so source validation is no longer silently dropping rows from the record set."
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=t5_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=False,
             )
@@ -8844,15 +8844,15 @@ class TestEmptyStateFinalizePassthrough:
         # pattern. The detector must NOT flag this.
         innocuous_prose = "I fixed it."
 
-        with patch.object(service, "_runtime_preflight") as mock_preflight:
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight") as mock_preflight:
+            result = await service._completion._finalize_no_tool_response(
                 content=innocuous_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=False,
             )
@@ -8883,15 +8883,15 @@ class TestEmptyStateFinalizePassthrough:
         )
         agreement_prose = "You're right, I'll change that to rejected_records."
 
-        with patch.object(service, "_runtime_preflight"):
-            result = await service._finalize_no_tool_response(
+        with patch.object(service._preflight, "runtime_preflight"):
+            result = await service._completion._finalize_no_tool_response(
                 content=agreement_prose,
                 state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
                 last_runtime_preflight=None,
-                runtime_preflight_cache=service._new_runtime_preflight_cache(),
+                runtime_preflight_cache=service._preflight.new_cache(),
                 session_scope="session:test",
                 mutation_success_seen=True,  # the model DID act
             )
@@ -8913,7 +8913,7 @@ class TestEmptyStateFinalizePassthrough:
 
 
 class TestAttemptProofRepair:
-    """Direct exercise of ComposerServiceImpl._attempt_proof_repair."""
+    """Direct exercise of CompositionCompletion._attempt_proof_repair."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path: Path):
@@ -9062,7 +9062,7 @@ class TestAttemptProofRepair:
     def test_returns_clear_when_no_blocking_diagnostics(self) -> None:
         state = self._state_without_blob()
         messages: list[dict[str, Any]] = []
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9074,11 +9074,10 @@ class TestAttemptProofRepair:
         assert messages == []
 
     def test_returns_blocked_when_budget_exhausted(self) -> None:
-        from elspeth.web.composer.service import _MAX_REPAIR_TURNS
 
         state = self._state_with_blocking_csv()
         messages: list[dict[str, Any]] = []
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9092,7 +9091,7 @@ class TestAttemptProofRepair:
     def test_appends_repair_message_when_blocking(self) -> None:
         state = self._state_with_blocking_csv()
         messages: list[dict[str, Any]] = []
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9116,7 +9115,7 @@ class TestAttemptProofRepair:
         state = self._state_with_blocking_csv(schema={"mode": "observed"})
         messages: list[dict[str, Any]] = []
 
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9158,7 +9157,7 @@ class TestAttemptProofRepair:
         state = self._state_with_blocking_csv(schema={"mode": "observed"})
         messages: list[dict[str, Any]] = []
 
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9187,7 +9186,7 @@ class TestAttemptProofRepair:
         state = self._state_with_blocking_csv()
         messages: list[dict[str, Any]] = []
         # Simulate one already-used repair turn
-        outcome = self.service._attempt_proof_repair(
+        outcome = self.service._completion._attempt_proof_repair(
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
@@ -9203,13 +9202,13 @@ class TestAttemptProofRepair:
         Patch compute_proof_diagnostics to raise a synthetic 'plugin bug';
         _attempt_proof_repair must not swallow it.
         """
-        from elspeth.web.composer import service as svc_module
+        from elspeth.web.composer import composition_completion as svc_module
 
         with (
             patch.object(svc_module, "compute_proof_diagnostics", side_effect=RuntimeError("simulated plugin crash")),
             pytest.raises(RuntimeError, match="simulated plugin crash"),
         ):
-            self.service._attempt_proof_repair(
+            self.service._completion._attempt_proof_repair(
                 state=self._state_with_blocking_csv(),
                 llm_messages=[],
                 session_id=self.session_id,
@@ -9227,7 +9226,7 @@ class TestAttemptProofRepair:
         deterministic 5-item list of blocking entries — the synthesiser is
         the unit under test, and the diagnostic source is irrelevant.
         """
-        from elspeth.web.composer import service as svc_module
+        from elspeth.web.composer import composition_completion as svc_module
 
         fake_blockers = [
             {
@@ -9241,7 +9240,7 @@ class TestAttemptProofRepair:
         ]
         messages: list[dict[str, Any]] = []
         with patch.object(svc_module, "compute_proof_diagnostics", return_value=fake_blockers):
-            outcome = self.service._attempt_proof_repair(
+            outcome = self.service._completion._attempt_proof_repair(
                 state=self._state_without_blob(),
                 llm_messages=messages,
                 session_id=self.session_id,
@@ -9497,7 +9496,7 @@ class TestComposeLoopForcedRepair:
         empty = _empty_state()
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_stall, turn2_build, turn3_done]
             result = await self.service.compose(
@@ -9588,7 +9587,7 @@ class TestComposeLoopForcedRepair:
         empty = _empty_state()
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_refusal, turn2_build, turn3_done]
             result = await self.service.compose(
@@ -9668,7 +9667,7 @@ class TestComposeLoopForcedRepair:
         empty = _empty_state()
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2_done, turn3, turn4_done]
             result = await self.service.compose(
@@ -9727,7 +9726,6 @@ class TestComposeLoopForcedRepair:
           - Turn 6: claim complete → repair_turns_used==_MAX_REPAIR_TURNS,
             repair gate returns an explicit non-runnable blocker.
         """
-        from elspeth.web.composer.service import _MAX_REPAIR_TURNS
 
         # Sanity check on the constant — keeps the test honest if the
         # cap shifts.
@@ -9746,7 +9744,7 @@ class TestComposeLoopForcedRepair:
         empty = _empty_state()
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9788,7 +9786,6 @@ class TestComposeLoopForcedRepair:
         diagnostic (forced False by the proof gate even when authoring/
         runtime preflight pass).
         """
-        from elspeth.web.composer.service import _MAX_REPAIR_TURNS
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         # Turn 1 establishes the blocker. Turns 2..N all claim completion
@@ -9809,7 +9806,7 @@ class TestComposeLoopForcedRepair:
         empty = _empty_state()
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
             result = await self.service.compose(
@@ -9900,7 +9897,7 @@ class TestComposeLoopForcedRepair:
 
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done, turn2_repair, turn3_done]
             result = await self.service.compose(
@@ -9974,7 +9971,7 @@ class TestComposeLoopForcedRepair:
 
         with (
             patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done]
             result = await self.service.compose(
@@ -10000,7 +9997,7 @@ def test_log_guided_planner_failure_emits_typed_disposition() -> None:
     cbb00f4b) was opaque. This is the one in-fence emit that names the wall.
     """
     from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-    from elspeth.web.composer.service import _log_guided_planner_failure
+    from elspeth.web.composer.planning_application import _log_guided_planner_failure
 
     exc = PipelinePlannerError(
         "planner repair budget exhausted",
@@ -10031,7 +10028,7 @@ def test_log_guided_planner_failure_emits_typed_disposition() -> None:
 def test_log_guided_planner_failure_empty_rejection_codes_on_non_rejection_failure() -> None:
     """A non-rejection failure (timeout/provider) carries no rejection codes."""
     from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-    from elspeth.web.composer.service import _log_guided_planner_failure
+    from elspeth.web.composer.planning_application import _log_guided_planner_failure
 
     exc = PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT")
 

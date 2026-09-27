@@ -221,10 +221,10 @@ def _make_advisor_response(text: str = "Try setting `provider: azure` and supply
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 # --- 1. Advisor is mandatory — the tool is always exposed ---
@@ -1217,7 +1217,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     assert failed_outcome.call.function.name == "request_advisor_hint"
     assert failed_outcome.error_class == "ValueError"
     assert failed_outcome.error_message == "ValueError"
-    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    persisted_failure = json.loads(_persisted_tool_responses(service, session_id)[-1]["result_canonical"])
     assert persisted_failure["_redaction_status"] == "plugin_crash"
 
 
@@ -1730,5 +1730,5 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     failed_outcome = persist_kwargs["tool_outcomes"][-1]
     assert failed_outcome.call.function.name == "request_advisor_hint"
     assert failed_outcome.error_class == "AuditIntegrityError"
-    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    persisted_failure = json.loads(_persisted_tool_responses(service, session_id)[-1]["result_canonical"])
     assert persisted_failure["_redaction_status"] == "plugin_crash"

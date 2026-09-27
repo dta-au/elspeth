@@ -7,7 +7,7 @@ options. Backs the staging session 47cfbb5e thrash where the model
 called ``set_pipeline`` for a 4-plugin pipeline without preloading any
 schema, taking 13 tool calls / 18 LLM rounds to converge.
 
-Tracker lives on ``ComposerServiceImpl`` as
+Tracker lives in ``SchemaDisclosureTracker`` as
 ``_schemas_loaded_by_session: dict[session_id, set[(kind, plugin)]]``;
 prompts.py reads it through the ``schemas_loaded`` kwarg on
 ``build_context_string`` / ``build_messages``. This module exercises the
@@ -24,6 +24,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.prompts import build_context_string as _build_context_string
+from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -351,63 +352,51 @@ class TestSchemasLoadedUnsetSentinel:
         assert ("__elspeth_internal__", "__sentinel_schemas_loaded_unset__") in first
 
 
-class TestComposerServiceTracker:
-    """Verify the per-session tracker on ``ComposerServiceImpl``.
+class TestSchemaDisclosureTracker:
+    """Verify the session-local schema disclosure tracker.
 
     The compose-loop integration is exercised separately; these tests
     cover the accessor/marker contract in isolation so a regression in
     the tracker shape is caught before reaching the dispatch layer.
     """
 
-    def _make_service_with_tracker(self) -> Any:
-        """Construct a bare service with only the tracker fields exercised.
-
-        Bypasses the full ``__init__`` because the constructor wires
-        catalog, sessions service, and skill-hash gates that are
-        unrelated to the tracker. The tracker contract is a tiny,
-        independent surface; isolating it keeps these tests fast and
-        focused.
-        """
-        from elspeth.web.composer.service import ComposerServiceImpl
-
-        service = object.__new__(ComposerServiceImpl)
-        service._schemas_loaded_by_session = {}  # type: ignore[attr-defined]
-        return service
+    def _make_tracker(self) -> SchemaDisclosureTracker:
+        return SchemaDisclosureTracker()
 
     def test_get_returns_empty_frozenset_for_unseen_session(self) -> None:
-        service = self._make_service_with_tracker()
-        assert service._schemas_loaded_for_session("session-A") == frozenset()
+        tracker = self._make_tracker()
+        assert tracker.schemas_loaded_for_session("session-A") == frozenset()
 
     def test_get_returns_empty_frozenset_for_none_session(self) -> None:
-        service = self._make_service_with_tracker()
-        assert service._schemas_loaded_for_session(None) == frozenset()
+        tracker = self._make_tracker()
+        assert tracker.schemas_loaded_for_session(None) == frozenset()
 
     def test_mark_then_get_round_trips(self) -> None:
-        service = self._make_service_with_tracker()
-        service._mark_plugin_schema_loaded("session-A", "transform", "openrouter_llm")
-        assert service._schemas_loaded_for_session("session-A") == frozenset({("transform", "openrouter_llm")})
+        tracker = self._make_tracker()
+        tracker.mark_plugin_schema_loaded("session-A", "transform", "openrouter_llm")
+        assert tracker.schemas_loaded_for_session("session-A") == frozenset({("transform", "openrouter_llm")})
 
     def test_mark_is_session_scoped(self) -> None:
-        service = self._make_service_with_tracker()
-        service._mark_plugin_schema_loaded("session-A", "source", "csv")
-        service._mark_plugin_schema_loaded("session-B", "sink", "json")
-        assert service._schemas_loaded_for_session("session-A") == frozenset({("source", "csv")})
-        assert service._schemas_loaded_for_session("session-B") == frozenset({("sink", "json")})
+        tracker = self._make_tracker()
+        tracker.mark_plugin_schema_loaded("session-A", "source", "csv")
+        tracker.mark_plugin_schema_loaded("session-B", "sink", "json")
+        assert tracker.schemas_loaded_for_session("session-A") == frozenset({("source", "csv")})
+        assert tracker.schemas_loaded_for_session("session-B") == frozenset({("sink", "json")})
 
     def test_mark_with_none_session_is_noop(self) -> None:
         """Unsaved sessions have no persistent identity for the tracker;
         marking a None session_id must not silently keep state under a
         sentinel key that could collide with a future real session."""
-        service = self._make_service_with_tracker()
-        service._mark_plugin_schema_loaded(None, "source", "csv")
-        assert service._schemas_loaded_by_session == {}
+        tracker = self._make_tracker()
+        tracker.mark_plugin_schema_loaded(None, "source", "csv")
+        assert tracker.schemas_loaded_for_session(None) == frozenset()
 
     def test_get_returns_snapshot_not_live_view(self) -> None:
         """A subsequent mark must not mutate a previously-returned frozenset."""
-        service = self._make_service_with_tracker()
-        service._mark_plugin_schema_loaded("session-A", "source", "csv")
-        snapshot = service._schemas_loaded_for_session("session-A")
-        service._mark_plugin_schema_loaded("session-A", "sink", "json")
+        tracker = self._make_tracker()
+        tracker.mark_plugin_schema_loaded("session-A", "source", "csv")
+        snapshot = tracker.schemas_loaded_for_session("session-A")
+        tracker.mark_plugin_schema_loaded("session-A", "sink", "json")
         # snapshot remains as it was at the moment of read.
         assert snapshot == frozenset({("source", "csv")})
 

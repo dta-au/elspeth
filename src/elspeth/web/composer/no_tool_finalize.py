@@ -1,8 +1,7 @@
 """No-tool-response finalizer for the composer compose loop.
 
-Extracted verbatim from ComposerServiceImpl._finalize_no_tool_response
-(service.py) to reduce the god-class surface. The logic is UNCHANGED;
-the enclosing self reference is made explicit via the ``service`` parameter.
+Extracted from ComposerServiceImpl._finalize_no_tool_response. The runtime
+validation dependency is the Composer preflight owner.
 
 Behaviour-preservation contract: all augmentation exit shapes and the
 state-claim grounding correction path are identical to the pre-extraction
@@ -11,11 +10,10 @@ method. Pinned by the compose-loop integration tests.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
@@ -53,12 +51,9 @@ from elspeth.web.composer.state_claim_grounding import (
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
-if TYPE_CHECKING:
-    from elspeth.web.composer.service import ComposerServiceImpl
-
 
 async def finalize_no_tool_response(
-    service: ComposerServiceImpl,
+    preflight: ComposerPreflight,
     *,
     content: str,
     state: CompositionState,
@@ -250,7 +245,7 @@ async def finalize_no_tool_response(
     # empty state (e.g. a cleared source) must still pay the preflight so the
     # ``preflight_invalid_empty_state_augmentation`` branch below can carry
     # the real validator objection.
-    runtime_result: ValidationResult | None = await service._reuse_or_recompute_runtime_preflight(
+    runtime_result: ValidationResult | None = await preflight.reuse_or_recompute_runtime_preflight(
         state=state,
         user_id=user_id,
         session_id=session_id,

@@ -56,17 +56,14 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.service import (
-    ComposerAvailability,
-    ComposerServiceImpl,
-    _pending_interpretation_review_repair_message,
-)
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM
 from elspeth.web.composer.state import (
     CompositionState,
@@ -644,10 +641,10 @@ def _force_composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep tests independent of local API keys — same pattern as the wider
     composer test suite (conftest.py ``_composer_available_for_phase3``)."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="anthropic")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="anthropic")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _build_composer(
@@ -778,8 +775,8 @@ def test_composer_runtime_preflight_uses_backend_readiness_contract(
     state = _state_with_llm_node()
     expected = ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
 
-    with patch("elspeth.web.composer.service.validate_pipeline", return_value=expected) as validate:
-        result = composer._runtime_preflight(state, user_id="alice", session_id=None)
+    with patch("elspeth.web.composer.composer_preflight.validate_pipeline", return_value=expected) as validate:
+        result = composer._preflight.runtime_preflight(state, user_id="alice", session_id=None)
 
     assert result is expected
     validate.assert_called_once()
@@ -1035,7 +1032,7 @@ async def test_request_interpretation_review_result_uses_profile_aware_validatio
     )
 
     with patch(
-        "elspeth.web.composer.service.normalize_tool_result_validation",
+        "elspeth.web.composer.session_tool.normalize_tool_result_validation",
         wraps=normalize_tool_result_validation,
     ) as normalize:
         result = await composer._run_one_turn_for_test(
@@ -1407,13 +1404,13 @@ async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_tur
     repair gate as the no-tool completion claim: masked failures spend the
     shared repair budget BEFORE the handoff may complete.
     """
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
 
     composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
     session_id = await _seed_bare_session(sessions_service, "Staged review spends a repair turn")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_valid()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
 
     sink_dir = tmp_path / "outputs" / str(session_id)
     llm = _ScriptedLLM(
@@ -1487,13 +1484,13 @@ async def test_staged_review_over_unwired_draft_adds_only_reply_turn(
     elspeth-e6ff1b8c13 fixed. Wiredness (sources AND outputs) is the
     applicability axis, the same one the cross-turn arm uses.
     """
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
 
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Unwired draft keeps the handoff")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
 
     llm = _ScriptedLLM(
         [
@@ -1542,14 +1539,15 @@ async def test_staged_review_with_spent_budget_withholds_cards_for_invalid_graph
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A spent repair budget cannot turn a broken graph into review cards."""
-    from elspeth.web.composer import service as service_module
+    from elspeth.web.composer import composer_preflight as preflight_module
+    from elspeth.web.composer import composition_completion as completion_module
 
     composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
     session_id = await _seed_bare_session(sessions_service, "Spent budget completes qualified")
 
     fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_structural_failure()])
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
-    monkeypatch.setattr(service_module, "_MAX_REPAIR_TURNS", 0)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
+    monkeypatch.setattr(completion_module, "_MAX_REPAIR_TURNS", 0)
 
     llm = _ScriptedLLM(_staged_review_script_prefix(sink_path=str(tmp_path / "outputs" / str(session_id) / "output.csv")))
 
@@ -1875,7 +1873,7 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     and ``affected_nodes`` must exclude source sites (mirroring the runtime
     preflight's ``InterpretationReviewPending`` handling).
     """
-    from elspeth.web.composer.service import _orphaned_interpretation_review_validation
+    from elspeth.web.composer.composition_completion import _orphaned_interpretation_review_validation
 
     result = _orphaned_interpretation_review_validation(
         (
@@ -2035,7 +2033,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -2045,7 +2043,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3264,10 +3262,10 @@ async def test_f6_rate_cap_branch_emits_telemetry_and_writes_audit_row(
        template).
     """
     composer = _build_composer(tmp_path, sessions_service)
-    # Swap in a fresh telemetry container so we can inspect the
-    # interpretation_rate_cap_exceeded_total counter cleanly.
+    # Replace the counter on the actual session-tool owner. The composition
+    # root supplies an OTel counter, which observed_value cannot inspect.
     telemetry = build_sessions_telemetry()
-    composer._telemetry = telemetry  # type: ignore[attr-defined]
+    composer._session_tools._telemetry = telemetry
 
     # Multi-node state — the rate cap is keyed on ``user_term``, NOT
     # ``affected_node_id``. Three distinct sites all reference the same
@@ -3572,7 +3570,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3582,7 +3580,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3630,7 +3628,7 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
 
     llm_messages: list[dict[str, Any]] = []
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="Select the colour column.",
             llm_messages=llm_messages,
@@ -3640,7 +3638,7 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3683,7 +3681,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
         content = "Done — the pipeline is ready for review."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="Select the colour column.",
             llm_messages=[],
@@ -3693,7 +3691,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3835,7 +3833,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3845,7 +3843,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -3920,7 +3918,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -3930,7 +3928,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -4049,7 +4047,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
         content = "Done — the pipeline is ready."
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        outcome = await composer._try_terminate_no_tools(
+        outcome = await composer._completion._try_terminate_no_tools(
             assistant_message=_AssistantMessage(),
             message="rate how cool the pages are",
             llm_messages=[],
@@ -4059,7 +4057,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=None,
-            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            runtime_preflight_cache=composer._preflight.new_cache(),
             session_scope=str(session_id),
             mutation_success_seen=True,
             recorder=BufferingRecorder(),
@@ -4554,6 +4552,9 @@ async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_f
             persisted_assistant_matches_current_dispatch=False,
             unwind_audit_failed=False,
             failed_turn=None,
+            redacted_assistant_tool_calls=(),
+            redacted_tool_rows=(),
+            audit_outcome=None,
         )
 
     composer._persist_turn_audit = _drop_second_persist  # type: ignore[method-assign]

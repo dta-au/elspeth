@@ -24,12 +24,12 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
+from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
-    _freeform_planner_conversation_context,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
@@ -138,10 +138,10 @@ def _make_text_only_response(content: str) -> _AdmittedLLMCompletion:
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.mark.asyncio

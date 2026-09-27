@@ -23,6 +23,7 @@ from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._dispatch import (
@@ -32,6 +33,7 @@ from elspeth.web.composer.tools._dispatch import (
     get_tool_definitions,
     require_schema_valid_arguments,
 )
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.tree_gate import iter_gate_files
 
 from .conftest import (
@@ -429,7 +431,7 @@ async def test_compose_loop_site_records_honest_class_and_category(
     assert (invocation.error_class, invocation.error_category) == (error_class, category)
     outcome = result.tool_outcomes[0]
     assert (outcome.error_class, outcome.error_category) == (error_class, category)
-    persisted = json.loads(fake_composer_service._phase3_last_redacted_tool_rows[-1].content)
+    persisted = json.loads(result.persisted_tool_row_content[-1])
     assert persisted["_redaction_status"] == "arg_error"
     assert persisted["error_category"] == category.value
     assert persisted["error_class"] == error_class
@@ -509,11 +511,18 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.anti_anchor import AntiAnchorTracker
     from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
-    from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    owner = SessionToolOwner(
+        sessions_service=None,
+        telemetry=build_sessions_telemetry(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        model_identifier="test-model",
+        provider=None,
+        composer_skill_hash="test-skill-hash",
+    )
     with pytest.raises(RuntimeError) as caught:
-        await service._dispatch_session_aware_tool(
+        await owner._dispatch_session_aware_tool(
             tool_name="request_interpretation_review",
             tool_call_id="call_1",
             arguments={},

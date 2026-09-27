@@ -20,16 +20,18 @@ from sqlalchemy import select, text, update
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
+from elspeth.web.composer import turn_audit as turn_audit_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
@@ -44,6 +46,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
+from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.session_fences import acquire_compose_context, seed_live_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -282,7 +285,7 @@ def test_current_loop_arg_error_tool_row_scrubs_arbitrary_error_message(
         error_message=canary,
     )
 
-    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+    serialized = turn_audit_module._serialize_response_via_walker(
         outcome,
         telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
     )
@@ -333,7 +336,7 @@ def test_current_loop_non_arg_failure_projection_matches_legacy(
         error_message=error_message,
     )
 
-    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+    serialized = turn_audit_module._serialize_response_via_walker(
         outcome,
         telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
         failure_status=failure_status,
@@ -401,7 +404,7 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
         with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
-            await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+            await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
                 session_id=UUID(result_session_id),
                 current_state_id=None,
                 llm_calls=(),
@@ -427,7 +430,7 @@ async def test_planner_audit_cohort_carries_the_prose_the_planner_refused_to_pub
     sessions_service = composer_service_with_real_sessions._sessions_service
     assert sessions_service is not None
     async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
-        await composer_service_with_real_sessions._persist_pipeline_planner_audit(
+        await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
             session_id=UUID(result_session_id),
             current_state_id=None,
             llm_calls=(),
@@ -484,7 +487,6 @@ async def test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_sta
 
     assert handler_calls == []
     assert batch_progress_calls == 0
-    assert composer_service_with_real_sessions._phase3_last_tool_outcomes == ()  # type: ignore[attr-defined]
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (
@@ -1386,10 +1388,12 @@ async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed
     assert persisted_invocation["arguments_canonical"] == expected_canonical
     assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
     persisted_blob = json.dumps(
-        {
-            "assistant_tool_calls": result.persisted_assistant_tool_calls,
-            "tool_rows": result.persisted_tool_row_content,
-        },
+        deep_thaw(
+            {
+                "assistant_tool_calls": result.persisted_assistant_tool_calls,
+                "tool_rows": result.persisted_tool_row_content,
+            }
+        ),
         sort_keys=True,
     )
     assert filename_canary not in persisted_blob
@@ -1481,7 +1485,14 @@ async def test_step1_plugin_bug_captures_crash_breaks_loop(
 ) -> None:
     """RuntimeError on call 2 of 3 records the crash and skips call 3."""
 
-    with pytest.raises(ComposerPluginCrashError) as excinfo:
+    with (
+        patch.object(
+            composer_service_with_real_sessions,
+            "_persist_turn_audit",
+            wraps=composer_service_with_real_sessions._persist_turn_audit,
+        ) as persist_audit,
+        pytest.raises(ComposerPluginCrashError) as excinfo,
+    ):
         await _run_one_turn(
             composer_service_with_real_sessions,
             llm=fake_llm_runtime_error_on_second,
@@ -1490,7 +1501,8 @@ async def test_step1_plugin_bug_captures_crash_breaks_loop(
 
     assert excinfo.value.__cause__ is not None
     assert isinstance(excinfo.value.__cause__, RuntimeError)
-    outcomes = composer_service_with_real_sessions._phase3_last_tool_outcomes  # type: ignore[attr-defined]
+    assert persist_audit.await_count == 1
+    outcomes = persist_audit.await_args.kwargs["tool_outcomes"]
     assert len(outcomes) == 2
     assert outcomes[0].error_class is None
     assert outcomes[1].error_class == "RuntimeError"
@@ -1552,7 +1564,15 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
         "error_class": "<redacted-plugin-crash-class>",
         "field_count": 4,
     }
-    persisted_call = composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls[0]  # type: ignore[attr-defined]
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
+    with sessions_service._engine.connect() as conn:
+        persisted_calls = conn.execute(
+            select(chat_messages_table.c.tool_calls)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role == "assistant")
+        ).scalar_one()
+    persisted_call = persisted_calls[0]
     assert json.loads(persisted_call["function"]["arguments"]) == expected_arguments
     arguments_canonical = canonical_json(invalid_arguments)
     durable_invocation = ComposerToolInvocation(
@@ -1579,7 +1599,7 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
     assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
     assert error_class_canary not in json.dumps(
         {
-            "assistant_tool_calls": composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls,  # type: ignore[attr-defined]
+            "assistant_tool_calls": persisted_calls,
             "invocation": persisted_invocation,
         },
         sort_keys=True,
@@ -1897,10 +1917,12 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
         "field_count": 5,
     }
     persisted_blob = json.dumps(
-        {
-            "assistant_tool_calls": result.persisted_assistant_tool_calls,
-            "tool_rows": result.persisted_tool_row_content,
-        },
+        deep_thaw(
+            {
+                "assistant_tool_calls": result.persisted_assistant_tool_calls,
+                "tool_rows": result.persisted_tool_row_content,
+            }
+        ),
         sort_keys=True,
     )
     assert "full_context" not in persisted_blob
@@ -2004,14 +2026,15 @@ async def test_step2_preserves_absent_raw_content_as_none(
 ) -> None:
     """Missing assistant content remains NULL in raw_content."""
 
-    await _run_one_turn(
+    result = await _run_one_turn(
         composer_service_with_real_sessions,
         llm=fake_llm_tool_call_with_no_content,
         session_id=result_session_id,
     )
 
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
-    audit_outcome = composer_service_with_real_sessions._phase3_last_audit_outcome  # type: ignore[attr-defined]
+    audit_outcome = result.audit_outcome
+    assert audit_outcome is not None
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         row = conn.execute(
             text("SELECT raw_content FROM chat_messages WHERE id = :id"),
@@ -2035,16 +2058,174 @@ async def test_step2_first_tool_turn_uses_existing_current_state_id(
         provenance="session_seed",
     )
 
-    await _run_one_turn(
+    result = await _run_one_turn(
         composer_service_with_real_sessions,
         llm=fake_llm_two_tool_calls,
         session_id=result_session_id,
         current_state_id=str(state_record.id),
     )
 
-    assert composer_service_with_real_sessions._phase3_last_expected_current_state_id == str(state_record.id)  # type: ignore[attr-defined]
-    audit_outcome = composer_service_with_real_sessions._phase3_last_audit_outcome  # type: ignore[attr-defined]
+    assert result.pre_state_id == str(state_record.id)
+    audit_outcome = result.audit_outcome
+    assert audit_outcome is not None
     assert audit_outcome.current_state_id == str(state_record.id)
+
+
+@pytest.mark.parametrize("share_diagnostics", [False, True], ids=["separate-carriers", "shared-carrier-negative-control"])
+@pytest.mark.asyncio
+async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    share_diagnostics: bool,
+) -> None:
+    """A second turn must not replace the first turn's diagnostic facts."""
+
+    service = composer_service_with_real_sessions
+    sessions_service = service._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
+    _patch_auto_commit_preferences(monkeypatch, sessions_service)
+    second_session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+        user_id="phase3-test-user",
+        auth_provider_type="local",
+        title="Overlapping compose session",
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    second_session_id = str(second_session.id)
+    first_diagnostics = _ComposeLoopDiagnostics()
+    second_diagnostics = first_diagnostics if share_diagnostics else _ComposeLoopDiagnostics()
+    first_persisted = asyncio.Event()
+    second_persisted = asyncio.Event()
+    real_persist = service._persist_turn_audit
+
+    async def _interleaved_persist(**kwargs: Any) -> Any:
+        outcome = await real_persist(**kwargs)
+        if kwargs["session_id"] == result_session_id:
+            first_persisted.set()
+            await second_persisted.wait()
+        else:
+            assert kwargs["session_id"] == second_session_id
+        return outcome
+
+    turns = {"alpha": 0, "beta": 0}
+
+    async def _llm(messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+        prompt = json.dumps(messages)
+        label = "alpha" if "overlap alpha 8472" in prompt else "beta"
+        assert label == "alpha" or "overlap beta 9351" in prompt
+        turns[label] += 1
+        if turns[label] == 1:
+            return _admit_composer_llm_completion(_tool_batch_response((f"call_{label}", "get_pipeline_state", {})))
+        return _text_response(f"finished {label}")
+
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    plugin_snapshot, policy_catalog = service._policy_context.build(None)
+    async with (
+        acquire_compose_context(sessions_service, result_session_id) as first_context,
+        acquire_compose_context(sessions_service, second_session_id) as second_context,
+    ):
+        first_state = await sessions_service.save_composition_state(
+            UUID(result_session_id),
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=first_context,
+        )
+        second_state = await sessions_service.save_composition_state(
+            UUID(second_session_id),
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=second_context,
+        )
+        with (
+            patch.object(service, "_persist_turn_audit", new=_interleaved_persist),
+            patch.object(service._provider_gateway, "_call_llm", new=_llm),
+        ):
+            first = asyncio.create_task(
+                service._compose_loop(
+                    "overlap alpha 8472",
+                    [],
+                    state,
+                    session_id=result_session_id,
+                    initial_current_state_id=str(first_state.id),
+                    deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
+                    plugin_snapshot=plugin_snapshot,
+                    policy_catalog=policy_catalog,
+                    session_operation_context=first_context,
+                    diagnostics=first_diagnostics,
+                )
+            )
+            first_persist_waiter = asyncio.create_task(first_persisted.wait())
+            done, _pending = await asyncio.wait({first, first_persist_waiter}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            if first in done:
+                first.result()
+            assert first_persist_waiter in done, "first compose did not reach turn audit persistence"
+            second = await service._compose_loop(
+                "overlap beta 9351",
+                [],
+                state,
+                session_id=second_session_id,
+                initial_current_state_id=str(second_state.id),
+                deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
+                plugin_snapshot=plugin_snapshot,
+                policy_catalog=policy_catalog,
+                session_operation_context=second_context,
+                diagnostics=second_diagnostics,
+            )
+            second_persisted.set()
+            first_result = await asyncio.wait_for(first, timeout=10)
+
+    assert turns == {"alpha": 2, "beta": 2}
+    assert [inv.tool_call_id for inv in first_result.tool_invocations] == ["call_alpha"]
+    assert [inv.tool_call_id for inv in second.tool_invocations] == ["call_beta"]
+
+    def _assert_owned_diagnostics(
+        diagnostics: _ComposeLoopDiagnostics,
+        *,
+        expected_call_id: str,
+        expected_state_id: str,
+        expected_assistant_id: str,
+        expected_tool_content: str,
+    ) -> None:
+        assert [outcome.call.id for outcome in diagnostics.tool_outcomes] == [expected_call_id], "diagnostic call id crossed sessions"
+        assert [call["id"] for call in diagnostics.redacted_assistant_tool_calls] == [expected_call_id], "redacted call crossed sessions"
+        assert [row.tool_call_id for row in diagnostics.redacted_tool_rows] == [expected_call_id], "redacted row crossed sessions"
+        assert diagnostics.redacted_tool_rows[0].content == expected_tool_content, "redacted content crossed sessions"
+        assert diagnostics.pre_state_id == expected_state_id
+        assert diagnostics.audit_outcome is not None
+        assert diagnostics.audit_outcome.assistant_id == expected_assistant_id
+        assert diagnostics.audit_outcome.current_state_id == expected_state_id
+
+    with sessions_service._engine.connect() as conn:
+        for session_id, expected_call_id, diagnostics, expected_state_id in (
+            (result_session_id, "call_alpha", first_diagnostics, str(first_state.id)),
+            (second_session_id, "call_beta", second_diagnostics, str(second_state.id)),
+        ):
+            rows = conn.execute(
+                select(chat_messages_table.c.id, chat_messages_table.c.role, chat_messages_table.c.tool_call_id)
+                .where(chat_messages_table.c.session_id == session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+            assert [row.tool_call_id for row in rows if row.role == "tool"] == [expected_call_id]
+            tool_content = conn.execute(
+                select(chat_messages_table.c.content)
+                .where(chat_messages_table.c.session_id == session_id)
+                .where(chat_messages_table.c.role == "tool")
+            ).scalar_one()
+            expected = {
+                "expected_call_id": expected_call_id,
+                "expected_state_id": expected_state_id,
+                "expected_assistant_id": next(row.id for row in rows if row.role == "assistant"),
+                "expected_tool_content": tool_content,
+            }
+
+            if share_diagnostics:
+                crossed_field = "diagnostic call id" if session_id == result_session_id else "redacted call"
+                with pytest.raises(AssertionError, match=crossed_field):
+                    _assert_owned_diagnostics(diagnostics, **expected)
+            else:
+                _assert_owned_diagnostics(diagnostics, **expected)
 
 
 @pytest.mark.asyncio

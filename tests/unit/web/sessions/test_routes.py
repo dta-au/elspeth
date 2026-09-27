@@ -5728,9 +5728,8 @@ class TestMessageRoutes:
             }
         )
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
         )
         app.state.composer_service = ComposerServiceImpl(
             app.state.catalog_service,
@@ -6981,11 +6980,10 @@ class TestLiteLLMErrorRedaction:
             raise ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner")
 
         monkeypatch.setattr("litellm.acompletion", unavailable_provider)
-        monkeypatch.setattr("elspeth.web.composer.service._LLM_API_RETRY_BASE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr("elspeth.web.composer.service.LLM_API_RETRY_BASE_DELAY_SECONDS", 0.0)
         monkeypatch.setattr(
-            ComposerServiceImpl,
-            "_compute_availability",
-            lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+            "elspeth.web.composer.service.compute_availability",
+            lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
         )
         app, service = _make_app(tmp_path, quota_enabled=True)
         app.state.settings = app.state.settings.model_copy(update={"composer_model": "test/planner", "composer_boot_probe_enabled": False})
@@ -15378,7 +15376,7 @@ def test_composer_chat_history_skips_audit_tool_messages() -> None:
 
 
 def test_composer_chat_history_marks_edited_fork_user_but_not_fork_system_row() -> None:
-    from elspeth.web.composer.service import _freeform_planner_conversation_context
+    from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
     from elspeth.web.sessions.routes import _composer_chat_history
 
     session_id = uuid.uuid4()

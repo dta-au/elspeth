@@ -230,9 +230,8 @@ def _build_app(
     )
 
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     monkeypatch.setattr("litellm.acompletion", completion)
 

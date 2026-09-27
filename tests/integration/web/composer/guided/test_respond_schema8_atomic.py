@@ -2553,7 +2553,7 @@ def test_respond_postcommit_cancellation_joins_success_writer_and_replays(
             async def decline_planner(**_kwargs: object) -> GuidedPlannerDecline:
                 return GuidedPlannerDecline(decline_text="I cannot make that revision safely.")
 
-            monkeypatch.setattr(client.app.state.composer_service, "plan_guided_pipeline", decline_planner)
+            monkeypatch.setattr(client.app.state.planning_application, "plan_guided_pipeline", decline_planner)
             body = _live_body(
                 turn,
                 proposal_id=payload["proposal_id"],

@@ -50,17 +50,18 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
         readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
     )
     masked_preflight = _AsyncRecorder(return_value=findings)
-    service._pending_handoff_outstanding_findings = masked_preflight
+    service._preflight.pending_handoff_outstanding_findings = masked_preflight
     surface = _AsyncRecorder(return_value=None)
     service._interpretation_surfacing.surface_pending_interpretation_reviews = surface
     messages = _AsyncRecorder(return_value=None)
     service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=messages)
     service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._completion._sessions_service = service._sessions_service
     session_id = str(uuid4())
     deadline = asyncio.get_running_loop().time() + (-1 if expired else 60)
 
     async def evaluate():
-        return await service._evaluate_terminal_no_tool_advisor_gate(
+        return await service._completion._evaluate_terminal_no_tool_advisor_gate(
             state=state,
             session_id=session_id,
             session_operation_context=_compose_context(session_id),
@@ -78,7 +79,7 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
             runtime_preflight=_pending_handoff_preflight(),
             user_message="Keep the requested behavior and fix the graph",
             user_id="alice",
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=0,
             session_scope="pending-advisor-terminal",
             plugin_snapshot=None,

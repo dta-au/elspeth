@@ -34,6 +34,7 @@ from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -385,6 +386,8 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             )
 
     app.state.composer_service = _DeterministicGuidedPlanner()
+    app.state.planning_application = app.state.composer_service
+    app.state.schema_disclosure = SchemaDisclosureTracker()
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = create_catalog_service()
     runtime_policy = RuntimeWebPluginConfig.from_settings(app.state.settings)
@@ -477,6 +480,8 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         restarted_app.state.scoped_secret_resolver = None
         restarted_app.state.settings = app.state.settings
         restarted_app.state.composer_service = type(app.state.composer_service)()
+        restarted_app.state.planning_application = restarted_app.state.composer_service
+        restarted_app.state.schema_disclosure = SchemaDisclosureTracker()
         restarted_app.state.rate_limiter = ComposerRateLimiter(limit=100)
         restarted_app.state.catalog_service = create_catalog_service()
         restarted_runtime_policy = RuntimeWebPluginConfig.from_settings(restarted_app.state.settings)

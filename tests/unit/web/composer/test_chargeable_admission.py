@@ -80,6 +80,8 @@ async def test_public_entry_refuses_before_provider_work(
     authority = _AdmissionService(reason)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     origin = PlannerOriginatingMessage(_SESSION_ID, None, "Build a pipeline", "owner")
@@ -90,7 +92,7 @@ async def test_public_entry_refuses_before_provider_work(
     with (
         patch.object(service._provider_gateway, "_call_llm", autospec=True) as tool_provider,
         patch.object(service._provider_gateway, "_call_text_llm", autospec=True) as text_provider,
-        patch("elspeth.web.composer.service.plan_pipeline", autospec=True) as planner,
+        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True) as planner,
         patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True) as advisor,
         pytest.raises(ComposerAdmissionRefused, match=reason.value),
     ):
@@ -105,7 +107,7 @@ async def test_public_entry_refuses_before_provider_work(
                 session_operation_context=_CONTEXT,
             )
         elif entry == "guided_full":
-            await service.plan_guided_full_pipeline(
+            await service._planning_application.plan_guided_full_pipeline(
                 intent="Build a pipeline",
                 current_state=state,
                 originating_message=origin,
@@ -117,7 +119,7 @@ async def test_public_entry_refuses_before_provider_work(
                 session_operation_context=_CONTEXT,
             )
         elif entry == "guided_delta":
-            await service.plan_guided_pipeline(
+            await service._planning_application.plan_guided_pipeline(
                 intent="Build a pipeline",
                 current_state=state,
                 guided=unused,
@@ -157,6 +159,8 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
 
@@ -297,7 +301,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     with (
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.service.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
+        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
         patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
         pytest.raises(_PlannerReached if allowed else ComposerAdmissionRefused),
     ):
@@ -312,7 +316,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
                 session_operation_context=_CONTEXT,
             )
         elif entry == "guided_full":
-            await service.plan_guided_full_pipeline(
+            await service._planning_application.plan_guided_full_pipeline(
                 intent=origin.content,
                 current_state=state,
                 originating_message=origin,
@@ -324,7 +328,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
                 session_operation_context=_CONTEXT,
             )
         elif entry == "guided_delta":
-            await service.plan_guided_pipeline(
+            await service._planning_application.plan_guided_pipeline(
                 intent=origin.content,
                 current_state=state,
                 guided=guided,
@@ -357,6 +361,8 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     second_context = SessionOperationContext(

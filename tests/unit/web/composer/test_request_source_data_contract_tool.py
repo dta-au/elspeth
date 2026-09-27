@@ -15,8 +15,8 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationEventRecord, InterpretationKind
+from elspeth.web.composer.composition_completion import _orphaned_interpretation_review_validation
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.service import _orphaned_interpretation_review_validation
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     build_source_data_contract_draft,

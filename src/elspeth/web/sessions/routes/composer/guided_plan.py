@@ -516,7 +516,7 @@ async def post_guided_plan(
         )
 
         async with _cancel_on_client_disconnect(request):
-            outcome = await request.app.state.composer_service.plan_guided_full_pipeline(
+            outcome = await request.app.state.planning_application.plan_guided_full_pipeline(
                 intent=body.intent,
                 current_state=observed_state,
                 originating_message=PlannerOriginatingMessage(

@@ -1315,14 +1315,14 @@ async def test_final_completion_claim_is_augmented_with_runtime_preflight_failur
     changed_state = replace(state, version=state.version + 1)
     model_prose = "The pipeline is complete and valid."
 
-    result = await composer._finalize_no_tool_response(
+    result = await composer._completion._finalize_no_tool_response(
         content=model_prose,
         state=changed_state,
         initial_version=state.version,
         user_id=EVAL_USER_ID,
         session_id=SCENARIO_2_SESSION_ID,
         last_runtime_preflight=None,
-        runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+        runtime_preflight_cache=composer._preflight.new_cache(),
         session_scope="session:eval",
     )
 

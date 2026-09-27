@@ -4294,7 +4294,7 @@ async def maybe_resolve_step_2_sink_chat(
     reasoning_effort: str | None = None,
     # Per-session get_plugin_schema success tracker hook — the same tracker
     # the freeform batch and planner surfaces write
-    # (ComposerServiceImpl._mark_plugin_schema_loaded, bound to a session id;
+    # (SchemaDisclosureTracker.mark_plugin_schema_loaded, bound to a session id;
     # key shape (plugin_type, plugin_name)). Only SUCCESSES mark; a
     # semantically-failed result threads back to the model unmarked.
     mark_schema_loaded: Callable[[str, str], None] | None = None,

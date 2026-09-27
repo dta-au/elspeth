@@ -52,6 +52,7 @@ from tests.integration.web.composer.test_freeform_proposal_prevalidation import 
     _harness,
     _incremental_base_state,
     _persisted_tool_content,
+    _record_phase3_outcomes,
     _ScriptedLLM,
     _tool_turn,
 )
@@ -479,7 +480,7 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
         "llm",
         "aws_bedrock_content_safety",
         "field_mapper",
-    ], (result.message, result.tool_invocations, harness.service._phase3_last_tool_outcomes)
+    ], (result.message, result.tool_invocations)
     _assert_required_control_disclosures(state_payload)
     report = build_implicit_decisions_report(result.state)
     policy_entries = [entry for entry in report["entries"] if entry["category"] == "policy_control"]
@@ -826,9 +827,8 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     assert expected is not preview.updated_state
     expected_plugins = _node_plugins(expected.to_dict())
 
-    with patch.object(
-        ComposerServiceImpl,
-        "_compute_availability",
+    with patch(
+        "elspeth.web.composer.service.compute_availability",
         return_value=ComposerAvailability(available=True, model="test-model", provider="test"),
     ):
         composer = ComposerServiceImpl.for_trained_operator(
@@ -963,6 +963,7 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls_state", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -980,7 +981,7 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == "call_incremental_finalizer_failure"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, "call_incremental_finalizer_failure")
@@ -1008,6 +1009,7 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.owned_composition_state_authority", side_effect=failure) as projector,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -1025,7 +1027,7 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     assert _count_rows(harness.engine, blobs_table) == 2
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == "call_owned_state_projection_failure"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, "call_owned_state_projection_failure")
@@ -1059,6 +1061,7 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -1077,7 +1080,7 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     assert _count_rows(harness.engine, blobs_table) == 0
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == f"call_finalizer_failure_{trust_mode}"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, f"call_finalizer_failure_{trust_mode}")

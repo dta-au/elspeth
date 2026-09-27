@@ -38,7 +38,7 @@ from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -57,10 +57,10 @@ from tests.unit.web.composer._helpers import _composer_service_with_session
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass API-key check so tests focus on compose behavior, not credentials."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)

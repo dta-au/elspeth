@@ -307,9 +307,9 @@ class TestErrorClassProducerCensus:
         assert _dishonest(_error_class_labels("planted.py", planted)) == {("planted.py", "site", "TypeError")}
 
     def test_instrument_sees_the_live_tree(self) -> None:
-        # Known positives: the LLM-call ``except TimeoutError`` sites in service.py.
+        # Known positives: the physical LLM-call ``except TimeoutError`` sites in the provider gateway.
         labels = _live_labels()
-        assert any(label.path == "service.py" and label.label == "TimeoutError" and label.backed for label in labels)
+        assert any(label.path == "provider_gateway.py" and label.label == "TimeoutError" and label.backed for label in labels)
 
     def test_every_error_class_label_names_a_raised_class(self) -> None:
         assert _dishonest(_live_labels()) == set()

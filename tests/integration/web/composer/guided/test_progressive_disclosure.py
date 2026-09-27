@@ -157,6 +157,8 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     app.state.blob_service = blob_service
     app.state.settings = settings
     app.state.composer_service = composer_service
+    app.state.planning_application = composer_service._planning_application
+    app.state.schema_disclosure = composer_service._schema_disclosure
     app.state.scoped_secret_resolver = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = catalog

@@ -381,11 +381,11 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
     user_message_id = await _seed_user_message(sessions_service, result_session_id)
     injector = _InsertInjector(sessions_service, fail_at)
     injector.install(monkeypatch)
-    preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+            return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
                 plan=_plan(),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -402,7 +402,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
                 plugin_snapshot=None,
             )
 
-    with patch.object(service, "_cached_runtime_preflight", preflight):
+    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
         if fail_at is None:
             result = await _stage()
             assert result.message
@@ -429,7 +429,7 @@ async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, r
     # so the staging turn runs under a real acquired COMPOSE operation exactly
     # as the compose route does.
     async with sessions_service._call_context(UUID(session_id), SessionOperationKind.COMPOSE) as compose_context:
-        return await driver._plan_and_stage_empty_pipeline(
+        return await driver._planning_application._plan_and_stage_empty_pipeline(
             message="build me a pipeline",
             messages=[],
             state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -467,7 +467,7 @@ async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_inde
             planner_recorder.record(invocation)
         raise PlannerDeclined("declined", decline_text="I cannot build that from the available components.")
 
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", _declining_planner)
+    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", _declining_planner)
 
     if fail_at is None:
         result = await _plan_and_stage_empty(service, result_session_id, recorder)
@@ -599,11 +599,11 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
     user_message_id = await _seed_user_message(sessions_service, result_session_id)
     gate = _GatedInsert(sessions_service)
     gate.install(monkeypatch)
-    preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+            return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
                 plan=_plan(),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -620,7 +620,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
                 plugin_snapshot=None,
             )
 
-    with patch.object(service, "_cached_runtime_preflight", preflight):
+    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
         task = asyncio.create_task(_stage())
         await asyncio.wait_for(gate.entered.wait(), timeout=2.0)
         task.cancel()

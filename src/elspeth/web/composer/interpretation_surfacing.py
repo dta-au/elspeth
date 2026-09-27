@@ -567,6 +567,8 @@ async def _surface_pending_interpretation_reviews_under_writer(
     session_operation_context: SessionOperationContext,
 ) -> None:
     """Both surfacing arms under one writer's authority."""
+    from elspeth.web.sessions.protocol import InterpretationResolveError
+
     # llm_prompt_template is already handled by the existing surfacer,
     # which carries the exact draft-aware dedup the writer boundary needs.
     await _auto_surface_prompt_template_reviews_for_state(
@@ -598,8 +600,8 @@ async def _surface_pending_interpretation_reviews_under_writer(
         # W1 backstop: the per-kind precondition above is NECESSARY but not
         # always SUFFICIENT (e.g. pipeline_decision must additionally pass
         # validate_pipeline_decision_semantics, which the surfacer does not
-        # replicate). create_pending_interpretation_event raises a ValueError
-        # subclass on any boundary mismatch, and this runs AFTER
+        # replicate). create_pending_interpretation_event raises
+        # InterpretationResolveError on an expected boundary mismatch, and this runs AFTER
         # save_composition_state at a persist seam with NO outer except — so
         # an unguarded raise would 500 and wedge the session. Skip the site
         # instead; it stays fail-closed at the run-time gate (advisory
@@ -622,7 +624,7 @@ async def _surface_pending_interpretation_reviews_under_writer(
                 provider=provider,
                 composer_skill_hash=composer_skill_hash,
             )
-        except ValueError:
+        except InterpretationResolveError:
             continue
 
 

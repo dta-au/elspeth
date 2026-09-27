@@ -12,7 +12,7 @@ only, no values) into ``result_canonical`` via the ARG_ERROR payload factory.
 These tests pin:
 
 1. ``canonicalize_pydantic_cause`` helper produces leak-safe output.
-2. The module-level ``_arg_error_payload`` factory threads
+2. The ``tool_error_payloads.arg_error_payload`` factory threads
    ``validation_errors`` through when the ``__cause__`` is a Pydantic
    ``ValidationError``.
 """
@@ -30,7 +30,7 @@ from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.web.composer.audit import canonicalize_pydantic_cause
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetSourceArgumentsModel
-from elspeth.web.composer.service import _arg_error_payload
+from elspeth.web.composer.tool_error_payloads import arg_error_payload
 
 
 class _IntFieldModel(BaseModel):
@@ -232,7 +232,7 @@ def test_real_schema_fields_remain_distinguishable_in_payload() -> None:
     else:
         raise AssertionError("model_validate should have raised")
 
-    payload = _arg_error_payload(arg_err, "set_source")
+    payload = arg_error_payload(arg_err, "set_source")
     errors = payload["validation_errors"]
     assert isinstance(errors, list)
     assert {tuple(entry["loc"]) for entry in errors} == {("plugin",), ("on_success",)}
@@ -281,11 +281,11 @@ def test_oversized_validation_error_set_uses_fixed_truncated_diagnostic() -> Non
 
 
 def test_arg_error_payload_factory_threads_validation_errors() -> None:
-    """``_arg_error_payload`` includes ``validation_errors`` when ``__cause__`` is Pydantic."""
+    """``arg_error_payload`` includes ``validation_errors`` when ``__cause__`` is Pydantic."""
     cause = _make_int_parsing_error()
     arg_err = ToolArgumentError(argument="x", expected="an integer", actual_type="str")
     arg_err.__cause__ = cause
-    payload = _arg_error_payload(arg_err, "set_metadata")
+    payload = arg_error_payload(arg_err, "set_metadata")
     assert "error" in payload
     assert "Tool 'set_metadata' failed" in payload["error"]
     assert "validation_errors" in payload
@@ -303,11 +303,11 @@ def test_arg_error_payload_factory_omits_validation_errors_for_non_pydantic_caus
     """
     arg_err = ToolArgumentError(argument="x", expected="an integer", actual_type="str")
     arg_err.__cause__ = ValueError("not pydantic")
-    payload = _arg_error_payload(arg_err, "set_metadata")
+    payload = arg_error_payload(arg_err, "set_metadata")
     assert "validation_errors" not in payload
 
     arg_err_no_cause = ToolArgumentError(argument="y", expected="a string", actual_type="int")
-    payload_no_cause = _arg_error_payload(arg_err_no_cause, "set_metadata")
+    payload_no_cause = arg_error_payload(arg_err_no_cause, "set_metadata")
     assert "validation_errors" not in payload_no_cause
 
 
@@ -319,7 +319,7 @@ def test_arg_error_payload_factory_strips_leak_vectors_end_to_end() -> None:
     assert raw_errors[0]["input"] == "not-an-int"
     arg_err = ToolArgumentError(argument="x", expected="an integer", actual_type="str")
     arg_err.__cause__ = cause
-    payload = _arg_error_payload(arg_err, "set_metadata")
+    payload = arg_error_payload(arg_err, "set_metadata")
     # Walk the payload exhaustively for the rejected value.
     import json
 
@@ -332,7 +332,7 @@ def test_arg_error_payload_factory_strips_hostile_pydantic_loc_and_message() -> 
     arg_err = ToolArgumentError(argument="content", expected="a string", actual_type="str")
     arg_err.__cause__ = _make_hostile_validation_error()
 
-    serialized = json.dumps(_arg_error_payload(arg_err, "set_metadata"), sort_keys=True)
+    serialized = json.dumps(arg_error_payload(arg_err, "set_metadata"), sort_keys=True)
     assert _PYDANTIC_LOC_CANARY not in serialized
     assert _PYDANTIC_MESSAGE_CANARY not in serialized
 

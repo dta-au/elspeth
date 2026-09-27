@@ -1730,7 +1730,7 @@ class TestStep2SchemaLoadMarking:
 
         assert status == 200, body
         assert len(completion.calls) == 2
-        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        tracker = composer_test_client.app.state.schema_disclosure.schemas_loaded_for_session(session_id)
         assert tracker == frozenset({("sink", "json")})
 
     def test_step_2_schema_failure_never_marks_the_composer_tracker(self, composer_test_client: TestClient) -> None:
@@ -1751,7 +1751,7 @@ class TestStep2SchemaLoadMarking:
 
         assert status == 200, body
         assert len(completion.calls) == 2
-        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        tracker = composer_test_client.app.state.schema_disclosure.schemas_loaded_for_session(session_id)
         assert tracker == frozenset()
 
 

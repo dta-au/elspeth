@@ -249,7 +249,7 @@ async def test_sink_loop_schema_success_marks_the_session_tracker() -> None:
     """F2: a step-2 get_plugin_schema SUCCESS reaches the marking hook.
 
     The hook is the seam the route binds to
-    ``ComposerServiceImpl._mark_plugin_schema_loaded`` — same
+    ``SchemaDisclosureTracker.mark_plugin_schema_loaded`` — same
     ``(plugin_type, plugin_name)`` key shape the freeform batch writes.
     ``list_sinks`` is discovery too but is deliberately NOT a schema load.
     """

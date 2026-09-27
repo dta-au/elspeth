@@ -170,7 +170,7 @@ class _BlockingPlanner:
 
 def _plan_setup(client: TestClient) -> tuple[str, str, dict[str, str], _BlockingPlanner]:
     planner = _BlockingPlanner()
-    client.app.state.composer_service = planner
+    client.app.state.planning_application = planner
     session_id = str(client.post("/api/sessions", json={"title": "guided plan heartbeat"}).json()["id"])
     body = {"operation_id": "00000000-0000-4000-8000-0000000000a1", "intent": "Plan until the heartbeat fails."}
     return session_id, f"/api/sessions/{session_id}/guided/plan", body, planner

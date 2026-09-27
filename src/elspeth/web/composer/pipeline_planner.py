@@ -598,7 +598,7 @@ class PlannerDeclined(PipelinePlannerError):
 class GuidedPlannerDecline:
     """A ``PlannerDeclined`` outcome carried as a return value, not raised.
 
-    Guided callers (``ComposerServiceImpl.plan_guided_full_pipeline`` and
+    Guided callers (``PlanningApplication.plan_guided_full_pipeline`` and
     ``.plan_guided_pipeline``) catch ``PlannerDeclined`` themselves and
     return this instead of letting it propagate as a
     ``PipelinePlannerError``: a decline is a conversational outcome, not a

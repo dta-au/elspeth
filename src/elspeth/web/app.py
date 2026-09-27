@@ -1894,6 +1894,8 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
     )
     app.state.interpretation_surfacing = app.state.composer_service._interpretation_surfacing
+    app.state.planning_application = app.state.composer_service._planning_application
+    app.state.schema_disclosure = app.state.composer_service._schema_disclosure
     app.state.composer_availability = app.state.composer_service.get_availability()
     # PostgreSQL owns cross-process UI state and quotas. Construction never
     # falls back to a process-local store when the database refuses a call.

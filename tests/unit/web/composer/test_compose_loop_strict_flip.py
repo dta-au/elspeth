@@ -69,10 +69,10 @@ def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _settings(**overrides: Any) -> WebSettings:
@@ -224,7 +224,7 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
     for label, strict_setting in (("strict", "preferred"), ("off", "off")):
         settings = base_settings.model_copy(update={"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": strict_setting})
         service = ComposerServiceImpl.for_trained_operator(
-            composer_service_with_real_sessions._catalog, settings, sessions_service=sessions, session_engine=sessions._engine
+            _mock_catalog(), settings, sessions_service=sessions, session_engine=sessions._engine
         )
         requests: list[dict[str, Any]] = []
 
@@ -239,7 +239,7 @@ async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_bo
 
         monkeypatch.setattr("litellm.acompletion", completion)
         with pytest.raises(PipelinePlannerError):
-            await service.plan_guided_pipeline(
+            await service._planning_application.plan_guided_pipeline(
                 session_operation_context=operation_context,
                 intent="Build the reviewed pipeline.",
                 current_state=_empty_state(),

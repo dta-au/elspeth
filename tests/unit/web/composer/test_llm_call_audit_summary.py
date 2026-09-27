@@ -5,7 +5,7 @@ Two things are pinned here.
 **The consolidation.** ``content`` for an LLM-call audit row used to be
 hand-built byte-identically at three drain sites
 (``sessions/routes/_helpers._persist_llm_calls``,
-``composer/service._persist_pipeline_planner_audit``,
+``composer/planning_application._persist_pipeline_planner_audit``,
 ``sessions/guided_audit.prepare_guided_audit_rows``). They now share one
 projection, :func:`llm_call_audit_summary`. The no-regression proof compares
 the helper against a JSON string written out literally in this file — not
@@ -53,7 +53,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptPhase,
 )
 from elspeth.web.composer.audit import llm_call_audit_summary
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
@@ -317,7 +317,7 @@ class _CapturingSessionService:
 
 
 class _PlannerAuditHost:
-    """Minimal host for the real ``ComposerServiceImpl`` drain body.
+    """Minimal host for the real ``PlanningApplication`` drain body.
 
     ``_persist_pipeline_planner_audit`` reaches ``self`` for exactly one
     thing — the sessions service. Binding the real method to this host runs
@@ -327,7 +327,8 @@ class _PlannerAuditHost:
     def __init__(self, sessions: _CapturingSessionService) -> None:
         self._sessions = sessions
 
-    def _require_sessions_service(self) -> SessionServiceProtocol:
+    @property
+    def _sessions_service(self) -> SessionServiceProtocol:
         return cast(SessionServiceProtocol, self._sessions)
 
 
@@ -367,7 +368,7 @@ class TestAllThreeDrainSitesShareOneProjection:
         )
 
         planner_session_id = uuid4()
-        await ComposerServiceImpl._persist_pipeline_planner_audit(
+        await PlanningApplication._persist_pipeline_planner_audit(
             cast(Any, host),
             session_id=planner_session_id,
             current_state_id=None,
@@ -429,7 +430,7 @@ async def test_freeform_planner_persistence_atomically_interleaves_physical_call
     response_call = _call(planner_call_ordinal=2)
 
     planner_session_id = uuid4()
-    await ComposerServiceImpl._persist_pipeline_planner_audit(
+    await PlanningApplication._persist_pipeline_planner_audit(
         cast(Any, host),
         session_id=planner_session_id,
         current_state_id=None,

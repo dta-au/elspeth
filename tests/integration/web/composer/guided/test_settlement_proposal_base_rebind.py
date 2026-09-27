@@ -189,7 +189,7 @@ def _decline_a_prose_revision(
     async def _decline(**_kwargs: object) -> GuidedPlannerDecline:
         return GuidedPlannerDecline(decline_text="I could not fit that instruction to the reviewed components.")
 
-    monkeypatch.setattr(client.app.state.composer_service, "plan_guided_pipeline", _decline)
+    monkeypatch.setattr(client.app.state.planning_application, "plan_guided_pipeline", _decline)
     declined = client.post(
         f"/api/sessions/{session_id}/guided/respond",
         json={
@@ -214,7 +214,7 @@ def _decline_a_guided_full_plan(
     async def _decline(**_kwargs: object) -> GuidedPlannerDecline:
         return GuidedPlannerDecline(decline_text="That is not something I can plan in one shot.")
 
-    monkeypatch.setattr(client.app.state.composer_service, "plan_guided_full_pipeline", _decline)
+    monkeypatch.setattr(client.app.state.planning_application, "plan_guided_full_pipeline", _decline)
     planned = client.post(
         f"/api/sessions/{session_id}/guided/plan",
         json={"operation_id": str(uuid4()), "intent": "Just plan the whole thing instead."},

@@ -48,6 +48,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
@@ -343,8 +344,7 @@ class _DispatchOutcome:
     # accumulator.
     mutation_success_observed: bool
 
-    # pre_state_id captured at the start of the dispatch turn — written to
-    # the ``self._phase3_last_expected_current_state_id`` test-hook by P3.
+    # State identity at the start of this dispatch turn.
     pre_state_id: str | None
 
     def __post_init__(self) -> None:
@@ -384,8 +384,12 @@ class _PersistOutcome:
     persisted_assistant_matches_current_dispatch: bool
     unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
+    redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...]
+    redacted_tool_rows: tuple[RedactedToolRow, ...]
+    audit_outcome: AuditOutcome | None
 
     def __post_init__(self) -> None:
+        freeze_fields(self, "redacted_assistant_tool_calls", "redacted_tool_rows")
         # Biconditional, not a one-way check: the id names a row and the
         # content is what that row holds, so one without the other is a
         # half-threaded state. Setting the id alone is the dangerous

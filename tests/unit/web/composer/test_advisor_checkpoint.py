@@ -44,6 +44,7 @@ from elspeth.web.composer.advisor_context import _node_required_input_fields
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGatePassed, AdvisorSignoffGateFact
 from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL, ADVISOR_UNAVAILABLE_USER_DETAIL
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.llm_response_parsing import admit_llm_provider_metadata
 from elspeth.web.composer.no_tool_policy import (
@@ -109,9 +110,13 @@ def _malformed_provider_error(message: str) -> _MalformedLLMResponseError:
 
 
 def _composer_service_method(name: str) -> ast.AsyncFunctionDef | ast.FunctionDef:
-    tree = ast.parse((_ROOT / "src/elspeth/web/composer/service.py").read_text(encoding="utf-8"))
-    service_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ComposerServiceImpl")
-    return next(node for node in service_class.body if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name)
+    for filename, class_name in (("service.py", "ComposerServiceImpl"), ("composition_completion.py", "CompositionCompletion")):
+        tree = ast.parse((_ROOT / "src/elspeth/web/composer" / filename).read_text(encoding="utf-8"))
+        owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        for method in owner.body:
+            if isinstance(method, (ast.AsyncFunctionDef, ast.FunctionDef)) and method.name == name:
+                return method
+    raise AssertionError(f"Composer application method {name} missing")
 
 
 def _self_method_calls(method_name: str, called_name: str) -> int:
@@ -218,7 +223,7 @@ def test_owner_describes_signoff_authority_and_end_checkpoint() -> None:
 
 
 def test_terminal_gate_docstring_scopes_user_constraint_comparison_to_supplied_evidence() -> None:
-    doc = inspect.getdoc(ComposerServiceImpl._evaluate_terminal_no_tool_advisor_gate)
+    doc = inspect.getdoc(CompositionCompletion._evaluate_terminal_no_tool_advisor_gate)
 
     assert doc is not None
     normalized = " ".join(doc.split())
@@ -240,6 +245,7 @@ def _fenced_session(service: Any) -> dict[str, Any]:
     if service._sessions_service is None:
         service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
         service._advisor_checkpoint._sessions_service = service._sessions_service
+        service._completion._sessions_service = service._sessions_service
     session_id = str(uuid.uuid4())
     return {"session_id": session_id, "session_operation_context": _compose_context(session_id)}
 
@@ -2566,7 +2572,7 @@ async def drive_try_terminate(
     result (so the clean fall-through is isolated from finalize plumbing).
     """
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_and_finalize_no_tools = _AsyncRecorder(
+    service._completion._surface_and_finalize_no_tools = _AsyncRecorder(
         return_value=finalize_result or ComposerResult(message="Done — the pipeline is ready.", state=state)
     )
     # The advisor-blocked terminal returns now run the surface+orphan-gate pair
@@ -2576,7 +2582,7 @@ async def drive_try_terminate(
     # interpretation-review-dispatch suite. Without the stub it would call the
     # real ``_auto_surface_prompt_template_reviews`` -> ``_require_sessions_service``
     # which is intentionally unwired in this advisor-focused harness.
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=orphan_result)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=orphan_result)
     # The END advisor gate only reviews a mechanically valid pipeline: the Fix 2
     # preflight-repair gate runs BEFORE it and would intercept a preflight-invalid
     # state. These tests exercise the ADVISOR, so stub the runtime preflight valid
@@ -2635,23 +2641,24 @@ async def drive_try_terminate(
     ) -> ValidationResult:
         return tolerant_stub if allow_pending_interpretation_placeholders else stubbed_preflight
 
-    service._runtime_preflight = _stubbed_runtime_preflight
+    service._preflight.runtime_preflight = _stubbed_runtime_preflight
     if runtime_preflight_absent:
         # elspeth-2ae50afcd1: the fourth preflight shape — ``None``, i.e. the
         # turn computed no preflight at all (``_turn_runtime_preflight``'s
         # question-only / unmutated-state arm, covered in its own suite).
-        service._turn_runtime_preflight = _AsyncRecorder(return_value=None)
+        service._preflight.turn_runtime_preflight = _AsyncRecorder(return_value=None)
     # A terminal END-gate block persists its publication record, so the gate
     # needs a sessions service and a UUID-shaped session id even in this
     # advisor-focused harness.
     if service._sessions_service is None:
         service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
         service._advisor_checkpoint._sessions_service = service._sessions_service
+        service._completion._sessions_service = service._sessions_service
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
     session_id = str(uuid.uuid4())
-    return await service._try_terminate_no_tools(
+    return await service._completion._try_terminate_no_tools(
         assistant_message=_AssistantMessage(),
         message=message,
         llm_messages=[] if llm_messages is None else llm_messages,
@@ -2662,7 +2669,7 @@ async def drive_try_terminate(
         initial_version=initial_version,
         user_id="alice",
         last_runtime_preflight=None,
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         session_scope="s1",
         mutation_success_seen=True,
         recorder=recorder or make_recorder(),
@@ -2888,7 +2895,7 @@ async def test_end_gate_flagged_on_last_pass_withholds_completion_only(make_serv
 async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(make_service, clean_runnable_state):
     service = make_service()
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong")
     )
@@ -2896,6 +2903,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
     service._advisor_checkpoint._advisor_blocked_result = blocked_result
     service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
     service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._completion._sessions_service = service._sessions_service
     runtime_preflight = ValidationResult(
         is_valid=True,
         checks=[],
@@ -2904,7 +2912,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
     )
 
     gate_session_id = str(uuid.uuid4())
-    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+    outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
         session_id=gate_session_id,
         session_operation_context=_compose_context(gate_session_id),
@@ -2922,7 +2930,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         runtime_preflight=runtime_preflight,
         user_message="Review this pipeline",
         user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
@@ -4006,7 +4014,7 @@ async def test_end_gate_masked_graph_failure_blocks_handoff_and_names_outstandin
     assert preflight.errors[0].error_code == "advisor_signoff_blocked"
     assert ADVISOR_UNAVAILABLE_USER_DETAIL in preflight.errors[0].message
     assert service._advisor_checkpoint._run_advisor_checkpoint.await_count == 2
-    service._surface_pt_and_gate_orphans_or_none.assert_not_awaited()
+    service._completion._surface_pt_and_gate_orphans_or_none.assert_not_awaited()
     assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE not in outcome.result.message
     assert "Edge contract violation" in outcome.result.message
     assert outcome.result.advisor_terminal_publication.preflight_shape == "red"
@@ -4879,13 +4887,14 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
 
     service = make_service()
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
     )
     sessions = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
     service._sessions_service = sessions
     service._advisor_checkpoint._sessions_service = sessions
+    service._completion._sessions_service = sessions
     session_id = str(uuid.uuid4())
     runtime_preflight = ValidationResult(
         is_valid=True,
@@ -4896,9 +4905,9 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     # This test isolates publication over a verified graph. The fixture's
     # intentionally skeletal LLM options are not a runtime-valid pipeline;
     # model the masked validation required before review-card publication.
-    service._pending_handoff_outstanding_findings = _AsyncRecorder(return_value=None)
+    service._preflight.pending_handoff_outstanding_findings = _AsyncRecorder(return_value=None)
 
-    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+    outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
         session_id=session_id,
         session_operation_context=_compose_context(session_id),
@@ -4916,7 +4925,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
         runtime_preflight=runtime_preflight,
         user_message="remove the gate entirely but keep the guarantee",
         user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
@@ -4924,7 +4933,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
 
     assert outcome.action == "return"
     assert outcome.result.raw_assistant_content == _AssistantMessage.content
-    assert service._pending_handoff_outstanding_findings.await_count == 1
+    assert service._preflight.pending_handoff_outstanding_findings.await_count == 1
     # Two fenced audit rows, disclosure first, then the ``terminal_block``
     # publication record (audit primacy: the row lands before the publication
     # event mirrors it). No withheld-reply row: nothing was withheld.
@@ -4951,7 +4960,7 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
     """No durable store exists without a session — the gate must still block cleanly."""
     service = make_service()
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
     )
@@ -4962,7 +4971,7 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
 
-    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+    outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
         session_id=None,
         current_state_id=None,
@@ -4979,7 +4988,7 @@ async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_servi
         runtime_preflight=runtime_preflight,
         user_message="remove the gate entirely but keep the guarantee",
         user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
@@ -5021,8 +5030,9 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
     service = make_service()
     service._sessions_service = sessions
     service._advisor_checkpoint._sessions_service = sessions
+    service._completion._sessions_service = sessions
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
     )
@@ -5038,7 +5048,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
     # acquired COMPOSE operation, released before the route's own trailing
     # assistant write below (P4-D6 family A2b).
     async with sessions._call_context(session.id, SessionOperationKind.COMPOSE) as compose_context:
-        outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+        outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
             state=clean_runnable_state,
             session_id=str(session.id),
             session_operation_context=compose_context,
@@ -5056,7 +5066,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
             runtime_preflight=runtime_preflight,
             user_message=contradiction,
             user_id="alice",
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="s1",
             plugin_snapshot=None,
@@ -5404,7 +5414,7 @@ async def _drive_gate_with_review_state(service, state, review_state):
     from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still unresolved")
     )
@@ -5414,7 +5424,7 @@ async def _drive_gate_with_review_state(service, state, review_state):
         errors=[],
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
-    return await service._evaluate_terminal_no_tool_advisor_gate(
+    return await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=state,
         session_id=None,
         current_state_id=None,
@@ -5431,7 +5441,7 @@ async def _drive_gate_with_review_state(service, state, review_state):
         runtime_preflight=runtime_preflight,
         user_message="build the thing",
         user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
@@ -5500,7 +5510,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
 
     service = _make_stalled_gate_service()
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._completion._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
     )
@@ -5516,7 +5526,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         errors=[],
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
-    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+    outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
         session_id=None,
         current_state_id=None,
@@ -5533,7 +5543,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
         runtime_preflight=runtime_preflight,
         user_message="build the thing",
         user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         initial_version=1,
         session_scope="s1",
         plugin_snapshot=None,
@@ -6087,11 +6097,13 @@ def test_bound_advisor_pipeline_summary_publishes_marker_alone_when_no_line_fits
 
 def test_both_end_gate_call_sites_pass_the_durable_gate_fact():
     """P2 and P5 share one gate; a site that omits the fact reviews where the other skips."""
+    from elspeth.web.composer import composition_completion
     from elspeth.web.composer import service as service_module
 
-    tree = ast.parse(inspect.getsource(service_module))
+    trees = (ast.parse(inspect.getsource(module)) for module in (service_module, composition_completion))
     calls = [
         node
+        for tree in trees
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)

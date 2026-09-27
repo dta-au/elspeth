@@ -254,7 +254,7 @@ def test_guided_full_completed_replay_after_restart_restores_terminal_progress(
 def test_guided_full_completed_replay_cannot_overwrite_a_newer_active_operation(
     composer_test_client,
 ) -> None:
-    original_planner = composer_test_client.app.state.composer_service
+    original_planner = composer_test_client.app.state.planning_application
     session = composer_test_client.post("/api/sessions", json={"title": "guided replay progress custody"}).json()
     older_operation_id = "00000000-0000-4000-8000-000000000078"
     older_body = {"operation_id": older_operation_id, "intent": "Build the already completed proposal."}
@@ -279,7 +279,7 @@ def test_guided_full_completed_replay_cannot_overwrite_a_newer_active_operation(
             return await original_planner.plan_guided_full_pipeline(**kwargs)
 
     planner = _BlockingNewerPlanner()
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     newer_operation_id = "00000000-0000-4000-8000-000000000079"
 
     async def replay_during_newer_operation() -> None:
@@ -342,7 +342,7 @@ def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
         async def plan_guided_full_pipeline(self, **_kwargs):
             raise asyncio.CancelledError()
 
-    composer_test_client.app.state.composer_service = _ProviderCancelledPlanner()
+    composer_test_client.app.state.planning_application = _ProviderCancelledPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "provider cancelled"}).json()
     operation_id = "00000000-0000-4000-8000-000000000054"
 
@@ -387,7 +387,7 @@ def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a
         async def plan_guided_full_pipeline(self, **_kwargs):
             return GuidedPlannerDecline(decline_text=decline_text)
 
-    composer_test_client.app.state.composer_service = _DecliningPlanner()
+    composer_test_client.app.state.planning_application = _DecliningPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full decline"}).json()
     operation_id = "00000000-0000-4000-8000-000000000056"
 
@@ -486,7 +486,7 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
             _record_failed_llm_call(kwargs["recorder"], status=ComposerLLMCallStatus.API_ERROR, secret=secret)
             raise PipelinePlannerError("safe provider failure", code="PROVIDER_ERROR")
 
-    composer_test_client.app.state.composer_service = _AuditedFailurePlanner()
+    composer_test_client.app.state.planning_application = _AuditedFailurePlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "audited guided failure"}).json()
     operation_id = "00000000-0000-4000-8000-000000000055"
 
@@ -535,7 +535,7 @@ def test_guided_plan_cancellation_during_ordinary_audit_write_keeps_original_fai
             _record_failed_llm_call(kwargs["recorder"], status=ComposerLLMCallStatus.API_ERROR, secret="safe-test-marker")
             raise PipelinePlannerError("safe provider failure", code="PROVIDER_ERROR")
 
-    composer_test_client.app.state.composer_service = _AuditedFailurePlanner()
+    composer_test_client.app.state.planning_application = _AuditedFailurePlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided plan writer custody"}).json()
     operation_id = str(uuid4())
     service = composer_test_client.app.state.session_service
@@ -620,7 +620,7 @@ def test_guided_plan_cancellation_during_tier1_audit_write_preserves_typed_abort
             _record_failed_llm_call(kwargs["recorder"], status=ComposerLLMCallStatus.API_ERROR, secret="safe-tier1-marker")
             raise original_failure
 
-    composer_test_client.app.state.composer_service = _IntegrityFailurePlanner()
+    composer_test_client.app.state.planning_application = _IntegrityFailurePlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided plan Tier-1 custody"}).json()
     operation_id = str(uuid4())
     service = composer_test_client.app.state.session_service
@@ -711,7 +711,7 @@ def test_guided_full_failure_settlement_error_surfaces_integrity_error(
     async def fail_cleanup(_command, *, session_operation_context):
         raise RuntimeError(secondary_secret)
 
-    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    composer_test_client.app.state.planning_application = _PrimaryFailurePlanner()
     monkeypatch.setattr(
         composer_test_client.app.state.session_service,
         "fail_guided_operation_with_audit",
@@ -760,7 +760,7 @@ def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcom
             return None
         return await real_reserve(**kwargs)
 
-    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    composer_test_client.app.state.planning_application = _PrimaryFailurePlanner()
     monkeypatch.setattr(
         composer_test_client.app.state.session_service,
         "fail_guided_operation_with_audit",
@@ -848,7 +848,7 @@ def test_guided_full_main_fence_loss_without_a_replayable_winner_preserves_the_p
             raise RuntimeError("SENSITIVE_LOOKUP_DETAIL")
         return None
 
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_replayable_winner)
     session = composer_test_client.post("/api/sessions", json={"title": f"guided main fence {lookup_outcome}"}).json()
     operation_id = "00000000-0000-4000-8000-000000000081"
@@ -915,7 +915,7 @@ def test_guided_full_main_fence_primary_survives_cancelled_terminal_progress_cle
 
         return publish
 
-    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    composer_test_client.app.state.planning_application = _FenceLosingPlanner()
     monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner)
     monkeypatch.setattr(registry, "bind_request", bind_with_cancelled_terminal)
     session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled terminal cleanup"}).json()
@@ -991,7 +991,7 @@ def test_guided_full_replayable_winner_survives_terminal_progress_publication_fa
 
         return publish
 
-    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    composer_test_client.app.state.planning_application = _FenceLosingPlanner()
     monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_winner)
     monkeypatch.setattr(registry, "bind_request", bind_with_failed_complete)
     operation_id = "00000000-0000-4000-8000-000000000084"
@@ -1245,7 +1245,7 @@ def test_guided_full_replay_fails_closed_on_persisted_authority_tamper(
         async def plan_guided_full_pipeline(self, **_kwargs):
             raise AssertionError("replay must not call the planner")
 
-    composer_test_client.app.state.composer_service = _ForbiddenPlanner()
+    composer_test_client.app.state.planning_application = _ForbiddenPlanner()
     with pytest.raises(AuditIntegrityError):
         composer_test_client.post(
             f"/api/sessions/{session['id']}/guided/plan",
@@ -1299,7 +1299,7 @@ def test_guided_full_provider_timeout_fails_closed_before_atomic_staging(compose
         async def plan_guided_full_pipeline(self, **_kwargs):
             raise PipelinePlannerError("bounded provider timeout", code="TIMEOUT")
 
-    composer_test_client.app.state.composer_service = _TimedOutPlanner()
+    composer_test_client.app.state.planning_application = _TimedOutPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full timeout"}).json()
     operation_id = "00000000-0000-4000-8000-000000000004"
 
@@ -1496,7 +1496,7 @@ class _InlineCustodyPlanner:
 
 
 def test_guided_full_inline_custody_settles_atomically_with_its_originating_message(composer_test_client) -> None:
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody"}).json()
 
     response = composer_test_client.post(
@@ -1538,7 +1538,7 @@ def test_guided_full_stages_inline_bytes_before_the_atomic_sql_cohort(composer_t
     """A real route stage cannot retain the cohort's SQL writer transaction."""
     from elspeth.web.blobs import service as blob_service_module
 
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "inline staging before SQL"}).json()
     engine = composer_test_client.app.state.session_engine
     active_writers: set[int] = set()
@@ -1593,7 +1593,7 @@ def test_guided_full_refuses_cohort_after_staged_bytes_lose_session_authority(co
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.composer import pipeline_custody as pipeline_custody_module
 
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "inline staging fence loss"}).json()
     service = composer_test_client.app.state.session_service
     authority = service.session_operation_authority
@@ -1659,7 +1659,7 @@ def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(c
     the two are plumbed from independent sources, so divergence must fail
     closed instead of silently enforcing whichever value arrived, and
     nothing from the staging cohort may become durable."""
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full ceiling divergence"}).json()
     # Simulate the settle-time source diverging after plan time: the fake
     # planner stamps the fixture default (500 MiB) on the preparation.
@@ -1701,7 +1701,7 @@ def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(c
 
 
 def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(composer_test_client) -> None:
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody fault"}).json()
     engine = composer_test_client.app.state.session_engine
     armed = True
@@ -1749,7 +1749,7 @@ def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(co
 
 def test_guided_full_late_fault_removes_inline_custody_artifacts_after_rollback(composer_test_client) -> None:
     """A later cohort failure must not leave rowless custody bytes behind."""
-    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    composer_test_client.app.state.planning_application = _InlineCustodyPlanner()
     session = composer_test_client.post("/api/sessions", json={"title": "guided full late custody fault"}).json()
     engine = composer_test_client.app.state.session_engine
     armed = True
@@ -1882,7 +1882,7 @@ def test_guided_full_cancel_before_staging_leaves_no_partial_cohort(composer_tes
                 raise
 
     planner = _BlockingPlanner()
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     session = composer_test_client.post("/api/sessions", json={"title": "guided full cancelled"}).json()
     operation_id = "00000000-0000-4000-8000-000000000016"
 
@@ -2160,7 +2160,7 @@ def test_guided_full_cancellation_settlement_error_surfaces_integrity_error(
         raise RuntimeError(secondary_secret)
 
     planner = _BlockingPlanner()
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     monkeypatch.setattr(
         composer_test_client.app.state.session_service,
         "fail_guided_operation_with_audit",
@@ -2228,7 +2228,7 @@ def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preservi
             return None
         return await real_reserve(**kwargs)
 
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     monkeypatch.setattr(
         composer_test_client.app.state.session_service,
         "fail_guided_operation_with_audit",
@@ -2314,7 +2314,7 @@ def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
             raise lookup_failure
         return await real_reserve(**kwargs)
 
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     monkeypatch.setattr(
         composer_test_client.app.state.session_service,
         "fail_guided_operation_with_audit",
@@ -2350,7 +2350,7 @@ def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
 def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
     composer_test_client,
 ) -> None:
-    original_planner = composer_test_client.app.state.composer_service
+    original_planner = composer_test_client.app.state.planning_application
 
     class _ControlledPlanner:
         def __init__(self) -> None:
@@ -2369,7 +2369,7 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
             return await original_planner.plan_guided_full_pipeline(**kwargs)
 
     planner = _ControlledPlanner()
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     session = composer_test_client.post("/api/sessions", json={"title": "guided full takeover"}).json()
     operation_id = "00000000-0000-4000-8000-000000000017"
     body = {"operation_id": operation_id, "intent": "One exact winner."}
@@ -2410,7 +2410,7 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
 def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
     composer_test_client,
 ) -> None:
-    original_planner = composer_test_client.app.state.composer_service
+    original_planner = composer_test_client.app.state.planning_application
 
     class _OrderedPlanner:
         def __init__(self) -> None:
@@ -2434,7 +2434,7 @@ def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
             return await original_planner.plan_guided_full_pipeline(**kwargs)
 
     planner = _OrderedPlanner()
-    composer_test_client.app.state.composer_service = planner
+    composer_test_client.app.state.planning_application = planner
     session = composer_test_client.post("/api/sessions", json={"title": "guided progress custody"}).json()
     older_operation_id = "00000000-0000-4000-8000-000000000071"
     newer_operation_id = "00000000-0000-4000-8000-000000000072"
@@ -2525,7 +2525,7 @@ def test_guided_full_main_fence_winner_lookup_integrity_failure_aborts_instead_o
             raise AuditIntegrityError("guided winner lookup could not verify the durable operation row")
         return await real_reserve(**kwargs)
 
-    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    composer_test_client.app.state.planning_application = _FenceLosingPlanner()
     monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", integrity_failure_on_lookup)
     session = composer_test_client.post("/api/sessions", json={"title": "guided lookup integrity"}).json()
     operation_id = "00000000-0000-4000-8000-0000000000a1"
