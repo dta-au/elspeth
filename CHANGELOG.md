@@ -722,6 +722,14 @@ These ran and delivered rows before:
   to agree), and a field_mapper dotted extraction merged with a carried rename
   of a declared `int` delivered too; on this branch before the fix both failed
   every row. Declare the type on every branch.
+- **A `field_mapper` with a `strict` option** (either value) is refused at
+  configuration: "field_mapper has no 'strict' option: every mapping source
+  is a required input, and a row missing one routes to on_error as
+  missing_field". Before, the option was accepted and changed nothing under
+  `elspeth run` — `strict: true` and `strict: false` ran identically for
+  plain, dotted and header-spelled sources behind observed and fixed
+  sources, because the engine checks every mapping source before the
+  mapping runs. Remove the key.
 
 These already failed and are now refused earlier or routed, with no loss:
 `output_mode: passthrough` over a flush that did not return one row per

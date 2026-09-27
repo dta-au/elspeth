@@ -1792,7 +1792,6 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
                     "colour_score": "colour_score",
                 },
                 "select_only": True,
-                "strict": True,
             },
         },
     )

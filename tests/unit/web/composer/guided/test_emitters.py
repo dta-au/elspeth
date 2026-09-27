@@ -199,7 +199,6 @@ def _field_mapper_state(*, plugin: str = "field_mapper", options: dict[str, obje
                         "schema": {"mode": "observed"},
                         "mapping": {"given_name": "first_name", "meta.source": "origin"},
                         "select_only": True,
-                        "strict": True,
                         "description": "/private/secrets.txt",
                     }
                 ),
@@ -691,7 +690,6 @@ class TestStep4WireEmitter:
         # Same hygiene rationale as ``_wire_schema``: never project adjacent
         # path/secret-shaped options, and never a knob outside the allowlist.
         assert "/private/secrets.txt" not in str(turn)
-        assert "strict" not in str(node["node_options_summary"])
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
     def test_field_mapper_options_summary_reports_the_pass_through_default(self) -> None:

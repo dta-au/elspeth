@@ -5273,7 +5273,6 @@ class TestSchemaContractValidation:
                     },
                     "mapping": {"text": "body"},
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -5306,7 +5305,6 @@ class TestSchemaContractValidation:
                 "schema": {"mode": "fixed", "fields": ["body: str", "text: str"]},
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
 
@@ -5574,7 +5572,6 @@ class TestSchemaContractValidation:
                 options={
                     "schema": {"mode": "observed"},
                     "mapping": {"text": "body"},
-                    "strict": True,
                 },
             )
         )
@@ -5813,7 +5810,6 @@ class TestSchemaContractValidation:
                 },
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
         sink = OutputSpec(
@@ -6437,7 +6433,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"first_name": "fname", "user.name": "uname", "Name": "nm"},
                     "schema": {"mode": "flexible", "fields": ["fname: str", "uname: str", "nm: str"]},
                 },
@@ -6482,7 +6477,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"user.name": "uname"},
                     "schema": {"mode": "fixed", "fields": ["user: any"]},
                 },
@@ -6515,8 +6509,8 @@ class TestSchemaContractValidation:
         """The fixed input model names ``user``; the emitted target is not an input.
 
         The old target-only schema is rejected at construction. With the root
-        declared, a present leaf succeeds and a missing child routes in
-        non-strict mode, which is the behavior that makes ``uname`` guaranteed
+        declared, a present leaf succeeds and a missing child routes, which is
+        the behavior that makes ``uname`` guaranteed
         on every successful row. The historical regression identifier is kept
         for integration-matrix traceability.
         """
@@ -6524,7 +6518,6 @@ class TestSchemaContractValidation:
 
         incoherent = {
             "select_only": True,
-            "strict": True,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["uname: str"]},
         }
@@ -6533,7 +6526,6 @@ class TestSchemaContractValidation:
 
         coherent = {
             "select_only": True,
-            "strict": False,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["user: any"]},
         }
@@ -8584,7 +8576,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -8743,8 +8734,8 @@ class TestSchemaContractValidation:
     def test_rule_d_skips_a_select_only_field_mapper_that_cannot_overwrite(self) -> None:
         """Rule D is capability-keyed: a fresh-dict writer cannot overwrite (elspeth-6ea3619737).
 
-        A ``select_only`` + ``strict`` field_mapper declares its rename target
-        (an honest guarantee — strict promises the source), and the target name
+        A ``select_only`` field_mapper declares its rename target (an honest
+        guarantee — the mapping requires its source), and the target name
         definitely arrives on its input. But ``process`` builds its output from
         a fresh ``{}``: the arriving field is dropped, never overwritten —
         which is what select_only MEANS. Before the capability key this shape
@@ -8766,7 +8757,6 @@ class TestSchemaContractValidation:
                 options={
                     "mapping": {"a": "b"},
                     "select_only": True,
-                    "strict": True,
                     "schema": {"mode": "observed"},
                 },
             )
@@ -9210,7 +9200,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -9315,7 +9304,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )

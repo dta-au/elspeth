@@ -854,7 +854,7 @@ class TestTransformExecutor:
         assert kwargs["path"] == TerminalPath.UNROUTED
         assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
 
-    def test_field_mapper_missing_mapping_source_never_reaches_non_strict_process(self) -> None:
+    def test_field_mapper_missing_mapping_source_never_reaches_process(self) -> None:
         """A derived mapping-source requirement closes the original silent-skip seam."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -867,7 +867,6 @@ class TestTransformExecutor:
                     "colour": "colour",
                     "complementary_colour": "recommended_pairing",
                 },
-                "strict": False,
             }
         )
         transform.node_id = "tidy_output"
@@ -1584,12 +1583,12 @@ class TestTransformExecutor:
         transform.process.assert_not_called()
 
     def test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight(self) -> None:
-        """End-to-end FP cure (elspeth-6ea3619737 family 1): strict + select_only.
+        """End-to-end FP cure (elspeth-6ea3619737 family 1): select_only rename.
 
         ``select_only`` builds its output from a fresh ``{}`` — it CANNOT
         overwrite an input field; a rename onto a name the input also carries
-        DROPS that input, which is what select_only means. Under ``strict:
-        true`` the target is declared (an honest guarantee), and before the
+        DROPS that input, which is what select_only means. The target is
+        declared (an honest guarantee: the mapping requires its source), and before the
         capability key this armed the collision gate: 0/5 rows survived a real
         run, quarantined with "would overwrite existing input fields" — false
         by construction.
@@ -1602,7 +1601,6 @@ class TestTransformExecutor:
             {
                 "mapping": {"a": "tgt"},
                 "select_only": True,
-                "strict": True,
                 "schema": {"mode": "observed"},
             }
         )
@@ -1778,7 +1776,7 @@ class TestTransformExecutor:
             executor.execute_transform(transform, token, ctx, attempt=0)
 
     def test_field_mapper_mapping_source_is_dispatched_as_a_required_input(self) -> None:
-        """The executor enforces d4's derived source before non-strict process()."""
+        """The executor enforces d4's derived source before process()."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         factory = _make_factory()
@@ -1787,7 +1785,6 @@ class TestTransformExecutor:
             {
                 "mapping": {"maybe_field": "output"},
                 "select_only": True,
-                "strict": False,
                 "schema": {"mode": "observed"},
             }
         )

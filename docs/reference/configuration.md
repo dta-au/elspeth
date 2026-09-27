@@ -1068,8 +1068,8 @@ transforms:
           expression: "row['first_name'] + ' ' + row['last_name']"
 ```
 
-The split is not stylistic. `field_mapper` accepts `mapping` (singular),
-`select_only`, and `strict` — there is no `computed` key, and because plugin
+The split is not stylistic. `field_mapper` accepts `mapping` (singular) and
+`select_only` — there is no `computed` key, and because plugin
 options are validated with `extra: forbid`, an unknown key is a hard
 configuration failure rather than an ignored one. Computing a value is
 `value_transform`'s job: an ordered list of `operations`, each with a `target`

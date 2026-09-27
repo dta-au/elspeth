@@ -140,7 +140,7 @@ class TestContractInvariantsAcrossAllTransforms:
                 id="json_explode",
             ),
             pytest.param(
-                lambda: FieldMapper({"mapping": {"a": "b"}, "strict": True, "schema": {"mode": "observed"}}),
+                lambda: FieldMapper({"mapping": {"a": "b"}, "schema": {"mode": "observed"}}),
                 id="field_mapper",
             ),
         ],

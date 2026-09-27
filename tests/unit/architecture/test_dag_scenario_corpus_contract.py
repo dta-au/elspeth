@@ -886,6 +886,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48f
 # observed_error), whose only user pinned the abort, is deleted, so its nine
 # `"expected_error": null` manifest literals dropped. Exactly one oracle_freeze
 # snapshot moved (this case's), sanctioned by the same ruling.
+# Rotated 2026-09-28 (elspeth-5887fb7928 B1, field_mapper `strict` retired): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper refuses the
+# retired `strict` option and routes every missing mapping source, so its
+# source_file_hash moved b96c5b5e88bcd1eb -> 4fed05d6f8252950
+# (scripts/cicd/plugin_hash); no corpus case uses field_mapper, so no manifest
+# literal, resume digest, registry digest or oracle_freeze snapshot moved.
 EXPECTED_CASE_REGISTRY_SHA256 = "7c11c485d085d128914319b804a8e1121f191d9e254aa0812b176ac534acd620"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
