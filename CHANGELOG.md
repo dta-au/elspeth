@@ -257,6 +257,12 @@ drained and repair this release forward.
   `row`, and its remedy no longer suggests `[]`);
   a multi-query `row.source_row.<column>` read must be listed in
   `required_input_fields` itself (an `image_inputs` column is refused there),
+  read by the same analysis as a single-query `row` read, so a column read
+  through an attribute filter (`row.source_row | attr('x')`,
+  `map(attribute='x')`, `selectattr('x')`, `sort`/`join`/`sum(attribute='x')`,
+  `groupby('x')`) or a `set` alias of `row.source_row` counts too, and a
+  method on a column's value (`row.source_row.get('meta', '').upper()`) is not
+  mistaken for an unbound query variable;
   and a computed key through it (`row.source_row[k]`,
   `row.source_row.get(expr)`) is refused at configuration as one through
   `row` already was, unless `required_input_fields` is `[]`;
@@ -936,8 +942,12 @@ These ran and delivered rows before:
   leaves `name` free, as keeping the field does.
 - **A template test or read of a field the node does not declare** (the
   ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
-  or a `row.source_row` column read through a `set` alias fails each row
-  with `template_rendering_failed` ("Undeclared field"). In a RAG
+  fails each row with `template_rendering_failed` ("Undeclared field"). A
+  query template's `row.source_row` column outside `required_input_fields`
+  read through an attribute filter (`row.source_row | attr('x')`,
+  `map(attribute='x')`, `selectattr`, `sort`/`join`/`sum(attribute='x')`,
+  `groupby`) or a `set` alias is refused at configuration, as the plain
+  `row.source_row.x` read already was. In a RAG
   `query_template`, a `row.<field>` read outside `required_input_fields`
   and `query_field` is refused at configuration. A `'x' in row` test there
   fails each row.

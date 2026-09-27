@@ -274,9 +274,39 @@ def extract_jinja2_field_usage(
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     if row_attribute is not None:
-        root = f"{namespace}.{row_attribute}"  # a dotted name no template can spell or shadow
+        root = _nested_row_root(namespace, row_attribute)
         ast = _NestedRowRoot(namespace, row_attribute, root).visit(ast)
         namespace = root
+    return _field_usage(ast, namespace)
+
+
+def extract_jinja2_context_fields(template_string: str, namespace: str = "row", *, row_attribute: str) -> frozenset[str]:
+    """The names a template reads on its context ``namespace`` itself, the row nested at ``namespace.row_attribute`` excluded.
+
+    Multi-query binds ``row`` to the query's variables and the row to
+    ``row.source_row``. A read through the nested row is a column read
+    (``extract_jinja2_field_usage(..., row_attribute=...)`` owns it), never a
+    context name: ``row.source_row.get('meta', '').upper()`` reads the
+    column ``meta`` and calls a method on its value, so the context names it
+    reads are none. Analysing the context with the nested row still in place
+    walks into that chain and reports ``upper`` as a variable the query
+    never binds. The nested row is rewritten to its own root first, exactly
+    as the column analysis does, so the two analyses split one template
+    between them.
+    """
+    validate_jinja_source(template_string)
+    ast = _create_field_extraction_environment().parse(template_string)
+    ast = _NestedRowRoot(namespace, row_attribute, _nested_row_root(namespace, row_attribute)).visit(ast)
+    return _field_usage(ast, namespace).fields
+
+
+def _nested_row_root(namespace: str, row_attribute: str) -> str:
+    """The root name a nested row is rewritten to: a dotted name no template can spell or shadow."""
+    return f"{namespace}.{row_attribute}"
+
+
+def _field_usage(ast: Node, namespace: str) -> Jinja2FieldExtraction:
+    """The concrete fields and dynamic accesses of ``namespace`` in a parsed template."""
     (
         namespaces,
         api_aliases,

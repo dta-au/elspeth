@@ -87,6 +87,7 @@ from elspeth.plugins.sources.field_normalization import (
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
 from elspeth.plugins.transforms.llm.base import (
     MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY,
+    multi_query_context_names,
     multi_query_source_row_columns,
     multi_query_undeclared_columns_message,
 )
@@ -4060,12 +4061,6 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
     return tuple(errors)
 
 
-# The one name build_template_context injects beside the query's own
-# input_fields variables (multi_query.py): the full source row, reachable as
-# row.source_row.<column> inside a query template.
-_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
-
-
 @dataclass(frozen=True, slots=True)
 class PromptTemplateNames:
     """The names one prompt template reads.
@@ -4099,6 +4094,23 @@ def _parse_template_names(template: str) -> tuple[PromptTemplateNames | None, st
     except (TemplateError, TemplateSyntaxError) as exc:
         return None, str(exc)
     return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=usage.fields), None
+
+
+def _parse_query_template_names(template: str) -> tuple[PromptTemplateNames | None, str | None]:
+    """``_parse_template_names`` for a multi-query query's effective template.
+
+    ``row_fields`` are the query variables it reads as ``row.<variable>``
+    (``multi_query_context_names``, shared with ``LLMConfig``): its
+    ``row.source_row`` reads are column reads, so a method on a column's
+    value (``row.source_row.get('meta', '').upper()``) is no variable.
+    """
+    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
+    try:
+        ast = create_sandboxed_environment().parse(masked)
+        variables = multi_query_context_names(masked)
+    except (TemplateError, TemplateSyntaxError) as exc:
+        return None, str(exc)
+    return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=variables), None
 
 
 @observation_boundary(
@@ -4178,7 +4190,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
         return ()
 
     node_template = node.options.get("prompt_template")
-    node_parse, _node_syntax_error = _parse_template_names(node_template) if isinstance(node_template, str) else (None, None)
+    node_parse, _node_syntax_error = _parse_query_template_names(node_template) if isinstance(node_template, str) else (None, None)
 
     errors: list[ValidationEntry] = []
     node_template_in_use = False
@@ -4193,7 +4205,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
 
         override = entry.get("template")
         if isinstance(override, str):
-            parsed, _override_syntax_error = _parse_template_names(override)
+            parsed, _override_syntax_error = _parse_query_template_names(override)
             source_desc = "its template override"
         elif override is None:
             if node_parse is None:
@@ -4227,7 +4239,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
                     )
                 )
 
-        unbound_fields = sorted(row_fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+        unbound_fields = sorted(row_fields - bound)
         if unbound_fields:
             fields = ", ".join(f"'{name}'" for name in unbound_fields)
             bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
