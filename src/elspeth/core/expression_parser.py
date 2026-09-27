@@ -760,6 +760,13 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         except TypeError:
             msg = f"type error in {op_name}: cannot apply to {type(left).__name__} and {type(right).__name__}"
             raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
+        except KeyError:
+            # ``str % mapping`` is the one operator arm that raises KeyError from
+            # row data: the format string names a key the mapping lacks. The
+            # exception's text is that key (row-derived when the format string
+            # or the mapping is), so only the mapping's type is named.
+            msg = f"%-format key not found in {type(right).__name__} ({op_name} operation)"
+            raise ExpressionEvaluationError(msg, kind="missing_key") from None
         return self._ensure_finite_float(result, context=f"{op_name} operation")
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:

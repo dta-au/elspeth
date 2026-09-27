@@ -1526,6 +1526,13 @@ class TestExpressionEvaluationErrorIsValueFree:
             ("row['n'] / row['zero']", {"n": 918273645, "zero": 0}, "division_by_zero"),
             (" * ".join(["row['n']"] * 36) + " / 3", {"n": 918273645}, "arithmetic_overflow"),
             (" * ".join(["row['n']"] * 36) + " + 0.5", {"n": 918273645}, "arithmetic_overflow"),
+            # ``%`` formatting (review r2): each exception class the operator raises from row data
+            ("row['fmt'] % {'a': 1}", {"fmt": f"%({_ROW_SENTINEL})s"}, "missing_key"),
+            ("row['fmt'] % row['lookup']", {"fmt": f"%({_ROW_SENTINEL})s", "lookup": {"a": 1}}, "missing_key"),
+            ("'%(a)s' % row['lookup']", {"lookup": {_ROW_SENTINEL: 1}}, "missing_key"),
+            ("row['fmt'] % row['n']", {"fmt": f"%{_ROW_SENTINEL}", "n": 1}, "invalid_value"),
+            ("row['fmt'] % row['n']", {"fmt": "%c", "n": 918273645}, "arithmetic_overflow"),
+            ("row['fmt'] % row['n']", {"fmt": f"%s %s {_ROW_SENTINEL}", "n": 1}, "incompatible_types"),
         ],
     )
     def test_message_names_no_row_value(self, expression: str, row: dict[str, object], kind: str) -> None:
@@ -1563,6 +1570,27 @@ class TestExpressionEvaluationErrorIsValueFree:
         with pytest.raises(ExpressionEvaluationError) as index_info:
             ExpressionParser("row['items'][-5]").evaluate({"items": [1]})
         assert str(index_info.value) == "Index -5 out of range for list of length 1"
+
+    def test_format_key_miss_names_only_the_mapping_type(self) -> None:
+        """``str % mapping`` raises KeyError whose text is the row-derived key (review r2).
+
+        It is a missing key (the mapping lacks what the format asks for), not an
+        evaluator bug to crash through, and the key is never named.
+        """
+        from types import MappingProxyType
+
+        from elspeth.testing import make_pipeline_row
+
+        with pytest.raises(ExpressionEvaluationError) as literal_info:
+            ExpressionParser("row['fmt'] % {'a': 1}").evaluate({"fmt": f"%({_ROW_SENTINEL})s"})
+        assert str(literal_info.value) == "%-format key not found in dict (Mod operation)"
+        assert literal_info.value.kind == "missing_key"
+        assert literal_info.value.__cause__ is None
+        row = make_pipeline_row({"fmt": f"%({_ROW_SENTINEL})s", "lookup": MappingProxyType({"a": 1})})
+        with pytest.raises(ExpressionEvaluationError) as frozen_info:
+            ExpressionParser("row['fmt'] % row['lookup']").evaluate(row)
+        assert str(frozen_info.value) == "%-format key not found in mappingproxy (Mod operation)"
+        assert frozen_info.value.kind == "missing_key"
 
     def test_call_names_argument_types_only(self) -> None:
         with pytest.raises(ExpressionEvaluationError) as exc_info:

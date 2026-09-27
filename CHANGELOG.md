@@ -577,7 +577,12 @@ drained and repair this release forward.
   prints `<a key the expression does not spell out>`, while a key written in
   the expression is still named, and no Python operand error text is kept.
   `value_transform` adds the arm as `error_type` (`missing_key`,
-  `index_out_of_range`, `incompatible_types`, …). A gate whose condition
+  `index_out_of_range`, `incompatible_types`, …). A `%` format whose key the
+  mapping lacks (`row['fmt'] % {...}`) is now a `missing_key` evaluation error
+  that `on_error` routes; it used to end the run, even under `on_error`, with
+  the format key as a raw `KeyError` in the failed node state (in a
+  `reference_join` output it is an `on_miss` miss, as a subscript miss is,
+  instead of a crash while loading the table). A gate whose condition
   returns an unconfigured route label or a value that is not a bool or string
   no longer records a preview or a hash of that value (a short value printed
   whole); the failure names its type, a string's length and the condition.
