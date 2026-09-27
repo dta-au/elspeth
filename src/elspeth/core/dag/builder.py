@@ -459,6 +459,7 @@ def build_execution_graph(
             output_schema=source_instance.output_schema,  # SourceProtocol requires this
             output_schema_config=source_schema_config,
             observed_value_type=source_instance.observed_value_type,
+            field_renames=source_instance.field_renames,
         )
 
     # Add sinks
@@ -562,6 +563,7 @@ def build_execution_graph(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
+            renamed_input_fields=transform.renamed_input_fields,
             preserves_input_values=transform.preserves_input_values,
             output_field_declarations=published.output_field_declarations,
             carried_output_sources=published.carried_output_sources,

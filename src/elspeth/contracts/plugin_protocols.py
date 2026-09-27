@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
     from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
+    from elspeth.contracts.field_spelling import SourceFieldRenames
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
     from elspeth.contracts.schema_contract import OutputFieldDeclaration, PipelineRow, SchemaContract
@@ -203,6 +204,18 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # whose observed values carry format-native types (json, database) stay
     # None. Consumed by resolve_guaranteed_field_type's structural source arm.
     observed_value_type: ClassVar[str | None]
+
+    # The renames this source applies: its validated ``field_mapping`` and what
+    # it matches the mapping keys against — the normalized external name
+    # (headered CSV, JSON object keys, Dataverse attributes) or, for headerless
+    # CSV, the configured column name as written. Rows are keyed by
+    # ``mapping.get(k, k)`` (``resolve_field_names``), so a declaration whose
+    # ``k`` this source renames names the rename TARGET. Read by the field-name
+    # spelling rule's build-time resolution
+    # (``contracts.field_spelling.FieldNameResolution.of_source_renames``) on
+    # both the DAG builder and the Web Composer's source probe.
+    @property
+    def field_renames(self) -> "SourceFieldRenames": ...
 
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
@@ -427,6 +440,16 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # through the named subtraction; a fixed contract is a firewall.
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
+
+    # Identity-carrying renames (field-name spelling rule): source spelling ->
+    # new name, for every field process() moves to a new key while its output
+    # contract carries the field's recorded original name onto that key
+    # (``narrow_contract_to_output(renamed_fields=...)``), so a lookup of any
+    # spelling of the old field reads the new one. The source is a LOOKUP
+    # (it may be a header spelling). Read by the build-time name resolution
+    # (``FieldNameResolution.then_renamed``) in the DAG validator and the Web
+    # Composer's mirror; empty for a transform that renames nothing.
+    renamed_input_fields: Mapping[str, str]
 
     # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
     # above say which fields survive; this one says the plugin never CHANGES a

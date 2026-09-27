@@ -280,16 +280,19 @@ class TestSharedValidators:
         assert reason["canonical_fields"] == ["amount_usd"]
         assert "1.5" not in str(excinfo.value)
 
-    def test_a_required_original_header_the_source_mapped_away_resolves_through_the_contract(self, node_kind: str) -> None:
-        """Presence resolves an ORIGINAL name exactly as ``row[field]`` does (review-R1 F1, mutant MA).
+    def test_a_required_original_header_the_source_mapped_away_is_a_header_spelling_of_its_target(self, node_kind: str) -> None:
+        """A header a source ``field_mapping`` renamed (``Weird Header`` -> ``b``) names ``b``, so declaring it is refused.
 
-        A header a source ``field_mapping`` renamed to an unrelated key
-        (``Weird Header`` -> ``b``) is not a header spelling by the rule's
-        predicate — ``normalize("Weird Header")`` is ``weird_header``, which the
-        row does not carry — so it reaches the presence check, which resolves it
-        through the contract. Reading presence off the normalized ``to_dict()``
-        keys instead would fail every such batch.
+        ``row["Weird Header"]`` reads ``b`` through the contract, while the
+        declaration met no field: the predicate once compared only
+        ``normalize("Weird Header")`` (``weird_header``, absent) and let it
+        through to presence, which resolved it — so a declaration and a lookup
+        named the field differently (Codex final review, finding 1; this test
+        pinned the admission before). The predicate now resolves the literal
+        through the row's own contract, as the lookup does, and refuses it
+        with the canonical name and the leg that named it.
         """
+        from elspeth.contracts.errors import HeaderSpelledDeclarationViolation
         from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 
         row = PipelineRow(
@@ -304,7 +307,14 @@ class TestSharedValidators:
         )
         transform = _FakeBatchTransform(input_schema=_ObservedSchema, required=frozenset({"Weird Header"}))
 
-        validate_batch_inputs(transform, [row], node_kind=node_kind)
+        with pytest.raises(HeaderSpelledDeclarationViolation) as excinfo:
+            validate_batch_inputs(transform, [row], node_kind=node_kind)
+        reason = excinfo.value.to_transform_error_reason()
+        assert reason["reason"] == "declared_field_is_header_spelling"
+        assert reason["fields"] == ["Weird Header"]
+        assert reason["canonical_fields"] == ["b"]
+        assert "rows carry the field it names as 'b'" in str(excinfo.value)
+        assert "1.5" not in str(excinfo.value)
 
     def test_several_absent_fields_are_named_in_sorted_order(self, node_kind: str) -> None:
         """The reason lists absent fields sorted, so its text (and error hash) never depends on set order (review-R1 F1, mutant MB)."""

@@ -154,7 +154,28 @@ drained and repair this release forward.
   `{id: Name}` or `{Name: ID}`, or two `value_transform` targets `total` and
   `Total` of one node, now refused at configuration), or crashed a csv/json sink's write (a header-spelled custom
   `headers` key). A `required_input_fields` verdict for a header spelling of a
-  guaranteed field now names the normalized spelling. Behaviour changes: a
+  guaranteed field now names the normalized spelling. A header the source's
+  `field_mapping` renames is a spelling of the rename's TARGET: under
+  `field_mapping: {name: b}` a declaration `Name`, `NAME` or the mapping key
+  `name` itself names `b` and is refused ("... and the source's field_mapping
+  renames 'name' to 'b'. Declare 'b'"). A headerless CSV source (csv with
+  `columns`, or aws_s3/azure_blob `format: csv` with
+  `csv_options: {has_header: false}`) matches `field_mapping`
+  keys against the column names as written, so under `columns: [Name]` and
+  `field_mapping: {Name: b}` the declaration `Name` names `b` and is refused
+  ("... renames its column 'Name' to 'b'. Declare 'b'"). Only the normalized form used to be
+  compared, so `field_mapper` `{Name: given}` with `Name: int?` under that
+  mapping delivered a str under a recorded `given: int` with exit 0, and both
+  `elspeth validate` and the Composer admitted it. The build and the Composer
+  resolve a declaration through the `field_mapping` of every source whose rows
+  reach the node, followed through every transform rename on the way; the run
+  time resolves it through the row's own contract, exactly as a lookup does. A
+  `field_mapper` rename carries the field's original header onto its new name,
+  so behind `{name: c}` (or a source `{name: b}` then `{b: c}`) a declaration
+  `Name` names `c` and is refused at validation ("... a transform upstream
+  renames the field it names to 'c' ... Declare 'c'"); with or without a source
+  `field_mapping`, that shape also delivered a str under a recorded
+  `given: int` with exit 0. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
   Price}]` over header `Price` worked as a lookup and now routes every row
   with `declared_field_is_header_spelling` — write `field: price`; and a
@@ -619,6 +640,61 @@ drained and repair this release forward.
   every composer authority hash and the advisor fingerprint (session epoch 67).
   A planner `set_pipeline` whose row_union branch value is not a string now
   persists as an argument error instead of failing audit persistence.
+- **Failure reasons no longer carry the row value.** `type_coerce` wrote the
+  offending value into its failure message (`'…' is not a valid integer
+  string`, `float … has fractional part`), and the engine copies that reason
+  into `transform_errors`, `node_states.error_json`, the scheduler's pending
+  error and the routing reason. The reason now names the field, the expected
+  and actual type and a stable `error_type` code (`not_integer_string`,
+  `fractional_float`, …); the value stays only in the row-data columns.
+  `blob_csv_expand`, `blob_json_expand`, `blob_text_expand` and
+  `pdf_rasterize` no longer echo a malformed `blob_ref` (arbitrary row text)
+  in their `invalid_blob_ref` reason; a well-formed payload-store hash is
+  still named where it identifies the stored blob. `reference_join` no longer
+  records the row's join key (`reference_key_value`, and the key inside the
+  miss message); the reason names the key field. `web_scrape` and
+  `blob_fetch` no longer name the row's URL anywhere in a reason or a
+  persisted error message (the `url` key, `HTTP 404: <url>`, `Connection
+  error fetching <url>` — the last reached `node_states.error_json` with the
+  query string unredacted), and an SSRF or DNS refusal no longer repeats the
+  host or resolved address; the URL stays in the row and the recorded call.
+  Which check refused the URL (always-blocked vs blocked address range,
+  malformed, forbidden scheme, credentials, DNS failure, …) is kept, value-free,
+  as the reason's `cause`.
+  The `llm` structured-output reasons no longer carry response content
+  (`raw_response_preview` becomes `content_length`; a type mismatch drops
+  `value`, an enum miss drops the value from its message, a missing field
+  drops the response's `available_fields`) — the response can echo the
+  prompt's row data and stays in the recorded call. `rag_retrieval`'s
+  `no_results` reason drops the query text, and `blob_json_expand`'s
+  `data_key_not_found` no longer lists the document's own keys.
+  An expression evaluation error (`value_transform`'s reason, a gate's failed
+  node state) no longer names a lookup key or index the expression computes
+  from the row (`row[row['code']]` wrote `Key 'CUSTOMER_…' not found`): it
+  prints `<a key the expression does not spell out>`, while a key written in
+  the expression is still named, and no Python operand error text is kept.
+  `value_transform` adds the arm as `error_type` (`missing_key`,
+  `index_out_of_range`, `incompatible_types`, …). A `%` format whose key the
+  mapping lacks (`row['fmt'] % {...}`) is now a `missing_key` evaluation error
+  that `on_error` routes; it used to end the run, even under `on_error`, with
+  the format key as a raw `KeyError` in the failed node state (in a
+  `reference_join` output it is an `on_miss` miss, as a subscript miss is,
+  instead of a crash while loading the table). A gate whose condition
+  returns an unconfigured route label or a value that is not a bool or string
+  no longer records a preview or a hash of that value (a short value printed
+  whole); the failure names its type, a string's length and the condition.
+  A source that passes an integer beyond the JSON safe range as a valid row
+  still ends the run at ingest, but the failure (the source operation's error
+  and the printed traceback) no longer is that integer: it names the row
+  index, a declared field and the error type, as the transform, aggregation
+  and collector seams already did. Sinks follow the same rule: `dataverse`
+  no longer prints the row's alternate-key or lookup value when it refuses a
+  duplicate, blank or non-string key or an unsafe `@odata.bind` reference
+  (it names the field, the failure and, for a duplicate, the two member
+  ordinals), and the `csv`, `json` and `azure_blob` sinks' encoding and
+  serialization diversion reasons carry the exception class instead of the
+  codec's text, which quoted the character it could not encode (`CSV
+  encoding (ascii) failed: UnicodeEncodeError`) or the non-finite float.
 
 ### Newly refused configurations
 
@@ -650,7 +726,18 @@ These ran and delivered rows before:
   string. Declare the normalized name (`name`, `price`). Two `value_transform`
   targets of one node that spell one another (`total`, then `Total`) are
   refused at configuration ("target 'Total' is a header spelling of target
-  'total'"); before, both keys were written to the row.
+  'total'"); before, both keys were written to the row. Re-creating the
+  normalized name of a field a `field_mapper` renamed away (a
+  `value_transform` target `name` behind `{name: c}` over a header `Name` or
+  `name`) is refused at build ("'name' is a header spelling of the arriving
+  field 'c'"). A rename now carries the field's original header onto `c`
+  (above), so behind header `name` a lookup of `name` reads `c` and a created
+  `name` would be a second field under that spelling; behind header `Name` it
+  would not, but the build cannot tell the two headers apart. Before, both
+  delivered `c` and `name`. Choose another name, or target `c`. Renaming a
+  field that no lookup of `name` reads (`{Name: c}` behind a source
+  `field_mapping: {x: Name}`, or behind a headerless `columns: [Name]`)
+  leaves `name` free, as keeping the field does.
 - **A `type_coerce` conversion field that some rows lack** ends the run
   with `DeclaredRequiredInputFieldsViolation` at the first such row behind
   an observed source, and is refused at build behind a `fixed` one. Before,

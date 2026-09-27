@@ -956,6 +956,7 @@ class TestOutputSchemaConfig:
         carries ``Name``. An undeclared target stays carried.
         """
         from elspeth.contracts.field_spelling import DeclaredSpellings
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         declared = FieldMapper({"mapping": mapping, "schema": {"mode": "flexible", "fields": ["Name: str"]}})
@@ -970,6 +971,11 @@ class TestOutputSchemaConfig:
             DeclaredSpellings.of(reads=declared.declared_read_fields, creates=declared.declared_created_fields).in_row(
                 row_keys=frozenset({"id", "name"}),
                 forwarded_keys=frozenset({"id"}),
+                contract=SchemaContract(
+                    mode="OBSERVED",
+                    fields=(FieldContract("id", "ID", str, False, "inferred"), FieldContract("name", "Name", str, False, "inferred")),
+                    locked=True,
+                ),
             )
             == ()
         )

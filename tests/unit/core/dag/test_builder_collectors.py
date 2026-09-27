@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig, get_raw_node_required_fields
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import CollectorName, NodeID
@@ -24,6 +27,7 @@ class _Source:
     on_success = "rows"
     _output_schema_config = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _Sink:
@@ -76,6 +80,7 @@ class _MultiRowTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         # .name is the PLUGIN name (matches TransformSettings.plugin below via
@@ -119,6 +124,7 @@ class _BatchTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "stitch"
@@ -158,6 +164,7 @@ class _PlainTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str) -> None:
         self.name = name

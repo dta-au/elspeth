@@ -457,18 +457,27 @@ DIAGNOSTIC_CASES = (
     # observations must survive the renderer.
     _message_case(
         errors.HeaderSpelledDeclarationViolation,
-        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        {
+            "component": "Transform 'fixed'",
+            "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read", leg="normalized"),),
+        },
         "component",
         (("Transform 'alpha_component'", "Transform 'alpha_component'"), ("Sink 'omega_component'", "Sink 'omega_component'")),
     ),
     _message_case(
         errors.HeaderSpelledDeclarationViolation,
-        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        {
+            "component": "Transform 'fixed'",
+            "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read", leg="normalized"),),
+        },
         "spellings",
         (
-            ((HeaderSpelling(literal="Alpha", canonical="alpha", kind="read"),), "'Alpha' is a header spelling of 'alpha'"),
             (
-                (HeaderSpelling(literal="Omega", canonical="omega", kind="create"),),
+                (HeaderSpelling(literal="Alpha", canonical="alpha", kind="read", leg="normalized"),),
+                "'Alpha' is a header spelling of 'alpha'",
+            ),
+            (
+                (HeaderSpelling(literal="Omega", canonical="omega", kind="create", leg="normalized"),),
                 "'Omega' is a header spelling of the arriving field 'omega'",
             ),
         ),

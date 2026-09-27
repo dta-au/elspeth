@@ -737,7 +737,7 @@ class TestPaginateOdata:
         with (
             patch(
                 "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("DNS rebinding detected"),
+                side_effect=SSRFBlockedError("DNS rebinding detected", kind="blocked_range"),
             ),
             pytest.raises(DataverseClientError, match="IP-pinning SSRF validation"),
         ):
@@ -753,7 +753,7 @@ class TestPaginateOdata:
         with (
             patch(
                 "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("DNS rebinding detected"),
+                side_effect=SSRFBlockedError("DNS rebinding detected", kind="blocked_range"),
             ),
             pytest.raises(DataverseClientError) as excinfo,
         ):
@@ -782,7 +782,7 @@ class TestPaginateOdata:
         with (
             patch(
                 "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("DNS rebinding detected"),
+                side_effect=SSRFBlockedError("DNS rebinding detected", kind="blocked_range"),
             ),
             pytest.raises(DataverseClientError) as exc_info,
         ):

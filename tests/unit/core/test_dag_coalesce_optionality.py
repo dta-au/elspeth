@@ -8,11 +8,14 @@ and FieldDefinition directly — optionality is a first-class boolean field.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import (
@@ -1013,6 +1016,7 @@ class _BuilderMockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -1069,6 +1073,7 @@ class _TransformWithTypedSchema:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, schema: SchemaConfig) -> None:
         self.name = name
@@ -2562,6 +2567,7 @@ class _SourceWithGuarantees:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     _on_validation_failure = "discard"
     on_success = "output"
 
@@ -2608,6 +2614,7 @@ class _PassThroughBranchTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, added_field: str) -> None:
         self.name = name

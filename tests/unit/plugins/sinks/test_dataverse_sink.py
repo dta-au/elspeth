@@ -950,3 +950,74 @@ class TestDataverseMemberEffects:
 
         assert result.kind is SinkEffectReconcileKind.UNKNOWN
         assert deep_thaw(result.evidence)["classification"] == "divergent"
+
+
+class TestValueFreeEffectReasons:
+    """The pre-network effect-path refusals name the field and failure kind, never the row's value.
+
+    ``prepare_effect`` runs before any HTTP call (the credential is lazy), and
+    its ValueError text reaches captured stderr. The alternate key is the row's
+    business key (an email in the plugin's own example) and a lookup value is
+    the row's reference data, so neither may appear in the text.
+    """
+
+    _SENTINEL = "SNTL_DV_VALUE_7731"
+
+    def _prepare(self, sink: DataverseSink, rows: tuple[dict[str, object], ...]) -> None:
+        members = tuple(_effect_member(index, row) for index, row in enumerate(rows))
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
+        ctx = _restricted_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None), ctx)
+        sink.prepare_effect(SinkEffectPrepareRequest(effect_id="a" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+    @patch("elspeth.plugins.sinks.dataverse.create_schema_from_config", return_value=FakeDataverseRowSchema)
+    def test_duplicate_alternate_key_names_ordinals_not_the_key(self, _mock_schema: MagicMock) -> None:
+        sink = inject_write_failure(DataverseSink(_config()))
+        key = f"{self._SENTINEL}@example.com"
+
+        with pytest.raises(ValueError, match="unique alternate-key values") as excinfo:
+            self._prepare(sink, ({"email": key, "name": "a"}, {"email": key, "name": "b"}))
+
+        assert str(excinfo.value) == (
+            "Dataverse effect members require unique alternate-key values: members 0 and 1 carry the same 'email' value"
+        )
+        assert self._SENTINEL not in str(excinfo.value)
+
+    @patch("elspeth.plugins.sinks.dataverse.create_schema_from_config", return_value=FakeDataverseRowSchema)
+    def test_non_string_alternate_key_names_the_type_not_the_value(self, _mock_schema: MagicMock) -> None:
+        sink = inject_write_failure(DataverseSink(_config()))
+
+        with pytest.raises(ValueError, match="non-string value") as excinfo:
+            self._prepare(sink, ({"email": 918273645, "name": self._SENTINEL},))
+
+        assert "(type int)" in str(excinfo.value)
+        assert "918273645" not in str(excinfo.value)
+        assert self._SENTINEL not in str(excinfo.value)
+
+    @patch("elspeth.plugins.sinks.dataverse.create_schema_from_config", return_value=FakeDataverseRowSchema)
+    def test_blank_alternate_key_is_stated_without_echoing_it(self, _mock_schema: MagicMock) -> None:
+        sink = inject_write_failure(DataverseSink(_config()))
+
+        with pytest.raises(ValueError) as excinfo:
+            self._prepare(sink, ({"email": " \t ", "name": self._SENTINEL},))
+
+        assert str(excinfo.value) == (
+            "alternate_key field 'email' is empty or whitespace-only — cannot construct PATCH URL for entity 'contacts'"
+        )
+
+    @patch("elspeth.plugins.sinks.dataverse.create_schema_from_config", return_value=FakeDataverseRowSchema)
+    def test_rejected_lookup_value_is_not_echoed(self, _mock_schema: MagicMock) -> None:
+        sink = inject_write_failure(
+            DataverseSink(
+                _config(
+                    field_mapping={"email": "emailaddress1", "account_id": "ignored_column"},
+                    lookups={"account_id": {"target_entity": "accounts", "target_field": "parentcustomerid"}},
+                )
+            )
+        )
+
+        with pytest.raises(ValueError, match="not a valid record reference") as excinfo:
+            self._prepare(sink, ({"email": "a", "account_id": f"{self._SENTINEL}/../x"},))
+
+        assert "lookup field 'account_id' (type str)" in str(excinfo.value)
+        assert self._SENTINEL not in str(excinfo.value)

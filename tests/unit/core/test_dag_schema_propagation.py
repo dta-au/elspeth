@@ -11,11 +11,14 @@ contracts from upstream transforms, so audit records reflect actual data contrac
 (P1-2026-02-05: pass-through nodes drop computed schema contracts)
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import (
@@ -64,6 +67,7 @@ class MockTransformWithSchemaConfig:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         # Computed schema config with guaranteed and audit fields
@@ -109,6 +113,7 @@ class MockTransformWithoutSchemaConfig:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
     _output_schema_config: SchemaConfig | None = None
 
 
@@ -119,6 +124,7 @@ class MockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed", "guaranteed_fields": ["source_field"]}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -528,6 +534,7 @@ class MockAggregationTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self._output_schema_config = SchemaConfig(
@@ -1113,6 +1120,7 @@ class _ConfigurableTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, guaranteed_fields: tuple[str, ...] | None) -> None:
         self.name = name

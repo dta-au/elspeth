@@ -8233,7 +8233,7 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
 
     @staticmethod
-    def _value_transform(*, target: str, schema: dict[str, Any] | None = None) -> NodeSpec:
+    def _value_transform(*, target: str, schema: dict[str, Any] | None = None, reads: str = "name") -> NodeSpec:
         return NodeSpec(
             id="t",
             node_type="transform",
@@ -8241,7 +8241,7 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             input="t_in",
             on_success="main",
             on_error="discard",
-            options={"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": "row['name']"}]},
+            options={"schema": schema or {"mode": "observed"}, "operations": [{"target": target, "expression": f"row['{reads}']"}]},
             condition=None,
             routes=None,
             fork_to=None,
@@ -8370,6 +8370,336 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             node=self._keyword_filter("Name"),
         )
         self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of 'name'")
+
+    # --- A header the source's field_mapping renames (Codex final review, finding 1) ---
+    # CSV header 'Name' under field_mapping {name: b}: the row carries 'b', and
+    # a lookup of 'Name' reads it, so every spelling of the mapped header —
+    # 'Name', and the mapping key 'name' itself — declares 'b'. Both surfaces
+    # resolve the declaration through the renames of the sources reaching it;
+    # comparing only normalize(T) admitted the Codex shape on both, delivering
+    # a str under a recorded 'given: int'.
+
+    def _mapped_state(
+        self,
+        tmp_path: Path,
+        *,
+        node: NodeSpec | None,
+        output_schema: dict[str, Any] | None = None,
+        source_schema: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        source = SourceSpec(
+            plugin="csv",
+            on_success="t_in" if node is not None else "main",
+            options={
+                "path": str(self._csv_input(tmp_path)),
+                "field_mapping": {"name": "b"},
+                "schema": source_schema or {"mode": "fixed", "fields": ["id: str", "b: str"]},
+            },
+            on_validation_failure="discard",
+        )
+        return CompositionState(
+            source=source,
+            nodes=() if node is None else (node,),
+            edges=(),
+            outputs=(self._output(tmp_path, output_schema),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def test_both_reject_the_codex_shape_a_renamed_header_declared_on_a_field_mapper(self, tmp_path: Path) -> None:
+        node = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        node = replace(node, options={**node.options, "select_only": True})
+        self._assert_both_reject(
+            self._mapped_state(tmp_path, node=node),
+            tmp_path,
+            "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') "
+            "and the source's field_mapping renames 'name' to 'b'. Declare 'b'",
+        )
+
+    @pytest.mark.parametrize("declared", ["Name", "name"], ids=["the-header", "the-mapping-key"])
+    def test_both_reject_a_renamed_header_read_behind_a_closed_upstream(self, tmp_path: Path, declared: str) -> None:
+        state = self._mapped_state(
+            tmp_path,
+            node=self._value_transform(target="total", schema={"mode": "flexible", "fields": [f"{declared}: str?"]}, reads="b"),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert f"'{declared}' is a header spelling of 'b'" in entry.message
+        assert entry.contract is not None and declared in entry.contract.missing_fields
+        assert not runtime.is_valid
+        assert any(f"'{declared}' is a header spelling of 'b'" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_a_renamed_header_sink_declaration_behind_a_closed_upstream(self, tmp_path: Path) -> None:
+        self._assert_both_reject(
+            self._mapped_state(tmp_path, node=None, output_schema={"mode": "flexible", "fields": ["Name: str?"]}),
+            tmp_path,
+            "'Name' is a header spelling of 'b'",
+        )
+
+    def test_both_accept_the_rename_target_and_what_an_observed_upstream_cannot_prove(self, tmp_path: Path) -> None:
+        """Controls: declaring the target 'b' is canonical; an observed source proves no absence (the row settles it)."""
+        declares = {"mode": "flexible", "fields": ["b: str?"]}
+        self._assert_both_accept(
+            self._mapped_state(tmp_path, node=self._value_transform(target="total", schema=declares, reads="b")), tmp_path
+        )
+        header = {"mode": "flexible", "fields": ["Name: str?"]}
+        observed = self._mapped_state(
+            tmp_path, node=self._value_transform(target="total", schema=header, reads="b"), source_schema={"mode": "observed"}
+        )
+        self._assert_both_accept(observed, tmp_path)
+
+    def test_a_source_that_does_not_construct_contributes_no_renames(self, tmp_path: Path) -> None:
+        """Composer only: the renames probe tolerates a draft source config, as the other source probes do.
+
+        The source's schema parses (so its vote participates and the probe
+        runs) but an unknown option fails construction: ``validate()`` returns
+        without a spelling verdict (the same config with a constructible source
+        refuses ``Name`` as a spelling of ``b``, above) and never raises. The
+        unknown option itself is Stage 2's to refuse.
+        """
+        state = self._mapped_state(
+            tmp_path, node=self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b")
+        )
+        [source] = state.sources.values()
+        broken = CompositionState(
+            source=replace(source, options={**source.options, "not_a_csv_option": 1}),
+            nodes=state.nodes,
+            edges=(),
+            outputs=state.outputs,
+            metadata=state.metadata,
+            version=1,
+        )
+
+        result = broken.validate()
+
+        assert not [e for e in result.errors if e.error_code == "field_name_header_spelling"], result.errors
+
+    def test_both_resolve_only_through_the_sources_whose_rows_reach_the_consumer(self, tmp_path: Path) -> None:
+        """A second source's rename does not reach a consumer fed only by the first.
+
+        Source 'plain' (header 'ID,B', no rename) feeds the transform; source
+        'mapped' renames name -> b but writes straight to its own sink. The
+        transform's optional 'Name' names nothing its rows carry, so neither
+        surface refuses it; resolving through every source in the pipeline
+        would have refused it as a spelling of 'b'.
+        """
+        plain_csv = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "plain.csv"
+        plain_csv.parent.mkdir(parents=True, exist_ok=True)
+        plain_csv.write_text("ID,B\n1,x\n", encoding="utf-8")
+        mapped = self._mapped_state(tmp_path, node=None)
+        state = CompositionState(
+            sources={
+                "plain": SourceSpec(
+                    plugin="csv",
+                    on_success="t_in",
+                    options={"path": str(plain_csv), "schema": {"mode": "fixed", "fields": ["id: str", "b: str"]}},
+                    on_validation_failure="discard",
+                ),
+                "mapped": mapped.sources["source"],
+            },
+            nodes=(self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b"),),
+            edges=(),
+            outputs=mapped.outputs,
+            metadata=mapped.metadata,
+            version=1,
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_resolve_through_a_source_reaching_the_consumer_behind_an_intermediate_transform(self, tmp_path: Path) -> None:
+        """The source's rename reaches a consumer two hops down (review-C1-alias-bypass-r1 F2).
+
+        source {name: b} -> hop (value_transform, fixed b) -> field_mapper
+        declaring 'Name: int?': both surfaces walk the live reach transitively,
+        so the consumer is refused exactly as a direct consumer is. Resolving
+        through direct predecessors only would find no source behind 'hop' and
+        the composer would admit what the runtime validation refuses.
+        """
+        hop = replace(
+            self._value_transform(target="x", schema={"mode": "fixed", "fields": ["id: str", "b: str"]}, reads="b"),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        consumer = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        consumer = replace(consumer, options={**consumer.options, "select_only": True}, input="t2_in")
+        mapped = self._mapped_state(tmp_path, node=consumer)
+        state = CompositionState(
+            sources=mapped.sources,
+            nodes=(hop, consumer),
+            edges=(),
+            outputs=mapped.outputs,
+            metadata=mapped.metadata,
+            version=1,
+        )
+        self._assert_both_reject(
+            state,
+            tmp_path,
+            "'Name' is a header spelling of 'b': headers are normalized to lowercase identifiers ('Name' -> 'name') "
+            "and the source's field_mapping renames 'name' to 'b'. Declare 'b'",
+        )
+
+    # --- A headerless source renames each column AS WRITTEN (review-C1-alias-bypass-r1 F1) ---
+    # resolve_field_names keys a headerless source's field_mapping by the column
+    # as written: under columns [id, Name] + {Name: b} the literal 'Name' names
+    # 'b', under columns [id, name] + {name: b} it names nothing. Both surfaces
+    # read the keying off the source's own field_renames.
+
+    def _headerless_state(self, tmp_path: Path, *, columns: list[str], field_mapping: dict[str, str], node: NodeSpec) -> CompositionState:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "headerless.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1,Ann\n", encoding="utf-8")
+        source = SourceSpec(
+            plugin="csv",
+            on_success="t_in",
+            options={
+                "path": str(path),
+                "columns": list(columns),
+                "field_mapping": dict(field_mapping),
+                "schema": {"mode": "fixed", "fields": ["id: str", "b: str"]},
+            },
+            on_validation_failure="discard",
+        )
+        return CompositionState(
+            source=source,
+            nodes=(node,),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def test_both_reject_the_codex_shape_on_a_headerless_source(self, tmp_path: Path) -> None:
+        node = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        node = replace(node, options={**node.options, "select_only": True})
+        self._assert_both_reject(
+            self._headerless_state(tmp_path, columns=["id", "Name"], field_mapping={"Name": "b"}, node=node),
+            tmp_path,
+            "'Name' is a header spelling of 'b': the source's field_mapping renames its column 'Name' to 'b'. Declare 'b'",
+        )
+
+    def test_both_accept_a_case_variant_of_a_renamed_headerless_column(self, tmp_path: Path) -> None:
+        """Control: under columns [id, name] + {name: b} no lookup resolves 'Name' to 'b', so it is no spelling of 'b'."""
+        node = self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b")
+        self._assert_both_accept(self._headerless_state(tmp_path, columns=["id", "name"], field_mapping={"name": "b"}, node=node), tmp_path)
+
+    # --- A field a TRANSFORM renamed (review-C1-alias-bypass-r2) ---
+    # field_mapper {b: c} carries b's recorded original name onto c, so a lookup
+    # of 'Name' reads c. Both surfaces resolved a declaration through the
+    # sources' renames and normalization only — both admitted 'Name: int?'
+    # behind the rename while the run time refused every row. Both now follow
+    # the transform's renamed_input_fields.
+
+    def _renamed_state(self, tmp_path: Path, *, mapped: bool, consumer: NodeSpec) -> CompositionState:
+        """source -> hop (closed field_mapper renaming the header field to 'c') -> consumer."""
+        old = "b" if mapped else "name"
+        hop = replace(
+            self._field_mapper({old: "c"}, schema={"mode": "fixed", "fields": ["id: str", f"{old}: str"]}),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        base = (
+            self._mapped_state(tmp_path, node=hop)
+            if mapped
+            else self._state(tmp_path, source_schema={"mode": "fixed", "fields": ["id: str", "name: str"]}, node=hop)
+        )
+        return CompositionState(
+            sources=base.sources,
+            nodes=(hop, replace(consumer, input="t2_in")),
+            edges=(),
+            outputs=base.outputs,
+            metadata=base.metadata,
+            version=1,
+        )
+
+    @pytest.mark.parametrize("mapped", [True, False], ids=["source-field_mapping", "no-source-field_mapping"])
+    def test_both_reject_a_header_spelling_of_a_field_a_transform_renamed(self, tmp_path: Path, mapped: bool) -> None:
+        consumer = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        consumer = replace(consumer, options={**consumer.options, "select_only": True})
+        self._assert_both_reject(
+            self._renamed_state(tmp_path, mapped=mapped, consumer=consumer),
+            tmp_path,
+            "'Name' is a header spelling of 'c': a transform upstream renames the field it names to 'c', so rows carry it as 'c' "
+            "(a lookup of 'Name' reads that field). Declare 'c'",
+        )
+
+    def test_both_reject_recreating_an_unmapped_field_under_its_header_name_behind_its_rename(self, tmp_path: Path) -> None:
+        """No source rename: 'name' is the field's identity, so behind {name: c} a created 'name' is a spelling of c."""
+        composer, runtime = self._both(
+            self._renamed_state(tmp_path, mapped=False, consumer=self._value_transform(target="name", reads="c")), tmp_path
+        )
+        spelling = "'name' is a header spelling of the arriving field 'c'"
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert spelling in entry.message
+        assert not runtime.is_valid
+        assert any("Field name header spelling" in e.message and spelling in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize(
+        "consumer",
+        [
+            pytest.param({"target": "b", "reads": "c"}, id="recreate-the-name-a-source-rename-gave"),
+            pytest.param({"target": "total", "schema": {"mode": "flexible", "fields": ["c: str?"]}, "reads": "c"}, id="canonical-read"),
+        ],
+    )
+    def test_both_accept_what_no_lookup_resolves_to_the_renamed_field(self, tmp_path: Path, consumer: dict[str, Any]) -> None:
+        """Behind source {name: b} -> {b: c}, b's identity is 'Name': 'b' names nothing, 'c' is the field itself."""
+        self._assert_both_accept(self._renamed_state(tmp_path, mapped=True, consumer=self._value_transform(**consumer)), tmp_path)
+
+    # --- Only a field the lookup of a rename's source reads moves (review-C1-alias-bypass-r3 F1) ---
+    # Both surfaces call the one FieldNameResolution.then_renamed, so they
+    # admit and refuse these together.
+
+    def _rename_name_state(self, tmp_path: Path, *, source_options: dict[str, Any], old: str, consumer: NodeSpec) -> CompositionState:
+        """source -> hop (closed field_mapper {old: c}) -> consumer."""
+        hop = replace(
+            self._field_mapper({old: "c"}, schema={"mode": "fixed", "fields": ["id: str", f"{old}: str"]}),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        source = SourceSpec(plugin="csv", on_success="t_in", options=source_options, on_validation_failure="discard")
+        return CompositionState(
+            source=source,
+            nodes=(hop, replace(consumer, input="t2_in")),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def _rename_source_options(self, tmp_path: Path, shape: str) -> dict[str, Any]:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / f"{shape}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if shape == "fmval-create":
+            path.write_text("ID,x\n1,Ann\n", encoding="utf-8")
+            return {"path": str(path), "field_mapping": {"x": "Name"}, "schema": {"mode": "fixed", "fields": ["id: str", "Name: str"]}}
+        path.write_text("1,Ann\n", encoding="utf-8")
+        column = "Name" if shape == "hl-create" else "name"
+        return {"path": str(path), "columns": ["id", column], "schema": {"mode": "fixed", "fields": ["id: str", f"{column}: str"]}}
+
+    @pytest.mark.parametrize("shape", ["fmval-create", "hl-create"])
+    def test_both_accept_creating_a_normalized_name_the_renamed_field_never_carried(self, tmp_path: Path, shape: str) -> None:
+        state = self._rename_name_state(
+            tmp_path,
+            source_options=self._rename_source_options(tmp_path, shape),
+            old="Name",
+            consumer=self._value_transform(target="name", reads="c"),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_reject_recreating_a_renamed_headerless_fixed_point_column(self, tmp_path: Path) -> None:
+        state = self._rename_name_state(
+            tmp_path,
+            source_options=self._rename_source_options(tmp_path, "hl-create-lc"),
+            old="name",
+            consumer=self._value_transform(target="name", reads="c"),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        spelling = "'name' is a header spelling of the arriving field 'c'"
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert spelling in entry.message
+        assert not runtime.is_valid
+        assert any("Field name header spelling" in e.message and spelling in e.message for e in runtime.errors), runtime.errors
 
     @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
     def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:

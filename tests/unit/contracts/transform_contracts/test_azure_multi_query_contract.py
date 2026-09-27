@@ -209,7 +209,9 @@ class TestMultiQueryBatchContract(BatchTransformContractTestBase):
         assert result.reason["reason"] == "json_parse_failed"
         assert result.reason["query_name"] == "cs1_test_criterion"
         assert result.reason["query_index"] == 0
-        assert result.reason["raw_response_preview"] == "not valid JSON"
+        # The response text echoes row data: only its length is recorded (C3).
+        assert result.reason["content_length"] == len("not valid JSON")
+        assert "not valid JSON" not in repr(result.reason)
         assert result.reason["discarded_successful_queries"] == 0
 
     def test_provider_auth_failure_emits_non_retryable_query_error(

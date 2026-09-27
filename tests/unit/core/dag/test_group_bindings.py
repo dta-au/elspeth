@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
@@ -168,6 +171,7 @@ class _GroupBindingsMockSource:
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _GroupBindingsMockSink:
@@ -238,6 +242,7 @@ class _GroupBindingsTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name

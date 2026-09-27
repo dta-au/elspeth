@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts.data import CompatibilityResult
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NODE_ID_MAX_LENGTH, CoalesceName, NodeID
@@ -349,7 +350,25 @@ class NodeInfo:
     # carried-rename arm, which follows the type upstream under the source name.
     carried_output_sources: Mapping[str, str] = field(default_factory=dict)
 
+    # A source's renames, keyed the way the source keys them (normalized
+    # header, or a headerless column as written). Populated only for SOURCE
+    # nodes by the builder from SourceProtocol.field_renames. Consumed by
+    # validate_declared_field_spellings, which resolves a downstream
+    # declaration through the renames of every source whose rows reach it
+    # (field-name spelling rule): under field_mapping {name: b} the
+    # declaration 'Name' names 'b'.
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
+
+    # A transform's identity-carrying renames (source spelling -> new name).
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.renamed_input_fields. Consumed by
+    # upstream_name_resolution, which follows each rename between the sources
+    # and a declaring node (field-name spelling rule): behind field_mapper
+    # {b: c} a spelling of b names c.
+    renamed_input_fields: Mapping[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
+        freeze_fields(self, "renamed_input_fields")
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
         if not self.node_id:
@@ -502,6 +521,20 @@ class NodeInfo:
                 f"NodeInfo.observed_value_type is only meaningful for SOURCE nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with observed_value_type={self.observed_value_type!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Same threading guard for the source's renames.
+        if self.field_renames.mapping and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.field_renames is only meaningful for SOURCE nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # And for a transform's renames.
+        if self.renamed_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.renamed_input_fields is only meaningful for TRANSFORM nodes; node {self.node_id!r} has type {self.node_type.name}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

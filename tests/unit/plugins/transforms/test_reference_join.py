@@ -199,8 +199,10 @@ class TestMissPolicy:
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "reference_miss"
-        assert result.reason["reference_key_value"] == "gloves"
         assert result.reason["unresolved_fields"] == ["product_description"]
+        # The join key is row data: named by field, never by value.
+        assert result.reason["field"] == "product"
+        assert "gloves" not in repr(result.reason)
 
     def test_key_miss_writes_null(self, ctx: "PluginContext") -> None:
         transform = build(on_miss="null")
@@ -232,6 +234,7 @@ class TestMissPolicy:
         assert result.reason["reason"] == "reference_miss"
         assert result.reason["unresolved_fields"] == ["tax_rate"]
         assert "did not resolve" in result.reason["error"]
+        assert "socks" not in repr(result.reason)
 
     def test_unresolved_path_nulls_only_that_field(self, ctx: "PluginContext") -> None:
         transform = build(
@@ -555,6 +558,32 @@ class TestTheTableIsWholeOrItIsRefused:
         assert result.status == "success"
         assert result.row is not None
         assert result.row.to_dict()["d"] is None
+
+    def test_a_format_key_the_entry_lacks_is_a_miss_not_a_crash(self) -> None:
+        """``str % mapping`` raises KeyError when the mapping lacks the named key (C3 review r2).
+
+        The evaluator classifies it as ``missing_key`` — the same fact as a
+        subscript miss: this entry's mapping does not hold what the expression
+        asks for — so a sparse entry stays governed by on_miss. It used to crash
+        through the load as a bare KeyError.
+        """
+        table = json.dumps([{"sku": "hats", "attrs": {"description": "A fine hat"}}, {"sku": "coats", "attrs": {}}])
+        transform = build(
+            reference_content=table,
+            reference_format="json",
+            output={"d": "'%(description)s' % ref['attrs']"},
+            on_miss="null",
+        )
+        ctx_local = make_source_context()
+
+        hit = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
+        miss = transform.process(make_pipeline_row({"product": "coats"}), ctx_local)
+
+        assert hit.row is not None
+        assert hit.row.to_dict()["d"] == "A fine hat"
+        assert miss.status == "success"
+        assert miss.row is not None
+        assert miss.row.to_dict()["d"] is None
 
 
 class TestANullIsAValueAndAMissIsNot:

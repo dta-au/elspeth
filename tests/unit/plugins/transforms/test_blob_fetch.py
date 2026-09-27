@@ -196,9 +196,9 @@ def test_blob_fetch_redacts_url_in_error_reason(monkeypatch: pytest.MonkeyPatch)
     assert "password" not in persisted_reason
     assert "ERROR_SECRET" not in persisted_reason
     assert "fragment-secret" not in persisted_reason
-    persisted_url = result.reason["url"]
-    assert isinstance(persisted_url, str)
-    assert urllib.parse.parse_qs(urllib.parse.urlsplit(persisted_url).query)["token"][0].startswith("<fingerprint:")
+    # The URL is row data: no part of it is persisted in the reason (C3).
+    assert "url" not in result.reason
+    assert "example.test" not in persisted_reason
 
 
 def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,7 +206,7 @@ def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -
     from elspeth.plugins.transforms.blob_fetch import BlobFetch
 
     def _blocked(url: str, allowed_ranges=()) -> SSRFSafeRequest:
-        raise SSRFBlockedError(f"blocked: {url}")
+        raise SSRFBlockedError(f"blocked: {url}", kind="blocked_range")
 
     monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _blocked)
 

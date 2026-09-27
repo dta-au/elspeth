@@ -892,7 +892,52 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48f
 # source_file_hash moved b96c5b5e88bcd1eb -> 4fed05d6f8252950
 # (scripts/cicd/plugin_hash); no corpus case uses field_mapper, so no manifest
 # literal, resume digest, registry digest or oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "7c11c485d085d128914319b804a8e1121f191d9e254aa0812b176ac534acd620"
+# Rotated 2026-09-27 (elspeth-5887fb7928, field-name spelling rule, C1 fix
+# round 1): a PLUGIN PROVENANCE rotation. csv_source publishes what it matches
+# field_mapping keys against (headerless columns as written) on
+# SourceProtocol.field_renames, so its source_file_hash moved
+# 081b2eaaf545bb99 -> 040ed5b1c21f4dae (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 0488ea94... -> 3c03ee77..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 081b2eaaf545bb99 reproduces 0488ea94... exactly, so the move is plugin
+# provenance, not runtime semantics; (3) this digest. aws_s3
+# (aaaf6619345f0665 -> b491b922f1b34cb4) and azure_blob (6bf3a35d44316f7b ->
+# 719563e76907222d) moved too with no manifest pin. No oracle_freeze snapshot
+# moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, C3 value-free reasons, review r1 F1):
+# a PLUGIN PROVENANCE rotation. value_transform records the evaluator's
+# value-free ``kind`` as ``error_type`` in its failure reason, so its
+# source_file_hash moved f645e8e83a012f3f -> de648209de2ccdd6
+# (scripts/cicd/plugin_hash). Order: (1) the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail; (2) this
+# digest 5134cb96... -> 1908eb05... — with the new code and the OLD manifest
+# pins this parity test passed and only the provenance-pin test failed, so the
+# move is the pin literal alone. No union-collision-fail row hits an
+# evaluation error; no resume digest and no oracle_freeze snapshot moved.
+# The same round moved reference_join 46245d6f287224d6 -> 6aa4025393448c89 (it
+# tells a sparse miss from a broken expression by the evaluator's ``kind``, the
+# chained cause being gone) with no manifest pin; no digest moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928, C3 value-free reasons, review r3 +
+# sink census): a PLUGIN PROVENANCE rotation. json_sink's encode/serialize
+# diversion reasons carry the exception class, never the codec's text (which
+# quotes the row's character), so its source_file_hash moved
+# 2629742182442969 -> 9ef547005076060e (scripts/cicd/plugin_hash). Order:
+# (1) the manifest's 15 literal pins; (2) reopen-resume's
+# resumed_full_projection_sha256 3c03ee77... -> cab4aab8..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — with ONLY the json_sink pin (code and manifest) set back to
+# 2629742182442969 the reopen/checkpoint production-path and oracle-freeze
+# cases pass 23/23, so the move is the pin literal alone; (3) this digest
+# 1908eb05... -> a3b8a299.... csv_sink cb4119567e0d1b1c, dataverse
+# 934b0bdb38c02efa and azure_blob 0719093e3ea19a79 moved in the same round
+# with no manifest pin. No oracle_freeze snapshot moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the codex
+# branch onto the lane): the two rotation chains above ran on sibling branches;
+# the manifest carries both sides' literals and this digest is re-captured from
+# the merged tree (never hand-computed).
+EXPECTED_CASE_REGISTRY_SHA256 = "dc2e8e1d8292e5feb4107f46e7e1d80e73c2c24da6bd982d6c260bb2ce9052b3"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

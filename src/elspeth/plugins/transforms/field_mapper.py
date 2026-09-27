@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Annotated, Any
 
 from pydantic import Field, model_validator
@@ -327,7 +328,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4fed05d6f8252950"
+    source_file_hash: str | None = "sha256:8e1f5e5488b29ee1"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -425,6 +426,14 @@ class FieldMapper(BaseTransform):
             if self.forwards_input_fields
             else frozenset()
         )
+
+        # Every flat mapping moves the field its source names to the target and
+        # the output contract carries the field's recorded original name there
+        # (``process`` passes exactly these to ``narrow_contract_to_output``),
+        # so a lookup of any spelling of the old field reads the target. A
+        # dotted source is a nested extraction, not a rename: its root field
+        # stays where it is.
+        self.renamed_input_fields = MappingProxyType({source: target for source, target in cfg.mapping.items() if "." not in source})
 
         # Every mapping target is a created name (the field-name spelling rule,
         # operator ruling 2026-09-25). Where this node forwards its input but
@@ -804,7 +813,7 @@ class FieldMapper(BaseTransform):
                     if "." not in source and source in row
                 }
                 forwarded = frozenset(row_data) - removed
-                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded)
+                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded, contract=row.contract)
                 if spellings:
                     raise HeaderSpelledDeclarationViolation(component=f"Transform '{self.name}'", spellings=spellings)
 
@@ -882,8 +891,10 @@ class FieldMapper(BaseTransform):
         # to the root's contract, so those targets must be inferred from the
         # output value. Contracts are flat — presenting "meta.source" as a
         # rename source would (correctly) fail narrow_contract_to_output's
-        # unknown-source invariant.
-        renamed_fields = {source: target for source, target in applied_mappings.items() if "." not in source}
+        # unknown-source invariant. The renames passed are the declared ones
+        # (``renamed_input_fields``) this row applied, so the identity the
+        # contract carries and the one the build resolves cannot diverge.
+        renamed_fields = {source: target for source, target in applied_mappings.items() if source in self.renamed_input_fields}
         output_contract = narrow_contract_to_output(
             input_contract=row.contract,
             output_row=output,

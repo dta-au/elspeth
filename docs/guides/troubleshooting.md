@@ -140,15 +140,14 @@ docker run --rm \
 {
   "reason": "missing_output_field",
   "query_name": "classify",
-  "field": "category",
-  "available_fields": ["label", "confidence"]
+  "field": "category"
 }
 ```
 
 **Solution:**
 
 1. Check your prompt template — ensure it instructs the LLM to include the required fields
-2. Review the `available_fields` in the error to see what the LLM actually returned
+2. Inspect the recorded LLM call's response (the row's `calls` record, e.g. the Landscape MCP `get_calls` tool) to see what the LLM actually returned — the error reason deliberately carries no response content, because the response can echo row data
 3. Consider adding few-shot examples to your prompt to guide the output format
 4. If the field is genuinely optional, remove it from `output_fields` in your query spec
 

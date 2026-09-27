@@ -20,6 +20,7 @@ from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
     DeclaredSpellings,
+    FieldNameResolution,
     describe_header_spellings,
     header_spelled_declarations,
     header_spelled_names,
@@ -222,7 +223,7 @@ def validate_single_edge(
                 f"  Producer ({from_info.plugin_name}) guarantees: "
                 f"{sorted(producer_guaranteed) if producer_guaranteed else '(none - dynamic schema)'}\n"
                 f"  Missing fields: {sorted(missing)}\n"
-                f"{header_spelling_hint(missing, producer_guaranteed)}"
+                f"{header_spelling_hint(missing, producer_guaranteed, upstream_name_resolution(graph, to_node_id, {}))}"
                 f"\n"
                 f"Fix: Either:\n"
                 f"  1. Add missing fields to producer's schema or guaranteed_fields, or\n"
@@ -711,7 +712,7 @@ def _validate_locked_consumer_guaranteed_extras(
 
     if sink_missing:
         message = (
-            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing, walk_effective_guarantee_vote(graph, from_node_id, {}).fields)}\n"
+            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing, walk_effective_guarantee_vote(graph, from_node_id, {}).fields, upstream_name_resolution(graph, to_node_id, {}))}\n"
             f"\n"
             f"The same edge ALSO violates the consumer's locked input contract. "
             f"BOTH must be repaired — dropping the extras alone leaves the sink "
@@ -1203,7 +1204,59 @@ def _sink_required_missing_fields(
     return sink_required - vote.fields
 
 
-def header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str]) -> str:
+def upstream_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
+    """The field-name spelling rule's build-time resolution for the rows arriving at ``node_id``.
+
+    A declaration names what the upstream makes of its spelling, so the build
+    resolves it the way the rows' own contract will: through the renames of
+    every source whose rows reach the node (``NodeInfo.field_renames``, each
+    source's ``field_mapping``), followed through every transform rename on
+    the way (``NodeInfo.renamed_input_fields``, e.g. field_mapper's
+    ``mapping``), which carries the field's identity onto its new name. Where
+    predecessors meet, their resolutions unite
+    (``FieldNameResolution.union``). The walk follows live edges only
+    (``_live_predecessors``), since a DIVERT edge delivers an error envelope,
+    not the producer's row — the same reason the vote itself skips them.
+    Membership in the node's upstream vote still decides whether a resolved
+    name is refused. The Web Composer's Stage-1 mirror composes the same
+    resolution over the same live wiring (``_live_name_resolution`` in
+    web/composer/state.py).
+
+    ``cache`` holds each node's OUTPUT resolution and may be shared across
+    calls on one graph.
+    """
+    return FieldNameResolution.union(
+        _output_name_resolution(graph, predecessor_id, cache) for predecessor_id in _live_predecessors(graph, node_id)
+    )
+
+
+def _output_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
+    """The name resolution of the rows ``node_id`` emits: a source's renames, else its input's past its own renames.
+
+    Iterative post-order over live predecessors, memoised in ``cache``, so a
+    deep chain does not recurse.
+    """
+    pending: list[tuple[str, bool]] = [(node_id, False)]
+    while pending:
+        current, inputs_resolved = pending.pop()
+        if current in cache:
+            continue
+        info = graph.get_node_info(current)
+        if info.node_type is NodeType.SOURCE:
+            cache[current] = FieldNameResolution.of_source_renames((info.field_renames,))
+            continue
+        predecessors = _live_predecessors(graph, current)
+        if not inputs_resolved:
+            pending.append((current, True))
+            pending.extend((predecessor_id, False) for predecessor_id in predecessors if predecessor_id not in cache)
+            continue
+        cache[current] = FieldNameResolution.union(cache[predecessor_id] for predecessor_id in predecessors).then_renamed(
+            info.renamed_input_fields
+        )
+    return cache[node_id]
+
+
+def header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str], resolution: FieldNameResolution) -> str:
     """One line naming each missing field that is a header spelling of a guaranteed one, or "".
 
     A required name is checked against a producer's guarantees fail-closed by
@@ -1213,7 +1266,7 @@ def header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str]) ->
     explains the miss, the verdict says so and names the remedy — the same
     sentence the source and ``validate_declared_field_spellings`` use.
     """
-    spellings = header_spelled_names(missing, guaranteed, kind="read")
+    spellings = header_spelled_names(missing, guaranteed, resolution, kind="read")
     if not spellings:
         return ""
     return f"  Header spellings: {describe_header_spellings(spellings)}.\n"
@@ -1224,6 +1277,7 @@ def _sink_required_violation_message(
     predecessor_id: str,
     missing: frozenset[str],
     guaranteed: frozenset[str],
+    resolution: FieldNameResolution,
 ) -> str:
     """The one wording of the sink required-fields verdict.
 
@@ -1267,13 +1321,13 @@ def _sink_required_violation_message(
         f"that declares nothing ABSTAINS, and the sink's requirement is enforced "
         f"per row at runtime instead of at build time.\n"
         f"  3. Remove {sorted(missing)} from the sink's declared_required_fields."
-        f"{_indented_header_spelling_hint(missing, guaranteed)}"
+        f"{_indented_header_spelling_hint(missing, guaranteed, resolution)}"
     )
 
 
-def _indented_header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str]) -> str:
+def _indented_header_spelling_hint(missing: frozenset[str], guaranteed: frozenset[str], resolution: FieldNameResolution) -> str:
     """``header_spelling_hint`` as a trailing paragraph for a multi-line verdict, or ""."""
-    hint = header_spelling_hint(missing, guaranteed)
+    hint = header_spelling_hint(missing, guaranteed, resolution)
     return f"\n\n{hint.strip()}" if hint else ""
 
 
@@ -1336,6 +1390,7 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
                     predecessor_id,
                     missing,
                     walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache).fields,
+                    upstream_name_resolution(graph, node_id, {}),
                 ),
                 component_id=str(node_id),
                 component_type="sink",
@@ -1356,23 +1411,18 @@ def _live_predecessors(graph: ExecutionGraph, node_id: str) -> list[str]:
     pair, so a predecessor counts as live when ANY of its edges is non-DIVERT;
     filtering edge-wise without regrouping would drop a live predecessor.
 
-    REACHABILITY, stated honestly: ``build_execution_graph`` cannot currently
-    produce a DIVERT edge INTO a transform — that claim is what THIS
-    function's every caller relies on (each filters to ``NodeType.TRANSFORM``
-    before calling this helper, below), and it still holds. Error routing in
-    ELSPETH is no longer uniformly terminal, though: since spec §7 rule 9
-    (Task 11), an in-region transform/gate's ``on_error`` may target its
-    enclosing bound region's closer (coalesce/row_union/collector), so a
-    DIVERT edge can now land on one of THOSE node kinds too, not only a sink
-    (source quarantine, transform/gate ``on_error``, sink failsink, and now
-    an in-region closer). None of that widens what THIS function sees,
-    because it is never called for a coalesce/row_union/collector node — so
-    on today's production path this filter is still equivalent to bare
-    ``.predecessors()`` for every node it actually examines. It is kept as
-    defence-in-depth for the public ``add_edge`` surface — which tests and any
-    future "route errors into a repair transform" topology use — and pinned by
-    ``test_divert_only_predecessor_is_not_checked``. Do not read it as
-    guarding a live production path.
+    REACHABILITY: ``build_execution_graph`` cannot produce a DIVERT edge INTO
+    a transform, but DIVERT edges do land on sinks (source quarantine,
+    transform/gate ``on_error``, sink failsink) and, since spec §7 rule 9
+    (Task 11), on an enclosing bound region's closer
+    (coalesce/row_union/collector). The filter is LIVE for two callers:
+    ``validate_declared_field_spellings`` walks the votes of sink, aggregation
+    and collector consumers through it, and ``upstream_name_resolution``
+    walks every ancestor of every kind through it, so a source whose rows reach
+    a node only as an error envelope (a closer's ``on_error`` arm, a quarantine
+    sink) contributes no renames. Pinned by
+    ``test_divert_only_predecessor_is_not_checked`` and, for the resolution,
+    by the composer/runtime agreement test on live-source reach.
 
     Deliberately NOT shared with ``validate_sink_required_fields``, which uses
     bare ``.predecessors()`` and IS DIVERT-reachable (sink → failsink sink):
@@ -1665,7 +1715,12 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
     The predicate is ``contracts.field_spelling``'s, and the gating is its
     ``header_spelled_declarations`` — the same call the Web Composer's Stage-1
     mirror makes, so the two surfaces cannot disagree about when a build may
-    refuse. Soundness, per predecessor vote:
+    refuse. A declared name is resolved the way the upstream resolves it: its
+    normalized form, renamed by the ``field_mapping`` of any source reaching the
+    node and by every transform rename on the way (``upstream_name_resolution``)
+    — so under ``field_mapping: {name: b}`` both ``Name`` and ``name`` are
+    spellings of ``b``, and behind a field_mapper ``{b: c}`` of ``c``. Soundness, per
+    predecessor vote:
 
     - a READ is refused only against a PARTICIPATING and CLOSED vote. Absence of
       the header literal needs an upper bound on the arriving fields; an open
@@ -1696,6 +1751,7 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
             participating predecessor carries.
     """
     effective_fields_cache: dict[str, EffectiveGuaranteeVote] = {}
+    name_resolution_cache: dict[str, FieldNameResolution] = {}
 
     for node_id, data in graph._graph.nodes(data=True):
         info = data["info"]
@@ -1710,11 +1766,12 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
                 else frozenset()
             ),
         )
-        # Every declaration canonical: no upstream can make one a header
-        # spelling, so no vote is walked.
+        # A node that declares nothing has nothing any upstream could make a
+        # header spelling, so no vote is walked.
         if declared.is_empty:
             continue
 
+        resolution = upstream_name_resolution(graph, node_id, name_resolution_cache)
         for predecessor_id in _live_predecessors(graph, node_id):
             vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
             spellings = header_spelled_declarations(
@@ -1723,6 +1780,7 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
                 forwarded=vote.fields - info.removed_input_fields,
                 participated=vote.participated,
                 closed=vote.closed,
+                resolution=resolution,
             )
             if not spellings:
                 continue

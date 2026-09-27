@@ -145,7 +145,7 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:526fa52df048d26e"
+    source_file_hash: str | None = "sha256:cb4119567e0d1b1c"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -459,10 +459,12 @@ class CSVSink(BaseSink):
                     writer.writerow(row)
                     row_text = row_buffer.getvalue()
                     row_text.encode(self._encoding)
-                except UnicodeEncodeError as exc:
-                    reason = f"CSV encoding ({self._encoding}) failed: {exc}"
+                except UnicodeEncodeError:
+                    # Value-free: the codec's own text quotes the character it
+                    # could not encode, a fragment of the row's value.
+                    reason = f"CSV encoding ({self._encoding}) failed: UnicodeEncodeError"
                     if current_member is None:
-                        raise ValueError(f"Predecessor CSV snapshot is incompatible: {reason}") from exc
+                        raise ValueError(f"Predecessor CSV snapshot is incompatible: {reason}") from None
                     self._divert_row(
                         row,
                         row_index=current_member.ordinal,
@@ -471,10 +473,10 @@ class CSVSink(BaseSink):
                     diverted.append(current_member.ordinal)
                     diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))
                     continue
-                except csv.Error as exc:
-                    reason = f"CSV serialization failed: {exc}"
+                except csv.Error:
+                    reason = "CSV serialization failed: csv.Error"
                     if current_member is None:
-                        raise ValueError(f"Predecessor CSV snapshot is incompatible: {reason}") from exc
+                        raise ValueError(f"Predecessor CSV snapshot is incompatible: {reason}") from None
                     self._divert_row(row, row_index=current_member.ordinal, reason=reason)
                     diverted.append(current_member.ordinal)
                     diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))

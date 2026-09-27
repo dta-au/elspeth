@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import re
 
+from elspeth.contracts.field_spelling import NORMALIZATION_ONLY
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.dag.models import NodeInfo
 from elspeth.core.dag.schema_validation import _sink_required_violation_message
@@ -35,7 +36,7 @@ _ROUTE_LINE = re.compile(r"^ {2}(\d+)\. ", re.MULTILINE)
 
 
 def _verdict() -> str:
-    return _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}), frozenset())
+    return _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}), frozenset(), NORMALIZATION_ONLY)
 
 
 def _dataclass_field_names(cls: type) -> frozenset[str]:
@@ -118,7 +119,9 @@ class TestTheVerdictStillStatesTheContractAndTheSymptom:
         key on "does not guarantee them" and on the sink/upstream naming, so a
         rewrite that improved only the tail would break them from a distance.
         """
-        verdict = _sink_required_violation_message("json", "coalesce_merge_b_99", frozenset({"id", "value"}), frozenset())
+        verdict = _sink_required_violation_message(
+            "json", "coalesce_merge_b_99", frozenset({"id", "value"}), frozenset(), NORMALIZATION_ONLY
+        )
 
         assert re.search(
             r"Sink 'json' requires fields \['id', 'value'\].*upstream 'coalesce_merge_b_99' does not guarantee them",
@@ -132,4 +135,6 @@ class TestTheVerdictStillStatesTheContractAndTheSymptom:
         identically, so a graph tripping BOTH rules reads the same as one
         tripping only this rule.
         """
-        assert _verdict() == _sink_required_violation_message("csv", "source_primary_ab12", frozenset({"colour"}), frozenset())
+        assert _verdict() == _sink_required_violation_message(
+            "csv", "source_primary_ab12", frozenset({"colour"}), frozenset(), NORMALIZATION_ONLY
+        )

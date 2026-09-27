@@ -15,11 +15,14 @@ must exist in the DAG builder.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
@@ -35,6 +38,7 @@ class MockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -94,6 +98,7 @@ class MockFieldAddingTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(
         self,

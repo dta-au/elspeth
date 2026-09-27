@@ -381,7 +381,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:89687a0a81a01a23"
+    source_file_hash: str | None = "sha256:184aa56ff5f95e44"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -541,7 +541,7 @@ class PDFRasterize(BaseTransform):
             )
         if _PAYLOAD_REF_PATTERN.fullmatch(blob_ref) is None:
             return TransformResult.error(
-                {"reason": "invalid_input", "field": field_name, "blob_ref": blob_ref, "error_type": "invalid_blob_ref"},
+                {"reason": "invalid_input", "field": field_name, "error_type": "invalid_blob_ref"},
                 retryable=False,
             )
 

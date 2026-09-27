@@ -119,7 +119,7 @@ def parse_field_value(
             if not isinstance(value, str):
                 return None, f"expected string (enum), got {type(value).__name__}"
             if field_config.values and value not in field_config.values:
-                return None, f"value '{value}' not in allowed values: {field_config.values}"
+                return None, f"value not in allowed values: {field_config.values}"
             return value, None
         case _:
             assert_never(field_config.type)
@@ -282,10 +282,12 @@ def extract_structured_fields(
     try:
         parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
     except (json.JSONDecodeError, ValueError) as e:
+        # The response text is external content that echoes the prompt (row
+        # data): it stays in the recorded call, never in the reason.
         return {}, {
             "reason": "json_parse_failed",
             "error": str(e),
-            "raw_response_preview": content[:500],
+            "content_length": len(content),
         }
     if not isinstance(parsed, dict):
         return {}, {
@@ -299,7 +301,6 @@ def extract_structured_fields(
             return {}, {
                 "reason": "missing_output_field",
                 "field": field.suffix,
-                "available_fields": list(parsed.keys()),
             }
         parsed_value, type_error = parse_field_value(parsed[field.suffix], field)
         if type_error is not None:
@@ -307,7 +308,6 @@ def extract_structured_fields(
                 "reason": "field_type_mismatch",
                 "field": field.suffix,
                 "error": type_error,
-                "value": repr(parsed[field.suffix])[:200],
             }
         extracted[field.suffix] = parsed_value
     return extracted, None
