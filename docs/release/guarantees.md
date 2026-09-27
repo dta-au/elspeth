@@ -98,6 +98,7 @@ This is not optional. This is not best-effort. This is the reason ELSPETH exists
 - Same data → same hash (deterministic)
 - Hash algorithm versioned (`sha256-rfc8785-v1`)
 - NaN/Infinity strictly rejected (not silently converted)
+- Integers beyond ±(2**53-1) strictly rejected; a source quarantines a row that carries one
 - Payload store verifies hash on read
 
 ### 1.4 Payload Retention

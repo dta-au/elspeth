@@ -122,11 +122,16 @@ class TestBlobRowsConfig:
             ("mime_type", "image/gif", "mime_type must be one of"),
             ("filename", "", "at least 1 character"),
             ("size_bytes", -1, "greater than or equal"),
+            # the row carries size_bytes and canonical JSON stops at 2**53-1 (H1, lane 5887)
+            ("size_bytes", 2**53, "less than or equal to 9007199254740991"),
         ],
     )
     def test_malformed_entry_rejected(self, field: str, value: Any, match: str) -> None:
         with pytest.raises(PluginConfigError, match=match):
             _make_source(_config([_entry(1, **{field: value})]))
+
+    def test_largest_canonical_size_is_admitted(self) -> None:
+        _make_source(_config([_entry(1, size_bytes=2**53 - 1)]))
 
     def test_unknown_entry_field_rejected(self) -> None:
         with pytest.raises(PluginConfigError):

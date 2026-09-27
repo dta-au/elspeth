@@ -769,6 +769,18 @@ class TestAzureBlobSourceJSONL:
         assert rows[0].row == {"id": 1, "name": "alice"}
         assert rows[1].row["name"] == "bob"
 
+    def test_unsafe_integer_quarantines_and_next_line_survives(self, ctx: PluginContext) -> None:
+        """H1 (lane 5887): an integer outside ±(2**53-1) is quarantined, value-free, not passed as valid."""
+        blob_bytes = b'{"id": 1, "n": 9007199254740993}\n{"id": 2, "n": 5}\n'
+        source = _make_source(_base_config(format="jsonl"))
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(blob_bytes)):
+            rows = list(source.load(ctx))
+
+        assert rows[0].is_quarantined
+        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert rows[1].row == {"id": 2, "n": 5}
+
     def test_skips_empty_lines(self, ctx: PluginContext) -> None:
         """JSONL skips blank lines."""
         blob_bytes = b'{"id": 1}\n\n{"id": 2}\n\n'

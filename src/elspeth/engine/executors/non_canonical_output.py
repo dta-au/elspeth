@@ -37,15 +37,27 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import stable_hash
 
 
+def _field_phrase(row: PipelineRow, declared_fields: Collection[str]) -> str | None:
+    """Describe where in ``row`` the first non-canonical field is, or None when every field canonicalizes.
+
+    The phrase follows the row's own locator (``emitted row 2`` / ``source row
+    7``): `` field 'x'`` for a declared field, else a phrase naming no field.
+    """
+    for field_name, value in row.to_dict().items():
+        try:
+            stable_hash(value)
+        except (TypeError, ValueError):
+            if field_name in declared_fields:
+                return f" field {field_name!r}"
+            return ", in a field its output schema does not declare"
+    return None
+
+
 def _locate_in_rows(rows: Sequence[PipelineRow], declared_fields: Collection[str]) -> str:
     for index, row in enumerate(rows):
-        for field_name, value in row.to_dict().items():
-            try:
-                stable_hash(value)
-            except (TypeError, ValueError):
-                if field_name in declared_fields:
-                    return f"emitted row {index} field {field_name!r}"
-                return f"emitted row {index}, in a field its output schema does not declare"
+        phrase = _field_phrase(row, declared_fields)
+        if phrase is not None:
+            return f"emitted row {index}{phrase}"
     return "its emitted output"
 
 
@@ -82,9 +94,15 @@ def non_canonical_source_row_violation(
     producer: str,
     declared_fields: Collection[str],
     row: PipelineRow,
+    source_row_index: int,
     exc: ValueError,
 ) -> PluginContractViolation:
     """Build the violation for a VALID source row the ingest hash refused, naming no row value.
+
+    A source that validates its rows through its schema (``schema_factory``'s
+    source-boundary check) quarantines a number outside canonical JSON itself,
+    so reaching this seam means the source skipped that validation or emitted a
+    type canonical JSON cannot represent: its contract breach, and the run ends.
 
     Args:
         producer: How the message names the source, e.g. ``"Source 'json'"``.
@@ -92,10 +110,12 @@ def non_canonical_source_row_violation(
             only these may appear in the message (an observed source's keys
             come from the data).
         row: The valid row the ingest transaction failed to canonicalize.
+        source_row_index: The row's source-authored position, which locates it.
         exc: The canonicalization error; only its type is reported.
     """
+    phrase = _field_phrase(row, declared_fields) or ""
     return PluginContractViolation(
-        f"{producer} emitted a valid row with non-canonical data at {_locate_in_rows([row], declared_fields)} "
-        f"({type(exc).__name__}). A source must quarantine a value outside canonical JSON (such as an integer "
-        "beyond the JSON safe integer range) at its boundary."
+        f"{producer} emitted a valid row with non-canonical data at source row {source_row_index}{phrase} "
+        f"({type(exc).__name__}). A source must validate each row at its boundary, quarantining a number outside "
+        "canonical JSON (NaN, Infinity, an integer beyond the JSON safe integer range), and emit only JSON types."
     )

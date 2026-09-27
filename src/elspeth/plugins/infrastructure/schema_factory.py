@@ -10,7 +10,6 @@ CRITICAL: The `allow_coercion` parameter enforces the three-tier trust model:
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -20,49 +19,51 @@ from pydantic import ConfigDict, create_model, model_validator
 from elspeth.contracts import PluginSchema
 from elspeth.contracts.schema import FIELD_TYPE_MAP as TYPE_MAP
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.core.canonical import is_non_canonical_number
 
 # Type alias for extra field handling modes
 ExtraMode = Literal["allow", "forbid"]
 
 
-def _find_non_finite_value_path(value: Any, path: str = "$") -> str | None:
-    """Find the first path containing a non-finite float value."""
+def _find_non_canonical_number_path(value: Any, path: str = "$") -> str | None:
+    """Find the first path holding a number canonical JSON refuses by value.
+
+    ``is_non_canonical_number`` decides (NaN/Infinity, an integer outside the
+    JSON safe range ±(2**53-1), a NumPy value beyond the double range); this
+    walker only finds where it is. Such a value cannot be hashed into the audit
+    trail, so a source must quarantine the row that carries it.
+    """
     # isinstance (not exact-type) so container/scalar subclasses cannot fail open:
-    # a NaN nested in an OrderedDict/Mapping subclass or a namedtuple (tuple
-    # subclass) must still be caught at the source boundary. bool is excluded
-    # (subclass of int, not float); str/bytes are excluded from the Sequence arm.
-    if isinstance(value, float) and not math.isfinite(value):
+    # a value nested in an OrderedDict/Mapping subclass or a namedtuple (tuple
+    # subclass) must still be caught at the source boundary. str/bytes are
+    # excluded from the Sequence arm.
+    if is_non_canonical_number(value):
         return path
 
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            nested_path = _find_non_finite_value_path(nested, f"{path}.{key!s}")
+            nested_path = _find_non_canonical_number_path(nested, f"{path}.{key!s}")
             if nested_path is not None:
                 return nested_path
         return None
 
     if isinstance(value, (list, tuple)):
         for idx, nested in enumerate(value):
-            nested_path = _find_non_finite_value_path(nested, f"{path}[{idx}]")
+            nested_path = _find_non_canonical_number_path(nested, f"{path}[{idx}]")
             if nested_path is not None:
                 return nested_path
         return None
 
-    # Catch numpy floating scalars (longdouble, float16, float32, float64, etc.)
-    # Use np.isfinite() — math.isfinite(float(value)) overflows for np.longdouble
-    # values outside IEEE 754 double range, falsely treating finite values as inf.
-    if isinstance(value, np.floating) and not np.isfinite(value):
-        return path
-
-    # NumPy arrays: scan for non-finite elements and report a useful path.
-    # Gate on a floating dtype rather than catching np.isfinite()'s TypeError on
-    # non-numeric dtypes: non-float dtypes (string/object/int/bool/complex) cannot
-    # harbour the NaN/Infinity floats this scanner reports, so they are skipped.
-    # (Complex arrays were never reported by the prior float-only element check
-    # either; np.floating preserves that — np.number would wrongly include them.)
-    if isinstance(value, np.ndarray) and value.size > 0 and np.issubdtype(value.dtype, np.floating) and np.any(~np.isfinite(value)):
+    # NumPy arrays: scan integer and floating elements and report a useful path.
+    # Other dtypes (string/object/bool/complex) hold no value the number rule
+    # judges, so they are skipped.
+    if (
+        isinstance(value, np.ndarray)
+        and value.size > 0
+        and (np.issubdtype(value.dtype, np.floating) or np.issubdtype(value.dtype, np.integer))
+    ):
         for idx, elem in enumerate(value.flat):
-            if not np.isfinite(elem):
+            if is_non_canonical_number(elem):
                 indices = np.unravel_index(idx, value.shape)
                 index_str = "][".join(str(i) for i in indices)
                 return f"{path}[{index_str}]"
@@ -70,21 +71,29 @@ def _find_non_finite_value_path(value: Any, path: str = "$") -> str | None:
     return None
 
 
-def _reject_non_finite_observed_values(data: Any) -> Any:
-    """Reject NaN/Infinity in observed schemas at source boundary."""
-    offending_path = _find_non_finite_value_path(data)
+def _reject_non_canonical_numbers(data: Any) -> Any:
+    """Reject a number canonical JSON refuses by value (NaN/Infinity, unsafe integer) at the source boundary."""
+    offending_path = _find_non_canonical_number_path(data)
     if offending_path is not None:
-        raise ValueError(f"Non-finite float at {offending_path}. Use null/None for missing values, not NaN/Infinity.")
+        raise ValueError(
+            f"Non-finite or out-of-range number at {offending_path}: canonical JSON admits finite numbers and integers "
+            "within ±(2**53-1). Use null/None for missing values, not NaN/Infinity."
+        )
     return data
 
 
 class _ObservedPluginSchema(PluginSchema):
-    """PluginSchema base for observed mode with non-finite rejection."""
+    """PluginSchema base for the source boundary: rejects non-canonical numbers.
 
-    @model_validator(mode="before")
-    @classmethod
-    def _validate_non_finite_values(cls, data: Any) -> Any:
-        return _reject_non_finite_observed_values(data)
+    Runs AFTER field validation, so it judges the values the row will carry —
+    including a typed ``int`` field coerced from text (a CSV cell), which a
+    before-validator would only see as a string.
+    """
+
+    @model_validator(mode="after")
+    def _validate_canonical_numbers(self) -> _ObservedPluginSchema:
+        _reject_non_canonical_numbers(dict(self))
+        return self
 
 
 def create_schema_from_config(
@@ -172,8 +181,10 @@ def _create_explicit_schema(
     use_strict = not allow_coercion
 
     # At source boundary (allow_coercion=True), use _ObservedPluginSchema base
-    # to reject NaN/Infinity in 'any' fields and flexible-mode extras.
-    # FiniteFloat handles typed float fields; the model validator catches the rest.
+    # to reject numbers canonical JSON refuses (NaN/Infinity, an integer outside
+    # ±(2**53-1)) in every field: typed (after coercion), 'any', and
+    # flexible-mode extras. FiniteFloat still rejects a non-finite typed float
+    # first, with its own field-level error.
     base_class = _ObservedPluginSchema if allow_coercion else PluginSchema
 
     return create_model(

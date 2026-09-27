@@ -1655,6 +1655,19 @@ class TestDataverseSourceLoadStructured:
         assert call_kwargs["schema_mode"] == "odata_strip"
         assert "collision" in call_kwargs["error"].lower()
 
+    def test_load_quarantines_an_unsafe_integer_value_free(self) -> None:
+        """H1 (lane 5887): an OData integer outside ±(2**53-1) is quarantined, not passed as valid."""
+        pages = [_make_page([{"contactid": "c1", "n": 9_007_199_254_740_993}, {"contactid": "c2", "n": 5}])]
+        source = _make_source_for_load(pages, _base_config())
+        ctx = _mock_source_context()
+
+        rows = list(source.load(ctx))
+
+        assert [row.is_quarantined for row in rows] == [True, False]
+        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert "9007199254740993" not in ctx.record_validation_error.call_args.kwargs["error"]
+        assert rows[1].row["n"] == 5
+
     def test_load_discard_does_not_yield_quarantined(self) -> None:
         """When on_validation_failure='discard', quarantined rows are not yielded."""
         pages = [

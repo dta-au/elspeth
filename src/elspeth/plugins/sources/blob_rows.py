@@ -56,7 +56,10 @@ class BlobRowsEntry(BaseModel):
     payload_ref: str = Field(description="64-lowercase-hex SHA-256 content hash in the payload store.")
     filename: str = Field(min_length=1, max_length=512, description="Blob filename recorded at admission.")
     mime_type: str = Field(description="Declared storage MIME type recorded at admission.")
-    size_bytes: int = Field(ge=0, description="Blob byte length recorded at admission.")
+    # The row carries this value, and the audit trail hashes rows as canonical
+    # JSON, whose integers stop at 2**53-1: a larger configured size is refused
+    # here, at construction, not at the first row's ingest.
+    size_bytes: int = Field(ge=0, le=2**53 - 1, description="Blob byte length recorded at admission.")
 
     @field_validator("blob_id")
     @classmethod
@@ -126,7 +129,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8027d28c8aec8228"
+    source_file_hash: str | None = "sha256:694f938d877c1127"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the

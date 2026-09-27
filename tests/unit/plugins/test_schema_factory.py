@@ -585,7 +585,7 @@ class TestNonFiniteFloatRejection:
     def test_observed_schema_rejects_nan_inside_numpy_array(self) -> None:
         """NaN/Infinity inside NumPy arrays must be detected at source boundary.
 
-        Bug fix for elspeth-214096f76b: _find_non_finite_value_path had no
+        Bug fix for elspeth-214096f76b: _find_non_canonical_number_path had no
         ndarray handling, so rows with NaN in arrays passed source validation
         and crashed later during audit hashing.
         """
@@ -630,42 +630,44 @@ class TestNonFiniteFloatRejection:
         assert instance is not None
 
     def test_find_non_finite_path_numpy_array_reports_correct_index(self) -> None:
-        """_find_non_finite_value_path reports useful path for ndarray NaN."""
+        """_find_non_canonical_number_path reports useful path for ndarray NaN."""
         import numpy as np
 
-        from elspeth.plugins.infrastructure.schema_factory import _find_non_finite_value_path
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
 
         # 1-D array with NaN at index 2
-        path = _find_non_finite_value_path(np.array([1.0, 2.0, float("nan")]), "$")
+        path = _find_non_canonical_number_path(np.array([1.0, 2.0, float("nan")]), "$")
         assert path is not None
         assert "[2]" in path
 
     def test_find_non_finite_path_2d_numpy_array(self) -> None:
-        """_find_non_finite_value_path handles multi-dimensional arrays."""
+        """_find_non_canonical_number_path handles multi-dimensional arrays."""
         import numpy as np
 
-        from elspeth.plugins.infrastructure.schema_factory import _find_non_finite_value_path
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
 
         arr = np.array([[1.0, 2.0], [3.0, float("inf")]])
-        path = _find_non_finite_value_path(arr, "$")
+        path = _find_non_canonical_number_path(arr, "$")
         assert path is not None
         assert "[1]" in path and "[1]" in path  # row 1, col 1
 
-    def test_find_non_finite_path_longdouble_scalar_uses_native_check(self) -> None:
-        """np.longdouble finite values must not be falsely reported as non-finite.
+    def test_find_path_longdouble_judged_by_the_canonicalizer_not_finiteness(self) -> None:
+        """np.longdouble is judged by whether canonical JSON admits it, not by finiteness.
 
-        Bug fix: the old code used math.isfinite(float(value)) which overflows.
+        2**1024 is finite in longdouble but overflows the IEEE 754 double JSON
+        numbers use, so canonical_json refuses it and the ingest hash would end
+        the run: the source boundary reports it. A longdouble inside the double
+        range is admitted.
         """
         import numpy as np
 
-        from elspeth.plugins.infrastructure.schema_factory import _find_non_finite_value_path
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
 
-        # Large but finite value in longdouble range
         large_val = np.longdouble(2.0) ** np.longdouble(1024)
         assert np.isfinite(large_val), "Test precondition"
 
-        path = _find_non_finite_value_path(large_val, "$")
-        assert path is None, "Finite np.longdouble must not be reported as non-finite"
+        assert _find_non_canonical_number_path(large_val, "$") == "$"
+        assert _find_non_canonical_number_path(np.longdouble(1.5), "$") is None
 
     def test_find_non_finite_path_detects_nan_in_mapping_subclass(self) -> None:
         """NaN nested in a Mapping subclass (OrderedDict/defaultdict) must be caught.
@@ -676,18 +678,18 @@ class TestNonFiniteFloatRejection:
         """
         from collections import OrderedDict, defaultdict
 
-        from elspeth.plugins.infrastructure.schema_factory import _find_non_finite_value_path
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
 
         ordered = OrderedDict([("a", 1.0), ("b", float("nan"))])
-        path = _find_non_finite_value_path(ordered, "$")
+        path = _find_non_canonical_number_path(ordered, "$")
         assert path is not None
         assert ".b" in path
 
         nested = {"outer": OrderedDict([("inner", float("inf"))])}
-        assert _find_non_finite_value_path(nested, "$") is not None
+        assert _find_non_canonical_number_path(nested, "$") is not None
 
         dd: defaultdict[str, float] = defaultdict(float, {"x": float("nan")})
-        assert _find_non_finite_value_path(dd, "$") is not None
+        assert _find_non_canonical_number_path(dd, "$") is not None
 
     def test_find_non_finite_path_detects_nan_in_tuple_subclass(self) -> None:
         """NaN inside a named-tuple (a tuple subclass) must be caught.
@@ -697,13 +699,13 @@ class TestNonFiniteFloatRejection:
         """
         from typing import NamedTuple
 
-        from elspeth.plugins.infrastructure.schema_factory import _find_non_finite_value_path
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
 
         class Point(NamedTuple):
             x: float
             y: float
 
-        path = _find_non_finite_value_path(Point(1.0, float("nan")), "$")
+        path = _find_non_canonical_number_path(Point(1.0, float("nan")), "$")
         assert path is not None
 
     def test_explicit_schema_no_validator_at_transform_boundary(self) -> None:
@@ -721,6 +723,78 @@ class TestNonFiniteFloatRejection:
         # NaN passes schema validation at transform boundary — crash happens downstream
         instance = Schema(data=float("nan"))
         assert instance.data != instance.data  # NaN != NaN
+
+
+_UNSAFE_INT = 9_007_199_254_740_993  # 2**53 + 1: canonical JSON (rfc8785) refuses it
+
+
+class TestUnsafeIntegerRejectionAtSourceBoundary:
+    """H1 (lane 5887): an integer outside ±(2**53-1) is quarantined by the source schema.
+
+    The audit trail hashes each source row as canonical JSON, which refuses such
+    an integer; a source that admitted it ended the run at ingest with the row's
+    token left without an outcome. The source-boundary schema now rejects it for
+    every field shape, so the source quarantines the row like any other invalid
+    row, and the rendered reason names no value.
+    """
+
+    @pytest.mark.parametrize(
+        ("schema", "row"),
+        [
+            ({"mode": "observed"}, {"id": 1, "big": _UNSAFE_INT}),
+            ({"mode": "observed"}, {"id": 1, "big": -_UNSAFE_INT}),
+            ({"mode": "observed"}, {"id": 1, "obj": {"n": [5, _UNSAFE_INT]}}),
+            ({"mode": "fixed", "fields": ["id: int", "big: int"]}, {"id": 1, "big": _UNSAFE_INT}),
+            # a CSV cell: the typed int field is COERCED from text, which only an
+            # after-validation check sees as an integer
+            ({"mode": "fixed", "fields": ["id: int", "big: int"]}, {"id": "1", "big": str(_UNSAFE_INT)}),
+            ({"mode": "fixed", "fields": ["data: any"]}, {"data": _UNSAFE_INT}),
+            ({"mode": "flexible", "fields": ["id: int"]}, {"id": 1, "extra": _UNSAFE_INT}),
+        ],
+        ids=["observed", "observed-negative", "observed-nested", "fixed-int", "fixed-int-coerced-from-text", "fixed-any", "flexible-extra"],
+    )
+    def test_source_schema_rejects_an_unsafe_integer_value_free(self, schema: dict[str, object], row: dict[str, object]) -> None:
+        from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        Schema = create_schema_from_config(SchemaConfig.from_dict(schema), "SourceSchema", allow_coercion=True)
+
+        with pytest.raises(ValidationError) as exc_info:
+            Schema.model_validate(row)
+        rendered = safe_validation_error_text(exc_info.value, Schema)
+        assert rendered == "1 validation error: <root>: [value_error]"
+        assert str(_UNSAFE_INT) not in rendered
+
+    @pytest.mark.parametrize(
+        "value",
+        [2**53 - 1, -(2**53 - 1), True, 0, "9007199254740993"],
+        ids=["max-safe", "min-safe", "bool", "zero", "digit-string"],
+    )
+    def test_source_schema_admits_every_value_canonical_json_admits(self, value: object) -> None:
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        Schema = create_schema_from_config(SchemaConfig.from_dict({"mode": "observed"}), "SourceSchema", allow_coercion=True)
+
+        assert Schema.model_validate({"v": value}).to_row() == {"v": value}
+
+    def test_numpy_integer_array_beyond_the_safe_range_is_located(self) -> None:
+        import numpy as np
+
+        from elspeth.plugins.infrastructure.schema_factory import _find_non_canonical_number_path
+
+        assert _find_non_canonical_number_path(np.array([1, 2**60], dtype=np.int64), "$") == "$[1]"
+        assert _find_non_canonical_number_path(np.array([1, 2**53 - 1], dtype=np.int64), "$") is None
+
+    def test_transform_boundary_schema_has_no_canonical_number_check(self) -> None:
+        """allow_coercion=False (transforms/sinks) keeps no such check: a value there is an upstream bug."""
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        Schema = create_schema_from_config(SchemaConfig.from_dict({"mode": "fixed", "fields": ["data: any"]}), "T", allow_coercion=False)
+
+        assert Schema(data=_UNSAFE_INT).data == _UNSAFE_INT
 
 
 class TestSchemaPluginSchemaCompliance:

@@ -3081,6 +3081,7 @@ class RowProcessor:
                 producer=f"Source {effective_source_plugin.name!r}" if effective_source_plugin is not None else "Source",
                 declared_fields=(effective_source_plugin.output_schema.model_fields if effective_source_plugin is not None else ()),
                 row=pipeline_row,
+                source_row_index=source_row_index,
                 exc=exc,
             ) from None
         return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)

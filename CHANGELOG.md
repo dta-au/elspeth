@@ -423,6 +423,24 @@ drained and repair this release forward.
   the same way and the run stays `FAILED`. The re-run is at-least-once, as a
   lease takeover already is: an external call the failed attempt made may be
   made again.
+- **A source row carrying an integer beyond ±(2**53-1) is quarantined, not
+  fatal.** The audit trail hashes each row as canonical JSON, which refuses
+  such an integer, so a source that read one (a JSON number, a CSV or text
+  value under an `int` field, an LLM source's integer output field, a cloud
+  blob or Dataverse record) passed it as a valid row and the run ended at
+  ingest with that row's token left without an outcome. The source-boundary
+  schema check that already quarantined `NaN`/`Infinity` now applies the
+  canonicalizer's own number rule to every field (declared, `any`, extras and
+  nested values, after coercion), so the row takes the source's
+  `on_validation_failure` route with the value-free reason
+  `<root>: [value_error]`, and the rows around it deliver. A row quarantined for
+  another reason that also carries such an integer now reaches its quarantine
+  sink (the value is nulled there, as `NaN` already was) instead of ending the
+  run. A transform whose observed output schema receives such an integer now
+  fails that schema's output validation (routed, value-free), as it already did
+  for `NaN`. `blob_rows` refuses a configured `size_bytes` above 2**53-1 at
+  validation. A source that bypasses its schema still ends the run at ingest,
+  and the error now names the offending row by its source row index.
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:
   `settings.yaml` routes all three rows, with their original values, to the

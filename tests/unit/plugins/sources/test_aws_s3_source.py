@@ -1035,6 +1035,17 @@ class TestAWSS3SourceRegistrationAndParsing:
         rows = list(source.load(ctx))
         assert len(rows) == 1 and rows[0].is_quarantined
 
+    @pytest.mark.parametrize("source_format", ["json", "jsonl"])
+    def test_unsafe_integer_quarantines_and_next_row_survives(self, source_format: str) -> None:
+        """H1 (lane 5887): an integer outside ±(2**53-1) is quarantined, value-free, not passed as valid."""
+        records = [{"id": 1, "n": 9_007_199_254_740_993}, {"id": 2, "n": 5}]
+        data = json.dumps(records) if source_format == "json" else "\n".join(json.dumps(record) for record in records)
+        source, _, ctx = _source_for(data.encode(), format=source_format)
+        rows = list(source.load(ctx))
+        assert rows[0].is_quarantined
+        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert rows[1].row == {"id": 2, "n": 5}
+
     def test_json_array_non_object_quarantines_and_continues(self) -> None:
         source, _, ctx = _source_for(b'[1,{"id":2}]', format="json")
         rows = list(source.load(ctx))

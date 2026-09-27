@@ -704,23 +704,50 @@ class TestSanitizeForCanonical:
         result = sanitize_for_canonical({"x": np.longdouble(3.14)})
         assert result == {"x": np.longdouble(3.14)}
 
-    def test_sanitize_numpy_longdouble_large_finite_unchanged(self) -> None:
-        """Finite np.longdouble values that overflow float64 must NOT be replaced with None.
+    def test_sanitize_numpy_longdouble_beyond_double_range_is_replaced(self) -> None:
+        """A finite np.longdouble beyond the double range is replaced: canonical JSON refuses it.
 
-        Bug fix: sanitize_for_canonical used math.isfinite(float(obj)) which
-        falsely treats large-but-finite np.longdouble values as non-finite
-        because float() overflows to inf for values outside IEEE 754 double range.
+        The sanitizer's job is to make a quarantined row hashable. The value is
+        finite in longdouble but ``canonical_json`` refuses it (it overflows the
+        IEEE 754 double JSON numbers use), so keeping it — as the finiteness-only
+        rule did — left the quarantine record's hash to fail. The rule is now the
+        canonicalizer's own (``is_non_canonical_number``), not finiteness.
         """
-        from elspeth.core.canonical import sanitize_for_canonical
+        from elspeth.core.canonical import canonical_json, sanitize_for_canonical
 
         # 2^1024 is finite in np.longdouble (max_exp=16384) but overflows float64
         large_val = np.longdouble(2.0) ** np.longdouble(1024)
         assert np.isfinite(large_val), "Test precondition: value must be finite in longdouble"
+        with pytest.raises(ValueError):
+            canonical_json({"x": large_val})
 
         result = sanitize_for_canonical({"x": large_val})
-        # Sanitizer only replaces truly non-finite values — this is finite
-        assert result["x"] is not None
-        assert np.isfinite(result["x"])
+        assert result == {"x": None}
+        canonical_json(result)
+
+    @pytest.mark.parametrize(
+        "value",
+        [2**53, -(2**53), 2**60, np.int64(2**60), Decimal("NaN"), Decimal("Infinity")],
+        ids=["2**53", "-(2**53)", "2**60", "np.int64(2**60)", "Decimal-NaN", "Decimal-Infinity"],
+    )
+    def test_sanitize_replaces_numbers_canonical_json_refuses(self, value: object) -> None:
+        """An integer outside ±(2**53-1), or a non-finite Decimal, is replaced so the quarantine row hashes."""
+        from elspeth.core.canonical import canonical_json, sanitize_for_canonical
+
+        result = sanitize_for_canonical({"x": value, "nested": [value]})
+        assert result == {"x": None, "nested": [None]}
+        canonical_json(result)
+
+    @pytest.mark.parametrize(
+        "value",
+        [2**53 - 1, -(2**53 - 1), True, 0.0, np.int64(5), Decimal("1.5"), "9007199254740993"],
+        ids=["2**53-1", "-(2**53-1)", "bool", "0.0", "np.int64(5)", "Decimal-1.5", "digit-string"],
+    )
+    def test_sanitize_keeps_numbers_canonical_json_admits(self, value: object) -> None:
+        """Every value canonical JSON admits, and every non-number, passes through unchanged."""
+        from elspeth.core.canonical import sanitize_for_canonical
+
+        assert sanitize_for_canonical({"x": value}) == {"x": value}
 
 
 class TestSanitizeNumpyArrays:
