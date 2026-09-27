@@ -18,6 +18,7 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
@@ -2220,13 +2221,18 @@ def _fork_responses_diagnostic(winner_response: Any, stale_response: Any) -> str
 def _make_fork_app(
     tmp_path: Path,
     user_id: str = "alice",
+    *,
+    file_backed: bool = False,
 ) -> tuple[FastAPI, SessionServiceImpl, BlobServiceImpl]:
     """Create a test app with session + blob services for fork testing."""
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
-    )
+    if file_backed:
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'fork-sessions.db'}")
+    else:
+        engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
@@ -2287,7 +2293,7 @@ class TestForkEndpoint:
     async def test_partial_copy_stale_worker_takeover_completes_without_stale_cleanup(self, tmp_path) -> None:
         """A worker fenced after one copy joins the takeover winner without compensating it."""
 
-        app, service, blob_service = _make_fork_app(tmp_path)
+        app, service, blob_service = _make_fork_app(tmp_path, file_backed=True)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
             await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
@@ -2327,8 +2333,8 @@ class TestForkEndpoint:
                 await checkpoint()
                 checkpoint_count += 1
                 if invocation == 1 and checkpoint_count == 3:
-                    await asyncio.to_thread(partial_copied.wait, 5)
-                    await asyncio.to_thread(resume_stale.wait, 5)
+                    await run_sync_in_worker(partial_copied.wait, 5)
+                    await run_sync_in_worker(resume_stale.wait, 5)
 
             return await original_copy(*args, **{**kwargs, "checkpoint": controlled_checkpoint})
 
@@ -2342,13 +2348,13 @@ class TestForkEndpoint:
             patch.object(blob_service, "cleanup_blobs_for_fork", new=observed_cleanup),
         ):
             stale_task = asyncio.create_task(
-                asyncio.to_thread(
+                run_sync_in_worker(
                     client.post,
                     f"/api/sessions/{parent.id}/fork",
                     json=body,
                 )
             )
-            await asyncio.to_thread(partial_copied.wait, 5)
+            await run_sync_in_worker(partial_copied.wait, 5)
             with service._engine.connect() as conn:
                 operation = conn.execute(
                     select(guided_operations_table).where(
@@ -2390,12 +2396,12 @@ class TestForkEndpoint:
                 expired_at=expired_at,
             )
 
-            winner_response = await asyncio.to_thread(
+            winner_response = await run_sync_in_worker(
                 client.post,
                 f"/api/sessions/{parent.id}/fork",
                 json=body,
             )
-            await asyncio.to_thread(resume_stale.wait, 5)
+            await run_sync_in_worker(resume_stale.wait, 5)
             stale_response = await stale_task
 
         assert winner_response.status_code == stale_response.status_code == 201, _fork_responses_diagnostic(winner_response, stale_response)
@@ -2441,7 +2447,7 @@ class TestForkEndpoint:
         load to reproduce -- only a slow enough box. No sleep is needed here.
         """
 
-        app, service, blob_service = _make_fork_app(tmp_path)
+        app, service, blob_service = _make_fork_app(tmp_path, file_backed=True)
         parent = await service.create_session("alice", "Parent", "local")
         for index in range(2):
             await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
@@ -2477,20 +2483,20 @@ class TestForkEndpoint:
                 await checkpoint()
                 checkpoint_count += 1
                 if invocation == 1 and checkpoint_count == 3:
-                    await asyncio.to_thread(partial_copied.wait, 5)
-                    await asyncio.to_thread(resume_stale.wait, 5)
+                    await run_sync_in_worker(partial_copied.wait, 5)
+                    await run_sync_in_worker(resume_stale.wait, 5)
 
             return await original_copy(*args, **{**kwargs, "checkpoint": controlled_checkpoint})
 
         with patch.object(blob_service, "copy_blobs_for_fork", new=controlled_copy):
             stale_task = asyncio.create_task(
-                asyncio.to_thread(
+                run_sync_in_worker(
                     client.post,
                     f"/api/sessions/{parent.id}/fork",
                     json=body,
                 )
             )
-            await asyncio.to_thread(partial_copied.wait, 5)
+            await run_sync_in_worker(partial_copied.wait, 5)
             with service._engine.connect() as conn:
                 operation = conn.execute(
                     select(guided_operations_table).where(
@@ -2529,12 +2535,12 @@ class TestForkEndpoint:
                     .values(lease_expires_at=child_fence.lease_expires_at + timedelta(hours=1))
                 )
 
-            winner_response = await asyncio.to_thread(
+            winner_response = await run_sync_in_worker(
                 client.post,
                 f"/api/sessions/{parent.id}/fork",
                 json=body,
             )
-            await asyncio.to_thread(resume_stale.wait, 5)
+            await run_sync_in_worker(resume_stale.wait, 5)
             stale_response = await stale_task
 
         diagnostic = _fork_responses_diagnostic(winner_response, stale_response)
