@@ -179,6 +179,13 @@ _CASES: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = [
     ("outlier-no-spread", "batch_outlier_annotator", {"schema": {"mode": "observed"}, "value_field": "v"}, [{"v": 3}, {"v": 3}]),
     ("outlier-singleton", "batch_outlier_annotator", {"schema": {"mode": "observed"}, "value_field": "v"}, [{"v": 3}]),
     (
+        "rank-mixed",
+        "batch_rank",
+        {"schema": {"mode": "observed"}, "value_field": "v"},
+        [{"v": 1}, {"v": 2.5}, {"v": 2.5}, {"v": None}, {"v": _NAN}, {"w": 0}],
+    ),
+    ("rank-singleton-dense", "batch_rank", {"schema": {"mode": "observed"}, "value_field": "v", "ties": "dense"}, [{"v": 3}]),
+    (
         "replicate",
         "batch_replicate",
         {"schema": {"mode": "observed"}, "copies_field": "copies", "include_copy_index": True},

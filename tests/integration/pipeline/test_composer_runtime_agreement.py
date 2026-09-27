@@ -7852,16 +7852,18 @@ class TestComposerRuntimeBatchPlacementAgreement:
             assert entry.contract.missing_fields == composer_missing
             assert not runtime.is_valid
 
-    def test_both_reject_every_registered_batch_plugin_under_passthrough(self, tmp_path: Path) -> None:
-        """No shipped batch plugin emits one row per buffered row, so passthrough admits none of them.
+    def test_both_reject_every_registered_non_declaring_batch_plugin_under_passthrough(self, tmp_path: Path) -> None:
+        """Every shipped batch plugin but batch_rank reduces, replicates or skips rows, so passthrough refuses it.
 
         Both refusals are decided on the class before any plugin option is
         read, so the node carries only a schema.
         """
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
-        names = sorted(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware)
+        batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
+        names = sorted(cls.name for cls in batch_plugins if not cls.flush_emits_one_row_per_buffered_row)
         assert len(names) >= 13, names  # positive control: the registry is populated
+        assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank"]
         for name in names:
             state = self._state(tmp_path, self._aggregation(name, "passthrough"))
 
@@ -7875,6 +7877,16 @@ class TestComposerRuntimeBatchPlacementAgreement:
                 self._runtime_instantiate(state)
             assert declaration in str(raised.value)
             assert "Use output_mode: transform" in str(raised.value)
+
+    @pytest.mark.parametrize("output_mode", ["passthrough", "transform", None], ids=["passthrough", "transform", "absent-mode"])
+    def test_both_accept_the_declaring_batch_rank_in_every_output_mode(self, tmp_path: Path, output_mode: str | None) -> None:
+        """batch_rank declares that its flush emits one row per buffered row: both surfaces admit it, passthrough included."""
+        node = replace(self._aggregation("batch_rank", output_mode), options={"schema": {"mode": "observed"}, "value_field": "v"})
+        state = self._state(tmp_path, node)
+
+        composer = state.validate()
+        assert not any(e.error_code == "batch_transform_misplaced" for e in composer.errors), composer.errors
+        self._runtime_instantiate(state)
 
     @pytest.mark.parametrize("output_mode", ["transform", None], ids=["explicit-transform", "absent-is-the-runtime-default"])
     def test_both_accept_batch_replicate_outside_passthrough(self, tmp_path: Path, output_mode: str | None) -> None:

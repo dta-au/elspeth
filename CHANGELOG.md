@@ -335,12 +335,13 @@ drained and repair this release forward.
   is claimed quarantined. Every buffered row is recorded `failed` before the
   run ends.
 - **`output_mode: passthrough` admits only a batch plugin that emits one row
-  per buffered row; no shipped plugin does.** Every batch plugin now declares
+  per buffered row.** Every batch plugin now declares
   whether its flush emits exactly one row per buffered row
   (`flush_emits_one_row_per_buffered_row`), and `elspeth validate`, `elspeth
-  run` and the composer read that one declaration. None of the 13 shipped
-  batch plugins does: they reduce the batch, replicate rows (`batch_replicate`)
-  or skip rows (`batch_outlier_annotator` skips a null or non-finite value).
+  run` and the composer read that one declaration. None of the 13 existing
+  batch plugins does (the new `batch_rank`, below, does): they reduce the
+  batch, replicate rows (`batch_replicate`) or skip rows
+  (`batch_outlier_annotator` skips a null or non-finite value).
   So an aggregation of any of them under `output_mode: passthrough` is now
   refused at config with "Use output_mode: transform". Before, `batch_stats`,
   `batch_outlier_annotator` or `batch_replicate` under `passthrough` passed
@@ -355,6 +356,17 @@ drained and repair this release forward.
   `flush_emits_one_row_per_buffered_row = True` on its class; the default is
   `False`, and an undeclared plugin is refused with a message naming the
   attribute (`docs/contracts/plugin-protocol.md` § Output Mode).
+- **New batch plugin `batch_rank`: rank rows within a batch and keep every
+  row.** It adds `<prefix>_rank`, `<prefix>_percentile`,
+  `<prefix>_ranked_count` and `<prefix>_batch_size` (default prefix `rank`)
+  to every buffered row, ranking a numeric `value_field` (`order:
+  descending|ascending`, `ties: competition|dense`), and emits exactly one row
+  per buffered row, in order. A null, absent or non-finite value keeps its row
+  with a null rank and percentile; a present text or boolean value fails the
+  whole batch (routed by `on_error`, value-free reason). It is the one shipped
+  batch plugin that declares `flush_emits_one_row_per_buffered_row`, so it
+  runs under `output_mode: passthrough`, where the same tokens continue
+  downstream, as well as under `transform`.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
@@ -568,8 +580,8 @@ These ran and delivered rows before:
 
 These already failed, or recorded a false type, and are now refused earlier
 or routed, with no loss:
-`output_mode: passthrough` with any shipped batch plugin (ended the run with
-the batch's rows left without an outcome); a template number literal that
+`output_mode: passthrough` with any batch plugin but the new `batch_rank`
+(ended the run with the batch's rows left without an outcome); a template number literal that
 overflows to infinity; a `<response>_usage` schema type other than `any`;
 a header-spelled `value_transform` or `field_mapper` target and a
 header-spelled scan field over a non-string column (each crashed the run,

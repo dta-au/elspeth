@@ -182,9 +182,11 @@ def test_only_report_assemble_declares_the_aggregation_window_requirement():
 def test_every_registered_batch_plugin_states_whether_passthrough_can_carry_it():
     """flush_emits_one_row_per_buffered_row is ONE authority, stated in each batch plugin's own class body.
 
-    No shipped batch plugin emits exactly one row per buffered row: each one
-    reduces the batch, replicates rows, or (batch_outlier_annotator) skips rows
-    whose value is null or non-finite. So passthrough admits none of them.
+    Exactly one shipped batch plugin emits one row per buffered row:
+    batch_rank, which emits every buffered row (an unranked one with a null
+    rank). Every other one reduces the batch, replicates rows, or
+    (batch_outlier_annotator) skips rows whose value is null or non-finite, so
+    passthrough admits none of them.
     """
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
@@ -192,7 +194,7 @@ def test_every_registered_batch_plugin_states_whether_passthrough_can_carry_it()
     assert len(batch_plugins) >= 13  # positive control: the registry is populated
     undeclared = sorted(cls.name for cls in batch_plugins if "flush_emits_one_row_per_buffered_row" not in cls.__dict__)
     assert undeclared == []
-    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == []
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank"]
 
 
 def test_the_passthrough_declaration_census_sees_a_declaring_plugin(monkeypatch):
@@ -202,7 +204,7 @@ def test_the_passthrough_declaration_census_sees_a_declaring_plugin(monkeypatch)
     batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
     monkeypatch.setattr(batch_stats_cls, "flush_emits_one_row_per_buffered_row", True)
     batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
-    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_stats"]
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank", "batch_stats"]
 
 
 def test_a_passthrough_aggregation_reports_the_output_mode_not_the_plugins_config_error():
@@ -231,3 +233,26 @@ def test_a_passthrough_aggregation_reports_the_output_mode_not_the_plugins_confi
     # author sets (P5 review r1 F3).
     assert "does not declare that its flush emits exactly one row per buffered row" in str(excinfo.value)
     assert "declares flush_emits_one_row_per_buffered_row = True on its class" in str(excinfo.value)
+
+
+def test_a_passthrough_aggregation_of_the_declaring_batch_rank_is_admitted():
+    """Control for the refusal above: batch_rank declares the capability, so the same aggregation builds."""
+    settings = load_settings_from_config_dict(
+        {
+            **_BASE_DOC,
+            "aggregations": [
+                {
+                    "name": "rank",
+                    "plugin": "batch_rank",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "trigger": {"count": 3},
+                    "output_mode": "passthrough",
+                    "options": {"schema": {"mode": "observed"}, "value_field": "score"},
+                }
+            ],
+        }
+    )
+    plugins = instantiate_plugins_from_config(settings, preflight_mode=True)
+    assert [aggregation.name for aggregation, _settings in plugins.aggregations.values()] == ["batch_rank"]

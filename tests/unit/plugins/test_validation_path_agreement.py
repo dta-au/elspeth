@@ -173,6 +173,16 @@ _TRANSFORM_REJECTION_CASES = [
         "collides with outlier annotation output key",
         id="batch_outlier_annotator-value-field-collision",
     ),
+    # ── batch_rank ───────────────────────────────────────────────────────
+    pytest.param(
+        "batch_rank",
+        {
+            "schema": _make_observed_schema(),
+            "value_field": "rank_percentile",  # value field would be overwritten by a rank annotation
+        },
+        "collides with a batch_rank output field",
+        id="batch_rank-value-field-collision",
+    ),
     # ── batch_data_quality_report ────────────────────────────────────────
     pytest.param(
         "batch_data_quality_report",

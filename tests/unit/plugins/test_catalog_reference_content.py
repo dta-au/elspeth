@@ -58,6 +58,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "transform:batch_experiment_compare",
         "transform:batch_outlier_annotator",
         "transform:batch_paired_preference",
+        "transform:batch_rank",
         "transform:batch_replicate",
         "transform:batch_stats",
         "transform:batch_threshold_summary",
@@ -217,10 +218,10 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
 
 
 def test_registry_contains_the_exact_accepted_builtin_inventory() -> None:
-    assert len(REFERENCES) == 56
+    assert len(REFERENCES) == 57
     assert Counter(reference.kind for reference in REFERENCES) == {
         "source": 9,
-        "transform": 38,
+        "transform": 39,
         "sink": 9,
     }
     assert {_identity(reference) for reference in REFERENCES} == EXPECTED_BUILTIN_IDENTITIES
@@ -260,7 +261,7 @@ def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
             profiled_examples.add(_identity(reference))
 
     assert profiled_examples == WEB_PROFILE_EXAMPLE_IDENTITIES
-    assert len(DIRECT_CONFIG_REFERENCES) == 52
+    assert len(DIRECT_CONFIG_REFERENCES) == 53
 
 
 @pytest.mark.parametrize("reference", DIRECT_CONFIG_REFERENCES, ids=_identity)

@@ -201,6 +201,7 @@ TRANSFORMS:
   batch_experiment_compare - Compare experiment variants over a batch using mean deltas.
   batch_outlier_annotator - Annotate batch rows with z-score and robust-z outlier signals.
   batch_paired_preference - Compare paired variant scores over an aggregation batch.
+  batch_rank           - Rank every row of a batch by a numeric field; one output row per input row, in order.
   batch_replicate      - Replicate rows based on a copies field.
   batch_stats          - Compute aggregate statistics over a batch of rows.
   batch_threshold_summary - Report threshold match counts and rates for finite numeric batch values.

@@ -211,6 +211,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "batch_experiment_compare": Determinism.DETERMINISTIC,
     "batch_outlier_annotator": Determinism.DETERMINISTIC,
     "batch_paired_preference": Determinism.DETERMINISTIC,
+    "batch_rank": Determinism.DETERMINISTIC,
     "batch_replicate": Determinism.DETERMINISTIC,
     "batch_stats": Determinism.DETERMINISTIC,
     "batch_threshold_summary": Determinism.DETERMINISTIC,
