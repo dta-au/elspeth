@@ -544,7 +544,9 @@ output-header key, and a name the node creates. A header spelling there is
 refused: at validation with `field_name_header_spelling` where the upstream's
 declared schema proves it, otherwise at run time, where every row routes to
 `on_error` (reason `declared_field_is_header_spelling` or
-`target_is_header_spelling`), observed schemas included. Row LOOKUPS keep
+`target_is_header_spelling`), observed schemas included. Two names one node
+creates must not spell one another either (`total` and `Total`): write one
+spelling. Row LOOKUPS keep
 either spelling: an expression or template reading `row['Price USD']`, a
 rename source, and an option that only locates a field to read in place
 resolve the header too.

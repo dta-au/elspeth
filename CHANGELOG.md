@@ -151,7 +151,8 @@ drained and repair this release forward.
   under a declared schema), crashed with `Duplicate original_name` leaving the
   row with no outcome (a `value_transform` target `Name` over header `Name`),
   silently shadowed the field (target `Name` over header `NAME`, `field_mapper`
-  `{id: Name}` or `{Name: ID}`), or crashed a csv/json sink's write (a header-spelled custom
+  `{id: Name}` or `{Name: ID}`, or two `value_transform` targets `total` and
+  `Total` of one node, now refused at configuration), or crashed a csv/json sink's write (a header-spelled custom
   `headers` key). A `required_input_fields` verdict for a header spelling of a
   guaranteed field now names the normalized spelling. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
@@ -214,7 +215,10 @@ drained and repair this release forward.
   (the declared-but-unread check refuses only a prompt that never reads
   `row`, and its remedy no longer suggests `[]`);
   a multi-query `row.source_row.<column>` read must be listed in
-  `required_input_fields` itself (an `image_inputs` column is refused there);
+  `required_input_fields` itself (an `image_inputs` column is refused there),
+  and a computed key through it (`row.source_row[k]`,
+  `row.source_row.get(expr)`) is refused at configuration as one through
+  `row` already was, unless `required_input_fields` is `[]`;
   `<response_field>_variables_hash` is the hash of the declared field values
   the template could see (unchanged under `[]`). On the web, required-control
   coverage protects the declared fields plus each query's `input_fields`
@@ -350,11 +354,15 @@ drained and repair this release forward.
   batch plugins does: they reduce the batch, replicate rows (`batch_replicate`)
   or skip rows (`batch_outlier_annotator` skips a null or non-finite value).
   So an aggregation of any of them under `output_mode: passthrough` is now
-  refused at config with "Use output_mode: transform". Before, `batch_stats`,
-  `batch_outlier_annotator` or `batch_replicate` under `passthrough` passed
-  `elspeth validate` and ended the run (exit 4) on the first flush that was
-  not one row per buffered row, and the rows of that batch were left without
-  an outcome. The composer refused only `batch_replicate`, by name, and also
+  refused at config with "Use output_mode: transform". Before, any batch
+  plugin under `passthrough` passed `elspeth validate`. A flush that returned
+  as many rows as it buffered, from a batch of two or more, was delivered:
+  `batch_outlier_annotator` over finite values, and `batch_replicate` where
+  every copy count was 1, annotated or passed every row. Any other flush
+  ended the run (exit 4) and left the rows of that batch without an outcome:
+  a batch of one row (including an end-of-input remainder of one), a null or
+  non-finite outlier value, a copy count above 1, or a reducer such as
+  `batch_stats` returning fewer rows than it buffered. The composer refused only `batch_replicate`, by name, and also
   refused it when `output_mode` was left to its default, `transform`. A
   plugin that declares the capability and then returns another shape still
   ends the run with `BatchPassthroughShapeError` (a Tier-1 invariant error),
@@ -542,7 +550,10 @@ These ran and delivered rows before:
   `ID,Name` delivered `ID` beside `id`). A `field_mapper` schema that
   declares its rename source by header (`{Name: given}` with `Name: int?`)
   is a declaration too; before, it recorded `given: int` over a delivered
-  string. Declare the normalized name (`name`, `price`).
+  string. Declare the normalized name (`name`, `price`). Two `value_transform`
+  targets of one node that spell one another (`total`, then `Total`) are
+  refused at configuration ("target 'Total' is a header spelling of target
+  'total'"); before, both keys were written to the row.
 - **A `type_coerce` conversion field that some rows lack** ends the run
   with `DeclaredRequiredInputFieldsViolation` at the first such row behind
   an observed source, and is refused at build behind a `fixed` one. Before,
@@ -561,6 +572,17 @@ These ran and delivered rows before:
   refused at configuration; before, the query rendered without them. On the
   web, an LLM node with `required_input_fields: []` or none is now
   `input_fields_unprovable` for a field-scoped prompt shield.
+- **A multi-query template that reads `row.source_row` by a computed key**
+  (`row.source_row[k]`, `row.source_row.get(expr)`) is refused at
+  configuration with "LLM prompt_template uses dynamic row field access",
+  as the same key through `row` already was, unless `required_input_fields`
+  is `[]`. Before, it rendered and every row was delivered.
+- **`output_mode: passthrough` over a flush that returned one row per
+  buffered row** (the passthrough bullet above): `batch_outlier_annotator`
+  over finite values, or `batch_replicate` with every copy count 1, is
+  refused at configuration with "Use output_mode: transform". Before, while
+  every batch held two or more rows, and for the annotator no null or
+  non-finite value, every row was delivered.
 - **An unknown filter or test name that Jinja looks up at render** (the
   template-literal bullet above): inside `{% if %}` or an inline `if`, or
   given by name to `map`, `select`, `reject`, `selectattr` or `rejectattr`,
@@ -595,8 +617,9 @@ These ran and delivered rows before:
   `len({...})`) is unaffected.
 
 These already failed and are now refused earlier or routed, with no loss:
-`output_mode: passthrough` with any shipped batch plugin (ended the run with
-the batch's rows left without an outcome); a `value_transform` target
+`output_mode: passthrough` over a flush that did not return one row per
+buffered row (ended the run with the batch's rows left without an outcome);
+a `value_transform` target
 spelled exactly as the header of the field it would overwrite (crashed with
 `Duplicate original_name`, leaving the row without an outcome). Each of
 these failed every row: a template number literal that overflows to

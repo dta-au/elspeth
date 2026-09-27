@@ -289,7 +289,10 @@ field declares `float`.
 A row template — an LLM prompt or query template, or a retrieval
 `query_template` — sees only the fields its node declares in
 `required_input_fields` (a retrieval template also sees its query field).
-Declare every field the template reads or tests. Reading or testing any other
+Declare every field the template reads or tests, and read each one by a fixed
+name (`row.field`, `row['field']`, a query's `row.source_row.field`): a key
+computed at render (`row[k]`, `row.get(expr)`, or either through
+`row.source_row`) is refused. Reading or testing any other
 field fails every row, including `'x' in row`, a row carried through a `set`
 or loop variable, and a multi-query `row.source_row` column. `[]` shows the
 whole row but proves nothing to a field-scoped prompt-injection control, so
