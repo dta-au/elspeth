@@ -419,7 +419,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
 async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, recorder: BufferingRecorder) -> Any:
     driver = cast(Any, service)
     sessions_service = cast(Any, service._sessions_service)
-    plugin_snapshot, policy_catalog = driver._plugin_policy_context(None)
+    plugin_snapshot, policy_catalog = driver._policy_context.build(None)
     # P4-D6 family A2b: the planner-evidence cohort is a fenced session write,
     # so the staging turn runs under a real acquired COMPOSE operation exactly
     # as the compose route does.

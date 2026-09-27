@@ -218,7 +218,7 @@ async def settle_pipeline_proposal_under_compose_lock(
         # can resolve. The pass is idempotent, so re-running it here is a no-op
         # when the first attempt already completed it.
         _, replay_cancelled = await _await_with_deferred_cancellation(
-            request.app.state.composer_service.surface_pending_interpretation_reviews(
+            request.app.state.interpretation_surfacing.surface_pending_interpretation_reviews(
                 _state_from_record(state),
                 session_id=str(proposal.session_id),
                 current_state_id=str(state.id),
@@ -430,9 +430,9 @@ async def settle_pipeline_proposal_under_compose_lock(
     # (interpretation_placeholder_unresolved) with nothing the user can
     # resolve. Mirrors the guided dispatcher's post-commit surfacing pass;
     # runs after settlement so events bind to the durable state id.
-    composer = request.app.state.composer_service
+    interpretation_surfacing = request.app.state.interpretation_surfacing
     await _await_with_deferred_cancellation(
-        composer.surface_pending_interpretation_reviews(
+        interpretation_surfacing.surface_pending_interpretation_reviews(
             prepared.result.updated_state,
             session_id=str(proposal.session_id),
             current_state_id=str(settled.state.id),

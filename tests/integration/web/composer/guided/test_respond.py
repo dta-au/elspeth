@@ -5799,7 +5799,7 @@ class TestStep2IntraStep:
         Provenance must name the planner that authored the draft under review
         — the proposal row's identity, not the composer service's.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
 
         class _SurfacingWorkerCrash(BaseException):
             """Escape the route exactly as a process loss would."""
@@ -5825,13 +5825,13 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
 
         def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
             raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
 
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             _crash_between_settlement_and_surfacing,
         )
@@ -5842,7 +5842,7 @@ class TestStep2IntraStep:
         # The window is real: settled durably, nothing surfaced.
         assert asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending")) == []
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             original_surface,
         )
@@ -5935,7 +5935,7 @@ class TestStep2IntraStep:
         committed node, no extra composition-state version, identical event
         identity across replays.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
         from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
         class _SurfacingWorkerCrash(BaseException):
@@ -5970,13 +5970,13 @@ class TestStep2IntraStep:
         def _state_versions() -> dict[str, int]:
             return asyncio.run(session_service.get_state_version_numbers(UUID(session_id)))
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
 
         def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
             raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
 
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             _crash_between_settlement_and_surfacing,
         )
@@ -5990,7 +5990,7 @@ class TestStep2IntraStep:
         async def _lose_repair_lease(*_args, **_kwargs):
             raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
 
-        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", _lose_repair_lease)
+        monkeypatch.setattr(interpretation_surfacing_module, "surface_pending_interpretation_reviews_for_state", _lose_repair_lease)
         # The leak-safe fence error is answered by the production handler
         # (``create_app`` and this fixture register the same one): the
         # nonleaking 404 absence, never a fabricated success. The client
@@ -6002,7 +6002,7 @@ class TestStep2IntraStep:
         assert _state_versions() == versions_after_settlement
 
         # Second replay: the repair runs to completion and surfaces the one owed site.
-        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", original_surface)
+        monkeypatch.setattr(interpretation_surfacing_module, "surface_pending_interpretation_reviews_for_state", original_surface)
         repaired = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
         assert repaired.status_code == 200, repaired.json()
         assert repaired.json()["terminal"]["kind"] == "completed"
@@ -6083,7 +6083,7 @@ class TestStep2IntraStep:
         committed by production -- so the shared-state condition here is the
         one production can actually produce.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
 
         class _SurfacingWorkerCrash(BaseException):
             """Escape the route exactly as a process loss would."""
@@ -6158,20 +6158,20 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
 
         def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
             raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
 
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             _crash_between_settlement_and_surfacing,
         )
         with pytest.raises(_SurfacingWorkerCrash):
             composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             original_surface,
         )
@@ -6319,7 +6319,7 @@ class TestStep2IntraStep:
         on whether the debt still exists; when it says no, the replay must
         still return its stored response.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
 
         class _SurfacingWorkerCrash(BaseException):
             """Escape the route exactly as a process loss would."""
@@ -6345,20 +6345,20 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
 
         def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
             raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
 
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             _crash_between_settlement_and_surfacing,
         )
         with pytest.raises(_SurfacingWorkerCrash):
             composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             original_surface,
         )
@@ -6409,7 +6409,7 @@ class TestStep2IntraStep:
         sites surfaced and others not. The replay must add exactly the
         missing ones and leave the existing evidence untouched.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
 
         class _SurfacingWorkerCrash(BaseException):
             """Escape the route exactly as a process loss would."""
@@ -6435,7 +6435,7 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
         original_create = type(composer_test_client.app.state.session_service).create_pending_interpretation_event
         created = 0
 
@@ -6459,7 +6459,7 @@ class TestStep2IntraStep:
             original_create,
         )
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             original_surface,
         )
@@ -6495,7 +6495,7 @@ class TestStep2IntraStep:
         fail integrity verification. The mismatch must abort with ZERO
         interpretation and session writes.
         """
-        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.composer import interpretation_surfacing as interpretation_surfacing_module
 
         class _SurfacingWorkerCrash(BaseException):
             """Escape the route exactly as a process loss would."""
@@ -6521,20 +6521,20 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_surface = interpretation_surfacing_module.surface_pending_interpretation_reviews_for_state
 
         def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
             raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
 
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             _crash_between_settlement_and_surfacing,
         )
         with pytest.raises(_SurfacingWorkerCrash):
             composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
         monkeypatch.setattr(
-            composer_service_module,
+            interpretation_surfacing_module,
             "surface_pending_interpretation_reviews_for_state",
             original_surface,
         )

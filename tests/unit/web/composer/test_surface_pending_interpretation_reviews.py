@@ -148,7 +148,7 @@ async def _surface(
         )
     )
     try:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),

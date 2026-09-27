@@ -28,6 +28,7 @@ from starlette.routing import Route
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -235,8 +236,9 @@ def _create_test_app(
     app.state.session_service = mock_session_service
 
     # The validate backstop surfaces stranded interpretation reviews through
-    # the app-level composer service (elspeth-03f5728c33).
+    # the app-level owner (elspeth-03f5728c33).
     app.state.composer_service = create_autospec(ComposerService, instance=True, spec_set=True)
+    app.state.interpretation_surfacing = create_autospec(InterpretationSurfacing, instance=True, spec_set=True)
 
     # Mock settings for ownership checks
     app.state.settings = _FakeWebSettings()
@@ -417,7 +419,7 @@ class TestValidateEndpoint:
         async def _record_surface(*args: Any, **kwargs: Any) -> None:
             call_order.append("surface")
 
-        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer = app.state.interpretation_surfacing.surface_pending_interpretation_reviews
         surfacer.side_effect = _record_surface
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -446,7 +448,7 @@ class TestValidateEndpoint:
             resp = await client.post(f"/api/sessions/{uuid4()}/validate")
             assert resp.status_code == 200
 
-        app.state.composer_service.surface_pending_interpretation_reviews.assert_not_awaited()
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews.assert_not_awaited()
         svc.validate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -472,7 +474,7 @@ class TestValidateEndpoint:
             )
             assert resp.status_code == 200
 
-        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer = app.state.interpretation_surfacing.surface_pending_interpretation_reviews
         surfacer.assert_awaited_once()
         kwargs = surfacer.await_args.kwargs
         assert kwargs["session_id"] == str(session_id)

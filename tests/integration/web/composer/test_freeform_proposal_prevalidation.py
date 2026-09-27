@@ -372,7 +372,7 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
         return responses.pop(0)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
         patch.object(harness.service, "_call_llm", new=_llm),
         patch.object(AntiAnchorTracker, "record_failure", new=_record_failure),
         patch(
@@ -1081,7 +1081,7 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
         original_record(recorder, invocation)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
         patch.object(harness.service, "_call_llm", new=_llm),
         patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
@@ -1150,7 +1150,7 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
         original_record(recorder, invocation)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
         patch.object(harness.service, "_call_llm", new=_llm),
         patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,

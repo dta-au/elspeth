@@ -283,7 +283,7 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         await harness.service.compose(
@@ -353,7 +353,7 @@ async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Pat
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         await harness.service.compose(
@@ -385,7 +385,7 @@ async def test_explicit_finalization_and_custody_replay_keeps_coalesce_order(tmp
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         await harness.service.compose(

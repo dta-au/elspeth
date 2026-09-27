@@ -2527,7 +2527,7 @@ async def drive_try_terminate(
     gate runs) and the shared finalize tail to return a canned runnable
     result (so the clean fall-through is isolated from finalize plumbing).
     """
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_and_finalize_no_tools = _AsyncRecorder(
         return_value=finalize_result or ComposerResult(message="Done — the pipeline is ready.", state=state)
     )
@@ -2846,7 +2846,7 @@ async def test_end_gate_flagged_on_last_pass_withholds_completion_only(make_serv
 @pytest.mark.asyncio
 async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(make_service, clean_runnable_state):
     service = make_service()
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong")
@@ -4826,7 +4826,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
     from elspeth.web.composer.advisor_policy import ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
 
     service = make_service()
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
@@ -4897,7 +4897,7 @@ async def test_end_gate_terminal_block_writes_the_disclosure_and_publication_row
 async def test_end_gate_terminal_block_blocks_cleanly_without_session(make_service, clean_runnable_state):
     """No durable store exists without a session — the gate must still block cleanly."""
     service = make_service()
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
@@ -4967,7 +4967,7 @@ async def test_blocked_turn_replays_its_own_reply_into_next_turn_model_history(t
 
     service = make_service()
     service._sessions_service = sessions
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
@@ -5349,7 +5349,7 @@ def _make_stalled_gate_service():
 async def _drive_gate_with_review_state(service, state, review_state):
     from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still unresolved")
@@ -5445,7 +5445,7 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
     from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 
     service = _make_stalled_gate_service()
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
     service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
     review_state = _AdvisorReviewState(

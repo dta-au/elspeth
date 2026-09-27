@@ -379,7 +379,7 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     initial_state = _empty_state()
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
@@ -460,7 +460,7 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
     )
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
@@ -528,7 +528,7 @@ async def test_auto_commit_does_not_wire_an_incomplete_set_pipeline_candidate(tm
     llm = _ScriptedLLM(_tool_turn("call_incomplete", "set_pipeline", incomplete))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -571,7 +571,7 @@ async def test_auto_commit_does_not_duplicate_already_covered_controls(tmp_path:
     llm = _ScriptedLLM(_tool_turn("call_already_covered", "set_pipeline", covered))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -613,7 +613,7 @@ async def test_auto_commit_wires_controls_when_set_output_completes_incremental_
     llm = _ScriptedLLM(_tool_turn("call_complete_with_output", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
@@ -661,7 +661,7 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
     llm = _ScriptedLLM(_tool_turn("call_review_incremental_completion", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
@@ -722,7 +722,7 @@ async def test_auto_commit_wires_incremental_named_blob_sources_without_public_r
     llm = _ScriptedLLM(_tool_turn("call_complete_named_sources", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
@@ -840,7 +840,7 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     app.state.composer_service = composer
     llm = _ScriptedLLM(_tool_turn(f"call_review_{source_count}_blob_sources", "set_output", output))
     with (
-        patch.object(composer, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(composer._policy_context, "build", return_value=(snapshot, view)),
         patch.object(composer, "_call_llm", new=llm),
     ):
         result = await composer.compose(
@@ -916,7 +916,7 @@ async def test_auto_commit_does_not_wire_incremental_mutation_while_pipeline_is_
     llm = _ScriptedLLM(_tool_turn("call_still_incomplete", "set_metadata", {"patch": {"name": "Still incomplete"}}))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -961,7 +961,7 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     failure = RuntimeError("private incremental finalizer failure detail")
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch("elspeth.web.composer.tool_batch.wire_required_controls_state", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,
@@ -1006,7 +1006,7 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     failure = RuntimeError("private owned-state projection failure detail")
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch("elspeth.web.composer.tool_batch.owned_composition_state_authority", side_effect=failure) as projector,
         pytest.raises(ComposerPluginCrashError) as exc_info,
@@ -1057,7 +1057,7 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     initial_state = _incremental_base_state(tmp_path)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
         patch.object(harness.service, "_call_llm", new=llm),
         patch("elspeth.web.composer.tool_batch.wire_required_controls", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,

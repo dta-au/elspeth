@@ -31,6 +31,7 @@ from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, Char
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination.quota_authority import ProviderAttempt
@@ -47,6 +48,7 @@ def admission_context(composer_service_without_sessions_service: ComposerService
     )
     sessions.begin_provider_attempt.return_value = ProviderAttempt(attempt_id="diagnostics-attempt", started_at=datetime.now(UTC))
     composer_service_without_sessions_service._sessions_service = sessions
+    composer_service_without_sessions_service._chargeable_admission = ComposerChargeableAdmission(sessions)
     context = SessionOperationContext(
         fence=SessionOperationFence(session_id="diagnostics-session", operation_id="operation", lease_token="token", operation_epoch=1),
         operation_kind=SessionOperationKind.COMPOSE,

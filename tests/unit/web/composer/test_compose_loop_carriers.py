@@ -233,7 +233,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         assert outcome.completion.message.content == "admitted content"
         assert [call.id for call in outcome.completion.tool_batch.calls] == ["call-admitted"]
 
-        plugin_snapshot, policy_catalog = service._plugin_policy_context(None)
+        plugin_snapshot, policy_catalog = service._policy_context.build(None)
         llm_messages: list[dict[str, Any]] = []
         dispatch, _advisor_calls_used = await service._dispatch_tool_batch(
             call_model=outcome,

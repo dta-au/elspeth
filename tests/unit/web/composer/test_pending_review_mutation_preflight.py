@@ -95,8 +95,8 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         async def missing(*_args: Any, **_kwargs: Any) -> tuple[()]:
             return ()
 
-        monkeypatch.setattr(service, "surface_pending_interpretation_reviews", surface)
-        monkeypatch.setattr(service, "_missing_pending_interpretation_review_sites", missing)
+        monkeypatch.setattr(service._interpretation_surfacing, "surface_pending_interpretation_reviews", surface)
+        monkeypatch.setattr(service._interpretation_surfacing, "_missing_pending_interpretation_review_sites", missing)
         result = await service._surface_and_finalize_no_tools(
             assistant_message=_admit_composer_llm_completion(_fake_llm_response(content="The pipeline is ready.")).message,
             state=state,

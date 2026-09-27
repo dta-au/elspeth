@@ -58,6 +58,7 @@ from elspeth.web.composer.control_messages import advisor_signoff_withheld_contr
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep, TerminalKind, TerminalReason, TerminalState
+from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
@@ -370,7 +371,6 @@ def _make_composer_mock(
             state=state or _EMPTY_STATE,
         ),
     )
-    mock.surface_pending_interpretation_reviews = AsyncMock(spec=ComposerService.surface_pending_interpretation_reviews, return_value=None)
     return mock
 
 
@@ -830,6 +830,9 @@ def _make_progress_route_app(
     )
     app.state.payload_store = FilesystemPayloadStore(app.state.settings.get_payload_store_path())
     app.state.composer_service = None
+    app.state.interpretation_surfacing = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(spec=InterpretationSurfacing.surface_pending_interpretation_reviews)
+    )
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = _ExecutionServiceStub()
     app.state.composer_progress_registry = ComposerProgressRegistry()
@@ -952,6 +955,9 @@ def _make_app(
     # composer_service is set to None here; tests that POST messages
     # must replace it with a mock before sending requests.
     app.state.composer_service = None
+    app.state.interpretation_surfacing = SimpleNamespace(
+        surface_pending_interpretation_reviews=AsyncMock(spec=InterpretationSurfacing.surface_pending_interpretation_reviews)
+    )
 
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
@@ -1672,8 +1678,8 @@ async def test_cancel_after_pipeline_commit_still_surfaces_durable_review_eviden
     cancel_during_surface: bool,
 ) -> None:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
     from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
-    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
     from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
@@ -1757,6 +1763,7 @@ async def test_cancel_after_pipeline_commit_still_surfaces_durable_review_eviden
         surfaced.set()
 
     composer = SimpleNamespace(surface_pending_interpretation_reviews=surface_reviews)
+    app.state.interpretation_surfacing = composer
     if automatic:
         composer.compose = AsyncMock(
             spec=ComposerService.compose,
@@ -1836,9 +1843,9 @@ def test_manual_canonical_pipeline_accept_records_origin_chat_ingress(tmp_path, 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.composer_service = SimpleNamespace(
+    app.state.interpretation_surfacing = SimpleNamespace(
         surface_pending_interpretation_reviews=AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews,
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
             return_value=None,
         )
     )
@@ -1867,9 +1874,9 @@ def test_manual_pipeline_accept_retains_prior_chat_paste(tmp_path, monkeypatch: 
         )
     )
     app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
-    app.state.composer_service = SimpleNamespace(
+    app.state.interpretation_surfacing = SimpleNamespace(
         surface_pending_interpretation_reviews=AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews,
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
             return_value=None,
         )
     )
@@ -1892,8 +1899,8 @@ def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkey
     )
     assert row.pipeline_metadata is not None
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
@@ -1958,8 +1965,8 @@ def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_sett
     )
     assert row.pipeline_metadata is not None
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
 
     async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
@@ -2017,8 +2024,8 @@ async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
     )
     assert row.pipeline_metadata is not None
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews,
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
         return_value=None,
     )
     composer.compose = AsyncMock(
@@ -2115,8 +2122,8 @@ def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_pa
         )
     )
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
@@ -2153,8 +2160,8 @@ def test_recompose_auto_commit_uses_shared_pipeline_settlement(tmp_path, monkeyp
     )
     assert row.pipeline_metadata is not None
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
@@ -2663,14 +2670,14 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     # interpretation_placeholder_unresolved with nothing for the user to
     # resolve.
     surfaced_state_ids = [
-        call.kwargs["current_state_id"] for call in app.state.composer_service.surface_pending_interpretation_reviews.call_args_list
+        call.kwargs["current_state_id"] for call in app.state.interpretation_surfacing.surface_pending_interpretation_reviews.call_args_list
     ]
     assert surfaced_state_ids == [str(committed_state.id), str(committed_state.id)], (
         f"expected the accept and its exact-committed retry to each surface against the committed state, got {surfaced_state_ids!r}"
     )
     surfaced_contexts = [
         call.kwargs.get("session_operation_context")
-        for call in app.state.composer_service.surface_pending_interpretation_reviews.call_args_list
+        for call in app.state.interpretation_surfacing.surface_pending_interpretation_reviews.call_args_list
     ]
     assert all(type(context) is SessionOperationContext for context in surfaced_contexts)
     assert all(context.fence.session_id == str(session_id) for context in surfaced_contexts if type(context) is SessionOperationContext)
@@ -5580,8 +5587,8 @@ class TestMessageRoutes:
             _llm_call(provider_request_id="chatcmpl-b", prompt_tokens=5, completion_tokens=16, total_tokens=21),
         )
         composer = SimpleNamespace()
-        composer.surface_pending_interpretation_reviews = AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
         )
         composer.compose = AsyncMock(
             spec=ComposerService.compose, return_value=ComposerResult(message="Saved with audit.", state=_EMPTY_STATE, llm_calls=llm_calls)
@@ -6039,8 +6046,8 @@ class TestMessageRoutes:
         """
         app, service = _make_app(tmp_path)
         composer = SimpleNamespace()
-        composer.surface_pending_interpretation_reviews = AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
         )
         composer.compose = AsyncMock(
             spec=ComposerService.compose,
@@ -6092,8 +6099,8 @@ class TestMessageRoutes:
         """
         app, service = _make_app(tmp_path)
         composer = SimpleNamespace()
-        composer.surface_pending_interpretation_reviews = AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
         )
         composer.compose = AsyncMock(
             spec=ComposerService.compose,
@@ -6177,8 +6184,8 @@ class TestMessageRoutes:
             actor="composer-web:user-test",
         )
         composer = SimpleNamespace()
-        composer.surface_pending_interpretation_reviews = AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
         )
         composer.compose = AsyncMock(
             spec=ComposerService.compose,
@@ -7104,13 +7111,13 @@ class TestLiteLLMErrorRedaction:
         original = ValueError("first-party advisor admission failed")
         cast(Any, original).llm_calls = (llm_call,)
         mock_composer = SimpleNamespace()
-        mock_composer.surface_pending_interpretation_reviews = AsyncMock(
-            spec=ComposerService.surface_pending_interpretation_reviews,
-            return_value=None,
-        )
         mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=original)
 
         app, service = _make_app(tmp_path)
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+            spec=InterpretationSurfacing.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
         app.state.composer_service = mock_composer
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -15142,8 +15149,8 @@ def test_assistant_raw_content_is_persisted_but_not_returned(tmp_path) -> None:
         raw_assistant_content="The pipeline is complete and valid.",
     )
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(spec=ComposerService.compose, return_value=composer_result)
     app.state.composer_service = composer
@@ -16644,8 +16651,8 @@ def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path
         )
 
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_with_midloop_persist)
     app.state.composer_service = composer
@@ -16722,8 +16729,8 @@ def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path
         )
 
     composer = SimpleNamespace()
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    app.state.interpretation_surfacing.surface_pending_interpretation_reviews = AsyncMock(
+        spec=InterpretationSurfacing.surface_pending_interpretation_reviews, return_value=None
     )
     composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_then_downgrade)
     app.state.composer_service = composer

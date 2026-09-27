@@ -49,8 +49,8 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
-from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -3180,7 +3180,7 @@ async def post_guided_respond(
         ):
             raise AuditIntegrityError("Guided RESPOND replay result proposal has incomplete composer provenance")
         record = await service.get_state_in_session(result.state_id, session_id)
-        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
         from elspeth.web.coordination.contracts import SessionOperationKind
         from elspeth.web.coordination.lifecycle import SessionOperationLease
 
@@ -5279,7 +5279,7 @@ async def post_guided_respond(
                         # deferred cancellation: the settlement is durable, and
                         # skipping here would orphan the session in exactly the
                         # failure this pass exists to prevent.
-                        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+                        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
                         planner_row = authority.row
                         if (

@@ -804,6 +804,8 @@ files:
   src/elspeth/web/composer/implicit_decisions.py:
     Mapping[str, Any]: 3
     dict[str, object]: 2
+  src/elspeth/web/composer/interpretation_surfacing.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/composer/inventory_response_contracts.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/llm_response_parsing.py:
@@ -858,7 +860,7 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 20
+    Mapping[str, Any]: 18
     Mapping[str, object]: 1
     boundary: 1
     dict[str, Any]: 36

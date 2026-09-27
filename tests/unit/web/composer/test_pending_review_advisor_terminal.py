@@ -35,7 +35,7 @@ from .test_advisor_checkpoint import (
 async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(expired: bool) -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     state = complaint_triage_state(pending=True, narrow_consumer=True)
-    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(
             ok=True, blocking=True, findings_text="FLAGGED: requested behavior was removed", note="Requested behavior was removed"
@@ -55,7 +55,7 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     masked_preflight = _AsyncRecorder(return_value=findings)
     service._pending_handoff_outstanding_findings = masked_preflight
     surface = _AsyncRecorder(return_value=None)
-    service.surface_pending_interpretation_reviews = surface
+    service._interpretation_surfacing.surface_pending_interpretation_reviews = surface
     messages = _AsyncRecorder(return_value=None)
     service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=messages)
     session_id = str(uuid4())

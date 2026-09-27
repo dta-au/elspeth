@@ -19,13 +19,15 @@ from elspeth.contracts.chargeable_admission import (
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer import provider_quota
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PresentBase, composition_content_hash
-from elspeth.web.composer.service import ComposerAdmissionRefused, ComposerServiceImpl
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
@@ -77,6 +79,7 @@ async def test_public_entry_refuses_before_provider_work(
     service = composer_service_without_sessions_service
     authority = _AdmissionService(reason)
     service._sessions_service = cast(SessionServiceProtocol, authority)
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
     origin = PlannerOriginatingMessage(_SESSION_ID, None, "Build a pipeline", "owner")
     # These later-stage dependencies deliberately fail if reached. The admission
     # boundary must precede planner preparation as well as outbound model calls.
@@ -151,6 +154,7 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     service = composer_service_without_sessions_service
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
 
     async def explain(*args: object, **kwargs: object) -> str:
         scope = provider_quota._SCOPE.get()
@@ -250,7 +254,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     origin = PlannerOriginatingMessage(_SESSION_ID, message_id, "Build a CSV pipeline", "owner")
     base = PresentBase(state_id=UUID(message_id), composition_content_hash=composition_content_hash(state))
     fence = GuidedOperationFence(session_id=UUID(_SESSION_ID), operation_id="guided-operation", lease_token="token", attempt=1)
-    snapshot, catalog = service._plugin_policy_context("owner")
+    snapshot, catalog = service._policy_context.build("owner")
     source_id = "11111111-1111-4111-8111-111111111111"
     output_id = "22222222-2222-4222-8222-222222222222"
     guided = GuidedSession(
@@ -348,6 +352,7 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     service = composer_service_without_sessions_service
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
     second_context = SessionOperationContext(
         fence=SessionOperationFence(session_id="second-session", operation_id="second-operation", lease_token="token", operation_epoch=1),
         operation_kind=SessionOperationKind.COMPOSE,

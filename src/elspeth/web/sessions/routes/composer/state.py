@@ -129,7 +129,7 @@ async def _surface_reverted_interpretation_reviews(
     # revert compatibility instead of turning this additive repair into a 500.
     if state_record.metadata_ is None:
         return
-    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
     # The replay joiner released the operation's session lease before this
     # post-verification repair runs, and the settling caller's guided lease
@@ -838,7 +838,7 @@ async def _review_debt_sites_off_loop(
     reaches the detail. The worker's own exceptions propagate unchanged, so
     each caller's malformed-metadata arm still sees the classes it handles.
     """
-    from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+    from elspeth.web.composer.interpretation_surfacing import unsurfaceable_pending_interpretation_review_sites
 
     try:
         return await asyncio.wait_for(
@@ -926,7 +926,7 @@ async def seed_state_from_runtime_yaml(
             # the generic Composer surfacer's own pure site-to-writer mapping so a
             # pending site that cannot become a consumable event is rejected before
             # the composition state is saved.
-            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
+            from elspeth.web.composer.interpretation_surfacing import prepare_pending_interpretation_event_drafts_for_state
 
             try:
                 unsurfaceable_sites = await _review_debt_sites_off_loop(
@@ -1118,7 +1118,7 @@ async def seed_state_for_e2e(
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(seeded_state)
-            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
+            from elspeth.web.composer.interpretation_surfacing import prepare_pending_interpretation_event_drafts_for_state
 
             try:
                 unsurfaceable_sites = await _review_debt_sites_off_loop(

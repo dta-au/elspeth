@@ -254,6 +254,7 @@ def _build_app(
     app.state.scoped_secret_resolver = None
     app.state.settings = settings
     app.state.composer_service = composer
+    app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = create_catalog_service()
     runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
@@ -1060,8 +1061,8 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         _valid_pipeline_completion(tmp_path, session_id_holder),
     )
     composer = client.app.state.composer_service
-    spy = AsyncMock(wraps=composer.surface_pending_interpretation_reviews)
-    monkeypatch.setattr(composer, "surface_pending_interpretation_reviews", spy)
+    spy = AsyncMock(wraps=composer._interpretation_surfacing.surface_pending_interpretation_reviews)
+    monkeypatch.setattr(composer._interpretation_surfacing, "surface_pending_interpretation_reviews", spy)
 
     session_id = client.post("/api/sessions", json={"title": "auto-commit surfacer"}).json()["id"]
     session_id_holder["id"] = session_id

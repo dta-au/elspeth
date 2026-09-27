@@ -55,6 +55,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
@@ -1924,7 +1925,7 @@ async def test_prompt_template_review_event_does_not_trigger_vague_term_repair(
         composer_skill_hash="a" * 64,
     )
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -1955,7 +1956,7 @@ async def test_missing_prompt_template_review_event_reported_by_orphan_gate(
     state = _state_with_prompt_template_review_node()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -1981,7 +1982,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -1998,7 +1999,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
 
     # Idempotent: a second call must not create a duplicate.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -2373,7 +2374,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     session_id, state_id_a = await _seed_session_and_state(sessions_service, state=state_a)
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_id_a),
@@ -2438,7 +2439,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     )
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(record_b.id),
@@ -2510,7 +2511,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
     state_a = _state_with_parts([{"kind": "text", "text": prompt}])
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_a_id),
@@ -2537,7 +2538,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
         provenance="tool_call",
     )
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer._auto_surface_prompt_template_reviews(
+        await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(state_b_record.id),
@@ -2613,7 +2614,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
     state_a = _state("original reason")
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state_a,
             session_id=str(session_id),
             current_state_id=str(state_a_id),
@@ -2634,7 +2635,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
         provenance="tool_call",
     )
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state_b,
             session_id=str(session_id),
             current_state_id=str(state_b_record.id),
@@ -2679,7 +2680,7 @@ def test_has_pending_prompt_template_requirement_false_on_duplicate() -> None:
     }
 
     assert (
-        ComposerServiceImpl._has_pending_prompt_template_requirement(
+        _has_pending_prompt_template_requirement(
             options,
             user_term="llm_prompt_template:rate_node",
         )
@@ -2696,7 +2697,7 @@ def test_has_pending_prompt_template_requirement_rejects_malformed_present_requi
     }
 
     with pytest.raises(InvariantError, match="user_term"):
-        ComposerServiceImpl._has_pending_prompt_template_requirement(
+        _has_pending_prompt_template_requirement(
             options,
             user_term="llm_prompt_template:rate_node",
         )
@@ -2713,7 +2714,7 @@ async def test_missing_invented_source_review_event_forces_review_tool_retry(
     state = _state_with_source_review()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -2732,7 +2733,7 @@ async def test_missing_pipeline_decision_review_event_forces_review_tool_retry(
     state = _state_with_pipeline_decision_review()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -2767,7 +2768,7 @@ async def test_unreviewed_raw_html_cleanup_forces_pipeline_decision_staging_retr
     state = _state_with_unreviewed_raw_html_cleanup()
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -3556,7 +3557,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
     # Half (1) — the masking site is REAL for this state (and is PT-kind).
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert any(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
@@ -3616,7 +3617,7 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
 
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
@@ -3742,7 +3743,7 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
 
     # Half (1) — the masking site is REAL for this state (and is PT-kind), with
     # no genuine non-PT orphan to legitimately suppress the advisor.
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
@@ -3870,7 +3871,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
     # The PT site is now resolvable (a pending event matches it), so the orphan
     # gate sees no orphan for it.
-    missing = await composer._missing_pending_interpretation_review_sites(
+    missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
         state,
         session_id=str(session_id),
     )
@@ -3975,7 +3976,7 @@ async def test_p5_budget_exhaustion_advisor_blocked_return_surfaces_prompt_templ
     # orphan that would legitimately suppress the END advisor), so genuine_orphans
     # is empty and the P5 END gate fires (see the CLEAN counterpart
     # test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhaustion).
-    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    sites = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
     assert sites and all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
     # Force the P5 blocked-return branch (ok=False == unavailable -> fail closed).
@@ -4103,7 +4104,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
     assert await sessions_service.list_interpretation_events(session_id, status="all") == []
 
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4115,7 +4116,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
 
     # Idempotent while the card is live: a second validate adds nothing.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4134,7 +4135,7 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
 
     # Repair mode honours evidence in ANY status: no resurrection after resolve.
     async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4179,7 +4180,7 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
     async with acquire_compose_context(sessions_service, session_id) as compose_ctx:
-        await composer.surface_pending_interpretation_reviews(
+        await composer._interpretation_surfacing.surface_pending_interpretation_reviews(
             state,
             session_id=str(session_id),
             current_state_id=str(state_id),
@@ -4196,7 +4197,7 @@ async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
         log=structlog.get_logger("test.sessions.reading"),
         session_operation_authority=authority,
     )
-    await _build_composer(tmp_path, reading_service).surface_pending_interpretation_reviews(
+    await _build_composer(tmp_path, reading_service)._interpretation_surfacing.surface_pending_interpretation_reviews(
         state,
         session_id=str(session_id),
         current_state_id=str(state_id),

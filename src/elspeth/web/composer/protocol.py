@@ -466,6 +466,10 @@ class ComposerServiceError(Exception):
     """Base exception for composer service errors."""
 
 
+class ComposerAdmissionRefused(ComposerServiceError):
+    """A committed admission decision refused this provider operation."""
+
+
 def _convergence_reason_for_budget(
     budget_exhausted: Literal["composition", "discovery", "timeout"],
 ) -> ComposerProgressReason:
@@ -1726,34 +1730,6 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the shared planner."""
-        ...
-
-    async def surface_pending_interpretation_reviews(
-        self,
-        state: CompositionState,
-        *,
-        session_id: str | None,
-        current_state_id: str | None,
-        only_missing_evidence: bool = False,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        """Kind-general backend surfacer for the GUIDED commit path (B1).
-
-        Surfaces a resolvable pending interpretation EVENT for every
-        interpretation site on ``state`` whose writer-boundary precondition
-        holds (every ``InterpretationKind`` member). Called by the guided
-        route persistence seam (``post_guided_respond``) after every committed
-        source or transform commit, because the guided dispatch path
-        never reaches the freeform fail-closed orphan gate, and by the
-        /validate backstop (elspeth-03f5728c33) with
-        ``only_missing_evidence=True`` to repair states stranded by a compose
-        that died after persisting its mutating turn — repair mode leaves every
-        site already carrying evidence in any resolution status alone.
-        Advisory polarity: the run-time
-        ``UnresolvedInterpretationPlaceholderError`` gate stays the hard
-        backstop. Idempotent; a no-op when there is no session/persisted
-        state. See P3.1 for the concrete implementation.
-        """
         ...
 
     async def run_signoff_checkpoint(

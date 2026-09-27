@@ -46,6 +46,7 @@ from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, 
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
+    ComposerAdmissionRefused,
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerResult,
@@ -56,7 +57,6 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
-    ComposerAdmissionRefused,
     ComposerAvailability,
     ComposerServiceImpl,
     _compose_preflight_repair_message,
