@@ -1224,6 +1224,9 @@ Within that:
   fields the row carries, and so does every other builtin filter applied to
   the row: it sees the same mapping `dict(row)` holds.
 - `{{ row }}` prints that mapping, e.g. `{'note': 'first', 'amount_usd': 5}`.
+  A filter that returns a lazy sequence (`row | reverse`, `row | items`,
+  `row | map(...)`) prints its iterator, as it does for any value: end it
+  with `| list` to print the elements.
 
 `row` has fields and one method, `get`. Every other attribute or item lookup
 on `row` reads a field of that name: `row.keys` and `row.items` are fields,

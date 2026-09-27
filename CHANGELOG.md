@@ -271,7 +271,10 @@ drained and repair this release forward.
   the mapping it holds: `{{ row }}` and every string filter print the declared
   fields, and `row | tojson` (also over a nested value such as
   `row.meta | tojson`), `row | last`, `row | urlencode` and `row | pprint`
-  work, where each failed every row or printed an object repr. With the
+  work, where each failed every row or printed an object repr. `row | reverse`
+  now returns a lazy iterator, as it does for a dict, so print it as
+  `row | reverse | list` (printed bare it shows the iterator's repr, which it
+  did not before). With the
   declaration omitted, a single-query prompt that uses `row` as a whole
   (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
   empty row. A multi-query `input_fields` variable named `source_row` or like

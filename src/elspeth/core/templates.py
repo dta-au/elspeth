@@ -139,7 +139,11 @@ _ROW_API_MISUSE_EXAMPLES: dict[str, str] = {
 
 
 def describe_dynamic_row_access(dynamic_accesses: Iterable[str]) -> str:
-    """``"<kinds> via <examples>"`` for a template's computed-key row accesses, sorted and deduplicated."""
+    """``"<kinds> via <examples>"`` for a template's computed-key row accesses, sorted and deduplicated.
+
+    Pass ``Jinja2FieldExtraction.computed_key_accesses``: a row-API misuse kind
+    has its own refusal (``describe_row_api_misuse``) and raises ``KeyError`` here.
+    """
     kinds = sorted(set(dynamic_accesses))
     return f"{', '.join(kinds)} via {', '.join(_DYNAMIC_ACCESS_EXAMPLES[kind] for kind in kinds)}"
 

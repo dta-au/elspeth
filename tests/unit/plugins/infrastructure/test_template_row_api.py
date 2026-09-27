@@ -50,6 +50,15 @@ _RESERVED = (
 _ADDRESS = re.compile(r" at 0x[0-9a-f]+")
 
 
+def test_a_row_api_misuse_kind_is_never_described_as_a_computed_key() -> None:
+    """The two refusals have separate texts: the computed-key text has no entry for a misuse kind."""
+    from elspeth.core.templates import ROW_API_MISUSE_KINDS, describe_dynamic_row_access
+
+    for kind in ROW_API_MISUSE_KINDS:
+        with pytest.raises(KeyError):
+            describe_dynamic_row_access([kind])
+
+
 def test_the_row_api_constants_are_the_ones_the_runtime_implements() -> None:
     """The sandbox returns ``row.get`` for the one method; a second method needs a runtime change too."""
     assert frozenset({"get"}) == TEMPLATE_ROW_METHODS
