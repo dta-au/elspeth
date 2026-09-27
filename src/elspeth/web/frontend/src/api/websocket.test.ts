@@ -196,6 +196,75 @@ describe("connectToRun", () => {
     expect(MockWebSocket.instances).toHaveLength(2);
   });
 
+  it("backs off across open then backend-unavailable cycles until a healthy event arrives", async () => {
+    const handlers = callbacks();
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+
+    MockWebSocket.instances[0].open();
+    MockWebSocket.instances[0].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    MockWebSocket.instances[1].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(3);
+
+    MockWebSocket.instances[2].open();
+    MockWebSocket.instances[2].onmessage?.({
+      data: JSON.stringify({ event_type: "progress", event_sequence: 1, data: {} }),
+    } as MessageEvent);
+    MockWebSocket.instances[2].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(4);
+    expect(handlers.onProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("also backs off across open then abnormal-network-close cycles", async () => {
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), callbacks());
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+    MockWebSocket.instances[0].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    MockWebSocket.instances[1].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it("ignores open and message callbacks from a closed socket handle", async () => {
+    const handlers = callbacks();
+    const connection = connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+    const oldSocket = MockWebSocket.instances[0];
+    connection.close();
+
+    oldSocket.open();
+    oldSocket.onmessage?.({
+      data: JSON.stringify({ event_type: "progress", event_sequence: 1, data: {} }),
+    } as MessageEvent);
+
+    expect(handlers.onConnected).not.toHaveBeenCalled();
+    expect(handlers.onProgress).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
   it("keeps reconnecting on a transient backend close when the ticket mint is also down", async () => {
     // The outage that closes 4503 is the same outage that fails the mint, so
     // a ticket rejection here must re-arm the ladder rather than end it —

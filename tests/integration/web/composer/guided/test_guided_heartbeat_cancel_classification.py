@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -169,7 +170,7 @@ class _BlockingPlanner:
 
 def _plan_setup(client: TestClient) -> tuple[str, str, dict[str, str], _BlockingPlanner]:
     planner = _BlockingPlanner()
-    client.app.state.composer_service = planner
+    client.app.state.planning_application = planner
     session_id = str(client.post("/api/sessions", json={"title": "guided plan heartbeat"}).json()["id"])
     body = {"operation_id": "00000000-0000-4000-8000-0000000000a1", "intent": "Plan until the heartbeat fails."}
     return session_id, f"/api/sessions/{session_id}/guided/plan", body, planner
@@ -305,33 +306,41 @@ def test_guided_chat_client_disconnect_is_still_request_cancelled(
 # terminal progress on any cancellation, so the tests assert none.
 
 
-def _respond_setup(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, dict[str, Any], asyncio.Event]:
+def _respond_setup(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, dict[str, Any], asyncio.Event, AsyncMock]:
     session_id = _create_rootless_session(client)
     turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
     body = _live_body(turn, chosen=[turn["payload"]["options"][0]["id"]])
-    settling = asyncio.Event()
+    running = asyncio.Event()
     service = client.app.state.session_service
+    real_renew = service.renew_guided_operation
+    settlement = AsyncMock(wraps=service.settle_guided_state_operation)
 
-    async def parked_settlement(*args: Any, **kwargs: Any) -> Any:
-        del args, kwargs
-        settling.set()
+    async def parked_after_renewal(*args: Any, **kwargs: Any) -> Any:
+        # Operation admission and renewal must finish before cancellation so
+        # there is a durable operation whose failure classification we inspect.
+        # Park the route before it submits a state writer: once submitted, that
+        # writer must be joined, so an unreleased fake writer would hang forever.
+        await real_renew(*args, **kwargs)
+        running.set()
         await asyncio.Event().wait()
-        raise AssertionError("unreachable: the parked settlement never completes")
+        raise AssertionError("unreachable: cancellation ends the parked route")
 
-    monkeypatch.setattr(service, "settle_guided_state_operation", parked_settlement)
-    return session_id, f"/api/sessions/{session_id}/guided/respond", body, settling
+    monkeypatch.setattr(service, "renew_guided_operation", parked_after_renewal)
+    monkeypatch.setattr(service, "settle_guided_state_operation", settlement)
+    return session_id, f"/api/sessions/{session_id}/guided/respond", body, running, settlement
 
 
 def test_guided_respond_heartbeat_cancel_records_operation_failed_and_answers_503(
     composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = composer_test_client
-    session_id, path, body, settling = _respond_setup(client, monkeypatch)
-    _heartbeat_loses_lease_once_running(monkeypatch, client, settling)
+    session_id, path, body, running, settlement = _respond_setup(client, monkeypatch)
+    _heartbeat_loses_lease_once_running(monkeypatch, client, running)
     statuses = _capture_request_terminal_status(monkeypatch)
 
     response = asyncio.run(_post_heartbeat_cancelled(client, path, body))
 
+    settlement.assert_not_awaited()
     assert response.status_code == 503
     assert response.json() == _LEASE_LOST_503
     operation = _guided_operation_row(client, session_id, body["operation_id"])
@@ -344,11 +353,12 @@ def test_guided_respond_plain_task_cancel_is_still_request_cancelled(
     composer_test_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = composer_test_client
-    session_id, path, body, settling = _respond_setup(client, monkeypatch)
+    session_id, path, body, running, settlement = _respond_setup(client, monkeypatch)
     statuses = _capture_request_terminal_status(monkeypatch)
 
-    asyncio.run(_post_then_cancel_task(client, path, body, settling))
+    asyncio.run(_post_then_cancel_task(client, path, body, running))
 
+    settlement.assert_not_awaited()
     operation = _guided_operation_row(client, session_id, body["operation_id"])
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "request_cancelled"

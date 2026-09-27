@@ -26,6 +26,28 @@ describe("shared composition state HTTP contract", () => {
   });
 });
 
+it.each(["provider_auth", "provider_bad_request"] as const)(
+  "decodes a persisted %s guided failure reason",
+  (reason) => {
+    const wire = wireResponse();
+    wire.guided_session = {
+      ...(wire.guided_session as Record<string, unknown>),
+      chat_history: [{
+        role: "assistant",
+        content: "Ask an administrator to correct the provider configuration.",
+        seq: 1,
+        step: "step_4_wire",
+        ts_iso: "2026-09-27T00:00:00+00:00",
+        assistant_message_kind: "synthetic_failure",
+        synthetic_failure_reason: reason,
+        turn_token: null,
+      }],
+      chat_turn_seq: 1,
+    };
+    expect(decodeGetGuidedResponse(wire).guided_session.chat_history[0]?.synthetic_failure_reason).toBe(reason);
+  },
+);
+
 function wireResponse(payloadOverrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     guided_session: {

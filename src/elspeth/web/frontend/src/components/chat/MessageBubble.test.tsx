@@ -149,7 +149,7 @@ describe("MessageBubble", () => {
       expect(screen.getByText("Failed to send message. Please try again.")).toBeInTheDocument();
     });
 
-    it.each(["policy_blocked", "admission_refused"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
+    it.each(["policy_blocked", "admission_refused", "token_accounting_unavailable", "message_idempotency_conflict", "recompose_user_message_mismatch"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
       // policy_blocked is permanent by construction — a deployment policy
       // refused the pipeline — so the failed row must not invite a retry.
       const onRetry = vi.fn();

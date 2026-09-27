@@ -13,6 +13,7 @@ from uuid import UUID
 
 import structlog
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.compartments import ChatIngressInput, compartment_ingress_record
@@ -78,10 +79,14 @@ async def _await_guided_atomic_settlement[T](awaitable: Awaitable[T]) -> T:
             result = await asyncio.shield(settlement_task)
         except asyncio.CancelledError as exc:
             if settlement_task.done() and settlement_task.cancelled():
+                child_failure = AuditIntegrityError("Guided atomic settlement child was cancelled before completion")
                 if cancellation is not None:
-                    cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = exc
-                    raise cancellation from exc
-                raise
+                    cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = child_failure
+                    raise cancellation from child_failure
+                if caller_task is not None and caller_task.cancelling() > 0:
+                    exc.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = child_failure
+                    raise exc from child_failure
+                raise child_failure from exc
             if caller_task is None or caller_task.cancelling() == 0:
                 raise
             if cancellation is None:
@@ -212,12 +217,16 @@ async def settle_pipeline_proposal_under_compose_lock(
         # closed on interpretation_placeholder_unresolved with nothing the user
         # can resolve. The pass is idempotent, so re-running it here is a no-op
         # when the first attempt already completed it.
-        await request.app.state.composer_service.surface_pending_interpretation_reviews(
-            _state_from_record(state),
-            session_id=str(proposal.session_id),
-            current_state_id=str(state.id),
-            session_operation_context=session_operation_context,
+        _, replay_cancelled = await _await_with_deferred_cancellation(
+            request.app.state.interpretation_surfacing.surface_pending_interpretation_reviews(
+                _state_from_record(state),
+                session_id=str(proposal.session_id),
+                current_state_id=str(state.id),
+                session_operation_context=session_operation_context,
+            )
         )
+        if replay_cancelled:
+            raise asyncio.CancelledError
         return PipelineRouteSettlement(
             settlement=PipelineProposalSettlementResult(proposal=proposal, state=state),
             validation=None,
@@ -327,6 +336,11 @@ async def settle_pipeline_proposal_under_compose_lock(
             raise
         if cancellation_state.requested:
             raise asyncio.CancelledError from exc
+        if exc.code == "TIMEOUT":
+            raise HTTPException(
+                status_code=504,
+                detail="Pipeline preparation timed out. Please retry this proposal.",
+            ) from exc
         status_code = 409 if exc.code in {"BASE_CONFLICT", "NOT_PENDING"} else 422
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except BaseException as exc:
@@ -407,8 +421,6 @@ async def settle_pipeline_proposal_under_compose_lock(
         if cancellation_state.requested:
             raise asyncio.CancelledError from exc
         raise
-    if cancellation_state.requested:
-        raise asyncio.CancelledError
     # Surface resolvable interpretation-review EVENTS for every site the
     # committed pipeline created (llm prompt templates etc.). The planner
     # path mints proposals without the compose loop's
@@ -418,13 +430,18 @@ async def settle_pipeline_proposal_under_compose_lock(
     # (interpretation_placeholder_unresolved) with nothing the user can
     # resolve. Mirrors the guided dispatcher's post-commit surfacing pass;
     # runs after settlement so events bind to the durable state id.
-    composer = request.app.state.composer_service
-    await composer.surface_pending_interpretation_reviews(
-        prepared.result.updated_state,
-        session_id=str(proposal.session_id),
-        current_state_id=str(settled.state.id),
-        session_operation_context=session_operation_context,
+    interpretation_surfacing = request.app.state.interpretation_surfacing
+    await _await_with_deferred_cancellation(
+        interpretation_surfacing.surface_pending_interpretation_reviews(
+            prepared.result.updated_state,
+            session_id=str(proposal.session_id),
+            current_state_id=str(settled.state.id),
+            session_operation_context=session_operation_context,
+        ),
+        state=cancellation_state,
     )
+    if cancellation_state.requested:
+        raise asyncio.CancelledError
     return PipelineRouteSettlement(settlement=settled, validation=validation)
 
 

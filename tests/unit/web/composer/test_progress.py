@@ -83,6 +83,7 @@ class TestComposerProgressEvent:
             "plugin_crash",
             "runtime_preflight_failed",
             "service_setup_failed",
+            "accounting_unavailable",
             "client_cancelled",
             "composer_idle",
             "composer_complete",

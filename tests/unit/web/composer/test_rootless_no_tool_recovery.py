@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from elspeth.web.composer import service as composer_service_module
+from elspeth.web.composer import composition_completion as completion_module
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean as _stub_advisor_end_gate_clean
 from tests.unit.web.composer.test_service import (
     ValidationResult,
@@ -42,8 +42,8 @@ async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution()
         ]
     )
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as completion,
-        patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as completion,
+        patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
     ):
         completion.side_effect = [
             _make_llm_response(content=_FALSE_COMPLETION),
@@ -66,7 +66,7 @@ async def test_repeated_rootless_prose_ends_after_one_neutral_retry() -> None:
         observed.append(deepcopy(args[0]))
         return _make_llm_response(content=_FALSE_COMPLETION)
 
-    with patch.object(service, "_call_llm", side_effect=respond) as completion:
+    with patch.object(service._provider_gateway, "_call_llm", side_effect=respond) as completion:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
     assert completion.call_count == 2
     assert result.repair_turns_used == 1
@@ -87,7 +87,7 @@ async def test_repeated_rootless_prose_ends_after_one_neutral_retry() -> None:
 async def test_neutral_retry_keeps_explanation_and_revocation_without_mutation(user_message: str) -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     with patch.object(
-        service, "_call_llm", return_value=_make_llm_response(content="I can explain that without changing anything.")
+        service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="I can explain that without changing anything.")
     ) as completion:
         result = await service.compose(user_message, [], _empty_state(), session_id=sid)
     assert completion.call_count == 2
@@ -103,9 +103,11 @@ async def test_neutral_retry_keeps_explanation_and_revocation_without_mutation(u
     ids=["greeting", "disabled-repairs"],
 )
 async def test_ineligible_request_does_not_add_a_call(user_message: str, repair_budget: int, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(composer_service_module, "_MAX_REPAIR_TURNS", repair_budget)
+    monkeypatch.setattr(completion_module, "_MAX_REPAIR_TURNS", repair_budget)
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
-    with patch.object(service, "_call_llm", return_value=_make_llm_response(content="Here is my response.")) as completion:
+    with patch.object(
+        service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="Here is my response.")
+    ) as completion:
         result = await service.compose(user_message, [], _empty_state(), session_id=sid)
     assert completion.call_count == 1
     assert result.repair_turns_used == 0
@@ -115,15 +117,15 @@ async def test_ineligible_request_does_not_add_a_call(user_message: str, repair_
 @pytest.mark.asyncio
 async def test_expired_deadline_does_not_start_rootless_retry() -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
-    terminate = service._try_terminate_no_tools
+    terminate = service._completion._try_terminate_no_tools
 
     async def terminate_after_deadline(**kwargs: Any) -> Any:
         kwargs["deadline"] = 0.0
         return await terminate(**kwargs)
 
     with (
-        patch.object(service, "_call_llm", return_value=_make_llm_response(content=_FALSE_COMPLETION)) as completion,
-        patch.object(service, "_try_terminate_no_tools", side_effect=terminate_after_deadline),
+        patch.object(service._provider_gateway, "_call_llm", return_value=_make_llm_response(content=_FALSE_COMPLETION)) as completion,
+        patch.object(service._completion, "_try_terminate_no_tools", side_effect=terminate_after_deadline),
     ):
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
     assert completion.call_count == 1

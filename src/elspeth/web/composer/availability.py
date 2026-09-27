@@ -1,28 +1,15 @@
-"""Boot-time availability snapshot and computation for the composer service.
-
-Extracted verbatim from ComposerServiceImpl._compute_availability (service.py)
-to reduce the god-class surface. The logic is UNCHANGED; the enclosing
-self reference is made explicit via the ``service`` parameter.
-
-``ComposerAvailability`` is re-exported through ``service.py`` so all
-existing ``from elspeth.web.composer.service import ComposerAvailability``
-imports continue to resolve without change.
-"""
+"""Boot-time availability snapshot and computation for Composer."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from elspeth.web.composer.provider_config import (
     PROVIDER_REQUIRED_ENV_KEYS,
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-
-if TYPE_CHECKING:
-    from elspeth.web.composer.service import ComposerServiceImpl
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +63,16 @@ def _missing_required_env_keys(provider: str, *, endpoint_configured: bool) -> t
     return tuple(key for key in PROVIDER_REQUIRED_ENV_KEYS[provider] if key not in os.environ or not os.environ[key])
 
 
-def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
+def compute_availability(
+    *,
+    model: str,
+    advisor_model: str,
+    advisor_provider: str,
+    endpoint_base_url: str | None,
+    endpoint_api_key: str | None,
+    advisor_endpoint_base_url: str | None,
+    advisor_endpoint_api_key: str | None,
+) -> ComposerAvailability:
     """Infer whether the configured primary and advisor have required env.
 
     This is a configuration/readiness signal, not a network health check.
@@ -91,14 +87,14 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
     case today) see byte-identical behaviour to before this affordance
     existed.
     """
-    provider = infer_provider_from_model_name(service._model) or infer_provider_from_unprefixed_model_name(service._model)
+    provider = infer_provider_from_model_name(model) or infer_provider_from_unprefixed_model_name(model)
     if provider is None:
         return ComposerAvailability(
             available=False,
-            model=service._model,
+            model=model,
             provider=provider,
             reason=(
-                f"Composer model {service._model} is unavailable: provider could not be inferred. "
+                f"Composer model {model} is unavailable: provider could not be inferred. "
                 "Use a provider-prefixed model name or a recognized OpenAI/Anthropic model name."
             ),
         )
@@ -106,30 +102,28 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
     if provider not in PROVIDER_REQUIRED_ENV_KEYS:
         return ComposerAvailability(
             available=False,
-            model=service._model,
+            model=model,
             provider=provider,
-            reason=f"Composer model {service._model} is unavailable: provider {provider!r} has no configured environment contract.",
+            reason=f"Composer model {model} is unavailable: provider {provider!r} has no configured environment contract.",
         )
 
-    primary_endpoint_configured = service._endpoint_base_url is not None and service._endpoint_api_key is not None
+    primary_endpoint_configured = endpoint_base_url is not None and endpoint_api_key is not None
     missing_keys = _missing_required_env_keys(provider, endpoint_configured=primary_endpoint_configured)
     if missing_keys:
         missing = ", ".join(missing_keys)
-        reason = f"Composer model {service._model} is unavailable: missing {missing}."
+        reason = f"Composer model {model} is unavailable: missing {missing}."
         return ComposerAvailability(
             available=False,
-            model=service._model,
+            model=model,
             provider=provider,
             reason=reason,
             missing_keys=missing_keys,
         )
 
-    advisor_model = service._settings.composer_advisor_model
-    advisor_provider = service._advisor_provider
     if advisor_provider not in PROVIDER_REQUIRED_ENV_KEYS:
         return ComposerAvailability(
             available=False,
-            model=service._model,
+            model=model,
             provider=provider,
             reason=(
                 f"Composer advisor model {advisor_model} is unavailable: provider "
@@ -137,13 +131,13 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
             ),
         )
 
-    advisor_endpoint_configured = service._advisor_endpoint_base_url is not None and service._advisor_endpoint_api_key is not None
+    advisor_endpoint_configured = advisor_endpoint_base_url is not None and advisor_endpoint_api_key is not None
     advisor_missing_keys = _missing_required_env_keys(advisor_provider, endpoint_configured=advisor_endpoint_configured)
     if advisor_missing_keys:
         missing = ", ".join(advisor_missing_keys)
         return ComposerAvailability(
             available=False,
-            model=service._model,
+            model=model,
             provider=provider,
             reason=f"Composer advisor model {advisor_model} is unavailable: missing {missing}.",
             missing_keys=advisor_missing_keys,
@@ -151,6 +145,6 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
 
     return ComposerAvailability(
         available=True,
-        model=service._model,
+        model=model,
         provider=provider,
     )

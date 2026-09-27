@@ -54,7 +54,6 @@ import type {
   GuidedRespondRequest,
   GuidedRespondResponse,
   GuidedStartOperationReconciliation,
-  TutorialSampleResponse,
 } from "@/types/guided";
 import {
   decodeCompositionState,
@@ -80,6 +79,8 @@ import type {
   TutorialOrphanCleanupResponse,
   TutorialRunRequest,
   TutorialRunResponse,
+  TutorialReadinessResponse,
+  TutorialSampleResponse,
   UserComposerPreferencesPayload,
   UpdateUserComposerPreferencesPayload,
 } from "@/types/api";
@@ -265,7 +266,10 @@ export async function parseResponse<T>(
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
+    let clientRequestId: string | undefined;
+    let userMessageId: string | undefined;
     let failureCode: string | undefined;
+    let guidance: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
@@ -311,7 +315,10 @@ export async function parseResponse<T>(
         : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      clientRequestId = firstStringField([body, nestedDetail], ["client_request_id"]);
+      userMessageId = firstStringField([body, nestedDetail], ["user_message_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+      guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
       // Convergence discriminator + its recovery copy. Kept off `detail` so
       // the SPA branches on the taxonomy rather than parsing prose.
@@ -462,7 +469,10 @@ export async function parseResponse<T>(
       storage_quota: storageQuota,
       sources,
       request_id: requestId,
+      client_request_id: clientRequestId,
+      user_message_id: userMessageId,
       failure_code: failureCode,
+      guidance,
       component_id: componentId,
       plugin_id: pluginId,
       reason,
@@ -896,11 +906,15 @@ export async function rejectCompositionProposal(
 export async function sendMessage(
   sessionId: string,
   content: string,
-  stateId?: string,
+  clientRequestId: string,
+  stateId?: string | null,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const body: { content: string; state_id?: string } = { content };
-  if (stateId) {
+  const body: { content: string; client_request_id: string; state_id?: string | null } = {
+    content,
+    client_request_id: clientRequestId,
+  };
+  if (stateId !== undefined) {
     body.state_id = stateId;
   }
   const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
@@ -916,11 +930,13 @@ export async function sendMessage(
  *  Used by the retry flow when the user message is already persisted. */
 export async function recompose(
   sessionId: string,
+  expectedUserMessageId: string,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
   const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
     method: "POST",
     headers: authHeaders("application/json"),
+    body: JSON.stringify({ expected_user_message_id: expectedUserMessageId }),
     signal,
   });
   return parseResponse<MessageWithStateResponse>(response);
@@ -959,21 +975,15 @@ export async function getGuided(
 }
 
 /**
- * Fetch the runtime-derived synthetic-scrape sample URLs for the active
- * TUTORIAL session's resolved origin (p4 Task 8a GET surface).
- *
- * Consumed by `TutorialGuidedShell`: the URLs are computed server-side from the
- * resolved base at request time (they cannot ride the frozen profile
- * constants), so the shell fetches them and appends them to the locked STEP_1
- * prompt. The synthetic pages are publicly hosted, so the tutorial's web_scrape
- * node carries no SSRF allowlist (it uses the plugin default `public_only`).
+ * Fetch runtime-derived sample URLs for the freeform tutorial brief.
+ * They are data, not a server-authored pipeline proposal.
  */
 export async function getTutorialSample(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TutorialSampleResponse> {
   const response = await authFetch(
-    `/api/sessions/${sessionId}/guided/tutorial-sample`,
+    `/api/tutorial/${sessionId}/sample`,
     {
       method: "GET",
       headers: authHeaders(),
@@ -981,6 +991,18 @@ export async function getTutorialSample(
     },
   );
   return parseResponse<TutorialSampleResponse>(response);
+}
+
+export async function getTutorialReadiness(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<TutorialReadinessResponse> {
+  const response = await authFetch(`/api/tutorial/${sessionId}/readiness`, {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  return parseResponse<TutorialReadinessResponse>(response);
 }
 
 /**
@@ -1469,9 +1491,10 @@ export async function getRunResults(
 }
 
 /** List runs for a session. */
-export async function fetchRuns(sessionId: string): Promise<Run[]> {
+export async function fetchRuns(sessionId: string, signal?: AbortSignal): Promise<Run[]> {
   const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
     headers: authHeaders(),
+    signal,
   });
   return parseResponse<Run[]>(response);
 }

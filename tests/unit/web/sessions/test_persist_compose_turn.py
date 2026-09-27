@@ -23,7 +23,8 @@ from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.models import session_operation_fences_table
-from elspeth.web.sessions.service import SessionServiceImpl, _valid_compartment_ingress_metadata
+from elspeth.web.sessions.proposal_authority import _valid_compartment_ingress_metadata
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session as _make_session_row

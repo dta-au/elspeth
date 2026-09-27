@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_68() -> None:
+def test_current_session_schema_epoch_is_70() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -246,7 +246,8 @@ def test_current_session_schema_epoch_is_68() -> None:
     # 67: composer authority hashes and the advisor fingerprint bind coalesce
     # mapping-branch order and multi-source sources order. Stores recreated.
     # 68: guided and ordinary proposal checkpoint rebase reasons are persisted.
-    assert SESSION_SCHEMA_EPOCH == 68
+    # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
+    assert SESSION_SCHEMA_EPOCH == 70
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -1209,6 +1210,8 @@ class TestSchemaValidatorCatchesMissingTrigger:
             "trg_interpretation_events_no_delete_resolved",
             "trg_chat_messages_immutable_content",
             "trg_chat_messages_no_delete",
+            "trg_message_ingress_receipts_no_update",
+            "trg_message_ingress_receipts_no_delete",
             "trg_guided_operations_terminal_immutable",
             "trg_guided_operation_events_no_update",
             "trg_guided_operation_events_no_delete",

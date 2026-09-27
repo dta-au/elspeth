@@ -202,14 +202,94 @@ async def _replay_completed[ResponseT: BaseModel](
     return response
 
 
-async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
-    """Join owned cleanup despite repeated cancellation of the caller."""
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T: ...
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError) -> T | None: ...
+
+
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError | None = None
+) -> T | None:
+    """Join owned cleanup despite repeated caller cancellation.
+
+    A route already unwinding its original cancellation can keep an ordinary
+    child failure secondary while continuing later cleanup. A registered
+    integrity failure stays primary. A child that cancels itself has not
+    proved its cleanup complete and therefore fails closed.
+    """
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             continue
-    return task.result()
+        except BaseException:
+            # A failed child is raised by ``shield`` as soon as it finishes;
+            # consume that result below using the same priority rule as a
+            # child that finished before this join began.
+            if not task.done():
+                raise
+    try:
+        return task.result()
+    except BaseException as child_error:
+        if primary_cancellation is None:
+            raise
+        if _is_guided_integrity_failure(child_error):
+            raise child_error from primary_cancellation
+        if isinstance(child_error, asyncio.CancelledError):
+            raise AuditIntegrityError("Shielded cleanup task was cancelled before completion") from primary_cancellation
+        if not isinstance(child_error, Exception):
+            raise
+        primary_cancellation.add_note(f"Shielded cleanup also failed with {type(child_error).__name__}.")
+        previous_cause = primary_cancellation.__cause__
+        primary_cancellation.__cause__ = (
+            child_error if previous_cause is None else BaseExceptionGroup("Shielded cleanup failures", [previous_cause, child_error])
+        )
+        return None
+
+
+async def _await_guided_terminal_write[T](
+    awaitable: Awaitable[T],
+    *,
+    child_cancel_is_integrity: bool = True,
+    propagate_caller_cancellation: bool = False,
+) -> T:
+    """Join a guided terminal write before its route releases the operation lease.
+
+    A caller may be cancelled repeatedly while a database or progress write is
+    in flight. The child owns that write until it finishes. A child that
+    cancels itself has not proved completion and is an integrity failure for
+    required writes. A caller that is already preserving a stronger durable
+    primary may instead treat a progress-only sink cancellation as secondary.
+    After the join, the caller chooses whether its injected cancellation or
+    an earlier primary failure remains the route outcome. In propagation mode,
+    an ordinary child failure is attached to the caller cancellation; an
+    integrity failure still escapes as primary.
+    """
+    write_task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(write_task)
+    except asyncio.CancelledError as exc:
+        if write_task.cancelled() and child_cancel_is_integrity:
+            raise AuditIntegrityError("Guided terminal write was cancelled before completion") from exc
+        if propagate_caller_cancellation:
+            try:
+                await _join_shielded_task_after_cancellation(write_task, primary_cancellation=exc)
+            except AuditIntegrityError:
+                if not child_cancel_is_integrity and write_task.cancelled():
+                    # A secondary progress sink may cancel itself. Preserve
+                    # the independent cancellation injected into the caller.
+                    raise exc from None
+                raise
+            raise exc
+        try:
+            return await _join_shielded_task_after_cancellation(write_task)
+        except asyncio.CancelledError as child_cancel:
+            if child_cancel_is_integrity:
+                raise AuditIntegrityError("Guided terminal write was cancelled before completion") from child_cancel
+            raise
 
 
 def _record_guided_cleanup_failure(error: BaseException, *, site: str, session_lease: SessionOperationLease) -> None:

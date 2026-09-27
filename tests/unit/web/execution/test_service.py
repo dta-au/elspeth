@@ -12277,20 +12277,27 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
 def test_per_call_quota_admission_persists_pending_under_transferred_lease(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     run_uuid = uuid4()
     attempt = ProviderAttempt(attempt_id="provider-attempt", started_at=datetime.now(UTC))
-    mock_session_service.begin_provider_attempt.return_value = attempt
+    mock_session_service.begin_run_provider_attempt_sync.return_value = attempt
     assert service._admit_run_llm_call(run_uuid, _execute_lease()) == attempt.attempt_id
-    mock_session_service.begin_provider_attempt.assert_awaited_once_with(
-        session_operation_context=_execute_lease().context, source="run", run_id=run_uuid
+    mock_session_service.begin_run_provider_attempt_sync.assert_called_once_with(
+        session_operation_context=_execute_lease().context, run_id=run_uuid
     )
+    service._call_async.assert_not_called()
 
 
 def test_per_call_quota_refusal_propagates_before_dispatch(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     refusal = ChargeableAdmissionRefused(
         ChargeableAdmissionDecision(
             refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
@@ -12299,17 +12306,21 @@ def test_per_call_quota_refusal_propagates_before_dispatch(
             ),
         )
     )
-    mock_session_service.begin_provider_attempt.side_effect = refusal
+    mock_session_service.begin_run_provider_attempt_sync.side_effect = refusal
     with pytest.raises(ChargeableAdmissionRefused) as caught:
         service._admit_run_llm_call(uuid4(), _execute_lease())
     assert caught.value is refusal
-    mock_session_service.settle_provider_attempt.assert_not_awaited()
+    mock_session_service.settle_run_provider_attempt_sync.assert_not_called()
+    service._call_async.assert_not_called()
 
 
 def test_per_call_settlement_uses_exact_durable_call_identity(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run settlement entered async bridge"))
+    )
     entry = TokenUsageEntry(
         model="model",
         prompt_tokens=3,
@@ -12326,6 +12337,7 @@ def test_per_call_settlement_uses_exact_durable_call_identity(
             service._settle_run_llm_call(
                 uuid4(), _execute_lease(), "pending-attempt", "unknown-call", landscape_db=db, landscape_run_id="run"
             )
-    mock_session_service.settle_provider_attempt.assert_awaited_once_with(
+    mock_session_service.settle_run_provider_attempt_sync.assert_called_once_with(
         session_operation_context=_execute_lease().context, attempt_id="pending-attempt", entry=entry
     )
+    service._call_async.assert_not_called()

@@ -143,6 +143,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    _await_guided_terminal_write,
     guided_operation_failure_error,
     guided_operation_lease_guard,
     reserve_or_replay_guided_operation,
@@ -159,6 +160,11 @@ from .guided_chat_intent_management import (
     maybe_prepare_schema8_management_rewind,
 )
 from .guided_proposal_rebase import carried_pending_proposal_rebase
+from .pipeline_settlement import (
+    _GUIDED_ATOMIC_SETTLEMENT_COMPLETED,
+    _GUIDED_ATOMIC_SETTLEMENT_FAILURE,
+    _await_guided_atomic_settlement,
+)
 
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
@@ -1259,6 +1265,26 @@ async def _step_1_inline_source_inspection_facts(
     return facts
 
 
+def _guided_chat_complete_progress_event() -> ComposerProgressEvent:
+    return ComposerProgressEvent(
+        phase="complete",
+        headline="ELSPETH finished responding to this guided message.",
+        evidence=("The guided chat turn was settled atomically.",),
+        likely_next="Review the reply and continue the wizard.",
+        reason="composer_complete",
+    )
+
+
+def _guided_chat_failed_progress_event() -> ComposerProgressEvent:
+    return ComposerProgressEvent(
+        phase="failed",
+        headline="The guided chat turn could not be completed.",
+        evidence=("The guided operation was settled with a safe failure classification.",),
+        likely_next="Review the error response before retrying this guided turn.",
+        reason="service_setup_failed",
+    )
+
+
 async def post_guided_chat_schema8(
     *,
     session_id: UUID,
@@ -1481,6 +1507,7 @@ async def post_guided_chat_schema8(
                 content=body.message,
             )
             progress_started = False
+            settled_success = False
             progress_registry = _get_composer_progress_registry(request)
             try:
                 progress_sink = await _composer_progress_sink(
@@ -1537,12 +1564,12 @@ async def post_guided_chat_schema8(
                     # consumes it. Step 2's discovery loop is the sole
                     # consumer (run_guided_chat_provider_attempt passes it
                     # to resolve_step_2_sink_chat_with_auto_drop and
-                    # nowhere else), so binding the service attribute
+                    # nowhere else), so binding the tracker operation
                     # eagerly on every turn coupled steps 1/3/4 to a
                     # collaborator they never use.
                     mark_schema_loaded = (
                         functools.partial(
-                            request.app.state.composer_service._mark_plugin_schema_loaded,
+                            request.app.state.schema_disclosure.mark_plugin_schema_loaded,
                             str(session_id),
                         )
                         if frozen.guided.step is GuidedStep.STEP_2_SINK
@@ -1794,6 +1821,7 @@ async def post_guided_chat_schema8(
                                 status=paired_resolution_chat.status,
                                 latency_ms=deferred.chat.latency_ms,
                                 error_class=paired_resolution_chat.error_class,
+                                provider_failure_kind=paired_resolution_chat.provider_failure_kind,
                             )
                     retained_intent_ids = deferred_request_retained_intent_ids(deferred)
                     management = deferred_request_management(deferred)
@@ -2139,6 +2167,10 @@ async def post_guided_chat_schema8(
                             if chat_result.error_class in _NOT_APPLIED_ERROR_CLASSES
                             else "quality_guard"
                             if chat_result.error_class == "AssistantScaffoldLeakError"
+                            else "provider_auth"
+                            if chat_result.provider_failure_kind == "auth"
+                            else "provider_bad_request"
+                            if chat_result.provider_failure_kind == "bad_request"
                             # The provider ANSWERED; the reply violated the
                             # tool's argument contract. Calling that
                             # "unavailable" mislabels a model-output defect as
@@ -2363,48 +2395,49 @@ async def post_guided_chat_schema8(
                             likely_next="ELSPETH will finish the atomic state and audit settlement.",
                         ),
                     )
-                    settlement = await service.settle_guided_state_operation(
-                        GuidedStateOperationCommand(
-                            fence=fence,
-                            expected_current_state_id=current_record.id if current_record is not None else None,
-                            expected_current_state_version=current_record.version if current_record is not None else None,
-                            expected_current_content_hash=(composition_content_hash(current_state) if current_record is not None else None),
-                            state_id=uuid4(),
-                            state=state_data,
-                            provenance="convergence_persist",
-                            actor="composer_route",
-                            response=GuidedResponseDescriptor(
-                                kind="guided_chat",
-                                next_turn=replay_turn,
-                                assistant_turn_seq=assistant_turn.seq,
+                    settlement = await _await_guided_atomic_settlement(
+                        service.settle_guided_state_operation(
+                            GuidedStateOperationCommand(
+                                fence=fence,
+                                expected_current_state_id=current_record.id if current_record is not None else None,
+                                expected_current_state_version=current_record.version if current_record is not None else None,
+                                expected_current_content_hash=(
+                                    composition_content_hash(current_state) if current_record is not None else None
+                                ),
+                                state_id=uuid4(),
+                                state=state_data,
+                                provenance="convergence_persist",
+                                actor="composer_route",
+                                response=GuidedResponseDescriptor(
+                                    kind="guided_chat",
+                                    next_turn=replay_turn,
+                                    assistant_turn_seq=assistant_turn.seq,
+                                ),
+                                payloads=tuple(prepared_payloads),
+                                audit_evidence=evidence,
+                                originating_message=originating_message,
+                                retained_deferred_intent_ids=retained_intent_ids,
+                                deferred_intent_action=settled_management_action,
+                                invalidated_pending_proposal=invalidated_pending_proposal,
+                                rebased_pending_proposal=chat_rebase,
                             ),
-                            payloads=tuple(prepared_payloads),
-                            audit_evidence=evidence,
-                            originating_message=originating_message,
-                            retained_deferred_intent_ids=retained_intent_ids,
-                            deferred_intent_action=settled_management_action,
-                            invalidated_pending_proposal=invalidated_pending_proposal,
-                            rebased_pending_proposal=chat_rebase,
-                        ),
-                        payload_store=payload_store,
-                        session_operation_context=reserved.session_operation_context,
+                            payload_store=payload_store,
+                            session_operation_context=reserved.session_operation_context,
+                        )
                     )
+                    settled_success = True
                     response = response_from_record(settlement.result_state)
 
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="complete",
-                        headline="ELSPETH finished responding to this guided message.",
-                        evidence=("The guided chat turn was settled atomically.",),
-                        likely_next="Review the reply and continue the wizard.",
-                        reason="composer_complete",
-                    ),
-                )
+                await _await_guided_terminal_write(_publish_progress(progress_sink, event=_guided_chat_complete_progress_event()))
                 return response
             except GuidedOperationFenceLostError:
                 rejoin_after_lock = True
             except asyncio.CancelledError as exc:
+                if settled_success or exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
+                    # The durable state already completed. A cancelled HTTP
+                    # exchange cannot turn its progress into client_cancelled.
+                    await _await_guided_terminal_write(_publish_progress(progress_sink, event=_guided_chat_complete_progress_event()))
+                    raise
                 # A user Stop or client disconnect is not a server failure
                 # (F1 finding #24): mirror guided_plan.py's cancel arm so the
                 # durable audit row and the terminal envelope both record
@@ -2419,15 +2452,28 @@ async def post_guided_chat_schema8(
                 # ``raise`` below hands it to ``_track_compose_inflight``,
                 # which answers with the structured 503.
                 cancel_heartbeat = _composer_heartbeat_cancel_of(exc)
+                settlement_failure = exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
+                child_cancelled = isinstance(settlement_failure, asyncio.CancelledError)
+                if (
+                    settlement_failure is None
+                    and cancel_heartbeat is None
+                    and not cancel_disconnected
+                    and (cancel_caller_task is None or cancel_caller_task.cancelling() == 0)
+                ):
+                    child_cancelled = True
                 cancel_failure_code: GuidedOperationFailureCode = (
-                    "operation_failed"
-                    if cancel_heartbeat is not None
+                    "stale_conflict"
+                    if isinstance(settlement_failure, GuidedOperationSettlementConflictError)
+                    else "integrity_error"
+                    if isinstance(settlement_failure, (AuditIntegrityError, InvariantError)) or child_cancelled
+                    else "operation_failed"
+                    if settlement_failure is not None or cancel_heartbeat is not None
                     else "request_cancelled"
                     if cancel_disconnected or (cancel_caller_task is not None and cancel_caller_task.cancelling() > 0)
-                    else "operation_failed"
+                    else "integrity_error"
                 )
                 try:
-                    await asyncio.shield(
+                    await _await_guided_terminal_write(
                         service.fail_guided_operation_with_audit(
                             GuidedOperationFailureCommand(
                                 fence=reserved.fence,
@@ -2461,13 +2507,15 @@ async def post_guided_chat_schema8(
                     raise AuditIntegrityError("Guided Chat could not record its cancellation settlement") from settlement_exc
                 if progress_started:
                     try:
-                        await asyncio.shield(
+                        await _await_guided_terminal_write(
                             _publish_progress(
                                 progress_sink,
                                 event=(
                                     client_cancelled_progress_event()
-                                    if cancel_heartbeat is None
+                                    if cancel_failure_code == "request_cancelled"
                                     else _composer_heartbeat_failed_progress_event()
+                                    if cancel_heartbeat is not None
+                                    else _guided_chat_failed_progress_event()
                                 ),
                             )
                         )
@@ -2492,6 +2540,10 @@ async def post_guided_chat_schema8(
                             frames=_safe_frame_strings(progress_exc),
                         )
                         raise
+                if isinstance(settlement_failure, (AuditIntegrityError, InvariantError)):
+                    raise settlement_failure from exc
+                if child_cancelled:
+                    raise AuditIntegrityError("Guided Chat settlement child was cancelled before completion") from exc
                 if cancel_disconnected:
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise
@@ -2526,18 +2578,20 @@ async def post_guided_chat_schema8(
                     request_id=_failure_log_request_id(request),
                 )
                 try:
-                    failed = await service.fail_guided_operation_with_audit(
-                        GuidedOperationFailureCommand(
-                            fence=reserved.fence,
-                            failure_code=failure_code,
-                            actor="composer_route",
-                            audit_evidence=GuidedAuditEvidence(
-                                invocations=recorder.invocations,
-                                llm_calls=recorder.llm_calls,
-                                chat_turns=recorder.chat_turns,
+                    failed = await _await_guided_terminal_write(
+                        service.fail_guided_operation_with_audit(
+                            GuidedOperationFailureCommand(
+                                fence=reserved.fence,
+                                failure_code=failure_code,
+                                actor="composer_route",
+                                audit_evidence=GuidedAuditEvidence(
+                                    invocations=recorder.invocations,
+                                    llm_calls=recorder.llm_calls,
+                                    chat_turns=recorder.chat_turns,
+                                ),
                             ),
-                        ),
-                        session_operation_context=reserved.session_operation_context,
+                            session_operation_context=reserved.session_operation_context,
+                        )
                     )
                 except GuidedOperationFenceLostError as settlement_exc:
                     if failure_code == "integrity_error":
@@ -2548,6 +2602,7 @@ async def post_guided_chat_schema8(
                         raise exc from settlement_exc
                     raise
                 else:
+                    await _await_guided_terminal_write(_publish_progress(progress_sink, event=_guided_chat_failed_progress_event()))
                     raise guided_operation_failure_error(failed) from exc
             finally:
                 await lease_guard.finish_active_exception()

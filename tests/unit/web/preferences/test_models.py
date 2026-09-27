@@ -29,7 +29,7 @@ def test_completion_requires_explicit_intent_and_freeform(via: str) -> None:
 @pytest.mark.parametrize("completed_at", [None, "2026-09-20T00:00:00Z"])
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("tutorial_stage", "guided"), ("tutorial_session_id", "session"), ("tutorial_run_id", "run"), ("tutorial_source_data_hash", "hash")],
+    [("tutorial_stage", "build"), ("tutorial_session_id", "session"), ("tutorial_run_id", "run"), ("tutorial_source_data_hash", "hash")],
 )
 def test_completion_and_reset_reject_populated_progress(completed_at: str | None, field: str, value: str) -> None:
     payload: dict[str, object] = {"tutorial_completed_at": completed_at, field: value}
@@ -180,10 +180,10 @@ def test_composer_preferences_rejects_invalid_tutorial_stage() -> None:
 
 def test_update_request_accepts_tutorial_progress_fields() -> None:
     payload = UpdateComposerPreferencesRequest(
-        tutorial_stage="guided",
+        tutorial_stage="build",
         tutorial_session_id="sess-1",
     )
-    assert payload.tutorial_stage == "guided"
+    assert payload.tutorial_stage == "build"
     assert payload.tutorial_session_id == "sess-1"
     assert "tutorial_stage" in payload.model_fields_set
     assert "tutorial_run_id" not in payload.model_fields_set

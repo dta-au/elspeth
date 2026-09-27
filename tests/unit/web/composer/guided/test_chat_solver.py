@@ -23,6 +23,8 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCallStatus
 from elspeth.contracts.freeze import deep_thaw
@@ -30,6 +32,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSecretRequirement, PluginSummary
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided import chat_solver, planning
 from elspeth.web.composer.guided.chat_solver import (
@@ -412,6 +415,243 @@ async def test_management_auto_drop_uses_canonical_provider_api_error_classifica
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        (BadGatewayError, ComposerLLMCallStatus.API_ERROR),
+        (ServiceUnavailableError, ComposerLLMCallStatus.API_ERROR),
+        (LiteLLMTimeout, ComposerLLMCallStatus.TIMEOUT),
+    ],
+)
+async def test_management_auto_drop_handles_gateway_status_errors_with_terminal_audit(
+    monkeypatch: pytest.MonkeyPatch, error_type, expected_status: ComposerLLMCallStatus
+) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    result = await resolve_deferred_intent_management_chat_with_auto_drop(
+        site="test",
+        session_id="session",
+        user_id="user",
+        request=DeferredIntentManagementChatRequest(
+            model="test/model",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="cancel one saved instruction",
+            temperature=None,
+            seed=None,
+            timeout_seconds=5,
+            context_block="safe context",
+        ),
+        recorder=recorder,
+    )
+    assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
+    assert result.chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert result.chat.error_class == error_type.__name__
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is expected_status
+    assert recorder.llm_calls[0].error_class == error_type.__name__
+    assert "private upstream response" not in repr(result)
+    assert "private upstream response" not in repr(recorder.llm_calls[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("palette", ["source", "sink", "advisory"])
+@pytest.mark.parametrize("error_type", [BadGatewayError, ServiceUnavailableError])
+async def test_guided_palettes_absorb_gateway_status_errors(monkeypatch: pytest.MonkeyPatch, palette: str, error_type) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    shared = {
+        "site": "test",
+        "session_id": "session",
+        "user_id": "user",
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+    }
+    if palette == "source":
+        monkeypatch.setattr(guided_step_chat_module, "maybe_resolve_step_1_source_chat", provider_failure)
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            **shared, plugin_hint=None, current_source=None, available_source_plugins=()
+        )
+        chat = result.chat
+    elif palette == "sink":
+        monkeypatch.setattr(guided_step_chat_module, "maybe_resolve_step_2_sink_chat", provider_failure)
+        result = await resolve_step_2_sink_chat_with_auto_drop(**shared, current_sink=None)
+        chat = result.chat
+    else:
+        monkeypatch.setattr(guided_step_chat_module, "solve_step_chat", provider_failure)
+        chat = await guided_step_chat_module.solve_step_chat_with_auto_drop(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+    assert chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert chat.error_class == error_type.__name__
+    assert "private upstream response" not in repr(chat)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("palette", ["management", "source", "sink", "advisory"])
+@pytest.mark.parametrize("failure_kind", ["transport", "authentication", "bad_request", "unavailable"])
+async def test_guided_palettes_preserve_physical_provider_failure_kind(
+    monkeypatch: pytest.MonkeyPatch, palette: str, failure_kind: str
+) -> None:
+    import httpx
+    from litellm.exceptions import AuthenticationError, BadRequestError
+
+    errors = {
+        "transport": httpx.ConnectError("private upstream response"),
+        "authentication": AuthenticationError(message="private upstream response", llm_provider="test", model="test/model"),
+        "bad_request": BadRequestError(message="private upstream response", llm_provider="test", model="test/model"),
+        "unavailable": ServiceUnavailableError(message="private upstream response", llm_provider="test", model="test/model"),
+    }
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise errors[failure_kind]
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    shared = {
+        "site": "test",
+        "session_id": "session",
+        "user_id": "user",
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+        "recorder": recorder,
+    }
+    if palette == "management":
+        result = await resolve_deferred_intent_management_chat_with_auto_drop(
+            site="test",
+            session_id="session",
+            user_id="user",
+            request=DeferredIntentManagementChatRequest(
+                model="test/model",
+                step=GuidedStep.STEP_3_TRANSFORMS,
+                user_message="cancel one saved instruction",
+                temperature=None,
+                seed=None,
+                timeout_seconds=5,
+                context_block="safe context",
+            ),
+            recorder=recorder,
+        )
+        chat = result.chat
+    elif palette == "source":
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            **shared, plugin_hint=None, current_source=None, available_source_plugins=("csv",)
+        )
+        chat = result.chat
+    elif palette == "sink":
+        result = await resolve_step_2_sink_chat_with_auto_drop(**shared, current_sink=None)
+        chat = result.chat
+    else:
+        chat = await guided_step_chat_module.solve_step_chat_with_auto_drop(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+
+    assert chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert (
+        chat.provider_failure_kind
+        == {
+            "transport": "unavailable",
+            "authentication": "auth",
+            "bad_request": "bad_request",
+            "unavailable": "unavailable",
+        }[failure_kind]
+    )
+    assert "private upstream response" not in chat.assistant_message
+    if failure_kind == "authentication":
+        assert "credential" in chat.assistant_message.lower()
+    elif failure_kind == "bad_request":
+        assert "configuration" in chat.assistant_message.lower()
+    assert len(recorder.llm_calls) == 1
+    assert (
+        recorder.llm_calls[0].status
+        is {
+            "transport": ComposerLLMCallStatus.API_ERROR,
+            "authentication": ComposerLLMCallStatus.AUTH_ERROR,
+            "bad_request": ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+            "unavailable": ComposerLLMCallStatus.API_ERROR,
+        }[failure_kind]
+    )
+
+
+@pytest.mark.asyncio
+async def test_guided_first_party_error_is_not_a_provider_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    assert chat_solver.classify_guided_provider_failure(httpx.ConnectError("tool transport")) is None
+
+    async def programmer_failure(**_kwargs: object) -> object:
+        raise TypeError("local call contract broke")
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", programmer_failure)
+    recorder = BufferingRecorder()
+    with pytest.raises(TypeError, match="local call contract broke"):
+        await guided_step_chat_module.solve_step_chat_with_auto_drop(
+            site="test",
+            session_id="session",
+            user_id="user",
+            model="test/model",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="help me",
+            temperature=None,
+            seed=None,
+            timeout_seconds=5,
+            recorder=recorder,
+        )
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].error_class == "TypeError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("solver", ["source", "sink", "advisory"])
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        (BadGatewayError, ComposerLLMCallStatus.API_ERROR),
+        (ServiceUnavailableError, ComposerLLMCallStatus.API_ERROR),
+        (LiteLLMTimeout, ComposerLLMCallStatus.TIMEOUT),
+    ],
+)
+async def test_guided_solver_provider_audit_uses_sdk_status_class(
+    monkeypatch: pytest.MonkeyPatch, solver: str, error_type, expected_status: ComposerLLMCallStatus
+) -> None:
+    error = error_type(message="private upstream response", llm_provider="test", model="test/model")
+
+    async def provider_failure(**_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider_failure)
+    recorder = BufferingRecorder()
+    shared = {
+        "model": "test/model",
+        "user_message": "help me",
+        "temperature": None,
+        "seed": None,
+        "timeout_seconds": 5,
+        "recorder": recorder,
+    }
+    with pytest.raises(error_type):
+        if solver == "source":
+            await maybe_resolve_step_1_source_chat(**shared, plugin_hint=None, current_source=None, available_source_plugins=("csv",))
+        elif solver == "sink":
+            await maybe_resolve_step_2_sink_chat(**shared, current_sink=None)
+        else:
+            await solve_step_chat(**shared, step=GuidedStep.STEP_3_TRANSFORMS)
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is expected_status
+    assert recorder.llm_calls[0].error_class == error_type.__name__
+    assert "private upstream response" not in repr(recorder.llm_calls[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("error_kind", "expected_status", "expected_class"),
     [
         ("authentication", ComposerLLMCallStatus.AUTH_ERROR, "AuthenticationError"),
@@ -436,7 +676,7 @@ async def test_management_llm_audit_matches_source_and_sink_error_classification
     async def provider_failure(**_kwargs: object) -> object:
         raise error
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", provider_failure)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider_failure)
     recorder = BufferingRecorder()
     with pytest.raises(type(error)):
         await maybe_manage_deferred_intent_chat(
@@ -463,7 +703,7 @@ async def test_management_scaffold_leak_uses_quality_check_copy_not_provider_una
     async def scaffold_reply(**_kwargs: object) -> _FakeLLMResponse:
         return _ok_response("<tool_call>manage_deferred_intent</tool_call>")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_reply)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scaffold_reply)
     result = await resolve_deferred_intent_management_chat_with_auto_drop(
         site="test",
         session_id="session",
@@ -498,7 +738,7 @@ async def test_management_solver_rejects_non_string_prose_without_private_repr_e
             choices=[SimpleNamespace(message=SimpleNamespace(content=malformed_content, tool_calls=None))],
         )
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_reply)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", malformed_reply)
     recorder = BufferingRecorder()
     with pytest.raises(ValueError, match="assistant_message must be a non-empty string") as raised:
         await maybe_manage_deferred_intent_chat(
@@ -579,7 +819,7 @@ async def test_existing_upload_real_solver_uses_only_provider_authored_choices(m
         call = SimpleNamespace(id="upload-call", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(authored)))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Please use this upload.",
@@ -683,7 +923,7 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Later, use the llm transform.",
@@ -766,7 +1006,7 @@ async def test_step_1_solver_exposes_explicit_pending_plugin_reselection(monkeyp
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     reviewed_source = SourceResolved(
         name="source",
         plugin="csv",
@@ -826,7 +1066,7 @@ async def test_step_1_solver_rejects_unoffered_plugin_reselection(monkeypatch: p
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     result = await resolve_step_1_source_chat_with_auto_drop(
         site="test",
@@ -891,7 +1131,7 @@ async def test_malformed_deferred_action_degrades_to_clarification_retention_wit
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     result = await resolve_step_1_source_chat_with_auto_drop(
         site="test",
         session_id="session",
@@ -989,7 +1229,7 @@ async def test_every_repair_exhausted_deferred_payload_degrades_to_clarification
         call = SimpleNamespace(id="call_retain", function=SimpleNamespace(name="retain_deferred_intent", arguments=arguments))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     if stage == "source":
         result = await resolve_step_1_source_chat_with_auto_drop(
             site="test",
@@ -1038,7 +1278,7 @@ async def test_malformed_pair_exhausting_repair_degrades_to_clarification_retent
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     if stage == "source":
         result = await resolve_step_1_source_chat_with_auto_drop(
             site="test",
@@ -1330,7 +1570,7 @@ async def test_step_1_pair_with_omitted_hinted_plugin_applies_both(monkeypatch: 
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_acompletion)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -1373,7 +1613,7 @@ async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_
 
     telemetry: list[dict[str, Any]] = []
     monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_acompletion)
     recorder = BufferingRecorder()
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
@@ -1443,7 +1683,7 @@ async def test_step_1_source_repair_preserves_grouped_retains_when_only_source_i
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_source)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_only_source)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these rows, then retain two topology requirements.",
@@ -1497,7 +1737,7 @@ async def test_step_2_sink_repair_preserves_grouped_retains_when_only_sink_is_re
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_sink)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_only_sink)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save the rows, then retain two topology requirements.",
@@ -1553,7 +1793,7 @@ async def test_resolution_repair_prose_reply_returns_pending_retains_with_withhe
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", declining_repair)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -1596,7 +1836,7 @@ async def test_step_1_shape_repair_is_bounded_by_max_attempts(monkeypatch: pytes
 
     telemetry: list[dict[str, Any]] = []
     monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_shape_invalid)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", always_shape_invalid)
     with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
         await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -1628,7 +1868,7 @@ async def test_step_1_scaffold_leak_is_never_repaired(monkeypatch: pytest.Monkey
         call = SimpleNamespace(id="c_source_1", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(arguments)))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_leaking)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scaffold_leaking)
     with pytest.raises(chat_solver.AssistantScaffoldLeakError):
         await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -1665,7 +1905,7 @@ async def test_step_2_shape_rejected_resolve_sink_is_repaired_within_one_tool_tu
             call = SimpleNamespace(id="c_sink_2", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_acompletion)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl.",
@@ -1698,7 +1938,7 @@ async def test_step_2_shape_repair_is_bounded_by_the_iteration_cap(monkeypatch: 
         call = SimpleNamespace(id=f"c_sink_{len(calls)}", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(arguments)))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_shape_invalid)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", always_shape_invalid)
     with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
         await maybe_resolve_step_2_sink_chat(
             model="test/model",
@@ -1736,7 +1976,7 @@ async def test_malformed_deferred_action_is_repaired_within_one_tool_turn(
             )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_acompletion)
     outcome = await _run_stage_solver(stage)
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
@@ -1767,7 +2007,7 @@ async def test_deferred_repair_is_bounded_to_one_turn(
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_malformed)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", always_malformed)
     from elspeth.web.composer.guided.deferred_intents import DeferredIntentActionShapeError
 
     with pytest.raises(DeferredIntentActionShapeError):
@@ -1839,7 +2079,7 @@ async def test_half_plugin_identity_is_repaired_by_the_rejection_text_it_is_hand
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_acompletion)
     outcome = await _run_stage_solver(stage)
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
@@ -1912,7 +2152,7 @@ async def test_step_2_pair_of_resolve_sink_and_retain_applies_both(monkeypatch: 
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_acompletion)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -1940,7 +2180,7 @@ async def test_step_1_pair_of_resolve_source_and_retain_applies_both(monkeypatch
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_acompletion)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -2015,7 +2255,7 @@ async def test_two_retains_alone_return_every_action_in_call_order(monkeypatch: 
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", two_retain_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", two_retain_acompletion)
     outcome = await _run_stage_solver(stage)
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
@@ -2038,7 +2278,7 @@ async def test_step_1_resolve_source_with_two_retains_applies_all(monkeypatch: p
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", group_acompletion)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, later add the passthrough transform, and later map the fields.",
@@ -2071,7 +2311,7 @@ async def test_step_2_resolve_sink_with_two_retains_applies_all(monkeypatch: pyt
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", group_acompletion)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, later add the passthrough transform, and later map the fields.",
@@ -2100,7 +2340,7 @@ async def test_step_1_retain_count_above_cap_degrades_to_clarification_retention
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", flooding_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", flooding_acompletion)
     result = await resolve_step_1_source_chat_with_auto_drop(
         site="test",
         session_id="session",
@@ -2143,7 +2383,7 @@ async def test_step_1_group_with_one_malformed_retain_is_repaired_answering_ever
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_group)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_group)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, later add the passthrough transform, and later map the fields.",
@@ -2218,7 +2458,7 @@ async def test_deferred_repair_preserves_valid_siblings_exactly_once_in_call_ord
                 calls = [corrected_call]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_only_rejected)
     outcome = await _run_stage_solver(stage)
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
@@ -2289,7 +2529,7 @@ async def test_targeted_retain_repair_preserves_valid_grouped_resolution(
                 calls = [corrected_call]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected_retain)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_only_rejected_retain)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -2352,7 +2592,7 @@ async def test_deferred_repair_decline_uses_clarification_retention(
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=retry_content, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", declining_repair)
 
     with pytest.raises(chat_solver.DeferredIntentActionShapeError):
         await _run_stage_solver(stage)
@@ -2407,7 +2647,7 @@ async def test_deferred_repair_non_retain_retry_uses_clarification_retention(
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", replacing_retain_group_with_resolution)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", replacing_retain_group_with_resolution)
 
     with pytest.raises(chat_solver.DeferredIntentActionShapeError):
         await _run_stage_solver(stage)
@@ -2458,7 +2698,7 @@ async def test_settled_retain_repair_allows_follow_on_sink_repair(
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_retain_then_sink)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_retain_then_sink)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save the rows and retain two topology requirements.",
@@ -2573,7 +2813,7 @@ async def test_resolution_open_exit_withholds_exact_ordered_actions(
         content = "I cannot complete that resolution." if calls_seen > 1 and exit_kind == "prose" else None
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_then_exit)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", resolution_then_exit)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -2641,7 +2881,7 @@ async def test_resolution_open_accepts_only_a_corrected_resolution_or_exact_full
             calls = _resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_repair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", resolution_repair)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -2703,7 +2943,7 @@ async def test_resolution_open_rejects_replay_order_and_cardinality_mismatch(
             calls = _resolution_replay_calls(stage, replayed_retains)
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mismatched_replay)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", mismatched_replay)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -2756,7 +2996,7 @@ async def test_resolution_open_source_reselection_withholds_exact_actions(monkey
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", reselect_after_resolution_repair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", reselect_after_resolution_repair)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Create the source and retain the same future requirement twice.",
@@ -2798,7 +3038,7 @@ async def test_resolution_open_malformed_resolution_withholds_exact_actions(
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_correction)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", malformed_correction)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -2867,7 +3107,7 @@ async def test_retain_open_repairs_every_malformed_position_without_losing_dupli
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_one_position)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repair_one_position)
     outcome = await _run_stage_solver(stage)
 
     if stage == "source":
@@ -2910,7 +3150,7 @@ async def test_resolution_open_sink_allows_read_only_discovery_then_corrected_re
         dispatched.append(tool_call.function.name)
         return {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps({"success": True, "data": []})}
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_then_resolve)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", discover_then_resolve)
     monkeypatch.setattr(chat_solver, "_execute_discovery_call", execute_discovery)
     catalog, snapshot = _sink_digest_catalog([])
     outcome = await maybe_resolve_step_2_sink_chat(
@@ -2950,7 +3190,7 @@ async def test_resolution_open_sink_discovery_cap_withholds_exact_actions(monkey
             calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_until_cap)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", discover_until_cap)
     monkeypatch.setattr(
         chat_solver,
         "_execute_discovery_call",
@@ -3003,7 +3243,7 @@ async def test_resolution_open_sink_discovery_batch_cap_withholds_exact_actions(
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", oversized_discovery_batch)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", oversized_discovery_batch)
     catalog, snapshot = _sink_digest_catalog([])
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
@@ -3121,7 +3361,7 @@ async def test_resolution_open_malformed_retain_preserves_failure_and_settled_ac
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_retain_replay)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", malformed_retain_replay)
     recorder = BufferingRecorder()
     outcome = await _run_failure_state_solver(stage, recorder=recorder)
 
@@ -3164,7 +3404,7 @@ async def test_open_deferred_repair_state_survives_provider_failure(
             raise TimeoutError
         return _FakeLLMResponse(choices=[])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fail_second_provider_call)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail_second_provider_call)
     recorder = BufferingRecorder()
     if open_state == "retain":
         with pytest.raises(chat_solver.DeferredIntentActionShapeError):
@@ -3196,7 +3436,7 @@ async def test_open_deferred_repair_state_never_swallows_cancellation(
             return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", cancel_second_provider_call)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancel_second_provider_call)
     recorder = BufferingRecorder()
     with pytest.raises(asyncio.CancelledError):
         await _run_failure_state_solver(stage, recorder=recorder)
@@ -3228,7 +3468,7 @@ async def test_step_2_open_deferred_repair_state_survives_discovery_dispatch_fai
     def fail_discovery_dispatch(**_kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("discovery dispatch failed")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", request_discovery_after_opening_state)
     monkeypatch.setattr(chat_solver, "_execute_discovery_call", fail_discovery_dispatch)
     recorder = BufferingRecorder()
     if open_state == "retain":
@@ -3265,7 +3505,7 @@ async def test_step_2_open_deferred_repair_state_survives_progress_failure(
         if progress_calls == 3:
             raise RuntimeError("progress sink failed")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", return_open_state)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", return_open_state)
     recorder = BufferingRecorder()
     if open_state == "retain":
         with pytest.raises(chat_solver.DeferredIntentActionShapeError):
@@ -3303,7 +3543,7 @@ async def test_step_2_open_deferred_repair_state_never_swallows_discovery_progre
         if progress_calls == 3:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", request_discovery_after_opening_state)
     recorder = BufferingRecorder()
     with pytest.raises(asyncio.CancelledError):
         await _run_failure_state_solver(
@@ -3367,7 +3607,7 @@ async def test_multiple_rejected_retains_require_identity_anchored_full_replay(
             ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_multiple_rejections)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repair_multiple_rejections)
     if replay_kind == "targeted":
         with pytest.raises(chat_solver.DeferredIntentActionShapeError):
             await _run_stage_solver(stage)
@@ -3408,7 +3648,7 @@ async def test_targeted_retain_repair_rejects_a_hybrid_resolution_replay(
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", hybrid_retry)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", hybrid_retry)
     with pytest.raises(chat_solver.DeferredIntentActionShapeError):
         await _run_stage_solver(stage)
 
@@ -3441,7 +3681,7 @@ async def test_complete_retain_replay_rejects_a_changed_held_resolution(
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", changed_full_replay)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", changed_full_replay)
     with pytest.raises(chat_solver.DeferredIntentActionShapeError):
         await _run_stage_solver(stage)
 
@@ -3473,7 +3713,7 @@ async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resol
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", stale_pair_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", stale_pair_acompletion)
     context_block = build_step_chat_context_block(
         step=GuidedStep.STEP_1_SOURCE if stage == "source" else GuidedStep.STEP_2_SINK,
         current_source=None,
@@ -3528,7 +3768,7 @@ async def test_step_2_pair_with_malformed_retain_is_repaired_then_applies_both(m
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", repairing_pair)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -3589,7 +3829,7 @@ async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", stubborn_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", stubborn_pair)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -3621,7 +3861,7 @@ async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypa
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", shape_invalid_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", shape_invalid_pair)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -3650,7 +3890,7 @@ async def test_step_1_pair_with_shape_invalid_source_returns_retain_alone(monkey
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", shape_invalid_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", shape_invalid_pair)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -3693,7 +3933,7 @@ async def test_step_1_pair_with_mistyped_on_validation_failure_returns_retain_al
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", mistyped_pair)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -3733,7 +3973,7 @@ async def test_step_1_pair_with_non_string_assistant_message_returns_retain_alon
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", mistyped_pair)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -3772,7 +4012,7 @@ async def test_step_2_pair_with_non_string_assistant_message_returns_retain_alon
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", mistyped_pair)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -3812,7 +4052,7 @@ async def test_step_1_pair_with_scaffold_assistant_message_returns_retain_alone(
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scaffold_pair)
     outcome = await maybe_resolve_step_1_source_chat(
         model="test/model",
         user_message="Use these JSON rows, and later add the passthrough transform.",
@@ -3854,7 +4094,7 @@ async def test_step_2_pair_with_scaffold_assistant_message_returns_retain_alone(
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_pair)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scaffold_pair)
     outcome = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Save results as jsonl, and later add the passthrough transform.",
@@ -3881,7 +4121,7 @@ async def test_step_2_pair_wrapper_threads_deferred_action(monkeypatch: pytest.M
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", pair_acompletion)
     result = await resolve_step_2_sink_chat_with_auto_drop(
         site="test",
         session_id="session",
@@ -3930,7 +4170,7 @@ async def test_step_2_solver_returns_the_same_closed_deferred_action(monkeypatch
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     result = await maybe_resolve_step_2_sink_chat(
         model="test/model",
         user_message="Later add passthrough.",
@@ -3987,7 +4227,7 @@ async def test_step_2_provider_uses_one_alias_registry_for_sink_revision_and_bui
         captured.update(kwargs)
         return _ok_response("The output keeps the selected fields.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_2_sink_chat(
         model="test/model",
@@ -4034,7 +4274,7 @@ async def test_step_2_contextless_revision_keeps_exact_sink_labels_at_user_autho
         captured.update(kwargs)
         return _ok_response("The output keeps the selected fields.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_2_sink_chat(
         model="test/model",
@@ -4126,7 +4366,7 @@ async def test_step_1_provider_reuses_combined_context_alias_registry_in_dynamic
         captured.update(kwargs)
         return _ok_response("The source field identity is stable.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_1_source_chat(
         model="test/model",
@@ -4397,7 +4637,7 @@ async def test_step_2_solver_rejects_plural_current_sink_without_revision_target
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         return _ok_response("This permissive provider call must not happen.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(InvariantError, match="zero or one current output"):
         await maybe_resolve_step_2_sink_chat(
@@ -4461,7 +4701,7 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
         captured.update(kwargs)
         return _ok_response("The selected output is ready.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_sink_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", capture_sink_provider)
 
     await guided_chat_atomic_module.run_guided_chat_provider_attempt(
         session_id=uuid4(),
@@ -4540,7 +4780,7 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
         captured.update(kwargs)
         return _ok_response("The selected output is ready.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_sink_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", capture_sink_provider)
 
     await guided_chat_atomic_module.run_guided_chat_provider_attempt(
         session_id=uuid4(),
@@ -4640,7 +4880,7 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
         captured.update(kwargs)
         return _ok_response("Use the current wizard form to make that change.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_advisory_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", capture_advisory_provider)
 
     outcome = await guided_chat_atomic_module.run_guided_chat_provider_attempt(
         session_id=uuid4(),
@@ -4738,7 +4978,7 @@ async def test_step_1_empty_specialised_result_falls_through_to_the_advisory_sol
         "resolve_step_1_source_chat_with_auto_drop",
         empty_step_1_resolver,
     )
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", advisory_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", advisory_provider)
 
     outcome = await guided_chat_atomic_module.run_guided_chat_provider_attempt(
         session_id=uuid4(),
@@ -4792,7 +5032,7 @@ async def test_source_and_sink_solvers_return_only_the_closed_stable_intent_mana
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     if stage == "source":
         outcome = await maybe_resolve_step_1_source_chat(
             model="test/model",
@@ -4857,7 +5097,7 @@ async def test_solver_sends_step_scoped_system_prompt(monkeypatch: pytest.Monkey
         captured.update(kwargs)
         return _ok_response("here's some advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     reply = await solve_step_chat(
         model="test/model",
@@ -4905,7 +5145,7 @@ async def test_missing_response_content_raises(monkeypatch: pytest.MonkeyPatch) 
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(InvariantError, match="missing message content"):
         await solve_step_chat(
@@ -4925,7 +5165,7 @@ async def test_whitespace_only_response_raises(monkeypatch: pytest.MonkeyPatch) 
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         return _ok_response("   \n  \t  \n")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(InvariantError, match="missing message content"):
         await solve_step_chat(
@@ -5115,7 +5355,7 @@ async def test_uploaded_source_labels_never_receive_system_authority(
         captured.update(kwargs)
         return _ok_response("I can revise the applied source.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_1_source_chat(
         model="test/model",
@@ -5195,7 +5435,7 @@ async def test_advisory_source_context_keeps_exact_labels_at_user_authority(
         captured.update(kwargs)
         return _ok_response("The aliases describe the uploaded fields.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await solve_step_chat(
         model="test/model",
@@ -5658,7 +5898,7 @@ async def test_step_1_tool_path_preserves_deferred_constraint_user_block(monkeyp
         captured.update(kwargs)
         return _ok_response("The future instruction remains pending.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
 
     await maybe_resolve_step_1_source_chat(
         model="test/model",
@@ -5835,7 +6075,7 @@ async def test_guided_advisory_provider_and_audit_share_exact_role_split(monkeyp
         captured.update(kwargs)
         return _ok_response("The reviewed graph routes each row from the gate.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
     recorder = BufferingRecorder()
     outcome = await maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(
@@ -5911,7 +6151,7 @@ async def test_management_only_chat_lists_stable_intent_and_offers_no_other_tool
         )
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
     outcome = await maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(
             model="test-model",
@@ -5949,7 +6189,7 @@ async def test_solve_step_chat_threads_context_block_as_third_message(
         captured.update(kwargs)
         return _ok_response("here's what you're seeing")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     reply = await solve_step_chat(
         model="test/model",
@@ -5986,7 +6226,7 @@ async def test_solve_step_chat_rejects_tool_scaffolding_in_reply(monkeypatch: py
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         return _ok_response('Let me look. <tool_call>{"name": "list_sources"}</tool_call> ...prose after.')
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     with pytest.raises(AssistantScaffoldLeakError, match="user-facing prose"):
         await solve_step_chat(
@@ -6719,7 +6959,7 @@ async def test_step_2_chat_system_prompt_carries_the_sink_digest(monkeypatch: py
         captured.update(kwargs)
         return _ok_response("Which file should I write?")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_2_sink_chat(
         model="test/model",
@@ -6750,7 +6990,7 @@ async def test_step_2_chat_withholds_the_sink_digest_without_the_discovery_palet
         captured.update(kwargs)
         return _ok_response("Which file should I write?")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await maybe_resolve_step_2_sink_chat(
         model="test/model",
@@ -6779,7 +7019,7 @@ async def test_step_2_form_directed_revision_withholds_the_sink_digest(monkeypat
         captured.update(kwargs)
         return _ok_response("Use the output form to change that.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     context_block = build_step_chat_context_block(
         step=GuidedStep.STEP_2_SINK,
         current_source=None,
@@ -6820,7 +7060,7 @@ async def test_solve_step_chat_timeout_seconds_bounds_the_llm_call(monkeypatch: 
         await asyncio.sleep(60)
         raise AssertionError("unreachable — the wait_for bound must fire first")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", hung_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", hung_acompletion)
 
     with pytest.raises(TimeoutError):
         await solve_step_chat(

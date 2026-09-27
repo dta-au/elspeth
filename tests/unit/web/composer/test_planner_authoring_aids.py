@@ -1918,7 +1918,7 @@ class TestAuthoringAidsPayload:
     def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
         """Prompt examples wrap flat canonical documents exactly as the web tool does."""
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
-        from elspeth.web.composer.service import composer_loop_tool_definitions
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)

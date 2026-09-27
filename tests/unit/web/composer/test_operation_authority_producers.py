@@ -30,7 +30,7 @@ def test_proof_check_without_blob_effects_remains_available_without_sessions(
     composer_service_without_sessions_service: ComposerServiceImpl,
 ) -> None:
     messages: list[dict[str, Any]] = []
-    outcome = composer_service_without_sessions_service._attempt_proof_repair(
+    outcome = composer_service_without_sessions_service._completion._attempt_proof_repair(
         state=_empty_state(), llm_messages=messages, session_id=None, repair_turns_used=0
     )
     assert outcome.action == "clear"

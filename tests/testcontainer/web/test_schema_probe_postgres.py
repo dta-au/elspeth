@@ -987,6 +987,8 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
         "trg_guided_operations_terminal_immutable",
         "trg_guided_operation_events_no_update",
         "trg_guided_operation_events_no_delete",
@@ -1126,6 +1128,10 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
     [
         "DROP TRIGGER trg_chat_messages_no_delete ON chat_messages",
         "ALTER TABLE chat_messages DISABLE TRIGGER trg_chat_messages_no_delete",
+        "DROP TRIGGER trg_message_ingress_receipts_no_update ON message_ingress_receipts",
+        "ALTER TABLE message_ingress_receipts DISABLE TRIGGER trg_message_ingress_receipts_no_update",
+        "DROP TRIGGER trg_message_ingress_receipts_no_delete ON message_ingress_receipts",
+        "ALTER TABLE message_ingress_receipts DISABLE TRIGGER trg_message_ingress_receipts_no_delete",
         "DROP TRIGGER trg_guided_operations_terminal_immutable ON guided_operations",
         "ALTER TABLE guided_operations DISABLE TRIGGER trg_guided_operations_terminal_immutable",
         "DROP TRIGGER trg_guided_operation_events_no_update ON guided_operation_events",
@@ -1309,7 +1315,7 @@ def test_late_tutorial_progress_cannot_overwrite_committed_completion(postgres_e
         asyncio.run(
             service.update_composer_preferences(
                 user_id,
-                UpdateComposerPreferencesRequest(default_mode="guided", tutorial_stage="guided", tutorial_session_id="tutorial-session"),
+                UpdateComposerPreferencesRequest(default_mode="guided", tutorial_stage="build", tutorial_session_id="tutorial-session"),
             )
         )
 

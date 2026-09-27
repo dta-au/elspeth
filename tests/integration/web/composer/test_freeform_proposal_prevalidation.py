@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,10 +24,14 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.blobs.protocol import BlobPendingProposalError
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
@@ -47,7 +53,9 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.composer.conftest import (
-    _fake_llm_response,
+    _fake_llm_response as _raw_fake_llm_response,
+)
+from tests.unit.web.composer.conftest import (
     _make_settings,
     build_test_sessions_service,
 )
@@ -60,20 +68,25 @@ class _Harness:
     engine: Engine
     sessions: SessionServiceImpl
     service: ComposerServiceImpl
+    catalog: CatalogService
     session_id: str
     user_message_id: str
 
 
 class _ScriptedLLM:
-    def __init__(self, *responses: Any) -> None:
+    def __init__(self, *responses: _AdmittedLLMCompletion) -> None:
         self._responses = list(responses)
         self.message_snapshots: list[list[dict[str, Any]]] = []
 
-    async def __call__(self, messages: list[dict[str, Any]], _tools: Any) -> Any:
+    async def __call__(self, messages: list[dict[str, Any]], _tools: Any) -> _AdmittedLLMCompletion:
         self.message_snapshots.append(deepcopy(messages))
         if not self._responses:
             return _fake_llm_response(content="Done.")
         return self._responses.pop(0)
+
+
+def _fake_llm_response(*, content: str | None = None, tool_calls: tuple[dict[str, Any], ...] = ()) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(_raw_fake_llm_response(content=content, tool_calls=tool_calls))
 
 
 async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
@@ -177,22 +190,23 @@ def _harness(tmp_path: Path) -> _Harness:
                 parent_assistant_id=None,
             )
         )
-    with patch.object(
-        ComposerServiceImpl,
-        "_compute_availability",
+    catalog = create_catalog_service()
+    with patch(
+        "elspeth.web.composer.service.compute_availability",
         return_value=ComposerAvailability(available=True, model="test-model", provider="test"),
     ):
         service = ComposerServiceImpl.for_trained_operator(
-            catalog=create_catalog_service(),
+            catalog=catalog,
             settings=_make_settings(tmp_path),
             sessions_service=sessions,
             session_engine=engine,
         )
-    service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
+    service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
         engine=engine,
         sessions=sessions,
         service=service,
+        catalog=catalog,
         session_id=session_id,
         user_message_id=user_message_id,
     )
@@ -229,7 +243,7 @@ def _valid_pipeline_args(tmp_path: Path, *, metadata_name: str = "proposal-valid
     }
 
 
-def _tool_turn(call_id: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+def _tool_turn(call_id: str, tool_name: str, arguments: dict[str, Any]) -> _AdmittedLLMCompletion:
     return _fake_llm_response(
         tool_calls=(
             {
@@ -275,6 +289,21 @@ def _persisted_tool_content(harness: _Harness, tool_call_id: str) -> str:
         )
 
 
+@contextmanager
+def _record_phase3_outcomes(service: ComposerServiceImpl) -> Iterator[list[tuple[Any, ...]]]:
+    """Capture each real dispatch result without storing test state on the service."""
+    batches: list[tuple[Any, ...]] = []
+    dispatch = service._dispatch_tool_batch
+
+    async def record(*args: Any, **kwargs: Any) -> Any:
+        result = await dispatch(*args, **kwargs)
+        batches.append(result[0].tool_outcomes)
+        return result
+
+    with patch.object(service, "_dispatch_tool_batch", new=record):
+        yield batches
+
+
 @pytest.mark.asyncio
 async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_one_proposal(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
@@ -288,7 +317,10 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
         _fake_llm_response(content="The repaired proposal is pending approval."),
     )
 
-    with patch.object(harness.service, "_call_llm", new=llm):
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
+    ):
         result = await harness.service.compose(
             "Build a reviewed pipeline.",
             [],
@@ -306,7 +338,7 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     assert _count_rows(harness.engine, composition_states_table) == 0
     assert _count_rows(harness.engine, blobs_table) == 0
 
-    proposal_outcome = harness.service._phase3_last_tool_outcomes[0]
+    proposal_outcome = outcome_batches[-1][0]
     assert isinstance(proposal_outcome.response, ToolResult)
     assert proposal_outcome.post_version == state.version
 
@@ -346,8 +378,8 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     state = _incremental_base_state(tmp_path)
     invalid = _valid_pipeline_args(tmp_path, metadata_name="final-profile-reject")
     repaired = _valid_pipeline_args(tmp_path, metadata_name="profile-repaired")
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
-    catalog = _FinalRejectingCatalog.for_trained_operator(harness.service._catalog, snapshot)
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+    catalog = _FinalRejectingCatalog.for_trained_operator(harness.catalog, snapshot)
     failures: list[tuple[str, str]] = []
     message_snapshots: list[list[dict[str, Any]]] = []
     responses = [
@@ -372,8 +404,8 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
         return responses.pop(0)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
-        patch.object(harness.service, "_call_llm", new=_llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
         patch.object(AntiAnchorTracker, "record_failure", new=_record_failure),
         patch(
             "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
@@ -461,13 +493,15 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     args = _inline_pipeline_args(tmp_path)
     raw_content = "private-inline-value-7f45\n42\n"
     args["source"]["inline_blob"]["content"] = raw_content
-    llm = _ScriptedLLM(
-        _tool_turn("call_inline", "set_pipeline", args),
-        _fake_llm_response(content="The inline pipeline proposal is pending approval."),
-    )
+    raw_responses = [
+        _raw_fake_llm_response(tool_calls=({"id": "call_inline", "name": "set_pipeline", "arguments": args},)),
+        _raw_fake_llm_response(content="The inline pipeline proposal is pending approval."),
+    ]
+    message_snapshots: list[list[dict[str, Any]]] = []
 
     async def provider_completion(**kwargs: Any) -> Any:
-        return await llm(kwargs["messages"], kwargs["tools"])
+        message_snapshots.append(deepcopy(kwargs["messages"]))
+        return raw_responses.pop(0)
 
     seeded_at = datetime.now(UTC)
     with harness.engine.begin() as conn:
@@ -564,9 +598,9 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     assert "[redacted inline content held for custody]" not in json.dumps(api_facing_result)
     assert raw_content not in caplog.text
     assert "[redacted inline content held for custody]" not in caplog.text
-    assert len(llm.message_snapshots) == 2
-    assert raw_content not in json.dumps(llm.message_snapshots[1])
-    assert result.llm_calls[1].messages_hash == stable_hash(llm.message_snapshots[1])
+    assert len(message_snapshots) == 2
+    assert raw_content not in json.dumps(message_snapshots[1])
+    assert result.llm_calls[1].messages_hash == stable_hash(message_snapshots[1])
 
     blob_service = BlobServiceImpl(harness.engine, tmp_path)
     blob_id = UUID(safe_arguments["source"]["blob_id"])
@@ -636,7 +670,7 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
 
     first_llm = _ScriptedLLM(_tool_turn("call_gap", "set_pipeline", arguments))
     with (
-        patch.object(harness.service, "_call_llm", new=first_llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=first_llm),
         patch.object(harness.sessions, "create_pipeline_composition_proposal", new=_interrupt_before_proposal),
         pytest.raises(RuntimeError, match="simulated interruption before proposal creation"),
     ):
@@ -666,7 +700,7 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
         _tool_turn("call_gap_retry", "set_pipeline", arguments),
         _fake_llm_response(content="The retried inline proposal is pending approval."),
     )
-    with patch.object(harness.service, "_call_llm", new=retry_llm):
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=retry_llm):
         await harness.service.compose(
             "Build a reviewed inline pipeline.",
             [],
@@ -739,7 +773,7 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
     async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
-            invalid_turn_outcomes.extend(harness.service._phase3_last_tool_outcomes)
+            invalid_turn_outcomes.extend(outcome_batches[0])
             assert builder.call_count == expected_invalid_builder_calls
             assert _count_rows(harness.engine, composition_proposals_table) == 0
             assert _count_rows(harness.engine, blobs_table) == 0
@@ -747,7 +781,8 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
         return responses.pop(0)
 
     with (
-        patch.object(harness.service, "_call_llm", new=_llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch(
             "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
             wraps=real_build_set_pipeline_candidate,
@@ -826,7 +861,7 @@ async def test_malformed_inline_blob_never_survives_full_compose_surfaces(
         _tool_turn(f"call_repaired_{malformed_shape}", "set_pipeline", repaired),
         _fake_llm_response(content="The repaired inline proposal is pending approval."),
     )
-    with patch.object(harness.service, "_call_llm", new=llm):
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
         result = await harness.service.compose(
             "Build a reviewed inline pipeline.",
             [],
@@ -873,7 +908,7 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
     async def _llm(messages: list[dict[str, Any]], _tools: Any) -> Any:
         message_snapshots.append(deepcopy(messages))
         if len(message_snapshots) == 2:
-            invalid_turn_outcomes.extend(harness.service._phase3_last_tool_outcomes)
+            invalid_turn_outcomes.extend(outcome_batches[0])
             assert builder.call_count == 0
             assert _count_rows(harness.engine, composition_proposals_table) == 0
             assert _count_rows(harness.engine, blobs_table) == 0
@@ -881,7 +916,8 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
         return responses.pop(0)
 
     with (
-        patch.object(harness.service, "_call_llm", new=_llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch(
             "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
             wraps=real_build_set_pipeline_candidate,
@@ -952,7 +988,8 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
     unexpected = RuntimeError("candidate finalizer internal failure with private detail")
 
     with (
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch(
             "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
             wraps=real_build_set_pipeline_candidate,
@@ -979,7 +1016,7 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
     assert _count_rows(harness.engine, blobs_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
 
-    outcomes = harness.service._phase3_last_tool_outcomes
+    outcomes = outcome_batches[-1]
     assert len(outcomes) == 1
     assert outcomes[0].error_class == "RuntimeError"
     assert outcomes[0].error_message == "RuntimeError"
@@ -1012,7 +1049,7 @@ async def test_preproposal_base_exception_is_audited_once_and_propagated_unchang
         original_record(recorder, invocation)
 
     with (
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
             wraps=real_build_set_pipeline_candidate,
@@ -1056,8 +1093,8 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
     state = _incremental_base_state(tmp_path)
     response = _tool_turn("call_prior_runtime_crash", "set_pipeline", _inline_pipeline_args(tmp_path))
     failure = RuntimeError("candidate-prior validation private detail")
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
-    catalog = PolicyCatalogView.for_trained_operator(harness.service._catalog, snapshot)
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+    catalog = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
     original_validate = catalog.validate_composition_state
     armed = False
     llm_calls = 0
@@ -1081,8 +1118,8 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
         original_record(recorder, invocation)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
-        patch.object(harness.service, "_call_llm", new=_llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
         patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
         patch("elspeth.web.composer.tool_batch.finalize_tool_result") as finalizer,
@@ -1125,8 +1162,8 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
     state = _incremental_base_state(tmp_path)
     response = _tool_turn("call_prior_base_signal", "set_pipeline", _inline_pipeline_args(tmp_path))
     signal = _PreproposalBaseSignal("candidate-prior shutdown-style private detail")
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
-    catalog = PolicyCatalogView.for_trained_operator(harness.service._catalog, snapshot)
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+    catalog = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
     original_validate = catalog.validate_composition_state
     armed = False
     llm_calls = 0
@@ -1150,8 +1187,8 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
         original_record(recorder, invocation)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, catalog)),
-        patch.object(harness.service, "_call_llm", new=_llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
         patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
         patch("elspeth.web.composer.tool_batch.finalize_tool_result") as finalizer,
@@ -1210,7 +1247,8 @@ async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
     )
 
     with (
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
     ):
         result = await harness.service.compose(
@@ -1226,7 +1264,7 @@ async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
     assert len(proposals) == expected_proposals
     assert builder.call_count == 0
     assert result.state is state
-    outcome = harness.service._phase3_last_tool_outcomes[0]
+    outcome = outcome_batches[0][0]
     assert outcome.error_class == expected_error_class
     assert outcome.post_version == state.version
 
@@ -1247,7 +1285,7 @@ async def test_auto_commit_set_pipeline_uses_candidate_builder_once(tmp_path: Pa
     )
 
     with (
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tools.sessions.build_set_pipeline_candidate",
             wraps=real_build_set_pipeline_candidate,

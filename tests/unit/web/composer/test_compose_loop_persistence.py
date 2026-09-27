@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
@@ -19,13 +20,18 @@ from sqlalchemy import select, text, update
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
+from elspeth.web.composer import turn_audit as turn_audit_module
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
@@ -40,6 +46,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
+from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.session_fences import acquire_compose_context, seed_live_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -47,14 +54,20 @@ from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noq
 async def _run_one_turn(
     service: ComposerServiceImpl,
     *,
-    llm: Any,
+    llm: Any | None,
     session_id: str,
     current_state_id: str | None = None,
     session_operation_context: Any = None,
 ) -> Any:
     driver = cast(Any, service)
+    if llm is not None:
+        with patch.object(service._provider_gateway, "_call_llm", new=llm):
+            return await driver._run_one_turn_for_test(
+                session_id=session_id,
+                current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
+            )
     return await driver._run_one_turn_for_test(
-        llm=llm,
         session_id=session_id,
         current_state_id=current_state_id,
         session_operation_context=session_operation_context,
@@ -74,7 +87,7 @@ def _patch_auto_commit_preferences(monkeypatch: pytest.MonkeyPatch, sessions_ser
     monkeypatch.setattr(sessions_service, "get_composer_preferences", _get_composer_preferences)
 
 
-def _advisor_tool_call_response(call_id: str, *, extra_args: dict[str, Any] | None = None) -> Any:
+def _advisor_tool_call_response(call_id: str, *, extra_args: dict[str, Any] | None = None) -> _AdmittedLLMCompletion:
     arguments = {
         "trigger": "proactive_security_safety",
         "problem_summary": "stuck on llm config with private schema",
@@ -89,31 +102,37 @@ def _advisor_tool_call_response(call_id: str, *, extra_args: dict[str, Any] | No
     }
     if extra_args is not None:
         arguments.update(extra_args)
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content=None,
-                    tool_calls=[
-                        SimpleNamespace(
-                            id=call_id,
-                            function=SimpleNamespace(
-                                name="request_advisor_hint",
-                                arguments=json.dumps(arguments),
-                            ),
-                        )
-                    ],
+    return _admit_composer_llm_completion(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id=call_id,
+                                function=SimpleNamespace(
+                                    name="request_advisor_hint",
+                                    arguments=json.dumps(arguments),
+                                ),
+                            )
+                        ],
+                    )
                 )
-            )
-        ],
+            ],
+        )
     )
 
 
-def _text_response(content: str) -> Any:
+def _raw_text_response(content: str) -> Any:
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
 
 
-def _metadata_tool_response(call_id: str, name: str) -> Any:
+def _text_response(content: str) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(_raw_text_response(content))
+
+
+def _metadata_tool_response(call_id: str, name: str) -> _AdmittedLLMCompletion:
     tool_call = SimpleNamespace(
         id=call_id,
         function=SimpleNamespace(
@@ -121,7 +140,9 @@ def _metadata_tool_response(call_id: str, name: str) -> Any:
             arguments=json.dumps({"patch": {"name": name}}),
         ),
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    )
 
 
 def _tool_batch_response(*calls: tuple[object, str, dict[str, Any]]) -> Any:
@@ -165,21 +186,29 @@ async def _capture_tool_batch_rejection(
     response: Any,
     current_state_id: str | None = None,
 ) -> BaseException | None:
-    responses = [response, _text_response("Done.")]
+    responses = [response, _raw_text_response("Done.")]
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _raw_completion(**_kwargs: Any) -> Any:
         return responses.pop(0)
 
     try:
-        await _run_one_turn(
-            service,
-            llm=_fake_llm,
-            session_id=session_id,
-            current_state_id=current_state_id,
-        )
+        with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", new=_raw_completion):
+            await _run_one_turn(
+                service,
+                llm=None,
+                session_id=session_id,
+                current_state_id=current_state_id,
+            )
     except BaseException as exc:
         return exc
     return None
+
+
+def _assert_provider_tool_batch_rejection(caught: BaseException | None, expected_message: str) -> None:
+    assert type(caught) is _MalformedLLMResponseError
+    assert str(caught) == f"LLM tool batch failed admission: {expected_message}"
+    assert type(caught.__cause__) is AuditIntegrityError
+    assert str(caught.__cause__) == expected_message
 
 
 def _assert_no_blob_side_effects(
@@ -224,7 +253,7 @@ def _interpretation_review_node() -> dict[str, Any]:
     return state.to_dict()["nodes"][0]
 
 
-def _unknown_tool_response(call_id: str, *, arguments: dict[str, Any]) -> Any:
+def _unknown_tool_response(call_id: str, *, arguments: dict[str, Any]) -> _AdmittedLLMCompletion:
     tool_call = SimpleNamespace(
         id=call_id,
         function=SimpleNamespace(
@@ -232,7 +261,9 @@ def _unknown_tool_response(call_id: str, *, arguments: dict[str, Any]) -> Any:
             arguments=json.dumps(arguments),
         ),
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    )
 
 
 def _advisor_model_response(content: str = "Try setting `provider: azure` with the deployment name.") -> Any:
@@ -254,7 +285,7 @@ def test_current_loop_arg_error_tool_row_scrubs_arbitrary_error_message(
         error_message=canary,
     )
 
-    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+    serialized = turn_audit_module._serialize_response_via_walker(
         outcome,
         telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
     )
@@ -305,7 +336,7 @@ def test_current_loop_non_arg_failure_projection_matches_legacy(
         error_message=error_message,
     )
 
-    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+    serialized = turn_audit_module._serialize_response_via_walker(
         outcome,
         telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
         failure_status=failure_status,
@@ -373,7 +404,7 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
         with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
-            await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+            await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
                 session_id=UUID(result_session_id),
                 current_state_id=None,
                 llm_calls=(),
@@ -399,7 +430,7 @@ async def test_planner_audit_cohort_carries_the_prose_the_planner_refused_to_pub
     sessions_service = composer_service_with_real_sessions._sessions_service
     assert sessions_service is not None
     async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
-        await composer_service_with_real_sessions._persist_pipeline_planner_audit(
+        await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
             session_id=UUID(result_session_id),
             current_state_id=None,
             llm_calls=(),
@@ -456,7 +487,6 @@ async def test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_sta
 
     assert handler_calls == []
     assert batch_progress_calls == 0
-    assert composer_service_with_real_sessions._phase3_last_tool_outcomes == ()  # type: ignore[attr-defined]
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (
@@ -476,8 +506,7 @@ async def test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_sta
         session_id=result_session_id,
         tmp_path=tmp_path,
     )
-    assert type(caught) is AuditIntegrityError
-    assert str(caught) == "Composer tool batch contains duplicate provider tool-call IDs"
+    _assert_provider_tool_batch_rejection(caught, "Composer tool batch contains duplicate provider tool-call IDs")
 
 
 @pytest.mark.asyncio
@@ -519,8 +548,7 @@ async def test_tool_batch_rejects_duplicate_ids_before_durable_proposal_creation
         assert (
             conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
         )
-    assert type(caught) is AuditIntegrityError
-    assert str(caught) == "Composer tool batch contains duplicate provider tool-call IDs"
+    _assert_provider_tool_batch_rejection(caught, "Composer tool batch contains duplicate provider tool-call IDs")
 
 
 @pytest.mark.parametrize("proposal_count", [10, 11])
@@ -761,8 +789,7 @@ async def test_tool_batch_rejects_invalid_id_before_real_handler_or_blob_side_ef
         session_id=result_session_id,
         tmp_path=tmp_path,
     )
-    assert type(caught) is AuditIntegrityError
-    assert str(caught) == expected_message
+    _assert_provider_tool_batch_rejection(caught, expected_message)
 
 
 @pytest.mark.asyncio
@@ -789,7 +816,7 @@ async def test_tool_batch_snapshots_calls_before_first_await(
             )
         ],
     )
-    responses = [response, _text_response("Done.")]
+    responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
     async def _fake_llm(_messages: Any, _tools: Any) -> Any:
         return responses.pop(0)
@@ -858,7 +885,7 @@ async def test_tool_batch_snapshots_calls_before_preference_await(
             )
         ],
     )
-    responses = [response, _text_response("Done.")]
+    responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
     async def _fake_llm(_messages: Any, _tools: Any) -> Any:
         return responses.pop(0)
@@ -920,20 +947,24 @@ async def test_tool_batch_rejects_session_reused_id_before_current_turn_proposal
         conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
 
     responses = [
-        _tool_batch_response(
-            ("call_session_reuse", "set_metadata", {"patch": {"name": "prior proposal"}}),
+        _admit_composer_llm_completion(
+            _tool_batch_response(
+                ("call_session_reuse", "set_metadata", {"patch": {"name": "prior proposal"}}),
+            )
         ),
-        _tool_batch_response(
-            ("call_fresh_proposal", "set_metadata", {"patch": {"name": "must not propose"}}),
-            (
-                "call_session_reuse",
-                "create_blob",
-                {
-                    "filename": "session-reuse-tripwire.txt",
-                    "mime_type": "text/plain",
-                    "content": "must never be written",
-                },
-            ),
+        _admit_composer_llm_completion(
+            _tool_batch_response(
+                ("call_fresh_proposal", "set_metadata", {"patch": {"name": "must not propose"}}),
+                (
+                    "call_session_reuse",
+                    "create_blob",
+                    {
+                        "filename": "session-reuse-tripwire.txt",
+                        "mime_type": "text/plain",
+                        "content": "must never be written",
+                    },
+                ),
+            )
         ),
         _text_response("Done."),
     ]
@@ -1215,8 +1246,7 @@ async def test_tool_batch_rejects_non_string_or_unicode_whitespace_id(
     )
 
     assert handler_calls == []
-    assert type(caught) is AuditIntegrityError
-    assert str(caught) == expected_message
+    _assert_provider_tool_batch_rejection(caught, expected_message)
 
 
 @pytest.mark.asyncio
@@ -1250,8 +1280,7 @@ async def test_tool_batch_rejects_missing_id_with_leak_safe_audit_error(
     )
 
     assert handler_calls == []
-    assert type(caught) is AuditIntegrityError
-    assert str(caught) == "Composer tool batch is missing a provider tool-call ID"
+    _assert_provider_tool_batch_rejection(caught, "Composer tool batch is missing a provider tool-call ID")
 
 
 @pytest.mark.asyncio
@@ -1316,20 +1345,22 @@ async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed
 
     monkeypatch.setattr("elspeth.web.composer.tool_batch.execute_tool", _semantic_arg_error)
     responses = [
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                id="call_current_create_blob_semantic_arg_error",
-                                function=SimpleNamespace(name="create_blob", arguments=json.dumps(arguments)),
-                            )
-                        ],
+        _admit_composer_llm_completion(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_current_create_blob_semantic_arg_error",
+                                    function=SimpleNamespace(name="create_blob", arguments=json.dumps(arguments)),
+                                )
+                            ],
+                        )
                     )
-                )
-            ]
+                ]
+            )
         ),
         _text_response("Recovered after the semantic argument error."),
     ]
@@ -1357,10 +1388,12 @@ async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed
     assert persisted_invocation["arguments_canonical"] == expected_canonical
     assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
     persisted_blob = json.dumps(
-        {
-            "assistant_tool_calls": result.persisted_assistant_tool_calls,
-            "tool_rows": result.persisted_tool_row_content,
-        },
+        deep_thaw(
+            {
+                "assistant_tool_calls": result.persisted_assistant_tool_calls,
+                "tool_rows": result.persisted_tool_row_content,
+            }
+        ),
         sort_keys=True,
     )
     assert filename_canary not in persisted_blob
@@ -1373,20 +1406,22 @@ async def test_current_loop_non_object_arg_error_matches_durable_projection_and_
     result_session_id: str,
 ) -> None:
     responses = [
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                id="call_current_set_source_non_object",
-                                function=SimpleNamespace(name="set_source", arguments="[]"),
-                            )
-                        ],
+        _admit_composer_llm_completion(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_current_set_source_non_object",
+                                    function=SimpleNamespace(name="set_source", arguments="[]"),
+                                )
+                            ],
+                        )
                     )
-                )
-            ]
+                ]
+            )
         ),
         _text_response("Recovered after the non-object argument error."),
     ]
@@ -1450,7 +1485,14 @@ async def test_step1_plugin_bug_captures_crash_breaks_loop(
 ) -> None:
     """RuntimeError on call 2 of 3 records the crash and skips call 3."""
 
-    with pytest.raises(ComposerPluginCrashError) as excinfo:
+    with (
+        patch.object(
+            composer_service_with_real_sessions,
+            "_persist_turn_audit",
+            wraps=composer_service_with_real_sessions._persist_turn_audit,
+        ) as persist_audit,
+        pytest.raises(ComposerPluginCrashError) as excinfo,
+    ):
         await _run_one_turn(
             composer_service_with_real_sessions,
             llm=fake_llm_runtime_error_on_second,
@@ -1459,7 +1501,8 @@ async def test_step1_plugin_bug_captures_crash_breaks_loop(
 
     assert excinfo.value.__cause__ is not None
     assert isinstance(excinfo.value.__cause__, RuntimeError)
-    outcomes = composer_service_with_real_sessions._phase3_last_tool_outcomes  # type: ignore[attr-defined]
+    assert persist_audit.await_count == 1
+    outcomes = persist_audit.await_args.kwargs["tool_outcomes"]
     assert len(outcomes) == 2
     assert outcomes[0].error_class is None
     assert outcomes[1].error_class == "RuntimeError"
@@ -1487,20 +1530,22 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
         "on_validation_failure": "discard",
     }
     responses = [
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                id="call_invalid_set_source_plugin_crash",
-                                function=SimpleNamespace(name="set_source", arguments=json.dumps(invalid_arguments)),
-                            )
-                        ],
+        _admit_composer_llm_completion(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_invalid_set_source_plugin_crash",
+                                    function=SimpleNamespace(name="set_source", arguments=json.dumps(invalid_arguments)),
+                                )
+                            ],
+                        )
                     )
-                )
-            ]
+                ]
+            )
         )
     ]
 
@@ -1519,7 +1564,15 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
         "error_class": "<redacted-plugin-crash-class>",
         "field_count": 4,
     }
-    persisted_call = composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls[0]  # type: ignore[attr-defined]
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
+    with sessions_service._engine.connect() as conn:
+        persisted_calls = conn.execute(
+            select(chat_messages_table.c.tool_calls)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role == "assistant")
+        ).scalar_one()
+    persisted_call = persisted_calls[0]
     assert json.loads(persisted_call["function"]["arguments"]) == expected_arguments
     arguments_canonical = canonical_json(invalid_arguments)
     durable_invocation = ComposerToolInvocation(
@@ -1546,7 +1599,7 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
     assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
     assert error_class_canary not in json.dumps(
         {
-            "assistant_tool_calls": composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls,  # type: ignore[attr-defined]
+            "assistant_tool_calls": persisted_calls,
             "invocation": persisted_invocation,
         },
         sort_keys=True,
@@ -1626,7 +1679,7 @@ async def test_step2_persists_intercepted_advisor_tool_call_rows(
     async def _fake_advisor(**_kwargs: Any) -> Any:
         return _advisor_model_response()
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", _fake_advisor)
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", _fake_advisor)
 
     result = await _run_one_turn(
         service,
@@ -1707,7 +1760,7 @@ async def test_step2_advisor_compose_timeout_persists_recovery_envelope(
         provider_calls += 1
         raise TimeoutError
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", _timeout_advisor)
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", _timeout_advisor)
     monkeypatch.setattr("elspeth.web.composer.tool_batch._remaining_compose_seconds", lambda _deadline: remaining)
 
     with pytest.raises(ComposerConvergenceError) as exc_info:
@@ -1845,7 +1898,7 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
     async def _fake_advisor(**_kwargs: Any) -> Any:
         return _advisor_model_response()
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", _fake_advisor)
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", _fake_advisor)
 
     result = await _run_one_turn(
         service,
@@ -1864,10 +1917,12 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
         "field_count": 5,
     }
     persisted_blob = json.dumps(
-        {
-            "assistant_tool_calls": result.persisted_assistant_tool_calls,
-            "tool_rows": result.persisted_tool_row_content,
-        },
+        deep_thaw(
+            {
+                "assistant_tool_calls": result.persisted_assistant_tool_calls,
+                "tool_rows": result.persisted_tool_row_content,
+            }
+        ),
         sort_keys=True,
     )
     assert "full_context" not in persisted_blob
@@ -1971,14 +2026,15 @@ async def test_step2_preserves_absent_raw_content_as_none(
 ) -> None:
     """Missing assistant content remains NULL in raw_content."""
 
-    await _run_one_turn(
+    result = await _run_one_turn(
         composer_service_with_real_sessions,
         llm=fake_llm_tool_call_with_no_content,
         session_id=result_session_id,
     )
 
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
-    audit_outcome = composer_service_with_real_sessions._phase3_last_audit_outcome  # type: ignore[attr-defined]
+    audit_outcome = result.audit_outcome
+    assert audit_outcome is not None
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         row = conn.execute(
             text("SELECT raw_content FROM chat_messages WHERE id = :id"),
@@ -2002,16 +2058,174 @@ async def test_step2_first_tool_turn_uses_existing_current_state_id(
         provenance="session_seed",
     )
 
-    await _run_one_turn(
+    result = await _run_one_turn(
         composer_service_with_real_sessions,
         llm=fake_llm_two_tool_calls,
         session_id=result_session_id,
         current_state_id=str(state_record.id),
     )
 
-    assert composer_service_with_real_sessions._phase3_last_expected_current_state_id == str(state_record.id)  # type: ignore[attr-defined]
-    audit_outcome = composer_service_with_real_sessions._phase3_last_audit_outcome  # type: ignore[attr-defined]
+    assert result.pre_state_id == str(state_record.id)
+    audit_outcome = result.audit_outcome
+    assert audit_outcome is not None
     assert audit_outcome.current_state_id == str(state_record.id)
+
+
+@pytest.mark.parametrize("share_diagnostics", [False, True], ids=["separate-carriers", "shared-carrier-negative-control"])
+@pytest.mark.asyncio
+async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    share_diagnostics: bool,
+) -> None:
+    """A second turn must not replace the first turn's diagnostic facts."""
+
+    service = composer_service_with_real_sessions
+    sessions_service = service._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
+    _patch_auto_commit_preferences(monkeypatch, sessions_service)
+    second_session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+        user_id="phase3-test-user",
+        auth_provider_type="local",
+        title="Overlapping compose session",
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    second_session_id = str(second_session.id)
+    first_diagnostics = _ComposeLoopDiagnostics()
+    second_diagnostics = first_diagnostics if share_diagnostics else _ComposeLoopDiagnostics()
+    first_persisted = asyncio.Event()
+    second_persisted = asyncio.Event()
+    real_persist = service._persist_turn_audit
+
+    async def _interleaved_persist(**kwargs: Any) -> Any:
+        outcome = await real_persist(**kwargs)
+        if kwargs["session_id"] == result_session_id:
+            first_persisted.set()
+            await second_persisted.wait()
+        else:
+            assert kwargs["session_id"] == second_session_id
+        return outcome
+
+    turns = {"alpha": 0, "beta": 0}
+
+    async def _llm(messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+        prompt = json.dumps(messages)
+        label = "alpha" if "overlap alpha 8472" in prompt else "beta"
+        assert label == "alpha" or "overlap beta 9351" in prompt
+        turns[label] += 1
+        if turns[label] == 1:
+            return _admit_composer_llm_completion(_tool_batch_response((f"call_{label}", "get_pipeline_state", {})))
+        return _text_response(f"finished {label}")
+
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    plugin_snapshot, policy_catalog = service._policy_context.build(None)
+    async with (
+        acquire_compose_context(sessions_service, result_session_id) as first_context,
+        acquire_compose_context(sessions_service, second_session_id) as second_context,
+    ):
+        first_state = await sessions_service.save_composition_state(
+            UUID(result_session_id),
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=first_context,
+        )
+        second_state = await sessions_service.save_composition_state(
+            UUID(second_session_id),
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=second_context,
+        )
+        with (
+            patch.object(service, "_persist_turn_audit", new=_interleaved_persist),
+            patch.object(service._provider_gateway, "_call_llm", new=_llm),
+        ):
+            first = asyncio.create_task(
+                service._compose_loop(
+                    "overlap alpha 8472",
+                    [],
+                    state,
+                    session_id=result_session_id,
+                    initial_current_state_id=str(first_state.id),
+                    deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
+                    plugin_snapshot=plugin_snapshot,
+                    policy_catalog=policy_catalog,
+                    session_operation_context=first_context,
+                    diagnostics=first_diagnostics,
+                )
+            )
+            first_persist_waiter = asyncio.create_task(first_persisted.wait())
+            done, _pending = await asyncio.wait({first, first_persist_waiter}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            if first in done:
+                first.result()
+            assert first_persist_waiter in done, "first compose did not reach turn audit persistence"
+            second = await service._compose_loop(
+                "overlap beta 9351",
+                [],
+                state,
+                session_id=second_session_id,
+                initial_current_state_id=str(second_state.id),
+                deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
+                plugin_snapshot=plugin_snapshot,
+                policy_catalog=policy_catalog,
+                session_operation_context=second_context,
+                diagnostics=second_diagnostics,
+            )
+            second_persisted.set()
+            first_result = await asyncio.wait_for(first, timeout=10)
+
+    assert turns == {"alpha": 2, "beta": 2}
+    assert [inv.tool_call_id for inv in first_result.tool_invocations] == ["call_alpha"]
+    assert [inv.tool_call_id for inv in second.tool_invocations] == ["call_beta"]
+
+    def _assert_owned_diagnostics(
+        diagnostics: _ComposeLoopDiagnostics,
+        *,
+        expected_call_id: str,
+        expected_state_id: str,
+        expected_assistant_id: str,
+        expected_tool_content: str,
+    ) -> None:
+        assert [outcome.call.id for outcome in diagnostics.tool_outcomes] == [expected_call_id], "diagnostic call id crossed sessions"
+        assert [call["id"] for call in diagnostics.redacted_assistant_tool_calls] == [expected_call_id], "redacted call crossed sessions"
+        assert [row.tool_call_id for row in diagnostics.redacted_tool_rows] == [expected_call_id], "redacted row crossed sessions"
+        assert diagnostics.redacted_tool_rows[0].content == expected_tool_content, "redacted content crossed sessions"
+        assert diagnostics.pre_state_id == expected_state_id
+        assert diagnostics.audit_outcome is not None
+        assert diagnostics.audit_outcome.assistant_id == expected_assistant_id
+        assert diagnostics.audit_outcome.current_state_id == expected_state_id
+
+    with sessions_service._engine.connect() as conn:
+        for session_id, expected_call_id, diagnostics, expected_state_id in (
+            (result_session_id, "call_alpha", first_diagnostics, str(first_state.id)),
+            (second_session_id, "call_beta", second_diagnostics, str(second_state.id)),
+        ):
+            rows = conn.execute(
+                select(chat_messages_table.c.id, chat_messages_table.c.role, chat_messages_table.c.tool_call_id)
+                .where(chat_messages_table.c.session_id == session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+            assert [row.tool_call_id for row in rows if row.role == "tool"] == [expected_call_id]
+            tool_content = conn.execute(
+                select(chat_messages_table.c.content)
+                .where(chat_messages_table.c.session_id == session_id)
+                .where(chat_messages_table.c.role == "tool")
+            ).scalar_one()
+            expected = {
+                "expected_call_id": expected_call_id,
+                "expected_state_id": expected_state_id,
+                "expected_assistant_id": next(row.id for row in rows if row.role == "assistant"),
+                "expected_tool_content": tool_content,
+            }
+
+            if share_diagnostics:
+                crossed_field = "diagnostic call id" if session_id == result_session_id else "redacted call"
+                with pytest.raises(AssertionError, match=crossed_field):
+                    _assert_owned_diagnostics(diagnostics, **expected)
+            else:
+                _assert_owned_diagnostics(diagnostics, **expected)
 
 
 @pytest.mark.asyncio
@@ -2097,30 +2311,32 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
         nonlocal llm_calls
         llm_calls += 1
         if llm_calls == 1:
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            content=None,
-                            tool_calls=[
-                                SimpleNamespace(
-                                    id="call_cancel_during_worker",
-                                    function=SimpleNamespace(
-                                        name="set_metadata",
-                                        arguments=json.dumps({"patch": {"name": "Committed before cancel"}}),
+            return _admit_composer_llm_completion(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="call_cancel_during_worker",
+                                        function=SimpleNamespace(
+                                            name="set_metadata",
+                                            arguments=json.dumps({"patch": {"name": "Committed before cancel"}}),
+                                        ),
                                     ),
-                                ),
-                                SimpleNamespace(
-                                    id="call_must_not_start_after_cancel",
-                                    function=SimpleNamespace(
-                                        name="set_metadata",
-                                        arguments=json.dumps({"patch": {"name": "Must not run"}}),
+                                    SimpleNamespace(
+                                        id="call_must_not_start_after_cancel",
+                                        function=SimpleNamespace(
+                                            name="set_metadata",
+                                            arguments=json.dumps({"patch": {"name": "Must not run"}}),
+                                        ),
                                     ),
-                                ),
-                            ],
+                                ],
+                            )
                         )
-                    )
-                ]
+                    ]
+                )
             )
         return _text_response("must not be reached after cancellation")
 
@@ -2139,7 +2355,7 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
         assert not compose_task.done(), "cancellation escaped while the synchronous tool still owned an in-flight side effect"
     finally:
         release_worker.set()
-        await asyncio.to_thread(worker_finished.wait, 5.0)
+        await run_sync_in_worker(worker_finished.wait, 5.0)
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(compose_task, timeout=5.0)

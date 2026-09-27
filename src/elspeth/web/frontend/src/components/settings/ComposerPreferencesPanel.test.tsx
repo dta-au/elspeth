@@ -229,7 +229,7 @@ describe("ComposerPreferencesForm", () => {
     usePreferencesStore.setState({
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-in-progress",
     });
     render(<ComposerPreferencesForm />);

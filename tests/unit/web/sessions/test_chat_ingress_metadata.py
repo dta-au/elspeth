@@ -1,6 +1,6 @@
 """Closed metadata shape for durable, content-free chat ingress evidence."""
 
-from elspeth.web.sessions.service import _valid_chat_ingress_inputs_metadata
+from elspeth.web.sessions.proposal_authority import _valid_chat_ingress_inputs_metadata
 
 
 def test_chat_ingress_metadata_requires_exact_unique_durable_input_records() -> None:

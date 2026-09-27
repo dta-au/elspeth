@@ -10,7 +10,7 @@ import { Button } from "@/components/ui";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { TutorialTurn1Welcome } from "./TutorialTurn1Welcome";
-import { TutorialGuidedShell } from "./TutorialGuidedShell";
+import { TutorialFreeformShell } from "./TutorialFreeformShell";
 import { abandonTutorialRun, TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
 import { TutorialTurn7Graduation } from "./TutorialTurn7Graduation";
@@ -61,7 +61,6 @@ export function HelloWorldTutorial({
   const [sessionId, setSessionId] = useState<string | null>(state.sessionId);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const guidedStartupExitRequestedRef = useRef(false);
   const startAttemptRef = useRef(0);
   const startingRef = useRef(false);
   const exitingRef = useRef(false);
@@ -86,13 +85,13 @@ export function HelloWorldTutorial({
 
   // The persisted resume session can outlive its session row (orphan sweep,
   // archive, a prerelease DB wipe). A dead session dead-ends EVERY resumed
-  // stage — guided renders "Session not found" with no forward affordance
+  // stage — Build otherwise renders "Session not found" with no forward affordance
   // (the tutorial suppresses skip/exit past Welcome), run/audit 404 into a
   // Retry that can never succeed. Recovery: fall back to a fresh Welcome;
   // the stage-persist effect above then clears the stale server-side resume
   // fields (welcome maps to all-null in progressForTutorialState).
   // Idempotent per dead id: the mount-time membership check below and
-  // TutorialGuidedShell's guided/start 404 handler can BOTH detect the same
+  // TutorialFreeformShell's sample-load 404 handler can BOTH detect the same
   // dead resume (they race), and the recovery must run once — otherwise the
   // warning double-logs and the reducer resets twice.
   const recoveredSessionIdRef = useRef<string | null>(null);
@@ -104,7 +103,7 @@ export function HelloWorldTutorial({
     console.warn(
       "[tutorial] persisted resume session no longer exists — restarting at Welcome",
     );
-    // Release the app-level binding too: resetForTutorialSession bound
+    // Release the app-level binding too: session selection bound
     // activeSessionId to the (dead) resume id before the server could 404
     // it, and consumers keyed on activeSessionId (run list, composer
     // progress) would otherwise keep polling the dead session while the
@@ -115,9 +114,9 @@ export function HelloWorldTutorial({
   }, []);
 
   // Mount-time validation of the resumed session (covers the run/audit
-  // stages, which have no equivalent of TutorialGuidedShell's 404 recovery).
+  // stages, which have no equivalent of TutorialFreeformShell's 404 recovery).
   // Best-effort: a failed LIST keeps the resume — the shell's own 404
-  // recovery still applies for the guided stage, and a transient list error
+  // recovery still applies for Build, and a transient list error
   // must not throw away a healthy resume.
   const initialResumeSessionIdRef = useRef(state.resumed ? state.sessionId : null);
   useEffect(() => {
@@ -143,25 +142,19 @@ export function HelloWorldTutorial({
 
   // The run step keeps the workspace frame (pipeline pane) mounted around the
   // run card so the learner sees the graph they just confirmed beside the
-  // Run button (I-1). In-page the guided shell already bound the session
-  // store to this session and the committed composition state is still in
-  // it. After a reload the store is empty, so re-bind it the way the guided
-  // shell does and hydrate through the read-only GET /guided (the store's
-  // `startGuided`): it returns the persisted composition state and the
-  // completed guided session for the inspector, and never writes. No
-  // tutorial-special backend path (ADR-031) — the same load the app performs
-  // for any guided session. A dead resume session 404s here into the store's
-  // error, and the mount-time membership check above recovers to Welcome.
+  // Run button (I-1). In-page the freeform Build shell already bound the
+  // session and its committed state. A reload uses the ordinary session
+  // selection read path to restore them; it never submits a new prompt or
+  // starts a run. A dead resume is handled by the membership check above.
   useEffect(() => {
     if (state.step !== "run" || state.sessionId === null) {
       return;
     }
     const store = useSessionStore.getState();
-    if (store.activeSessionId === state.sessionId) {
+    if (store.activeSessionId === state.sessionId && store.compositionStateLoaded) {
       return;
     }
-    store.resetForTutorialSession(state.sessionId);
-    void store.startGuided(state.sessionId);
+    void store.selectSession(state.sessionId);
   }, [state.step, state.sessionId]);
 
   // Persist the tutorial stage server-side on every stage transition so a
@@ -224,9 +217,9 @@ export function HelloWorldTutorial({
     return () => window.removeEventListener("pagehide", handlePageHide);
   }, []);
 
-  // Create the tutorial session on Start so TutorialGuidedShell has a
-  // sessionId. Tag it with the pending title BEFORE the shell's external
-  // POST /guided/start so the backend orphan-cleanup scan (which matches the
+  // Create the tutorial session on Start so the freeform Build has a
+  // sessionId. Tag it with the pending title BEFORE the first Composer turn
+  // so the backend orphan-cleanup scan (which matches the
   // exact pending title) catches sessions abandoned mid-tutorial.
   const onStart = async (): Promise<void> => {
     if (startingRef.current) return;
@@ -240,7 +233,6 @@ export function HelloWorldTutorial({
       );
       return;
     }
-    guidedStartupExitRequestedRef.current = false;
     startingRef.current = true;
     const attempt = ++startAttemptRef.current;
     setStarting(true);
@@ -288,23 +280,12 @@ export function HelloWorldTutorial({
       });
   };
 
-  // Keep the tutorial mounted until both the authoritative session exit and
-  // preference save settle. Startup has its own in-flight owner: request its
-  // handoff and let onExited retry here once the terminal is authoritative.
+  // Keep the tutorial mounted until the session is loaded and the preference
+  // save settles. An in-flight freeform compose must finish before departure.
   const onExitTutorial = useCallback((): void => {
     if (exitingRef.current) return;
-    const { guidedSession } = useSessionStore.getState();
     const tutorialSessionId = state.sessionId ?? sessionId;
     setExitError(null);
-    if (
-      state.step === "guided" &&
-      guidedSession === null &&
-      tutorialSessionId !== null
-    ) {
-      guidedStartupExitRequestedRef.current = true;
-      setExitError("Finishing tutorial startup before exiting. If startup fails, retry it or reset the tutorial from Composer preferences.");
-      return;
-    }
     // Exit during an in-flight run: the run turn's effect cleanup
     // deliberately never aborts (StrictMode), and its Cancel button is the
     // only other abort path — without this the backend run (LLM spend, sink
@@ -326,7 +307,7 @@ export function HelloWorldTutorial({
     void (async () => {
       if (
         useSessionStore.getState().activeSessionId !== tutorialSessionId ||
-        useSessionStore.getState().guidedSession === null
+        !useSessionStore.getState().compositionStateLoaded
       ) {
         await useSessionStore.getState().selectSession(tutorialSessionId);
       }
@@ -360,13 +341,13 @@ export function HelloWorldTutorial({
   return (
     <main
       className={
-        // The guided and run steps embed the workspace frame (ChatPanel or the
+        // The Build and Run steps embed the workspace frame (ChatPanel or the
         // run card beside the pipeline pane), which needs the wrapper to be a
-        // growing flex column (see `.tutorial-shell--guided` in tutorial.css).
+        // growing flex column (see `.tutorial-shell--workspace` in tutorial.css).
         // The bookend turns are short centred cards and keep the base
         // scrolling-column layout.
-        state.step === "guided" || state.step === "run"
-          ? "tutorial-shell tutorial-shell--guided"
+        state.step === "build" || state.step === "run"
+          ? "tutorial-shell tutorial-shell--workspace"
           : "tutorial-shell"
       }
       aria-label="First-run tutorial"
@@ -421,7 +402,7 @@ export function HelloWorldTutorial({
             → "Reset tutorial" two-step. Welcome keeps its own "Skip the
             tutorial"; graduation IS the exit (its finish CTA persists the
             same opt-out); every step between gets this control. */}
-        {(state.step === "guided" ||
+        {(state.step === "build" ||
           state.step === "run" ||
           state.step === "audit") && (
           <Button
@@ -463,34 +444,29 @@ export function HelloWorldTutorial({
           />
         </>
       )}
-      {state.step === "guided" && sessionId !== null && (
-        // One TutorialGuidedShell per tutorial session. The shell is
-        // mount-once (startedRef); keying it on sessionId guarantees a new
-        // session remounts a fresh shell rather than reusing a started one.
-        <TutorialGuidedShell
+      {state.step === "build" && sessionId !== null && (
+        <TutorialFreeformShell
           key={sessionId}
           sessionId={sessionId}
           onCompleted={(id) =>
-            dispatch({ type: "guidedCompleted", sessionId: id })
+            dispatch({ type: "buildCompleted", sessionId: id })
           }
-          onExited={onExitTutorial}
           onSessionMissing={onSessionMissing}
-          exitRequestedRef={guidedStartupExitRequestedRef}
         />
       )}
       {state.step === "run" && state.sessionId !== null && (
         // The run card sits in the workspace frame's authoring pane, with the
-        // committed graph in the pipeline pane beside it (I-1). No onBack: the
-        // guided wizard is terminal once completed (previousStep(run) is
-        // null), so the run turn has no prior step to return to and renders
-        // no Back affordance.
+        // committed graph in the pipeline pane beside it (I-1). Freeform Build
+        // remains revisitable before the Run begins. A typed
+        // readiness refusal on Run can return to that same session.
         <TutorialWorkspaceFrame ariaLabel="Tutorial run">
-          <div className="tutorial-guided-authoring tutorial-run-authoring">
+          <div className="tutorial-workspace-authoring tutorial-run-authoring">
             <TutorialTurn4Run
               sessionId={state.sessionId}
               onResult={(result) => dispatch({ type: "runResultReady", result })}
               onCompleted={(result) => dispatch({ type: "runCompleted", result })}
               onCancelled={() => dispatch({ type: "cancelRun" })}
+              onBack={state.runId === null ? goBack : undefined}
             />
           </div>
         </TutorialWorkspaceFrame>
@@ -525,19 +501,15 @@ export function HelloWorldTutorial({
 
 /**
  * Display labels for the progress dots and the sr-only "Step N of M" hint.
- * The staged guided flow is welcome -> guided -> run -> audit -> graduation;
- * the guided surface owns its own internal stages (source/sink/transform/wire).
+ * The freeform tutorial is welcome -> build -> run -> audit -> graduation.
  */
 const TUTORIAL_STEP_LABELS: ReadonlyArray<{ key: string; label: string }> = [
   { key: "welcome", label: "Welcome" },
-  { key: "guided", label: "Build" },
+  { key: "build", label: "Build" },
   { key: "run", label: "Run" },
   { key: "audit", label: "Audit" },
   // "Graduate" (was "Ready"): this macro phase IS the graduation turn. The inner
-  // guided stepper's terminal step is also labelled "Ready" (an assembled,
-  // ready-to-run pipeline); two different "Ready"s in nested progress trackers
-  // read as a collision. Rename the macro one — "Ready" stays the product term
-  // for a finished pipeline on the stepper.
+  // Graduation names the final handoff into the ordinary Composer.
   { key: "graduation", label: "Graduate" },
 ];
 
@@ -545,7 +517,7 @@ function stepIndex(step: string): number {
   switch (step) {
     case "welcome":
       return 0;
-    case "guided":
+    case "build":
       return 1;
     case "run":
       return 2;
@@ -574,5 +546,5 @@ function formatError(err: unknown): string {
 }
 
 function tutorialComposerUnavailableMessage(reason: string | null): string {
-  return reason ?? "The guided tutorial needs the composer model, but it is not available. Configure the model provider or skip the tutorial for now.";
+  return reason ?? "The tutorial needs the composer model, but it is not available. Configure the model provider or skip the tutorial for now.";
 }

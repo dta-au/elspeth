@@ -25,10 +25,9 @@ from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, Pipeline
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.progress import ComposerRequestLease, client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
-from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
@@ -78,6 +77,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    _await_guided_terminal_write,
     guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
@@ -241,7 +241,7 @@ async def _publish_guided_full_terminal_preserving_primary(
     diagnostic; other ``BaseException`` subclasses still escape.
     """
     try:
-        await progress(event)
+        await _await_guided_terminal_write(progress(event), child_cancel_is_integrity=False, propagate_caller_cancellation=True)
     except contract_errors.TIER_1_ERRORS:
         raise
     except asyncio.CancelledError as progress_exc:
@@ -516,7 +516,7 @@ async def post_guided_plan(
         )
 
         async with _cancel_on_client_disconnect(request):
-            outcome = await request.app.state.composer_service.plan_guided_full_pipeline(
+            outcome = await request.app.state.planning_application.plan_guided_full_pipeline(
                 intent=body.intent,
                 current_state=observed_state,
                 originating_message=PlannerOriginatingMessage(
@@ -590,7 +590,7 @@ async def post_guided_plan(
                     )
                 )
             decline_response = project_guided_full_decline(decline_settlement.decline_message)
-            await progress(_guided_full_complete_progress_event(declined=True))
+            await _await_guided_terminal_write(progress(_guided_full_complete_progress_event(declined=True)))
             return decline_response
 
         plan, _catalog_ids = outcome
@@ -642,7 +642,7 @@ async def post_guided_plan(
                 )
             )
         proposal_response = project_composition_proposal(settlement.proposal)
-        await progress(_guided_full_complete_progress_event())
+        await _await_guided_terminal_write(progress(_guided_full_complete_progress_event()))
         return proposal_response
     except (GuidedOperationFenceLostError, BlobGuidedOperationFenceLostError) as exc:
         fence_loss_observed = True
@@ -893,19 +893,21 @@ async def post_guided_plan(
         # settlement itself could not be written.
         failure_code = _guided_full_failure_code(exc)
         try:
-            await service.fail_guided_operation_with_audit(
-                GuidedOperationFailureCommand(
-                    fence=reserved.fence,
-                    failure_code=failure_code,
-                    actor="composer_route",
-                    audit_evidence=GuidedAuditEvidence(
-                        invocations=recorder.invocations,
-                        llm_calls=recorder.llm_calls,
-                        planner_attempts=recorder.planner_attempts,
-                        chat_turns=recorder.chat_turns,
+            await _await_guided_terminal_write(
+                service.fail_guided_operation_with_audit(
+                    GuidedOperationFailureCommand(
+                        fence=reserved.fence,
+                        failure_code=failure_code,
+                        actor="composer_route",
+                        audit_evidence=GuidedAuditEvidence(
+                            invocations=recorder.invocations,
+                            llm_calls=recorder.llm_calls,
+                            planner_attempts=recorder.planner_attempts,
+                            chat_turns=recorder.chat_turns,
+                        ),
                     ),
-                ),
-                session_operation_context=reserved.session_operation_context,
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
         except GuidedOperationFenceLostError as fence_lost:
             fence_loss_observed = True
@@ -934,19 +936,21 @@ async def post_guided_plan(
     except Exception as exc:
         failure_code = _guided_full_failure_code(exc)
         try:
-            failed = await service.fail_guided_operation_with_audit(
-                GuidedOperationFailureCommand(
-                    fence=reserved.fence,
-                    failure_code=failure_code,
-                    actor="composer_route",
-                    audit_evidence=GuidedAuditEvidence(
-                        invocations=recorder.invocations,
-                        llm_calls=recorder.llm_calls,
-                        planner_attempts=recorder.planner_attempts,
-                        chat_turns=recorder.chat_turns,
+            failed = await _await_guided_terminal_write(
+                service.fail_guided_operation_with_audit(
+                    GuidedOperationFailureCommand(
+                        fence=reserved.fence,
+                        failure_code=failure_code,
+                        actor="composer_route",
+                        audit_evidence=GuidedAuditEvidence(
+                            invocations=recorder.invocations,
+                            llm_calls=recorder.llm_calls,
+                            planner_attempts=recorder.planner_attempts,
+                            chat_turns=recorder.chat_turns,
+                        ),
                     ),
-                ),
-                session_operation_context=reserved.session_operation_context,
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
         except GuidedOperationFenceLostError as fence_lost:
             fence_loss_observed = True
@@ -979,11 +983,13 @@ async def post_guided_plan(
                     secondary=fence_lost,
                     site="fence_lost_no_winner",
                 )
-                await progress(_guided_full_failed_progress_event(failure_code))
+                await _await_guided_terminal_write(progress(_guided_full_failed_progress_event(failure_code)))
                 raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
-            await progress(
-                _guided_full_complete_progress_event(
-                    declined=type(joined) is GuidedPlanDeclinedResponse,
+            await _await_guided_terminal_write(
+                progress(
+                    _guided_full_complete_progress_event(
+                        declined=type(joined) is GuidedPlanDeclinedResponse,
+                    )
                 )
             )
             return joined
@@ -998,7 +1004,7 @@ async def post_guided_plan(
             # settlement surfaces as an integrity error instead of being
             # replaced by a coded failure derived from the earlier primary.
             raise AuditIntegrityError("Guided PLAN could not record its terminal failure") from cleanup_exc
-        await progress(_guided_full_failed_progress_event(failure_code))
+        await _await_guided_terminal_write(progress(_guided_full_failed_progress_event(failure_code)))
         raise_guided_operation_failure(failed)
     finally:
         try:

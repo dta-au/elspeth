@@ -1066,6 +1066,7 @@ class ChatMessageRecord:
     composition_state_id: UUID | None = None
     tool_call_id: str | None = None
     parent_assistant_id: UUID | None = None
+    client_request_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if self.role not in CHAT_MESSAGE_ROLE_VALUES:
@@ -1087,6 +1088,31 @@ class ChatMessageRecord:
         # Only ``tool_calls`` carries mutable contents.
         if self.tool_calls is not None:
             freeze_fields(self, "tool_calls")
+
+
+@dataclass(frozen=True, slots=True)
+class MessageIngressFresh:
+    """A newly accepted user row with its same-transaction transcript."""
+
+    client_request_id: UUID
+    message: ChatMessageRecord
+    transcript: tuple[ChatMessageRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageIngressAccepted:
+    """The exact request was accepted earlier; composition is not implied."""
+
+    client_request_id: UUID
+    user_message_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class MessageIngressConflict:
+    """A request ID was previously bound to different content or state."""
+
+    client_request_id: UUID
+    user_message_id: UUID
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -4620,12 +4646,26 @@ class SessionServiceProtocol(Protocol):
         offset: int = 0,
     ) -> list[ChatMessageRecord]: ...
 
+    async def lookup_message_ingress(
+        self,
+        session_id: UUID,
+        *,
+        client_request_id: UUID,
+        content: str,
+        requested_state_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> MessageIngressAccepted | MessageIngressConflict | None:
+        """Read an existing receipt before route state preflight under a compose fence."""
+        ...
+
     async def add_message_with_transcript(
         self,
         session_id: UUID,
         role: ChatMessageRole,
         content: str,
         *,
+        client_request_id: UUID,
+        requested_state_id: UUID | None,
         writer_principal: ChatMessageWriterPrincipal,
         tool_calls: Sequence[Mapping[str, Any]] | None = None,
         composition_state_id: UUID | None = None,
@@ -4633,8 +4673,8 @@ class SessionServiceProtocol(Protocol):
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
-    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
-        """Insert one message and return ``(record, full transcript)``.
+    ) -> MessageIngressFresh | MessageIngressAccepted | MessageIngressConflict:
+        """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
         write-locked transaction on one connection, so the returned
@@ -4645,7 +4685,8 @@ class SessionServiceProtocol(Protocol):
         a different pooled connection and a stale reader turns the Tier-1
         snapshot guard into a false 500. Implementations MUST also apply
         the same fail-closed guided-failure cohort verification as
-        ``get_messages`` over the same rows.
+        ``get_messages`` over the fresh transcript rows. Exact receipt replays
+        do not read a transcript or imply composition completion.
         """
         ...
 
@@ -4872,13 +4913,26 @@ class SessionServiceProtocol(Protocol):
     ) -> ProviderAttempt:
         """Admit and persist pending provider evidence before dispatch."""
 
+    def begin_run_provider_attempt_sync(self, *, session_operation_context: SessionOperationContext, run_id: UUID) -> ProviderAttempt:
+        """Return a committed EXECUTE attempt before the pipeline enters its provider."""
+
     async def finish_provider_attempt(self, *, session_operation_context: SessionOperationContext, call: ComposerLLMCall) -> None:
         """Checkpoint terminal provider audit and settle its ledger atomically."""
+
+    async def cancel_undispatched_provider_attempt(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
+    ) -> None:
+        """Close a proven undispatched COMPOSE intent under its original fence."""
 
     async def settle_provider_attempt(
         self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
     ) -> None:
         """Settle non-Composer provider evidence under COMPOSE or EXECUTE authority."""
+
+    def settle_run_provider_attempt_sync(
+        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
+    ) -> None:
+        """Commit an EXECUTE attempt's exact Landscape usage before return."""
 
     async def request_run_cancellation(
         self, run_id: UUID, *, session_id: UUID, user_id: str, auth_provider_type: AuthProviderType

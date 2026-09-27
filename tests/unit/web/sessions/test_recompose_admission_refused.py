@@ -17,8 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-from elspeth.web.composer.protocol import ComposerService
-from elspeth.web.composer.service import ComposerAdmissionRefused, ComposerServiceError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
 from tests.unit.web.sessions.test_routes import TestClient, _make_app
 
 _REFUSAL_TEXT = "Composer admission refused: identity_disabled."
@@ -39,17 +38,23 @@ def _post_after_compose_failure(tmp_path: Path, failure: ComposerServiceError, *
     session_id = client.post("/api/sessions", json={"title": "Admission"}).json()["id"]
 
     if route == "messages":
-        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build a pipeline"})
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build a pipeline", "client_request_id": str(uuid.uuid4())},
+        )
     else:
         # recompose precondition: the conversation ends at the failed user turn.
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(
+            user_message = loop.run_until_complete(
                 service.add_message(uuid.UUID(session_id), "user", "Build a pipeline", writer_principal="route_user_message")
             )
         finally:
             loop.close()
-        response = client.post(f"/api/sessions/{session_id}/recompose")
+        response = client.post(
+            f"/api/sessions/{session_id}/recompose",
+            json={"expected_user_message_id": str(user_message.id)},
+        )
 
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
     return response.status_code, response.json()["detail"], progress

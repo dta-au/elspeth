@@ -30,6 +30,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.protocol import (
     GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS,
     GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH,
@@ -49,7 +50,6 @@ from elspeth.web.sessions.routes.guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
-from elspeth.web.sessions.service import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.titles import mint_default_session_title
 
 from ._helpers import (

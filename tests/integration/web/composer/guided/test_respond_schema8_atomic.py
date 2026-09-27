@@ -51,7 +51,7 @@ from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
-from elspeth.web.sessions.models import guided_operations_table
+from elspeth.web.sessions.models import composition_proposals_table, guided_operation_events_table, guided_operations_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationTakenOver
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 from elspeth.web.sessions.routes.composer import guided as guided_route
@@ -2347,3 +2347,468 @@ def test_route_takeover_uses_live_fence_and_stale_worker_joins_winner(
     assert settle_attempts == [1, 2]
     assert _respond_operation_count(client, session_id) == 1
     assert len(asyncio.run(service.get_state_versions(UUID(session_id)))) == 1
+
+
+def test_cancellation_during_respond_failure_writer_preserves_route_terminalization(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _live_body(turn, chosen=[turn["payload"]["options"][0]["id"]])
+    service = client.app.state.session_service
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    real_writer = service.fail_guided_operation_with_audit
+
+    async def fail_success_settlement(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected respond settlement failure")
+
+    async def delayed_failure(command: object, *, session_operation_context: object) -> object:
+        writer_started.set()
+        await release_writer.wait()
+        return await real_writer(command, session_operation_context=session_operation_context)
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", fail_success_settlement)
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", delayed_failure)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(writer_started.wait(), 5)
+            request_task.cancel("cancel while recording respond failure")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_writer.set()
+            response = await asyncio.wait_for(request_task, 5)
+            assert response.status_code == 500
+
+    asyncio.run(drive())
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "failed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "operation_failed"
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["actor"] == "composer_route"
+
+
+@pytest.mark.parametrize("failure_writer_integrity", [False, True], ids=["child_failure", "failure_writer_failure"])
+def test_respond_cancelled_state_settlement_preserves_integrity_failure(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_writer_integrity: bool,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _live_body(turn, chosen=[turn["payload"]["options"][0]["id"]])
+    service = client.app.state.session_service
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_settlement(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        if failure_writer_integrity:
+            raise RuntimeError("injected ordinary respond settlement failure")
+        raise AuditIntegrityError("injected respond settlement integrity failure")
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", fail_settlement)
+    expected_message = (
+        "injected respond failure-writer integrity failure" if failure_writer_integrity else "injected respond settlement integrity failure"
+    )
+    if failure_writer_integrity:
+
+        async def fail_failure_writer(*_args: object, **_kwargs: object) -> object:
+            raise AuditIntegrityError(expected_message)
+
+        monkeypatch.setattr(service, "fail_guided_operation_with_audit", fail_failure_writer)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            request_task.cancel("cancel while respond state settlement is pending")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release.set()
+            with pytest.raises(AuditIntegrityError, match=expected_message):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    replay = client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
+
+
+def test_respond_simultaneous_child_and_caller_cancellation_is_integrity_failure(
+    file_composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = file_composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _live_body(turn, chosen=[turn["payload"]["options"][0]["id"]])
+    service = client.app.state.session_service
+    entered = asyncio.Event()
+    child_task: asyncio.Task[object] | None = None
+
+    async def self_cancelled_settlement(*_args: object, **_kwargs: object) -> object:
+        nonlocal child_task
+        child_task = asyncio.current_task()
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable after child cancellation")
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", self_cancelled_settlement)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            assert child_task is not None
+            child_task.cancel("respond settlement child stopped")
+            request_task.cancel("respond caller cancelled in the same scheduling turn")
+            with pytest.raises(AuditIntegrityError):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    replay = client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
+
+
+@pytest.mark.parametrize("scenario", ["generic", "reviewed", "planner_decline"])
+def test_respond_postcommit_cancellation_joins_success_writer_and_replays(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+    client = composer_test_client
+    if scenario == "generic":
+        session_id = _create_session(client)
+        turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+        body = _live_body(turn, chosen=[turn["payload"]["options"][0]["id"]])
+    else:
+        session_id, staged = _stage_proposal(client, filename=f"postcommit-{scenario}.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        if scenario == "reviewed":
+            body = _live_body(turn, chosen=["review_wiring"], proposal_id=payload["proposal_id"], draft_hash=payload["draft_hash"])
+        else:
+
+            async def decline_planner(**_kwargs: object) -> GuidedPlannerDecline:
+                return GuidedPlannerDecline(decline_text="I cannot make that revision safely.")
+
+            monkeypatch.setattr(client.app.state.planning_application, "plan_guided_pipeline", decline_planner)
+            body = _live_body(
+                turn,
+                proposal_id=payload["proposal_id"],
+                draft_hash=payload["draft_hash"],
+                edited_values={"revision_instruction": "Use a transform that is unavailable."},
+            )
+    service = client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_settle = service.settle_guided_state_operation
+
+    async def settle_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        result = await real_settle(*args, **kwargs)
+        committed.set()
+        try:
+            await release_result.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "settle_guided_state_operation", settle_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(committed.wait(), 10)
+            request_task.cancel("cancel after durable respond commit")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 10)
+
+    asyncio.run(drive())
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "completed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "completed"
+    assert len(terminal_events) == 1
+    replay = client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+    assert replay.status_code == 200, replay.json()
+
+
+@pytest.mark.parametrize("pause_after_commit", [False, True], ids=["before_commit", "after_commit"])
+def test_respond_reject_cancellation_joins_atomic_decision_and_replays(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pause_after_commit: bool,
+) -> None:
+    client = composer_test_client
+    session_id, staged = _stage_proposal(client, filename=f"reject-cancel-{pause_after_commit}.jsonl")
+    turn = staged["next_turn"]
+    payload = turn["payload"]
+    body = _live_body(
+        turn,
+        control_signal="reject",
+        proposal_id=payload["proposal_id"],
+        draft_hash=payload["draft_hash"],
+    )
+    service = client.app.state.session_service
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_reject = service.reject_guided_pipeline_proposal
+
+    async def reject_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        if not pause_after_commit:
+            writer_started.set()
+        try:
+            if not pause_after_commit:
+                await release_writer.wait()
+            result = await real_reject(*args, **kwargs)
+            if pause_after_commit:
+                writer_started.set()
+                await release_writer.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "reject_guided_pipeline_proposal", reject_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(writer_started.wait(), 10)
+            request_task.cancel("first cancellation during reject")
+            request_task.cancel("second cancellation during reject")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_writer.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 10)
+
+    asyncio.run(drive())
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+        proposal = (
+            connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == payload["proposal_id"]))
+            .mappings()
+            .one()
+        )
+        terminal_events = (
+            connection.execute(
+                select(guided_operation_events_table).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "completed",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert operation["status"] == "completed"
+    assert proposal["status"] == "rejected"
+    assert len(terminal_events) == 1
+    replay = client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+    assert replay.status_code == 200, replay.json()
+
+
+@pytest.mark.parametrize("origin", ["proposal_review", "wire_review"])
+def test_respond_back_edit_postcommit_cancellation_joins_success_writer(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+) -> None:
+    client = composer_test_client
+    session_id, staged = _stage_proposal(client, filename=f"back-edit-cancel-{origin}.jsonl")
+    if origin == "proposal_review":
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "source")
+        body = _live_body(
+            turn,
+            proposal_id=payload["proposal_id"],
+            draft_hash=payload["draft_hash"],
+            edit_target=target,
+        )
+    else:
+        proposal_turn = staged["next_turn"]
+        proposal_payload = proposal_turn["payload"]
+        reviewed = client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(
+                proposal_turn,
+                chosen=["review_wiring"],
+                proposal_id=proposal_payload["proposal_id"],
+                draft_hash=proposal_payload["draft_hash"],
+            ),
+        )
+        assert reviewed.status_code == 200, reviewed.json()
+        turn = reviewed.json()["next_turn"]
+        payload = turn["payload"]
+        body = _live_body(
+            turn,
+            proposal_id=payload["proposal_id"],
+            draft_hash=payload["draft_hash"],
+            edit_target={"kind": "source", "stable_id": payload["sources"][0]["stable_id"]},
+            correction_feedback="Change the reviewed source settings.",
+        )
+    service = client.app.state.session_service
+    committed = asyncio.Event()
+    release_result = asyncio.Event()
+    writer_finished = asyncio.Event()
+    writer_cancelled = False
+    real_back_edit = service.back_edit_guided_pipeline_proposal
+
+    async def back_edit_then_pause(*args: object, **kwargs: object) -> object:
+        nonlocal writer_cancelled
+        result = await real_back_edit(*args, **kwargs)
+        committed.set()
+        try:
+            await release_result.wait()
+            return result
+        except asyncio.CancelledError:
+            writer_cancelled = True
+            raise
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(service, "back_edit_guided_pipeline_proposal", back_edit_then_pause)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
+            await asyncio.wait_for(committed.wait(), 10)
+            request_task.cancel("cancel after back-edit commit")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release_result.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request_task, 10)
+
+    asyncio.run(drive())
+    assert writer_finished.is_set()
+    assert not writer_cancelled
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "completed"
+    replay = client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+    assert replay.status_code == 200, replay.json()

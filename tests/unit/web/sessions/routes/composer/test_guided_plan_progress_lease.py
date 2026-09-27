@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.composer.protocol import ComposerService
+from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import GuidedOperationFailed, GuidedOperationFence, SessionServiceProtocol
@@ -56,10 +56,10 @@ async def test_progress_claim_failure_terminalizes_then_closes_actual_lease(monk
         session_lease=lease,
     )
     service = create_autospec(SessionServiceProtocol, instance=True)
-    composer = create_autospec(ComposerService, instance=True)
+    planning = create_autospec(PlanningApplication, instance=True)
     app = FastAPI()
     app.state.session_service = service
-    app.state.composer_service = composer
+    app.state.planning_application = planning
     request = Request({"type": "http", "method": "POST", "path": "/guided/plan", "headers": [], "query_string": b"", "app": app})
     limiter = _Limiter()
     monkeypatch.setattr(guided_plan, "_verify_session_ownership", create_autospec(guided_plan._verify_session_ownership))
@@ -118,7 +118,7 @@ async def test_progress_claim_failure_terminalizes_then_closes_actual_lease(monk
         assert lease.closed
         assert lease._renewal_task.done()
         service.fail_guided_operation.assert_awaited_once()
-        composer.plan_guided_full_pipeline.assert_not_called()
+        planning.plan_guided_full_pipeline.assert_not_called()
     finally:
         allow_settlement.set()
         if not task.done():

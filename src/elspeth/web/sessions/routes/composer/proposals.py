@@ -714,11 +714,13 @@ async def reject_composition_proposal(
             raise
         if authority.pipeline is None:
             try:
-                proposal = await service.reject_composition_proposal(
-                    session_id=session.id,
-                    proposal_id=proposal_id,
-                    actor=f"user:{user.user_id}",
-                    session_operation_context=lease.context,
+                proposal, was_cancelled = await _await_with_deferred_cancellation(
+                    service.reject_composition_proposal(
+                        session_id=session.id,
+                        proposal_id=proposal_id,
+                        actor=f"user:{user.user_id}",
+                        session_operation_context=lease.context,
+                    )
                 )
             except ValueError as primary:
                 await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -732,7 +734,7 @@ async def reject_composition_proposal(
                 lease,
                 session_id=session.id,
             )
-            if cleanup_cancelled:
+            if was_cancelled or cleanup_cancelled:
                 raise asyncio.CancelledError
             return response
 
@@ -744,15 +746,17 @@ async def reject_composition_proposal(
             await _close_proposal_lease_before_commit(lease, primary=request_error)
             raise request_error
         try:
-            proposal = await service.reject_pipeline_composition_proposal(
-                session_id=session.id,
-                proposal_id=proposal_id,
-                draft_hash=authority.pipeline.proposal.draft_hash,
-                reviewed_facts=None,
-                reason="operator_rejected",
-                dispatch=None,
-                actor=f"user:{user.user_id}",
-                session_operation_context=lease.context,
+            proposal, was_cancelled = await _await_with_deferred_cancellation(
+                service.reject_pipeline_composition_proposal(
+                    session_id=session.id,
+                    proposal_id=proposal_id,
+                    draft_hash=authority.pipeline.proposal.draft_hash,
+                    reviewed_facts=None,
+                    reason="operator_rejected",
+                    dispatch=None,
+                    actor=f"user:{user.user_id}",
+                    session_operation_context=lease.context,
+                )
             )
         except ValueError as primary:
             await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -767,6 +771,6 @@ async def reject_composition_proposal(
             session_id=session.id,
             event="composer_pipeline_proposal_reject_postcommit_cleanup_failed",
         )
-        if cleanup_cancelled:
+        if was_cancelled or cleanup_cancelled:
             raise asyncio.CancelledError
         return response

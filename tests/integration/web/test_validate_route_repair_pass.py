@@ -55,6 +55,7 @@ def _build_repair_pass_app(tmp_path: Path) -> FastAPI:
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough", "transform:llm"),
+        composer_boot_probe_enabled=False,
     )
     app = create_app(settings=settings)
     with app.state.session_engine.begin() as conn:

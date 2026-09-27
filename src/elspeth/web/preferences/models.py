@@ -65,7 +65,7 @@ ComposerMode = Literal["guided", "freeform"]
 # same four sites, as ``ComposerMode`` above. The decoder fails closed on an
 # unlisted stage, so adding a value here without it makes the frontend reject
 # a payload the server considers valid.
-TutorialStage = Literal["guided", "run", "audit", "graduation"]
+TutorialStage = Literal["build", "run", "audit", "graduation"]
 
 
 class ComposerPreferences(BaseModel):

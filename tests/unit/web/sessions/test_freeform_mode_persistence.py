@@ -170,9 +170,6 @@ def test_lazy_freeform_composition_does_not_pass_a_guided_checkpoint(tmp_path, e
     session = client.post("/api/sessions", json={"title": "Freeform request"}).json()
     session_id = uuid.UUID(session["id"])
     composer = MagicMock(spec=ComposerService)
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
-    )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
         return_value=ComposerResult(
@@ -182,10 +179,16 @@ def test_lazy_freeform_composition_does_not_pass_a_guided_checkpoint(tmp_path, e
     )
     app.state.composer_service = composer
     if endpoint == "recompose":
-        asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
-        response = client.post(f"/api/sessions/{session_id}/recompose")
+        user_message = asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
+        response = client.post(
+            f"/api/sessions/{session_id}/recompose",
+            json={"expected_user_message_id": str(user_message.id)},
+        )
     else:
-        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Summarize my CSV"})
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Summarize my CSV", "client_request_id": str(uuid.uuid4())},
+        )
     assert response.status_code == 200, response.json()
     composer.compose.assert_awaited_once()
     supplied_state = composer.compose.call_args.args[2]

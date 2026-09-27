@@ -406,6 +406,23 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it.each(["provider_auth", "provider_bad_request"] as const)(
+    "withholds blind Retry for a %s failure while retaining corrective copy",
+    (reason) => {
+      const turn: ChatTurn = {
+        ...TURN_SYNTHETIC_FAILURE,
+        content: reason === "provider_auth" ? "Ask an administrator to update the provider credentials." : "Ask an administrator to correct the model configuration.",
+        synthetic_failure_reason: reason,
+      };
+      const { container } = render(
+        <GuidedChatHistory chatHistory={[turn]} onRetrySyntheticFailure={vi.fn()} />,
+      );
+
+      expect(container.querySelector(".bubble-error")).toHaveTextContent(turn.content);
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
   it.each(["unavailable", "quality_guard", "model_defect"] as const)(
     "keeps Retry for a %s failure — retry is the designed remedy",
     (reason) => {

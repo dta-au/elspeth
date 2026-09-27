@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import pytest
 
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided import chat_solver
 from elspeth.web.composer.guided.chat_solver import DeferredIntentManagementChatRequest
@@ -54,7 +55,7 @@ async def test_solve_step_chat_omits_endpoint_kwargs_when_unset(monkeypatch: pyt
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="gpt-5",
@@ -77,7 +78,7 @@ async def test_solve_step_chat_sends_configured_endpoint(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="gpt-5",
@@ -102,7 +103,7 @@ async def test_step_1_source_chat_omits_endpoint_kwargs_when_unset(monkeypatch: 
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_1_source_chat(
         model="gpt-4o",
@@ -127,7 +128,7 @@ async def test_step_1_source_chat_sends_configured_endpoint(monkeypatch: pytest.
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_1_source_chat(
         model="gpt-4o",
@@ -154,7 +155,7 @@ async def test_step_2_sink_chat_omits_endpoint_kwargs_when_unset(monkeypatch: py
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_2_sink_chat(
         model="gpt-4o",
@@ -177,7 +178,7 @@ async def test_step_2_sink_chat_sends_configured_endpoint(monkeypatch: pytest.Mo
         captured.update(kwargs)
         return _text_response("advice")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_resolve_step_2_sink_chat(
         model="gpt-4o",
@@ -202,7 +203,7 @@ async def test_deferred_intent_management_chat_omits_endpoint_kwargs_when_unset(
         captured.update(kwargs)
         return _text_response("ok")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(
@@ -229,7 +230,7 @@ async def test_deferred_intent_management_chat_sends_configured_endpoint(monkeyp
         captured.update(kwargs)
         return _text_response("ok")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(
@@ -292,7 +293,7 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         captured.update(kwargs)
         return _text_response("The selected output is ready.")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_provider)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", capture_provider)
     recorder = BufferingRecorder()
 
     await guided_chat_atomic_module.run_guided_chat_provider_attempt(
@@ -342,7 +343,7 @@ async def test_solve_step_chat_threads_the_discovery_reasoning_knob(monkeypatch:
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="anthropic/claude-sonnet-5",
@@ -365,7 +366,7 @@ async def test_solve_step_chat_uses_the_native_object_for_openrouter_models(monk
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="openrouter/anthropic/claude-sonnet-5",
@@ -389,7 +390,7 @@ async def test_solve_step_chat_default_is_unhinted(monkeypatch: pytest.MonkeyPat
         captured.update(kwargs)
         return _text_response("reply")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
         model="gpt-5",
@@ -412,7 +413,7 @@ async def test_deferred_intent_management_request_carries_the_reasoning_knob(mon
         captured.update(kwargs)
         return _text_response("ok")
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(

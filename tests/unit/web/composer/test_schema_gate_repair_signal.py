@@ -65,7 +65,7 @@ class _RecordingComposeLLM(_FakeComposeLLM):
         super().__init__(responses)
         self.tool_messages: list[dict[str, Any]] = []
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _FakeLLMResponse:
+    async def __call__(self, _messages: Any, _tools: Any) -> Any:
         for message in _messages:
             if type(message) is dict and message["role"] == "tool":
                 self.tool_messages.append(dict(message))

@@ -153,11 +153,18 @@ class SendMessageRequest(_RequestModel):
     # _InlineBlobModel.content 256 KiB cap (web/composer/redaction.py).
     content: str = pydantic.Field(min_length=1, max_length=65536)
     state_id: UUID | None = None
+    client_request_id: UUID
 
     @field_validator("content")
     @classmethod
     def _validate_content(cls, value: str) -> str:
         return _require_visible_content(value, field_label="Message content")
+
+
+class RecomposeRequest(_RequestModel):
+    """Only retry the conversational user row the client actually selected."""
+
+    expected_user_message_id: UUID
 
 
 type ToolCallObject = dict[str, JsonValue]
@@ -208,6 +215,7 @@ class ChatMessageResponse(_StrictResponse):
     """
 
     id: str
+    client_request_id: str | None = None
     session_id: str
     role: str
     content: str
@@ -576,7 +584,9 @@ class ChatTurnResponse(_StrictResponse):
     step: str
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None
+    synthetic_failure_reason: (
+        Literal["quality_guard", "unavailable", "not_applied", "model_defect", "provider_auth", "provider_bad_request"] | None
+    )
     turn_token: str | None
 
 
@@ -703,21 +713,6 @@ GuidedStartOperationReconciliationResponse = Annotated[
     GuidedStartOperationInProgressResponse | GuidedStartOperationFailedResponse | GuidedStartOperationCompletedResponse,
     Field(discriminator="status"),
 ]
-
-
-class TutorialSampleResponse(_StrictResponse):
-    """Response for GET /api/sessions/{id}/guided/tutorial-sample.
-
-    Runtime-derived inputs for the tutorial's prefilled worked example: the 3
-    synthetic sample-page URLs (appended to the locked STEP_1 prompt the learner
-    sends verbatim) for the active tutorial session's resolved origin. The URLs
-    are computed from the resolved base at request time (they cannot ride the
-    frozen profile constants). The tutorial's ``web_scrape`` node relies on the
-    plugin default ``allowed_hosts="public_only"`` — the pages are publicly
-    hosted, so the server injects no SSRF allowlist.
-    """
-
-    sample_urls: list[str]
 
 
 class GuidedEditTargetRequest(BaseModel):

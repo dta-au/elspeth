@@ -530,8 +530,8 @@ class ChatTurn:
     persisted discriminator. User turns require both fields to be ``None``.
     Assistant turns require a kind; real replies require a ``None`` reason,
     while synthetic failures require one closed reason: quality rejection,
-    provider unavailability, a safe response that was deliberately not
-    applied, or a model-output defect (the provider answered but the reply
+    provider unavailability, provider configuration rejection, a safe response
+    that was deliberately not applied, or a model-output defect (the provider answered but the reply
     violated a tool's argument contract — retrying the same message is the
     designed remedy, unlike the deterministic ``not_applied`` causes).
     There is no nested compatibility reader for omitted fields.
@@ -543,7 +543,9 @@ class ChatTurn:
     step: GuidedStep
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
+    synthetic_failure_reason: (
+        Literal["quality_guard", "unavailable", "not_applied", "model_defect", "provider_auth", "provider_bad_request"] | None
+    ) = None
     # The guided turn token under which this USER chat message was submitted —
     # the occurrence the retry affordance must be bound to. Without it, Retry
     # on a historical synthetic failure resubmits old prose under whatever
@@ -570,11 +572,10 @@ class ChatTurn:
             "unavailable",
             "not_applied",
             "model_defect",
+            "provider_auth",
+            "provider_bad_request",
         ):
-            raise ValueError(
-                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', 'model_defect', or None; "
-                f"got {self.synthetic_failure_reason!r}"
-            )
+            raise ValueError(f"synthetic_failure_reason must be a recognized failure reason or None; got {self.synthetic_failure_reason!r}")
         if self.synthetic_failure_reason is not None and self.assistant_message_kind != "synthetic_failure":
             raise ValueError("synthetic_failure_reason is set but assistant_message_kind is not 'synthetic_failure'")
         if self.role is ChatRole.USER and (self.assistant_message_kind is not None or self.synthetic_failure_reason is not None):

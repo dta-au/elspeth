@@ -388,7 +388,7 @@ async def test_send_message_heartbeat_cancel_publishes_server_fault_not_client_c
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
             f"/api/sessions/{service.session.id}/messages",
-            json={"content": "Heartbeat will lose the lease"},
+            json={"content": "Heartbeat will lose the lease", "client_request_id": str(uuid4())},
         )
 
     assert _HangingComposer.cancelled is True

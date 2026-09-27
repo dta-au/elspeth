@@ -53,6 +53,7 @@ from elspeth.web.sessions.models import (
     proposal_events_table,
     sessions_table,
 )
+from elspeth.web.sessions.proposal_authority import _pipeline_audit_payload_hash
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     StaleComposeStateError,
@@ -61,7 +62,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _pipeline_audit_payload_hash
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import acquire_operation_context, fenced_operation_context

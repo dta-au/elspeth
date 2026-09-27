@@ -252,10 +252,10 @@ def test_persisted_advisor_fact_preserves_pending_handoff_until_reviews_resolve(
 
 
 def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None:
-    from elspeth.web.composer.service import _advisor_signoff_pending_validation
+    from elspeth.web.composer.advisor_policy import advisor_signoff_pending_validation
 
     state = _make_state()
-    result = _advisor_signoff_pending_validation(
+    result = advisor_signoff_pending_validation(
         _green_result(), reason="unavailable", findings="Model unavailable.", category="other", step_ids=(), note=None
     )
     suggestion = (
@@ -320,17 +320,17 @@ def test_persisted_advisor_suggestion_is_required() -> None:
 
 @pytest.mark.parametrize("reason", ["flagged_no_repair", "flagged_final_pass", "flagged_unrepairable"])
 def test_advisor_readiness_never_publishes_model_findings(reason: str) -> None:
-    from elspeth.web.composer.service import (
-        _advisor_signoff_blocked_validation,
-        _advisor_signoff_pending_validation,
-        _advisor_signoff_unverified_validation,
+    from elspeth.web.composer.advisor_policy import (
+        advisor_signoff_blocked_validation,
+        advisor_signoff_pending_validation,
+        advisor_signoff_unverified_validation,
     )
 
     findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
     results = [
-        _advisor_signoff_blocked_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
-        _advisor_signoff_unverified_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
-        _advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings, category="other", step_ids=(), note=None),
     ]
     for result in results:
         blocker = result.readiness.blockers[0]
@@ -346,18 +346,18 @@ def test_advisor_note_reaches_only_the_blocker_note_field(reason: str) -> None:
     bounded note IS published — in ``blockers[].note`` and nowhere else. The
     raw ``findings_text`` stays off every surface, note included: the note is
     the parser's sanitised extract, not the fenced reply."""
-    from elspeth.web.composer.service import (
-        _advisor_signoff_blocked_validation,
-        _advisor_signoff_pending_validation,
-        _advisor_signoff_unverified_validation,
+    from elspeth.web.composer.advisor_policy import (
+        advisor_signoff_blocked_validation,
+        advisor_signoff_pending_validation,
+        advisor_signoff_unverified_validation,
     )
 
     findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
     note = "The merge step cannot route failures; pick per-branch sinks or a partial-arrival policy."
     results = [
-        _advisor_signoff_blocked_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
-        _advisor_signoff_unverified_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
-        _advisor_signoff_pending_validation(
+        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        advisor_signoff_pending_validation(
             _green_result(), reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
         ),
     ]
@@ -683,10 +683,10 @@ def _blocked_facts_for(state: CompositionState, *, note: str | None = None) -> C
 
 def test_note_survives_reload_and_reaches_validate() -> None:
     """Ruling 2026-09-22: the note the blocking turn showed is the note /validate shows on the same graph."""
-    from elspeth.web.composer.service import _advisor_signoff_pending_validation
+    from elspeth.web.composer.advisor_policy import advisor_signoff_pending_validation
 
     state = _make_state()
-    result = _advisor_signoff_pending_validation(
+    result = advisor_signoff_pending_validation(
         _green_result(),
         reason="flagged_final_pass",
         findings="FLAGGED: choose per-branch sinks",

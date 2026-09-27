@@ -848,7 +848,7 @@ class TestAutoWireIdempotence:
 
         # REQUIRED posture through the service finalizer factory (the seam the
         # regression test exercises).
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
 
         finalize = _required_controls_candidate_finalizer(policy_catalog=req_view, plugin_snapshot=req_snapshot)
         assert finalize(frozen) is frozen
@@ -1010,7 +1010,7 @@ class TestServiceFinalizerFactory:
     """The exact finalizer callable all three plan_pipeline sites now pass."""
 
     def test_finalizer_wires_the_candidate(self, tmp_path: Path) -> None:
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
 
         view, snapshot = _guardrail_profile_view(tmp_path)
         finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot)
@@ -1023,7 +1023,7 @@ class TestServiceFinalizerFactory:
     def test_inner_finalizer_runs_before_the_pass(self, tmp_path: Path) -> None:
         """The guided reviewed-component binder composes BEFORE wiring, so the
         pass always sees the bound candidate."""
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
 
         view, snapshot = _guardrail_profile_view(tmp_path)
         seen: list[dict[str, Any]] = []

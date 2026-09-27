@@ -69,7 +69,7 @@ import respx
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.capability_skill import PLANNER_TERMINAL_TOOL_NAME
 from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
-from elspeth.web.composer.service import build_composer_loop_request_kwargs, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import build_composer_loop_request_kwargs, composer_loop_tool_definitions
 from elspeth.web.composer.strict_transport import (
     StrictTransport,
     resolve_composer_tool_contract,

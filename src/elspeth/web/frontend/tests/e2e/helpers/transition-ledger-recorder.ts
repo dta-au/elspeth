@@ -1,7 +1,7 @@
 // Playwright glue for the per-transition tutorial ledger (harness/transition-ledger.ts).
 //
-// Intercepts every transition request (POST guided/start|respond|chat and
-// POST /api/tutorial/run) with page.route, forwards it to the deployment, and
+// Intercepts authoring transition requests (POST freeform messages or guided
+// start/respond/chat) and POST /api/tutorial/run, forwards them, and
 // HOLDS the response back from the browser until the backend's durable audit
 // rows have been re-read. The browser cannot fire the next gesture before the
 // held response arrives, so every audit row first seen after a request is the
@@ -34,8 +34,7 @@ import {
 } from "../harness/transition-ledger";
 import { fetchLlmAuditMessages } from "./tutorial-harness";
 
-// A guided transition can legitimately take minutes (two multi-minute planner
-// runs on the pre-remediation tutorial); route.fetch's 30 s default would
+// A Composer transition can legitimately take minutes; route.fetch's 30 s default would
 // abort the walk. Matches the driver's own 900 s walk deadline.
 const TRANSITION_FETCH_TIMEOUT_MS = 900_000;
 // How long finalize() waits for an in-flight transition before reporting it
@@ -64,6 +63,8 @@ function summarizeRequest(endpoint: TransitionEndpoint, body: unknown): Transiti
     view.respond_shape = arms.length > 0 ? arms.join("+") : view.control_signal === null ? "empty" : "control_signal";
   } else if (endpoint === "guided/chat") {
     view.chat_message_chars = typeof body.message === "string" ? body.message.length : null;
+  } else if (endpoint === "freeform/compose") {
+    view.chat_message_chars = typeof body.content === "string" ? body.content.length : null;
   }
   return view;
 }
@@ -86,6 +87,17 @@ function summarizeResponse(
   if (!isRecord(body)) return { view, turnToken: undefined };
   if (endpoint === "tutorial/run") {
     view.run_id = typeof body.run_id === "string" ? body.run_id : null;
+    return { view, turnToken: undefined };
+  }
+  if (endpoint === "freeform/compose") {
+    const proposals = body.proposals;
+    if (Array.isArray(proposals) && proposals.length > 0) {
+      view.next_turn_type = "freeform_proposal";
+      view.new_turn_occurrence = true;
+    } else if (isRecord(body.state)) {
+      view.next_turn_type = "freeform_state";
+      view.new_turn_occurrence = true;
+    }
     return { view, turnToken: undefined };
   }
   const session = body.guided_session;
@@ -256,7 +268,7 @@ export class TransitionLedgerRecorder {
   private async readEvidence(): Promise<TransitionEvidence> {
     if (this.sessionId === null) {
       this.afterUnavailable = true;
-      return unavailableTransitionEvidence("session id not yet observed on a guided request");
+      return unavailableTransitionEvidence("session id not yet observed on a composer request");
     }
     try {
       const rows = summarizeLlmAuditRows(await fetchLlmAuditMessages(this.ctx, this.sessionId));

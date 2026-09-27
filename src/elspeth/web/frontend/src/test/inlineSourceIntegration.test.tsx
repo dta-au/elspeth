@@ -451,14 +451,15 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     await user.type(input, userText);
     await user.click(screen.getByRole("button", { name: /send message/i }));
 
-    // (a) sendMessage was called with the user text. The third arg is
-    // the optional stateId (state.id from the seeded composition).
+    // (a) The send carries one client request UUID alongside the user text
+    // and the original state id from the seeded composition.
     await waitFor(() => {
       expect(sendMessageSpy).toHaveBeenCalled();
     });
     expect(sendMessageSpy).toHaveBeenCalledWith(
       SESSION_ID,
       userText,
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
       "state-1",
       expect.any(AbortSignal),
     );

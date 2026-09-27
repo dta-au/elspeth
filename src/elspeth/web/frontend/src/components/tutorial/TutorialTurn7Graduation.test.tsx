@@ -10,7 +10,6 @@ import { TutorialTurn7Graduation } from "./TutorialTurn7Graduation";
 vi.mock("@/api/client", () => ({
   createSession: vi.fn(),
   fetchUserComposerPreferences: vi.fn(),
-  startGuided: vi.fn(),
   updateUserComposerPreferences: vi.fn(),
 }));
 
@@ -33,19 +32,7 @@ describe("TutorialTurn7Graduation", () => {
       renameSession: vi.fn().mockResolvedValue(undefined),
       loadSessions: vi.fn().mockResolvedValue(undefined),
       selectSession: vi.fn().mockImplementation(async (id: string) => {
-        useSessionStore.setState({ activeSessionId: id, guidedSession: {
-          step: "step_4_wire", history: [], chat_history: [], chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] }, profile: null,
-          terminal: { kind: "completed", reason: null, pipeline_yaml: "sources: {}" },
-        } });
-      }),
-      exitToFreeform: vi.fn().mockImplementation(async () => {
-        const guided = useSessionStore.getState().guidedSession;
-        if (guided === null) throw new Error("Missing test session");
-        useSessionStore.setState({ guidedSession: {
-          ...guided, terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
-        } });
-        return { status: "applied" };
+        useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true, guidedSession: null });
       }),
     } as never);
     vi.mocked(api.createSession).mockResolvedValue({
@@ -98,13 +85,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(screen.getByText("Read before you run.")).toBeInTheDocument();
     expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(screen.getByText("LLMs are confident even when they're wrong.")).toBeInTheDocument();
-    // Guided and freeform differ only in interaction style, not capability.
-    expect(
-      screen.getByText(/guided and freeform can build the same pipelines/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/interaction preference, not a capability limit/i),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/ask in the chat panel/i)).toBeInTheDocument();
 
     window.removeEventListener("tutorial_graduation_shown", eventListener);
   });
@@ -273,9 +254,9 @@ describe("TutorialTurn7Graduation", () => {
     expect(useSessionStore.getState().activeSessionId).toBeNull();
   });
 
-  it("refuses graduation when the session ID loaded but its Guided state did not", async () => {
+  it("refuses graduation when the session ID loaded but its state did not", async () => {
     useSessionStore.setState({ selectSession: vi.fn().mockImplementation(async (id: string) => {
-      useSessionStore.setState({ activeSessionId: id, guidedSession: null });
+      useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: false });
     }) });
     const user = userEvent.setup();
     render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
@@ -285,23 +266,20 @@ describe("TutorialTurn7Graduation", () => {
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
   });
 
-  it("keeps a pending exit visible and allows retry without publishing completion", async () => {
-    const appliedExit = useSessionStore.getState().exitToFreeform;
-    const exitToFreeform = vi.fn().mockResolvedValueOnce({
-      status: "not_applied", reason: "pending", message: "Wait for the current operation to finish.",
-    }).mockImplementationOnce(appliedExit);
-    useSessionStore.setState({ exitToFreeform });
+  it("keeps a pending compose visible and allows retry without publishing completion", async () => {
+    useSessionStore.setState({ isComposing: true });
     const user = userEvent.setup();
     render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
     await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Wait for the current operation to finish.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("current Composer operation");
     expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
     expect(screen.getByRole("button", { name: "Take me to the composer" })).toBeEnabled();
+    useSessionStore.setState({ isComposing: false });
     await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
     await waitFor(() => expect(usePreferencesStore.getState().tutorialCompleted).toBe(true));
     expect(useSessionStore.getState().activeSessionId).toBe("sess-new");
-    expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe("exited_to_freeform");
+    expect(useSessionStore.getState().guidedSession).toBeNull();
     expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1);
   });
 });
@@ -330,14 +308,10 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     expect(
       screen.getByText(/nothing executes without your say-so/i),
     ).toBeInTheDocument();
-    // Shared bullets (no just-ran claims) render on both paths, including
-    // the guided/freeform capability-parity guidance riding "Ask ELSPETH.".
+    // Shared bullets (no just-ran claims) render on both paths.
     expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(
-      screen.getByText(/guided and freeform can build the same pipelines/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/interaction preference, not a capability limit/i),
+      screen.getByText(/same freeform conversation/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText("LLMs are confident even when they're wrong."),

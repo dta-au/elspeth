@@ -18,6 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -31,9 +32,10 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _pipeline_private_arguments_hash
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -966,9 +968,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
             )
 
         if winner == "proposal":
-            from elspeth.web.sessions import service as service_module
+            from elspeth.web.sessions import mutation_capabilities
 
-            original_validate = service_module.validate_proposal_blob_references
+            original_validate = mutation_capabilities.validate_proposal_blob_references
 
             def blocked_validate(*args, **kwargs):
                 entered.set()
@@ -976,9 +978,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                     raise AssertionError("proposal race barrier timed out")
                 return original_validate(*args, **kwargs)
 
-            monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
+            monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", blocked_validate)
             proposal_task = asyncio.create_task(create_proposal())
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await run_sync_in_worker(entered.wait, 5)
             delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
             await asyncio.sleep(0)
             release.set()
@@ -1002,7 +1004,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
 
         monkeypatch.setattr(coordination_repository, "pending_proposal_reference_id", blocked_pending)
         delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await run_sync_in_worker(entered.wait, 5)
         proposal_task = asyncio.create_task(create_proposal())
         await asyncio.sleep(0)
         release.set()
@@ -1016,14 +1018,8 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_row(service) -> None:
-    """Pin the raise contract the route-level auto-reject sentinel depends on.
-
-    A missing row is ``KeyError`` (corruption of our own data, never
-    swallowed); a row that exists but is no longer pending is
-    ``ProposalStateConflictError``, the benign status race the accept route
-    suppresses before surfacing the validation failure as 422.
-    """
+async def test_reject_composition_proposal_exact_replay_and_conflicting_actor(service) -> None:
+    """An exact retry returns the original receipt; another actor conflicts."""
     session_id = (await service.create_session("alice", "Reject contract", "local")).id
     async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
         proposal = await service.create_composition_proposal(
@@ -1055,16 +1051,37 @@ async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_r
             session_operation_context=context,
         )
         assert rejected.status == "rejected"
+        replayed = await service.reject_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        assert replayed == rejected
         with pytest.raises(ProposalStateConflictError, match="must be pending to reject; got 'rejected'"):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal.id,
+                actor="system:auto_reject_validation_failed:user:alice",
+                session_operation_context=context,
+            )
+
+    events = await service.list_proposal_events(session_id)
+    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.id == str(rejected.audit_event_id))
+            .values(payload={"status": "tampered"})
+        )
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        with pytest.raises(AuditIntegrityError, match="terminal binding mismatch"):
             await service.reject_composition_proposal(
                 session_id=session_id,
                 proposal_id=proposal.id,
                 actor="user:alice",
                 session_operation_context=context,
             )
-
-    events = await service.list_proposal_events(session_id)
-    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
 
 
 @pytest.mark.asyncio

@@ -101,7 +101,7 @@ async def test_sink_driver_resolves_json_output() -> None:
         return _fake_resolve_sink_response(_JSON_SINK_ARGS)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_json_sink_response,
     ):
         outcome = await maybe_resolve_step_2_sink_chat(
@@ -134,7 +134,7 @@ async def test_sink_driver_captures_prose_reply_on_decline() -> None:
         return prose
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_prose_reply,
     ):
         outcome = await maybe_resolve_step_2_sink_chat(
@@ -169,7 +169,7 @@ async def test_sink_driver_returns_both_none_on_hallucinated_tool_call() -> None
         return hallucinated
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_hallucinated_tool_call,
     ):
         outcome = await maybe_resolve_step_2_sink_chat(
@@ -210,7 +210,7 @@ async def test_sink_driver_rejects_scaffold_leak_in_declined_prose() -> None:
 
     with (
         patch(
-            "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             new=_return_scaffold_reply,
         ),
         pytest.raises(AssistantScaffoldLeakError, match="user-facing prose"),
@@ -246,7 +246,7 @@ async def test_sink_driver_revise_threads_current_sink() -> None:
         return _fake_resolve_sink_response(_JSON_SINK_ARGS)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_capture,
     ):
         await maybe_resolve_step_2_sink_chat(
@@ -376,7 +376,7 @@ async def test_sink_wrapper_classifies_strict_snapshot_failure_as_malformed_and_
 
     recorder = BufferingRecorder()
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_malformed_sink_response,
     ):
         result = await resolve_step_2_sink_chat_with_auto_drop(
@@ -418,7 +418,7 @@ async def test_sink_wrapper_classifies_argument_shape_error_as_model_defect_not_
         return _fake_resolve_sink_response(shape_args)
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_shape_error_response,
     ):
         result = await resolve_step_2_sink_chat_with_auto_drop(
@@ -514,7 +514,7 @@ async def test_sink_wrapper_absorbs_malformed_discovery_args_into_synthetic_unav
         return malformed
 
     with patch(
-        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        "elspeth.web.composer.provider_gateway._litellm_acompletion",
         new=_return_malformed_discovery_call,
     ):
         result = await resolve_step_2_sink_chat_with_auto_drop(

@@ -2,19 +2,19 @@
 // gap in elspeth-515096e18c).
 //
 // The per-walk planner-efficiency gate (helpers/tutorial-harness.ts) counts
-// provider calls over the whole guided walk. That granularity hid the
+// provider calls over the whole walk. That granularity hid the
 // b073d248e server-authored sketch for 26 days: the bypass removed the
 // provider from ONE transition (rootless step-2 -> 3) while the walk still
 // carried one call (the frozen-prompt revision), so "zero provider calls" never
 // fired. This module attributes provider calls to the individual guided
-// transition that produced them, so a transition that emits pipeline
+// or freeform compose transition that produced them, so a transition that emits pipeline
 // structure with no provider call is visible on its own line.
 //
 // Evidence discipline: provider calls come from the backend's durable audit
 // rows (role="audit" llm_call_audit / planner_attempt_audit envelopes on the
 // session's chat_messages, exposed by GET /messages?include_llm_audit=true),
 // never from client-side timing. Attribution is by ROW IDENTITY: the recorder
-// (helpers/transition-ledger-recorder.ts) holds each guided HTTP response back
+// (helpers/transition-ledger-recorder.ts) holds each authoring HTTP response back
 // from the browser until it has re-read the durable rows, so every new row id
 // belongs unambiguously to the transition whose settlement just committed it
 // (guided settlements write their audit cohort inside the request; the
@@ -26,18 +26,21 @@ export const TRANSITION_LEDGER_SCHEMA = "transition-ledger/1";
 
 /** The HTTP boundaries that constitute a tutorial transition. */
 export type TransitionEndpoint =
+  | "freeform/compose"
   | "guided/start"
   | "guided/respond"
   | "guided/chat"
   | "tutorial/run";
 
 const GUIDED_ENDPOINT = /\/api\/sessions\/([0-9a-f-]{36})\/guided\/(start|respond|chat)(?:[?#]|$)/i;
+const FREEFORM_ENDPOINT = /\/api\/sessions\/([0-9a-f-]{36})\/messages(?:[?#]|$)/i;
 const TUTORIAL_RUN_ENDPOINT = /\/api\/tutorial\/run(?:[?#]|$)/i;
 
 /** Classify a browser request as a transition boundary, or null. POST only;
- *  `guided/start/{op}/reconcile` and GET /guided probes are not transitions. */
+ *  `guided/start/{op}/reconcile`, GET /guided, and GET /messages are not transitions. */
 export function classifyTransitionRequest(url: string, method: string): TransitionEndpoint | null {
   if (method !== "POST") return null;
+  if (FREEFORM_ENDPOINT.test(url)) return "freeform/compose";
   const guided = GUIDED_ENDPOINT.exec(url);
   if (guided !== null) {
     const verb = guided[2].toLowerCase();
@@ -51,7 +54,9 @@ export function classifyTransitionRequest(url: string, method: string): Transiti
 
 export function sessionIdFromTransitionUrl(url: string): string | null {
   const guided = GUIDED_ENDPOINT.exec(url);
-  return guided === null ? null : guided[1].toLowerCase();
+  if (guided !== null) return guided[1].toLowerCase();
+  const freeform = FREEFORM_ENDPOINT.exec(url);
+  return freeform === null ? null : freeform[1].toLowerCase();
 }
 
 // ── Durable audit rows ────────────────────────────────────────────────────────
@@ -228,7 +233,7 @@ export interface TransitionRequestView {
   respond_shape: string | null;
   /** guided/respond: the control signal, when one was sent. */
   control_signal: string | null;
-  /** guided/chat: message length only; the text itself is not recorded. */
+  /** guided/chat or freeform/compose: message length only, never its text. */
   chat_message_chars: number | null;
 }
 
@@ -274,12 +279,17 @@ export function transitionViolations(entry: Omit<TransitionLedgerEntry, "violati
   if (
     ok &&
     entry.evidence.status === "complete" &&
-    entry.response.next_turn_type === "propose_pipeline" &&
+    (entry.response.next_turn_type === "propose_pipeline" ||
+      entry.response.next_turn_type === "freeform_proposal" ||
+      entry.response.next_turn_type === "freeform_state") &&
     entry.response.new_turn_occurrence &&
     entry.evidence.planner_calls === 0
   ) {
+    const structure = entry.endpoint === "freeform/compose"
+      ? "new freeform pipeline structure"
+      : "a new propose_pipeline turn";
     violations.push(
-      `${label}: emitted a new propose_pipeline turn with zero planner provider calls attributed to it (server-authored structure?)`,
+      `${label}: emitted ${structure} with zero planner provider calls attributed to it (server-authored structure?)`,
     );
   }
   return violations;
@@ -299,7 +309,7 @@ export interface TransitionLedgerTotals {
   planner_runs: number;
   failed_calls: number;
   model_latency_ms: number;
-  /** Sum of guided transition durations (start/respond/chat), excluding the run. */
+  /** Historical field name; sum of authoring transition durations, excluding the run. */
   guided_wall_clock_ms: number;
   /** First build gesture -> run request (the review's wall clock to "ready"). */
   wall_clock_to_run_ms: number | null;
@@ -338,12 +348,15 @@ export function ledgerTotals(
   postGestures: readonly LedgerGesture[],
   finalRows: readonly LlmAuditRow[],
 ): TransitionLedgerTotals {
-  const startIndex = entries.findIndex((entry) => entry.endpoint === "guided/start");
+  const guidedStartIndex = entries.findIndex((entry) => entry.endpoint === "guided/start");
+  const freeformStartIndex = entries.findIndex((entry) => entry.endpoint === "freeform/compose");
+  const startIndex = guidedStartIndex === -1 ? freeformStartIndex : guidedStartIndex;
+  const firstBuildIndex = guidedStartIndex === -1 ? freeformStartIndex : guidedStartIndex + 1;
   const runIndex = entries.findIndex((entry) => entry.endpoint === "tutorial/run");
   const buildEntries = entries.filter(
-    (_entry, index) => index > startIndex && (runIndex === -1 || index <= runIndex),
+    (_entry, index) => index >= firstBuildIndex && (runIndex === -1 || index <= runIndex),
   );
-  const firstBuildGesture = buildEntries.flatMap((entry) => entry.gestures)[0] ?? null;
+  const firstBuildGesture = startIndex === -1 ? null : (buildEntries.flatMap((entry) => entry.gestures)[0] ?? null);
   const run = runIndex === -1 ? null : entries[runIndex];
   const claimed = new Set(entries.flatMap((entry) => entry.evidence.row_ids));
   const unattributedCalls = finalRows.filter((row) => row.kind === "llm_call" && !claimed.has(row.id));
@@ -422,7 +435,7 @@ export function renderLedgerMarkdown(ledger: TransitionLedger): string {
   const t = ledger.totals;
   lines.push("");
   lines.push(
-    `Totals: ${t.transitions} transitions · ${t.gestures} gestures (${t.gestures_to_run ?? "-"} to run) · ${t.provider_calls} provider calls · ${t.planner_calls} planner calls in ${t.planner_runs} planner run(s) · model time ${ms(t.model_latency_ms)} · guided wall clock ${ms(t.guided_wall_clock_ms)} · first build gesture → run ${ms(t.wall_clock_to_run_ms)} · run ${ms(t.run_wall_clock_ms)} · unattributed ${t.unattributed_provider_calls} (${t.unattributed_planner_calls} planner) · gaps ${t.attribution_gaps}`,
+    `Totals: ${t.transitions} transitions · ${t.gestures} gestures (${t.gestures_to_run ?? "-"} to run) · ${t.provider_calls} provider calls · ${t.planner_calls} planner calls in ${t.planner_runs} planner run(s) · model time ${ms(t.model_latency_ms)} · authoring wall clock ${ms(t.guided_wall_clock_ms)} · first build gesture → run ${ms(t.wall_clock_to_run_ms)} · run ${ms(t.run_wall_clock_ms)} · unattributed ${t.unattributed_provider_calls} (${t.unattributed_planner_calls} planner) · gaps ${t.attribution_gaps}`,
   );
   if (ledger.post_gestures.length > 0) {
     lines.push(`Post-run gestures: ${ledger.post_gestures.map((gesture) => gesture.label).join(", ")}`);

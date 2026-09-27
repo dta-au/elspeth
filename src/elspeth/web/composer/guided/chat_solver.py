@@ -28,6 +28,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, NotRequired, TypedDict, cast, get_args
 from uuid import UUID
 
+import httpx
 from pydantic import ValidationError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
@@ -42,6 +43,7 @@ from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, ge
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.guided._discovery import _assistant_tool_calls_message, _execute_discovery_call
@@ -85,9 +87,10 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
+from elspeth.web.composer.provider_errors import ProviderFailure, classify_provider_failure
+from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
-from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.composer.state import CompositionState, NodeType
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
@@ -103,6 +106,18 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 # "Step 1 source commit failed". Mirrors ``_WEB_ONLY_SOURCE_KEYS`` in
 # ``composer/tools/_common.py`` (the commit-side stripper for prevalidation).
 _RESOLVER_FORBIDDEN_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset({"blob_ref", SOURCE_AUTHORING_KEY})
+
+
+class GuidedProviderTransportError(Exception):
+    """Owned failure from the physical guided LLM call's HTTP transport."""
+
+
+def classify_guided_provider_failure(exc: BaseException) -> ProviderFailure | None:
+    """Classify guided provider failures without mislabeling tool HTTP traffic."""
+    if isinstance(exc, GuidedProviderTransportError):
+        return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
+    return classify_provider_failure(exc)
+
 
 # Register guard for the user-facing chat message. Models occasionally dump
 # their internal agentic scratchpad — pseudo tool-call transcripts in
@@ -961,7 +976,7 @@ def _fold_deferred_constraint_kind_names() -> tuple[str, ...]:
     variant is a boot/collection failure beside the partition assert above it,
     not a live-turn 500. Previously a shape error surfaced as a KeyError or
     IndexError escaping every handler in ``_guided_step_chat.py`` — neither is
-    a ``ValueError``, so neither matched ``_guided_tool_transient_exception_types``
+    a ``ValueError``, so neither matched the earlier guided fallback set
     — and reached the route's broad handler as a durably-failed guided
     operation and an HTTP 500. Honest, audited, and far too late.
     """
@@ -2866,7 +2881,8 @@ async def maybe_manage_deferred_intent_chat(
         error_message = "malformed_response"
         raise
     except Exception as exc:
-        status = ComposerLLMCallStatus.API_ERROR
+        failure = classify_guided_provider_failure(exc)
+        status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
         error_class = type(exc).__name__
         error_message = type(exc).__name__
         raise
@@ -3168,7 +3184,10 @@ async def _bounded_acompletion(kwargs: dict[str, Any], timeout_seconds: float) -
         raise TypeError("timeout_seconds must be a finite positive number")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be a finite positive number")
-    return await asyncio.wait_for(_litellm_acompletion(**kwargs), timeout=timeout_seconds)
+    try:
+        return await asyncio.wait_for(provider_gateway._litellm_acompletion(**kwargs), timeout=timeout_seconds)
+    except httpx.TransportError as exc:
+        raise GuidedProviderTransportError("Guided provider transport failed") from exc
 
 
 @quota_provider_calls
@@ -3789,7 +3808,8 @@ async def maybe_resolve_step_1_source_chat(
                 return repair_outcome
             raise
         except Exception as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+            failure = classify_guided_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
@@ -4274,7 +4294,7 @@ async def maybe_resolve_step_2_sink_chat(
     reasoning_effort: str | None = None,
     # Per-session get_plugin_schema success tracker hook — the same tracker
     # the freeform batch and planner surfaces write
-    # (ComposerServiceImpl._mark_plugin_schema_loaded, bound to a session id;
+    # (SchemaDisclosureTracker.mark_plugin_schema_loaded, bound to a session id;
     # key shape (plugin_type, plugin_name)). Only SUCCESSES mark; a
     # semantically-failed result threads back to the model unmarked.
     mark_schema_loaded: Callable[[str, str], None] | None = None,
@@ -4808,7 +4828,8 @@ async def maybe_resolve_step_2_sink_chat(
                 return repair_outcome
             raise
         except Exception as exc:
-            status = ComposerLLMCallStatus.API_ERROR
+            failure = classify_guided_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
             repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
@@ -4995,7 +5016,8 @@ async def solve_step_chat(
         error_message = "malformed_response"
         raise
     except Exception as exc:
-        status = ComposerLLMCallStatus.API_ERROR
+        failure = classify_guided_provider_failure(exc)
+        status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
         error_class = type(exc).__name__
         error_message = type(exc).__name__
         raise

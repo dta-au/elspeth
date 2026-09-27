@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
@@ -17,7 +18,7 @@ from elspeth.plugins.infrastructure.validation import get_sink_config_model, get
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.compartments import chat_ingress_input, compartment_ingress_record
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
-from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
+from elspeth.web.composer.guided.profile import WorkflowProfileKind, profile_for_kind
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GUIDED_GOAL_ACKNOWLEDGEMENT, Turn, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
@@ -48,8 +49,8 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.redaction import assert_guided_custody_persistable
-from elspeth.web.composer.service import ComposerAdmissionRefused
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -59,10 +60,6 @@ from elspeth.web.composer.source_inspection import (
     resolve_source_inspection_blob_id,
 )
 from elspeth.web.composer.tools._common import validate_composer_file_sink_collision_policy
-from elspeth.web.composer.tutorial_sample import (
-    resolve_tutorial_sample_urls,
-    tutorial_sample_base_url,
-)
 from elspeth.web.interpretation_state import refine_prompt_shield_warnings_for_availability
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS, allowed_sink_directories, resolve_sink_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -101,7 +98,6 @@ from elspeth.web.sessions.schemas import (
     GuidedStartOperationReconciliationResponse,
     ReenterGuidedRequest,
     StartGuidedRequest,
-    TutorialSampleResponse,
 )
 
 from .._helpers import (
@@ -203,6 +199,38 @@ _CONTRACT_REJECTION_EXC_MESSAGE_CHARS = 500
 # row is pathological lease churn and terminates in AuditIntegrityError
 # instead of an unbounded retry.
 _GUIDED_FENCE_REJOIN_ATTEMPTS = 5
+
+
+async def _await_guided_state_write_preserving_failure[T](awaitable: Awaitable[T]) -> T:
+    """Surface a joined child's failure to routes with no cancellation audit arm.
+
+    Reenter and CONVERT rely on their exception handlers or lease guard for
+    terminal failure classification. An attached settlement failure cannot
+    remain hidden inside request cancellation at that boundary.
+    """
+    write_task = asyncio.ensure_future(awaitable)
+    try:
+        return await _await_guided_atomic_settlement(write_task)
+    except asyncio.CancelledError as cancellation:
+        markers = cancellation.__dict__
+        if _GUIDED_ATOMIC_SETTLEMENT_COMPLETED in markers and markers[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] is True:
+            raise
+        if _GUIDED_ATOMIC_SETTLEMENT_FAILURE in markers:
+            failure = markers[_GUIDED_ATOMIC_SETTLEMENT_FAILURE]
+            if isinstance(failure, asyncio.CancelledError):
+                raise AuditIntegrityError("Guided state settlement child was cancelled before completion") from cancellation
+            if isinstance(failure, BaseException):
+                raise failure from cancellation
+            raise AuditIntegrityError("Guided state settlement reported an invalid failure marker") from cancellation
+        if write_task.cancelled():
+            # The child and caller can both cancel before the helper's first
+            # shielded await resumes. In that ordering the helper has no
+            # retained caller cancellation to annotate with child evidence.
+            raise AuditIntegrityError("Guided state settlement child was cancelled before completion") from cancellation
+        caller = asyncio.current_task()
+        if caller is None or caller.cancelling() == 0:
+            raise AuditIntegrityError("Guided state settlement child was cancelled before completion") from cancellation
+        raise
 
 
 def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
@@ -957,55 +985,6 @@ async def get_guided(
         )
 
 
-@router.get("/{session_id}/guided/tutorial-sample", response_model=TutorialSampleResponse)
-async def get_guided_tutorial_sample(
-    session_id: UUID,
-    request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
-) -> TutorialSampleResponse:
-    """Return the runtime-derived synthetic-scrape inputs for a TUTORIAL session.
-
-    Exposes the 3 synthetic sample-page URLs for the active tutorial session.
-    The base is resolved via ``tutorial_sample_base_url`` (a configured
-    ``WebSettings.tutorial_sample_base_url`` wins, else the canonical public
-    GitHub Pages copy). The URLs are a runtime-derived payload computed by the
-    server seam. The pages are publicly hosted, so the tutorial's ``web_scrape``
-    node needs no server-injected SSRF allowlist (it uses the plugin default
-    ``allowed_hosts="public_only"``).
-
-    Read-only: this route never mutates state. Returns 404 if the session does
-    not exist or does not belong to the requesting user. Returns 400 if the
-    session has no guided session, or is not a tutorial session (a
-    live/freeform session has no tutorial sample surface).
-    """
-    await _verify_session_ownership(session_id, user, request)
-    service: SessionServiceProtocol = request.app.state.session_service
-
-    state_record = await service.get_current_state(session_id)
-    if state_record is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No active guided session for this session; start a tutorial session first.",
-        )
-    state = _state_from_record(state_record)
-    guided = state.guided_session
-    if guided is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Session is not in guided mode; the tutorial sample surface is guided-only.",
-        )
-    if guided.profile != TUTORIAL_PROFILE:
-        raise HTTPException(
-            status_code=400,
-            detail="Session is not a tutorial session; no tutorial sample surface is available.",
-        )
-
-    settings = request.app.state.settings
-    base_url = tutorial_sample_base_url(settings=settings)
-    sample_urls = resolve_tutorial_sample_urls(base_url=base_url)
-    return TutorialSampleResponse(sample_urls=list(sample_urls))
-
-
 @router.post("/{session_id}/guided/reenter", response_model=GetGuidedResponse)
 async def post_guided_reenter(
     session_id: UUID,
@@ -1052,6 +1031,7 @@ async def post_guided_reenter(
     from ..guided_operations import (
         GuidedOperationExpired,
         GuidedOperationLease,
+        _await_guided_terminal_write,
         guided_operation_lock_guard,
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
@@ -1286,33 +1266,37 @@ async def post_guided_reenter(
             else None
         )
         try:
-            settlement = await service.settle_guided_state_operation(
-                GuidedStateOperationCommand(
-                    fence=reserved.fence,
-                    expected_current_state_id=state_record.id,
-                    expected_current_state_version=state_record.version,
-                    expected_current_content_hash=composition_content_hash(state),
-                    state_id=uuid4(),
-                    state=state_data,
-                    provenance="convergence_persist",
-                    actor="composer_route",
-                    response=GuidedResponseDescriptor(
-                        kind="guided_reenter",
-                        next_turn=next_turn_descriptor,
-                        assistant_turn_seq=None,
+            settlement = await _await_guided_state_write_preserving_failure(
+                service.settle_guided_state_operation(
+                    GuidedStateOperationCommand(
+                        fence=reserved.fence,
+                        expected_current_state_id=state_record.id,
+                        expected_current_state_version=state_record.version,
+                        expected_current_content_hash=composition_content_hash(state),
+                        state_id=uuid4(),
+                        state=state_data,
+                        provenance="convergence_persist",
+                        actor="composer_route",
+                        response=GuidedResponseDescriptor(
+                            kind="guided_reenter",
+                            next_turn=next_turn_descriptor,
+                            assistant_turn_seq=None,
+                        ),
+                        payloads=(prepared_turn,) if prepared_turn is not None else (),
+                        audit_evidence=audit_evidence,
                     ),
-                    payloads=(prepared_turn,) if prepared_turn is not None else (),
-                    audit_evidence=audit_evidence,
-                ),
-                payload_store=request.app.state.payload_store,
-                session_operation_context=reserved.session_operation_context,
+                    payload_store=request.app.state.payload_store,
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
         except GuidedOperationSettlementConflictError:
-            failed = await service.fail_guided_operation(
-                reserved.fence,
-                failure_code="stale_conflict",
-                actor="composer_route",
-                session_operation_context=reserved.session_operation_context,
+            failed = await _await_guided_terminal_write(
+                service.fail_guided_operation(
+                    reserved.fence,
+                    failure_code="stale_conflict",
+                    actor="composer_route",
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
             raise_guided_operation_failure(failed)
         return _response_from_record(settlement.result_state)
@@ -1524,6 +1508,7 @@ async def post_guided_start(
     from ..guided_operations import (
         GuidedOperationExpired,
         GuidedOperationLease,
+        _await_guided_terminal_write,
         guided_operation_lease_guard,
         guided_response_hash,
         raise_guided_operation_failure,
@@ -1820,7 +1805,7 @@ async def post_guided_start(
                     "stale_conflict"
                     if isinstance(settlement_failure, GuidedOperationSettlementConflictError)
                     else "integrity_error"
-                    if isinstance(settlement_failure, AuditIntegrityError)
+                    if isinstance(settlement_failure, (*contract_errors.TIER_1_ERRORS, asyncio.CancelledError))
                     else "operation_failed"
                 )
             else:
@@ -1838,9 +1823,19 @@ async def post_guided_start(
                     )
                 )
             except GuidedOperationFenceLostError as fence_lost:
+                if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                    raise settlement_failure from fence_lost
                 raise exc from fence_lost
             except Exception as failure_exc:
+                if isinstance(failure_exc, contract_errors.TIER_1_ERRORS):
+                    raise failure_exc from exc
+                if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                    raise settlement_failure from failure_exc
                 raise exc from failure_exc
+            if isinstance(settlement_failure, asyncio.CancelledError):
+                raise AuditIntegrityError("Guided START settlement child was cancelled before completion") from exc
+            if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                raise settlement_failure from exc
             if settlement_failure is not None:
                 raise exc from settlement_failure
             raise
@@ -1894,11 +1889,13 @@ async def post_guided_start(
                     request_id=_failure_log_request_id(request),
                 )
             try:
-                failed = await service.fail_guided_operation(
-                    reserved.fence,
-                    failure_code=failure_code,
-                    actor="composer_route",
-                    session_operation_context=reserved.session_operation_context,
+                failed = await _await_guided_terminal_write(
+                    service.fail_guided_operation(
+                        reserved.fence,
+                        failure_code=failure_code,
+                        actor="composer_route",
+                        session_operation_context=reserved.session_operation_context,
+                    )
                 )
             except GuidedOperationFenceLostError:
                 continue
@@ -1969,6 +1966,7 @@ async def post_guided_convert(
     from ..guided_operations import (
         GuidedOperationExpired,
         GuidedOperationLease,
+        _await_guided_terminal_write,
         guided_operation_lease_guard,
         guided_response_hash,
         raise_guided_operation_failure,
@@ -2196,28 +2194,32 @@ async def post_guided_convert(
                     f"freeform pipeline is saved as version {state_record.version} and can "
                     "be restored from version history."
                 )
-            state_record_out = await service.save_state_for_guided_operation(
-                reserved.fence,
-                expected_current_state_id=state_record.id if state_record is not None else None,
-                expected_current_state_version=state_record.version if state_record is not None else None,
-                state=state_data,
-                provenance="session_seed",
-                actor="composer_route",
-                response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
-                system_message=system_message,
-                payloads=(prepared_seed_turn,),
-                audit_evidence=seed_evidence,
-                originating_message=root_message,
-                payload_store=request.app.state.payload_store,
-                session_operation_context=reserved.session_operation_context,
+            state_record_out = await _await_guided_state_write_preserving_failure(
+                service.save_state_for_guided_operation(
+                    reserved.fence,
+                    expected_current_state_id=state_record.id if state_record is not None else None,
+                    expected_current_state_version=state_record.version if state_record is not None else None,
+                    state=state_data,
+                    provenance="session_seed",
+                    actor="composer_route",
+                    response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
+                    system_message=system_message,
+                    payloads=(prepared_seed_turn,),
+                    audit_evidence=seed_evidence,
+                    originating_message=root_message,
+                    payload_store=request.app.state.payload_store,
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
             return _response_from_record(state_record_out)
     except GuidedOperationSettlementConflictError:
-        failed = await service.fail_guided_operation(
-            reserved.fence,
-            failure_code="stale_conflict",
-            actor="composer_route",
-            session_operation_context=reserved.session_operation_context,
+        failed = await _await_guided_terminal_write(
+            service.fail_guided_operation(
+                reserved.fence,
+                failure_code="stale_conflict",
+                actor="composer_route",
+                session_operation_context=reserved.session_operation_context,
+            )
         )
         raise_guided_operation_failure(failed)
     except Exception as exc:
@@ -2225,11 +2227,13 @@ async def post_guided_convert(
             "integrity_error" if isinstance(exc, contract_errors.TIER_1_ERRORS) else "operation_failed"
         )
         try:
-            await service.fail_guided_operation(
-                reserved.fence,
-                failure_code=failure_code,
-                actor="composer_route",
-                session_operation_context=reserved.session_operation_context,
+            await _await_guided_terminal_write(
+                service.fail_guided_operation(
+                    reserved.fence,
+                    failure_code=failure_code,
+                    actor="composer_route",
+                    session_operation_context=reserved.session_operation_context,
+                )
             )
         except BaseException as settlement_error:
             if isinstance(exc, contract_errors.TIER_1_ERRORS):
@@ -3014,6 +3018,7 @@ async def post_guided_respond(
     from ..guided_operations import (
         GuidedOperationExpired,
         GuidedOperationLease,
+        _await_guided_terminal_write,
         bounded_admission_guard,
         guided_operation_lease_guard,
         raise_guided_operation_failure,
@@ -3027,7 +3032,6 @@ async def post_guided_respond(
     _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
 
     service: SessionServiceProtocol = request.app.state.session_service
-    composer = request.app.state.composer_service
     payload_store = request.app.state.payload_store
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     rate_limiter = await get_rate_limiter(request)
@@ -3121,7 +3125,7 @@ async def post_guided_respond(
         ):
             raise AuditIntegrityError("Guided RESPOND replay result proposal has incomplete composer provenance")
         record = await service.get_state_in_session(result.state_id, session_id)
-        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
         from elspeth.web.coordination.contracts import SessionOperationKind
         from elspeth.web.coordination.lifecycle import SessionOperationLease
 
@@ -3315,26 +3319,28 @@ async def post_guided_respond(
             ),
             assistant_turn_seq=None,
         )
-        rewound = await service.back_edit_guided_pipeline_proposal(
-            GuidedPipelineProposalBackEditCommand(
-                fence=fence,
-                expected_current_state_id=state_record.id,
-                expected_current_state_version=state_record.version,
-                expected_current_content_hash=composition_content_hash(state),
-                proposal_id=active.proposal_id,
-                draft_hash=active.draft_hash,
-                reviewed_facts=reviewed_facts,
-                edit_target=component_target,
-                state=rewind_state_data,
-                actor="composer_route",
-                response=rewind_response,
-                payloads=(prepared_response, prepared_edit),
-                origin=origin,
-                correction_feedback=correction_feedback,
-                audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
-            ),
-            payload_store=payload_store,
-            session_operation_context=session_operation_context,
+        rewound = await _await_guided_atomic_settlement(
+            service.back_edit_guided_pipeline_proposal(
+                GuidedPipelineProposalBackEditCommand(
+                    fence=fence,
+                    expected_current_state_id=state_record.id,
+                    expected_current_state_version=state_record.version,
+                    expected_current_content_hash=composition_content_hash(state),
+                    proposal_id=active.proposal_id,
+                    draft_hash=active.draft_hash,
+                    reviewed_facts=reviewed_facts,
+                    edit_target=component_target,
+                    state=rewind_state_data,
+                    actor="composer_route",
+                    response=rewind_response,
+                    payloads=(prepared_response, prepared_edit),
+                    origin=origin,
+                    correction_feedback=correction_feedback,
+                    audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                ),
+                payload_store=payload_store,
+                session_operation_context=session_operation_context,
+            )
         )
         return _response_from_record(rewound.result_state)
 
@@ -3931,47 +3937,51 @@ async def post_guided_respond(
                         settled_tool_invocations = tool_recorder.invocations
                         if tool_invocation_count is not None:
                             settled_tool_invocations = settled_tool_invocations[:tool_invocation_count]
-                        nonproposal_settlement = await service.settle_guided_state_operation(
-                            GuidedStateOperationCommand(
-                                fence=current_fence,
-                                expected_current_state_id=(current_state_record.id if current_state_record is not None else None),
-                                expected_current_state_version=(current_state_record.version if current_state_record is not None else None),
-                                expected_current_content_hash=(
-                                    composition_content_hash(current_state) if current_state_record is not None else None
-                                ),
-                                state_id=uuid4(),
-                                state=CompositionStateData(
-                                    sources=settled_state_dict["sources"],
-                                    nodes=settled_state_dict["nodes"],
-                                    edges=settled_state_dict["edges"],
-                                    outputs=settled_state_dict["outputs"],
-                                    metadata_=settled_state_dict["metadata"],
-                                    is_valid=settled_is_valid,
-                                    validation_errors=settled_validation_errors,
-                                    composer_meta=settled_meta,
-                                ),
-                                provenance="convergence_persist",
-                                actor="composer_route",
-                                response=GuidedResponseDescriptor(
-                                    kind="guided_respond",
-                                    next_turn=GuidedReplayTurn(
-                                        turn_type=TurnType(current_turn["type"]),
-                                        step_index=current_turn["step_index"],
-                                        payload_id=prepared_current.payload_id,
+                        nonproposal_settlement = await _await_guided_atomic_settlement(
+                            service.settle_guided_state_operation(
+                                GuidedStateOperationCommand(
+                                    fence=current_fence,
+                                    expected_current_state_id=(current_state_record.id if current_state_record is not None else None),
+                                    expected_current_state_version=(
+                                        current_state_record.version if current_state_record is not None else None
                                     ),
-                                    assistant_turn_seq=None,
+                                    expected_current_content_hash=(
+                                        composition_content_hash(current_state) if current_state_record is not None else None
+                                    ),
+                                    state_id=uuid4(),
+                                    state=CompositionStateData(
+                                        sources=settled_state_dict["sources"],
+                                        nodes=settled_state_dict["nodes"],
+                                        edges=settled_state_dict["edges"],
+                                        outputs=settled_state_dict["outputs"],
+                                        metadata_=settled_state_dict["metadata"],
+                                        is_valid=settled_is_valid,
+                                        validation_errors=settled_validation_errors,
+                                        composer_meta=settled_meta,
+                                    ),
+                                    provenance="convergence_persist",
+                                    actor="composer_route",
+                                    response=GuidedResponseDescriptor(
+                                        kind="guided_respond",
+                                        next_turn=GuidedReplayTurn(
+                                            turn_type=TurnType(current_turn["type"]),
+                                            step_index=current_turn["step_index"],
+                                            payload_id=prepared_current.payload_id,
+                                        ),
+                                        assistant_turn_seq=None,
+                                    ),
+                                    payloads=settled_payloads,
+                                    audit_evidence=GuidedAuditEvidence(
+                                        invocations=(*llm_recorder.invocations, *settled_tool_invocations),
+                                        llm_calls=llm_recorder.llm_calls,
+                                        planner_attempts=llm_recorder.planner_attempts,
+                                        chat_turns=llm_recorder.chat_turns,
+                                    ),
+                                    rebased_pending_proposal=settled_rebase,
                                 ),
-                                payloads=settled_payloads,
-                                audit_evidence=GuidedAuditEvidence(
-                                    invocations=(*llm_recorder.invocations, *settled_tool_invocations),
-                                    llm_calls=llm_recorder.llm_calls,
-                                    planner_attempts=llm_recorder.planner_attempts,
-                                    chat_turns=llm_recorder.chat_turns,
-                                ),
-                                rebased_pending_proposal=settled_rebase,
-                            ),
-                            payload_store=payload_store,
-                            session_operation_context=session_operation_context,
+                                payload_store=payload_store,
+                                session_operation_context=session_operation_context,
+                            )
                         )
                         return _response_from_record(nonproposal_settlement.result_state)
 
@@ -4033,22 +4043,24 @@ async def post_guided_respond(
                             raise AuditIntegrityError("guided proposal action authority changed after reservation")
 
                         if body.control_signal == "reject":
-                            rejected = await service.reject_guided_pipeline_proposal(
-                                GuidedPipelineProposalRejectCommand(
-                                    fence=fence,
-                                    expected_current_state_id=state_record.id,
-                                    expected_current_state_version=state_record.version,
-                                    proposal_id=guided.active_proposal.proposal_id,
-                                    draft_hash=guided.active_proposal.draft_hash,
-                                    reviewed_facts=reviewed_facts,
-                                    actor="composer_route",
-                                    response=GuidedResponseDescriptor(
-                                        kind="guided_respond",
-                                        next_turn=None,
-                                        assistant_turn_seq=None,
+                            rejected = await _await_guided_atomic_settlement(
+                                service.reject_guided_pipeline_proposal(
+                                    GuidedPipelineProposalRejectCommand(
+                                        fence=fence,
+                                        expected_current_state_id=state_record.id,
+                                        expected_current_state_version=state_record.version,
+                                        proposal_id=guided.active_proposal.proposal_id,
+                                        draft_hash=guided.active_proposal.draft_hash,
+                                        reviewed_facts=reviewed_facts,
+                                        actor="composer_route",
+                                        response=GuidedResponseDescriptor(
+                                            kind="guided_respond",
+                                            next_turn=None,
+                                            assistant_turn_seq=None,
+                                        ),
                                     ),
-                                ),
-                                session_operation_context=reserved.session_operation_context,
+                                    session_operation_context=reserved.session_operation_context,
+                                )
                             )
                             return _response_from_record(rejected.result_state)
 
@@ -4273,7 +4285,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=planner_current_state,
                                 guided=planning_guided,
@@ -4627,31 +4639,33 @@ async def post_guided_respond(
                                 "guided_session": final_guided.to_dict(),
                             },
                         )
-                        settlement = await service.settle_guided_state_operation(
-                            GuidedStateOperationCommand(
-                                fence=fence,
-                                expected_current_state_id=state_record.id,
-                                expected_current_state_version=state_record.version,
-                                expected_current_content_hash=composition_content_hash(state),
-                                state_id=uuid4(),
-                                state=state_data,
-                                provenance="convergence_persist",
-                                actor="composer_route",
-                                response=GuidedResponseDescriptor(
-                                    kind="guided_respond",
-                                    next_turn=GuidedReplayTurn(
-                                        turn_type=TurnType(wire_turn["type"]),
-                                        step_index=wire_turn["step_index"],
-                                        payload_id=prepared_wire.payload_id,
+                        settlement = await _await_guided_atomic_settlement(
+                            service.settle_guided_state_operation(
+                                GuidedStateOperationCommand(
+                                    fence=fence,
+                                    expected_current_state_id=state_record.id,
+                                    expected_current_state_version=state_record.version,
+                                    expected_current_content_hash=composition_content_hash(state),
+                                    state_id=uuid4(),
+                                    state=state_data,
+                                    provenance="convergence_persist",
+                                    actor="composer_route",
+                                    response=GuidedResponseDescriptor(
+                                        kind="guided_respond",
+                                        next_turn=GuidedReplayTurn(
+                                            turn_type=TurnType(wire_turn["type"]),
+                                            step_index=wire_turn["step_index"],
+                                            payload_id=prepared_wire.payload_id,
+                                        ),
+                                        assistant_turn_seq=None,
                                     ),
-                                    assistant_turn_seq=None,
+                                    payloads=(prepared_response, prepared_wire),
+                                    audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                                    rebased_pending_proposal=reviewed_rebase,
                                 ),
-                                payloads=(prepared_response, prepared_wire),
-                                audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
-                                rebased_pending_proposal=reviewed_rebase,
-                            ),
-                            payload_store=payload_store,
-                            session_operation_context=reserved.session_operation_context,
+                                payload_store=payload_store,
+                                session_operation_context=reserved.session_operation_context,
+                            )
                         )
                         return _response_from_record(settlement.result_state)
                     elif not is_active_exit and guided.step is GuidedStep.STEP_4_WIRE:
@@ -4767,7 +4781,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=body.correction_feedback,
                                 current_state=predecessor_candidate,
                                 guided=planning_guided,
@@ -5210,7 +5224,7 @@ async def post_guided_respond(
                         # deferred cancellation: the settlement is durable, and
                         # skipping here would orphan the session in exactly the
                         # failure this pass exists to prevent.
-                        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+                        from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
                         planner_row = authority.row
                         if (
@@ -5448,7 +5462,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            outcome = await composer.plan_guided_pipeline(
+                            outcome = await request.app.state.planning_application.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=state,
                                 guided=resulting_guided,
@@ -5663,10 +5677,12 @@ async def post_guided_respond(
                     # CHAT and other current writers do not all carry an
                     # expected-head CAS yet, so settlement remains mutually
                     # exclusive with them under the session compose lock.
-                    settlement = await service.settle_guided_state_operation(
-                        settlement_command,
-                        payload_store=payload_store,
-                        session_operation_context=reserved.session_operation_context,
+                    settlement = await _await_guided_atomic_settlement(
+                        service.settle_guided_state_operation(
+                            settlement_command,
+                            payload_store=payload_store,
+                            session_operation_context=reserved.session_operation_context,
+                        )
                     )
                     return _response_from_record(settlement.result_state)
             except GuidedOperationFenceLostError:
@@ -5695,7 +5711,7 @@ async def post_guided_respond(
                         "stale_conflict"
                         if isinstance(settlement_failure, GuidedOperationSettlementConflictError)
                         else "integrity_error"
-                        if isinstance(settlement_failure, (AuditIntegrityError, InvariantError))
+                        if isinstance(settlement_failure, (*contract_errors.TIER_1_ERRORS, asyncio.CancelledError))
                         else "operation_failed"
                         if settlement_failure is not None or heartbeat_cancelled or not request_cancelled
                         else "request_cancelled"
@@ -5718,9 +5734,19 @@ async def post_guided_respond(
                             )
                         )
                     except GuidedOperationFenceLostError as fence_lost:
+                        if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                            raise settlement_failure from fence_lost
                         raise exc from fence_lost
                     except Exception as failure_exc:
+                        if isinstance(failure_exc, contract_errors.TIER_1_ERRORS):
+                            raise failure_exc from exc
+                        if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                            raise settlement_failure from failure_exc
                         raise exc from failure_exc
+                    if isinstance(settlement_failure, asyncio.CancelledError):
+                        raise AuditIntegrityError("Guided RESPOND settlement child was cancelled before completion") from exc
+                    if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                        raise settlement_failure from exc
                     if settlement_failure is not None:
                         raise exc from settlement_failure
                     raise
@@ -5796,20 +5822,24 @@ async def post_guided_respond(
                     request_id=_failure_log_request_id(request),
                 )
                 try:
-                    failed = await service.fail_guided_operation_with_audit(
-                        GuidedOperationFailureCommand(
-                            fence=reserved.fence,
-                            failure_code=failure_code,
-                            actor="composer_route",
-                            audit_evidence=GuidedAuditEvidence(
-                                invocations=planner_recorder.invocations,
-                                llm_calls=planner_recorder.llm_calls,
-                                planner_attempts=planner_recorder.planner_attempts,
-                                chat_turns=planner_recorder.chat_turns,
+                    failed = await _await_guided_terminal_write(
+                        service.fail_guided_operation_with_audit(
+                            GuidedOperationFailureCommand(
+                                fence=reserved.fence,
+                                failure_code=failure_code,
+                                actor="composer_route",
+                                audit_evidence=GuidedAuditEvidence(
+                                    invocations=planner_recorder.invocations,
+                                    llm_calls=planner_recorder.llm_calls,
+                                    planner_attempts=planner_recorder.planner_attempts,
+                                    chat_turns=planner_recorder.chat_turns,
+                                ),
+                                unproducible_output_fields=(
+                                    exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()
+                                ),
                             ),
-                            unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),
-                        ),
-                        session_operation_context=reserved.session_operation_context,
+                            session_operation_context=reserved.session_operation_context,
+                        )
                     )
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True

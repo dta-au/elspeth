@@ -32,14 +32,18 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from litellm.exceptions import APIError as LiteLLMAPIError
+import httpx
+from openai import OpenAIError
 from opentelemetry import metrics
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.llm_response_parsing import safe_response_model, token_usage_from_response
-from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
+from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
 
@@ -104,6 +108,10 @@ class _MalformedAutoTitleResponseError(Exception):
     """Owned classification for an unusable external completion shape."""
 
 
+class _AutoTitleProviderTransportError(Exception):
+    """The physical auto-title LLM call failed in its HTTP transport."""
+
+
 @dataclass(frozen=True, slots=True)
 class _AdmittedAutoTitleCompletion:
     """Owned values admitted from one external LiteLLM response.
@@ -132,8 +140,10 @@ def _auto_title_exception_class(exc: BaseException) -> str:
         return "TimeoutError"
     if isinstance(exc, asyncio.CancelledError):
         return "CancelledError"
-    if isinstance(exc, LiteLLMAPIError):
-        return "LiteLLMAPIError"
+    if isinstance(exc, _AutoTitleProviderTransportError):
+        return "TransportError"
+    if classify_provider_failure(exc) is not None:
+        return type(exc).__name__
     if isinstance(exc, _MalformedAutoTitleResponseError):
         return "MalformedResponseError"
     return "other"
@@ -273,6 +283,7 @@ async def _charge_auto_title_response(
     response: object,
     attempt_id: str,
     recorded_at: datetime,
+    primary_cancellation: asyncio.CancelledError | None = None,
 ) -> None:
     """Charge one returned auto-title completion to the token ledger (R14, Task I1).
 
@@ -282,19 +293,67 @@ async def _charge_auto_title_response(
     """
     usage = token_usage_from_response(response)
     returned_model = safe_response_model(response)
-    await service.settle_provider_attempt(
-        session_operation_context=session_operation_context,
-        attempt_id=attempt_id,
-        entry=TokenUsageEntry(
-            model=model if returned_model is None else returned_model,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-            cached_prompt_tokens=usage.cached_prompt_tokens,
-            reasoning_tokens=usage.reasoning_tokens,
-            recorded_at=recorded_at,
-            call_id=attempt_id,
-        ),
+    entry = TokenUsageEntry(
+        model=model if returned_model is None else returned_model,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cached_prompt_tokens=usage.cached_prompt_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        recorded_at=recorded_at,
+        call_id=attempt_id,
     )
+
+    async def settle_required_attempt() -> None:
+        try:
+            await service.settle_provider_attempt(
+                session_operation_context=session_operation_context,
+                attempt_id=attempt_id,
+                entry=entry,
+            )
+        except AuditIntegrityError:
+            raise
+        except Exception as exc:
+            raise AuditIntegrityError("Auto-title provider attempt could not be settled") from exc
+
+    settlement = asyncio.create_task(settle_required_attempt())
+    _, interrupted = await _join_auto_title_custody_task(
+        settlement,
+        primary_cancellation=primary_cancellation,
+        child_cancel_message="Auto-title provider settlement was cancelled before durable completion",
+    )
+    if interrupted is not None and primary_cancellation is None:
+        raise interrupted
+
+
+async def _join_auto_title_custody_task[T](
+    task: asyncio.Task[T],
+    *,
+    child_cancel_message: str,
+    primary_cancellation: asyncio.CancelledError | None = None,
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Join owned custody work, preserving primary cancellation and integrity faults."""
+    interrupted = primary_cancellation
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if interrupted is None:
+                interrupted = exc
+        except Exception:
+            break
+    if task.cancelled():
+        try:
+            task.result()
+        except asyncio.CancelledError as child_cancel:
+            raise AuditIntegrityError(child_cancel_message) from (interrupted or child_cancel)
+    try:
+        return task.result(), interrupted
+    except Exception as failure:
+        if interrupted is not None:
+            if isinstance(failure, contract_errors.TIER_1_ERRORS):
+                raise failure from interrupted
+            raise interrupted from failure
+        raise
 
 
 async def maybe_auto_title_session(
@@ -339,24 +398,53 @@ async def maybe_auto_title_session(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    admission = asyncio.create_task(
+        service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
+    )
     try:
-        attempt = await service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
+        attempt, interrupted = await _join_auto_title_custody_task(
+            admission,
+            child_cancel_message="Auto-title provider admission was cancelled before its outcome was known",
+        )
     except ChargeableAdmissionRefused as exc:
         if exc.decision.refusal_reason is None:
             raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
         _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
         return
+    if interrupted is not None:
+        closure = asyncio.create_task(
+            service.cancel_undispatched_provider_attempt(
+                session_operation_context=session_operation_context,
+                attempt_id=attempt.attempt_id,
+                requested_model=model,
+            )
+        )
+        await _join_auto_title_custody_task(
+            closure,
+            primary_cancellation=interrupted,
+            child_cancel_message="Auto-title undispatched attempt closure was cancelled before durable completion",
+        )
+        raise interrupted
     response: object | None = None
     try:
-        response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        try:
+            response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        except httpx.TransportError as exc:
+            raise _AutoTitleProviderTransportError("Auto-title provider transport failed") from exc
         admitted = _admit_auto_title_completion(response)
     except asyncio.CancelledError as exc:
         await _charge_auto_title_response(
-            service, session_operation_context, model=model, response=exc, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
+            service,
+            session_operation_context,
+            model=model,
+            response=exc,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+            primary_cancellation=exc,
         )
         _record_auto_title_failure(exc)
         raise
-    except (LiteLLMAPIError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
+    except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature
@@ -371,6 +459,19 @@ async def maybe_auto_title_session(
         )
         _record_auto_title_failure(exc)
         return
+    except Exception as exc:
+        # A dispatched call remains chargeable even if our own parsing or
+        # provider adapter fails unexpectedly. Keep the original first-party
+        # failure visible after accounting, without calling it provider weather.
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc if response is None else response,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+        )
+        raise
     await _charge_auto_title_response(
         service, session_operation_context, model=model, response=response, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
     )

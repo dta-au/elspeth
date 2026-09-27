@@ -292,6 +292,261 @@ describe("sessionStore", () => {
     });
   });
 
+  describe("freeform send identity", () => {
+    it("retains refresh-only retry when polling canonicalizes the user before an accepted 409", async () => {
+      const api = await import("@/api/client");
+      const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      const pending = useSessionStore.getState().sendMessage("hello");
+      const optimistic = useSessionStore.getState().messages[0];
+      const canonical: ChatMessage = {
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: optimistic.client_request_id, tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      };
+      vi.mocked(api.fetchMessages).mockResolvedValue([canonical]);
+      await useSessionStore.getState().loadInflightMessages("session-1");
+      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
+      vi.mocked(api.fetchCompositionState).mockRejectedValueOnce(new TypeError("offline"));
+      send.reject({status: 409, error_type: "message_already_accepted",
+        client_request_id: optimistic.client_request_id, user_message_id: "canonical-user",
+        detail: "Already accepted"});
+      await pending;
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.id).toBe("canonical-user");
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      await useSessionStore.getState().retryMessage("canonical-user");
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it("does not let a progress tick invalidate a slow accepted-receipt snapshot", async () => {
+      const api = await import("@/api/client");
+      const stateRead = deferred<CompositionState | null>();
+      vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) => Promise.reject({
+        status: 409, error_type: "message_already_accepted",
+        client_request_id: requestId, user_message_id: "canonical-user", detail: "Already accepted",
+      }));
+      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      vi.mocked(api.fetchCompositionState).mockReturnValueOnce(stateRead.promise);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      useSessionStore.setState({activeSessionId: "session-1"});
+
+      const pending = useSessionStore.getState().sendMessage("hello");
+      await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+      // This is the interval callback's read shape. It must be inert while
+      // the owned receipt read is in progress.
+      await useSessionStore.getState().loadComposerProgress("session-1");
+      stateRead.resolve(null);
+      await pending;
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_accepted_user_message_id).toBeUndefined();
+      expect(useSessionStore.getState().error).toContain("saved without a reply");
+    });
+
+    it("keeps a canonical accepted message refresh-only when ambiguous transport reconciliation cannot load state", async () => {
+      const api = await import("@/api/client");
+      vi.mocked(api.sendMessage).mockRejectedValueOnce(new TypeError("offline"));
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      vi.mocked(api.fetchCompositionState).mockRejectedValue(new TypeError("state offline"));
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      await useSessionStore.getState().sendMessage("hello");
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.id).toBe("canonical-user");
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+      await useSessionStore.getState().retryMessage("canonical-user");
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it("attaches provider failure to a canonical user published before the POST fails", async () => {
+      const api = await import("@/api/client");
+      const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      const pending = useSessionStore.getState().sendMessage("hello");
+      const requestId = useSessionStore.getState().messages[0].client_request_id;
+      vi.mocked(api.fetchMessages).mockResolvedValue([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: requestId, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      await useSessionStore.getState().loadInflightMessages("session-1");
+      send.reject({status: 502, error_type: "llm_unavailable", detail: "Provider unavailable"});
+      await pending;
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_status).toBe("failed");
+      expect(canonical.local_error).toContain("temporarily unavailable");
+    });
+
+    it("reuses the original UUID, content, and requested state when an uncertain local send is retried", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+          status: 409,
+          error_type: "message_already_accepted",
+          client_request_id: requestId,
+          user_message_id: "canonical-user",
+          detail: "Message already accepted",
+        }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(makeCompositionState(1));
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
+      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
+
+      await useSessionStore.getState().sendMessage("same words");
+      const failed = useSessionStore.getState().messages[0];
+      expect(failed.local_status).toBe("failed");
+      expect(failed.client_request_id).toMatch(/^[0-9a-f-]{36}$/);
+      useSessionStore.setState({ compositionState: makeCompositionState(2) });
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "same words",
+        client_request_id: failed.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      await useSessionStore.getState().retryMessage(failed.id);
+
+      const calls = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[1].slice(0, 4)).toEqual(calls[0].slice(0, 4));
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages.map((message) => message.id)).toEqual(["canonical-user"]);
+    });
+
+    it("keeps an accepted receipt for refresh-only retry when reconciliation fails", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+        status: 409, error_type: "message_already_accepted", client_request_id: requestId,
+        user_message_id: "canonical-user", detail: "Message already accepted",
+      }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: unresolved.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
+      await useSessionStore.getState().retryMessage(unresolved.id);
+      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
+    });
+
+    it("offers a deliberate canonical recompose after acceptance with no assistant reply", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce({status: 502, error_type: "llm_unavailable", detail: "Model unavailable"})
+        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+          status: 409, error_type: "message_already_accepted", client_request_id: requestId,
+          user_message_id: "canonical-user", detail: "Message already accepted",
+        }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string,
+        tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "failed", inflight_requests: 0});
+      useSessionStore.setState({activeSessionId: "session-1"});
+      await useSessionStore.getState().sendMessage("hello");
+      const local = useSessionStore.getState().messages[0];
+      await useSessionStore.getState().retryMessage(local.id);
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_status).toBe("failed");
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+
+      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 502, detail: "Still unavailable"});
+      await useSessionStore.getState().retryMessage(canonical.id);
+      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "canonical-user", undefined);
+    });
+
+    it("does not match a local intent to another user's identical text", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "other-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: "other-intent", tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages.some((message) => message.id.startsWith("local-") && message.local_status === "failed")).toBe(true);
+    });
+
+    it("names the canonical user message in a deliberate recompose retry", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 409, error_type: "recompose_user_message_mismatch", detail: "Newer user message exists"});
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [{
+        id: "user-1", session_id: "session-1", role: "user", content: "hello", tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z", local_status: "failed",
+      }] });
+      await useSessionStore.getState().retryMessage("user-1");
+      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "user-1", undefined);
+      expect(apiMod.sendMessage).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("recompose_user_message_mismatch");
+    });
+
+    it("marks a conflicting reuse as terminal instead of offering an impossible retry", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 409, error_type: "message_idempotency_conflict", detail: "This request identity belongs to another message.",
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("message_idempotency_conflict");
+    });
+
+    it("does not automatically replay a pending send after a page reload", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages[0].client_request_id).toBeDefined();
+
+      // Pending identities are kept only in memory. A new store activation
+      // reads the server transcript and never invents a replacement key.
+      resetStore(useSessionStore);
+      (apiMod.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await useSessionStore.getState().selectSession("session-1");
+      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().messages).toEqual([]);
+    });
+  });
+
   describe("compose timeout readiness", () => {
     it("starts not ready so every send is gated until the backend wall clock lands", () => {
       // Fail-closed default: the single reactive source of truth for the
@@ -1087,6 +1342,7 @@ describe("sessionStore", () => {
       const sendPromise = useSessionStore
         .getState()
         .sendMessage("hello", controller.signal);
+      canonicalUser.client_request_id = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
       controller.abort("compose_user_cancel");
       await sendPromise;
 
@@ -1754,8 +2010,11 @@ describe("sessionStore", () => {
         tool_calls: null,
         created_at: "2026-09-15T00:00:01Z",
       };
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new TypeError("Failed to fetch"),
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (_session: string, _content: string, requestId: string) => {
+          canonicalUser.client_request_id = requestId;
+          return Promise.reject(new TypeError("Failed to fetch"));
+        },
       );
       (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
         canonicalUser,
@@ -1765,6 +2024,7 @@ describe("sessionStore", () => {
         makeCompositionState(3, ["new-node"]),
       );
       (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "complete", inflight_requests: 0});
 
       useSessionStore.setState({
         activeSessionId: "session-1",
@@ -1784,7 +2044,7 @@ describe("sessionStore", () => {
         true,
       );
       expect(state.compositionState?.version).toBe(3);
-      expect(state.error).toContain("Your request was saved");
+      expect(state.error).toContain("Your message was saved");
       expect(clearValidationMock).toHaveBeenCalled();
     });
 
@@ -1833,6 +2093,20 @@ describe("sessionStore", () => {
       );
       expect(state.error).toContain("Provider status: 402");
       expect(state.messages[0].local_error).toBe(state.error);
+    });
+
+    it("shows the gateway's safe retry guidance instead of generic immediate retry copy", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 502,
+        error_type: "llm_unavailable",
+        detail: "BadGatewayError",
+        guidance: "Retry later; if this continues, ask an administrator to investigate the model gateway.",
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().error).toContain("Retry later; if this continues");
+      expect(useSessionStore.getState().error).not.toContain("try again in a moment");
     });
 
     it("opens recovery state for recovery-shaped compose failures", async () => {
@@ -2069,6 +2343,7 @@ describe("sessionStore", () => {
 
         useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
         const sendPromise = useSessionStore.getState().sendMessage("hello");
+        canonicalUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
 
         // Drain the optimistic-append microtask.
         await Promise.resolve();
@@ -2206,6 +2481,7 @@ describe("sessionStore", () => {
 
           useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
           const sendPromise = useSessionStore.getState().sendMessage("hi");
+          pollUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
           await Promise.resolve();
           await vi.advanceTimersByTimeAsync(1500);
           expect(fetchMessages).toHaveBeenCalledTimes(1);
@@ -2299,6 +2575,38 @@ describe("sessionStore", () => {
           api.fetchComposerPreferences as ReturnType<typeof vi.fn>
         ).mockResolvedValue(null);
       }
+
+      it("does not publish an old accepted receipt over a newer A turn after A->B->A", async () => {
+        const api = await import("@/api/client");
+        await armProgressIdle();
+        await armSelectSessionReads();
+        const oldPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+        const newPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+        vi.mocked(api.sendMessage)
+          .mockReturnValueOnce(oldPost.promise)
+          .mockReturnValueOnce(newPost.promise);
+        vi.mocked(api.fetchMessages).mockResolvedValue([]);
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+
+        const oldTurn = useSessionStore.getState().sendMessage("old");
+        const oldRequestId = vi.mocked(api.sendMessage).mock.calls[0][2];
+        await useSessionStore.getState().selectSession("session-2");
+        await useSessionStore.getState().selectSession("session-1");
+        const newTurn = useSessionStore.getState().sendMessage("new");
+        oldPost.reject({
+          status: 409, error_type: "message_already_accepted",
+          client_request_id: oldRequestId, user_message_id: "old-user",
+          detail: "Message already accepted",
+        });
+        await oldTurn;
+        expect(useSessionStore.getState().isComposing).toBe(true);
+        expect(useSessionStore.getState().error).toBeNull();
+        expect(useSessionStore.getState().messages.map((message) => message.id)).not.toContain("old-user");
+
+        newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+        await newTurn;
+        expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+      });
 
       const pollTool: ChatMessage = {
         id: "msg-poll-tool",
@@ -2417,7 +2725,8 @@ describe("sessionStore", () => {
           async (id: string) => {
             if (id !== "session-1") return [];
             sessionOneFetches += 1;
-            // 1 = reselect load; 2 = the OLD turn's post-settle sync.
+            // A reselect read is the only read needed once a newer turn has
+            // claimed this session's compose state.
             return sessionOneFetches === 1
               ? [pollUser]
               : [pollUser, staleSentinel];
@@ -2437,7 +2746,7 @@ describe("sessionStore", () => {
         firstSend.resolve({ message: pollReply, state: null });
         await firstPromise;
 
-        expect(sessionOneFetches).toBe(2);
+        expect(sessionOneFetches).toBe(1);
         expect(useSessionStore.getState().messages.map((m) => m.id)).not.toContain(
           "msg-stale-sentinel",
         );
@@ -2445,6 +2754,178 @@ describe("sessionStore", () => {
         secondSend.resolve({ message: pollReply, state: null });
         await secondPromise;
       });
+
+      it.each(["send", "retry"] as const)(
+        "keeps the newer A turn when an old %s POST succeeds after A->B->A",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: CompositionState;
+            proposals: CompositionProposal[];
+          }>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
+            id === "session-1" ? [pollUser] : [],
+          );
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          const currentState = makeCompositionState(3, ["new-node"]);
+          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
+          useSessionStore.setState({
+            compositionState: currentState,
+            compositionProposals: [currentProposal],
+          });
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          expect(useSessionStore.getState().isComposing).toBe(true);
+
+          oldPost.resolve({
+            message: { ...pollReply, id: "old-reply" },
+            state: makeCompositionState(2, ["old-node"]),
+            proposals: [makeCompositionProposal({ id: "old-proposal" })],
+          });
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.compositionState).toBe(currentState);
+          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
+          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
+          expect(duringNewTurn.error).toBeNull();
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+          expect(useSessionStore.getState().isComposing).toBe(false);
+        },
+      );
+
+      it.each(["send", "retry"] as const)(
+        "keeps the newer A turn when an old %s POST fails after A->B->A",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
+            id === "session-1" ? [pollUser] : [],
+          );
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          oldPost.reject({ status: 502, error_type: "llm_unavailable", detail: "old failure" });
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.error).toBeNull();
+          expect(duringNewTurn.messages.find((message) => message.id === pollUser.id)?.local_status).toBeUndefined();
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+        },
+      );
+
+      it.each(["send", "retry"] as const)(
+        "drops an old %s POST metadata after its message sync is superseded",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: CompositionState;
+            proposals: CompositionProposal[];
+          }>();
+          const oldSync = deferred<ChatMessage[]>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          let readsForA = 0;
+          vi.mocked(api.fetchMessages).mockImplementation((id: string) => {
+            if (id !== "session-1") return Promise.resolve([]);
+            readsForA += 1;
+            return readsForA === 2 ? oldSync.promise : Promise.resolve([pollUser]);
+          });
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          oldPost.resolve({
+            message: { ...pollReply, id: "old-reply" },
+            state: makeCompositionState(2, ["old-node"]),
+            proposals: [makeCompositionProposal({ id: "old-proposal" })],
+          });
+          await vi.waitFor(() => expect(readsForA).toBe(2));
+          const currentState = makeCompositionState(3, ["new-node"]);
+          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
+          useSessionStore.setState({ compositionState: currentState, compositionProposals: [currentProposal] });
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          oldSync.resolve([pollUser, { ...pollReply, id: "old-reply" }]);
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.compositionState).toBe(currentState);
+          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
+          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+        },
+      );
 
       it("applies the aborted turn's resync message sync after an A->B->A switch stopped the poller", async () => {
         const { sendMessage: mockSendMessage, fetchMessages } = await import(
@@ -2990,6 +3471,126 @@ describe("sessionStore", () => {
   });
 
   describe("composer proposals", () => {
+    it.each(["none", "tool", "reply"] as const)(
+      "keeps accepted-message retry only when %s assistant evidence has no genuine reply",
+      async (evidence) => {
+        const api = await import("@/api/client");
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => {
+          const rows: ChatMessage[] = [{
+            id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+            client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+            tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+          }];
+          if (evidence !== "none") rows.push({
+            id: "assistant", session_id: "session-1", role: "assistant",
+            content: evidence === "tool" ? "Inspecting your source" : "Done",
+            tool_calls: evidence === "tool"
+              ? [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }]
+              : null,
+            created_at: "2026-09-27T00:00:01Z",
+          });
+          return rows;
+        });
+        vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+        vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        useSessionStore.setState({ activeSessionId: "session-1" });
+
+        await useSessionStore.getState().sendMessage("hello");
+
+        expect(api.recompose).not.toHaveBeenCalled();
+        expect(useSessionStore.getState().messages[0].local_status).toBe(
+          evidence === "reply" ? undefined : "failed",
+        );
+      },
+    );
+
+    it("keeps saved-message retry metadata when a poll sees only tool-call narration", async () => {
+      const api = await import("@/api/client");
+      const user: ChatMessage = {
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: "request-1", tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      };
+      vi.mocked(api.fetchMessages).mockResolvedValueOnce([
+        user,
+        {
+          id: "tool-narration", session_id: "session-1", role: "assistant",
+          content: "Inspecting your source",
+          tool_calls: [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }],
+          created_at: "2026-09-27T00:00:01Z",
+        },
+      ]);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [{ ...user, local_status: "failed", local_error: "Retry saved message" }],
+      });
+      useSessionStore.getState().startInflightMessagesPolling("session-1");
+
+      await useSessionStore.getState().loadInflightMessages("session-1");
+
+      expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
+      useSessionStore.getState().stopInflightMessagesPolling("session-1");
+    });
+
+    it.each(["reject", "accept"] as const)(
+      "keeps a newer %s receipt and state over a delayed accepted-message snapshot",
+      async (decision) => {
+        const api = await import("@/api/client");
+        const slowState = deferred<CompositionState | null>();
+        const pending = makeCompositionProposal();
+        const receipt = makeCompositionProposal({ status: decision === "accept" ? "committed" : "rejected" });
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+          id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+          client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+          tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+        }]);
+        vi.mocked(api.fetchCompositionState)
+          .mockReturnValueOnce(slowState.promise)
+          .mockResolvedValue(makeCompositionState(2));
+        vi.mocked(api.fetchCompositionProposals)
+          .mockResolvedValueOnce([pending])
+          .mockResolvedValue([receipt]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        vi.mocked(decision === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
+          .mockResolvedValue(receipt);
+        useSessionStore.setState({
+          activeSessionId: "session-1", compositionState: makeCompositionState(1),
+          compositionStateLoaded: true, compositionProposals: [pending],
+        });
+
+        const send = useSessionStore.getState().sendMessage("hello");
+        await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+        await useSessionStore.getState()[decision === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+
+        slowState.resolve(makeCompositionState(1));
+        await send;
+
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+      },
+    );
+
     it.each([409, 500])("retains confirmed staleness when rejection fails (%s)", async (status) => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();

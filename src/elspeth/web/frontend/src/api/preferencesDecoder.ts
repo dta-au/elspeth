@@ -48,7 +48,7 @@ import type {
 // in production.
 const MODES: Record<ComposerMode, true> = { guided: true, freeform: true };
 const STAGES: Record<PersistedTutorialStage, true> = {
-  guided: true,
+  build: true,
   run: true,
   audit: true,
   graduation: true,
@@ -102,7 +102,7 @@ export function decodeUserComposerPreferences(value: unknown): UserComposerPrefe
   }
   const stage = r.tutorial_stage;
   if (stage !== null && (typeof stage !== "string" || !Object.prototype.hasOwnProperty.call(STAGES, stage))) {
-    invalid(`${path}.tutorial_stage`, "expected guided|run|audit|graduation|null");
+    invalid(`${path}.tutorial_stage`, "expected build|run|audit|graduation|null");
   }
   return {
     default_mode: mode as ComposerMode,

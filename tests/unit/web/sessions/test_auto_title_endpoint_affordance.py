@@ -24,6 +24,7 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer import provider_gateway
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 
 _SENTINEL_CREDENTIAL = "sk-auto-title-endpoint-affordance-sentinel"  # secret-scan: allow-this-line
@@ -109,7 +110,7 @@ async def test_auto_title_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.M
         captured.update(kwargs)
         return _completion("My Title")
 
-    monkeypatch.setattr(at, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await at.maybe_auto_title_session(
         service=_TitleService(),
@@ -133,7 +134,7 @@ async def test_auto_title_sends_configured_primary_endpoint(monkeypatch: pytest.
         captured.update(kwargs)
         return _completion("My Title")
 
-    monkeypatch.setattr(at, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
     await at.maybe_auto_title_session(
         service=_TitleService(),

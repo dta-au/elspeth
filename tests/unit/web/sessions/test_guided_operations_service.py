@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy import event as sqlalchemy_event
 
-import elspeth.web.sessions.service as sessions_service_module
+import elspeth.web.sessions.mutation_capabilities as mutation_capabilities
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttempt,
@@ -35,6 +35,11 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.guided_operation_rules import (
+    _guided_failure_diagnostics,
+    _guided_in_progress_expiry,
+    _guided_terminal_outcome,
+)
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.models import (
     chat_messages_table,
@@ -80,15 +85,15 @@ class _StrictRequest(BaseModel):
 
 
 def test_guided_composite_authority_has_only_narrow_domain_mutations() -> None:
-    assert not hasattr(sessions_service_module, "_reject_guided_pending_proposal")
-    assert not hasattr(sessions_service_module, "_require_no_active_guided_confirmation_admission")
+    assert not hasattr(mutation_capabilities, "_reject_guided_pending_proposal")
+    assert not hasattr(mutation_capabilities, "_require_no_active_guided_confirmation_admission")
     assert {"require_no_active_confirmation", "claim_confirmation", "mark_session_updated"} <= set(
-        dir(sessions_service_module._GuidedSessionMutations)
+        dir(mutation_capabilities._GuidedSessionMutations)
     )
     assert {"reject_pending_proposal", "record_pending_proposal_rejection", "record_pending_proposal_acceptance"} <= set(
-        dir(sessions_service_module._GuidedComposerMutations)
+        dir(mutation_capabilities._GuidedComposerMutations)
     )
-    assert {"create_guided_pipeline_proposal"} <= set(dir(sessions_service_module._SessionComposerMutations))
+    assert {"create_guided_pipeline_proposal"} <= set(dir(mutation_capabilities._SessionComposerMutations))
 
 
 def test_guided_database_clock_maps_malformed_sqlite_text_to_audit_integrity_error() -> None:
@@ -507,11 +512,11 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
     }
 
     with pytest.raises(AuditIntegrityError, match=r"kind.*locator"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", completed))
+        _guided_terminal_outcome(cast("Any", completed))
     with pytest.raises(AuditIntegrityError, match=r"failure.*residue"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", failed))
+        _guided_terminal_outcome(cast("Any", failed))
     with pytest.raises(AuditIntegrityError, match=r"in-progress.*lease"):
-        SessionServiceImpl._guided_in_progress_expiry(
+        _guided_in_progress_expiry(
             cast(
                 "Any",
                 {
@@ -556,7 +561,7 @@ def test_failed_operation_decoder_rejects_malformed_output_field_enrichment(raw_
     }
 
     with pytest.raises(AuditIntegrityError, match="malformed unproducible output fields"):
-        SessionServiceImpl._guided_terminal_outcome(cast("Any", row))
+        _guided_terminal_outcome(cast("Any", row))
 
 
 @pytest.mark.asyncio
@@ -1305,7 +1310,7 @@ async def test_failure_event_fault_rolls_back_the_bound_audit_cohort(
     def fail_after_audit_insert(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("injected terminal event failure")
 
-    monkeypatch.setattr(sessions_service_module._GuidedSessionMutations, "fail", fail_after_audit_insert)
+    monkeypatch.setattr(mutation_capabilities._GuidedSessionMutations, "fail", fail_after_audit_insert)
     with pytest.raises(RuntimeError, match="injected terminal event failure"):
         await service.fail_guided_operation_with_audit(_failure_command(claim, marker="rollback"))
 
@@ -2685,4 +2690,4 @@ def test_failure_diagnostics_reject_malformed_or_unbounded_carriers(diagnostics:
 @pytest.mark.parametrize("raw_diagnostics", [[], {}, "note", [1], [""], ["x" * 513], ["note"] * 33])
 def test_failure_diagnostics_decoder_rejects_malformed_storage(raw_diagnostics: object) -> None:
     with pytest.raises(AuditIntegrityError, match="diagnostic"):
-        SessionServiceImpl._guided_failure_diagnostics(cast(Any, {"failure_diagnostics": raw_diagnostics}))
+        _guided_failure_diagnostics(cast(Any, {"failure_diagnostics": raw_diagnostics}))

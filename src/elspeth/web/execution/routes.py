@@ -40,8 +40,8 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.protocol import ComposerService, ComposerServiceError
-from elspeth.web.composer.service import ComposerAdmissionRefused, _BadRequestLLMError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -955,7 +955,7 @@ def create_execution_router() -> APIRouter:
         finalize already surfaced.
         """
         await verify_session_ownership(session_id, user, request)
-        composer: ComposerService = request.app.state.composer_service
+        interpretation_surfacing = request.app.state.interpretation_surfacing
         lease = await SessionOperationLease.acquire(
             session_service.session_operation_authority,
             session_id=session_id,
@@ -967,7 +967,7 @@ def create_execution_router() -> APIRouter:
             if state_id is None:
                 current_record = await session_service.get_current_state(session_id)
                 if current_record is not None:
-                    await composer.surface_pending_interpretation_reviews(
+                    await interpretation_surfacing.surface_pending_interpretation_reviews(
                         state_from_record(current_record),
                         session_id=str(session_id),
                         current_state_id=str(current_record.id),
@@ -989,7 +989,7 @@ def create_execution_router() -> APIRouter:
             # passes the loaded head), so the requested snapshot gets the same
             # repair pass as the None arm above, under the same BLOB_READ lease.
             composition_state = state_from_record(state_record)
-            await composer.surface_pending_interpretation_reviews(
+            await interpretation_surfacing.surface_pending_interpretation_reviews(
                 composition_state,
                 session_id=str(session_id),
                 current_state_id=str(state_record.id),

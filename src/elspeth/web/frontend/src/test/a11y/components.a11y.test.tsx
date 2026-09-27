@@ -73,7 +73,7 @@ const AUDITED_COMPONENTS = [
   "ProgressView",
   "RecoveryPanel",
   "RunsHistoryDrawer",
-  "TutorialGuidedShell",
+  "TutorialFreeformShell",
   "TutorialTurn1Welcome",
   "TutorialTurn4Run",
   "TutorialTurn5AuditStory",
@@ -148,7 +148,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "SchemaFormTurn",
   "ShortcutsHelp",
   "FreeformIntroduction",
-  "TutorialGuidedShell",
+  "TutorialFreeformShell",
   "TutorialTurn1Welcome",
   "TutorialTurn4Run",
   "TutorialTurn5AuditStory",
@@ -331,7 +331,7 @@ import { GraphModal } from "@/components/sidebar/GraphModal";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { RecoveryPanel } from "@/components/recovery/RecoveryPanel";
 import { HelloWorldTutorial } from "@/components/tutorial/HelloWorldTutorial";
-import { TutorialGuidedShell } from "@/components/tutorial/TutorialGuidedShell";
+import { TutorialFreeformShell } from "@/components/tutorial/TutorialFreeformShell";
 import { TutorialTurn1Welcome } from "@/components/tutorial/TutorialTurn1Welcome";
 import { TutorialTurn4Run } from "@/components/tutorial/TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "@/components/tutorial/TutorialTurn5AuditStory";
@@ -1277,12 +1277,15 @@ describe("TutorialTurn1Welcome", () => {
   });
 });
 
-describe("TutorialGuidedShell", () => {
-  it("has no axe violations while preparing the guided session", async () => {
-    // A pending start keeps the shell on its own chrome (kicker + sr-only
-    // status + sample-loading line) without mounting the embedded ChatPanel,
-    // whose guided internals are audited via their own components above.
-    vi.mocked(apiClient.startGuidedSession).mockReturnValue(
+describe("TutorialFreeformShell", () => {
+  it("has no axe violations while preparing the freeform sample brief", async () => {
+    // Keep the sample request pending to audit the loading surface.
+    useSessionStore.setState({
+      activeSessionId: "00000000-0000-4000-8000-000000000999",
+      compositionStateLoaded: true,
+      error: null,
+    });
+    vi.mocked(apiClient.getTutorialSample).mockReturnValue(
       new Promise<never>(() => {}),
     );
     vi.stubGlobal(
@@ -1294,12 +1297,12 @@ describe("TutorialGuidedShell", () => {
       },
     );
     const { container } = render(
-      <TutorialGuidedShell
+      <TutorialFreeformShell
         sessionId="00000000-0000-4000-8000-000000000999"
         onCompleted={() => {}}
       />,
     );
-    screen.getByText(/Preparing the tutorial's sample pages/);
+    screen.getByText(/Loading your example/);
     expect(await axe(container)).toHaveNoViolations();
   });
 });

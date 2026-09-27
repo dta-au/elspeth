@@ -4367,12 +4367,9 @@ class ExecutionServiceImpl:
     def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
         """Persist an admitted pending attempt before the provider can spend."""
         session_operation_lease.guard_external_effect()
-        attempt = self._call_async(
-            self._session_service.begin_provider_attempt(
-                session_operation_context=session_operation_lease.context,
-                source="run",
-                run_id=run_uuid,
-            )
+        attempt = self._session_service.begin_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            run_id=run_uuid,
         )
         return attempt.attempt_id
 
@@ -4393,12 +4390,10 @@ class ExecutionServiceImpl:
         )
         if len(entries) != 1:
             raise AuditIntegrityError(f"Run {run_uuid} provider outcome must identify exactly one durable LLM call")
-        self._call_async(
-            self._session_service.settle_provider_attempt(
-                session_operation_context=session_operation_lease.context,
-                attempt_id=attempt_id,
-                entry=entries[0],
-            )
+        self._session_service.settle_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            attempt_id=attempt_id,
+            entry=entries[0],
         )
 
     def _record_run_token_usage(

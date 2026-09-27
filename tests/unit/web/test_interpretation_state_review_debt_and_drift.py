@@ -24,7 +24,7 @@ import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.hashing import stable_hash
-from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+from elspeth.web.composer.interpretation_surfacing import unsurfaceable_pending_interpretation_review_sites
 from elspeth.web.composer.source_demand import source_data_contract_artifact_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.interpretation_state import (

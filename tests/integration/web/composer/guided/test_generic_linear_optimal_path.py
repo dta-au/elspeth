@@ -165,7 +165,11 @@ def test_real_guided_service_discovers_once_then_commits_canonical_document_abst
         model="openrouter/planner-under-test",
         provider="openrouter",
     )
+    real_service._planning_application._availability = real_service._availability
     app.state.composer_service = real_service
+    app.state.interpretation_surfacing = real_service._interpretation_surfacing
+    app.state.planning_application = real_service._planning_application
+    app.state.schema_disclosure = real_service._schema_disclosure
     monkeypatch.setattr("litellm.acompletion", completion)
 
     planned = composer_test_client.post(

@@ -26,10 +26,9 @@ interface TutorialTurn4RunProps {
   onCompleted: (result: TutorialRunResult) => void;
   onCancelled: () => void;
   /**
-   * Back affordance. Omitted (undefined) when the run turn has no real prior
-   * step to return to — once the guided wizard is completed it is terminal and
-   * non-returnable (`previousStep(run)` is null), so HelloWorldTutorial passes
-   * no `onBack`. When undefined the Back button is not rendered.
+   * Back affordance. The tutorial supplies it only before a run has started,
+   * returning to the same freeform Build session. Once a run has an identity,
+   * Back is omitted so a reload cannot accidentally re-execute it.
    */
   onBack?: () => void;
 }
@@ -58,10 +57,9 @@ interface CachedRun {
  * user-cancel path aborts via the cached controller and removes the entry
  * so a subsequent re-mount triggers a fresh run.
  *
- * The tutorial run is frozen-prompt (``TutorialRunRequest`` carries only
- * ``session_id`` — the backend always runs the canonical tutorial prompt),
- * so the cache key is the session id alone; there is no per-prompt identity
- * to fold into it.
+ * TutorialRunRequest carries only session_id; the backend rechecks and runs
+ * that session's approved state. Build is no longer revisited once Run starts,
+ * so the session ID identifies the in-page request for StrictMode dedupe.
  */
 const tutorialRunCache = new Map<string, CachedRun>();
 

@@ -660,6 +660,162 @@ async def test_guided_lease_guard_repeated_cancellation_fails_guided_before_exac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_outcome", "expected_error"),
+    [
+        (RuntimeError("private cleanup detail"), asyncio.CancelledError),
+        (AuditIntegrityError("integrity cleanup detail"), AuditIntegrityError),
+        (asyncio.CancelledError("child cancelled itself"), AuditIntegrityError),
+    ],
+    ids=["ordinary_secondary", "integrity_primary", "child_self_cancel_fails_closed"],
+)
+async def test_shielded_cleanup_join_preserves_cancellation_priority_and_drains_child(
+    child_outcome: BaseException, expected_error: type[BaseException]
+) -> None:
+    child_started = asyncio.Event()
+    finish_child = asyncio.Event()
+    child_finished = asyncio.Event()
+    original: asyncio.CancelledError | None = None
+
+    async def cleanup() -> None:
+        child_started.set()
+        try:
+            await finish_child.wait()
+            raise child_outcome
+        finally:
+            child_finished.set()
+
+    async def caller() -> None:
+        nonlocal original
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            original = cancellation
+            cleanup_task = asyncio.create_task(cleanup())
+            await guided_operations_module._join_shielded_task_after_cancellation(
+                cleanup_task,
+                primary_cancellation=cancellation,
+            )
+            raise
+
+    caller_task = asyncio.create_task(caller())
+    await asyncio.sleep(0)
+    caller_task.cancel("original cancellation")
+    await child_started.wait()
+    caller_task.cancel("repeated cancellation")
+    await asyncio.sleep(0)
+    assert not caller_task.done()
+    finish_child.set()
+
+    with pytest.raises(expected_error) as caught:
+        await caller_task
+
+    assert child_finished.is_set()
+    assert original is not None
+    if isinstance(child_outcome, RuntimeError):
+        assert caught.value is original
+        assert caught.value.__cause__ is child_outcome
+        assert "RuntimeError" in repr(caught.value.__notes__)
+        assert "private cleanup detail" not in repr(caught.value.__notes__)
+    elif isinstance(child_outcome, AuditIntegrityError):
+        assert caught.value is child_outcome
+        assert caught.value.__cause__ is original
+    else:
+        assert isinstance(caught.value, AuditIntegrityError)
+        assert caught.value.__cause__ is original
+        assert "child cancelled itself" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_shielded_cleanup_join_keeps_successful_child_result_under_repeated_cancellation() -> None:
+    child_started = asyncio.Event()
+    finish_child = asyncio.Event()
+    child_finished = asyncio.Event()
+    observed: list[str] = []
+
+    async def cleanup() -> str:
+        child_started.set()
+        await finish_child.wait()
+        child_finished.set()
+        return "durable result"
+
+    async def caller() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            child_task = asyncio.create_task(cleanup())
+            observed.append(
+                await guided_operations_module._join_shielded_task_after_cancellation(
+                    child_task,
+                    primary_cancellation=cancellation,
+                )
+            )
+            raise
+
+    caller_task = asyncio.create_task(caller())
+    await asyncio.sleep(0)
+    caller_task.cancel("original cancellation")
+    await child_started.wait()
+    caller_task.cancel("repeated cancellation")
+    await asyncio.sleep(0)
+    assert not caller_task.done()
+    finish_child.set()
+
+    with pytest.raises(asyncio.CancelledError, match="original cancellation"):
+        await caller_task
+    assert child_finished.is_set()
+    assert observed == ["durable result"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_failure", "expected_error"),
+    [
+        (None, None),
+        (AuditIntegrityError("failed terminal write"), AuditIntegrityError),
+        (asyncio.CancelledError("child cancelled itself"), AuditIntegrityError),
+    ],
+    ids=["joined_success", "integrity_primary", "self_cancel_fails_closed"],
+)
+async def test_guided_terminal_write_joins_repeated_cancellation_and_fails_closed(
+    child_failure: BaseException | None,
+    expected_error: type[BaseException] | None,
+) -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def durable_write() -> str:
+        started.set()
+        try:
+            await finish.wait()
+            if child_failure is not None:
+                raise child_failure
+            return "terminal write completed"
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(guided_operations_module._await_guided_terminal_write(durable_write()))
+    await started.wait()
+    task.cancel("first caller cancellation")
+    task.cancel("second caller cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish.set()
+    if expected_error is None:
+        assert await task == "terminal write completed"
+    else:
+        with pytest.raises(expected_error) as caught:
+            await task
+        if isinstance(child_failure, AuditIntegrityError):
+            assert caught.value is child_failure
+        else:
+            assert type(caught.value) is AuditIntegrityError
+            assert "child cancelled itself" not in str(caught.value)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_guided_guard_cancellation_during_normal_exit_drains_and_propagates() -> None:
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="cancel-close", lease_token="secret", attempt=1)

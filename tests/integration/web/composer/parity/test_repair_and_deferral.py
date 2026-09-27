@@ -321,7 +321,10 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
         # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
         completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
         parity_env.monkeypatch.setattr("litellm.acompletion", completion)
-        response = await client.post(f"/api/sessions/{session_id}/messages", json={"content": _LINEAR["intent"]})
+        response = await client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": _LINEAR["intent"], "client_request_id": str(uuid4())},
+        )
 
     assert response.status_code == 500, response.text
     detail = response.json()["detail"]

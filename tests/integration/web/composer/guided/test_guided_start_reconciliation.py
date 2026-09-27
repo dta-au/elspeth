@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.sessions.models import (
     chat_messages_table,
@@ -121,6 +124,56 @@ def test_reconciliation_reports_completed_safe_state_locator(composer_test_clien
     assert response.status_code == 200
     assert response.json() == {"status": "completed", "composition_state_id": state_id}
     assert set(response.json()) == {"status", "composition_state_id"}
+
+
+def test_start_cancelled_seed_settlement_preserves_integrity_failure(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    body = {"profile": "live", "intent": "Build a pipeline", "operation_id": str(uuid4())}
+    service = client.app.state.session_service
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_seed(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        raise AuditIntegrityError("injected START settlement integrity failure")
+
+    monkeypatch.setattr(service, "seed_or_complete_guided_start_operation", fail_seed)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/start", json=body))
+            await asyncio.wait_for(entered.wait(), 5)
+            request_task.cancel("cancel while START settlement is pending")
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), 0.05)
+            finally:
+                release.set()
+            with pytest.raises(AuditIntegrityError, match="injected START settlement integrity failure"):
+                await asyncio.wait_for(request_task, 5)
+
+    asyncio.run(drive())
+    with client.app.state.session_engine.connect() as connection:
+        operation = (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == body["operation_id"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    replay = client.post(f"/api/sessions/{session_id}/guided/start", json=body)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
 
 
 def test_reconciliation_rejects_wrong_operation_kind(composer_test_client: TestClient) -> None:

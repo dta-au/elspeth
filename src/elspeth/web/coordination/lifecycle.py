@@ -1083,6 +1083,17 @@ class SessionOperationLease:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
+            if (
+                isinstance(exc_value, asyncio.CancelledError)
+                and isinstance(cleanup_error, asyncio.CancelledError)
+                and self._close_task is not None
+                and self._close_task.done()
+                and not self._close_task.cancelled()
+                and self._close_task.exception() is None
+            ):
+                # A second cancellation interrupted only the waiter. The
+                # owned close finished; preserve the body's original signal.
+                return False
             if cleanup_error is not exc_value:
                 raise BaseExceptionGroup(
                     "Session operation body and cleanup both failed",

@@ -35,7 +35,7 @@ from typing import Any
 
 import pytest
 
-from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+from elspeth.web.composer.interpretation_surfacing import unsurfaceable_pending_interpretation_review_sites
 from elspeth.web.composer.state import CompositionState
 from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager, real_plugin_manager
 

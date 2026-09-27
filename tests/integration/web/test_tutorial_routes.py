@@ -122,6 +122,93 @@ def _seed_session_with_state(app: FastAPI) -> UUID:
     return session_id
 
 
+def test_get_sample_returns_runtime_urls_for_owned_freeform_session(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sample_urls": [
+            "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
+        ]
+    }
+
+
+def test_get_sample_hides_another_users_session(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="bob")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 404
+
+
+def test_get_sample_uses_configured_public_base(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"tutorial_sample_base_url": "https://example.gov.au/samples"})
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sample_urls": [
+            "https://example.gov.au/samples/tutorial-site/project-1.html",
+            "https://example.gov.au/samples/tutorial-site/project-2.html",
+            "https://example.gov.au/samples/tutorial-site/project-3.html",
+        ]
+    }
+
+
+def test_sample_is_not_exposed_through_guided_mode_route(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/sessions/{session_id}/guided/tutorial-sample")
+
+    assert response.status_code == 404
+
+
+def test_get_readiness_rejects_freeform_session_without_committed_state(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/readiness")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "tutorial_state_missing"
+
+
+def test_get_readiness_returns_exact_committed_state_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app(tmp_path)
+    session_id = _seed_session_with_state(app)
+    state_id = uuid4()
+
+    async def _ready(**_kwargs: Any) -> UUID:
+        return state_id
+
+    monkeypatch.setattr(tutorial_service_module, "_require_tutorial_launch_readiness", _ready)
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/readiness")
+
+    assert response.status_code == 200
+    assert response.json() == {"state_id": str(state_id)}
+
+
 def _install_fake_live_run(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -392,7 +479,7 @@ def test_delete_orphans_never_touches_the_resumable_tutorial_session(tmp_path: P
         app.state.preferences_service.update_composer_preferences(
             "alice",
             UpdateComposerPreferencesRequest(
-                tutorial_stage="guided",
+                tutorial_stage="build",
                 tutorial_session_id=str(resumable_id),
             ),
         )

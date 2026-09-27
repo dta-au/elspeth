@@ -400,16 +400,24 @@ def test_patch_persists_tutorial_progress_round_trip(client_as_alice: TestClient
     reload GETs them back and resumes at the persisted stage."""
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_stage": "guided", "tutorial_session_id": "sess-http-1"},
+        json={"tutorial_stage": "build", "tutorial_session_id": "sess-http-1"},
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["tutorial_stage"] == "guided"
+    assert body["tutorial_stage"] == "build"
     assert body["tutorial_session_id"] == "sess-http-1"
 
     follow_up = client_as_alice.get("/api/composer-preferences").json()
-    assert follow_up["tutorial_stage"] == "guided"
+    assert follow_up["tutorial_stage"] == "build"
     assert follow_up["tutorial_session_id"] == "sess-http-1"
+
+
+def test_patch_rejects_retired_guided_tutorial_stage(client_as_alice: TestClient) -> None:
+    response = client_as_alice.patch(
+        "/api/composer-preferences",
+        json={"tutorial_stage": "guided", "tutorial_session_id": "sess-http-old"},
+    )
+    assert response.status_code == 422
 
 
 def test_patch_rejects_invalid_tutorial_stage(client_as_alice: TestClient) -> None:
@@ -497,7 +505,7 @@ def test_completion_requires_intent_and_freeform_over_http(client_as_alice: Test
 
 @pytest.mark.parametrize(
     "progress",
-    [{"tutorial_stage": "guided"}, {"tutorial_session_id": "stale"}, {"tutorial_run_id": "stale"}, {"tutorial_source_data_hash": "stale"}],
+    [{"tutorial_stage": "build"}, {"tutorial_session_id": "stale"}, {"tutorial_run_id": "stale"}, {"tutorial_source_data_hash": "stale"}],
 )
 def test_late_progress_cannot_resurrect_completed_tutorial(client_as_alice: TestClient, progress: dict[str, str]) -> None:
     endpoint = "/api/composer-preferences"

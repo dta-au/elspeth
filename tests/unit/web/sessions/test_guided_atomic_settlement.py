@@ -2060,7 +2060,7 @@ async def test_failure_after_operation_complete_rolls_back_bind_terminal_and_all
     command = _empty_respond_command(claimed.fence)
     # The lane's settlement writes the terminal row through the guided
     # mutation capability; inject the failure after that exact write.
-    from elspeth.web.sessions.service import _GuidedSessionMutations
+    from elspeth.web.sessions.mutation_capabilities import _GuidedSessionMutations
 
     complete = _GuidedSessionMutations.complete
 
@@ -2648,7 +2648,7 @@ async def test_deferred_intent_cancellation_rejects_inauthentic_audit_or_binding
 
 @pytest.mark.parametrize("non_cancel_sideband", ["unchanged", "append", "edit"])
 def test_cancellation_audit_is_forbidden_without_exact_cancel_sideband(non_cancel_sideband: str) -> None:
-    from elspeth.web.sessions.service import _verify_guided_deferred_intent_mutation
+    from elspeth.web.sessions.proposal_authority import _verify_guided_deferred_intent_mutation
 
     intent = _deferred_intent()
     recorder = BufferingRecorder()

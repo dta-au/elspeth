@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -157,6 +157,8 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     app.state.blob_service = blob_service
     app.state.settings = settings
     app.state.composer_service = composer_service
+    app.state.planning_application = composer_service._planning_application
+    app.state.schema_disclosure = composer_service._schema_disclosure
     app.state.scoped_secret_resolver = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = catalog
@@ -269,7 +271,7 @@ def _get_current_guided_session(client: TestClient, session_id: str) -> dict:
 def _send_message(client: TestClient, session_id: str, content: str) -> dict:
     resp = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": content},
+        json={"content": content, "client_request_id": str(uuid4())},
     )
     assert resp.status_code == 200, f"send_message failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -293,8 +295,17 @@ def _seed_user_message(client: TestClient, session_id: str, content: str = "retr
     )
 
 
+def _last_user_message_id(client: TestClient, session_id: str) -> str:
+    service: SessionServiceImpl = client.app.state.session_service
+    messages = asyncio.run(service.get_messages(UUID(session_id)))
+    return str(next(message.id for message in reversed(messages) if message.role == "user"))
+
+
 def _recompose(client: TestClient, session_id: str) -> dict:
-    resp = client.post(f"/api/sessions/{session_id}/recompose")
+    resp = client.post(
+        f"/api/sessions/{session_id}/recompose",
+        json={"expected_user_message_id": _last_user_message_id(client, session_id)},
+    )
     assert resp.status_code == 200, f"recompose failed: {resp.status_code} {resp.text}"
     return resp.json()
 
@@ -346,7 +357,7 @@ class TestFirstFreeformTurnAfterExit:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _send_message(composer_freeform_client, session_id, "what can you do?")
@@ -383,7 +394,7 @@ class TestSecondFreeformTurnAfterTransition:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             # First freeform turn — should use transition prompt
@@ -394,7 +405,7 @@ class TestSecondFreeformTurnAfterTransition:
         assert gs_dict.get("transition_consumed") is True, f"transition_consumed not set to True after first turn. GuidedSession: {gs_dict}"
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             # Second freeform turn — must NOT use transition prompt
@@ -433,11 +444,11 @@ class TestSecondFreeformTurnAfterTransition:
             return _fake_chat_response("durable transition response")
 
         _inject_one_assistant_insert_failure(composer_freeform_client, monkeypatch)
-        with patch("elspeth.web.composer.service._litellm_acompletion", side_effect=_fake_acompletion):
+        with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake_acompletion):
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
                 composer_freeform_client.post(
                     f"/api/sessions/{session_id}/messages",
-                    json={"content": "leave guided mode"},
+                    json={"content": "leave guided mode", "client_request_id": str(uuid4())},
                 )
 
             assert _get_current_guided_session(composer_freeform_client, session_id).get("transition_consumed") is False
@@ -467,7 +478,7 @@ class TestTransitionPromptAfterCompletedTerminal:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _send_message(composer_freeform_client, session_id, "actually change the sink to CSV")
@@ -512,7 +523,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _recompose(composer_freeform_client, session_id)
@@ -543,7 +554,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             body = _recompose(composer_freeform_client, session_id)
@@ -570,7 +581,7 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response()
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "elspeth.web.composer.provider_gateway._litellm_acompletion",
             side_effect=_fake_acompletion,
         ):
             _recompose(composer_freeform_client, session_id)
@@ -603,9 +614,12 @@ class TestRecomposeTransitionPrompt:
             return _fake_chat_response("durable recompose transition")
 
         _inject_one_assistant_insert_failure(composer_freeform_client, monkeypatch)
-        with patch("elspeth.web.composer.service._litellm_acompletion", side_effect=_fake_acompletion):
+        with patch("elspeth.web.composer.provider_gateway._litellm_acompletion", side_effect=_fake_acompletion):
             with pytest.raises(IntegrityError, match="injected transition assistant failure"):
-                composer_freeform_client.post(f"/api/sessions/{session_id}/recompose")
+                composer_freeform_client.post(
+                    f"/api/sessions/{session_id}/recompose",
+                    json={"expected_user_message_id": _last_user_message_id(composer_freeform_client, session_id)},
+                )
 
             assert _get_current_guided_session(composer_freeform_client, session_id).get("transition_consumed") is False
             body = _recompose(composer_freeform_client, session_id)

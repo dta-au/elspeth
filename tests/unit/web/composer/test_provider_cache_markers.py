@@ -222,7 +222,7 @@ class TestToolListOrderIsCacheKeyContract:
         order swap (cache-invalidating reorder) is not.
         """
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
-        from elspeth.web.composer.service import composer_loop_tool_definitions
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
 
         defn_names = [d["name"] for d in get_tool_definitions()]
@@ -243,7 +243,7 @@ class TestToolListOrderIsCacheKeyContract:
 
     def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
-        from elspeth.web.composer.service import composer_loop_tool_definitions
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
 
         definitions = get_tool_definitions()

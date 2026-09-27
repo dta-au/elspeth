@@ -52,7 +52,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     _composer_service_with_session,
@@ -74,10 +74,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     offline.
     """
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 # ---------------------------------------------------------------------------

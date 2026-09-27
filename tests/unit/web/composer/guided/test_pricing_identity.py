@@ -5,8 +5,8 @@ from typing import Any
 import pytest
 from litellm.types.utils import ModelResponse
 
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided import chat_solver
 from elspeth.web.composer.guided.chat_solver import DeferredIntentManagementChatRequest
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.sessions import _guided_step_chat
@@ -25,7 +25,7 @@ async def test_guided_solver_routes_alias_and_prices_catalog_model(monkeypatch: 
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         )
 
-    monkeypatch.setattr(chat_solver, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     common: dict[str, Any] = {
         "model": "openai/operator-datazone",

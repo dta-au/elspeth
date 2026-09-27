@@ -2157,6 +2157,664 @@ describe("executionStore loadRuns degraded-path reconciliation", () => {
   });
 });
 
+describe("executionStore run publication ordering", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+  });
+
+  it("drops an older same-session list read after a newer terminal read", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    const newRead = deferred<Run[]>();
+    vi.mocked(fetchRuns).mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(newRead.promise);
+
+    const oldResult = useExecutionStore.getState().loadRuns("session-1");
+    const newResult = useExecutionStore.getState().loadRuns("session-1");
+    newRead.resolve([makeRun({ status: "completed", finished_at: "2026-04-26T05:32:08.000Z" })]);
+    expect(await newResult).toBe("loaded");
+    oldRead.resolve([makeRun({ status: "running" })]);
+    expect(await oldResult).toBe("stale");
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+  });
+
+  it("applies an older completed read while a newer overlapping poll is still pending", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    const newRead = deferred<Run[]>();
+    vi.mocked(fetchRuns).mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(newRead.promise);
+
+    const oldResult = useExecutionStore.getState().loadRuns("session-1");
+    const newResult = useExecutionStore.getState().loadRuns("session-1");
+    oldRead.resolve([makeRun({ status: "running" })]);
+    expect(await oldResult).toBe("loaded");
+    expect(useExecutionStore.getState().runs[0].status).toBe("running");
+    newRead.reject(new Error("temporary read failure"));
+    expect(await newResult).toBe("unavailable");
+    expect(useExecutionStore.getState().runs[0].status).toBe("running");
+  });
+
+  it("drops a rehydration read when a newer list read already settled the run", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    vi.mocked(fetchRuns)
+      .mockReturnValueOnce(oldRead.promise)
+      .mockResolvedValueOnce([makeRun({ status: "completed" })]);
+
+    const oldResult = useExecutionStore.getState().rehydrateActiveRun("session-1");
+    await useExecutionStore.getState().loadRuns("session-1");
+    oldRead.resolve([makeRun({ status: "running" })]);
+    await oldResult;
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+    expect(useExecutionStore.getState().activeRunId).toBeNull();
+    expect(connectToRun).not.toHaveBeenCalled();
+  });
+
+  it("drops a pre-navigation A read after A to B to A with a fresh A read", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    vi.mocked(fetchRuns)
+      .mockReturnValueOnce(oldRead.promise)
+      .mockResolvedValueOnce([makeRun({ status: "completed" })]);
+
+    const oldResult = useExecutionStore.getState().loadRuns("session-1");
+    useSessionStore.setState({ activeSessionId: "session-2" } as never);
+    useExecutionStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+    useExecutionStore.getState().reset();
+    await useExecutionStore.getState().loadRuns("session-1");
+    oldRead.resolve([makeRun({ status: "running" })]);
+    expect(await oldResult).toBe("stale");
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+  });
+
+  it("keeps a terminal status while a later REST row enriches its accounting", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "completed", accounting: null })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "completed", accounting: null } as RunProgress,
+    });
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "completed", accounting: makeAccounting() })]);
+
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().runs[0].accounting).toEqual(makeAccounting());
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+    expect(useExecutionStore.getState().progress?.accounting).toEqual(makeAccounting());
+  });
+
+  it("replaces a prior accounting-corruption projection when final accounting arrives", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    useExecutionStore.setState({ runs: [makeRun({
+      status: "completed",
+      accounting: null,
+      accounting_corruption: { landscape_run_id: "landscape-run-1", violations: ["incomplete"] },
+    })] });
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({
+      status: "completed",
+      accounting: makeAccounting(),
+      accounting_corruption: null,
+    })]);
+
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().runs[0].accounting).toEqual(makeAccounting());
+    expect(useExecutionStore.getState().runs[0].accounting_corruption).toBeNull();
+  });
+
+  it("clears stale progress accounting when the terminal REST row reports corruption", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "completed", accounting: makeAccounting() })],
+      activeRunId: "run-1", activeRunSessionId: "session-1",
+      progress: { status: "completed", accounting: makeAccounting() } as RunProgress,
+    });
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({
+      status: "completed", accounting: null,
+      accounting_corruption: { landscape_run_id: "landscape-run-1", violations: ["closure"] },
+    })]);
+
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().runs[0].accounting).toBeNull();
+    expect(useExecutionStore.getState().runs[0].accounting_corruption?.violations).toEqual(["closure"]);
+    expect(useExecutionStore.getState().progress?.accounting).toBeNull();
+  });
+
+  it("keeps a terminal run when an older cancellation acknowledgement arrives", async () => {
+    const { cancelRun } = await import("@/api/client");
+    const pending = deferred<{ status: "running"; cancel_requested: true }>();
+    vi.mocked(cancelRun).mockReturnValue(pending.promise);
+    useExecutionStore.setState({
+      runs: [makeRun()],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "running" } as RunProgress,
+    });
+
+    const cancel = useExecutionStore.getState().cancel("run-1");
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "cancelled", cancel_requested: false })],
+      progress: { status: "cancelled", cancel_requested: false } as RunProgress,
+      lastRunOutcome: { runId: "run-1", status: "cancelled", sessionId: "session-1" },
+    });
+    pending.resolve({ status: "running", cancel_requested: true });
+    await cancel;
+    expect(useExecutionStore.getState().runs[0].status).toBe("cancelled");
+    expect(useExecutionStore.getState().progress).toMatchObject({ status: "cancelled", cancel_requested: false });
+    expect(useExecutionStore.getState().lastRunOutcome?.status).toBe("cancelled");
+  });
+
+  it("drops an old cancellation error after A to B to A reactivation", async () => {
+    const { cancelRun } = await import("@/api/client");
+    const pending = deferred<{ status: "running"; cancel_requested: true }>();
+    vi.mocked(cancelRun).mockReturnValue(pending.promise);
+    useExecutionStore.setState({ runs: [makeRun()], activeRunId: "run-1" });
+
+    const cancel = useExecutionStore.getState().cancel("run-1");
+    useSessionStore.setState({ activeSessionId: "session-2" } as never);
+    useExecutionStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+    useExecutionStore.getState().reset();
+    pending.reject({ detail: "old request failed" });
+    await cancel;
+
+    expect(useExecutionStore.getState().error).toBeNull();
+  });
+
+  it("ignores late socket progress after a terminal REST result", async () => {
+    const { cancelRun } = await import("@/api/client");
+    vi.mocked(cancelRun).mockResolvedValue({ status: "cancelled", cancel_requested: false });
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+    useExecutionStore.setState({
+      runs: [makeRun()],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "running", source_rows_processed: 0 } as RunProgress,
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    await useExecutionStore.getState().cancel("run-1");
+    const progressData = {
+      source_rows_processed: 10,
+      tokens_succeeded: 8,
+      tokens_failed: 0,
+      tokens_quarantined: 0,
+      tokens_routed_success: 0,
+      tokens_routed_failure: 0,
+    };
+    const event: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:00.000Z",
+      event_type: "progress",
+      data: progressData,
+    };
+    handlers.onProgress(event, progressData);
+    handlers.onDisconnected?.();
+    expect(useExecutionStore.getState().runs[0].status).toBe("cancelled");
+    expect(useExecutionStore.getState().progress?.status).toBe("cancelled");
+    expect(useExecutionStore.getState().wsDisconnected).toBe(false);
+    expect(useExecutionStore.getState().lastRunOutcome?.status).toBe("cancelled");
+  });
+
+  it("keeps terminal socket evidence when an earlier recovery read returns live", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    vi.mocked(fetchRuns).mockReturnValueOnce(oldRead.promise).mockResolvedValue([
+      makeRun({ status: "completed", accounting: makeAccounting() }),
+    ]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+    useExecutionStore.setState({
+      runs: [makeRun()],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "running", accounting: null } as RunProgress,
+    });
+    const read = useExecutionStore.getState().loadRuns("session-1");
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    const completionData = {
+      status: "completed" as const,
+      accounting: makeAccounting(),
+      landscape_run_id: "landscape-run-1",
+    };
+    const terminal: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: completionData,
+    };
+    handlers.onComplete(terminal, completionData);
+    oldRead.resolve([makeRun({ status: "running" })]);
+    await read;
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+  });
+
+  it("reconciles conflicting terminal socket evidence with one fresh REST read", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "completed", accounting: makeAccounting() })]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "cancelled" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "cancelled", accounting: null } as RunProgress,
+      lastRunOutcome: { runId: "run-1", status: "cancelled", sessionId: "session-1" },
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    const completionData = {
+      status: "completed" as const,
+      accounting: makeAccounting(),
+      landscape_run_id: "landscape-run-1",
+    };
+    const terminal: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: completionData,
+    };
+    handlers.onComplete(terminal, completionData);
+    handlers.onComplete(terminal, completionData);
+    expect(useExecutionStore.getState().progress?.status).toBe("cancelled");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetchRuns).toHaveBeenCalledTimes(1);
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+  });
+
+  it("does not overwrite a terminal outcome from one conflicting REST snapshot", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const authoritativeRead = deferred<Run[]>();
+    vi.mocked(fetchRuns)
+      .mockResolvedValueOnce([makeRun({ status: "failed" })])
+      .mockReturnValueOnce(authoritativeRead.promise);
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "completed" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { status: "completed", accounting: null } as RunProgress,
+      lastRunOutcome: null,
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+    expect(useExecutionStore.getState().runs[0].status).toBe("completed");
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+
+    authoritativeRead.resolve([makeRun({ status: "failed" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useExecutionStore.getState().runs[0].status).toBe("failed");
+    expect(useExecutionStore.getState().progress?.status).toBe("failed");
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a failed terminal reconciliation without another socket event", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      vi.mocked(fetchRuns)
+        .mockRejectedValueOnce(new Error("database unavailable"))
+        .mockResolvedValueOnce([makeRun({ status: "failed" })]);
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fetchRuns).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchRuns).toHaveBeenCalledTimes(2);
+      expect(useExecutionStore.getState().progress?.status).toBe("failed");
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out a hung reconciliation read and fences its late response", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      const hungRead = deferred<Run[]>();
+      vi.mocked(fetchRuns)
+        .mockReturnValueOnce(hungRead.promise)
+        .mockRejectedValueOnce(new Error("still unavailable"))
+        .mockResolvedValueOnce([makeRun({ status: "failed" })]);
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      expect(fetchRuns).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(vi.mocked(fetchRuns).mock.calls[0][1]?.aborted).toBe(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchRuns).toHaveBeenCalledTimes(2);
+      hungRead.resolve([makeRun({ status: "completed" })]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchRuns).toHaveBeenCalledTimes(3);
+      expect(useExecutionStore.getState().progress?.status).toBe("failed");
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces a final-status warning after every reconciliation read hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      vi.mocked(fetchRuns).mockImplementation(() => new Promise<Run[]>(() => {}));
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(5);
+      expect(useExecutionStore.getState().error).toContain("Could not confirm this run's final status");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(5);
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a pending reconciliation when the execution store resets", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      vi.mocked(fetchRuns).mockImplementation(() => new Promise<Run[]>(() => {}));
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      const signal = vi.mocked(fetchRuns).mock.calls[0][1];
+      expect(signal?.aborted).toBe(false);
+      useExecutionStore.getState().reset();
+      expect(signal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(1);
+      expect(useExecutionStore.getState().error).toBeNull();
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces a safe final-status warning after bounded reconciliation failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      vi.mocked(fetchRuns).mockRejectedValue(new Error("private backend trace"));
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(5);
+      expect(useExecutionStore.getState().error).toContain("Could not confirm this run's final status");
+      expect(useExecutionStore.getState().error).not.toContain("private backend trace");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(5);
+      vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "completed" })]);
+      await useExecutionStore.getState().loadRuns("session-1");
+      expect(useExecutionStore.getState().error).toBeNull();
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a queued retry when an ordinary history read confirms the terminal status", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      vi.mocked(fetchRuns)
+        .mockRejectedValueOnce(new Error("database unavailable"))
+        .mockResolvedValue([makeRun({ status: "completed" })]);
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await Promise.resolve();
+      await Promise.resolve();
+      await useExecutionStore.getState().loadRuns("session-1");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchRuns).toHaveBeenCalledTimes(2);
+      expect(useExecutionStore.getState().error).toBeNull();
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a pre-conflict REST snapshot confirm a later socket conflict", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      const preConflictRead = deferred<Run[]>();
+      vi.mocked(fetchRuns)
+        .mockReturnValueOnce(preConflictRead.promise)
+        .mockRejectedValueOnce(new Error("database unavailable"))
+        .mockResolvedValueOnce([makeRun({ status: "failed" })]);
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      const oldRead = useExecutionStore.getState().loadRuns("session-1");
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await Promise.resolve();
+      preConflictRead.resolve([makeRun({ status: "completed" })]);
+      await oldRead;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchRuns).toHaveBeenCalledTimes(3);
+      expect(useExecutionStore.getState().progress?.status).toBe("failed");
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries a stale reconciliation read after a newer read supersedes it", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchRuns } = await import("@/api/client");
+      const staleRead = deferred<Run[]>();
+      vi.mocked(fetchRuns)
+        .mockReturnValueOnce(staleRead.promise)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([makeRun({ status: "failed" })]);
+      vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({
+        runs: [makeRun({ status: "completed" })],
+        activeRunId: "run-1", activeRunSessionId: "session-1",
+        progress: { status: "completed", accounting: null } as RunProgress,
+      });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+      const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+      const event: RunEvent = {
+        run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+        event_type: "failed", data: failureData,
+      };
+
+      handlers.onFailed(event, failureData);
+      await useExecutionStore.getState().loadRuns("session-1");
+      staleRead.resolve([makeRun({ status: "failed" })]);
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchRuns).toHaveBeenCalledTimes(3);
+      expect(useExecutionStore.getState().progress?.status).toBe("failed");
+    } finally {
+      useExecutionStore.getState().reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let an old A reconciliation release a new A claim after A to B to A", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const oldRead = deferred<Run[]>();
+    const newRead = deferred<Run[]>();
+    vi.mocked(fetchRuns)
+      .mockReturnValueOnce(oldRead.promise)
+      .mockReturnValueOnce(newRead.promise)
+      .mockResolvedValue([makeRun({ status: "failed" })]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+    const armTerminalRun = () => useExecutionStore.setState({
+      runs: [makeRun({ status: "completed" })],
+      activeRunId: "run-1", activeRunSessionId: "session-1",
+      progress: { status: "completed", accounting: null } as RunProgress,
+    });
+    const failureData = { status: "failed" as const, detail: "run failed", node_id: null };
+    const event: RunEvent = {
+      run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "failed", data: failureData,
+    };
+
+    armTerminalRun();
+    useExecutionStore.getState().connectWebSocket("run-1");
+    vi.mocked(connectToRun).mock.calls[0][2].onFailed(event, failureData);
+    useSessionStore.setState({ activeSessionId: "session-2" } as never);
+    useExecutionStore.getState().reset();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+    useExecutionStore.getState().reset();
+    armTerminalRun();
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const newHandlers = vi.mocked(connectToRun).mock.calls[1][2];
+    newHandlers.onFailed(event, failureData);
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+
+    oldRead.resolve([makeRun({ status: "failed" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+    newHandlers.onFailed(event, failureData);
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+    newRead.resolve([makeRun({ status: "failed" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it("enriches duplicate terminal socket evidence without recreating an acknowledged notice", () => {
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() });
+    useExecutionStore.setState({
+      runs: [makeRun({
+        status: "completed", accounting: null,
+        finished_at: "2026-04-26T05:32:10.000Z",
+        accounting_corruption: { landscape_run_id: "landscape-run-1", violations: ["incomplete"] },
+      })],
+      activeRunId: "run-1", activeRunSessionId: "session-1",
+      progress: { status: "completed", accounting: null } as RunProgress,
+      lastRunOutcome: null,
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    const completionData = {
+      status: "completed" as const, accounting: makeAccounting(),
+      landscape_run_id: "landscape-run-1",
+    };
+    const event: RunEvent = {
+      run_id: "run-1", timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed", data: completionData,
+    };
+    handlers.onComplete(event, completionData);
+
+    expect(useExecutionStore.getState().runs[0].accounting).toEqual(completionData.accounting);
+    expect(useExecutionStore.getState().runs[0].accounting_corruption).toBeNull();
+    expect(useExecutionStore.getState().runs[0].finished_at).toBe("2026-04-26T05:32:10.000Z");
+    expect(useExecutionStore.getState().progress?.accounting).toEqual(completionData.accounting);
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+});
+
 describe("executionStore progress events advance live accounting", () => {
   // The API run record no longer carries best-known live counters. Progress
   // events update state.progress, while completed events attach closed

@@ -375,6 +375,11 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
             state_id = approved_state_id if current_state_reads == 1 else newer_state_id
             return SimpleNamespace(id=state_id)
 
+        async def list_interpretation_events(self, _session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert status == "pending"
+            assert composition_state_id == approved_state_id
+            return []
+
         async def get_run(self, requested_run_id: Any) -> Any:
             assert requested_run_id == run_id
             return SimpleNamespace(status="cancelled")
@@ -590,6 +595,48 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     assert detail["code"] == "tutorial_interpretations_pending"
     assert "review" in detail["detail"].lower()
     assert "SENTINEL_NODE_ID" not in repr(detail)
+
+
+@pytest.mark.asyncio
+async def test_readiness_refuses_pending_interpretations_before_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session_id = uuid4()
+    state_id = uuid4()
+
+    class FakeSessionService:
+        async def get_current_state(self, requested_session_id: Any) -> Any:
+            assert requested_session_id == session_id
+            return SimpleNamespace(id=state_id)
+
+        async def list_interpretation_events(self, requested_session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert requested_session_id == session_id
+            assert status == "pending"
+            assert composition_state_id == state_id
+            return [SimpleNamespace(id=uuid4())]
+
+    monkeypatch.setattr(tutorial_service_module, "state_from_record", lambda _record: SimpleNamespace())
+    monkeypatch.setattr(tutorial_service_module, "_tutorial_launch_blocker", lambda **_kwargs: None)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                plugin_snapshot_factory=lambda _user: SimpleNamespace(),
+                web_plugin_policy=SimpleNamespace(),
+                operator_profile_registry=SimpleNamespace(),
+                catalog_service=SimpleNamespace(),
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await tutorial_service_module._require_tutorial_launch_readiness(
+            request=request,
+            user=SimpleNamespace(user_id="tutorial-user"),
+            session_id=session_id,
+            settings=_make_tutorial_settings(tmp_path),
+            session_service=FakeSessionService(),
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "tutorial_interpretations_pending"
 
 
 @pytest.mark.asyncio

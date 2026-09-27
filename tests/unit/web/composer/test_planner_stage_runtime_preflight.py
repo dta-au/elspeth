@@ -219,17 +219,17 @@ async def _stage(
     state = _empty_state()
 
     if isinstance(preflight, BaseException):
-        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, side_effect=preflight)
+        preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, side_effect=preflight)
     else:
-        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, return_value=preflight)
+        preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=preflight)
 
     with (
-        patch.object(service, "_sessions_service", sessions),
-        patch.object(service, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
-        patch.object(service, "_cached_runtime_preflight", preflight_mock),
+        patch.object(service._planning_application, "_sessions_service_optional", sessions),
+        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
+        patch.object(service._preflight, "cached_runtime_preflight", preflight_mock),
     ):
         staged_session_id = uuid4()
-        result = await service._stage_pipeline_plan(
+        result = await service._planning_application._stage_pipeline_plan(
             plan=_plan(candidate_state),
             state=state,
             session_id=staged_session_id,

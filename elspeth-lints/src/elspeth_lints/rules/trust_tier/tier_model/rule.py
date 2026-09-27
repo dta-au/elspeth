@@ -562,9 +562,9 @@ class TierModelVisitor(ast.NodeVisitor):
                 "walk_model_schema",
             }
         ),
+        "web/composer/composer_preflight.py": frozenset({"ComposerPreflight.cached_runtime_preflight"}),
         "web/composer/service.py": frozenset(
             {
-                "ComposerServiceImpl._cached_runtime_preflight",
                 "ComposerServiceImpl._compose_loop",
                 # _dispatch_tool_batch was extracted from _compose_loop on
                 # 2026-05-23 (compose-loop-decomp refactor). The Tier-3
@@ -574,7 +574,6 @@ class TierModelVisitor(ast.NodeVisitor):
                 # semantics, same boundary, new method name: this is a
                 # 1:1 successor inclusion, not a list extension.
                 "ComposerServiceImpl._dispatch_tool_batch",
-                "ComposerServiceImpl._validate_advisor_arguments",
             }
         ),
         "web/composer/source_inspection.py": frozenset({"_facts_from_objects", "_inspect_json", "_inspect_jsonl"}),

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import wraps
 from typing import TYPE_CHECKING
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -59,21 +61,27 @@ async def _settle(span: _ProviderSpan) -> None:
     settlement = asyncio.create_task(
         span.scope.service.finish_provider_attempt(session_operation_context=span.scope.context, call=span.call)
     )
-    interrupted: asyncio.CancelledError | None = None
-    while not settlement.done():
-        try:
-            await asyncio.shield(settlement)
-        except asyncio.CancelledError as error:
-            # Keep waiting for the durable settlement, but retain cancellation
-            # so the caller observes it after the ledger is reconciled.
-            if settlement.done():
-                raise
-            interrupted = error
+    try:
+        await asyncio.shield(settlement)
+    except asyncio.CancelledError as cancellation:
+        # The shielded write can outlive repeated caller cancellation. Observe
+        # its actual outcome before releasing the operation's audit authority.
+        while not settlement.done():
+            with suppress(BaseException):
+                await asyncio.shield(settlement)
+        if settlement.cancelled():
+            raise AuditIntegrityError("Composer provider settlement was cancelled before durable completion") from cancellation
+        failure = settlement.exception()
+        if failure is not None:
+            if isinstance(failure, contract_errors.TIER_1_ERRORS):
+                raise failure from cancellation
+            raise cancellation from failure
+        span.attempt = None
+        span.call = None
+        raise cancellation
     settlement.result()
     span.attempt = None
     span.call = None
-    if interrupted is not None:
-        raise interrupted
 
 
 def quota_provider_calls[**P, R](operation: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -89,25 +97,97 @@ def quota_provider_calls[**P, R](operation: Callable[P, Awaitable[R]]) -> Callab
         try:
             return await operation(*args, **kwargs)
         finally:
+            primary = sys.exception()
             try:
-                await _settle(span)
+                try:
+                    await _settle(span)
+                except BaseException as settlement_error:
+                    if isinstance(primary, asyncio.CancelledError) and settlement_error is not primary:
+                        if isinstance(settlement_error, asyncio.CancelledError):
+                            child_failure = settlement_error.__cause__
+                            if child_failure is None:
+                                raise primary from None
+                            settlement_error = child_failure
+                        if isinstance(settlement_error, contract_errors.TIER_1_ERRORS):
+                            raise settlement_error from primary
+                        raise primary from settlement_error
+                    raise
             finally:
                 _SPAN.reset(token)
 
     return wrapped
 
 
-async def admit_provider_attempt() -> None:
+async def _join_after_cancellation[R](task: asyncio.Task[R], cancellation: asyncio.CancelledError) -> R:
+    """Observe an owned task after cancellation without losing its result."""
+    while not task.done():
+        with suppress(BaseException):
+            await asyncio.shield(task)
+    if task.cancelled():
+        raise AuditIntegrityError("Composer provider custody task cancelled before its outcome was known") from cancellation
+    try:
+        return task.result()
+    except BaseException as failure:
+        if isinstance(failure, contract_errors.TIER_1_ERRORS):
+            raise failure from cancellation
+        raise cancellation from failure
+
+
+async def admit_provider_attempt(*, model: str) -> None:
     """Commit pending evidence and admission before the physical dispatch."""
     if _CONTEXTVAR_GET(_SCOPE) is None:
         return
     span = _CONTEXTVAR_GET(_SPAN)
     if span is None:
         raise AuditIntegrityError("Composer provider dispatch lacks an audited quota span")
+    if type(model) is not str or not model:
+        raise AuditIntegrityError("Composer provider attempt requires an owned requested model")
     # Retrying is another chargeable call. Settle the preceding attempt
     # before admission so one retry loop cannot run past a measured cap.
     await _settle(span)
-    span.attempt = await span.scope.service.begin_provider_attempt(session_operation_context=span.scope.context, source="composer")
+    admission = asyncio.create_task(
+        span.scope.service.begin_provider_attempt(session_operation_context=span.scope.context, source="composer")
+    )
+    try:
+        span.attempt = await asyncio.shield(admission)
+    except asyncio.CancelledError as cancellation:
+        attempt = await _join_after_cancellation(admission, cancellation)
+        # The SDK has not been entered: only this narrow path can assert zero
+        # usage without inventing a provider call. The authority records that
+        # explicit disposition under the original admission fence.
+        disposition = asyncio.create_task(
+            span.scope.service.cancel_undispatched_provider_attempt(
+                session_operation_context=span.scope.context,
+                attempt_id=attempt.attempt_id,
+                requested_model=model,
+            )
+        )
+        try:
+            await asyncio.shield(disposition)
+        except asyncio.CancelledError:
+            try:
+                await _join_after_cancellation(disposition, cancellation)
+            except asyncio.CancelledError as interrupted:
+                if interrupted.__cause__ is not None:
+                    raise AuditIntegrityError("Composer undispatched provider attempt could not be settled") from interrupted.__cause__
+                raise
+        except BaseException as failure:
+            if isinstance(failure, contract_errors.TIER_1_ERRORS):
+                raise failure from cancellation
+            raise AuditIntegrityError("Composer undispatched provider attempt could not be settled") from failure
+        raise cancellation
+
+
+def provider_attempt_needs_terminal_audit() -> bool:
+    """Whether a completion failure belongs to an admitted, unaudited attempt.
+
+    Retry admission first settles the preceding call. If that fails, the
+    span still holds its terminal evidence and must not be rebound to the
+    retry's exception. Unscoped callers retain their own audit lifecycle.
+    Check before building a call record, which binds it into the span.
+    """
+    span = _CONTEXTVAR_GET(_SPAN)
+    return span is None or (span.attempt is not None and span.call is None)
 
 
 def bind_provider_attempt(call: ComposerLLMCall) -> ComposerLLMCall:

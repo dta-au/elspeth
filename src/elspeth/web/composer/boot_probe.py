@@ -4,9 +4,9 @@ The probe sends the requests production sends. Each probe request is built by
 the same function the production call site uses:
 
 - ``loop_tools``: the freeform compose loop's request
-  (:func:`~elspeth.web.composer.service.build_composer_loop_request_kwargs`)
+  (:func:`~elspeth.web.composer.provider_gateway.build_composer_loop_request_kwargs`)
   with the exact loop tool list
-  (:func:`~elspeth.web.composer.service.composer_loop_tool_definitions`);
+  (:func:`~elspeth.web.composer.provider_gateway.composer_loop_tool_definitions`);
 - ``planner_tools``: the pipeline planner's request
   (:func:`~elspeth.web.composer.pipeline_planner.build_planner_request_kwargs`)
   with :func:`~elspeth.web.composer.pipeline_planner.planner_tool_definitions`
@@ -39,6 +39,7 @@ import httpx
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_response
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
@@ -48,9 +49,8 @@ from elspeth.web.composer.pipeline_planner import (
     planner_tool_definitions,
 )
 from elspeth.web.composer.protocol import ComposerSettings
-from elspeth.web.composer.service import (
+from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
-    _litellm_acompletion,
     _MalformedLLMResponseError,
     build_composer_loop_request_kwargs,
     composer_loop_tool_definitions,
@@ -267,7 +267,7 @@ async def probe_composer_config(request: ComposerProbeRequest) -> bool:
 
     kwargs = request.to_litellm_kwargs()
     try:
-        response = await _litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
     except LiteLLMBadRequestError as exc:
         # A 400 identifies a rejected request, not which option caused it.
         # Provider exception text may carry secrets; expose only owned facts

@@ -115,7 +115,7 @@ describe("api/client user composer preferences", () => {
       new Response(
         JSON.stringify(
           makePayload({
-            tutorial_stage: "guided",
+            tutorial_stage: "build",
             tutorial_session_id: "sess-1",
           }),
         ),
@@ -124,17 +124,17 @@ describe("api/client user composer preferences", () => {
     );
 
     const result = await updateUserComposerPreferences({
-      tutorial_stage: "guided",
+      tutorial_stage: "build",
       tutorial_session_id: "sess-1",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
     });
 
-    expect(result.tutorial_stage).toBe("guided");
+    expect(result.tutorial_stage).toBe("build");
     expect(result.tutorial_session_id).toBe("sess-1");
     const [, init] = fetchSpy.mock.calls[0];
     expect(JSON.parse(init?.body as string)).toEqual({
-      tutorial_stage: "guided",
+      tutorial_stage: "build",
       tutorial_session_id: "sess-1",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
