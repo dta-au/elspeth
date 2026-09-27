@@ -763,7 +763,7 @@ class TestUnsafeIntegerRejectionAtSourceBoundary:
         with pytest.raises(ValidationError) as exc_info:
             Schema.model_validate(row)
         rendered = safe_validation_error_text(exc_info.value, Schema)
-        assert rendered == "1 validation error: <root>: [value_error]"
+        assert rendered == "1 validation error: <root>: [non_canonical_number]"
         assert str(_UNSAFE_INT) not in rendered
 
     @pytest.mark.parametrize(

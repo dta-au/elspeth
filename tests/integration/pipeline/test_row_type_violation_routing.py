@@ -1454,9 +1454,13 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     # number canonical JSON refuses (the one canonical-number rule, H1 of lane
     # 5887: it used to reject only NaN/Infinity), so the out-of-range sum fails
     # the flush's OUTPUT VALIDATION, value-free, before the release hash sees it.
+    # The text names the rule and blames the computed number, not a schema bug
+    # (review-codexfix-handoffs-r1 M1).
     assert flush_error["exception"] == (
         "Collector transform 'batch_stats' output validation failed for emitted row 0: "
-        "1 validation error: <root>: [value_error]. This indicates a transform schema bug."
+        "1 validation error: <root>: [non_canonical_number]. It emitted a number canonical JSON cannot represent. "
+        "Ensure output contains only JSON-serializable types within the JSON safe integer range. "
+        "Use None instead of NaN for missing values."
     )
     member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
     assert len(member_errors) == 2
@@ -1473,6 +1477,86 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     payloads = [path.read_bytes() for path in (tmp_path / "payloads").rglob("*") if path.is_file()]
     assert any(str(_BIG_PAGE_VALUE).encode() in payload for payload in payloads)
     assert not any(str(_NON_CANONICAL_SUM).encode() in payload for payload in payloads)
+
+
+def test_a_transform_computing_an_unsafe_integer_routes_naming_the_rule_not_a_schema_bug(tmp_path: Any) -> None:
+    """review-codexfix-handoffs-r1 M1: the per-row seam's text for a computed out-of-range integer.
+
+    value_transform multiplies a safe integer past ±(2**53-1). Its observed
+    output schema refuses the result (the one canonical-number rule), the row
+    routes to on_error, and the recorded reason names the rule and the
+    canonical-JSON guidance — not "a transform schema bug" — with no value.
+    """
+    import json
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import transform_errors_table
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    computed = 10**12 * 1_000_000
+    _write_jsonl(tmp_path / "in.jsonl", ({"id": 1, "big": 5}, {"id": 2, "big": 10**12}, {"id": 3, "big": 7}))
+    settings = f"""sources:
+  src:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "in.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+transforms:
+- name: multiply
+  plugin: value_transform
+  input: rows
+  on_success: out
+  on_error: failed
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prod
+      expression: row['big'] * 1000000
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  failed:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "failed.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+    assert [row["id"] for row in _read_jsonl(tmp_path / "out.jsonl")] == [1, 3]
+    assert [row["id"] for row in _read_jsonl(tmp_path / "failed.jsonl")] == [2]
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        [details] = conn.execute(select(transform_errors_table.c.error_details_json)).scalars().all()
+    assert json.loads(details)["error"] == (
+        "Transform 'value_transform' output validation failed for emitted row 0: "
+        "1 validation error: <root>: [non_canonical_number]. It emitted a number canonical JSON cannot represent. "
+        "Ensure output contains only JSON-serializable types within the JSON safe integer range. "
+        "Use None instead of NaN for missing values."
+    )
+    assert _audit_cells_containing(db, str(computed)) == []
 
 
 _NON_CANONICAL_SOURCE_INT = 9_182_737_777_777_777_777_777_777_777_777
@@ -1559,7 +1643,7 @@ payload_store:
     assert sorted(token_id for token_id, completed in outcomes if completed) == sorted(tokens)
     assert len(tokens) == (3 if on_validation_failure == "quarantine" else 2)
     # Positive control: the value-free reason reaches the validation record.
-    assert ("validation_errors", "error") in _audit_cells_containing(db, "<root>: [value_error]")
+    assert ("validation_errors", "error") in _audit_cells_containing(db, "<root>: [non_canonical_number]")
     # The value is only in the raw-row record of what the source saw.
     assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == [("validation_errors", "row_data_json")]
 

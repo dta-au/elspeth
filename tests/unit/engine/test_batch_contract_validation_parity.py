@@ -198,6 +198,34 @@ class TestSharedValidators:
         )
         assert _SENTINEL not in message
 
+    def test_an_emitted_number_canonical_json_refuses_is_named_by_rule_not_blamed_on_the_schema(self, node_kind: str) -> None:
+        """review-codexfix-handoffs-r1 M1: a computed unsafe integer is data, not a schema bug.
+
+        The output schema is a real ``schema_factory`` observed schema, whose
+        canonical-number rule refuses the emitted value. The text names the
+        rule (``non_canonical_number``) and carries the canonical-JSON
+        guidance, never the value.
+        """
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        unsafe = 2**60 + 12345
+        transform = _FakeBatchTransform()
+        transform.output_schema = create_schema_from_config(SchemaConfig.from_dict({"mode": "observed"}), "Out", allow_coercion=False)
+        result = TransformResult.success_multi((_row({"item": 1, "total": unsafe}),), success_reason={"action": "collected"})
+
+        with pytest.raises(PluginContractViolation) as excinfo:
+            validate_success_outputs(transform, result, node_kind=node_kind)
+
+        message = str(excinfo.value)
+        assert message == (
+            f"{node_kind} transform 'fake_batch' output validation failed for emitted row 0: "
+            "1 validation error: <root>: [non_canonical_number]. It emitted a number canonical JSON cannot represent. "
+            "Ensure output contains only JSON-serializable types within the JSON safe integer range. "
+            "Use None instead of NaN for missing values."
+        )
+        assert str(unsafe) not in message
+
     def test_a_buffered_row_omitting_a_declared_field_is_rejected_without_its_content(self, node_kind: str) -> None:
         """An observed model cannot see ``required_fields``; the presence check does (R1).
 

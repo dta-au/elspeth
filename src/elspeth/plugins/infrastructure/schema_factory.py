@@ -15,8 +15,10 @@ from typing import Any, Literal
 
 import numpy as np
 from pydantic import ConfigDict, create_model, model_validator
+from pydantic_core import PydanticCustomError
 
 from elspeth.contracts import PluginSchema
+from elspeth.contracts.safe_validation_errors import NON_CANONICAL_NUMBER_ERROR_TYPE
 from elspeth.contracts.schema import FIELD_TYPE_MAP as TYPE_MAP
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.canonical import is_non_canonical_number
@@ -75,9 +77,15 @@ def _reject_non_canonical_numbers(data: Any) -> Any:
     """Reject a number canonical JSON refuses by value (NaN/Infinity, unsafe integer) at the source boundary."""
     offending_path = _find_non_canonical_number_path(data)
     if offending_path is not None:
-        raise ValueError(
-            f"Non-finite or out-of-range number at {offending_path}: canonical JSON admits finite numbers and integers "
-            "within ±(2**53-1). Use null/None for missing values, not NaN/Infinity."
+        # A fixed ELSPETH error type, so the value-free rendered reason names
+        # the rule (``<root>: [non_canonical_number]``) rather than a generic
+        # ``value_error``. The path goes in through the template context, never
+        # into the template itself (a key may contain braces).
+        raise PydanticCustomError(
+            NON_CANONICAL_NUMBER_ERROR_TYPE,
+            "Non-finite or out-of-range number at {path}: canonical JSON admits finite numbers and integers "
+            "within ±(2**53-1). Use null/None for missing values, not NaN/Infinity.",
+            {"path": offending_path},
         )
     return data
 

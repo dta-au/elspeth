@@ -778,7 +778,7 @@ class TestAzureBlobSourceJSONL:
             rows = list(source.load(ctx))
 
         assert rows[0].is_quarantined
-        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert rows[0].quarantine_error == "1 validation error: <root>: [non_canonical_number]"
         assert rows[1].row == {"id": 2, "n": 5}
 
     def test_skips_empty_lines(self, ctx: PluginContext) -> None:

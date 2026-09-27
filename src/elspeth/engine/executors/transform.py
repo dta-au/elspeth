@@ -57,7 +57,7 @@ from elspeth.engine.executors.declaration_dispatch import (
     run_pre_emission_checks,
 )
 from elspeth.engine.executors.declared_output_types import verify_produced_output_types
-from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation, output_validation_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.spans import SpanFactory
 
@@ -642,11 +642,12 @@ class TransformExecutor:
             try:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
-                output_violation = PluginContractViolation(
-                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {safe_validation_error_text(e, transform.output_schema)}. "
-                    "This indicates a transform schema bug."
-                )
-                raise output_violation from e
+                raise output_validation_violation(
+                    producer=f"Transform '{transform.name}'",
+                    emitted_row_index=idx,
+                    output_schema=transform.output_schema,
+                    exc=e,
+                ) from e
 
         # ADR-050, Tier 2: the declared concrete types against the values the
         # transform PRODUCED (created, or rewrote from the input row); a

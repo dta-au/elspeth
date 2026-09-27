@@ -433,12 +433,14 @@ drained and repair this release forward.
   canonicalizer's own number rule to every field (declared, `any`, extras and
   nested values, after coercion), so the row takes the source's
   `on_validation_failure` route with the value-free reason
-  `<root>: [value_error]`, and the rows around it deliver. A row quarantined for
-  another reason that also carries such an integer now reaches its quarantine
-  sink (the value is nulled there, as `NaN` already was) instead of ending the
-  run. A transform whose observed output schema receives such an integer now
-  fails that schema's output validation (routed, value-free), as it already did
-  for `NaN`. `blob_rows` refuses a configured `size_bytes` above 2**53-1 at
+  `<root>: [non_canonical_number]`, and the rows around it deliver. A row
+  quarantined for another reason that also carries such an integer now reaches
+  its quarantine sink (the value is nulled there, as `NaN` already was) instead
+  of ending the run. A transform that computes such a number (a
+  `value_transform` product, a collector's sum) fails its output validation
+  under the same rule, routed and value-free, and the recorded reason names the
+  rule (`[non_canonical_number]`) and the canonical-JSON guidance rather than a
+  transform schema bug. `blob_rows` refuses a configured `size_bytes` above 2**53-1 at
   validation. A source that bypasses its schema still ends the run at ingest,
   and the error now names the offending row by its source row index.
 - **A row carrying a float in [2**53, 1e21) no longer ends the run.** Canonical

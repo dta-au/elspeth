@@ -222,6 +222,24 @@ class TestSafeValidationErrorText:
     def test_custom_error_type_code_is_replaced(self) -> None:
         assert _render(_CustomTypeModel, {"customer": SECRET}) == "1 validation error: customer: [custom]"
 
+    def test_an_elspeth_error_code_is_printed_by_name(self) -> None:
+        """ELSPETH's own closed codes name their rule (review-codexfix-handoffs-r1 M1); others stay ``custom``."""
+        from elspeth.contracts.safe_validation_errors import ELSPETH_ERROR_TYPES, NON_CANONICAL_NUMBER_ERROR_TYPE
+
+        assert NON_CANONICAL_NUMBER_ERROR_TYPE in ELSPETH_ERROR_TYPES
+
+        class _OwnedCodeModel(PluginSchema):
+            customer: str
+
+            @field_validator("customer")
+            @classmethod
+            def _reject(cls, value: str) -> str:
+                raise PydanticCustomError(NON_CANONICAL_NUMBER_ERROR_TYPE, "customer {value} rejected", {"value": value})
+
+        exc = _validation_error(_OwnedCodeModel, {"customer": SECRET})
+        assert SECRET in str(exc), "positive control: the message carries the sentinel"
+        assert safe_validation_error_text(exc, _OwnedCodeModel) == "1 validation error: customer: [non_canonical_number]"
+
     def test_undeclared_field_name_is_replaced(self) -> None:
         assert _render(_ForbidModel, {"amount": 1, SECRET: 1}) == "1 validation error: [undeclared]: [extra_forbidden]"
 

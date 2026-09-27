@@ -1664,7 +1664,7 @@ class TestDataverseSourceLoadStructured:
         rows = list(source.load(ctx))
 
         assert [row.is_quarantined for row in rows] == [True, False]
-        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert rows[0].quarantine_error == "1 validation error: <root>: [non_canonical_number]"
         assert "9007199254740993" not in ctx.record_validation_error.call_args.kwargs["error"]
         assert rows[1].row["n"] == 5
 

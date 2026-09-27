@@ -1043,7 +1043,7 @@ class TestAWSS3SourceRegistrationAndParsing:
         source, _, ctx = _source_for(data.encode(), format=source_format)
         rows = list(source.load(ctx))
         assert rows[0].is_quarantined
-        assert rows[0].quarantine_error == "1 validation error: <root>: [value_error]"
+        assert rows[0].quarantine_error == "1 validation error: <root>: [non_canonical_number]"
         assert rows[1].row == {"id": 2, "n": 5}
 
     def test_json_array_non_object_quarantines_and_continues(self) -> None:

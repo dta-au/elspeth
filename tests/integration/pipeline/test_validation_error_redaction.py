@@ -416,5 +416,5 @@ def test_shipped_json_source_quarantines_a_non_finite_value_without_its_row_key(
     assert _audit_cells_containing(setup.db, SENTINEL) == {("validation_errors", "row_data_json")}
     with setup.db.engine.connect() as conn:
         [recorded] = conn.execute(select(validation_errors_table.c.error)).scalars()
-    assert recorded == "1 validation error: <root>: [value_error]"
+    assert recorded == "1 validation error: <root>: [non_canonical_number]"
     assert quarantined.quarantine_error == recorded
