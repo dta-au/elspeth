@@ -7,10 +7,10 @@ from typing import Any
 import pytest
 
 from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.service import (
-    AdvisorCheckpointVerdict,
     _tool_batch_ends_with_valid_current_preview,
 )
 from elspeth.web.composer.state import OutputSpec, SourceSpec, ValidationSummary
@@ -92,7 +92,7 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="The requested output needs review.")
         return await _clean_advisor_checkpoint(*args, **kwargs)
 
-    monkeypatch.setattr(service, "_run_advisor_checkpoint", advisor)
+    monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", advisor)
     before_deadline = service._call_llm_before_deadline
 
     async def expire_final_reply(*args: Any, **kwargs: Any) -> Any:

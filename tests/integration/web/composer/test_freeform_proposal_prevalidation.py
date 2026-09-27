@@ -23,11 +23,12 @@ from elspeth.web.blobs.protocol import BlobPendingProposalError
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
@@ -196,7 +197,7 @@ def _harness(tmp_path: Path) -> _Harness:
             sessions_service=sessions,
             session_engine=engine,
         )
-    service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
+    service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
         engine=engine,
         sessions=sessions,

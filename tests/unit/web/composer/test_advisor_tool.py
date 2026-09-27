@@ -31,13 +31,16 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
+from elspeth.web.composer._compose_loop_carriers import (
+    AdvisorArgumentRejection,
+    _AdmittedLLMCompletion,
+)
 from elspeth.web.composer.advisor_context import build_advisor_user_message
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, composer_loop_tool_definitions
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
@@ -155,53 +158,57 @@ def _make_advisor_tool_call(
     *,
     problem: str = "stuck on llm config",
     trigger: str = "proactive_security_safety",
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     args = {
         "trigger": trigger,
         "problem_summary": problem,
         "recent_errors": ["error A", "error A"],
         "attempted_actions": ["set_pipeline with options={}", "checked relevant schema"],
     }
-    return _FakeLLMResponse(
-        choices=[
-            _FakeChoice(
-                message=_FakeMessage(
-                    content=None,
-                    tool_calls=[
-                        _FakeToolCall(
-                            id=call_id,
-                            function=_FakeFunction(
-                                name="request_advisor_hint",
-                                arguments=json.dumps(args),
-                            ),
-                        )
-                    ],
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=call_id,
+                                function=_FakeFunction(
+                                    name="request_advisor_hint",
+                                    arguments=json.dumps(args),
+                                ),
+                            )
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _FakeLLMResponse:
-    return _FakeLLMResponse(
-        choices=[
-            _FakeChoice(
-                message=_FakeMessage(
-                    content=None,
-                    tool_calls=[
-                        _FakeToolCall(
-                            id=call_id,
-                            function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
-                        )
-                    ],
+def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=call_id,
+                                function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
+                            )
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _make_text_only_response(content: str) -> _FakeLLMResponse:
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
+def _make_text_only_response(content: str) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))]))
 
 
 def _make_advisor_response(text: str = "Try setting `provider: azure` and supplying `deployment`.") -> _FakeLLMResponse:
@@ -265,7 +272,7 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     raw_extra_context = "RAW_EXTRA_CONTEXT: raw traceback and source excerpt"
 
-    rejection = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {
             "trigger": "proactive_security_safety",
             "problem_summary": "stuck",
@@ -293,7 +300,7 @@ def test_reactive_trigger_is_retired() -> None:
     must be rejected as an unknown trigger.
     """
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    rejection = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {
             "trigger": "reactive_validation_loop",
             "problem_summary": "stuck",
@@ -312,7 +319,7 @@ def test_proactive_triggers_still_valid() -> None:
     """The two proactive triggers must still validate cleanly."""
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     for trig in ("proactive_security_safety", "proactive_red_listed_plugin"):
-        payload = service._validate_advisor_arguments(
+        payload = service._advisor_checkpoint._validate_advisor_arguments(
             {
                 "trigger": trig,
                 "problem_summary": "p",
@@ -452,7 +459,7 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
             )
         ]
     )
-    turns = [advisor_tool_call, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(advisor_tool_call), _make_text_only_response("done")]
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
@@ -586,7 +593,7 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
@@ -622,7 +629,7 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     kwargs = mock_acompletion.call_args.kwargs
     assert "seed" not in kwargs
@@ -925,7 +932,7 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
             return_value=5.0,
@@ -968,7 +975,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -1020,7 +1027,7 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     with (
         patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -1082,7 +1089,7 @@ async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
             return_value=remaining,
@@ -1149,7 +1156,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
             return_value=_make_advisor_response(),
         ) as mock_acompletion,
     ):
-        mock_llm.side_effect = [missing_trigger_response, _make_text_only_response("done")]
+        mock_llm.side_effect = [_admit_composer_llm_completion(missing_trigger_response), _make_text_only_response("done")]
         result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0
@@ -1418,7 +1425,7 @@ async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: st
             )
         ]
     )
-    turns = [bad_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(bad_response), _make_text_only_response("done")]
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
@@ -1535,7 +1542,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
             )
         ]
     )
-    turns = [huge_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(huge_response), _make_text_only_response("done")]
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
@@ -1606,7 +1613,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
             )
         ]
     )
-    turns = [overhead_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(overhead_response), _make_text_only_response("done")]
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
@@ -1675,7 +1682,7 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
         ),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].status.name == "CANCELLED"
@@ -1705,7 +1712,7 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,
     ):

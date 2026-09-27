@@ -8,14 +8,11 @@ from uuid import uuid4
 
 import pytest
 
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict, _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.service import (
-    AdvisorCheckpointVerdict,
-    ComposerServiceImpl,
-    _AdvisorCheckpointComposeDeadlineExpired,
-)
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
@@ -36,7 +33,7 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     state = complaint_triage_state(pending=True, narrow_consumer=True)
     service._interpretation_surfacing._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
-    service._run_advisor_checkpoint = _AsyncRecorder(
+    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(
             ok=True, blocking=True, findings_text="FLAGGED: requested behavior was removed", note="Requested behavior was removed"
         )
@@ -58,6 +55,7 @@ async def test_pending_graph_error_preserves_fresh_advisor_block_and_deadline(ex
     service._interpretation_surfacing.surface_pending_interpretation_reviews = surface
     messages = _AsyncRecorder(return_value=None)
     service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=messages)
+    service._advisor_checkpoint._sessions_service = service._sessions_service
     session_id = str(uuid4())
     deadline = asyncio.get_running_loop().time() + (-1 if expired else 60)
 

@@ -440,7 +440,7 @@ def test_advisor_prompt_budget_is_its_own_category() -> None:
 
     settings = _make_settings(composer_advisor_max_prompt_tokens=1)
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
-    rejection = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {"trigger": "proactive_security_safety", "problem_summary": "x" * 100, "recent_errors": [], "attempted_actions": []}
     )
     assert type(rejection) is AdvisorArgumentRejection
@@ -453,9 +453,9 @@ def test_advisor_model_rejection_after_schema_is_model_validation(monkeypatch: p
 
     # The flat schema and the pydantic model agree today, so skip S to reach
     # the model's own rejection arm, which must stay honestly labelled.
-    monkeypatch.setattr("elspeth.web.composer.service.require_schema_valid_arguments", lambda _name, _arguments: None)
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.require_schema_valid_arguments", lambda _name, _arguments: None)
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    rejection = service._validate_advisor_arguments({"trigger": "not-a-trigger"})
+    rejection = service._advisor_checkpoint._validate_advisor_arguments({"trigger": "not-a-trigger"})
     assert type(rejection) is AdvisorArgumentRejection
     assert rejection.category is ToolArgumentErrorCategory.MODEL_VALIDATION
     assert rejection.error_class == "ValidationError"

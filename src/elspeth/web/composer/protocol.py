@@ -31,7 +31,6 @@ if TYPE_CHECKING:
         PlannerOriginatingMessage,
     )
     from elspeth.web.composer.pipeline_proposal import PresentBase
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -1730,35 +1729,6 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the shared planner."""
-        ...
-
-    async def run_signoff_checkpoint(
-        self,
-        *,
-        state: CompositionState,
-        session_id: str | None,
-        recorder: BufferingRecorder | None,
-        progress: ComposerProgressSink | None = None,
-        user_message: str | None = None,
-    ) -> AdvisorCheckpointVerdict:
-        """Run the deterministic END evidence-scoped completion advisory checkpoint.
-
-        Public façade over the private ``_run_advisor_checkpoint(phase='end')``
-        so the guided STEP_4_WIRE dispatcher — which holds a ``ComposerService``
-        handle but not the impl's private methods — can request an
-        evidence-scoped completion advisory verdict. Non-raising: a sustained
-        provider failure yields ``ok=False`` (unavailable); a FLAGGED review yields
-        ``blocking=True``; CLEAN yields ``ok=True, blocking=False``. The caller
-        (the wire branch) maps the verdict to terminal/redirect per D13.
-
-        ``recorder`` threads the advisor call's audit sidecar; ``progress``
-        (when set) receives a ``calling_model`` event before the call.
-        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
-        chat turn, forwarded so the advisor can compare the supplied pipeline
-        evidence with explicit constraints visible in the bounded excerpt
-        (schema mode, field names/types, named plugins/values); optional and
-        rendered inside the existing untrusted fence.
-        """
         ...
 
     async def explain_run_diagnostics(

@@ -30,6 +30,7 @@ from sqlalchemy import select
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -64,7 +65,7 @@ def _settings_for(dialect: ToolContractDialect) -> Any:
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """The END advisor gate is not under test; make it a CLEAN no-op."""
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture(autouse=True)

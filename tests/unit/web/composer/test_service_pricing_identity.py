@@ -45,7 +45,7 @@ async def test_direct_service_call_uses_role_pricing_identity(tmp_path: Path, mo
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     if surface == "advisor":
-        await service._call_advisor_with_audit(
+        await service._advisor_checkpoint._call_advisor_with_audit(
             {"trigger": "reactive", "problem_summary": "stuck", "recent_errors": [], "attempted_actions": []}, recorder=recorder
         )
     elif surface == "text":

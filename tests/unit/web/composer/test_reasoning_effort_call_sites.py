@@ -113,7 +113,7 @@ async def test_advisor_call_carries_the_advisor_knob(
     expected_value: object,
 ) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_advisor_model=advisor_model)._call_advisor_with_audit(
+    await _service(tmp_path, composer_advisor_model=advisor_model)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",

@@ -102,7 +102,7 @@ async def test_advisor_omits_sampling_when_settings_are_none(monkeypatch: pytest
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_advisor_with_audit(
+    await _service(tmp_path)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -126,7 +126,7 @@ async def test_advisor_sends_configured_sampling(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._call_advisor_with_audit(
+    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",

@@ -42,9 +42,10 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import service as service_module
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import (
@@ -422,7 +423,7 @@ async def _run_no_tool_turn(
     """
     composer = _build_composer(tmp_path, sessions_service, max_composition_turns=max_composition_turns)
     if advisor is not None:
-        composer._run_advisor_checkpoint = advisor
+        composer._advisor_checkpoint._run_advisor_checkpoint = advisor
     session_id = await _seed_session(sessions_service)
     monkeypatch.setattr(service_module, "validate_pipeline", fake)
     llm = _ScriptedLLM(

@@ -47,7 +47,7 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_advisor_call_sends_no_tools_and_uses_the_advisor_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path)._call_advisor_with_audit(
+    await _service(tmp_path)._advisor_checkpoint._call_advisor_with_audit(
         {"trigger": "reactive", "problem_summary": "stuck", "recent_errors": [], "attempted_actions": []}, recorder=None
     )
     assert "tools" not in captured and captured["model"] == "anthropic/claude-opus-4-8"

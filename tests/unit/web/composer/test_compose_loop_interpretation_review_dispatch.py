@@ -55,6 +55,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.interpretation_surfacing import _has_pending_prompt_template_requirement
 from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
@@ -62,7 +63,6 @@ from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
-    AdvisorCheckpointVerdict,
     ComposerAvailability,
     ComposerServiceImpl,
     _pending_interpretation_review_repair_message,
@@ -3566,7 +3566,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     # Per-instance assertable advisor stub (instance attr wins over the autouse
     # class-level CLEAN stub) so we can assert it was awaited.
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
@@ -3623,7 +3623,7 @@ async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_mode
     assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
 
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     class _AssistantMessage:
         content = "Done — the pipeline is ready for review."
@@ -3675,7 +3675,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the source contract")
     )
 
@@ -3750,7 +3750,7 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
     assert all(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     llm = _ScriptedLLM(
         [
@@ -3827,7 +3827,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
     # Force the blocked-return branch (ok=False == unavailable). Instance attr
     # wins over the autouse class-level CLEAN stub.
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
@@ -3912,7 +3912,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the prompt")
     )
 
@@ -3983,7 +3983,7 @@ async def test_p5_budget_exhaustion_advisor_blocked_return_surfaces_prompt_templ
 
     # Force the P5 blocked-return branch (ok=False == unavailable -> fail closed).
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable"))
-    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
 
     # set_metadata (not set_pipeline) so the model-less PT node is not
     # re-canonicalized; the single mutation exhausts max_composition_turns=1 ->
@@ -4041,7 +4041,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
     state = _state_with_llm_node()  # bare {{interpretation:cool}}, no PT requirement, no event
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
     )
 
@@ -4459,7 +4459,7 @@ async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matc
             return await original_classify(**kwargs)
 
         monkeypatch.setattr(composer, "_classify_and_budget_turn", classify_with_prior)
-    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+    composer._advisor_checkpoint._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
         AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the interpretation before completion")
     )
     session_id = uuid4()

@@ -13,7 +13,7 @@ autouse ``_stub_advisor_end_gate_clean`` fixture in ``_helpers.py``; this
 package had no equivalent, so the convergence tests here went RED for an
 advisor-infra reason unrelated to the behaviour they assert. This conftest
 restores parity. Suites that legitimately exercise the gate override
-``service._run_advisor_checkpoint`` per-instance (instance attr wins over the
+``service._advisor_checkpoint._run_advisor_checkpoint`` per-instance (instance attr wins over the
 class patch), so this default never weakens a real gate assertion.
 """
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 
 
 async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
@@ -37,7 +37,7 @@ def _stub_advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     test avoids cross-test call-count leakage.
     """
     monkeypatch.setattr(
-        ComposerServiceImpl,
+        AdvisorCheckpointOwner,
         "_run_advisor_checkpoint",
         _clean_advisor_checkpoint,
         raising=True,

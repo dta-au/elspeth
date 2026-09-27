@@ -80,6 +80,8 @@ async def test_public_entry_refuses_before_provider_work(
     authority = _AdmissionService(reason)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     origin = PlannerOriginatingMessage(_SESSION_ID, None, "Build a pipeline", "owner")
     # These later-stage dependencies deliberately fail if reached. The admission
     # boundary must precede planner preparation as well as outbound model calls.
@@ -89,7 +91,7 @@ async def test_public_entry_refuses_before_provider_work(
         patch.object(service._provider_gateway, "_call_llm", autospec=True) as tool_provider,
         patch.object(service._provider_gateway, "_call_text_llm", autospec=True) as text_provider,
         patch("elspeth.web.composer.service.plan_pipeline", autospec=True) as planner,
-        patch.object(service, "_run_advisor_checkpoint", autospec=True) as advisor,
+        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True) as advisor,
         pytest.raises(ComposerAdmissionRefused, match=reason.value),
     ):
         if entry == "compose":
@@ -130,7 +132,7 @@ async def test_public_entry_refuses_before_provider_work(
         elif entry == "diagnostics":
             await service.explain_run_diagnostics({}, session_operation_context=_CONTEXT)
         else:
-            await service.run_signoff_checkpoint(
+            await service._advisor_checkpoint.run_signoff_checkpoint(
                 state=state,
                 session_id=_SESSION_ID,
                 recorder=BufferingRecorder(),
@@ -155,6 +157,8 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
 
     async def explain(*args: object, **kwargs: object) -> str:
         scope = provider_quota._SCOPE.get()
@@ -294,7 +298,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
         patch("elspeth.web.composer.service.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
-        patch.object(service, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
+        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
         pytest.raises(_PlannerReached if allowed else ComposerAdmissionRefused),
     ):
         if entry == "rootless":
@@ -333,7 +337,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
                 session_operation_context=_CONTEXT,
             )
         else:
-            await service.run_signoff_checkpoint(
+            await service._advisor_checkpoint.run_signoff_checkpoint(
                 state=state,
                 session_id=_SESSION_ID,
                 recorder=BufferingRecorder(),
@@ -353,6 +357,8 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     second_context = SessionOperationContext(
         fence=SessionOperationFence(session_id="second-session", operation_id="second-operation", lease_token="token", operation_epoch=1),
         operation_kind=SessionOperationKind.COMPOSE,

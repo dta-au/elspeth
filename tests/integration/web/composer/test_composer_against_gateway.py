@@ -683,7 +683,7 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await service._call_advisor_with_audit(
+    await service._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",

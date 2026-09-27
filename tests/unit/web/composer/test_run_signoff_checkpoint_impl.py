@@ -13,9 +13,10 @@ from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, Char
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.advisor_policy import ADVISOR_UNAVAILABLE_USER_DETAIL
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -123,13 +124,13 @@ async def test_run_signoff_delegates_to_end_checkpoint() -> None:
     service = _admitted_service()
     verdict = AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN: looks good")
     checkpoint = _AdvisorCheckpointFake(return_value=verdict)
-    service._run_advisor_checkpoint = checkpoint
+    service._advisor_checkpoint._run_advisor_checkpoint = checkpoint
     recorder = BufferingRecorder()
 
     async def sink(event: object) -> None:
         return None
 
-    out = await service.run_signoff_checkpoint(
+    out = await service._advisor_checkpoint.run_signoff_checkpoint(
         state=_state(), session_id="s1", recorder=recorder, progress=sink, session_operation_context=_CONTEXT
     )
 
@@ -152,6 +153,8 @@ async def test_run_signoff_progress_defaults_none() -> None:
             findings_text=ADVISOR_UNAVAILABLE_USER_DETAIL,
         )
     )
-    service._run_advisor_checkpoint = checkpoint
-    await service.run_signoff_checkpoint(state=_state(), session_id="s1", recorder=None, session_operation_context=_CONTEXT)
+    service._advisor_checkpoint._run_advisor_checkpoint = checkpoint
+    await service._advisor_checkpoint.run_signoff_checkpoint(
+        state=_state(), session_id="s1", recorder=None, session_operation_context=_CONTEXT
+    )
     assert checkpoint.assert_awaited_once().kwargs["progress"] is None

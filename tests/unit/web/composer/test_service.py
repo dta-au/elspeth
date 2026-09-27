@@ -35,6 +35,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
@@ -58,7 +59,6 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import (
-    AdvisorCheckpointVerdict,
     ComposerAvailability,
     ComposerServiceImpl,
     _compose_preflight_repair_message,
@@ -115,7 +115,7 @@ from tests.unit.web.composer._helpers import (
 from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
-_REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
+_REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
 
 
 def _make_llm_response(
@@ -1782,7 +1782,7 @@ class TestComposerSingleToolCall:
         async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
             return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
-        service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2002,7 +2002,7 @@ class TestComposerMultiTurnToolCalls:
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
-            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2059,7 +2059,9 @@ class TestComposerMultiTurnToolCalls:
         )
 
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
-        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
+            service._advisor_checkpoint, AdvisorCheckpointOwner
+        )  # type: ignore[method-assign]
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -2099,7 +2101,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
                 side_effect=_advisor_checkpoint_responses(
@@ -2176,13 +2178,15 @@ class TestComposerMultiTurnToolCalls:
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         prior_finding = "FLAGGED: sink omits rating"
-        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
+            service._advisor_checkpoint, AdvisorCheckpointOwner
+        )  # type: ignore[method-assign]
 
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
                 side_effect=_advisor_checkpoint_responses(
@@ -2220,7 +2224,9 @@ class TestComposerMultiTurnToolCalls:
             metadata=PipelineMetadata(),
             version=1,
         )
-        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
+            service._advisor_checkpoint, AdvisorCheckpointOwner
+        )  # type: ignore[method-assign]
 
         with (
             patch.object(
@@ -2231,7 +2237,7 @@ class TestComposerMultiTurnToolCalls:
             ),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
                 side_effect=_advisor_checkpoint_responses(
@@ -2282,7 +2288,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service._provider_gateway, "_call_llm", side_effect=scripted_call_llm),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new_callable=AsyncMock,
                 side_effect=[
@@ -2318,7 +2324,7 @@ class TestComposerMultiTurnToolCalls:
             ),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new_callable=AsyncMock,
                 side_effect=[
@@ -2354,7 +2360,7 @@ class TestComposerMultiTurnToolCalls:
                 service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
             ),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
-            patch.object(service, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new_callable=AsyncMock, return_value=outage),
         ):
             result = await service.compose("Review this pipeline", [], self._wired_source_only_state(), session_id=session_id)
 
@@ -2390,7 +2396,7 @@ class TestComposerMultiTurnToolCalls:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
             patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new_callable=AsyncMock,
                 side_effect=[
@@ -2477,7 +2483,7 @@ class TestComposerMultiTurnToolCalls:
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
-            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2540,7 +2546,7 @@ class TestComposerMultiTurnToolCalls:
         with (
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
-            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+            patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2606,7 +2612,7 @@ def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() ->
     # Consumer 1 — the END advisor gate: None preflight fails closed to the
     # fully blocking validation shape (every readiness axis withheld).
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    blocked = service._advisor_blocked_result(
+    blocked = service._advisor_checkpoint._advisor_blocked_result(
         reason="flagged_final_pass",
         verdict=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong"),
         state=_empty_state(),
@@ -4226,7 +4232,7 @@ class TestComposeTimeout:
         )
         service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         physical_calls = 0
 
         async def fail(*_args: object, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object) -> Any:
@@ -4236,8 +4242,10 @@ class TestComposeTimeout:
                 on_provider_dispatch()
             raise sdk_error
 
-        with patch.object(service, "_call_advisor_with_audit", side_effect=fail):
-            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+        with patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=fail):
+            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(
+                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+            )
 
         assert physical_calls == 2
         assert verdict.failure_class == expected_failure_class
@@ -4252,14 +4260,16 @@ class TestComposeTimeout:
     async def test_end_advisor_first_party_same_named_failure_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         impostor_class = type("ServiceUnavailableError", (Exception,), {})
         impostor = impostor_class("first-party defect")
         with (
-            patch.object(service, "_call_advisor_with_audit", side_effect=impostor) as advisor,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=impostor) as advisor,
             pytest.raises(impostor_class) as raised,
         ):
-            await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+            await _REAL_RUN_ADVISOR_CHECKPOINT(
+                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+            )
 
         assert raised.value is impostor
         assert advisor.await_count == 1
@@ -4272,8 +4282,10 @@ class TestComposeTimeout:
         named_generic_api_error = type("ServiceUnavailableError", (LiteLLMAPIError,), {})
         failure = named_generic_api_error(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
 
-        with patch.object(service, "_call_advisor_with_audit", side_effect=failure):
-            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(service, phase="end", state=_empty_state(), session_id=None, recorder=None)
+        with patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=failure):
+            verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(
+                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+            )
 
         assert verdict.failure_class == "malformed"
         assert verdict.findings_text == "advisor response was malformed"
@@ -4312,7 +4324,9 @@ class TestComposeTimeout:
             catalog=_mock_catalog(),
             settings=_make_settings(composer_timeout_seconds=0.005),
         )
-        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
+            service._advisor_checkpoint, AdvisorCheckpointOwner
+        )  # type: ignore[method-assign]
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
@@ -4329,7 +4343,7 @@ class TestComposeTimeout:
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         progress_events: list[ComposerProgressEvent] = []
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
 
         async def terminal_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
             await asyncio.sleep(0.01)
@@ -4341,7 +4355,7 @@ class TestComposeTimeout:
         with (
             patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=terminal_response_after_deadline),
             patch.object(service, "_runtime_preflight", return_value=passing_preflight),
-            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
             await service.compose("Review this pipeline", [], state, progress=record_progress, session_id=session_id)
@@ -4370,9 +4384,11 @@ class TestComposeTimeout:
             catalog=_mock_catalog(),
             settings=_make_settings(composer_timeout_seconds=1.0),
         )
-        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
+            service._advisor_checkpoint, AdvisorCheckpointOwner
+        )  # type: ignore[method-assign]
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",
             "on_success": "rows",
@@ -4411,7 +4427,7 @@ class TestComposeTimeout:
 
         with (
             patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=mutation_response),
-            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
             pytest.raises(ComposerConvergenceError) as exc_info,
         ):
@@ -4449,10 +4465,14 @@ class TestComposeTimeout:
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         sessions = service._require_sessions_service()
         await sessions.update_composer_preferences(UUID(session_id), trust_mode="auto_commit", density_default="high", actor="user:test")
-        monkeypatch.setattr(service, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl))
+        monkeypatch.setattr(
+            service._advisor_checkpoint,
+            "_run_advisor_checkpoint",
+            _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
+        )
         failure = error_type("advisor internal failure")
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
+        monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",
             "on_success": "rows",
@@ -4475,7 +4495,7 @@ class TestComposeTimeout:
                 new_callable=AsyncMock,
                 return_value=_make_llm_response(tool_calls=[{"id": "source-1", "name": "set_source", "arguments": source_arguments}]),
             ),
-            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock, side_effect=failure) as advisor,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock, side_effect=failure) as advisor,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
             pytest.raises(error_type) as raised,
         ):
@@ -5277,7 +5297,7 @@ class TestComposerAvailabilityAndBadRequest:
         else:
             monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", fail_completion)
             if call_path == "advisor":
-                call = service._call_advisor_with_audit(
+                call = service._advisor_checkpoint._call_advisor_with_audit(
                     {
                         "trigger": "proactive_security_safety",
                         "problem_summary": "Need guidance.",

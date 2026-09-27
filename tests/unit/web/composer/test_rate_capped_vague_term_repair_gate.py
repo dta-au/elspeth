@@ -20,7 +20,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine
 
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -41,7 +41,7 @@ _FALLBACK_INSTRUCTION = "write the interpretation into options.prompt_template"
 
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture

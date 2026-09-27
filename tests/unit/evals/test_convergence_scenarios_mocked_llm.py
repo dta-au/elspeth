@@ -1181,7 +1181,7 @@ class TestPreflightRepairContinue:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service, "_runtime_preflight", side_effect=_content_aware_preflight),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new=_clean_advisor_checkpoint,
             ),

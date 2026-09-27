@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
 from elspeth.web.composer.guided.protocol import GuidedStep
@@ -63,7 +64,7 @@ _NONE = ToolContractDialect.NONE
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """The END advisor gate is not under test; make it a CLEAN no-op."""
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture(autouse=True)

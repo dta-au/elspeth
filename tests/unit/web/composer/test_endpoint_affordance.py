@@ -169,7 +169,7 @@ async def test_advisor_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_advisor_with_audit(
+    await _service(tmp_path)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -197,7 +197,7 @@ async def test_advisor_sends_configured_advisor_endpoint(monkeypatch: pytest.Mon
         tmp_path,
         composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
         composer_advisor_endpoint_api_key=_SENTINEL_CREDENTIAL,
-    )._call_advisor_with_audit(
+    )._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -226,7 +226,7 @@ async def test_advisor_does_not_use_primary_endpoint(monkeypatch: pytest.MonkeyP
         tmp_path,
         composer_endpoint_base_url="https://primary-gateway.example.test/v1",
         composer_endpoint_api_key="primary-only-secret",
-    )._call_advisor_with_audit(
+    )._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -266,7 +266,7 @@ async def test_advisor_credential_never_appears_in_audit_record_on_failure(monke
             tmp_path,
             composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
             composer_advisor_endpoint_api_key=_SENTINEL_CREDENTIAL,
-        )._call_advisor_with_audit(
+        )._advisor_checkpoint._call_advisor_with_audit(
             {
                 "trigger": "reactive",
                 "problem_summary": "stuck",

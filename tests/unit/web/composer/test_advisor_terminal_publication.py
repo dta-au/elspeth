@@ -73,6 +73,7 @@ def _fenced_session(service: Any) -> tuple[str, SessionOperationContext]:
         service._sessions_service = MagicMock(
             spec=SessionServiceProtocol, add_message=AsyncMock(spec=SessionServiceProtocol.add_message, return_value=None)
         )
+        service._advisor_checkpoint._sessions_service = service._sessions_service
     session_id = str(uuid.uuid4())
     context = SessionOperationContext(
         fence=SessionOperationFence(
@@ -287,7 +288,7 @@ def _blocked_terminal(
     findings_backend_authored: bool = False,
     reason: str = "flagged_final_pass",
 ) -> Any:
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
     from elspeth.web.composer.tool_batch import BufferingRecorder
 
     # The verdict shape must match the reason the way the gate produces it:
@@ -308,7 +309,7 @@ def _blocked_terminal(
             findings_text="FLAGGED: still wrong",
             findings_backend_authored=findings_backend_authored,
         )
-    return service._advisor_blocked_result(
+    return service._advisor_checkpoint._advisor_blocked_result(
         reason=reason,
         verdict=verdict,
         state=_empty_state(),

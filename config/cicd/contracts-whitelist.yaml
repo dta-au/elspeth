@@ -970,8 +970,8 @@ allowed_dict_patterns:
   # (heterogeneous {phase, state-derived scalars}), not reducible to a TypedDict —
   # same rationale as ``_build_session_aware_kwargs:return`` below.
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_preflight_repair:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._maybe_run_early_checkpoint:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_checkpoint_arguments:return"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._maybe_run_early_checkpoint:llm_messages (list)"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._build_checkpoint_arguments:return"
   # R2-F14 (elspeth-5403f346c0): the format-retry helper returns a COPY of that
   # same checkpoint-argument dict with the verdict-format re-prompt appended to
   # ``problem_summary``. Identical shape, identical rationale — it cannot be a
@@ -1117,7 +1117,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:tools (list)"
   # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
   # payload; returns the admitted model or an owned AdvisorArgumentRejection.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._validate_advisor_arguments:arguments"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._validate_advisor_arguments:arguments"
   # elspeth-4e79436719 §Phase 3: Anthropic cache_control marker transform
   # operates on the same provider-call payload shape as the call sites above.
   # The `tools` parameter is typed `list | None`, so the contracts check

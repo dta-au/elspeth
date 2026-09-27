@@ -48,6 +48,7 @@ from elspeth.web.composer._required_paths_validator import (
     _TOOL_REQUIRED_PATHS,
     _find_missing_required_paths,
 )
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -654,6 +655,9 @@ class ToolBatchContext:
     """
 
     service: ComposerServiceImpl
+    advisor_checkpoint: AdvisorCheckpointOwner
+    advisor_max_calls_per_compose: int
+    advisor_timeout_seconds: float
     recorder: BufferingRecorder
     anti_anchor: AntiAnchorTracker
     discovery_cache: dict[str, _CachedDiscoveryPayload]
@@ -1876,7 +1880,7 @@ async def run_tool_batch(
             # outbound call is made — but anti-anchor counts them
             # so repeated identical bad-arg calls trigger the §7.7
             # structural hint.
-            advisor_arg_error = ctx.service._validate_advisor_arguments(arguments)
+            advisor_arg_error = ctx.advisor_checkpoint._validate_advisor_arguments(arguments)
             if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):
                 advisor_rejection_payload = advisor_arg_error.to_payload()
                 recorder.record(
@@ -1906,7 +1910,7 @@ async def run_tool_batch(
                 turn_has_discovery = True
                 continue
 
-            budget = ctx.service._settings.composer_advisor_max_calls_per_compose
+            budget = ctx.advisor_max_calls_per_compose
             if advisor_calls_used >= budget:
                 budget_payload = {
                     "status": "BUDGET_EXHAUSTED",
@@ -2007,7 +2011,7 @@ async def run_tool_batch(
                 turn_has_discovery = True
                 continue
 
-            advisor_timeout = ctx.service._settings.composer_advisor_timeout_seconds
+            advisor_timeout = ctx.advisor_timeout_seconds
             effective_advisor_timeout = min(advisor_timeout, remaining)
             advisor_deadline_limited = remaining <= advisor_timeout
 
@@ -2022,7 +2026,7 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                advisor_outcome = await ctx.service._call_advisor_for_tool(
+                advisor_outcome = await ctx.advisor_checkpoint._call_advisor_for_tool(
                     advisor_arg_error,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
