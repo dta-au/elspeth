@@ -338,16 +338,6 @@ the first evaded detection for 26 days because the gate counted calls per
 walk. If the trivial case feels too slow, that is a planner-brief defect to
 fix (see elspeth-63cf3803e6), never a reason to route around the provider.
 
-The interim guided collector guard is LIFTED (WS6, ruling 7878 on
-elspeth-88bb77953c): the guided lane authors and projects collectors like any
-other node kind, `guided_collector_not_authorable` is retired, and every
-`node_type` dispatch site in the guided path and frontend carries a collector
-arm or a deliberate documented exclusion. A new node kind or behavior arm is
-a parity sweep across those same surfaces (binder, proposal projection +
-`validate_payload`, wire cardinality, frontend union/decoder/renderers,
-teaching skills) — never a lane-scoped schema narrowing, which stays
-unauthorized unless refusal telemetry shows a real tax.
-
 ## Judge-signature stage (tier-model allowlist signing)
 
 The trust-tier CI failure is a deliberate fail-closed state: it prevents

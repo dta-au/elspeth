@@ -407,8 +407,7 @@ JSON-escaped, so grep the bare hex token), then any
 - `src/elspeth/web/audit_readiness/boundary_expectations.py`
   (`EXPECTED_TRANSFORM_DETERMINISMS`); editing it requires the commit trailer
   `telemetry-backfill: audit-readiness`.
-- The Python/TypeScript acronym mirror has no parity test: update both
-  `src/elspeth/web/composer/guided/_display.py::_ACRONYMS` and
+- The frontend plugin-display acronym list lives in
   `src/elspeth/web/frontend/src/components/catalog/pluginDisplayName.ts::ACRONYMS`.
 - Pin `source_file_hash` last.
 
@@ -765,9 +764,8 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   `src/elspeth/web/composer/skills/pipeline_capabilities.md`, the redaction
   snapshot (`scripts/cicd/bootstrap_redaction_snapshot.py --write`; only
   hashes may move, never `sensitive_path_count`, unless a sensitive path was
-  intended), and the frontend's strict guided wire decoder
-  (`frontend/src/api/guidedDecoder.ts`, `exactRecord` key lists) — a
-  production decoder that rejects unenumerated keys at runtime. Serialise
+  intended), and the frontend API contracts that consume the spec fields.
+  Serialise
   optional spec fields as omitted-when-`None` so persisted
   `composition_content_hash` values stay byte-identical.
 - The CSS barrel rules are under

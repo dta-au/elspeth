@@ -630,7 +630,7 @@ containing `landscape.url`, so the journal sits beside the audit database.
 ## Status and direction
 
 ELSPETH is a dual-surface authoring and execution platform: a CLI-first
-auditable pipeline engine plus a Web Composer for guided authoring, over one
+auditable pipeline engine plus a freeform Web Composer, over one
 shared execution and audit core.
 
 Current 0.8.0 behaviour:
@@ -638,9 +638,8 @@ Current 0.8.0 behaviour:
 - YAML remains a first-class operator path.
 - The Web Composer builds through discovery, mutation, blob, secret-reference,
   validation, service-side YAML export, and optional advisor tools.
-- Guided pipeline creation is LLM-primary: each stage is built by a language
-  model through `/guided/chat`, presented in a conversational builder with a
-  live verification panel and gated at the wire stage by an advisor sign-off.
+- Freeform pipeline creation is LLM-primary: the planner proposes the graph
+  through the ordinary conversation, with validation and review before a run.
 - Composer validation and web execution use runtime-shaped engine setup rather
   than a standalone UI validator.
 - The executor still runs from runtime-assembled settings and graph objects, not
