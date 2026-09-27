@@ -1,12 +1,11 @@
 """Test edge compatibility validation during graph construction."""
 
-from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import NodeType, PluginSchema
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import SourceSettings
 from elspeth.core.dag import ExecutionGraph
@@ -211,7 +210,7 @@ def test_edge_validation_timing_from_plugin_instances() -> None:
         output_schema: ClassVar[type[PluginSchema]] = ProducerSchema  # Has: id, name
         _output_schema_config: ClassVar[SchemaConfig | None] = None
         observed_value_type: str | None = None
-        field_renames: Mapping[str, str] = MappingProxyType({})
+        field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
         _on_validation_failure: ClassVar[str] = "discard"
 
     class MockSink:

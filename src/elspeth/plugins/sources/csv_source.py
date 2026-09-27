@@ -99,7 +99,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:081b2eaaf545bb99"
+    source_file_hash: str | None = "sha256:040ed5b1c21f4dae"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -155,6 +155,8 @@ class CSVSource(BaseSource):
         # Store normalization config for use in load()
         self._columns = cfg.columns
         self._field_mapping = cfg.field_mapping
+        # Headerless (explicit columns): field_mapping keys are the columns as written.
+        self._field_mapping_keys = "as_written" if cfg.columns is not None else "normalized"
 
         # Field resolution computed at load() time - includes version for audit
         self._field_resolution: FieldResolution | None = None

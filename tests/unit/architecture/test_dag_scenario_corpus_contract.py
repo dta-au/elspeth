@@ -862,7 +862,21 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # rotation above dropped on a false premise), so its source_file_hash moved
 # b39aa95f4046c12c -> 45320b13b23f6e0b (scripts/cicd/plugin_hash); no manifest
 # literal, resume digest, registry digest or oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "410accd26e4c164ef362de35335e25ea2d442d5ddf35ca1e30b2663dfffb31f1"
+# Rotated 2026-09-27 (elspeth-5887fb7928, field-name spelling rule, C1 fix
+# round 1): a PLUGIN PROVENANCE rotation. csv_source publishes what it matches
+# field_mapping keys against (headerless columns as written) on
+# SourceProtocol.field_renames, so its source_file_hash moved
+# 081b2eaaf545bb99 -> 040ed5b1c21f4dae (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 0488ea94... -> 3c03ee77..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 081b2eaaf545bb99 reproduces 0488ea94... exactly, so the move is plugin
+# provenance, not runtime semantics; (3) this digest. aws_s3
+# (aaaf6619345f0665 -> b491b922f1b34cb4) and azure_blob (6bf3a35d44316f7b ->
+# 719563e76907222d) moved too with no manifest pin. No oracle_freeze snapshot
+# moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "5134cb964dceaa39db5a08eca38e7e5f0c8f10c102884e413dd2a4804a7b3124"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -758,3 +758,70 @@ def test_a_renamed_header_group_by_fails_the_batch_routed(tmp_path: Path) -> Non
     assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 3}
     [failure] = [r for r in _batch_failure_reasons(tmp_path) if r.get("reason") == _READ]
     assert (failure["fields"], failure["canonical_fields"]) == (["Name"], ["b"])
+
+
+# A headerless source renames each column AS WRITTEN (review-C1-alias-bypass-r1 F1)
+# ---------------------------------------------------------------------------
+#
+# ``columns: [id, Name]`` + ``field_mapping: {Name: b}``: resolve_field_names
+# keys a headerless source's mapping by the column as written, not by its
+# normalized form, so ``Name`` names ``b`` while ``name`` names nothing. The
+# build resolution must follow that keying — resolving ``Name`` by its
+# normalized form missed the rename and let the declaration past
+# ``elspeth validate`` behind a closed upstream (every row then failed).
+
+_HEADERLESS_TEXT = f"1,{SENTINEL}\n2,Bob\n"
+
+
+def _headerless_source(
+    tmp_path: Path, *, columns: list[str], field_mapping: dict[str, str], schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    source = _csv_source(tmp_path, _HEADERLESS_TEXT, schema=schema)
+    source["options"]["columns"] = list(columns)
+    source["options"]["field_mapping"] = dict(field_mapping)
+    return source
+
+
+@pytest.mark.parametrize(("transform", "reason"), _mapped_surfaces(runtime=False))
+def test_a_renamed_headerless_column_declaration_is_refused_at_build_behind_a_closed_upstream(
+    tmp_path: Path, transform: dict[str, Any], reason: str
+) -> None:
+    """The build resolves ``Name`` through the source's as-written rename (``Name`` -> ``b``) and refuses before any row exists."""
+    source = _headerless_source(tmp_path, columns=["id", "Name"], field_mapping={"Name": "b"}, schema=_FIXED_ID_B)
+    output = _refused_at_build(_settings(tmp_path, source=source, transforms=[transform]))
+
+    if reason == _READ:
+        assert "'Name' is a header spelling of 'b': the source's field_mapping renames its column 'Name' to 'b'. Declare 'b'" in output
+        assert "headers are normalized" not in output
+    else:
+        assert "'Name' is a header spelling of the arriving field 'b'" in output
+
+
+@pytest.mark.parametrize(("transform", "reason"), _mapped_surfaces(runtime=True))
+def test_a_renamed_headerless_column_declaration_behind_an_observed_upstream_routes(
+    tmp_path: Path, transform: dict[str, Any], reason: str
+) -> None:
+    """The run time resolves ``Name`` through the row's contract (recorded original of ``b``) and routes every row."""
+    source = _headerless_source(tmp_path, columns=["id", "Name"], field_mapping={"Name": "b"})
+    result = _run(_settings(tmp_path, source=source, transforms=[transform]))
+
+    _assert_routed(tmp_path, result, reason=reason, literal="Name", canonical="b")
+
+
+def test_a_case_variant_of_a_renamed_headerless_column_is_no_spelling_of_the_target(tmp_path: Path) -> None:
+    """Control for the as-written keying: under ``columns: [id, name]`` + ``{name: b}`` the literal ``Name`` names nothing.
+
+    No lookup resolves ``Name`` to ``b`` there (the contract records ``name``),
+    so an optional ``Name`` declaration is not a spelling of ``b``: the build
+    admits it and the row is delivered. Keying the rename by the literal's
+    normalized form instead would refuse it as a spelling of ``b``.
+    """
+    vt = _transform(
+        "value_transform",
+        {"operations": [{"target": "doubled", "expression": "row['b'] + '!'"}], "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+    )
+    source = _headerless_source(tmp_path, columns=["id", "name"], field_mapping={"name": "b"}, schema=_FIXED_ID_B)
+    result = _run(_settings(tmp_path, source=source, transforms=[vt]))
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from hashlib import sha256
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import (
@@ -34,6 +33,7 @@ from elspeth.contracts import (
     SourceRow,
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -76,7 +76,7 @@ class _TestSourceBase:
     # SourceProtocol structural observed-cell type (elspeth-e6e552ce34).
     # None = no structural fact; the builder threads this onto NodeInfo.
     observed_value_type: str | None = None
-    field_renames: Mapping[str, str] = MappingProxyType({})
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}

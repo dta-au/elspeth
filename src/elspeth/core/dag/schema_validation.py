@@ -10,7 +10,6 @@ signatures.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from itertools import combinations
 from typing import TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
     DeclaredSpellings,
     FieldNameResolution,
+    SourceFieldRenames,
     describe_header_spellings,
     header_spelled_declarations,
     header_spelled_names,
@@ -1220,7 +1220,7 @@ def upstream_name_resolution(graph: ExecutionGraph, node_id: str) -> FieldNameRe
     """
     seen: set[str] = set()
     pending = [node_id]
-    renames: list[Mapping[str, str]] = []
+    renames: list[SourceFieldRenames] = []
     while pending:
         for predecessor_id in _live_predecessors(graph, pending.pop()):
             if predecessor_id in seen:

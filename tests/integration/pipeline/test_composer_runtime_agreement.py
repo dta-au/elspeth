@@ -8482,6 +8482,50 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         )
         self._assert_both_accept(state, tmp_path)
 
+    # --- A headerless source renames each column AS WRITTEN (review-C1-alias-bypass-r1 F1) ---
+    # resolve_field_names keys a headerless source's field_mapping by the column
+    # as written: under columns [id, Name] + {Name: b} the literal 'Name' names
+    # 'b', under columns [id, name] + {name: b} it names nothing. Both surfaces
+    # read the keying off the source's own field_renames.
+
+    def _headerless_state(self, tmp_path: Path, *, columns: list[str], field_mapping: dict[str, str], node: NodeSpec) -> CompositionState:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "headerless.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1,Ann\n", encoding="utf-8")
+        source = SourceSpec(
+            plugin="csv",
+            on_success="t_in",
+            options={
+                "path": str(path),
+                "columns": list(columns),
+                "field_mapping": dict(field_mapping),
+                "schema": {"mode": "fixed", "fields": ["id: str", "b: str"]},
+            },
+            on_validation_failure="discard",
+        )
+        return CompositionState(
+            source=source,
+            nodes=(node,),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def test_both_reject_the_codex_shape_on_a_headerless_source(self, tmp_path: Path) -> None:
+        node = self._field_mapper({"Name": "given"}, schema={"mode": "flexible", "fields": ["Name: int?"]})
+        node = replace(node, options={**node.options, "select_only": True})
+        self._assert_both_reject(
+            self._headerless_state(tmp_path, columns=["id", "Name"], field_mapping={"Name": "b"}, node=node),
+            tmp_path,
+            "'Name' is a header spelling of 'b': the source's field_mapping renames its column 'Name' to 'b'. Declare 'b'",
+        )
+
+    def test_both_accept_a_case_variant_of_a_renamed_headerless_column(self, tmp_path: Path) -> None:
+        """Control: under columns [id, name] + {name: b} no lookup resolves 'Name' to 'b', so it is no spelling of 'b'."""
+        node = self._value_transform(target="total", schema={"mode": "flexible", "fields": ["Name: str?"]}, reads="b")
+        self._assert_both_accept(self._headerless_state(tmp_path, columns=["id", "name"], field_mapping={"name": "b"}, node=node), tmp_path)
+
     @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
     def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:
         state = self._state(

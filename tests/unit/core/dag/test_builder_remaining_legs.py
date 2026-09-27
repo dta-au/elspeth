@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any
 
 import pytest
 
 from elspeth.contracts import FrameworkBugError
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import GateSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
@@ -22,7 +21,7 @@ class _Source:
     _on_validation_failure = "discard"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
-    field_renames: Mapping[str, str] = MappingProxyType({})
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config if config is not None else {"schema": {"mode": "observed"}}

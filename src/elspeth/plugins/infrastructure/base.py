@@ -38,7 +38,6 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
@@ -49,6 +48,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.field_spelling import FieldMappingKeys, SourceFieldRenames
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
     ContentTrust,
@@ -2665,17 +2665,22 @@ class BaseSource(ABC):
     # Schema contract for row validation
     _schema_contract: SchemaContract | None = None
 
-    # The source's validated ``field_mapping`` (normalized external name ->
-    # row key), set at construction by every source whose config carries one
+    # The source's validated ``field_mapping`` (key -> row key), set at
+    # construction by every source whose config carries one
     # (TabularSourceDataConfig and the json, aws_s3, azure_blob and dataverse
-    # configs); None for a source that renames nothing. Read through
+    # configs); None for a source that renames nothing. ``_field_mapping_keys``
+    # is what the source matches those keys against: the normalized external
+    # name, unless the source reads headerless CSV, whose keys are the
+    # configured column names as written (set at construction by csv, aws_s3
+    # and azure_blob from the same condition their loaders use). Read through
     # ``field_renames``.
     _field_mapping: dict[str, str] | None = None
+    _field_mapping_keys: FieldMappingKeys = "normalized"
 
     @property
-    def field_renames(self) -> Mapping[str, str]:
-        """The renames this source applies after normalizing an external name (``SourceProtocol.field_renames``)."""
-        return MappingProxyType({} if self._field_mapping is None else dict(self._field_mapping))
+    def field_renames(self) -> SourceFieldRenames:
+        """The renames this source applies, keyed the way it keys them (``SourceProtocol.field_renames``)."""
+        return SourceFieldRenames(mapping={} if self._field_mapping is None else self._field_mapping, keys=self._field_mapping_keys)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         # Enforces the contract documented in contracts/enums.py:Determinism —

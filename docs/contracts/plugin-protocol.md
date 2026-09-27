@@ -245,13 +245,17 @@ source boundary contract. Sources derive it from their effective
 source's observed-mode column heuristic must be reflected here, not only in the
 raw config dict.
 
-`field_renames: Mapping[str, str]` (a property; `BaseSource` provides it from
-the `_field_mapping` a mapping-bearing source sets at construction) is the
-source's `field_mapping`: normalized external name -> row key, empty when the
-source renames nothing. The field-name spelling rule resolves every downstream
-declaration through it at build time, in the pipeline build and the Web
-Composer alike, so a source that renames after normalizing must expose its
-renames here.
+`field_renames: SourceFieldRenames` (a property; `BaseSource` provides it from
+the `_field_mapping` and `_field_mapping_keys` a mapping-bearing source sets at
+construction) is the source's `field_mapping` (key -> row key, empty when the
+source renames nothing) together with what the source matches those keys
+against: `normalized` — the normalized external name (a header row, JSON object
+keys, Dataverse attributes) — or `as_written` — the configured column names
+verbatim (headerless CSV: explicit `columns`, or the schema's field names). The
+field-name spelling rule resolves every downstream declaration through it at
+build time, in the pipeline build and the Web Composer alike, so a source that
+renames must expose its renames here, keyed exactly as its own
+`resolve_field_names` call keys them.
 
 #### Required Configuration
 

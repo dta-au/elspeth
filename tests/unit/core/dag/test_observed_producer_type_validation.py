@@ -27,14 +27,13 @@ Three coordinated pieces under test here:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
@@ -493,7 +492,7 @@ class _ThreadingFakeSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
-    field_renames: Mapping[str, str] = MappingProxyType({})
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "rows"

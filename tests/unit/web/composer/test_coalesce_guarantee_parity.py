@@ -19,12 +19,11 @@ back into disagreement with an engine nobody re-read.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import CoalesceSettings, GateSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
@@ -56,7 +55,7 @@ class _Source:
     on_success = "rows"
     _output_schema_config = None
     observed_value_type: str | None = None
-    field_renames: Mapping[str, str] = MappingProxyType({})
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _Sink:

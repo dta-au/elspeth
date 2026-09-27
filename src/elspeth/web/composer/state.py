@@ -25,8 +25,10 @@ from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
+    NO_SOURCE_RENAMES,
     DeclaredSpellings,
     FieldNameResolution,
+    SourceFieldRenames,
     describe_header_spellings,
     header_spelled_declarations,
 )
@@ -7249,10 +7251,10 @@ def _check_schema_contracts(
     # ``field_mapping`` of every source whose rows reach the consumer, read off
     # a probe instance's ``field_renames`` exactly as the builder reads the real
     # source's (``upstream_name_resolution`` in core/dag/schema_validation.py).
-    source_renames_memo: dict[str, Mapping[str, str]] = {}
+    source_renames_memo: dict[str, SourceFieldRenames] = {}
 
-    def _source_field_renames(producer: ProducerEntry) -> Mapping[str, str]:
-        """A source producer's ``field_renames``; empty when its draft config does not construct.
+    def _source_field_renames(producer: ProducerEntry) -> SourceFieldRenames:
+        """A source producer's ``field_renames``; none when its draft config does not construct.
 
         A source that does not build is refused by its own validation, and the
         build that would read its renames never runs, so it contributes none.
@@ -7265,7 +7267,7 @@ def _check_schema_contracts(
 
         source_spec = source_map[source_name]
         probe: SourceProtocol | None = None
-        renames: Mapping[str, str]
+        renames: SourceFieldRenames
         try:
             probe_options = prepare_validation_probe_options(source_spec.options, plugin=source_spec.plugin)
             probe_options["on_validation_failure"] = source_spec.on_validation_failure
@@ -7275,7 +7277,7 @@ def _check_schema_contracts(
         except Exception as exc:
             if not _is_source_config_probe_exception(exc):
                 raise
-            renames = {}
+            renames = NO_SOURCE_RENAMES
         finally:
             if probe is not None:
                 probe.close()
@@ -7321,7 +7323,7 @@ def _check_schema_contracts(
         """
         if connections in live_reach_memo:
             return live_reach_memo[connections]
-        renames: list[Mapping[str, str]] = []
+        renames: list[SourceFieldRenames] = []
         seen_connections: set[str] = set()
         seen_producers: set[str] = set()
         pending = list(connections)

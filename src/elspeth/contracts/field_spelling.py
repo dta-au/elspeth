@@ -134,14 +134,47 @@ def normalized_field_name_or_empty(raw: str) -> str:
     return normalized
 
 
-SpellingLeg = Literal["recorded", "renamed", "normalized"]
+SpellingLeg = Literal["recorded", "renamed_as_written", "renamed", "normalized"]
 """Which leg of the upstream's resolution named the canonical field (``FieldNameResolution.resolve``).
 
 ``recorded``: the arriving row's contract resolves the literal (it is the
 original name recorded for that field — a lookup ``row[literal]`` reads it).
-``renamed``: a source's ``field_mapping`` renames the literal's normalized form.
+``renamed_as_written``: a headerless source's ``field_mapping`` renames the
+literal itself, a column name the source keys as written.
+``renamed``: a headered source's ``field_mapping`` renames the literal's
+normalized form.
 ``normalized``: the literal's normalized form is the field itself.
 """
+
+FieldMappingKeys = Literal["normalized", "as_written"]
+"""What a source matches its ``field_mapping`` keys against (``resolve_field_names``).
+
+``normalized``: the normalized form of each external name (a header row, JSON
+object keys, Dataverse attributes). ``as_written``: the configured column names
+verbatim (headerless CSV: explicit ``columns``, or the schema's field names).
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFieldRenames:
+    """The renames a source applies (``SourceProtocol.field_renames``), keyed the way the source keys them.
+
+    ``mapping`` is the source's validated ``field_mapping`` (key -> row key),
+    ``keys`` what those keys are matched against. A source keys a row by
+    ``mapping.get(k, k)`` where ``k`` is ``normalize(h)`` for a header ``h``
+    under ``normalized`` and the column name itself under ``as_written``, so a
+    declared literal names a rename target exactly when its ``k`` is a key.
+    """
+
+    mapping: Mapping[str, str]
+    keys: FieldMappingKeys
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "mapping")
+
+
+NO_SOURCE_RENAMES = SourceFieldRenames(mapping={}, keys="normalized")
+"""A source that renames nothing: every name it emits resolves by normalization alone."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,14 +209,20 @@ class FieldNameResolution:
     - ``recorded`` (run time): the arriving row's ``SchemaContract``. Its
       ``find_name`` is the resolution ``PipelineRow`` lookups use, so what it
       returns is exactly the field ``row[literal]`` reads.
-    - ``renames`` (build time): each upstream source's ``field_mapping``
-      (``SourceProtocol.field_renames``), keyed by normalized external name. A
-      source keys a row by ``field_mapping.get(normalize(h), normalize(h))``
-      (``resolve_field_names``), so that is what a header spelled ``literal``
-      becomes. Several sources may rename one normalized name differently; each
+    - ``renames_as_written`` / ``renames`` (build time): each upstream source's
+      ``field_mapping`` (``SourceProtocol.field_renames``), split by what the
+      source matches its keys against. A source keys a row by
+      ``field_mapping.get(k, k)`` (``resolve_field_names``) where ``k`` is the
+      configured column name verbatim for a headerless source and
+      ``normalize(h)`` for a headered one, so a literal a headerless source
+      renames is looked up as written and a header spelled ``literal`` by its
+      normalized form. Several sources may rename one key differently; each
       target is a candidate.
-    - ``normalize(literal)`` always — the rule as the source applies it with no
-      rename.
+    - ``normalize(literal)`` always — the header-spelling rule itself. A
+      headered source keys an unmapped header by it; a headerless source emits
+      its unmapped columns as written, so behind one this leg can only fire on
+      a literal that normalizes to a field the upstream carries, which the rule
+      refuses as a spelling of that field whatever the source's mode.
 
     The build has no row contract and the run time does not re-derive a
     source's renames: a recorded original name that a downstream transform
@@ -192,30 +231,33 @@ class FieldNameResolution:
     fields no lookup reaches.
     """
 
+    renames_as_written: Mapping[str, tuple[str, ...]]
     renames: Mapping[str, tuple[str, ...]]
     recorded: SchemaContract | None
 
     def __post_init__(self) -> None:
-        freeze_fields(self, "renames")
+        freeze_fields(self, "renames_as_written", "renames")
 
     @classmethod
-    def of_source_renames(cls, renames: Iterable[Mapping[str, str]]) -> FieldNameResolution:
+    def of_source_renames(cls, sources: Iterable[SourceFieldRenames]) -> FieldNameResolution:
         """The build-time resolution over the ``field_renames`` of every source whose rows can reach the node."""
-        targets: dict[str, set[str]] = {}
-        for source_renames in renames:
-            for normalized, target in source_renames.items():
-                if normalized not in targets:
-                    targets[normalized] = set()
-                targets[normalized].add(target)
+        targets: dict[FieldMappingKeys, dict[str, set[str]]] = {"as_written": {}, "normalized": {}}
+        for source in sources:
+            keyed = targets[source.keys]
+            for key, target in source.mapping.items():
+                if key not in keyed:
+                    keyed[key] = set()
+                keyed[key].add(target)
         return cls(
-            renames={normalized: tuple(sorted(found)) for normalized, found in targets.items()},
+            renames_as_written={key: tuple(sorted(found)) for key, found in targets["as_written"].items()},
+            renames={key: tuple(sorted(found)) for key, found in targets["normalized"].items()},
             recorded=None,
         )
 
     @classmethod
     def of_contract(cls, contract: SchemaContract) -> FieldNameResolution:
         """The run-time resolution: the arriving row's own contract."""
-        return cls(renames=NORMALIZATION_ONLY.renames, recorded=contract)
+        return cls(renames_as_written=NORMALIZATION_ONLY.renames_as_written, renames=NORMALIZATION_ONLY.renames, recorded=contract)
 
     def resolve(self, name: DeclaredName) -> Iterator[tuple[str, SpellingLeg]]:
         """Every field ``name`` can name upstream, strongest leg first."""
@@ -223,6 +265,9 @@ class FieldNameResolution:
             found = self.recorded.find_name(name.literal)
             if found is not None:
                 yield found, "recorded"
+        if name.literal in self.renames_as_written:
+            for target in self.renames_as_written[name.literal]:
+                yield target, "renamed_as_written"
         if name.normalized:
             if name.normalized in self.renames:
                 for target in self.renames[name.normalized]:
@@ -230,7 +275,7 @@ class FieldNameResolution:
             yield name.normalized, "normalized"
 
 
-NORMALIZATION_ONLY = FieldNameResolution(renames={}, recorded=None)
+NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, recorded=None)
 """The resolution with no upstream rename and no row contract: ``normalize(T)`` alone.
 
 For names checked against names the SAME node creates (value_transform's targets
@@ -423,6 +468,10 @@ def header_normalization_remedy(literal: str, canonical: str, *, header_kind: st
 def _read_remedy(spelling: HeaderSpelling) -> str:
     """Why a read literal names the canonical field, for the leg that fired, and what to declare instead."""
     normalized = normalized_field_name_or_empty(spelling.literal)
+    if spelling.leg == "renamed_as_written":
+        return (
+            f"the source's field_mapping renames its column '{spelling.literal}' to '{spelling.canonical}'. Declare '{spelling.canonical}'"
+        )
     if spelling.leg == "renamed":
         rename = f"the source's field_mapping renames '{normalized}' to '{spelling.canonical}'"
         if normalized != spelling.literal:

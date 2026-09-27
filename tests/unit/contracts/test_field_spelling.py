@@ -14,10 +14,12 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.field_spelling import (
+    NO_SOURCE_RENAMES,
     NORMALIZATION_ONLY,
     DeclaredSpellings,
     FieldNameResolution,
     HeaderSpelling,
+    SourceFieldRenames,
     describe_header_spelling,
     header_normalization_remedy,
     header_spelled_declarations,
@@ -29,7 +31,9 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.plugins.sources.field_normalization import normalize_field_name
 
 # The Codex shape: CSV header 'Name', source field_mapping {name: b}.
-RENAMED = FieldNameResolution.of_source_renames([{"name": "b"}])
+RENAMED = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"name": "b"}, keys="normalized")])
+# The same rename on a headerless source: columns [Name], field_mapping {Name: b}.
+RENAMED_COLUMN = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"Name": "b"}, keys="as_written")])
 
 
 def _contract(*fields: tuple[str, str]) -> SchemaContract:
@@ -124,11 +128,35 @@ class TestUpstreamResolution:
         assert header_spelled_names(["Name"], {"id"}, RENAMED, kind="read") == ()
 
     def test_every_source_reaching_the_node_contributes_its_renames(self) -> None:
-        both = FieldNameResolution.of_source_renames([{"name": "b"}, {"name": "c"}, {}])
+        both = FieldNameResolution.of_source_renames(
+            [
+                SourceFieldRenames(mapping={"name": "b"}, keys="normalized"),
+                SourceFieldRenames(mapping={"name": "c"}, keys="normalized"),
+                SourceFieldRenames(mapping={"Name": "d"}, keys="as_written"),
+                NO_SOURCE_RENAMES,
+            ]
+        )
         assert both.renames == {"name": ("b", "c")}
+        assert both.renames_as_written == {"Name": ("d",)}
         assert header_spelled_names(["Name"], {"c"}, both, kind="read") == (
             HeaderSpelling(literal="Name", canonical="c", kind="read", leg="renamed"),
         )
+
+    def test_a_headerless_rename_is_keyed_by_the_column_as_written(self) -> None:
+        # A headerless source keys field_mapping by the column as written
+        # (resolve_field_names): 'Name' names 'b'; 'NAME' and 'name' are not
+        # keys it renames, so they name nothing the rows carry.
+        assert header_spelled_names(["Name"], {"b"}, RENAMED_COLUMN, kind="read") == (
+            HeaderSpelling(literal="Name", canonical="b", kind="read", leg="renamed_as_written"),
+        )
+        assert header_spelled_names(["NAME", "name"], {"b"}, RENAMED_COLUMN, kind="read") == ()
+
+    def test_a_headered_rename_is_not_keyed_as_written(self) -> None:
+        # The converse: under a header row the key 'Name' is never matched (keys
+        # are normalized headers), so only 'name'-normalizing literals name 'b'.
+        headered = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"name": "b"}, keys="normalized")])
+        assert headered.renames_as_written == {}
+        assert header_spelled_names(["Name"], {"b"}, headered, kind="read")[0].leg == "renamed"
 
     def test_the_row_contract_resolves_the_recorded_original_name(self) -> None:
         # At run time the source's contract records b's original name 'Name';
@@ -163,6 +191,8 @@ class TestUpstreamResolution:
             recorded
             == "'Name' is a header spelling of 'b': rows carry the field it names as 'b' (a lookup of 'Name' reads that field). Declare 'b'"
         )
+        column = describe_header_spelling(HeaderSpelling(literal="Name", canonical="b", kind="read", leg="renamed_as_written"))
+        assert column == "'Name' is a header spelling of 'b': the source's field_mapping renames its column 'Name' to 'b'. Declare 'b'"
         # A recorded original that is only the normalized header keeps the source's own sentence.
         assert plain == f"'Name' is a header spelling of 'name': {header_normalization_remedy('Name', 'name')}"
 

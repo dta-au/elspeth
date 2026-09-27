@@ -537,7 +537,9 @@ digit gains a `_` prefix, a Python keyword gains a `_` suffix), and
 is declared `approved`, `First Name` is `first_name`, `Price USD` is
 `price_usd`. A source `field_mapping` renames after normalizing: under
 `field_mapping: {name: b}` header `Name` is declared `b`, and `Name`, `NAME`
-and the mapping key `name` are all refused as spellings of `b`. This holds for every DECLARATION on a transform, aggregation or
+and the mapping key `name` are all refused as spellings of `b`. A headerless
+CSV source (`columns`, or `has_header: false`) renames each column as written:
+under `columns: [Name]` and `field_mapping: {Name: b}` declare `b`, not `Name`. This holds for every DECLARATION on a transform, aggregation or
 output: schema `fields`, `required_input_fields`, the input-column options a
 plugin declares it requires (its live schema and assistance name them — for
 example the column a batch statistic reads, a conversion's field, or the named

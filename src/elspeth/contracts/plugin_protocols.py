@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
     from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
+    from elspeth.contracts.field_spelling import SourceFieldRenames
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -204,16 +205,17 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # None. Consumed by resolve_guaranteed_field_type's structural source arm.
     observed_value_type: ClassVar[str | None]
 
-    # The renames this source applies after normalizing an external name — its
-    # validated ``field_mapping``, normalized name -> row key; empty when it
-    # renames nothing. Rows are keyed by ``field_renames.get(normalize(h),
-    # normalize(h))`` (``resolve_field_names``), so a declaration spelled by a
-    # header this source renames names the rename TARGET. Read by the
-    # field-name spelling rule's build-time resolution
+    # The renames this source applies: its validated ``field_mapping`` and what
+    # it matches the mapping keys against — the normalized external name
+    # (headered CSV, JSON object keys, Dataverse attributes) or, for headerless
+    # CSV, the configured column name as written. Rows are keyed by
+    # ``mapping.get(k, k)`` (``resolve_field_names``), so a declaration whose
+    # ``k`` this source renames names the rename TARGET. Read by the field-name
+    # spelling rule's build-time resolution
     # (``contracts.field_spelling.FieldNameResolution.of_source_renames``) on
     # both the DAG builder and the Web Composer's source probe.
     @property
-    def field_renames(self) -> Mapping[str, str]: ...
+    def field_renames(self) -> "SourceFieldRenames": ...
 
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
