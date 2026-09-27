@@ -370,6 +370,15 @@ drained and repair this release forward.
   `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
   shortlists the top two per prompt, and contrasts the lineage of the two
   modes.
+- **Releasing a large aggregation batch no longer stops the run.** The
+  release wrote every buffered row in one statement with several bound
+  parameters per row, so SQLite (32,766 bound parameters) refused a large
+  batch: measured, 2,730 rows under `output_mode: passthrough` and 20,000
+  under `transform` stopped the run with exit 4, and passthrough left every
+  buffered row with no outcome and recorded the driver's error text, bound
+  row payloads included, as the operation's audit error message. The release
+  now runs in bounded statements inside the same transaction, and a refused
+  passthrough hand-off is recorded without the bound values.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of

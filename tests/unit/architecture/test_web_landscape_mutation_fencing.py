@@ -740,8 +740,17 @@ _EXPECTED_DML_COUNT = 163
 # K063 run accounting adds one collector_group_failures INSERT to the fenced
 # ExecutionRepository.complete_collector_failure verdict. The site records a
 # failed group even when no members arrived; all prior identities remain.
-# E3: b3c42f08… -> the value below, the two arrivals named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "802297e658b9189952fbabb63b5be4e34a28e46f16879f862d509054fe0604f8"
+# E3: b3c42f08… -> 802297e6…, the two arrivals named at _EXPECTED_DML_COUNT.
+# X1 fix round 2 (barrier release bound per statement): 802297e6… -> the value
+# below at count 163, write shapes 72/72 unchanged. Three token_work_items UPDATE
+# fingerprints move, identity otherwise unchanged: the terminalize and passthrough
+# hand-off UPDATEs in BarrierJournalRepository (d2312155f176d54b -> 927506072e2afba0,
+# 50e196dfb9f9d75c -> 93df40a0d0632b6f) and reset_adoption_marker_to_pending
+# (8f538e40a9a91999 -> a9ddef5f73955d39) each became one executemany of a per-row
+# statement in place of IN lists and CASE maps whose binds grew with the batch.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 4fa8e7451: arrived 3, departed 3, moved 0.
+_EXPECTED_DML_INVENTORY_SHA256 = "7ff0f6ac6cd53b099461b4bd614fe4885659dbd6ef7b9bcbbc6665b7caa4c334"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -891,8 +900,15 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "7683d3e0cfefa635a465005c75805f5aa666f027bc
 # Arrived: SchedulerLeaseRepository.requeue_undecided_failed_work ->
 # SchedulerEventStore.record_many (the resume_requeue_failed events, on the verb's
 # one fenced connection). Measured by scripts/fencing_inventory.py --baseline HEAD.
+# X1 fix round 2: 1e0222f8… -> the value below at count 147. Two edges keep their
+# endpoints and move fingerprint: _terminalize_consumed_barrier_rows and
+# _transition_passthrough_pending_sink -> SchedulerEventStore.record_many
+# (ff73b28faf6e6c8f -> c9cd14d8ac48f958, 437ff52f30dcf19a -> 6a488448bf78ff07); each
+# now records an event for every candidate row after its exact-count check instead
+# of filtering on a RETURNING image. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of 4fa8e7451: moved 2, arrived 0, departed 0.
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 147
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "1e0222f86a8f12d5a1de8ae10eaaf1b8b49589b97bd4e166abe8b453880e5f0f"
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "cc66a10dd8a76fe2c1de847bafd2ea2fa5966885ab2959df0fed24b6a696217b"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 92
@@ -8925,7 +8941,14 @@ def _deadline_executed_writes(function, resolver):
             yield write, call, callee.value, table[1], values
             continue
         payload = _deadline_binding(parameters[0], resolver, call)
-        rows = payload.elts if isinstance(payload, (ast.List, ast.Tuple)) else [payload]
+        # A list comprehension of dict displays is as static as a literal list:
+        # every row it yields carries the display's own keys.
+        if isinstance(payload, (ast.List, ast.Tuple)):
+            rows = payload.elts
+        elif isinstance(payload, ast.ListComp) and isinstance(payload.elt, ast.Dict):
+            rows = [payload.elt]
+        else:
+            rows = [payload]
         for row in rows:
             parameter_call = ast.Call(func=ast.Name(id="parameters", ctx=ast.Load()), args=[row], keywords=[])
             supplied = _deadline_write_values(parameter_call, resolver)
@@ -10584,10 +10607,11 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
     with fenced_write(self._engine, coordination_token=coordination_token, verb='complete_barrier') as conn:
         database_now = read_landscape_transaction_time(conn)
         if terminal_outcome_token_ids:
-            locked_tokens = conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(sorted(terminal_outcome_token_ids))).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()
+            sorted_terminal_token_ids = sorted(terminal_outcome_token_ids)
+            locked_tokens = [row for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(chunk)).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()]
             if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {(token_id, run_id) for token_id in terminal_outcome_token_ids}:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received a terminal outcome for a missing or foreign token.')
-            existing_terminal_rows = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(terminal_outcome_token_ids)).where(token_outcomes_table.c.completed == 1)).all()
+            existing_terminal_rows = [row for chunk in _chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(chunk)).where(token_outcomes_table.c.completed == 1)).all()]
             if existing_terminal_rows:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} would duplicate terminal outcomes for token_ids={sorted((str(row.token_id) for row in existing_terminal_rows))!r}.')
         blocked_rows = conn.execute(select(token_work_items_table.c.work_item_id, token_work_items_table.c.token_id, token_work_items_table.c.node_id, token_work_items_table.c.attempt, token_work_items_table.c.lease_owner, token_work_items_table.c.lease_expires_at).where(*blocked_predicates).order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.step_index, token_work_items_table.c.work_item_id)).mappings().all()
@@ -10604,7 +10628,7 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
             unknown_snapshot_token_ids = intake_snapshot_token_ids - durable_token_ids
             if unknown_snapshot_token_ids:
                 if scope_row_id is not None:
-                    cross_group_rows = conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(sorted(unknown_snapshot_token_ids)))).all()
+                    cross_group_rows = [row for chunk in _chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1) for row in conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(chunk))).all()]
                     cross_group = {row.token_id: row.row_id for row in cross_group_rows if row.row_id != scope_row_id}
                     if cross_group:
                         raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} scope_row_id={scope_row_id!r} received intake snapshot token(s) whose durable BLOCKED rows belong to a DIFFERENT row group: {dict(sorted(cross_group.items()))!r}; the flush caller built its firing-group snapshot across row groups (ADR-030 §E.3 scope validation).')
@@ -10755,11 +10779,12 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
     ),
     "src/elspeth/core/landscape/scheduler/barrier.py": (
         "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
-        "ImportFrom(module='collections.abc', names=[alias(name='Mapping'), alias(name='Sequence')], level=0)",
+        "ImportFrom(module='collections.abc', names=[alias(name='Iterator'), alias(name='Mapping'), alias(name='Sequence')], level=0)",
         "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
         "ImportFrom(module='datetime', names=[alias(name='UTC'), alias(name='datetime'), alias(name='timedelta')], level=0)",
-        "ImportFrom(module='sqlalchemy', names=[alias(name='case'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='bindparam'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
         "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='sqlalchemy.exc', names=[alias(name='SQLAlchemyError')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='lineage_path_to_json')], level=0)",
@@ -10767,6 +10792,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.execution.batches', names=[alias(name='add_batch_member_guarded')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord'), alias(name='SchedulerEventStore')], level=0)",
@@ -15448,6 +15474,59 @@ def test_deadline_issuance_requires_locked_sample_and_exact_registration(before:
     assert any("deadline" in finding for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units)))
 
 
+def _executemany_comprehension_fixture() -> SourceUnit:
+    """A non-issuing token_work_items UPDATE executed once over a comprehension of dict rows (X1 fix round 2)."""
+    return _parse_source(
+        "src/elspeth/core/landscape/scheduler/leases.py",
+        textwrap.dedent(
+            """\
+            from sqlalchemy import bindparam, update
+            from elspeth.contracts.coordination import WorkerMembershipToken
+            from elspeth.core.landscape.run_coordination_repository import fenced_member_transaction
+            from elspeth.core.landscape.schema import token_work_items_table
+
+            def park_items(*, member_token: WorkerMembershipToken, work_item_ids):
+                with fenced_member_transaction(engine, member_token=member_token, verb='park_items') as conn:
+                    result = conn.execute(update(token_work_items_table).where(
+                        token_work_items_table.c.work_item_id == bindparam('b_work_item_id'),
+                        token_work_items_table.c.run_id == member_token.run_id,
+                    ).values(lease_expires_at=None), [{'b_work_item_id': work_item_id} for work_item_id in work_item_ids])
+                    if result.rowcount != len(work_item_ids):
+                        raise RuntimeError('park refused')
+            """
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        # A row key that overrides a fluent value is not static any more.
+        ("[{'b_work_item_id': work_item_id}", "[{'b_work_item_id': work_item_id, 'lease_expires_at': work_item_id}"),
+        # A row built by a call rather than a dict display has unknown keys.
+        ("[{'b_work_item_id': work_item_id}", "[dict(b_work_item_id=work_item_id)"),
+        # A generator is not a list display the resolver reads.
+        (
+            "[{'b_work_item_id': work_item_id} for work_item_id in work_item_ids]",
+            "({'b_work_item_id': work_item_id} for work_item_id in work_item_ids)",
+        ),
+    ],
+)
+def test_deadline_write_values_resolve_comprehension_rows_only_when_static(before: str, after: str) -> None:
+    baseline = _executemany_comprehension_fixture()
+    baseline_units = _deadline_fixture_units(baseline)
+    assert not [
+        finding for finding in _transaction_order_violations(baseline_units, scan_dml_identities(baseline_units)) if "deadline" in finding
+    ]
+    assert before in baseline.source
+    mutant = _parse_source(baseline.path, baseline.source.replace(before, after))
+    mutant_units = _deadline_fixture_units(mutant)
+    assert any(
+        "deadline table has unresolved write values" in finding
+        for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units))
+    )
+
+
 def test_deadline_issuance_rejects_sampling_before_the_target_lock() -> None:
     baseline = _deadline_issuance_fixture()
     before_lock = baseline.source.replace("        database_now = read_landscape_decision_time(conn)\n", "").replace(
@@ -15467,6 +15546,7 @@ def test_deadline_issuance_rejects_sampling_before_the_target_lock() -> None:
         "transaction_without_registration",
         "mapping_without_registration",
         "executemany_without_registration",
+        "executemany_comprehension_without_registration",
         "split_stamp",
         "prelock_eligibility",
         "foreign_key_factory",
@@ -15495,6 +15575,10 @@ def test_deadline_registration_rejects_reviewed_provenance_and_control_flow_bypa
         "executemany_without_registration": missing.replace(
             ".values(lease_expires_at=expires_at, updated_at=database_now))",
             ", [{'lease_expires_at': expires_at, 'updated_at': database_now}])",
+        ),
+        "executemany_comprehension_without_registration": missing.replace(
+            ".values(lease_expires_at=expires_at, updated_at=database_now))",
+            ", [{'lease_expires_at': expires_at, 'updated_at': database_now} for _row in (work_item_id,)])",
         ),
         "split_stamp": baseline.source.replace("updated_at=database_now", "updated_at=read_landscape_decision_time(conn)"),
         "prelock_eligibility": baseline.source.replace(
